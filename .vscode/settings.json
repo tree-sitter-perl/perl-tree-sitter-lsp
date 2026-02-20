@@ -1,0 +1,10 @@
+{
+  "glspClient.serverConfigs": [
+    {
+      "id": "perl-lsp",
+      "name": "Perl LSP",
+      "command": "${workspaceFolder}/target/release/perl-lsp",
+      "languages": ["perl"]
+    }
+  ]
+}
