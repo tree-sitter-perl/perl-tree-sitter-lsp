@@ -28,6 +28,9 @@ vim.api.nvim_create_autocmd("LspAttach", {
     vim.keymap.set("n", "gr", vim.lsp.buf.references, opts)
     vim.keymap.set("n", "K", vim.lsp.buf.hover, opts)
 
+    -- Rename
+    vim.keymap.set("n", "<leader>rn", vim.lsp.buf.rename, opts)
+
     -- Symbol outline
     vim.keymap.set("n", "<leader>o", vim.lsp.buf.document_symbol, opts)
 
@@ -35,6 +38,6 @@ vim.api.nvim_create_autocmd("LspAttach", {
     vim.keymap.set("n", "[d", vim.diagnostic.goto_prev, opts)
     vim.keymap.set("n", "]d", vim.diagnostic.goto_next, opts)
 
-    print("perl-lsp attached! gd=definition gr=references K=hover <leader>o=symbols")
+    print("perl-lsp attached! gd=def gr=refs K=hover <leader>rn=rename <leader>o=symbols")
   end,
 })

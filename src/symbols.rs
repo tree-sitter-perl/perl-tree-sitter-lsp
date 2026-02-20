@@ -494,6 +494,57 @@ fn collect_package_refs(node: Node, source: &[u8], target: &str, refs: &mut Vec<
     }
 }
 
+// ---- Rename ----
+
+pub fn rename(
+    tree: &Tree,
+    source: &str,
+    pos: Position,
+    uri: &Url,
+    new_name: &str,
+) -> Option<WorkspaceEdit> {
+    let source_bytes = source.as_bytes();
+    let cursor_sym = symbol_at_cursor(tree, source_bytes, pos)?;
+
+    // For variables, the new name from the editor won't include the sigil,
+    // but our references include it. Preserve the original sigil.
+    let refs = find_references(tree, source, pos, uri);
+    if refs.is_empty() {
+        return None;
+    }
+
+    let edits: Vec<TextEdit> = refs
+        .into_iter()
+        .map(|loc| {
+            let new_text = match &cursor_sym {
+                CursorSymbol::Variable { text } => {
+                    // Keep the sigil from the original, replace the name part.
+                    let sigil = &text[..1]; // $, @, or %
+                    let replacement = if new_name.starts_with(|c| "$@%".contains(c)) {
+                        new_name.to_string()
+                    } else {
+                        format!("{}{}", sigil, new_name)
+                    };
+                    replacement
+                }
+                _ => new_name.to_string(),
+            };
+            TextEdit {
+                range: loc.range,
+                new_text,
+            }
+        })
+        .collect();
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), edits);
+
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    })
+}
+
 // ---- Hover ----
 
 pub fn hover_info(tree: &Tree, source: &str, pos: Position) -> Option<Hover> {
