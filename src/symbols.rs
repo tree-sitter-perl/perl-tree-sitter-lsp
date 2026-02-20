@@ -43,6 +43,13 @@ fn symbol_at_cursor(tree: &Tree, source: &[u8], pos: Position) -> Option<CursorS
                     text: text.to_string(),
                 });
             }
+            // TSP uses container_variable for hash/array element access bases:
+            // $hash{key} → container_variable in hash: field → canonical is %hash
+            // $arr[0]    → container_variable in array: field → canonical is @arr
+            "container_variable" | "slice_container_variable" | "keyval_container_variable" => {
+                let canonical = canonical_var_name(node, source)?;
+                return Some(CursorSymbol::Variable { text: canonical });
+            }
             "function" | "method" => {
                 let text = node.utf8_text(source).ok()?;
                 return Some(CursorSymbol::Function {
@@ -181,38 +188,19 @@ fn collect_symbols(node: Node, source: &[u8], symbols: &mut Vec<DocumentSymbol>)
         }
         "variable_declaration" => {
             let keyword = get_decl_keyword(node, source).unwrap_or("my");
-            if let Some(var_node) = node.child_by_field_name("variable") {
-                if let Ok(name) = var_node.utf8_text(source) {
-                    symbols.push(DocumentSymbol {
-                        name: name.to_string(),
-                        detail: Some(keyword.to_string()),
-                        kind: SymbolKind::VARIABLE,
-                        tags: None,
-                        deprecated: None,
-                        range: node_to_range(node),
-                        selection_range: node_to_range(var_node),
-                        children: None,
-                    });
-                }
-            } else if let Some(vars_node) = node.child_by_field_name("variables") {
-                for i in 0..vars_node.named_child_count() {
-                    if let Some(var_child) = vars_node.named_child(i) {
-                        if matches!(var_child.kind(), "scalar" | "array" | "hash") {
-                            if let Ok(name) = var_child.utf8_text(source) {
-                                symbols.push(DocumentSymbol {
-                                    name: name.to_string(),
-                                    detail: Some(keyword.to_string()),
-                                    kind: SymbolKind::VARIABLE,
-                                    tags: None,
-                                    deprecated: None,
-                                    range: node_to_range(node),
-                                    selection_range: node_to_range(var_child),
-                                    children: None,
-                                });
-                            }
-                        }
-                    }
-                }
+            let mut vars = Vec::new();
+            collect_declared_vars(node, source, &mut vars);
+            for (name, sel_node) in vars {
+                symbols.push(DocumentSymbol {
+                    name,
+                    detail: Some(keyword.to_string()),
+                    kind: SymbolKind::VARIABLE,
+                    tags: None,
+                    deprecated: None,
+                    range: node_to_range(node),
+                    selection_range: node_to_range(sel_node),
+                    children: None,
+                });
             }
             return;
         }
@@ -247,6 +235,27 @@ fn collect_symbols(node: Node, source: &[u8], symbols: &mut Vec<DocumentSymbol>)
 fn get_decl_keyword<'a>(decl: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
     let first = decl.child(0)?;
     first.utf8_text(source).ok()
+}
+
+/// Walk a variable_declaration subtree and collect all declared variable
+/// names (scalar/array/hash). Handles both single vars and paren lists,
+/// without relying on field names that break on hidden rules.
+fn collect_declared_vars<'a>(
+    node: Node<'a>,
+    source: &'a [u8],
+    out: &mut Vec<(String, Node<'a>)>,
+) {
+    if matches!(node.kind(), "scalar" | "array" | "hash") {
+        if let Ok(name) = node.utf8_text(source) {
+            out.push((name.to_string(), node));
+        }
+        return;
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_declared_vars(child, source, out);
+        }
+    }
 }
 
 // ---- Go to definition ----
@@ -330,19 +339,27 @@ fn decl_contains_variable<'a>(
     source: &[u8],
     target: &str,
 ) -> Option<Node<'a>> {
-    if let Some(var) = decl.child_by_field_name("variable") {
-        if var.utf8_text(source).ok() == Some(target) {
-            return Some(var);
-        }
+    // Walk all descendants — variable_declaration only contains declared
+    // variables (the RHS of any assignment is in the parent node).
+    // This handles both single vars (my $x) and lists (my ($x, %h))
+    // without relying on field names that break on hidden rules.
+    find_var_in_subtree(decl, source, target)
+}
+
+fn find_var_in_subtree<'a>(
+    node: Node<'a>,
+    source: &[u8],
+    target: &str,
+) -> Option<Node<'a>> {
+    if matches!(node.kind(), "scalar" | "array" | "hash")
+        && node.utf8_text(source).ok() == Some(target)
+    {
+        return Some(node);
     }
-    if let Some(vars) = decl.child_by_field_name("variables") {
-        for i in 0..vars.named_child_count() {
-            if let Some(child) = vars.named_child(i) {
-                if matches!(child.kind(), "scalar" | "array" | "hash")
-                    && child.utf8_text(source).ok() == Some(target)
-                {
-                    return Some(child);
-                }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if let Some(found) = find_var_in_subtree(child, source, target) {
+                return Some(found);
             }
         }
     }
@@ -435,11 +452,20 @@ pub fn find_references(tree: &Tree, source: &str, pos: Position, uri: &Url) -> V
 }
 
 fn collect_variable_refs(node: Node, source: &[u8], target: &str, refs: &mut Vec<Range>) {
-    if matches!(node.kind(), "scalar" | "array" | "hash") {
-        if node.utf8_text(source).ok() == Some(target) {
-            refs.push(node_to_range(node));
+    match node.kind() {
+        "scalar" | "array" | "hash" => {
+            if node.utf8_text(source).ok() == Some(target) {
+                refs.push(node_to_range(node));
+            }
+            return;
         }
-        return;
+        "container_variable" | "slice_container_variable" | "keyval_container_variable" => {
+            if canonical_var_name(node, source).as_deref() == Some(target) {
+                refs.push(node_to_range(node));
+            }
+            return;
+        }
+        _ => {}
     }
 
     for i in 0..node.child_count() {
@@ -447,6 +473,49 @@ fn collect_variable_refs(node: Node, source: &[u8], target: &str, refs: &mut Vec
             collect_variable_refs(child, source, target, refs);
         }
     }
+}
+
+/// Resolve a container_variable to its canonical sigil+name.
+/// TSP already distinguishes the context via parent field names:
+///   hash: field → %name, array: field → @name
+fn canonical_var_name(node: Node, source: &[u8]) -> Option<String> {
+    let varname = get_varname(node, source)?;
+
+    match node.kind() {
+        "keyval_container_variable" => return Some(format!("%{}", varname)),
+        "slice_container_variable" => {
+            // @hash{@keys} or @array[@idxs] — check parent field
+            if let Some(parent) = node.parent() {
+                if parent.child_by_field_name("hash").map_or(false, |h| h.id() == node.id()) {
+                    return Some(format!("%{}", varname));
+                }
+            }
+            return Some(format!("@{}", varname));
+        }
+        _ => {} // container_variable — check parent field below
+    }
+
+    if let Some(parent) = node.parent() {
+        if parent.child_by_field_name("hash").map_or(false, |h| h.id() == node.id()) {
+            return Some(format!("%{}", varname));
+        }
+        if parent.child_by_field_name("array").map_or(false, |a| a.id() == node.id()) {
+            return Some(format!("@{}", varname));
+        }
+    }
+    // Fallback to literal text
+    node.utf8_text(source).ok().map(|s| s.to_string())
+}
+
+fn get_varname<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if child.kind() == "varname" {
+                return child.utf8_text(source).ok();
+            }
+        }
+    }
+    None
 }
 
 fn collect_function_refs(node: Node, source: &[u8], target: &str, refs: &mut Vec<Range>) {
