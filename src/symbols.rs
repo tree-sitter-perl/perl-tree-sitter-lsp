@@ -398,7 +398,24 @@ pub fn find_references(tree: &Tree, source: &str, pos: Position, uri: &Url) -> V
 
     match cursor_sym {
         CursorSymbol::Variable { ref text } => {
-            collect_variable_refs(tree.root_node(), source_bytes, text, &mut ranges);
+            // Scope-aware: resolve which declaration this reference points to,
+            // then only include references that resolve to the same declaration.
+            let target_def = find_variable_def(tree.root_node(), source_bytes, text, pos);
+
+            let mut all_refs = Vec::new();
+            collect_variable_refs(tree.root_node(), source_bytes, text, &mut all_refs);
+
+            for ref_range in all_refs {
+                let ref_def = find_variable_def(
+                    tree.root_node(),
+                    source_bytes,
+                    text,
+                    ref_range.start,
+                );
+                if ref_def == target_def {
+                    ranges.push(ref_range);
+                }
+            }
         }
         CursorSymbol::Function { ref name } => {
             collect_function_refs(tree.root_node(), source_bytes, name, &mut ranges);
