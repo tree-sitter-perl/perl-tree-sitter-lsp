@@ -1236,18 +1236,17 @@ fn collect_variable_completions(
     collect_in_scope_vars(root, source, point, &mut raw);
 
     // Deduplicate by bare name, keeping innermost scope (smallest scope_size)
-    let mut seen = std::collections::HashMap::<String, usize>::new();
+    // Dedup by (bare_name, sigil) — $args and @args are different variables
+    let mut seen = std::collections::HashSet::<(String, char)>::new();
     let mut deduped = Vec::new();
     // Sort by scope_size ascending so we process innermost first
     raw.sort_by_key(|(_, _, _, sz)| *sz);
     for (bare_name, decl_sigil, detail, scope_size) in raw {
-        let idx = deduped.len();
-        if let Some(existing_idx) = seen.get(&bare_name) {
-            // Already have a tighter-scoped version, skip
-            let _ = existing_idx;
+        let key = (bare_name.clone(), decl_sigil);
+        if seen.contains(&key) {
             continue;
         }
-        seen.insert(bare_name.clone(), idx);
+        seen.insert(key);
         deduped.push((bare_name, decl_sigil, detail, scope_size));
     }
 
@@ -2262,6 +2261,22 @@ $g->"#;
         let l = labels(&items);
         assert!(l.contains(&"greet"), "missing greet, got {:?}", l);
         assert!(l.contains(&"wave"), "missing wave, got {:?}", l);
+    }
+
+    #[test]
+    fn test_complete_same_name_different_sigil() {
+        // %args and @args are different variables — both should appear
+        let src = "\
+sub new {
+    my (%args) = @_;
+    my @args;
+    $";
+        let tree = parse(src);
+        let items = collect_completions(&tree, src, Point::new(3, 5));
+        let l = labels(&items);
+        // Should have $args{} from %args AND $args[] from @args
+        assert!(l.contains(&"$args{}"), "missing $args{{}} from %args, got {:?}", l);
+        assert!(l.contains(&"$args[]"), "missing $args[] from @args, got {:?}", l);
     }
 
     #[test]

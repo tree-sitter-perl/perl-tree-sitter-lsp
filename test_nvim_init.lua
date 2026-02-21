@@ -38,6 +38,19 @@ vim.api.nvim_create_autocmd("LspAttach", {
     vim.keymap.set("n", "[d", vim.diagnostic.goto_prev, opts)
     vim.keymap.set("n", "]d", vim.diagnostic.goto_next, opts)
 
-    print("perl-lsp attached! gd=def gr=refs K=hover <leader>rn=rename <leader>o=symbols")
+    -- Completion: use omnifunc backed by LSP
+    vim.bo[buf].omnifunc = "v:lua.vim.lsp.omnifunc"
+
+    -- Auto-trigger completion on Perl sigils and ->
+    for _, char in ipairs({ "$", "@", "%" }) do
+      vim.keymap.set("i", char, char .. "<C-x><C-o>", { buffer = buf })
+    end
+    vim.keymap.set("i", "->", "-><C-x><C-o>", { buffer = buf })
+
+    print("perl-lsp attached! gd=def gr=refs K=hover <leader>rn=rename <leader>o=symbols C-x C-o=complete")
   end,
 })
+
+-- Completion menu settings
+vim.opt.completeopt = { "menuone", "noinsert", "preview" }
+vim.opt.pumheight = 15
