@@ -44,6 +44,16 @@ impl LanguageServer for Backend {
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 rename_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![
+                        "$".to_string(),
+                        "@".to_string(),
+                        "%".to_string(),
+                        ">".to_string(),
+                        ":".to_string(),
+                    ]),
+                    ..Default::default()
+                }),
                 ..ServerCapabilities::default()
             },
             ..Default::default()
@@ -150,5 +160,23 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         Ok(symbols::hover_info(&doc.tree, &doc.text, pos))
+    }
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> Result<Option<CompletionResponse>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let doc = match self.documents.get(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let items = symbols::completion_items(&doc.tree, &doc.text, pos);
+        if items.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(CompletionResponse::Array(items)))
+        }
     }
 }

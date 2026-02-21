@@ -115,6 +115,33 @@ pub fn rename(
     })
 }
 
+fn completion_kind(kind: &analysis::SymbolKind) -> CompletionItemKind {
+    match kind {
+        analysis::SymbolKind::Function => CompletionItemKind::FUNCTION,
+        analysis::SymbolKind::Method => CompletionItemKind::METHOD,
+        analysis::SymbolKind::Variable => CompletionItemKind::VARIABLE,
+        analysis::SymbolKind::Package => CompletionItemKind::CLASS,
+        analysis::SymbolKind::Class => CompletionItemKind::CLASS,
+        analysis::SymbolKind::Module => CompletionItemKind::MODULE,
+    }
+}
+
+pub fn completion_items(tree: &Tree, source: &str, pos: Position) -> Vec<CompletionItem> {
+    let candidates = analysis::collect_completions(tree, source, position_to_point(pos));
+
+    candidates
+        .into_iter()
+        .map(|c| CompletionItem {
+            label: c.label,
+            kind: Some(completion_kind(&c.kind)),
+            detail: c.detail,
+            insert_text: c.insert_text,
+            sort_text: Some(format!("{:03}", c.sort_priority)),
+            ..Default::default()
+        })
+        .collect()
+}
+
 pub fn hover_info(tree: &Tree, source: &str, pos: Position) -> Option<Hover> {
     let result = analysis::hover_info(tree, source, position_to_point(pos))?;
     Some(Hover {

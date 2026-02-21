@@ -76,6 +76,22 @@ pub struct MethodInfo {
     pub selection_span: Span,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompletionCandidate {
+    pub label: String,
+    pub kind: SymbolKind,
+    pub detail: Option<String>,
+    pub insert_text: Option<String>,
+    pub sort_priority: u8, // lower = higher priority (0 = innermost scope)
+}
+
+#[derive(Debug, PartialEq)]
+enum CompletionMode {
+    Variable { sigil: char },
+    Method { invocant: String },
+    General,
+}
+
 // ---- Symbol at cursor ----
 
 pub fn symbol_at_cursor(tree: &Tree, source: &[u8], point: Point) -> Option<CursorSymbol> {
@@ -1121,6 +1137,427 @@ pub fn hover_info(tree: &Tree, source: &str, point: Point) -> Option<HoverResult
     Some(HoverResult { markdown })
 }
 
+// ---- Completion ----
+
+pub fn collect_completions(tree: &Tree, source: &str, point: Point) -> Vec<CompletionCandidate> {
+    let source_bytes = source.as_bytes();
+    let mode = detect_completion_mode(source, point);
+
+    match mode {
+        CompletionMode::Variable { sigil } => {
+            collect_variable_completions(tree.root_node(), source_bytes, point, sigil)
+        }
+        CompletionMode::Method { ref invocant } => {
+            collect_method_completions(tree, source_bytes, invocant, point)
+        }
+        CompletionMode::General => {
+            let mut candidates = Vec::new();
+            // Variables (all sigils)
+            for sigil in ['$', '@', '%'] {
+                candidates.extend(collect_variable_completions(
+                    tree.root_node(),
+                    source_bytes,
+                    point,
+                    sigil,
+                ));
+            }
+            // Subs
+            candidates.extend(collect_all_subs(tree.root_node(), source_bytes));
+            // Package/class names
+            candidates.extend(collect_all_packages(tree.root_node(), source_bytes));
+            candidates
+        }
+    }
+}
+
+fn detect_completion_mode(source: &str, point: Point) -> CompletionMode {
+    let line = match source.lines().nth(point.row) {
+        Some(l) => l,
+        None => return CompletionMode::General,
+    };
+    let before = if point.column <= line.len() {
+        &line[..point.column]
+    } else {
+        line
+    };
+    let trimmed = before.trim_end();
+
+    // Check for -> (method completion)
+    if trimmed.ends_with("->") {
+        // Extract the invocant: everything before -> that looks like a variable or bareword
+        let prefix = trimmed[..trimmed.len() - 2].trim_end();
+        // Find the invocant token (last word/variable)
+        let invocant = extract_invocant_from_prefix(prefix);
+        if !invocant.is_empty() {
+            return CompletionMode::Method {
+                invocant: invocant.to_string(),
+            };
+        }
+    }
+
+    // Check for sigil trigger
+    if let Some(last_char) = trimmed.chars().last() {
+        if matches!(last_char, '$' | '@' | '%') {
+            return CompletionMode::Variable { sigil: last_char };
+        }
+    }
+
+    CompletionMode::General
+}
+
+fn extract_invocant_from_prefix(prefix: &str) -> &str {
+    // Walk backwards to find the start of the invocant token
+    let bytes = prefix.as_bytes();
+    let end = bytes.len();
+    let mut i = end;
+    while i > 0 {
+        i -= 1;
+        let ch = bytes[i] as char;
+        if ch.is_alphanumeric() || ch == '_' || ch == ':' {
+            continue;
+        }
+        if ch == '$' || ch == '@' || ch == '%' {
+            // Include the sigil
+            return &prefix[i..end];
+        }
+        // Not a valid invocant character — stop
+        return &prefix[i + 1..end];
+    }
+    &prefix[..end]
+}
+
+fn collect_variable_completions(
+    root: Node,
+    source: &[u8],
+    point: Point,
+    sigil: char,
+) -> Vec<CompletionCandidate> {
+    let mut raw: Vec<(String, char, Option<String>, usize)> = Vec::new(); // (bare_name, decl_sigil, detail, scope_size)
+    collect_in_scope_vars(root, source, point, &mut raw);
+
+    // Deduplicate by bare name, keeping innermost scope (smallest scope_size)
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    let mut deduped = Vec::new();
+    // Sort by scope_size ascending so we process innermost first
+    raw.sort_by_key(|(_, _, _, sz)| *sz);
+    for (bare_name, decl_sigil, detail, scope_size) in raw {
+        let idx = deduped.len();
+        if let Some(existing_idx) = seen.get(&bare_name) {
+            // Already have a tighter-scoped version, skip
+            let _ = existing_idx;
+            continue;
+        }
+        seen.insert(bare_name.clone(), idx);
+        deduped.push((bare_name, decl_sigil, detail, scope_size));
+    }
+
+    // Generate completion candidates with cross-sigil forms
+    let mut candidates = Vec::new();
+    for (bare_name, decl_sigil, detail, scope_size) in deduped {
+        let priority = std::cmp::min(scope_size, 255) as u8;
+
+        match sigil {
+            '$' => {
+                // Always offer $name for scalar-declared vars
+                if decl_sigil == '$' {
+                    candidates.push(CompletionCandidate {
+                        label: format!("${}", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: detail.clone(),
+                        insert_text: Some(bare_name.clone()),
+                        sort_priority: priority,
+                    });
+                }
+                // $arrayname[ for @array element access
+                if decl_sigil == '@' {
+                    candidates.push(CompletionCandidate {
+                        label: format!("${}[]", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: detail.clone().or(Some(format!("@{}", bare_name))),
+                        insert_text: Some(format!("{}[", bare_name)),
+                        sort_priority: priority,
+                    });
+                    // $#arrayname for last index
+                    candidates.push(CompletionCandidate {
+                        label: format!("$#{}", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: detail.clone().or(Some(format!("last index of @{}", bare_name))),
+                        insert_text: Some(format!("#{}", bare_name)),
+                        sort_priority: priority.saturating_add(1),
+                    });
+                }
+                // $hashname{ for %hash
+                if decl_sigil == '%' {
+                    candidates.push(CompletionCandidate {
+                        label: format!("${}{{}}", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: detail.clone().or(Some(format!("%{}", bare_name))),
+                        insert_text: Some(format!("{}{{", bare_name)),
+                        sort_priority: priority,
+                    });
+                }
+            }
+            '@' => {
+                // @name for arrays
+                if decl_sigil == '@' {
+                    candidates.push(CompletionCandidate {
+                        label: format!("@{}", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: detail.clone(),
+                        insert_text: Some(bare_name.clone()),
+                        sort_priority: priority,
+                    });
+                }
+                // @arrayname[] for array slice
+                if decl_sigil == '@' {
+                    candidates.push(CompletionCandidate {
+                        label: format!("@{}[]", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: Some("array slice".to_string()),
+                        insert_text: Some(format!("{}[", bare_name)),
+                        sort_priority: priority.saturating_add(1),
+                    });
+                }
+                // @hashname{} for hash slice
+                if decl_sigil == '%' {
+                    candidates.push(CompletionCandidate {
+                        label: format!("@{}{{}}", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: detail.clone().or(Some("hash slice".to_string())),
+                        insert_text: Some(format!("{}{{", bare_name)),
+                        sort_priority: priority,
+                    });
+                }
+            }
+            '%' => {
+                // %name for hashes
+                if decl_sigil == '%' {
+                    candidates.push(CompletionCandidate {
+                        label: format!("%{}", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: detail.clone(),
+                        insert_text: Some(bare_name.clone()),
+                        sort_priority: priority,
+                    });
+                }
+                // %arrayname[] for array key/value slice
+                if decl_sigil == '@' {
+                    candidates.push(CompletionCandidate {
+                        label: format!("%{}[]", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: Some("array kv slice".to_string()),
+                        insert_text: Some(format!("{}[", bare_name)),
+                        sort_priority: priority,
+                    });
+                }
+                // %hashname{} for hash key/value slice
+                if decl_sigil == '%' {
+                    candidates.push(CompletionCandidate {
+                        label: format!("%{}{{}}", bare_name),
+                        kind: SymbolKind::Variable,
+                        detail: Some("hash kv slice".to_string()),
+                        insert_text: Some(format!("{}{{", bare_name)),
+                        sort_priority: priority.saturating_add(1),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    candidates
+}
+
+fn collect_in_scope_vars(
+    node: Node,
+    source: &[u8],
+    point: Point,
+    out: &mut Vec<(String, char, Option<String>, usize)>, // (bare_name, sigil, detail, scope_size)
+) {
+    // variable_declaration: check scope contains point
+    if node.kind() == "variable_declaration" {
+        if node.start_position() <= point {
+            let keyword = get_decl_keyword(node, source).unwrap_or("my");
+            let scope = enclosing_scope(node);
+            let scope_end = scope.end_position();
+            if scope_end >= point {
+                let scope_size = scope_end.row - scope.start_position().row;
+                let mut vars = Vec::new();
+                collect_declared_vars(node, source, &mut vars);
+                for (name, _) in vars {
+                    if let Some(sigil) = name.chars().next() {
+                        let bare = name[1..].to_string();
+                        out.push((bare, sigil, Some(keyword.to_string()), scope_size));
+                    }
+                }
+            }
+        }
+    }
+
+    // Signature params: scoped to the sub body
+    if node.kind() == "subroutine_declaration_statement"
+        || node.kind() == "method_declaration_statement"
+    {
+        if let Some(body) = node.child_by_field_name("body") {
+            let body_end = body.end_position();
+            if body_end >= point && body.start_position() <= point {
+                let scope_size = body_end.row - body.start_position().row;
+                for i in 0..node.child_count() {
+                    if let Some(sig) = node.child(i) {
+                        if sig.kind() == "signature" {
+                            let mut vars = Vec::new();
+                            collect_declared_vars(sig, source, &mut vars);
+                            for (name, _) in vars {
+                                if let Some(sigil) = name.chars().next() {
+                                    let bare = name[1..].to_string();
+                                    out.push((bare, sigil, Some("param".to_string()), scope_size));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // for-loop variable
+    if node.kind() == "for_statement" {
+        if let Some(var_node) = node.child_by_field_name("variable") {
+            if var_node.start_position() <= point {
+                if let Some(block) = node.child_by_field_name("block") {
+                    let block_end = block.end_position();
+                    if block_end >= point {
+                        let scope_size = block_end.row - block.start_position().row;
+                        if let Ok(name) = var_node.utf8_text(source) {
+                            if let Some(sigil) = name.chars().next() {
+                                let bare = name[1..].to_string();
+                                out.push((bare, sigil, Some("for".to_string()), scope_size));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_in_scope_vars(child, source, point, out);
+        }
+    }
+}
+
+fn collect_method_completions(
+    tree: &Tree,
+    source: &[u8],
+    invocant: &str,
+    point: Point,
+) -> Vec<CompletionCandidate> {
+    let mut candidates = Vec::new();
+
+    // Try type inference
+    if let Some(class_name) = infer_variable_class(tree.root_node(), source, invocant, point) {
+        let classes = extract_classes(tree, std::str::from_utf8(source).unwrap_or(""));
+        if let Some(class) = classes.iter().find(|c| c.name == class_name) {
+            for method in &class.methods {
+                candidates.push(CompletionCandidate {
+                    label: method.name.clone(),
+                    kind: SymbolKind::Method,
+                    detail: Some(class_name.clone()),
+                    insert_text: None,
+                    sort_priority: 0,
+                });
+            }
+            return candidates;
+        }
+    }
+
+    // Fall back: all subs and methods in file
+    collect_all_subs(tree.root_node(), source)
+}
+
+fn collect_all_subs(node: Node, source: &[u8]) -> Vec<CompletionCandidate> {
+    let mut candidates = Vec::new();
+    collect_all_subs_walk(node, source, &mut candidates);
+    candidates
+}
+
+fn collect_all_subs_walk(node: Node, source: &[u8], out: &mut Vec<CompletionCandidate>) {
+    if node.kind() == "subroutine_declaration_statement"
+        || node.kind() == "method_declaration_statement"
+    {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            if let Ok(name) = name_node.utf8_text(source) {
+                let is_method = node.kind() == "method_declaration_statement";
+                out.push(CompletionCandidate {
+                    label: name.to_string(),
+                    kind: if is_method {
+                        SymbolKind::Method
+                    } else {
+                        SymbolKind::Function
+                    },
+                    detail: Some(
+                        if is_method { "method" } else { "sub" }.to_string(),
+                    ),
+                    insert_text: None,
+                    sort_priority: 10,
+                });
+            }
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_all_subs_walk(child, source, out);
+        }
+    }
+}
+
+fn collect_all_packages(node: Node, source: &[u8]) -> Vec<CompletionCandidate> {
+    let mut candidates = Vec::new();
+    collect_all_packages_walk(node, source, &mut candidates);
+    candidates
+}
+
+fn collect_all_packages_walk(node: Node, source: &[u8], out: &mut Vec<CompletionCandidate>) {
+    match node.kind() {
+        "package_statement" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(name) = name_node.utf8_text(source) {
+                    out.push(CompletionCandidate {
+                        label: name.to_string(),
+                        kind: SymbolKind::Package,
+                        detail: Some("package".to_string()),
+                        insert_text: None,
+                        sort_priority: 20,
+                    });
+                }
+            }
+        }
+        "class_statement" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(name) = name_node.utf8_text(source) {
+                    out.push(CompletionCandidate {
+                        label: name.to_string(),
+                        kind: SymbolKind::Class,
+                        detail: Some("class".to_string()),
+                        insert_text: None,
+                        sort_priority: 20,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_all_packages_walk(child, source, out);
+        }
+    }
+}
+
 // ---- Tests ----
 
 #[cfg(test)]
@@ -1777,6 +2214,121 @@ sub counter {
         let lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
         assert!(lines.contains(&0)); // declaration
         assert!(lines.contains(&2)); // heredoc body
+    }
+
+    // ---- Completion ----
+
+    fn labels(candidates: &[CompletionCandidate]) -> Vec<&str> {
+        candidates.iter().map(|c| c.label.as_str()).collect()
+    }
+
+    #[test]
+    fn test_complete_variables() {
+        let src = "my $x = 1;\nmy $y = 2;\n$";
+        let tree = parse(src);
+        // After $ on line 2
+        let items = collect_completions(&tree, src, Point::new(2, 1));
+        let l = labels(&items);
+        assert!(l.contains(&"$x"), "missing $x, got {:?}", l);
+        assert!(l.contains(&"$y"), "missing $y, got {:?}", l);
+    }
+
+    #[test]
+    fn test_complete_variables_scoped() {
+        let src = "\
+my $outer = 1;
+sub foo {
+    my $inner = 2;
+    $
+}";
+        let tree = parse(src);
+        // Inside sub body, both outer and inner should be visible
+        let items = collect_completions(&tree, src, Point::new(3, 5));
+        let l = labels(&items);
+        assert!(l.contains(&"$inner"), "missing $inner, got {:?}", l);
+        assert!(l.contains(&"$outer"), "missing $outer, got {:?}", l);
+    }
+
+    #[test]
+    fn test_complete_after_arrow() {
+        let src = r#"class Greeter {
+    method greet () { 1 }
+    method wave () { 2 }
+}
+my $g = Greeter->new();
+$g->"#;
+        let tree = parse(src);
+        let items = collect_completions(&tree, src, Point::new(5, 4));
+        let l = labels(&items);
+        assert!(l.contains(&"greet"), "missing greet, got {:?}", l);
+        assert!(l.contains(&"wave"), "missing wave, got {:?}", l);
+    }
+
+    #[test]
+    fn test_complete_subs() {
+        let src = "sub foo { 1 }\nsub bar { 2 }\n";
+        let tree = parse(src);
+        // General completion (no trigger character)
+        let items = collect_completions(&tree, src, Point::new(2, 0));
+        let l = labels(&items);
+        assert!(l.contains(&"foo"), "missing foo, got {:?}", l);
+        assert!(l.contains(&"bar"), "missing bar, got {:?}", l);
+    }
+
+    #[test]
+    fn test_complete_in_class() {
+        let src = r#"class Point {
+    field $x :param;
+    field $y :param;
+
+    method sum () {
+        $
+    }
+}"#;
+        let tree = parse(src);
+        // Inside method body, fields should be visible
+        let items = collect_completions(&tree, src, Point::new(5, 9));
+        let l = labels(&items);
+        assert!(l.contains(&"$x"), "missing $x, got {:?}", l);
+        assert!(l.contains(&"$y"), "missing $y, got {:?}", l);
+    }
+
+    #[test]
+    fn test_complete_cross_sigil() {
+        let src = "my @arr = (1,2);\nmy %hash = (a => 1);\n$";
+        let tree = parse(src);
+        let items = collect_completions(&tree, src, Point::new(2, 1));
+        let l = labels(&items);
+        // $arr[] for array element
+        assert!(l.contains(&"$arr[]"), "missing $arr[], got {:?}", l);
+        // $hash{} for hash element
+        assert!(l.contains(&"$hash{}"), "missing $hash{{}}, got {:?}", l);
+        // $#arr for last index
+        assert!(l.contains(&"$#arr"), "missing $#arr, got {:?}", l);
+    }
+
+    #[test]
+    fn test_complete_at_sigil_forms() {
+        let src = "my @arr = (1,2);\nmy %hash = (a => 1);\n@";
+        let tree = parse(src);
+        let items = collect_completions(&tree, src, Point::new(2, 1));
+        let l = labels(&items);
+        assert!(l.contains(&"@arr"), "missing @arr, got {:?}", l);
+        assert!(l.contains(&"@arr[]"), "missing @arr[] (slice), got {:?}", l);
+        assert!(l.contains(&"@hash{}"), "missing @hash{{}} (hash slice), got {:?}", l);
+        // Should NOT have @hash as a plain array
+        assert!(!l.contains(&"@hash"), "should not have plain @hash, got {:?}", l);
+    }
+
+    #[test]
+    fn test_complete_percent_sigil_forms() {
+        let src = "my @arr = (1,2);\nmy %hash = (a => 1);\n%";
+        let tree = parse(src);
+        let items = collect_completions(&tree, src, Point::new(2, 1));
+        let l = labels(&items);
+        assert!(l.contains(&"%hash"), "missing %hash, got {:?}", l);
+        assert!(l.contains(&"%hash{}"), "missing %hash{{}} (kv slice), got {:?}", l);
+        assert!(l.contains(&"%arr[]"), "missing %arr[] (array kv slice), got {:?}", l);
     }
 
     #[test]
