@@ -104,42 +104,27 @@ pub fn extract_symbols(tree: &Tree, source: &str) -> Vec<DocumentSymbol> {
 #[allow(deprecated)]
 fn collect_symbols(node: Node, source: &[u8], symbols: &mut Vec<DocumentSymbol>) {
     match node.kind() {
-        "subroutine_declaration_statement" => {
+        "subroutine_declaration_statement" | "method_declaration_statement" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 if let Ok(name) = name_node.utf8_text(source) {
+                    let is_method = node.kind() == "method_declaration_statement";
                     let mut children = Vec::new();
+                    collect_signature_params(node, source, &mut children);
                     if let Some(body) = node.child_by_field_name("body") {
                         collect_symbols(body, source, &mut children);
                     }
                     symbols.push(DocumentSymbol {
-                        name: format!("sub {}", name),
-                        detail: None,
-                        kind: SymbolKind::FUNCTION,
-                        tags: None,
-                        deprecated: None,
-                        range: node_to_range(node),
-                        selection_range: node_to_range(name_node),
-                        children: if children.is_empty() {
-                            None
+                        name: if is_method {
+                            format!("method {}", name)
                         } else {
-                            Some(children)
+                            format!("sub {}", name)
                         },
-                    });
-                    return;
-                }
-            }
-        }
-        "method_declaration_statement" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                if let Ok(name) = name_node.utf8_text(source) {
-                    let mut children = Vec::new();
-                    if let Some(body) = node.child_by_field_name("body") {
-                        collect_symbols(body, source, &mut children);
-                    }
-                    symbols.push(DocumentSymbol {
-                        name: format!("method {}", name),
                         detail: None,
-                        kind: SymbolKind::METHOD,
+                        kind: if is_method {
+                            SymbolKind::METHOD
+                        } else {
+                            SymbolKind::FUNCTION
+                        },
                         tags: None,
                         deprecated: None,
                         range: node_to_range(node),
@@ -258,6 +243,32 @@ fn collect_declared_vars<'a>(
     }
 }
 
+/// Collect signature parameters as Variable symbols.
+#[allow(deprecated)]
+fn collect_signature_params(sub_node: Node, source: &[u8], out: &mut Vec<DocumentSymbol>) {
+    for i in 0..sub_node.child_count() {
+        if let Some(sig) = sub_node.child(i) {
+            if sig.kind() == "signature" {
+                let mut vars = Vec::new();
+                collect_declared_vars(sig, source, &mut vars);
+                for (name, sel_node) in vars {
+                    out.push(DocumentSymbol {
+                        name,
+                        detail: Some("param".to_string()),
+                        kind: SymbolKind::VARIABLE,
+                        tags: None,
+                        deprecated: None,
+                        range: node_to_range(sig),
+                        selection_range: node_to_range(sel_node),
+                        children: None,
+                    });
+                }
+                break;
+            }
+        }
+    }
+}
+
 // ---- Go to definition ----
 
 pub fn find_definition(
@@ -321,6 +332,64 @@ fn find_variable_def_walk(
                     };
                     if should_replace {
                         *best = Some((node_to_range(var_node), scope_size));
+                    }
+                }
+            }
+        }
+    }
+
+    // sub foo ($x, @rest) { ... } — signature params are scoped to the body block.
+    if node.kind() == "subroutine_declaration_statement"
+        || node.kind() == "method_declaration_statement"
+    {
+        if let Some(body) = node.child_by_field_name("body") {
+            let body_end = body.end_position();
+            if body_end >= before_point {
+                for i in 0..node.child_count() {
+                    if let Some(sig) = node.child(i) {
+                        if sig.kind() == "signature" {
+                            if let Some(var_node) =
+                                find_var_in_subtree(sig, source, target_text)
+                            {
+                                if var_node.start_position() <= before_point {
+                                    let scope_size =
+                                        body_end.row - body.start_position().row;
+                                    let should_replace = match best {
+                                        Some((_, prev_size)) => scope_size <= *prev_size,
+                                        None => true,
+                                    };
+                                    if should_replace {
+                                        *best =
+                                            Some((node_to_range(var_node), scope_size));
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // for/foreach my $var (...) { ... } — variable: field is the loop variable,
+    // scoped to the for_statement's block.
+    if node.kind() == "for_statement" {
+        if let Some(var_node) = node.child_by_field_name("variable") {
+            if var_node.start_position() <= before_point {
+                if var_node.utf8_text(source).ok() == Some(target_text) {
+                    if let Some(block) = node.child_by_field_name("block") {
+                        let block_end = block.end_position();
+                        if block_end >= before_point {
+                            let scope_size = block_end.row - block.start_position().row;
+                            let should_replace = match best {
+                                Some((_, prev_size)) => scope_size <= *prev_size,
+                                None => true,
+                            };
+                            if should_replace {
+                                *best = Some((node_to_range(var_node), scope_size));
+                            }
+                        }
                     }
                 }
             }
@@ -616,6 +685,10 @@ pub fn rename(
     })
 }
 
+// TODO: consider handling `local $var` (localization_expression) as a declaration.
+// It doesn't create a new lexical variable — it temporarily saves/restores a global —
+// so it's unclear whether gd should resolve to it.
+
 // ---- Hover ----
 
 pub fn hover_info(tree: &Tree, source: &str, pos: Position) -> Option<Hover> {
@@ -804,6 +877,147 @@ sub new {
             _ => panic!("expected scalar"),
         };
         assert_eq!(loc.range.start.line, 1); // jumps to %args decl
+    }
+
+    #[test]
+    fn test_def_for_loop_variable() {
+        let src = "\
+for my $i (1..10) {
+    print $i;
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        // cursor on $i in print at L1:10
+        let resp = find_definition(&tree, src, Position::new(1, 11), &uri);
+        let loc = match resp.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc.range.start.line, 0); // jumps to $i in for
+    }
+
+    #[test]
+    fn test_def_for_loop_scoped() {
+        let src = "\
+my $i = 99;
+for my $i (1..10) {
+    print $i;
+}
+print $i;";
+        let tree = parse(src);
+        let uri = test_uri();
+        // $i inside loop body at L2 should resolve to for's $i at L1
+        let resp = find_definition(&tree, src, Position::new(2, 11), &uri);
+        let loc = match resp.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc.range.start.line, 1); // for loop's $i
+
+        // $i after loop at L4 should resolve to outer my $i at L0
+        let resp2 = find_definition(&tree, src, Position::new(4, 7), &uri);
+        let loc2 = match resp2.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc2.range.start.line, 0); // outer my $i
+    }
+
+    #[test]
+    fn test_refs_for_loop_scoped() {
+        let src = "\
+my $i = 99;
+for my $i (1..10) {
+    print $i;
+}
+print $i;";
+        let tree = parse(src);
+        let uri = test_uri();
+        // refs from $i inside loop
+        let refs = find_references(&tree, src, Position::new(2, 11), &uri);
+        let lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        assert!(lines.contains(&1));  // for decl
+        assert!(lines.contains(&2));  // loop body
+        assert!(!lines.contains(&0)); // outer my
+        assert!(!lines.contains(&4)); // after loop
+    }
+
+    // ---- Signatures ----
+
+    #[test]
+    fn test_def_signature_param() {
+        let src = "\
+sub foo ($x, $y) {
+    print $x;
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        // cursor on $x in print at L1:10
+        let resp = find_definition(&tree, src, Position::new(1, 11), &uri);
+        let loc = match resp.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc.range.start.line, 0); // $x in signature
+    }
+
+    #[test]
+    fn test_def_signature_vs_outer() {
+        let src = "\
+my $x = 99;
+sub foo ($x) {
+    print $x;
+}
+print $x;";
+        let tree = parse(src);
+        let uri = test_uri();
+        // $x inside sub body → signature param
+        let resp = find_definition(&tree, src, Position::new(2, 11), &uri);
+        let loc = match resp.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc.range.start.line, 1); // signature $x
+
+        // $x outside sub → outer my
+        let resp2 = find_definition(&tree, src, Position::new(4, 7), &uri);
+        let loc2 = match resp2.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc2.range.start.line, 0); // outer my $x
+    }
+
+    #[test]
+    fn test_refs_signature_param() {
+        let src = "\
+sub foo ($x, @rest) {
+    print $x;
+    return @rest;
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        // refs from $x in body
+        let refs = find_references(&tree, src, Position::new(1, 11), &uri);
+        let lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        assert!(lines.contains(&0)); // signature
+        assert!(lines.contains(&1)); // body usage
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn test_symbols_signature() {
+        let src = "sub foo ($x, $y = 10, @rest) { 1 }";
+        let tree = parse(src);
+        let syms = extract_symbols(&tree, src);
+        assert_eq!(syms.len(), 1);
+        let children = syms[0].children.as_ref().unwrap();
+        let names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"$x"));
+        assert!(names.contains(&"$y"));
+        assert!(names.contains(&"@rest"));
+        // params should have "param" detail
+        assert!(children.iter().all(|c| c.detail.as_deref() == Some("param")));
     }
 
     // ---- References ----
