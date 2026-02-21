@@ -14,6 +14,8 @@ sub new {
         history => [],
         verbose => $args{verbose} // 0,
     }, $class;
+    my @args;
+    $args[0];
     return $self;
 }
 

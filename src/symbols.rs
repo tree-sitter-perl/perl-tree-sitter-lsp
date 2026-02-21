@@ -456,8 +456,10 @@ fn collect_variable_refs(node: Node, source: &[u8], target: &str, refs: &mut Vec
         "scalar" | "array" | "hash" => {
             if node.utf8_text(source).ok() == Some(target) {
                 refs.push(node_to_range(node));
+                return;
             }
-            return;
+            // Don't return — dereference expressions like @{$hash{key}} parse as
+            // an array node wrapping a block with container_variable inside.
         }
         "container_variable" | "slice_container_variable" | "keyval_container_variable" => {
             if canonical_var_name(node, source).as_deref() == Some(target) {
@@ -575,32 +577,32 @@ pub fn rename(
     let source_bytes = source.as_bytes();
     let cursor_sym = symbol_at_cursor(tree, source_bytes, pos)?;
 
-    // For variables, the new name from the editor won't include the sigil,
-    // but our references include it. Preserve the original sigil.
     let refs = find_references(tree, source, pos, uri);
     if refs.is_empty() {
         return None;
     }
 
+    // Strip any sigil the user may have typed — we only rename the varname.
+    let bare_name = new_name.trim_start_matches(['$', '@', '%']);
+
     let edits: Vec<TextEdit> = refs
         .into_iter()
         .map(|loc| {
-            let new_text = match &cursor_sym {
-                CursorSymbol::Variable { text } => {
-                    // Keep the sigil from the original, replace the name part.
-                    let sigil = &text[..1]; // $, @, or %
-                    let replacement = if new_name.starts_with(|c| "$@%".contains(c)) {
-                        new_name.to_string()
-                    } else {
-                        format!("{}{}", sigil, new_name)
-                    };
-                    replacement
+            match &cursor_sym {
+                CursorSymbol::Variable { .. } => {
+                    // Only replace the varname, not the sigil. The sigil is
+                    // always the first character of the range.
+                    let mut range = loc.range;
+                    range.start.character += 1;
+                    TextEdit {
+                        range,
+                        new_text: bare_name.to_string(),
+                    }
                 }
-                _ => new_name.to_string(),
-            };
-            TextEdit {
-                range: loc.range,
-                new_text,
+                _ => TextEdit {
+                    range: loc.range,
+                    new_text: bare_name.to_string(),
+                },
             }
         })
         .collect();

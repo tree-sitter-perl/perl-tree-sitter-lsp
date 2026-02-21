@@ -29,8 +29,15 @@ impl LanguageServer for Backend {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(true),
+                        })),
+                        ..Default::default()
+                    },
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
@@ -66,6 +73,15 @@ impl LanguageServer for Backend {
         if let Some(change) = params.content_changes.into_iter().next() {
             if let Some(mut doc) = self.documents.get_mut(&uri) {
                 doc.update(change.text);
+            }
+        }
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        if let Some(text) = params.text {
+            let uri = params.text_document.uri;
+            if let Some(mut doc) = self.documents.get_mut(&uri) {
+                doc.update(text);
             }
         }
     }
