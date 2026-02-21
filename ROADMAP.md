@@ -4,9 +4,23 @@
 
 Single-file LSP with hand-rolled scope resolution. Supports:
 - documentSymbol, goto-definition, references, hover, rename
-- Scope-aware variable resolution (my, our, signatures, for-loops, class fields)
+- Scope-aware variable resolution (my, our, state, signatures, for-loops, class fields)
 - Core Perl `class` support (5.38+): class extraction, field/method symbols, type-inferred method go-to-def
 - Simple type inference: `my $obj = ClassName->new(...)` → method calls on `$obj` resolve to that class
+- Bareword invocants in method calls treated as class names (refs, rename work)
+- String interpolation, heredocs: variables inside `"$foo"` and `<<END` bodies tracked correctly (tree-sitter-perl handles this natively)
+- Completion: scope-aware (variables, subs, methods from current scope and class context)
+
+## Known issues to investigate
+
+### Reparse reliability
+
+Intermittent reports of go-to-definition failing on valid code until file is re-saved. Possible causes:
+- `didChange` with `TextDocumentSyncKind::FULL` should trigger full reparse, but incremental parse (`parser.parse(&new_text, Some(&self.tree))`) may behave oddly if the old tree doesn't match the new text
+- Race condition: rapid edits may cause tree/text desync if `did_change` fires while a previous parse is still running (though tree-sitter parsing is fast and synchronous)
+- Editor-specific: some editors batch changes or delay `didChange` notifications
+
+**Next steps**: Add debug logging around `did_change`/`did_save` to capture when parses happen and whether the tree is consistent. Consider always doing a fresh parse (pass `None` for old tree) as a safety net.
 
 ## Phase 1: Scopegraphs (prerequisite for multi-file)
 

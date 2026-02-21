@@ -135,6 +135,16 @@ pub fn symbol_at_cursor(tree: &Tree, source: &[u8], point: Point) -> Option<Curs
                             name: text.to_string(),
                         });
                     }
+                    // Bareword as invocant of method call → class name
+                    if parent.kind() == "method_call_expression" {
+                        if let Some(inv) = parent.child_by_field_name("invocant") {
+                            if inv.id() == node.id() {
+                                return Some(CursorSymbol::Package {
+                                    name: text.to_string(),
+                                });
+                            }
+                        }
+                    }
                 }
                 return Some(CursorSymbol::Function {
                     name: text.to_string(),
@@ -990,6 +1000,19 @@ fn collect_package_refs(node: Node, source: &[u8], target: &str, refs: &mut Vec<
         refs.push(node_to_span(node));
     }
 
+    // Bareword used as invocant of method call → class name reference
+    if node.kind() == "bareword" && node.utf8_text(source).ok() == Some(target) {
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "method_call_expression" {
+                if let Some(inv) = parent.child_by_field_name("invocant") {
+                    if inv.id() == node.id() {
+                        refs.push(node_to_span(node));
+                    }
+                }
+            }
+        }
+    }
+
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             collect_package_refs(child, source, target, refs);
@@ -1687,6 +1710,73 @@ for my $entry (@history) {
         assert_eq!(span.start.row, 51);
         let span2 = find_definition(&tree, src, Point::new(53, 15)).unwrap();
         assert_eq!(span2.start.row, 51);
+    }
+
+    // ---- Bareword invocant ----
+
+    #[test]
+    fn test_bareword_invocant_is_package() {
+        let src = "Calculator->new();";
+        let tree = parse(src);
+        // "Calculator" at col 0 is a bareword invocant → should be Package, not Function
+        let sym = symbol_at_cursor(&tree, src.as_bytes(), Point::new(0, 0));
+        assert!(matches!(sym, Some(CursorSymbol::Package { .. })));
+    }
+
+    #[test]
+    fn test_bareword_invocant_refs() {
+        let src = "\
+package Calculator;
+sub new { 1 }
+
+Calculator->new();";
+        let tree = parse(src);
+        // Refs from "Calculator" on line 3 → should find package decl and usage
+        let refs = find_references(&tree, src, Point::new(3, 0));
+        assert!(refs.len() >= 2);
+        let lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
+        assert!(lines.contains(&0)); // package Calculator
+        assert!(lines.contains(&3)); // Calculator->new()
+    }
+
+    // ---- Verify gap assumptions ----
+
+    #[test]
+    fn test_refs_string_interpolation() {
+        // Variables inside interpolated strings should be found by references
+        let src = r#"my $name = "World";
+print "Hello, $name!";
+print "Goodbye $name.";"#;
+        let tree = parse(src);
+        let refs = find_references(&tree, src, Point::new(0, 4));
+        let lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
+        assert!(lines.contains(&0)); // declaration
+        assert!(lines.contains(&1)); // "Hello, $name!"
+        assert!(lines.contains(&2)); // "Goodbye $name."
+    }
+
+    #[test]
+    fn test_def_state_variable() {
+        let src = "\
+sub counter {
+    state $count = 0;
+    $count++;
+    return $count;
+}";
+        let tree = parse(src);
+        // $count on line 2 → should resolve to state $count on line 1
+        let span = find_definition(&tree, src, Point::new(2, 5)).unwrap();
+        assert_eq!(span.start.row, 1);
+    }
+
+    #[test]
+    fn test_refs_heredoc() {
+        let src = "my $name = \"World\";\nmy $msg = <<END;\nHello $name!\nEND";
+        let tree = parse(src);
+        let refs = find_references(&tree, src, Point::new(0, 4));
+        let lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
+        assert!(lines.contains(&0)); // declaration
+        assert!(lines.contains(&2)); // heredoc body
     }
 
     #[test]
