@@ -427,7 +427,9 @@ pub fn find_definition(tree: &Tree, source: &str, point: Point) -> Option<Span> 
             let (_, sel_span) = find_sub_def(tree.root_node(), source_bytes, name)?;
             Some(sel_span)
         }
-        CursorSymbol::Package { .. } => None,
+        CursorSymbol::Package { ref name } => {
+            find_package_def(tree.root_node(), source_bytes, name)
+        }
     }
 }
 
@@ -842,6 +844,29 @@ fn find_method_in_block(block: Node, source: &[u8], method_name: &str) -> Option
                         return Some(node_to_span(name_node));
                     }
                 }
+            }
+        }
+    }
+    None
+}
+
+fn find_package_def(root: Node, source: &[u8], name: &str) -> Option<Span> {
+    find_package_def_walk(root, source, name)
+}
+
+fn find_package_def_walk(node: Node, source: &[u8], name: &str) -> Option<Span> {
+    if node.kind() == "package_statement" || node.kind() == "class_statement" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            if name_node.utf8_text(source).ok() == Some(name) {
+                return Some(node_to_span(name_node));
+            }
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if let Some(span) = find_package_def_walk(child, source, name) {
+                return Some(span);
             }
         }
     }
@@ -2173,6 +2198,31 @@ Calculator->new();";
         let lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
         assert!(lines.contains(&0)); // package Calculator
         assert!(lines.contains(&3)); // Calculator->new()
+    }
+
+    #[test]
+    fn test_def_package_from_invocant() {
+        let src = "\
+package Calculator;
+sub new { 1 }
+
+Calculator->new();";
+        let tree = parse(src);
+        // gd on "Calculator" bareword invocant → jumps to package declaration
+        let span = find_definition(&tree, src, Point::new(3, 0)).unwrap();
+        assert_eq!(span.start.row, 0);
+    }
+
+    #[test]
+    fn test_def_class_from_invocant() {
+        let src = r#"class Greeter {
+    method greet () { 1 }
+}
+Greeter->new();"#;
+        let tree = parse(src);
+        // gd on "Greeter" → jumps to class declaration
+        let span = find_definition(&tree, src, Point::new(3, 0)).unwrap();
+        assert_eq!(span.start.row, 0);
     }
 
     // ---- Verify gap assumptions ----
