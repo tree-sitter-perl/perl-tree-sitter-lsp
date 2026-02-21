@@ -18,6 +18,7 @@ fn node_to_span(node: Node) -> Span {
 pub enum CursorSymbol {
     Variable { text: String },
     Function { name: String },
+    Method { name: String, invocant: Option<String> },
     Package { name: String },
 }
 
@@ -50,6 +51,31 @@ pub struct RenameEdit {
     pub new_text: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClassInfo {
+    pub name: String,
+    pub span: Span,
+    pub parent: Option<String>,
+    pub roles: Vec<String>,
+    pub fields: Vec<FieldInfo>,
+    pub methods: Vec<MethodInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    pub name: String,
+    pub sigil: char,
+    pub span: Span,
+    pub attributes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    pub name: String,
+    pub span: Span,
+    pub selection_span: Span,
+}
+
 // ---- Symbol at cursor ----
 
 pub fn symbol_at_cursor(tree: &Tree, source: &[u8], point: Point) -> Option<CursorSymbol> {
@@ -69,10 +95,27 @@ pub fn symbol_at_cursor(tree: &Tree, source: &[u8], point: Point) -> Option<Curs
                 let canonical = canonical_var_name(node, source)?;
                 return Some(CursorSymbol::Variable { text: canonical });
             }
-            "function" | "method" => {
+            "function" => {
                 let text = node.utf8_text(source).ok()?;
                 return Some(CursorSymbol::Function {
                     name: text.to_string(),
+                });
+            }
+            "method" => {
+                let text = node.utf8_text(source).ok()?;
+                // Check if this is a method_call_expression to capture invocant
+                let invocant = node.parent().and_then(|p| {
+                    if p.kind() == "method_call_expression" {
+                        p.child_by_field_name("invocant")
+                            .and_then(|inv| inv.utf8_text(source).ok())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                });
+                return Some(CursorSymbol::Method {
+                    name: text.to_string(),
+                    invocant,
                 });
             }
             "package" => {
@@ -167,16 +210,27 @@ fn collect_symbols(node: Node, source: &[u8], symbols: &mut Vec<SymbolInfo>) {
         "class_statement" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 if let Ok(name) = name_node.utf8_text(source) {
+                    let mut children = Vec::new();
+                    // Collect fields and methods from the class block
+                    for i in 0..node.child_count() {
+                        if let Some(block) = node.child(i) {
+                            if block.kind() == "block" {
+                                collect_class_symbol_children(block, source, &mut children);
+                                break;
+                            }
+                        }
+                    }
                     symbols.push(SymbolInfo {
                         name: name.to_string(),
                         detail: Some("class".to_string()),
                         kind: SymbolKind::Class,
                         span: node_to_span(node),
                         selection_span: node_to_span(name_node),
-                        children: Vec::new(),
+                        children,
                     });
                 }
             }
+            return;
         }
         "variable_declaration" => {
             let keyword = get_decl_keyword(node, source).unwrap_or("my");
@@ -264,6 +318,55 @@ fn collect_signature_params(sub_node: Node, source: &[u8], out: &mut Vec<SymbolI
     }
 }
 
+fn collect_class_symbol_children(block: Node, source: &[u8], out: &mut Vec<SymbolInfo>) {
+    for i in 0..block.child_count() {
+        if let Some(child) = block.child(i) {
+            match child.kind() {
+                "expression_statement" => {
+                    // Field declarations: expression_statement > variable_declaration (field keyword)
+                    // or expression_statement > assignment_expression > variable_declaration
+                    if let Some(field_info) = try_parse_field(child, source) {
+                        let full_name = format!("{}{}", field_info.sigil, field_info.name);
+                        let detail = if field_info.attributes.is_empty() {
+                            "field".to_string()
+                        } else {
+                            format!("field :{}", field_info.attributes.join(" :"))
+                        };
+                        out.push(SymbolInfo {
+                            name: full_name,
+                            detail: Some(detail),
+                            kind: SymbolKind::Variable,
+                            span: field_info.span,
+                            selection_span: field_info.span,
+                            children: Vec::new(),
+                        });
+                    }
+                }
+                "method_declaration_statement" => {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        if let Ok(name) = name_node.utf8_text(source) {
+                            let mut children = Vec::new();
+                            collect_signature_params(child, source, &mut children);
+                            if let Some(body) = child.child_by_field_name("body") {
+                                collect_symbols(body, source, &mut children);
+                            }
+                            out.push(SymbolInfo {
+                                name: format!("method {}", name),
+                                detail: None,
+                                kind: SymbolKind::Method,
+                                span: node_to_span(child),
+                                selection_span: node_to_span(name_node),
+                                children,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 // ---- Go to definition ----
 
 pub fn find_definition(tree: &Tree, source: &str, point: Point) -> Option<Span> {
@@ -275,6 +378,26 @@ pub fn find_definition(tree: &Tree, source: &str, point: Point) -> Option<Span> 
             find_variable_def(tree.root_node(), source_bytes, text, point)
         }
         CursorSymbol::Function { ref name } => {
+            let (_, sel_span) = find_sub_def(tree.root_node(), source_bytes, name)?;
+            Some(sel_span)
+        }
+        CursorSymbol::Method { ref name, ref invocant } => {
+            // Try type-aware resolution: trace invocant to ClassName->new()
+            if let Some(inv_text) = invocant {
+                if let Some(class_name) =
+                    infer_variable_class(tree.root_node(), source_bytes, inv_text, point)
+                {
+                    if let Some(span) = find_method_in_class(
+                        tree.root_node(),
+                        source_bytes,
+                        &class_name,
+                        name,
+                    ) {
+                        return Some(span);
+                    }
+                }
+            }
+            // Fall back to file-wide sub/method name search
             let (_, sel_span) = find_sub_def(tree.root_node(), source_bytes, name)?;
             Some(sel_span)
         }
@@ -424,6 +547,281 @@ fn enclosing_scope(node: Node) -> Node {
     current
 }
 
+// ---- Class extraction ----
+
+pub fn extract_classes(tree: &Tree, source: &str) -> Vec<ClassInfo> {
+    let source_bytes = source.as_bytes();
+    let mut classes = Vec::new();
+    collect_classes(tree.root_node(), source_bytes, &mut classes);
+    classes
+}
+
+fn collect_classes(node: Node, source: &[u8], classes: &mut Vec<ClassInfo>) {
+    if node.kind() == "class_statement" {
+        if let Some(info) = parse_class_node(node, source) {
+            classes.push(info);
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_classes(child, source, classes);
+        }
+    }
+}
+
+fn parse_class_node(node: Node, source: &[u8]) -> Option<ClassInfo> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = name_node.utf8_text(source).ok()?.to_string();
+
+    let mut parent = None;
+    let mut roles = Vec::new();
+
+    // Parse :isa(X) and :does(Y) from the class attributes
+    if let Some(attrlist) = node.child_by_field_name("attributes") {
+        for i in 0..attrlist.named_child_count() {
+            if let Some(attr) = attrlist.named_child(i) {
+                if attr.kind() == "attribute" {
+                    let attr_name = attr
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok());
+                    let attr_value = attr
+                        .child_by_field_name("value")
+                        .and_then(|n| n.utf8_text(source).ok());
+                    match (attr_name, attr_value) {
+                        (Some("isa"), Some(val)) => parent = Some(val.to_string()),
+                        (Some("does"), Some(val)) => roles.push(val.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Find the class block and collect fields + methods
+    let mut fields = Vec::new();
+    let mut methods = Vec::new();
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.kind() == "block" {
+                collect_class_members(child, source, &mut fields, &mut methods);
+                break;
+            }
+        }
+    }
+
+    Some(ClassInfo {
+        name,
+        span: node_to_span(node),
+        parent,
+        roles,
+        fields,
+        methods,
+    })
+}
+
+fn collect_class_members(
+    block: Node,
+    source: &[u8],
+    fields: &mut Vec<FieldInfo>,
+    methods: &mut Vec<MethodInfo>,
+) {
+    for i in 0..block.child_count() {
+        if let Some(child) = block.child(i) {
+            match child.kind() {
+                "expression_statement" => {
+                    // field declarations appear as expression_statement > variable_declaration
+                    // or expression_statement > assignment_expression > variable_declaration
+                    if let Some(field_info) = try_parse_field(child, source) {
+                        fields.push(field_info);
+                    }
+                }
+                "method_declaration_statement" => {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        if let Ok(name) = name_node.utf8_text(source) {
+                            methods.push(MethodInfo {
+                                name: name.to_string(),
+                                span: node_to_span(child),
+                                selection_span: node_to_span(name_node),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn try_parse_field(expr_stmt: Node, source: &[u8]) -> Option<FieldInfo> {
+    // Look for variable_declaration with "field" keyword, either directly
+    // or inside an assignment_expression
+    for i in 0..expr_stmt.named_child_count() {
+        let child = expr_stmt.named_child(i)?;
+        let var_decl = if child.kind() == "variable_declaration" {
+            child
+        } else if child.kind() == "assignment_expression" {
+            child.child_by_field_name("left").filter(|n| n.kind() == "variable_declaration")?
+        } else {
+            continue;
+        };
+
+        // Check if keyword is "field"
+        let keyword = get_decl_keyword(var_decl, source)?;
+        if keyword != "field" {
+            return None;
+        }
+
+        let var_node = var_decl.child_by_field_name("variable")?;
+        let full_name = var_node.utf8_text(source).ok()?;
+        let sigil = full_name.chars().next()?;
+        let bare_name = full_name[1..].to_string();
+
+        let mut attributes = Vec::new();
+        if let Some(attrlist) = var_decl.child_by_field_name("attributes") {
+            for j in 0..attrlist.named_child_count() {
+                if let Some(attr) = attrlist.named_child(j) {
+                    if attr.kind() == "attribute" {
+                        if let Some(name_node) = attr.child_by_field_name("name") {
+                            if let Ok(attr_name) = name_node.utf8_text(source) {
+                                attributes.push(attr_name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return Some(FieldInfo {
+            name: bare_name,
+            sigil,
+            span: node_to_span(var_decl),
+            attributes,
+        });
+    }
+    None
+}
+
+// ---- Type inference (simple) ----
+
+/// Try to infer the class of a variable by tracing back to `ClassName->new(...)`.
+fn infer_variable_class<'a>(
+    root: Node<'a>,
+    source: &'a [u8],
+    var_text: &str,
+    before: Point,
+) -> Option<String> {
+    let mut result = None;
+    infer_variable_class_walk(root, source, var_text, before, &mut result);
+    result
+}
+
+fn infer_variable_class_walk(
+    node: Node,
+    source: &[u8],
+    var_text: &str,
+    before: Point,
+    result: &mut Option<String>,
+) {
+    // Look for: my $var = ClassName->new(...)
+    // AST: assignment_expression { left: variable_declaration, right: method_call_expression }
+    if node.kind() == "assignment_expression" {
+        if let Some(left) = node.child_by_field_name("left") {
+            if left.kind() == "variable_declaration" {
+                if decl_contains_variable(left, source, var_text).is_some() {
+                    if let Some(right) = node.child_by_field_name("right") {
+                        if let Some(class_name) = extract_constructor_class(right, source) {
+                            if node.start_position() <= before {
+                                *result = Some(class_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            infer_variable_class_walk(child, source, var_text, before, result);
+        }
+    }
+}
+
+/// Check if a node is `ClassName->new(...)` and return the class name.
+fn extract_constructor_class(node: Node, source: &[u8]) -> Option<String> {
+    if node.kind() != "method_call_expression" {
+        return None;
+    }
+    let method_node = node.child_by_field_name("method")?;
+    let method_name = method_node.utf8_text(source).ok()?;
+    if method_name != "new" {
+        return None;
+    }
+    let invocant = node.child_by_field_name("invocant")?;
+    // The invocant should be a package name (bareword/package node)
+    if invocant.kind() == "package" || invocant.kind() == "bareword" {
+        return invocant.utf8_text(source).ok().map(|s| s.to_string());
+    }
+    None
+}
+
+/// Find a method definition inside a specific class.
+fn find_method_in_class(
+    root: Node,
+    source: &[u8],
+    class_name: &str,
+    method_name: &str,
+) -> Option<Span> {
+    find_method_in_class_walk(root, source, class_name, method_name)
+}
+
+fn find_method_in_class_walk(
+    node: Node,
+    source: &[u8],
+    class_name: &str,
+    method_name: &str,
+) -> Option<Span> {
+    if node.kind() == "class_statement" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            if name_node.utf8_text(source).ok() == Some(class_name) {
+                // Search for method in this class's block
+                for i in 0..node.child_count() {
+                    if let Some(block) = node.child(i) {
+                        if block.kind() == "block" {
+                            return find_method_in_block(block, source, method_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if let Some(span) = find_method_in_class_walk(child, source, class_name, method_name) {
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
+fn find_method_in_block(block: Node, source: &[u8], method_name: &str) -> Option<Span> {
+    for i in 0..block.child_count() {
+        if let Some(child) = block.child(i) {
+            if child.kind() == "method_declaration_statement" {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    if name_node.utf8_text(source).ok() == Some(method_name) {
+                        return Some(node_to_span(name_node));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn find_sub_def(root: Node, source: &[u8], name: &str) -> Option<(Span, Span)> {
     find_sub_def_walk(root, source, name)
 }
@@ -479,7 +877,7 @@ pub fn find_references(tree: &Tree, source: &str, point: Point) -> Vec<Span> {
                 }
             }
         }
-        CursorSymbol::Function { ref name } => {
+        CursorSymbol::Function { ref name } | CursorSymbol::Method { ref name, .. } => {
             collect_function_refs(tree.root_node(), source_bytes, name, &mut spans);
         }
         CursorSymbol::Package { ref name } => {
@@ -654,6 +1052,37 @@ pub fn hover_info(tree: &Tree, source: &str, point: Point) -> Option<HoverResult
             }
         }
         CursorSymbol::Function { ref name } => {
+            if let Some((full_span, _)) = find_sub_def(tree.root_node(), source_bytes, name) {
+                let line = source.lines().nth(full_span.start.row).unwrap_or("");
+                format!("```perl\n{}\n```", line.trim())
+            } else {
+                format!("`{}`", name)
+            }
+        }
+        CursorSymbol::Method { ref name, ref invocant } => {
+            // Try type-aware: resolve invocant class, find method in class
+            if let Some(inv_text) = invocant {
+                if let Some(class_name) =
+                    infer_variable_class(tree.root_node(), source_bytes, inv_text, point)
+                {
+                    if let Some(span) = find_method_in_class(
+                        tree.root_node(),
+                        source_bytes,
+                        &class_name,
+                        name,
+                    ) {
+                        let line = source.lines().nth(span.start.row).unwrap_or("");
+                        return Some(HoverResult {
+                            markdown: format!(
+                                "**{}**\n```perl\n{}\n```",
+                                class_name,
+                                line.trim()
+                            ),
+                        });
+                    }
+                }
+            }
+            // Fall back to file-wide sub/method search
             if let Some((full_span, _)) = find_sub_def(tree.root_node(), source_bytes, name) {
                 let line = source.lines().nth(full_span.start.row).unwrap_or("");
                 format!("```perl\n{}\n```", line.trim())
@@ -1066,5 +1495,216 @@ sub foo {
         let tree = parse(src);
         let result = hover_info(&tree, src, Point::new(0, 8)).unwrap();
         assert!(result.markdown.contains("Foo"));
+    }
+
+    // ---- Class support ----
+
+    fn class_src() -> &'static str {
+        r#"class Point :isa(Base) :does(Printable) {
+    field $x :param :reader;
+    field $y :param;
+    field $label = "point";
+
+    method magnitude () {
+        return sqrt($x**2 + $y**2);
+    }
+
+    method to_string () {
+        return "$label: ($x, $y)";
+    }
+}"#
+    }
+
+    #[test]
+    fn test_class_extract() {
+        let src = class_src();
+        let tree = parse(src);
+        let classes = extract_classes(&tree, src);
+        assert_eq!(classes.len(), 1);
+        let c = &classes[0];
+        assert_eq!(c.name, "Point");
+        assert_eq!(c.parent.as_deref(), Some("Base"));
+        assert_eq!(c.roles, vec!["Printable"]);
+        assert_eq!(c.fields.len(), 3);
+        assert_eq!(c.fields[0].name, "x");
+        assert_eq!(c.fields[0].sigil, '$');
+        assert!(c.fields[0].attributes.contains(&"param".to_string()));
+        assert!(c.fields[0].attributes.contains(&"reader".to_string()));
+        assert_eq!(c.fields[1].name, "y");
+        assert!(c.fields[1].attributes.contains(&"param".to_string()));
+        assert_eq!(c.fields[2].name, "label");
+        assert!(c.fields[2].attributes.is_empty());
+        assert_eq!(c.methods.len(), 2);
+        assert_eq!(c.methods[0].name, "magnitude");
+        assert_eq!(c.methods[1].name, "to_string");
+    }
+
+    #[test]
+    fn test_class_symbols() {
+        let src = class_src();
+        let tree = parse(src);
+        let syms = extract_symbols(&tree, src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Point");
+        assert_eq!(syms[0].kind, SymbolKind::Class);
+
+        let children = &syms[0].children;
+        let names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"$x"));
+        assert!(names.contains(&"$y"));
+        assert!(names.contains(&"$label"));
+        assert!(names.contains(&"method magnitude"));
+        assert!(names.contains(&"method to_string"));
+
+        // Fields should have "field" in their detail
+        let field_x = children.iter().find(|c| c.name == "$x").unwrap();
+        assert!(field_x.detail.as_ref().unwrap().starts_with("field"));
+    }
+
+    #[test]
+    fn test_field_def() {
+        // field $x is scoped to the class block, so $x inside method body should resolve to it
+        let src = r#"class Point {
+    field $x :param;
+
+    method get_x () {
+        return $x;
+    }
+}"#;
+        let tree = parse(src);
+        // $x on line 4, col 15 → should resolve to field $x on line 1
+        let span = find_definition(&tree, src, Point::new(4, 15)).unwrap();
+        assert_eq!(span.start.row, 1);
+    }
+
+    #[test]
+    fn test_field_refs() {
+        let src = r#"class Point {
+    field $x :param;
+
+    method get_x () {
+        return $x;
+    }
+
+    method set_x ($val) {
+        $x = $val;
+    }
+}"#;
+        let tree = parse(src);
+        // References from field $x (line 1)
+        let refs = find_references(&tree, src, Point::new(1, 11));
+        let lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
+        assert!(lines.contains(&1)); // declaration
+        assert!(lines.contains(&4)); // return $x
+        assert!(lines.contains(&8)); // $x = $val
+    }
+
+    #[test]
+    fn test_method_def_in_class() {
+        let src = r#"class Greeter {
+    field $name :param;
+
+    method greet () {
+        return "Hello, $name!";
+    }
+}
+
+my $g = Greeter->new(name => "World");
+$g->greet();"#;
+        let tree = parse(src);
+        // Cursor on "greet" in $g->greet() (line 9, col 4)
+        let span = find_definition(&tree, src, Point::new(9, 4)).unwrap();
+        // Should resolve to method greet on line 3
+        assert_eq!(span.start.row, 3);
+    }
+
+    #[test]
+    fn test_method_def_fallback() {
+        // When type can't be inferred, fall back to file-wide search
+        let src = r#"class Foo {
+    method bar () {
+        return 1;
+    }
+}
+
+sub bar { 2 }
+$unknown->bar();"#;
+        let tree = parse(src);
+        // $unknown has no known type, so bar should resolve to sub bar (line 6)
+        // since find_sub_def searches both sub and method declarations
+        let span = find_definition(&tree, src, Point::new(7, 11)).unwrap();
+        // Could resolve to either the method (line 1) or the sub (line 6)
+        // find_sub_def walks in order, so it finds method first
+        assert!(span.start.row == 1 || span.start.row == 6);
+    }
+
+    #[test]
+    fn test_def_for_loop_list_var() {
+        let src = "\
+my @history = (1, 2, 3);
+for my $entry (@history) {
+    print $entry;
+}";
+        let tree = parse(src);
+        // @history on line 1 inside for list → should resolve to my @history on line 0
+        let span = find_definition(&tree, src, Point::new(1, 16)).unwrap();
+        assert_eq!(span.start.row, 0);
+    }
+
+    #[test]
+    fn test_def_for_loop_list_var_in_context() {
+        // Reproduces the sample.pl scenario: @history after package main
+        let src = "\
+package Calculator;
+
+sub get_history {
+    my ($self) = @_;
+    return @{$self->{history}};
+}
+
+package main;
+
+my $calc = Calculator->new(verbose => 1);
+my @history = $calc->get_history();
+
+for my $entry (@history) {
+    print $entry;
+}";
+        let tree = parse(src);
+        // @history on line 12 col 16 → should resolve to my @history on line 10
+        let span = find_definition(&tree, src, Point::new(12, 16)).unwrap();
+        assert_eq!(span.start.row, 10);
+    }
+
+    #[test]
+    fn test_def_for_loop_list_var_exact_sample() {
+        let src = include_str!("../test_files/sample.pl");
+        let tree = parse(src);
+        // Line 54 (1-indexed) = row 53: for my $entry (@history) {
+        // Line 52 (1-indexed) = row 51: my @history = $calc->get_history();
+        // @history starts at col 15 (@), col 16 (h)
+        let span = find_definition(&tree, src, Point::new(53, 16)).unwrap();
+        assert_eq!(span.start.row, 51);
+        let span2 = find_definition(&tree, src, Point::new(53, 15)).unwrap();
+        assert_eq!(span2.start.row, 51);
+    }
+
+    #[test]
+    fn test_hover_method_call() {
+        let src = r#"class Greeter {
+    field $name :param;
+
+    method greet () {
+        return "Hello, $name!";
+    }
+}
+
+my $g = Greeter->new(name => "World");
+$g->greet();"#;
+        let tree = parse(src);
+        // Hover on "greet" in $g->greet()
+        let result = hover_info(&tree, src, Point::new(9, 4)).unwrap();
+        assert!(result.markdown.contains("Greeter"));
+        assert!(result.markdown.contains("method greet"));
     }
 }

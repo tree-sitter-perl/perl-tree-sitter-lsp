@@ -59,3 +59,25 @@ print "Pi is approximately $pi\n";
 print "Version: $version\n";
 
 1;
+
+# ---- Core class (Perl 5.38+) ----
+
+use v5.38;
+
+class Point :isa(Base) :does(Printable) {
+    field $x :param :reader;
+    field $y :param;
+    field $label = "point";
+
+    method magnitude () {
+        return sqrt($x**2 + $y**2);
+    }
+
+    method to_string () {
+        return "$label: ($x, $y)";
+    }
+}
+
+my $p = Point->new(x => 3, y => 4);
+my $mag = $p->magnitude();
+print $p->to_string();
