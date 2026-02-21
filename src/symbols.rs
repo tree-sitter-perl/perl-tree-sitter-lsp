@@ -654,3 +654,354 @@ pub fn hover_info(tree: &Tree, source: &str, pos: Position) -> Option<Hover> {
         range: None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_perl::LANGUAGE.into())
+            .unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    fn test_uri() -> Url {
+        Url::parse("file:///test.pl").unwrap()
+    }
+
+    // ---- Document symbols ----
+
+    #[test]
+    fn test_symbols_sub() {
+        let src = "sub foo { 1 }";
+        let tree = parse(src);
+        let syms = extract_symbols(&tree, src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "sub foo");
+        assert_eq!(syms[0].kind, SymbolKind::FUNCTION);
+    }
+
+    #[test]
+    fn test_symbols_package() {
+        let src = "package Foo;";
+        let tree = parse(src);
+        let syms = extract_symbols(&tree, src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].kind, SymbolKind::NAMESPACE);
+    }
+
+    #[test]
+    fn test_symbols_variables() {
+        let src = "my $x = 1;\nour @list;";
+        let tree = parse(src);
+        let syms = extract_symbols(&tree, src);
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "$x");
+        assert_eq!(syms[0].kind, SymbolKind::VARIABLE);
+        assert_eq!(syms[0].detail.as_deref(), Some("my"));
+        assert_eq!(syms[1].name, "@list");
+        assert_eq!(syms[1].detail.as_deref(), Some("our"));
+    }
+
+    #[test]
+    fn test_symbols_use() {
+        let src = "use Carp;";
+        let tree = parse(src);
+        let syms = extract_symbols(&tree, src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "use Carp");
+        assert_eq!(syms[0].kind, SymbolKind::MODULE);
+    }
+
+    #[test]
+    fn test_symbols_nested() {
+        let src = "sub foo {\n    my $x = 1;\n}";
+        let tree = parse(src);
+        let syms = extract_symbols(&tree, src);
+        assert_eq!(syms.len(), 1);
+        let children = syms[0].children.as_ref().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "$x");
+    }
+
+    #[test]
+    fn test_symbols_paren_list() {
+        let src = "sub foo {\n    my ($x, %h) = @_;\n}";
+        let tree = parse(src);
+        let syms = extract_symbols(&tree, src);
+        let children = syms[0].children.as_ref().unwrap();
+        let names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"$x"));
+        assert!(names.contains(&"%h"));
+    }
+
+    // ---- Go to definition ----
+
+    #[test]
+    fn test_def_variable() {
+        let src = "my $x = 1;\nprint $x;";
+        let tree = parse(src);
+        let uri = test_uri();
+        // cursor on $x in print at L1:6
+        let resp = find_definition(&tree, src, Position::new(1, 7), &uri);
+        let loc = match resp.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc.range.start.line, 0); // jumps to L0 declaration
+    }
+
+    #[test]
+    fn test_def_scoped() {
+        let src = "\
+my $x = 1;
+sub foo {
+    my $x = 2;
+    print $x;
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        // cursor on $x in print at L3:10
+        let resp = find_definition(&tree, src, Position::new(3, 11), &uri);
+        let loc = match resp.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc.range.start.line, 2); // inner my $x at L2, not L0
+    }
+
+    #[test]
+    fn test_def_sub() {
+        let src = "sub add { 1 }\nadd();";
+        let tree = parse(src);
+        let uri = test_uri();
+        // cursor on add() call at L1:0
+        let resp = find_definition(&tree, src, Position::new(1, 0), &uri);
+        let loc = match resp.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc.range.start.line, 0);
+    }
+
+    #[test]
+    fn test_def_container_variable() {
+        let src = "\
+sub new {
+    my (%args) = @_;
+    return $args{verbose};
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        // cursor on $args in $args{verbose} at L2:11
+        let resp = find_definition(&tree, src, Position::new(2, 12), &uri);
+        let loc = match resp.unwrap() {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            _ => panic!("expected scalar"),
+        };
+        assert_eq!(loc.range.start.line, 1); // jumps to %args decl
+    }
+
+    // ---- References ----
+
+    #[test]
+    fn test_refs_variable_scoped() {
+        let src = "\
+sub add {
+    my $result = 1;
+    return $result;
+}
+sub sub2 {
+    my $result = 2;
+    return $result;
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        // refs from $result in add (L1:8)
+        let refs = find_references(&tree, src, Position::new(1, 8), &uri);
+        let lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        assert!(lines.contains(&1));
+        assert!(lines.contains(&2));
+        assert!(!lines.contains(&5)); // sub2's $result
+        assert!(!lines.contains(&6));
+    }
+
+    #[test]
+    fn test_refs_container_variable() {
+        let src = "\
+sub foo {
+    my (%opts) = @_;
+    print $opts{name};
+    return %opts;
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        // refs from %opts decl at L1:8
+        let refs = find_references(&tree, src, Position::new(1, 9), &uri);
+        let lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        assert!(lines.contains(&1)); // declaration
+        assert!(lines.contains(&2)); // $opts{name}
+        assert!(lines.contains(&3)); // %opts return
+    }
+
+    #[test]
+    fn test_refs_deref() {
+        let src = "\
+sub foo {
+    my (%hash) = @_;
+    my @vals = @{$hash{keys}};
+    return %hash;
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        let refs = find_references(&tree, src, Position::new(1, 9), &uri);
+        let lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        assert!(lines.contains(&1)); // declaration
+        assert!(lines.contains(&2)); // @{$hash{keys}}
+        assert!(lines.contains(&3)); // %hash return
+    }
+
+    #[test]
+    fn test_refs_function() {
+        let src = "sub add { 1 }\nmy $x = add();";
+        let tree = parse(src);
+        let uri = test_uri();
+        let refs = find_references(&tree, src, Position::new(0, 4), &uri);
+        let lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        assert!(lines.contains(&0)); // declaration
+        assert!(lines.contains(&1)); // call
+    }
+
+    #[test]
+    fn test_refs_package() {
+        let src = "package Foo;\nFoo->new();";
+        let tree = parse(src);
+        let uri = test_uri();
+        let refs = find_references(&tree, src, Position::new(0, 8), &uri);
+        assert!(refs.len() >= 1); // at least the declaration
+    }
+
+    // ---- Rename ----
+
+    #[test]
+    fn test_rename_variable() {
+        let src = "\
+sub foo {
+    my $result = 1;
+    return $result;
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        let edit = rename(&tree, src, Position::new(1, 8), &uri, "output").unwrap();
+        let edits = &edit.changes.unwrap()[&uri];
+        // All edits should replace "result" (not "$result")
+        assert!(edits.iter().all(|e| e.new_text == "output"));
+        // Sigil columns should be skipped (start.character should be 1 past the ref start)
+        for e in edits {
+            let orig_line = src.lines().nth(e.range.start.line as usize).unwrap();
+            let before_edit = &orig_line[..e.range.start.character as usize];
+            let last_char = before_edit.chars().last().unwrap();
+            assert_eq!(last_char, '$');
+        }
+    }
+
+    #[test]
+    fn test_rename_strips_sigil() {
+        let src = "my $x = 1;\nprint $x;";
+        let tree = parse(src);
+        let uri = test_uri();
+        let edit = rename(&tree, src, Position::new(0, 4), &uri, "$y").unwrap();
+        let edits = &edit.changes.unwrap()[&uri];
+        assert!(edits.iter().all(|e| e.new_text == "y"));
+    }
+
+    #[test]
+    fn test_rename_container() {
+        let src = "\
+sub foo {
+    my (%opts) = @_;
+    print $opts{name};
+    return %opts;
+}";
+        let tree = parse(src);
+        let uri = test_uri();
+        let edit = rename(&tree, src, Position::new(1, 9), &uri, "config").unwrap();
+        let edits = &edit.changes.unwrap()[&uri];
+        assert!(edits.iter().all(|e| e.new_text == "config"));
+
+        // Apply edits and verify sigils are preserved
+        let mut result = src.to_string();
+        let mut sorted: Vec<_> = edits.clone();
+        sorted.sort_by(|a, b| {
+            b.range.start.line.cmp(&a.range.start.line)
+                .then(b.range.start.character.cmp(&a.range.start.character))
+        });
+        for e in &sorted {
+            let lines: Vec<&str> = result.split('\n').collect();
+            let line = lines[e.range.start.line as usize];
+            let new_line = format!(
+                "{}{}{}",
+                &line[..e.range.start.character as usize],
+                e.new_text,
+                &line[e.range.end.character as usize..]
+            );
+            let mut new_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            new_lines[e.range.start.line as usize] = new_line;
+            result = new_lines.join("\n");
+        }
+        assert!(result.contains("%config"));       // declaration
+        assert!(result.contains("$config{name}"));  // container access
+        assert!(result.contains("return %config")); // plain hash ref
+        assert!(!result.contains("%config{"));       // no wrong sigil on access
+    }
+
+    #[test]
+    fn test_rename_function() {
+        let src = "sub add { 1 }\nadd();";
+        let tree = parse(src);
+        let uri = test_uri();
+        let edit = rename(&tree, src, Position::new(0, 4), &uri, "sum").unwrap();
+        let edits = &edit.changes.unwrap()[&uri];
+        assert!(edits.iter().all(|e| e.new_text == "sum"));
+        assert_eq!(edits.len(), 2);
+    }
+
+    // ---- Hover ----
+
+    #[test]
+    fn test_hover_variable() {
+        let src = "my $x = 42;\nprint $x;";
+        let tree = parse(src);
+        let hover = hover_info(&tree, src, Position::new(1, 7)).unwrap();
+        match hover.contents {
+            HoverContents::Markup(m) => assert!(m.value.contains("my $x = 42")),
+            _ => panic!("expected markup"),
+        }
+    }
+
+    #[test]
+    fn test_hover_function() {
+        let src = "sub greet { print 'hi' }\ngreet();";
+        let tree = parse(src);
+        let hover = hover_info(&tree, src, Position::new(1, 0)).unwrap();
+        match hover.contents {
+            HoverContents::Markup(m) => assert!(m.value.contains("sub greet")),
+            _ => panic!("expected markup"),
+        }
+    }
+
+    #[test]
+    fn test_hover_package() {
+        let src = "package Foo;";
+        let tree = parse(src);
+        let hover = hover_info(&tree, src, Position::new(0, 8)).unwrap();
+        match hover.contents {
+            HoverContents::Markup(m) => assert!(m.value.contains("Foo")),
+            _ => panic!("expected markup"),
+        }
+    }
+}
