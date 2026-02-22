@@ -152,3 +152,148 @@ pub fn hover_info(tree: &Tree, source: &str, pos: Position) -> Option<Hover> {
         range: None,
     })
 }
+
+pub fn document_highlights(tree: &Tree, source: &str, pos: Position) -> Vec<DocumentHighlight> {
+    analysis::document_highlights(tree, source, position_to_point(pos))
+        .into_iter()
+        .map(|h| DocumentHighlight {
+            range: span_to_range(h.span),
+            kind: Some(match h.kind {
+                analysis::HighlightKind::Write => DocumentHighlightKind::WRITE,
+                analysis::HighlightKind::Read => DocumentHighlightKind::READ,
+            }),
+        })
+        .collect()
+}
+
+pub fn selection_ranges(tree: &Tree, pos: Position) -> SelectionRange {
+    let spans = analysis::selection_ranges(tree, position_to_point(pos));
+    // Build linked list from innermost to outermost
+    let mut result: Option<SelectionRange> = None;
+    for span in spans.into_iter().rev() {
+        result = Some(SelectionRange {
+            range: span_to_range(span),
+            parent: result.map(Box::new),
+        });
+    }
+    result.unwrap_or(SelectionRange {
+        range: Range::default(),
+        parent: None,
+    })
+}
+
+pub fn folding_ranges(tree: &Tree, source: &str) -> Vec<FoldingRange> {
+    analysis::folding_ranges(tree, source)
+        .into_iter()
+        .map(|f| FoldingRange {
+            start_line: f.start_line as u32,
+            start_character: None,
+            end_line: f.end_line as u32,
+            end_character: None,
+            kind: Some(match f.kind {
+                analysis::FoldKind::Region => FoldingRangeKind::Region,
+                analysis::FoldKind::Comment => FoldingRangeKind::Comment,
+            }),
+            collapsed_text: None,
+        })
+        .collect()
+}
+
+// ---- Semantic tokens ----
+
+// Legend indices — must match the order in SEMANTIC_TOKEN_TYPES / SEMANTIC_TOKEN_MODIFIERS
+pub const TOKEN_TYPE_VARIABLE: u32 = 0;
+
+pub const TOKEN_MOD_DECLARATION: u32 = 0; // bit 0
+pub const TOKEN_MOD_READONLY: u32 = 1;    // bit 1
+pub const TOKEN_MOD_MODIFICATION: u32 = 2; // bit 2
+pub const TOKEN_MOD_SCALAR: u32 = 3;       // bit 3
+pub const TOKEN_MOD_ARRAY: u32 = 4;        // bit 4
+pub const TOKEN_MOD_HASH: u32 = 5;         // bit 5
+
+pub fn semantic_token_types() -> Vec<SemanticTokenType> {
+    vec![SemanticTokenType::VARIABLE]
+}
+
+pub fn semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
+    vec![
+        SemanticTokenModifier::DECLARATION,
+        SemanticTokenModifier::READONLY,
+        SemanticTokenModifier::MODIFICATION,
+        SemanticTokenModifier::new("scalar"),
+        SemanticTokenModifier::new("array"),
+        SemanticTokenModifier::new("hash"),
+    ]
+}
+
+pub fn semantic_tokens(tree: &Tree, source: &str) -> Vec<SemanticToken> {
+    let var_tokens = analysis::collect_semantic_tokens(tree, source);
+
+    let mut result = Vec::new();
+    let mut prev_line: u32 = 0;
+    let mut prev_start: u32 = 0;
+
+    for vt in &var_tokens {
+        let line = vt.span.start.row as u32;
+        let start = vt.span.start.column as u32;
+        let length = if vt.span.start.row == vt.span.end.row {
+            vt.span.end.column as u32 - start
+        } else {
+            1 // multi-line token, shouldn't happen for variables
+        };
+
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 {
+            start - prev_start
+        } else {
+            start
+        };
+
+        let mut modifiers: u32 = 0;
+        if vt.is_declaration {
+            modifiers |= 1 << TOKEN_MOD_DECLARATION;
+        }
+        if vt.is_readonly {
+            modifiers |= 1 << TOKEN_MOD_READONLY;
+        }
+        if vt.is_modification {
+            modifiers |= 1 << TOKEN_MOD_MODIFICATION;
+        }
+        match vt.var_type {
+            analysis::VarModifier::Scalar => modifiers |= 1 << TOKEN_MOD_SCALAR,
+            analysis::VarModifier::Array => modifiers |= 1 << TOKEN_MOD_ARRAY,
+            analysis::VarModifier::Hash => modifiers |= 1 << TOKEN_MOD_HASH,
+        }
+
+        result.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length,
+            token_type: TOKEN_TYPE_VARIABLE,
+            token_modifiers_bitset: modifiers,
+        });
+
+        prev_line = line;
+        prev_start = start;
+    }
+
+    result
+}
+
+// ---- Diagnostics ----
+
+pub fn collect_diagnostics(tree: &Tree, source: &str) -> Vec<Diagnostic> {
+    analysis::collect_diagnostics(tree, source)
+        .into_iter()
+        .map(|d| Diagnostic {
+            range: span_to_range(d.span),
+            severity: Some(match d.severity {
+                analysis::DiagnosticSeverity::Error => tower_lsp::lsp_types::DiagnosticSeverity::ERROR,
+                analysis::DiagnosticSeverity::Warning => tower_lsp::lsp_types::DiagnosticSeverity::WARNING,
+            }),
+            source: Some("perl-lsp".to_string()),
+            message: d.message,
+            ..Default::default()
+        })
+        .collect()
+}

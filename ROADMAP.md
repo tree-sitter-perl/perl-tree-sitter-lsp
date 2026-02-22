@@ -3,13 +3,14 @@
 ## Current state
 
 Single-file LSP with hand-rolled scope resolution. Supports:
-- documentSymbol, goto-definition, references, hover, rename
+- documentSymbol, goto-definition, references, hover, rename, completion
+- documentHighlight (read/write), selectionRange, foldingRange, formatting (perltidy)
 - Scope-aware variable resolution (my, our, state, signatures, for-loops, class fields)
 - Core Perl `class` support (5.38+): class extraction, field/method symbols, type-inferred method go-to-def
 - Simple type inference: `my $obj = ClassName->new(...)` → method calls on `$obj` resolve to that class
-- Bareword invocants in method calls treated as class names (refs, rename work)
+- Bareword invocants in method calls treated as class names (gd, refs, rename work)
 - String interpolation, heredocs: variables inside `"$foo"` and `<<END` bodies tracked correctly (tree-sitter-perl handles this natively)
-- Completion: scope-aware (variables, subs, methods from current scope and class context)
+- Completion: scope-aware (variables with cross-sigil forms, subs, methods from current scope and class context)
 
 ## Known issues to investigate
 
@@ -22,6 +23,19 @@ Intermittent reports of go-to-definition failing on valid code until file is re-
 
 **Next steps**: Add debug logging around `did_change`/`did_save` to capture when parses happen and whether the tree is consistent. Consider always doing a fresh parse (pass `None` for old tree) as a safety net.
 
+## Next up: Remaining single-file features
+
+### Signature Help
+`textDocument/signatureHelp` — show parameter hints on `(` and `,`. Parse from sub signatures (`sub foo ($x, $y)`) or `@_` unpacking patterns (`my ($self, $name) = @_;`). Medium effort but high value.
+
+## Deferred: Syntax diagnostics
+
+Tree-sitter error recovery in tree-sitter-perl is unreliable for real-time syntax diagnostics. The grammar is heavily external-scanner-driven with aggressive `term` rules that cause most partial/broken code to collapse into unhelpful error nodes rather than producing useful MISSING markers. Practical syntax diagnostics will likely require:
+- Upstream parser improvements (better error recovery in the external scanner)
+- Or running `perl -c` / `perlcritic` as an external process (like PLS and Perl Navigator do)
+
+Revisit after scopegraphs, or whenever tree-sitter-perl error recovery improves. Note: semantic diagnostics (like readonly field writes) are separate and don't depend on parser error recovery.
+
 ## Phase 1: Scopegraphs (prerequisite for multi-file)
 
 Replace the hand-rolled scope walking (`find_variable_def_walk`, `enclosing_scope`, per-construct special cases) with the [scopegraphs](https://docs.rs/scopegraphs) crate.
@@ -32,6 +46,7 @@ Replace the hand-rolled scope walking (`find_variable_def_walk`, `enclosing_scop
 - Build a scope graph from the tree-sitter CST: one scope node per block/sub/class/package, edges for declarations and references
 - `find_definition` becomes a graph query instead of a tree walk
 - Cross-file: scope graphs from different files connect via import/export edges
+- Selection range improves — scopes become first-class expansion levels instead of raw tree-sitter nodes
 
 **Scoping constructs to encode**:
 - `my`/`our`/`local`/`state` → lexical scope = enclosing block

@@ -2,7 +2,7 @@ use tree_sitter::{Node, Point, Tree};
 
 // ---- Types ----
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start: Point,
     pub end: Point,
@@ -20,6 +20,23 @@ pub enum CursorSymbol {
     Function { name: String },
     Method { name: String, invocant: Option<String> },
     Package { name: String },
+    HashKey { key_name: String, owner: HashKeyOwner },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum HashKeyOwner {
+    /// Keys belong to a class namespace (e.g. Calculator, Point)
+    Class(String),
+    /// Keys belong to a plain hash variable in a specific scope
+    Variable { name: String, def_span: Span },
+}
+
+pub struct HashKeyInfo {
+    pub key_name: String,
+    pub owner: HashKeyOwner,
+    pub span: Span,
+    pub is_dynamic: bool,
+    pub source_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +106,7 @@ pub struct CompletionCandidate {
 enum CompletionMode {
     Variable { sigil: char },
     Method { invocant: String },
+    HashKey { var_text: String },
     General,
 }
 
@@ -140,6 +158,45 @@ pub fn symbol_at_cursor(tree: &Tree, source: &[u8], point: Point) -> Option<Curs
                     name: text.to_string(),
                 });
             }
+            "autoquoted_bareword" => {
+                // Hash key in braces: $hash{key} or in fat comma context: key => val
+                let text = node.utf8_text(source).ok()?;
+                if let Some(parent) = node.parent() {
+                    // Direct hash element: $hash{bareword} or $self->{bareword}
+                    if parent.kind() == "hash_element_expression" {
+                        // Check if this node is the key (either via field or by position)
+                        let is_key = parent.child_by_field_name("key")
+                            .map_or(false, |k| k.id() == node.id());
+                        if is_key {
+                            if let Some(var_text) = get_hash_from_element(parent, source) {
+                                let owner = resolve_key_owner(
+                                    find_root(node),
+                                    source,
+                                    &var_text,
+                                    point,
+                                )?;
+                                return Some(CursorSymbol::HashKey {
+                                    key_name: text.to_string(),
+                                    owner,
+                                });
+                            }
+                        }
+                    }
+                    // Fat comma context in list: key => val  inside hash construction
+                    if parent.kind() == "list_expression" {
+                        if let Some(owner) = resolve_list_key_owner(node, parent, source, point) {
+                            return Some(CursorSymbol::HashKey {
+                                key_name: text.to_string(),
+                                owner,
+                            });
+                        }
+                    }
+                }
+                // Fall through to bareword handling
+                return Some(CursorSymbol::Function {
+                    name: text.to_string(),
+                });
+            }
             "bareword" => {
                 let text = node.utf8_text(source).ok()?;
                 if let Some(parent) = node.parent() {
@@ -165,6 +222,47 @@ pub fn symbol_at_cursor(tree: &Tree, source: &[u8], point: Point) -> Option<Curs
                 return Some(CursorSymbol::Function {
                     name: text.to_string(),
                 });
+            }
+            "string_content" => {
+                // String key inside hash braces: $hash{"key"}
+                if let Some(parent) = node.parent() {
+                    if let Some(grandparent) = parent.parent() {
+                        if grandparent.kind() == "hash_element_expression" {
+                            let is_key = grandparent.child_by_field_name("key")
+                                .map_or(false, |k| k.id() == parent.id());
+                            if is_key {
+                                let text = node.utf8_text(source).ok()?;
+                                if let Some(var_text) = get_hash_from_element(grandparent, source) {
+                                    let owner = resolve_key_owner(
+                                        find_root(node),
+                                        source,
+                                        &var_text,
+                                        point,
+                                    )?;
+                                    return Some(CursorSymbol::HashKey {
+                                        key_name: text.to_string(),
+                                        owner,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // String in list expression (hash construction)
+                    // string_content → string_literal → list_expression
+                    if let Some(grandparent) = parent.parent() {
+                        if grandparent.kind() == "list_expression" {
+                            if let Some(owner) = resolve_list_key_owner(parent, grandparent, source, point) {
+                                let text = node.utf8_text(source).ok()?;
+                                return Some(CursorSymbol::HashKey {
+                                    key_name: text.to_string(),
+                                    owner,
+                                });
+                            }
+                        }
+                    }
+                }
+                node = node.parent()?;
+                continue;
             }
             "varname" => {
                 node = node.parent()?;
@@ -408,17 +506,30 @@ pub fn find_definition(tree: &Tree, source: &str, point: Point) -> Option<Span> 
             Some(sel_span)
         }
         CursorSymbol::Method { ref name, ref invocant } => {
-            // Try type-aware resolution: trace invocant to ClassName->new()
+            // Try type-aware resolution
             if let Some(inv_text) = invocant {
-                if let Some(class_name) =
-                    infer_variable_class(tree.root_node(), source_bytes, inv_text, point)
+                // If invocant has no sigil, it's a bareword class name directly
+                let class_name = if inv_text.starts_with('$')
+                    || inv_text.starts_with('@')
+                    || inv_text.starts_with('%')
                 {
+                    infer_variable_class(tree.root_node(), source_bytes, inv_text, point)
+                } else {
+                    Some(inv_text.clone())
+                };
+
+                if let Some(ref cn) = class_name {
+                    // Try to find the method in the class
                     if let Some(span) = find_method_in_class(
                         tree.root_node(),
                         source_bytes,
-                        &class_name,
+                        cn,
                         name,
                     ) {
+                        return Some(span);
+                    }
+                    // Method not found in class (e.g. auto-generated "new") → go to class def
+                    if let Some(span) = find_package_def(tree.root_node(), source_bytes, cn) {
                         return Some(span);
                     }
                 }
@@ -429,6 +540,13 @@ pub fn find_definition(tree: &Tree, source: &str, point: Point) -> Option<Span> 
         }
         CursorSymbol::Package { ref name } => {
             find_package_def(tree.root_node(), source_bytes, name)
+        }
+        CursorSymbol::HashKey { ref key_name, ref owner } => {
+            let keys = collect_hash_keys(tree.root_node(), source_bytes, owner, point);
+            keys.iter()
+                .filter(|k| k.key_name == *key_name && !k.is_dynamic)
+                .map(|k| k.span)
+                .next()
         }
     }
 }
@@ -934,9 +1052,257 @@ pub fn find_references(tree: &Tree, source: &str, point: Point) -> Vec<Span> {
         CursorSymbol::Package { ref name } => {
             collect_package_refs(tree.root_node(), source_bytes, name, &mut spans);
         }
+        CursorSymbol::HashKey { ref key_name, ref owner } => {
+            let keys = collect_hash_keys(tree.root_node(), source_bytes, owner, point);
+            for k in keys {
+                if k.key_name == *key_name {
+                    spans.push(k.span);
+                }
+            }
+        }
     }
 
     spans
+}
+
+// ---- Document highlight ----
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HighlightKind {
+    Read,
+    Write,
+}
+
+pub struct Highlight {
+    pub span: Span,
+    pub kind: HighlightKind,
+}
+
+pub fn document_highlights(tree: &Tree, source: &str, point: Point) -> Vec<Highlight> {
+    let source_bytes = source.as_bytes();
+    let cursor_sym = match symbol_at_cursor(tree, source_bytes, point) {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    match cursor_sym {
+        CursorSymbol::Variable { ref text } => {
+            let target_def = find_variable_def(tree.root_node(), source_bytes, text, point);
+
+            let mut all_refs = Vec::new();
+            collect_variable_refs(tree.root_node(), source_bytes, text, &mut all_refs);
+
+            all_refs
+                .into_iter()
+                .filter(|ref_span| {
+                    let ref_def = find_variable_def(
+                        tree.root_node(),
+                        source_bytes,
+                        text,
+                        ref_span.start,
+                    );
+                    ref_def == target_def
+                })
+                .map(|span| {
+                    let kind = if is_write_position(tree, source_bytes, span.start) {
+                        HighlightKind::Write
+                    } else {
+                        HighlightKind::Read
+                    };
+                    Highlight { span, kind }
+                })
+                .collect()
+        }
+        CursorSymbol::Function { ref name } | CursorSymbol::Method { ref name, .. } => {
+            let mut spans = Vec::new();
+            collect_function_refs(tree.root_node(), source_bytes, name, &mut spans);
+            spans
+                .into_iter()
+                .map(|span| Highlight {
+                    span,
+                    kind: HighlightKind::Read,
+                })
+                .collect()
+        }
+        CursorSymbol::Package { ref name } => {
+            let mut spans = Vec::new();
+            collect_package_refs(tree.root_node(), source_bytes, name, &mut spans);
+            spans
+                .into_iter()
+                .map(|span| Highlight {
+                    span,
+                    kind: HighlightKind::Read,
+                })
+                .collect()
+        }
+        CursorSymbol::HashKey { ref key_name, ref owner } => {
+            let keys = collect_hash_keys(tree.root_node(), source_bytes, owner, point);
+            keys.into_iter()
+                .filter(|k| k.key_name == *key_name)
+                .map(|k| Highlight {
+                    span: k.span,
+                    kind: HighlightKind::Read,
+                })
+                .collect()
+        }
+    }
+}
+
+/// Check if a variable at `point` is in a write (assignment) position.
+fn is_write_position(tree: &Tree, _source: &[u8], point: Point) -> bool {
+    let node = match tree
+        .root_node()
+        .named_descendant_for_point_range(point, point)
+    {
+        Some(n) => n,
+        None => return false,
+    };
+
+    // Walk up to check if this variable is on the left side of an assignment,
+    // or is part of a declaration
+    let mut current = node;
+    for _ in 0..10 {
+        if let Some(parent) = current.parent() {
+            match parent.kind() {
+                "variable_declaration" => return true,
+                "assignment_expression" => {
+                    // Check if we're on the left side
+                    if let Some(left) = parent.child_by_field_name("left") {
+                        if left.start_position() <= point && left.end_position() >= point {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                "signature" => return true,
+                "for_statement" => {
+                    // Loop variable is a write
+                    if let Some(var) = parent.child_by_field_name("variable") {
+                        if var.start_position() <= point && var.end_position() >= point {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                _ => {
+                    current = parent;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    false
+}
+
+// ---- Selection range ----
+
+pub fn selection_ranges(tree: &Tree, point: Point) -> Vec<Span> {
+    let mut node = match tree
+        .root_node()
+        .named_descendant_for_point_range(point, point)
+    {
+        Some(n) => n,
+        None => return vec![],
+    };
+
+    let mut ranges = vec![node_to_span(node)];
+    while let Some(parent) = node.parent() {
+        ranges.push(node_to_span(parent));
+        node = parent;
+    }
+    ranges
+}
+
+// ---- Folding ranges ----
+
+#[derive(Debug, Clone)]
+pub struct FoldRange {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: FoldKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldKind {
+    Region,
+    Comment,
+}
+
+pub fn folding_ranges(tree: &Tree, source: &str) -> Vec<FoldRange> {
+    let mut ranges = Vec::new();
+    collect_fold_ranges(tree.root_node(), source.as_bytes(), &mut ranges);
+    // Pod sections
+    collect_pod_folds(source, &mut ranges);
+    ranges
+}
+
+fn collect_fold_ranges(node: Node, source: &[u8], out: &mut Vec<FoldRange>) {
+    let foldable = match node.kind() {
+        "block" | "do_block" => true,
+        "subroutine_declaration_statement"
+        | "method_declaration_statement"
+        | "class_statement"
+        | "package_statement" => {
+            // Fold from the declaration line to the end of the body
+            // but only if it spans multiple lines
+            false // we'll fold their block children instead
+        }
+        "if_statement" | "unless_statement" | "while_statement" | "until_statement"
+        | "for_statement" | "foreach_statement" => true,
+        "heredoc_body" | "heredoc_body_qq" | "heredoc_body_qx" => true,
+        _ => false,
+    };
+
+    if foldable {
+        let start = node.start_position().row;
+        let end = node.end_position().row;
+        if end > start {
+            out.push(FoldRange {
+                start_line: start,
+                end_line: end,
+                kind: FoldKind::Region,
+            });
+        }
+    }
+
+    // Also fold multi-line comments (consecutive # lines)
+    // Handled separately — just recurse into children here
+    let _ = source; // used by pod fold collector
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_fold_ranges(child, source, out);
+        }
+    }
+}
+
+fn collect_pod_folds(source: &str, out: &mut Vec<FoldRange>) {
+    let mut pod_start: Option<usize> = None;
+    for (i, line) in source.lines().enumerate() {
+        if line.starts_with("=head")
+            || line.starts_with("=pod")
+            || line.starts_with("=begin")
+            || line.starts_with("=over")
+            || line.starts_with("=item")
+            || line.starts_with("=encoding")
+            || line.starts_with("=for")
+        {
+            if pod_start.is_none() {
+                pod_start = Some(i);
+            }
+        }
+        if line.starts_with("=cut") {
+            if let Some(start) = pod_start {
+                out.push(FoldRange {
+                    start_line: start,
+                    end_line: i,
+                    kind: FoldKind::Comment,
+                });
+                pod_start = None;
+            }
+        }
+    }
 }
 
 fn collect_variable_refs(node: Node, source: &[u8], target: &str, refs: &mut Vec<Span>) {
@@ -1074,6 +1440,23 @@ pub fn rename(tree: &Tree, source: &str, point: Point, new_name: &str) -> Option
 
     let bare_name = new_name.trim_start_matches(['$', '@', '%']);
 
+    match &cursor_sym {
+        CursorSymbol::HashKey { ref key_name, ref owner } => {
+            let keys = collect_hash_keys(tree.root_node(), source_bytes, owner, point);
+            let edits: Vec<RenameEdit> = keys
+                .into_iter()
+                .filter(|k| k.key_name == *key_name)
+                .map(|k| RenameEdit {
+                    span: k.span,
+                    new_text: new_name.to_string(),
+                })
+                .collect();
+            if edits.is_empty() { return None; }
+            return Some(edits);
+        }
+        _ => {}
+    }
+
     let edits = ref_spans
         .into_iter()
         .map(|span| match &cursor_sym {
@@ -1126,24 +1509,35 @@ pub fn hover_info(tree: &Tree, source: &str, point: Point) -> Option<HoverResult
         CursorSymbol::Method { ref name, ref invocant } => {
             // Try type-aware: resolve invocant class, find method in class
             if let Some(inv_text) = invocant {
-                if let Some(class_name) =
-                    infer_variable_class(tree.root_node(), source_bytes, inv_text, point)
+                let class_name = if inv_text.starts_with('$')
+                    || inv_text.starts_with('@')
+                    || inv_text.starts_with('%')
                 {
+                    infer_variable_class(tree.root_node(), source_bytes, inv_text, point)
+                } else {
+                    Some(inv_text.clone())
+                };
+
+                if let Some(ref cn) = class_name {
                     if let Some(span) = find_method_in_class(
                         tree.root_node(),
                         source_bytes,
-                        &class_name,
+                        cn,
                         name,
                     ) {
                         let line = source.lines().nth(span.start.row).unwrap_or("");
                         return Some(HoverResult {
                             markdown: format!(
                                 "**{}**\n```perl\n{}\n```",
-                                class_name,
+                                cn,
                                 line.trim()
                             ),
                         });
                     }
+                    // Auto-generated method like "new" → show class info
+                    return Some(HoverResult {
+                        markdown: format!("**{}**::`{}`", cn, name),
+                    });
                 }
             }
             // Fall back to file-wide sub/method search
@@ -1157,9 +1551,602 @@ pub fn hover_info(tree: &Tree, source: &str, point: Point) -> Option<HoverResult
         CursorSymbol::Package { ref name } => {
             format!("**package** `{}`", name)
         }
+        CursorSymbol::HashKey { ref key_name, ref owner } => {
+            let keys = collect_hash_keys(tree.root_node(), source_bytes, owner, point);
+            let matching: Vec<&HashKeyInfo> = keys.iter()
+                .filter(|k| k.key_name == *key_name && !k.is_dynamic)
+                .collect();
+            let count = matching.len();
+            let owner_str = match owner {
+                HashKeyOwner::Class(ref cn) => format!("{}->", cn),
+                HashKeyOwner::Variable { ref name, .. } => format!("{}", name),
+            };
+            let first_line = matching.first().and_then(|k| {
+                source.lines().nth(k.span.start.row)
+            }).unwrap_or("");
+            format!(
+                "`{}{{{}}}`  \n{} occurrence{}\n```perl\n{}\n```",
+                owner_str,
+                key_name,
+                count,
+                if count == 1 { "" } else { "s" },
+                first_line.trim()
+            )
+        }
     };
 
     Some(HoverResult { markdown })
+}
+
+// ---- Hash key analysis ----
+
+/// Extract the key text from a hash key node.
+/// Returns (key_text, is_dynamic).
+fn extract_key_text(node: Node, source: &[u8]) -> Option<(String, bool)> {
+    match node.kind() {
+        "autoquoted_bareword" => {
+            node.utf8_text(source).ok().map(|s| (s.to_string(), false))
+        }
+        "string_literal" | "interpolated_string_literal" => {
+            // Look for string_content child
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if child.kind() == "string_content" {
+                        return child.utf8_text(source).ok().map(|s| (s.to_string(), false));
+                    }
+                }
+            }
+            // Empty string literal
+            Some(("".to_string(), false))
+        }
+        "string_content" => {
+            node.utf8_text(source).ok().map(|s| (s.to_string(), false))
+        }
+        // Dynamic key: $var, @arr, expression, etc.
+        "scalar" | "array" | "hash" | "function_call_expression"
+        | "method_call_expression" | "container_variable" => {
+            node.utf8_text(source).ok().map(|s| (s.to_string(), true))
+        }
+        _ => {
+            // Unknown node kind — treat as dynamic if it has text
+            node.utf8_text(source).ok().map(|s| (s.to_string(), true))
+        }
+    }
+}
+
+/// Get the hash variable node from a hash_element_expression.
+/// Handles both `$hash{key}` (where hash is a field) and `$self->{key}` (where it's not).
+fn get_hash_from_element(he: Node, source: &[u8]) -> Option<String> {
+    // Try the `hash` field first (works for $hash{key} style)
+    if let Some(hash_node) = he.child_by_field_name("hash") {
+        return resolve_hash_element_var(hash_node, source);
+    }
+    // For arrow syntax $obj->{key}: the scalar/variable is the first named child
+    for i in 0..he.named_child_count() {
+        if let Some(child) = he.named_child(i) {
+            match child.kind() {
+                "scalar" | "array" | "hash" | "container_variable"
+                | "slice_container_variable" | "keyval_container_variable"
+                | "hash_element_expression" => {
+                    return resolve_hash_element_var(child, source);
+                }
+                _ => continue,
+            }
+        }
+    }
+    None
+}
+
+/// Given a hash variable node, resolve to its canonical name.
+fn resolve_hash_element_var(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "scalar" | "array" | "hash" => {
+            node.utf8_text(source).ok().map(|s| s.to_string())
+        }
+        "container_variable" | "slice_container_variable" | "keyval_container_variable" => {
+            canonical_var_name(node, source)
+        }
+        "hash_element_expression" => {
+            // Nested: $self->{a}{b} — resolve from the inner hash
+            get_hash_from_element(node, source)
+        }
+        _ => node.utf8_text(source).ok().map(|s| s.to_string()),
+    }
+}
+
+/// Determine the HashKeyOwner for a variable used as a hash.
+fn resolve_key_owner(
+    root: Node,
+    source: &[u8],
+    var_text: &str,
+    point: Point,
+) -> Option<HashKeyOwner> {
+    // First check if the variable can be traced to a class
+    if let Some(class_name) = infer_variable_class(root, source, var_text, point) {
+        return Some(HashKeyOwner::Class(class_name));
+    }
+
+    // Check first-param-is-instance heuristic
+    if let Some(class_name) = infer_first_param_class(root, source, var_text, point) {
+        return Some(HashKeyOwner::Class(class_name));
+    }
+
+    // Fall back to plain variable
+    let def_span = find_variable_def(root, source, var_text, point)
+        .unwrap_or(Span {
+            start: Point::new(0, 0),
+            end: Point::new(0, 0),
+        });
+    Some(HashKeyOwner::Variable {
+        name: var_text.to_string(),
+        def_span,
+    })
+}
+
+/// Check if a variable is the first parameter of an enclosing sub/method in a package.
+fn infer_first_param_class(
+    root: Node,
+    source: &[u8],
+    var_text: &str,
+    point: Point,
+) -> Option<String> {
+    let mut node = root.named_descendant_for_point_range(point, point)?;
+    let mut sub_node: Option<Node> = None;
+    for _ in 0..30 {
+        if node.kind() == "subroutine_declaration_statement"
+            || node.kind() == "method_declaration_statement"
+        {
+            sub_node = Some(node);
+            break;
+        }
+        node = node.parent()?;
+    }
+    let sub_node = sub_node?;
+
+    let first_param = get_first_param(sub_node, source)?;
+    if first_param != var_text {
+        return None;
+    }
+
+    find_enclosing_package(sub_node, source)
+}
+
+/// Get the first parameter name of a sub/method.
+fn get_first_param(sub_node: Node, source: &[u8]) -> Option<String> {
+    // Check signature first
+    for i in 0..sub_node.child_count() {
+        if let Some(sig) = sub_node.child(i) {
+            if sig.kind() == "signature" {
+                for j in 0..sig.named_child_count() {
+                    if let Some(param) = sig.named_child(j) {
+                        if matches!(param.kind(), "scalar" | "array" | "hash") {
+                            return param.utf8_text(source).ok().map(|s| s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for `my ($self, ...) = @_` in the body
+    if let Some(body) = sub_node.child_by_field_name("body") {
+        for i in 0..body.named_child_count() {
+            if let Some(stmt) = body.named_child(i) {
+                let assign = if stmt.kind() == "expression_statement" {
+                    stmt.named_child(0).filter(|n| n.kind() == "assignment_expression")
+                } else if stmt.kind() == "assignment_expression" {
+                    Some(stmt)
+                } else {
+                    None
+                };
+                if let Some(assign) = assign {
+                    if let Some(right) = assign.child_by_field_name("right") {
+                        if right.utf8_text(source).ok() == Some("@_") {
+                            if let Some(left) = assign.child_by_field_name("left") {
+                                let mut vars = Vec::new();
+                                collect_declared_vars(left, source, &mut vars);
+                                if let Some((name, _)) = vars.first() {
+                                    return Some(name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find the enclosing package name for a node.
+fn find_enclosing_package(node: Node, source: &[u8]) -> Option<String> {
+    let mut current = node;
+    for _ in 0..30 {
+        if let Some(parent) = current.parent() {
+            if parent.kind() == "class_statement" {
+                return parent.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+            }
+            current = parent;
+        } else {
+            break;
+        }
+    }
+
+    // No class_statement — look for the most recent package_statement before this node
+    let source_file = current;
+    let mut last_package: Option<String> = None;
+    for i in 0..source_file.child_count() {
+        if let Some(child) = source_file.child(i) {
+            if child.start_position() > node.start_position() {
+                break;
+            }
+            if child.kind() == "package_statement" {
+                if let Some(name) = child.child_by_field_name("name") {
+                    if let Ok(text) = name.utf8_text(source) {
+                        last_package = Some(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    last_package
+}
+
+/// Collect all hash keys belonging to a specific owner.
+fn collect_hash_keys(
+    root: Node,
+    source: &[u8],
+    owner: &HashKeyOwner,
+    context_point: Point,
+) -> Vec<HashKeyInfo> {
+    let mut keys = Vec::new();
+    collect_hash_keys_walk(root, source, owner, context_point, &mut keys);
+    keys.sort_by(|a, b| {
+        a.span.start.row.cmp(&b.span.start.row)
+            .then(a.span.start.column.cmp(&b.span.start.column))
+    });
+    keys.dedup_by(|a, b| a.key_name == b.key_name && a.span == b.span);
+    keys
+}
+
+fn collect_hash_keys_walk(
+    node: Node,
+    source: &[u8],
+    owner: &HashKeyOwner,
+    context_point: Point,
+    keys: &mut Vec<HashKeyInfo>,
+) {
+    if node.kind() == "hash_element_expression" {
+        if let Some(key_node) = node.child_by_field_name("key") {
+            if let Some(var_text) = get_hash_from_element(node, source) {
+                let resolved_owner = resolve_key_owner(
+                    find_root(node),
+                    source,
+                    &var_text,
+                    node.start_position(),
+                );
+                if let Some(ref ro) = resolved_owner {
+                    if owners_match(ro, owner) {
+                        if let Some((key_text, is_dynamic)) = extract_key_text(key_node, source) {
+                            keys.push(HashKeyInfo {
+                                key_name: key_text.clone(),
+                                owner: ro.clone(),
+                                span: node_to_span(key_node),
+                                is_dynamic,
+                                source_text: key_node.utf8_text(source)
+                                    .unwrap_or("")
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if node.kind() == "anonymous_hash_expression" {
+        collect_construction_keys(node, source, owner, context_point, keys);
+    }
+
+    if node.kind() == "assignment_expression" {
+        collect_assignment_construction_keys(node, source, owner, context_point, keys);
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_hash_keys_walk(child, source, owner, context_point, keys);
+        }
+    }
+}
+
+fn collect_construction_keys(
+    anon_hash: Node,
+    source: &[u8],
+    owner: &HashKeyOwner,
+    context_point: Point,
+    keys: &mut Vec<HashKeyInfo>,
+) {
+    let construction_owner = resolve_anon_hash_owner(anon_hash, source, context_point);
+    if let Some(ref co) = construction_owner {
+        if !owners_match(co, owner) {
+            return;
+        }
+    } else {
+        return;
+    }
+
+    for i in 0..anon_hash.named_child_count() {
+        if let Some(list) = anon_hash.named_child(i) {
+            if list.kind() == "list_expression" {
+                collect_list_keys(list, source, construction_owner.as_ref().unwrap(), keys);
+            }
+        }
+    }
+}
+
+fn collect_assignment_construction_keys(
+    assign: Node,
+    source: &[u8],
+    owner: &HashKeyOwner,
+    _context_point: Point,
+    keys: &mut Vec<HashKeyInfo>,
+) {
+    let left = match assign.child_by_field_name("left") {
+        Some(l) => l,
+        None => return,
+    };
+
+    // Find the actual right-side content. child_by_field_name("right") may return
+    // a parenthesis when multiple children share the [right] field label.
+    // Scan all named children on the right side for list_expression or anonymous_hash_expression.
+    let hash_var = find_hash_var_in_lhs(left, source);
+    if let Some(ref var_text) = hash_var {
+        let resolved = resolve_key_owner(
+            find_root(assign),
+            source,
+            var_text,
+            assign.start_position(),
+        );
+        if let Some(ref ro) = resolved {
+            if owners_match(ro, owner) {
+                // Find list_expression or anonymous_hash_expression among children
+                for i in 0..assign.named_child_count() {
+                    if let Some(child) = assign.named_child(i) {
+                        if child.kind() == "list_expression" {
+                            collect_list_keys(child, source, ro, keys);
+                            return;
+                        }
+                        if child.kind() == "anonymous_hash_expression" {
+                            if let Some(list) = child.named_child(0) {
+                                if list.kind() == "list_expression" {
+                                    collect_list_keys(list, source, ro, keys);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_list_keys(
+    list: Node,
+    source: &[u8],
+    owner: &HashKeyOwner,
+    keys: &mut Vec<HashKeyInfo>,
+) {
+    // Use fat-comma detection: any autoquoted_bareword or string followed by =>
+    // is a key. This handles nested list_expressions reliably.
+    collect_fat_comma_keys_walk(list, source, owner, keys);
+}
+
+fn collect_fat_comma_keys_walk(
+    node: Node,
+    source: &[u8],
+    owner: &HashKeyOwner,
+    keys: &mut Vec<HashKeyInfo>,
+) {
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            // Check if this child is followed by =>
+            if child.is_named() {
+                let next_sibling = node.child(i + 1);
+                let is_before_fat_comma = next_sibling
+                    .map_or(false, |ns| ns.kind() == "=>");
+                if is_before_fat_comma {
+                    if let Some((key_text, is_dynamic)) = extract_key_text(child, source) {
+                        keys.push(HashKeyInfo {
+                            key_name: key_text,
+                            owner: owner.clone(),
+                            span: node_to_span(child),
+                            is_dynamic,
+                            source_text: child.utf8_text(source).unwrap_or("").to_string(),
+                        });
+                    }
+                }
+            }
+            // Recurse into nested list_expressions
+            if child.kind() == "list_expression" {
+                collect_fat_comma_keys_walk(child, source, owner, keys);
+            }
+        }
+    }
+}
+
+fn find_hash_var_in_lhs(left: Node, source: &[u8]) -> Option<String> {
+    if left.kind() == "hash" {
+        return left.utf8_text(source).ok().map(|s| s.to_string());
+    }
+    if left.kind() == "variable_declaration" {
+        let mut vars = Vec::new();
+        collect_declared_vars(left, source, &mut vars);
+        for (name, _) in vars {
+            if name.starts_with('%') {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn is_bless_call(node: Node, source: &[u8]) -> bool {
+    let kind = node.kind();
+    if kind == "function_call_expression" || kind == "ambiguous_function_call_expression" {
+        if let Some(func) = node.child_by_field_name("function") {
+            return func.utf8_text(source).ok() == Some("bless");
+        }
+    }
+    false
+}
+
+fn resolve_anon_hash_owner(
+    anon_hash: Node,
+    source: &[u8],
+    _context_point: Point,
+) -> Option<HashKeyOwner> {
+    let parent = anon_hash.parent()?;
+
+    // Direct child of bless call
+    if is_bless_call(parent, source) {
+        if let Some(pkg) = find_enclosing_package(anon_hash, source) {
+            return Some(HashKeyOwner::Class(pkg));
+        }
+    }
+
+    // Walk up a few levels to find bless (handles list_expression wrappers)
+    let mut ancestor = parent;
+    for _ in 0..5 {
+        if is_bless_call(ancestor, source) {
+            if let Some(pkg) = find_enclosing_package(anon_hash, source) {
+                return Some(HashKeyOwner::Class(pkg));
+            }
+        }
+        ancestor = match ancestor.parent() {
+            Some(p) => p,
+            None => break,
+        };
+    }
+
+    // Assigned to a variable: my $ref = { ... }
+    // Walk up to find assignment_expression
+    let mut current = anon_hash;
+    for _ in 0..5 {
+        if let Some(p) = current.parent() {
+            if p.kind() == "assignment_expression" {
+                if let Some(left) = p.child_by_field_name("left") {
+                    let var_text = get_var_text_from_lhs(left, source);
+                    if let Some(vt) = var_text {
+                        return resolve_key_owner(
+                            find_root(anon_hash),
+                            source,
+                            &vt,
+                            p.start_position(),
+                        );
+                    }
+                }
+            }
+            current = p;
+        } else {
+            break;
+        }
+    }
+
+    None
+}
+
+fn get_var_text_from_lhs(left: Node, source: &[u8]) -> Option<String> {
+    if matches!(left.kind(), "scalar" | "array" | "hash") {
+        return left.utf8_text(source).ok().map(|s| s.to_string());
+    }
+    if left.kind() == "variable_declaration" {
+        let mut vars = Vec::new();
+        collect_declared_vars(left, source, &mut vars);
+        if let Some((name, _)) = vars.first() {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+fn find_root(node: Node) -> Node {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        current = parent;
+    }
+    current
+}
+
+/// Determine the owner for a key node inside a list_expression (hash construction).
+/// Checks if the node is at a key position and if the list is in a hash context.
+fn resolve_list_key_owner(
+    key_node: Node,
+    list_node: Node,
+    source: &[u8],
+    point: Point,
+) -> Option<HashKeyOwner> {
+    // Verify this node is at a key position (even index among named children)
+    let mut idx = 0;
+    let mut is_key = false;
+    for i in 0..list_node.child_count() {
+        if let Some(child) = list_node.child(i) {
+            if !child.is_named() {
+                continue;
+            }
+            if child.id() == key_node.id() {
+                is_key = idx % 2 == 0;
+                break;
+            }
+            idx += 1;
+        }
+    }
+    if !is_key {
+        return None;
+    }
+
+    // Check if the list is in a hash context — walk up a few levels
+    let mut ancestor = list_node;
+    for _ in 0..5 {
+        let parent = match ancestor.parent() {
+            Some(p) => p,
+            None => return None,
+        };
+
+        if parent.kind() == "anonymous_hash_expression" {
+            return resolve_anon_hash_owner(parent, source, point);
+        }
+
+        if parent.kind() == "assignment_expression" {
+            if let Some(left) = parent.child_by_field_name("left") {
+                if let Some(hash_var) = find_hash_var_in_lhs(left, source) {
+                    return resolve_key_owner(
+                        find_root(list_node),
+                        source,
+                        &hash_var,
+                        parent.start_position(),
+                    );
+                }
+            }
+        }
+
+        ancestor = parent;
+    }
+
+    None
+}
+
+fn owners_match(a: &HashKeyOwner, b: &HashKeyOwner) -> bool {
+    match (a, b) {
+        (HashKeyOwner::Class(ref ca), HashKeyOwner::Class(ref cb)) => ca == cb,
+        (HashKeyOwner::Variable { ref name, ref def_span },
+         HashKeyOwner::Variable { name: ref name2, def_span: ref def_span2 }) => {
+            name == name2 && def_span == def_span2
+        }
+        _ => false,
+    }
 }
 
 // ---- Completion ----
@@ -1174,6 +2161,9 @@ pub fn collect_completions(tree: &Tree, source: &str, point: Point) -> Vec<Compl
         }
         CompletionMode::Method { ref invocant } => {
             collect_method_completions(tree, source_bytes, invocant, point)
+        }
+        CompletionMode::HashKey { ref var_text } => {
+            collect_hash_key_completions(tree, source_bytes, var_text, point)
         }
         CompletionMode::General => {
             let mut candidates = Vec::new();
@@ -1206,6 +2196,29 @@ fn detect_completion_mode(source: &str, point: Point) -> CompletionMode {
         line
     };
     let trimmed = before.trim_end();
+
+    // Check for hash key completion: $hash{ or $self->{
+    if trimmed.ends_with('{') {
+        let prefix = trimmed[..trimmed.len() - 1].trim_end();
+        // Arrow hash access: $var->{
+        if prefix.ends_with("->") {
+            let var_prefix = prefix[..prefix.len() - 2].trim_end();
+            let var_text = extract_invocant_from_prefix(var_prefix);
+            if !var_text.is_empty() {
+                return CompletionMode::HashKey {
+                    var_text: var_text.to_string(),
+                };
+            }
+        }
+        // Direct hash access: $hash{ or %hash to $hash{
+        let var_text = extract_invocant_from_prefix(prefix);
+        if !var_text.is_empty() && var_text.starts_with('$') {
+            // $hash{ → the hash is %hash (container variable)
+            return CompletionMode::HashKey {
+                var_text: var_text.to_string(),
+            };
+        }
+    }
 
     // Check for -> (method completion)
     if trimmed.ends_with("->") {
@@ -1472,6 +2485,217 @@ fn collect_in_scope_vars(
     }
 }
 
+fn collect_hash_key_completions(
+    tree: &Tree,
+    source: &[u8],
+    var_text: &str,
+    point: Point,
+) -> Vec<CompletionCandidate> {
+    let root = tree.root_node();
+
+    // Try multiple resolution strategies since the cursor line may be incomplete.
+    // For direct hash access ($hash{), the actual hash is %hash — try that first.
+    // Also scan existing usages in the file to resolve from a complete expression.
+    let bare_name = &var_text[1..]; // strip sigil
+
+    // First: try resolving from existing hash usages elsewhere in the file.
+    let mut owner = resolve_owner_from_existing_usages(root, source, bare_name);
+
+    // Second: try class inference from first-param scan (handles incomplete source
+    // where tree-sitter wraps subs in ERROR nodes). This is prioritized over plain
+    // variable resolution because $self->{} should resolve to a class, not a Variable.
+    if owner.is_none() {
+        owner = infer_class_from_first_param_scan(root, source, var_text);
+    }
+
+    // Third: try direct resolution with both sigil forms (e.g. $hash → %hash)
+    if owner.is_none() {
+        let candidates: Vec<String> = if var_text.starts_with('$') {
+            vec![format!("%{}", bare_name), var_text.to_string()]
+        } else {
+            vec![var_text.to_string()]
+        };
+        for candidate in &candidates {
+            let resolved = resolve_key_owner(root, source, &candidate, point);
+            if let Some(ref o) = resolved {
+                // Only accept if it found a real definition (not fallback zero span)
+                if let HashKeyOwner::Variable { ref def_span, .. } = o {
+                    if def_span.start == Point::new(0, 0) && def_span.end == Point::new(0, 0) {
+                        continue;
+                    }
+                }
+                owner = resolved;
+                break;
+            }
+        }
+    }
+
+    let owner = match owner {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+
+    let all_keys = collect_hash_keys(root, source, &owner, point);
+
+    // Deduplicate by key name, keeping first occurrence
+    let mut seen = std::collections::HashSet::new();
+    let mut candidates = Vec::new();
+    for key in &all_keys {
+        if seen.contains(&key.key_name) {
+            continue;
+        }
+        seen.insert(key.key_name.clone());
+
+        let detail = if key.is_dynamic {
+            Some(format!("(dynamic: {})", key.source_text))
+        } else {
+            match &owner {
+                HashKeyOwner::Class(name) => Some(format!("{}->{{{}}}", name, key.key_name)),
+                HashKeyOwner::Variable { name, .. } => {
+                    Some(format!("{}{{{}}}", name, key.key_name))
+                }
+            }
+        };
+
+        candidates.push(CompletionCandidate {
+            label: key.key_name.clone(),
+            kind: SymbolKind::Variable,
+            detail,
+            insert_text: None,
+            sort_priority: if key.is_dynamic { 50 } else { 10 },
+        });
+    }
+
+    candidates
+}
+
+/// Find an owner by scanning existing hash_element_expression nodes for the variable.
+fn resolve_owner_from_existing_usages(
+    root: Node,
+    source: &[u8],
+    bare_name: &str,
+) -> Option<HashKeyOwner> {
+    resolve_owner_from_usages_walk(root, source, bare_name)
+}
+
+fn resolve_owner_from_usages_walk(
+    node: Node,
+    source: &[u8],
+    bare_name: &str,
+) -> Option<HashKeyOwner> {
+    if node.kind() == "hash_element_expression" {
+        if let Some(var_text) = get_hash_from_element(node, source) {
+            let var_bare = &var_text[1..]; // strip sigil
+            if var_bare == bare_name {
+                return resolve_key_owner(
+                    find_root(node),
+                    source,
+                    &var_text,
+                    node.start_position(),
+                );
+            }
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if let Some(owner) = resolve_owner_from_usages_walk(child, source, bare_name) {
+                return Some(owner);
+            }
+        }
+    }
+    None
+}
+
+/// Scan all subs/methods in the file for var_text as first parameter.
+/// If found, infer class from enclosing package. Used as a fallback when
+/// tree-sitter can't resolve context at incomplete cursor position.
+fn infer_class_from_first_param_scan(
+    root: Node,
+    source: &[u8],
+    var_text: &str,
+) -> Option<HashKeyOwner> {
+    infer_class_scan_walk(root, source, var_text)
+}
+
+fn infer_class_scan_walk(
+    node: Node,
+    source: &[u8],
+    var_text: &str,
+) -> Option<HashKeyOwner> {
+    if node.kind() == "subroutine_declaration_statement"
+        || node.kind() == "method_declaration_statement"
+    {
+        if let Some(first_param) = get_first_param(node, source) {
+            if first_param == var_text {
+                if let Some(pkg) = find_enclosing_package(node, source) {
+                    return Some(HashKeyOwner::Class(pkg));
+                }
+            }
+        }
+    }
+
+    // When source is incomplete, tree-sitter may wrap subs in ERROR nodes.
+    // Look for `my ($var) = @_` pattern inside ERROR nodes and trace to package.
+    if node.kind() == "ERROR" {
+        if let Some(owner) = scan_error_node_for_first_param(node, source, var_text) {
+            return Some(owner);
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if let Some(owner) = infer_class_scan_walk(child, source, var_text) {
+                return Some(owner);
+            }
+        }
+    }
+    None
+}
+
+/// Scan an ERROR node for `my ($var) = @_` patterns that indicate the variable
+/// is the first param. Resolve the class from the most recent package statement.
+fn scan_error_node_for_first_param(
+    error_node: Node,
+    source: &[u8],
+    var_text: &str,
+) -> Option<HashKeyOwner> {
+    // Walk descendants looking for assignment expressions with @_ on the right
+    scan_error_for_param(error_node, source, var_text)
+}
+
+fn scan_error_for_param(
+    node: Node,
+    source: &[u8],
+    var_text: &str,
+) -> Option<HashKeyOwner> {
+    if node.kind() == "assignment_expression" {
+        if let Some(right) = node.child_by_field_name("right") {
+            if right.utf8_text(source).ok() == Some("@_") {
+                if let Some(left) = node.child_by_field_name("left") {
+                    let mut vars = Vec::new();
+                    collect_declared_vars(left, source, &mut vars);
+                    if let Some((first, _)) = vars.first() {
+                        if first == var_text {
+                            // Found the pattern — find enclosing package
+                            if let Some(pkg) = find_enclosing_package(node, source) {
+                                return Some(HashKeyOwner::Class(pkg));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if let Some(owner) = scan_error_for_param(child, source, var_text) {
+                return Some(owner);
+            }
+        }
+    }
+    None
+}
+
 fn collect_method_completions(
     tree: &Tree,
     source: &[u8],
@@ -1580,6 +2804,203 @@ fn collect_all_packages_walk(node: Node, source: &[u8], out: &mut Vec<Completion
             collect_all_packages_walk(child, source, out);
         }
     }
+}
+
+// ---- Semantic tokens ----
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarModifier {
+    Scalar,
+    Array,
+    Hash,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticVarToken {
+    pub span: Span,
+    pub var_type: VarModifier,
+    pub is_declaration: bool,
+    pub is_modification: bool,
+    pub is_readonly: bool,
+}
+
+pub fn collect_semantic_tokens(tree: &Tree, source: &str) -> Vec<SemanticVarToken> {
+    let source_bytes = source.as_bytes();
+    let classes = extract_classes(tree, source);
+    let mut tokens = Vec::new();
+    collect_semantic_tokens_walk(tree.root_node(), source_bytes, &classes, &mut tokens);
+    // Sort by position (line, then column)
+    tokens.sort_by(|a, b| {
+        a.span.start.row.cmp(&b.span.start.row)
+            .then(a.span.start.column.cmp(&b.span.start.column))
+    });
+    tokens
+}
+
+fn collect_semantic_tokens_walk(
+    node: Node,
+    source: &[u8],
+    classes: &[ClassInfo],
+    tokens: &mut Vec<SemanticVarToken>,
+) {
+    match node.kind() {
+        "scalar" | "array" | "hash" => {
+            let var_type = match node.kind() {
+                "scalar" => VarModifier::Scalar,
+                "array" => VarModifier::Array,
+                "hash" => VarModifier::Hash,
+                _ => unreachable!(),
+            };
+            let is_decl = is_declaration_node(node);
+            let is_mod = is_write_node(node);
+            let is_readonly = is_readonly_field(node, source, classes);
+            tokens.push(SemanticVarToken {
+                span: node_to_span(node),
+                var_type,
+                is_declaration: is_decl,
+                is_modification: is_mod && !is_decl,
+                is_readonly,
+            });
+        }
+        "container_variable" | "slice_container_variable" | "keyval_container_variable" => {
+            // Deref access like $hash{key}, @arr[0..2] — resolve the canonical sigil
+            let var_type = match node.kind() {
+                "keyval_container_variable" => VarModifier::Hash,
+                "slice_container_variable" => {
+                    if let Some(parent) = node.parent() {
+                        if parent.child_by_field_name("hash").map_or(false, |h| h.id() == node.id()) {
+                            VarModifier::Hash
+                        } else {
+                            VarModifier::Array
+                        }
+                    } else {
+                        VarModifier::Array
+                    }
+                }
+                _ => {
+                    // Regular container_variable — check parent field
+                    if let Some(parent) = node.parent() {
+                        if parent.child_by_field_name("hash").map_or(false, |h| h.id() == node.id()) {
+                            VarModifier::Hash
+                        } else if parent.child_by_field_name("array").map_or(false, |a| a.id() == node.id()) {
+                            VarModifier::Array
+                        } else {
+                            VarModifier::Scalar
+                        }
+                    } else {
+                        VarModifier::Scalar
+                    }
+                }
+            };
+            let is_mod = is_write_node(node);
+            tokens.push(SemanticVarToken {
+                span: node_to_span(node),
+                var_type,
+                is_declaration: false,
+                is_modification: is_mod,
+                is_readonly: false, // container access to fields could be tracked but skip for now
+            });
+            return; // Don't recurse into children of container_variable
+        }
+        _ => {}
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_semantic_tokens_walk(child, source, classes, tokens);
+        }
+    }
+}
+
+fn is_declaration_node(node: Node) -> bool {
+    let mut current = node;
+    for _ in 0..5 {
+        if let Some(parent) = current.parent() {
+            match parent.kind() {
+                "variable_declaration" => return true,
+                "signature" => return true,
+                "for_statement" => {
+                    // Check if this is the loop variable
+                    if let Some(var) = parent.child_by_field_name("variable") {
+                        if var.id() == current.id() || var.id() == node.id() {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                _ => {
+                    current = parent;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    false
+}
+
+fn is_write_node(node: Node) -> bool {
+    let mut current = node;
+    for _ in 0..5 {
+        if let Some(parent) = current.parent() {
+            match parent.kind() {
+                "variable_declaration" => return true,
+                "assignment_expression" => {
+                    if let Some(left) = parent.child_by_field_name("left") {
+                        let np = node.start_position();
+                        return left.start_position() <= np && left.end_position() >= np;
+                    }
+                    return false;
+                }
+                "signature" => return true,
+                "for_statement" => {
+                    if let Some(var) = parent.child_by_field_name("variable") {
+                        if var.id() == current.id() || var.id() == node.id() {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                _ => {
+                    current = parent;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    false
+}
+
+/// Check if a variable node refers to a readonly class field.
+/// Currently always returns false — core Perl `class` has no :readonly attribute.
+/// :reader just creates a getter method, it doesn't make the field immutable.
+/// This is a placeholder for when we add framework stubs (e.g. Moo `is => 'ro'`).
+fn is_readonly_field(_node: Node, _source: &[u8], _classes: &[ClassInfo]) -> bool {
+    false
+}
+
+// ---- Diagnostics ----
+
+#[derive(Debug, Clone)]
+pub struct LspDiagnostic {
+    pub span: Span,
+    pub message: String,
+    pub severity: DiagnosticSeverity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+}
+
+pub fn collect_diagnostics(tree: &Tree, source: &str) -> Vec<LspDiagnostic> {
+    let _ = (tree, source);
+    // Placeholder — readonly field write diagnostics will be added when we have
+    // framework stubs (e.g. Moo `is => 'ro'`) that can actually determine immutability.
+    // Core Perl `class` has no :readonly attribute (:reader just creates a getter).
+    Vec::new()
 }
 
 // ---- Tests ----
@@ -2225,6 +3646,35 @@ Greeter->new();"#;
         assert_eq!(span.start.row, 0);
     }
 
+    #[test]
+    fn test_def_new_on_bareword_class() {
+        // gd on "new" in Calculator->new() should resolve to the class/package
+        let src = "\
+package Calculator;
+sub add { 1 }
+
+Calculator->new();";
+        let tree = parse(src);
+        // Cursor on "new" (line 3, col 13)
+        let span = find_definition(&tree, src, Point::new(3, 13)).unwrap();
+        // Should jump to package Calculator on line 0
+        assert_eq!(span.start.row, 0);
+    }
+
+    #[test]
+    fn test_def_method_on_bareword_class() {
+        // gd on explicit method in Greeter->greet() should resolve to the method
+        let src = r#"class Greeter {
+    method greet () { 1 }
+}
+Greeter->greet();"#;
+        let tree = parse(src);
+        // Cursor on "greet" (line 3)
+        let span = find_definition(&tree, src, Point::new(3, 9)).unwrap();
+        // Should jump to method greet on line 1
+        assert_eq!(span.start.row, 1);
+    }
+
     // ---- Verify gap assumptions ----
 
     #[test]
@@ -2413,5 +3863,512 @@ $g->greet();"#;
         let result = hover_info(&tree, src, Point::new(9, 4)).unwrap();
         assert!(result.markdown.contains("Greeter"));
         assert!(result.markdown.contains("method greet"));
+    }
+
+    // ---- Document highlight ----
+
+    #[test]
+    fn test_highlight_variable_read_write() {
+        let src = "\
+my $x = 1;
+print $x;
+$x = 2;";
+        let tree = parse(src);
+        let highlights = document_highlights(&tree, src, Point::new(0, 4));
+        assert_eq!(highlights.len(), 3);
+        // Declaration is write
+        let decl = highlights.iter().find(|h| h.span.start.row == 0).unwrap();
+        assert_eq!(decl.kind, HighlightKind::Write);
+        // Usage in print is read
+        let usage = highlights.iter().find(|h| h.span.start.row == 1).unwrap();
+        assert_eq!(usage.kind, HighlightKind::Read);
+        // Assignment is write
+        let assign = highlights.iter().find(|h| h.span.start.row == 2).unwrap();
+        assert_eq!(assign.kind, HighlightKind::Write);
+    }
+
+    #[test]
+    fn test_highlight_function() {
+        let src = "sub foo { 1 }\nfoo();";
+        let tree = parse(src);
+        let highlights = document_highlights(&tree, src, Point::new(0, 4));
+        assert_eq!(highlights.len(), 2);
+        // Functions are all Read (declaration and call)
+        assert!(highlights.iter().all(|h| h.kind == HighlightKind::Read));
+    }
+
+    // ---- Selection range ----
+
+    #[test]
+    fn test_selection_range() {
+        let src = "\
+sub foo {
+    my $x = 1;
+}";
+        let tree = parse(src);
+        // Cursor on $x (line 1, col 7)
+        let ranges = selection_ranges(&tree, Point::new(1, 8));
+        // Should have multiple levels: $x → variable_declaration → expression_statement → block → sub → source_file
+        assert!(ranges.len() >= 3, "expected at least 3 levels, got {}", ranges.len());
+        // Innermost should be within line 1
+        assert_eq!(ranges[0].start.row, 1);
+        // Outermost should be the source file (row 0)
+        let last = ranges.last().unwrap();
+        assert_eq!(last.start.row, 0);
+    }
+
+    // ---- Folding ranges ----
+
+    #[test]
+    fn test_folding_ranges() {
+        let src = "\
+sub foo {
+    my $x = 1;
+    return $x;
+}
+
+sub bar {
+    return 2;
+}";
+        let tree = parse(src);
+        let folds = folding_ranges(&tree, src);
+        // Should have folds for both sub blocks
+        assert!(folds.len() >= 2, "expected at least 2 folds, got {:?}", folds);
+        let starts: Vec<usize> = folds.iter().map(|f| f.start_line).collect();
+        assert!(starts.contains(&0), "missing fold starting at line 0: {:?}", folds);
+        assert!(starts.contains(&5), "missing fold starting at line 5: {:?}", folds);
+    }
+
+    #[test]
+    fn test_folding_pod() {
+        let src = "\
+sub foo { 1 }
+
+=head1 NAME
+
+Some documentation
+
+=cut
+
+sub bar { 2 }";
+        let tree = parse(src);
+        let folds = folding_ranges(&tree, src);
+        // Should have a comment fold for the pod section
+        let pod_fold = folds.iter().find(|f| f.kind == FoldKind::Comment);
+        assert!(pod_fold.is_some(), "missing pod fold: {:?}", folds);
+        let pf = pod_fold.unwrap();
+        assert_eq!(pf.start_line, 2); // =head1
+        assert_eq!(pf.end_line, 6);   // =cut
+    }
+
+    #[test]
+    fn test_folding_class() {
+        let src = r#"class Point {
+    field $x :param;
+
+    method magnitude () {
+        return $x;
+    }
+}"#;
+        let tree = parse(src);
+        let folds = folding_ranges(&tree, src);
+        // Should fold the class block and the method block
+        assert!(folds.len() >= 2, "expected at least 2 folds, got {:?}", folds);
+    }
+
+    // ---- Semantic tokens ----
+
+    #[test]
+    fn test_semantic_tokens_basic() {
+        let src = "my $x = 1;\nmy @arr = (1,2);\nmy %hash = (a => 1);";
+        let tree = parse(src);
+        let tokens = collect_semantic_tokens(&tree, src);
+        assert!(tokens.len() >= 3, "expected at least 3 tokens, got {:?}", tokens);
+
+        let scalar = tokens.iter().find(|t| t.span.start.row == 0).unwrap();
+        assert_eq!(scalar.var_type, VarModifier::Scalar);
+        assert!(scalar.is_declaration);
+
+        let array = tokens.iter().find(|t| t.span.start.row == 1).unwrap();
+        assert_eq!(array.var_type, VarModifier::Array);
+        assert!(array.is_declaration);
+
+        let hash = tokens.iter().find(|t| t.span.start.row == 2).unwrap();
+        assert_eq!(hash.var_type, VarModifier::Hash);
+        assert!(hash.is_declaration);
+    }
+
+    #[test]
+    fn test_semantic_tokens_read_write() {
+        let src = "\
+my $x = 1;
+print $x;
+$x = 2;";
+        let tree = parse(src);
+        let tokens = collect_semantic_tokens(&tree, src);
+        // Line 0: declaration (write)
+        let decl = tokens.iter().find(|t| t.span.start.row == 0).unwrap();
+        assert!(decl.is_declaration);
+        assert!(!decl.is_modification); // declaration, not modification
+        // Line 1: read
+        let read = tokens.iter().find(|t| t.span.start.row == 1).unwrap();
+        assert!(!read.is_declaration);
+        assert!(!read.is_modification);
+        // Line 2: modification (write but not declaration)
+        let write = tokens.iter().find(|t| t.span.start.row == 2).unwrap();
+        assert!(!write.is_declaration);
+        assert!(write.is_modification);
+    }
+
+    // Readonly field detection is a placeholder — core Perl class has no :readonly.
+    // :reader just creates a getter. Readonly diagnostics will come with framework stubs
+    // (e.g. Moo `is => 'ro'`).
+
+    // ---- Hash key intelligence ----
+
+    fn dump_tree(node: tree_sitter::Node, source: &[u8], indent: usize) {
+        let prefix = " ".repeat(indent);
+        let text = if node.child_count() == 0 {
+            format!(" {:?}", node.utf8_text(source).unwrap_or("?"))
+        } else { "".to_string() };
+        let field = node.parent().and_then(|p| {
+            for i in 0..p.child_count() {
+                if p.child(i).map_or(false, |c| c.id() == node.id()) {
+                    return p.field_name_for_child(i as u32).map(|s| format!(" [{}]", s));
+                }
+            }
+            None
+        }).unwrap_or_default();
+        eprintln!("{}{}{} ({},{})-({},{}){}", prefix, node.kind(), field,
+            node.start_position().row, node.start_position().column,
+            node.end_position().row, node.end_position().column, text);
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                dump_tree(child, source, indent + 2);
+            }
+        }
+    }
+
+    // Tier 1: Basic hash element access
+
+    #[test]
+    fn test_hash_key_at_cursor() {
+        let src = "my %hash = (name => 1);\n$hash{name};";
+        let tree = parse(src);
+        // Cursor on "name" inside $hash{name} (line 1, col 6)
+        let sym = symbol_at_cursor(&tree, src.as_bytes(), Point::new(1, 6));
+        assert!(
+            matches!(sym, Some(CursorSymbol::HashKey { .. })),
+            "expected HashKey, got {:?}", sym.map(|_| "other")
+        );
+    }
+
+    #[test]
+    fn test_hash_key_string_at_cursor() {
+        let src = r#"my %hash = ("key" => 1);
+$hash{"key"};"#;
+        let tree = parse(src);
+        // Cursor on "key" inside $hash{"key"} — on the string_content
+        let sym = symbol_at_cursor(&tree, src.as_bytes(), Point::new(1, 7));
+        assert!(
+            matches!(sym, Some(CursorSymbol::HashKey { .. })),
+            "expected HashKey for string key"
+        );
+    }
+
+    #[test]
+    fn test_hash_key_definition() {
+        let src = "\
+package Calculator;
+
+sub new {
+    my ($class, %args) = @_;
+    my $self = bless {
+        history => [],
+        verbose => $args{verbose} // 0,
+    }, $class;
+    return $self;
+}
+
+sub add {
+    my ($self, $a, $b) = @_;
+    push @{$self->{history}}, \"add($a, $b)\";
+}";
+        let tree = parse(src);
+        // Cursor on "history" in $self->{history} (line 13)
+        // Should jump to first occurrence in bless { history => [] }
+        let span = find_definition(&tree, src, Point::new(13, 20));
+        assert!(span.is_some(), "expected definition for hash key 'history'");
+        let span = span.unwrap();
+        assert_eq!(span.start.row, 5, "expected definition at bless construction, got row {}", span.start.row);
+    }
+
+    #[test]
+    fn test_hash_key_references() {
+        let src = "\
+package Calculator;
+
+sub new {
+    my ($class, %args) = @_;
+    my $self = bless {
+        history => [],
+        verbose => 0,
+    }, $class;
+    return $self;
+}
+
+sub add {
+    my ($self, $a, $b) = @_;
+    push @{$self->{history}}, \"add\";
+}
+
+sub get_history {
+    my ($self) = @_;
+    return @{$self->{history}};
+}";
+        let tree = parse(src);
+        // References for "history" from $self->{history} on line 13
+        let refs = find_references(&tree, src, Point::new(13, 20));
+        assert!(refs.len() >= 3, "expected at least 3 refs for 'history', got {}: {:?}",
+            refs.len(), refs.iter().map(|r| r.start.row).collect::<Vec<_>>());
+        let rows: Vec<usize> = refs.iter().map(|r| r.start.row).collect();
+        assert!(rows.contains(&5), "missing bless construction ref");
+        assert!(rows.contains(&13), "missing add method ref");
+        assert!(rows.contains(&18), "missing get_history method ref");
+    }
+
+    // Tier 2: Construction patterns
+
+    #[test]
+    fn test_hash_key_fat_comma_construction() {
+        let src = "\
+package Foo;
+sub new {
+    my ($class) = @_;
+    my $self = bless {
+        name => 'foo',
+        count => 0,
+    }, $class;
+    return $self;
+}
+
+sub get_name {
+    my ($self) = @_;
+    return $self->{name};
+}";
+        let tree = parse(src);
+        // Cursor on "name" in the bless construction (line 4)
+        let sym = symbol_at_cursor(&tree, src.as_bytes(), Point::new(4, 8));
+        assert!(
+            matches!(sym, Some(CursorSymbol::HashKey { .. })),
+            "expected HashKey in bless construction"
+        );
+    }
+
+    #[test]
+    fn test_hash_key_plain_comma() {
+        let src = r#"my %h = ("a", 1, "b", 2);
+$h{a};"#;
+        let tree = parse(src);
+        // References for key "a" should include both the construction and access
+        let refs = find_references(&tree, src, Point::new(1, 3));
+        assert!(refs.len() >= 1, "expected refs for plain comma hash key 'a'");
+    }
+
+    #[test]
+    fn test_hash_key_anon_hashref() {
+        let src = "my $ref = { foo => 1, bar => 2 };\n$ref->{foo};";
+        let tree = parse(src);
+        let refs = find_references(&tree, src, Point::new(1, 7));
+        // Should find foo in both the anon hash and the access
+        assert!(refs.len() >= 2, "expected at least 2 refs for anon hashref key, got {}: {:?}",
+            refs.len(), refs.iter().map(|r| r.start.row).collect::<Vec<_>>());
+    }
+
+    // Tier 3: Class namespace binding
+
+    #[test]
+    fn test_hash_key_class_namespace() {
+        let src = "\
+package Calculator;
+
+sub new {
+    my ($class) = @_;
+    return bless { history => [] }, $class;
+}
+
+sub add {
+    my ($self) = @_;
+    push @{$self->{history}}, 'entry';
+}
+
+package main;
+
+my $calc = Calculator->new();
+$calc->{history};";
+        let tree = parse(src);
+        // Cursor on "history" in $calc->{history} (line 15)
+        // Should find references in bless construction AND $self->{history}
+        let refs = find_references(&tree, src, Point::new(15, 8));
+        let rows: Vec<usize> = refs.iter().map(|r| r.start.row).collect();
+        assert!(refs.len() >= 2, "expected cross-variable refs via class namespace, got {}: {:?}",
+            refs.len(), rows);
+        // Should include the bless construction on row 4
+        assert!(rows.contains(&4), "missing bless construction ref, got {:?}", rows);
+    }
+
+    #[test]
+    fn test_hash_key_first_param_instance() {
+        let src = "\
+package Foo;
+sub process {
+    my ($obj) = @_;
+    return $obj->{data};
+}";
+        let tree = parse(src);
+        // $obj is first param in package Foo → should bind to Foo namespace
+        let sym = symbol_at_cursor(&tree, src.as_bytes(), Point::new(3, 19));
+        match sym {
+            Some(CursorSymbol::HashKey { ref owner, .. }) => {
+                assert!(matches!(owner, HashKeyOwner::Class(ref cn) if cn == "Foo"),
+                    "expected Foo class owner, got {:?}", owner);
+            }
+            _ => panic!("expected HashKey, got {:?}", sym.map(|_| "other")),
+        }
+    }
+
+    // Tier 4: Rename + hover
+
+    #[test]
+    fn test_hash_key_rename() {
+        let src = "\
+package Foo;
+sub new {
+    my ($class) = @_;
+    return bless { verbose => 0 }, $class;
+}
+
+sub is_verbose {
+    my ($self) = @_;
+    return $self->{verbose};
+}";
+        let tree = parse(src);
+        let edits = rename(&tree, src, Point::new(8, 22), "debug");
+        assert!(edits.is_some(), "expected rename edits for hash key");
+        let edits = edits.unwrap();
+        assert!(edits.len() >= 2, "expected at least 2 rename edits, got {}", edits.len());
+        assert!(edits.iter().all(|e| e.new_text == "debug"),
+            "all edits should use new name");
+    }
+
+    #[test]
+    fn test_hash_key_hover() {
+        let src = "\
+package Foo;
+sub new {
+    my ($class) = @_;
+    return bless { name => 'x' }, $class;
+}
+sub get {
+    my ($self) = @_;
+    return $self->{name};
+}";
+        let tree = parse(src);
+        let result = hover_info(&tree, src, Point::new(7, 20));
+        assert!(result.is_some(), "expected hover for hash key");
+        let md = result.unwrap().markdown;
+        assert!(md.contains("name"), "hover should mention key name, got: {}", md);
+    }
+
+    // Tier 5: Edge cases
+
+    #[test]
+    fn test_hash_key_different_hashes() {
+        let src = "\
+my %a = (key => 1);
+my %b = (key => 2);
+$a{key};
+$b{key};";
+        let tree = parse(src);
+        // References from %a's key should not include %b's key
+        let refs_a = find_references(&tree, src, Point::new(2, 3));
+        let rows_a: Vec<usize> = refs_a.iter().map(|r| r.start.row).collect();
+        // Should include line 0 (construction) and line 2 (access), NOT line 1 or 3
+        assert!(!rows_a.contains(&1), "should not include %b construction: {:?}", rows_a);
+        assert!(!rows_a.contains(&3), "should not include %b access: {:?}", rows_a);
+    }
+
+    #[test]
+    fn test_hash_key_dynamic() {
+        let src = "\
+my %hash = (name => 1);
+my $key = 'name';
+$hash{$key};";
+        let tree = parse(src);
+        // Cursor on $key inside $hash{$key} — should detect as dynamic
+        let sym = symbol_at_cursor(&tree, src.as_bytes(), Point::new(2, 6));
+        // Dynamic key should resolve as Variable, not HashKey
+        // (because the node is a scalar, not an autoquoted_bareword)
+        assert!(
+            matches!(sym, Some(CursorSymbol::Variable { .. })),
+            "dynamic key $key should resolve as Variable, not HashKey"
+        );
+    }
+
+    // ---- Hash key completion tests ----
+
+    #[test]
+    fn test_hash_key_completion_direct() {
+        let src = "\
+my %hash = (name => 1, age => 2);
+$hash{";
+        let tree = parse(src);
+        // Cursor right after { on line 1
+        let items = collect_completions(&tree, src, Point::new(1, 6));
+        let l = labels(&items);
+        assert!(l.contains(&"name"), "missing name, got {:?}", l);
+        assert!(l.contains(&"age"), "missing age, got {:?}", l);
+    }
+
+    #[test]
+    fn test_hash_key_completion_arrow() {
+        let src = "\
+package Calculator;
+sub new {
+    my ($class) = @_;
+    return bless { history => [], verbose => 0 }, $class;
+}
+sub get {
+    my ($self) = @_;
+    $self->{";
+        let tree = parse(src);
+        // Cursor right after { on line 7
+        let items = collect_completions(&tree, src, Point::new(7, 12));
+        let l = labels(&items);
+        assert!(l.contains(&"history"), "missing history, got {:?}", l);
+        assert!(l.contains(&"verbose"), "missing verbose, got {:?}", l);
+    }
+
+    #[test]
+    fn test_hash_key_completion_mode_detection() {
+        // Test detect_completion_mode for various patterns
+        assert_eq!(
+            detect_completion_mode("$hash{", Point::new(0, 6)),
+            CompletionMode::HashKey { var_text: "$hash".to_string() }
+        );
+        assert_eq!(
+            detect_completion_mode("$self->{", Point::new(0, 8)),
+            CompletionMode::HashKey { var_text: "$self".to_string() }
+        );
+        // Regular variable trigger should not be hash key
+        assert_eq!(
+            detect_completion_mode("$", Point::new(0, 1)),
+            CompletionMode::Variable { sigil: '$' }
+        );
+        // Arrow without brace should be method
+        assert_eq!(
+            detect_completion_mode("$obj->", Point::new(0, 6)),
+            CompletionMode::Method { invocant: "$obj".to_string() }
+        );
     }
 }

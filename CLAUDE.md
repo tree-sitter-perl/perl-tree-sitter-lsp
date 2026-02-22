@@ -20,7 +20,8 @@ cd ../tree-sitter-perl && tree-sitter generate
 - `src/main.rs` — Entry point, stdio transport
 - `src/backend.rs` — `LanguageServer` trait implementation (tower-lsp)
 - `src/document.rs` — Document store with tree-sitter parsing
-- `src/symbols.rs` — Symbol extraction, go-to-definition, hover, references
+- `src/analysis.rs` — Core analysis: symbols, definitions, references, highlights, completion, folding
+- `src/symbols.rs` — LSP adapter layer (converts analysis types to LSP types)
 
 ## Key Dependencies
 
@@ -50,7 +51,15 @@ python3 /tmp/test_lsp2.py ./target/debug/perl-lsp ./test_files/sample.pl
 
 ## LSP Capabilities (current)
 
-- `textDocument/documentSymbol` — outline of subs, packages, variables
-- `textDocument/definition` — go-to-def for variables (scope-aware) and subs
-- `textDocument/references` — find all refs (file-wide text match)
-- `textDocument/hover` — shows declaration line
+- `textDocument/documentSymbol` — outline of subs, packages, variables, classes (with fields/methods as children)
+- `textDocument/definition` — go-to-def for variables (scope-aware), subs, methods (type-inferred), packages/classes
+- `textDocument/references` — scope-aware for variables, file-wide for functions/packages
+- `textDocument/hover` — shows declaration line, class-aware for methods
+- `textDocument/rename` — scope-aware for variables, file-wide for functions/packages
+- `textDocument/completion` — scope-aware variables (cross-sigil forms), subs, methods (type-inferred), packages
+- `textDocument/documentHighlight` — highlight all occurrences with read/write distinction
+- `textDocument/selectionRange` — expand/shrink selection via tree-sitter node hierarchy
+- `textDocument/foldingRange` — blocks, subs, classes, pod sections
+- `textDocument/formatting` — shells out to perltidy (respects .perltidyrc)
+- `textDocument/semanticTokens/full` — variable tokens with modifiers: scalar/array/hash, declaration, modification
+- Diagnostics — infrastructure in place, readonly write detection deferred to framework stubs
