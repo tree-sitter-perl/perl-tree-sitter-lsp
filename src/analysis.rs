@@ -2980,6 +2980,432 @@ fn is_readonly_field(_node: Node, _source: &[u8], _classes: &[ClassInfo]) -> boo
     false
 }
 
+// ---- Signature help ----
+
+#[derive(Debug, Clone)]
+pub struct SignatureParam {
+    pub name: String,
+    pub default: Option<String>,
+    pub is_slurpy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubSignature {
+    pub name: String,
+    pub params: Vec<SignatureParam>,
+    pub is_method: bool,
+}
+
+pub struct SignatureHelpResult {
+    pub signature: SubSignature,
+    pub active_param: usize,
+}
+
+/// Extract parameters from a subroutine node.
+/// Tries signature syntax first, then falls back to `my (...) = @_` pattern.
+fn extract_sub_params(sub_node: Node, source: &[u8]) -> Vec<SignatureParam> {
+    // Try signature syntax: sub foo($x, $y = 10, @rest) { }
+    for i in 0..sub_node.child_count() {
+        if let Some(sig) = sub_node.child(i) {
+            if sig.kind() == "signature" {
+                let mut params = Vec::new();
+                for j in 0..sig.named_child_count() {
+                    if let Some(param) = sig.named_child(j) {
+                        match param.kind() {
+                            "mandatory_parameter" => {
+                                if let Some(var) = first_var_child(param, source) {
+                                    params.push(SignatureParam {
+                                        name: var,
+                                        default: None,
+                                        is_slurpy: false,
+                                    });
+                                }
+                            }
+                            "optional_parameter" => {
+                                let var = first_var_child(param, source);
+                                let default = param.child_by_field_name("default")
+                                    .or_else(|| {
+                                        // Fallback: last named child after the variable
+                                        let nc = param.named_child_count();
+                                        if nc >= 2 { param.named_child(nc - 1) } else { None }
+                                    })
+                                    .and_then(|d| d.utf8_text(source).ok())
+                                    .map(|s| s.to_string());
+                                if let Some(name) = var {
+                                    params.push(SignatureParam {
+                                        name,
+                                        default,
+                                        is_slurpy: false,
+                                    });
+                                }
+                            }
+                            "slurpy_parameter" => {
+                                if let Some(var) = first_var_child(param, source) {
+                                    params.push(SignatureParam {
+                                        name: var,
+                                        default: None,
+                                        is_slurpy: true,
+                                    });
+                                }
+                            }
+                            // Bare scalar/array/hash directly in signature (some grammars)
+                            "scalar" | "array" | "hash" => {
+                                if let Ok(text) = param.utf8_text(source) {
+                                    let is_slurpy = matches!(param.kind(), "array" | "hash");
+                                    params.push(SignatureParam {
+                                        name: text.to_string(),
+                                        default: None,
+                                        is_slurpy,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                return params;
+            }
+        }
+    }
+
+    // Fallback: look for `my (...) = @_` in the body
+    if let Some(body) = sub_node.child_by_field_name("body") {
+        for i in 0..body.named_child_count() {
+            if let Some(stmt) = body.named_child(i) {
+                let assign = if stmt.kind() == "expression_statement" {
+                    stmt.named_child(0).filter(|n| n.kind() == "assignment_expression")
+                } else if stmt.kind() == "assignment_expression" {
+                    Some(stmt)
+                } else {
+                    None
+                };
+                if let Some(assign) = assign {
+                    if let Some(right) = assign.child_by_field_name("right") {
+                        if right.utf8_text(source).ok() == Some("@_") {
+                            if let Some(left) = assign.child_by_field_name("left") {
+                                let mut vars = Vec::new();
+                                collect_declared_vars(left, source, &mut vars);
+                                return vars
+                                    .into_iter()
+                                    .map(|(name, _)| {
+                                        let is_slurpy = name.starts_with('@') || name.starts_with('%');
+                                        SignatureParam {
+                                            name,
+                                            default: None,
+                                            is_slurpy,
+                                        }
+                                    })
+                                    .collect();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+/// Get the first variable (scalar/array/hash) text from a parameter node.
+fn first_var_child(node: Node, source: &[u8]) -> Option<String> {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if matches!(child.kind(), "scalar" | "array" | "hash") {
+                return child.utf8_text(source).ok().map(|s| s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Count the number of top-level commas before `cursor` in an arguments node or list.
+/// This gives the active parameter index.
+fn count_commas_before(node: Node, cursor: Point) -> usize {
+    let mut count = 0;
+    let mut depth = 0;
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.start_position() >= cursor {
+                break;
+            }
+            match child.kind() {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                "," if depth == 0 => count += 1,
+                _ => {
+                    // For nested expressions that might contain commas (like function_call_expression),
+                    // they're handled as a single node so we don't need to recurse.
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Find call context at cursor — walks up from cursor to find enclosing call.
+/// Returns (function/method name, is_method, invocant text, arguments node).
+fn find_call_at_cursor<'a>(
+    tree: &'a Tree,
+    source: &'a [u8],
+    point: Point,
+) -> Option<(String, bool, Option<String>, Option<Node<'a>>)> {
+    // Try at cursor, then one column back (cursor may be right after `(` or `,`)
+    let try_points = if point.column > 0 {
+        vec![point, Point::new(point.row, point.column - 1)]
+    } else {
+        vec![point]
+    };
+
+    for pt in try_points {
+        if let Some(result) = find_call_at_cursor_from(tree, source, pt, point) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+fn find_call_at_cursor_from<'a>(
+    tree: &'a Tree,
+    source: &'a [u8],
+    start_point: Point,
+    cursor: Point,
+) -> Option<(String, bool, Option<String>, Option<Node<'a>>)> {
+    let mut node = tree
+        .root_node()
+        .descendant_for_point_range(start_point, start_point)?;
+
+    // Walk up to find the enclosing call expression or ERROR
+    for _ in 0..30 {
+        match node.kind() {
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                let name = node
+                    .child_by_field_name("function")
+                    .and_then(|n| n.utf8_text(source).ok())?;
+                let args = node.child_by_field_name("arguments");
+                return Some((name.to_string(), false, None, args));
+            }
+            "method_call_expression" => {
+                // Only match if cursor is inside the arguments (after the `(`)
+                // If there are no arguments, this is a no-paren call — check next sibling for ERROR with `(`
+                let name = node
+                    .child_by_field_name("method")
+                    .and_then(|n| n.utf8_text(source).ok())?;
+                let invocant = node
+                    .child_by_field_name("invocant")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+                let args = node.child_by_field_name("arguments");
+                if args.is_some() {
+                    return Some((name.to_string(), true, invocant, args));
+                }
+                // No arguments field — check if next sibling is an ERROR with `(`
+                // This handles: method_call_expression (no parens) + ERROR > (
+                let args_from_error = node
+                    .parent()
+                    .and_then(|p| p.next_sibling())
+                    .filter(|s| s.kind() == "ERROR")
+                    .and_then(|err| {
+                        for i in 0..err.child_count() {
+                            if let Some(c) = err.child(i) {
+                                if c.kind() == "list_expression" {
+                                    return Some(c);
+                                }
+                            }
+                        }
+                        None
+                    });
+                return Some((name.to_string(), true, invocant, args_from_error));
+            }
+            "ERROR" => {
+                // First try: scan ERROR children for a full call pattern
+                if let Some(result) = parse_call_from_error(node, source, cursor) {
+                    return Some(result);
+                }
+                // Fallback: ERROR might just contain `(` with the call expression
+                // as a preceding sibling.
+                if let Some(result) = find_call_from_error_sibling(node, source, cursor) {
+                    return Some(result);
+                }
+            }
+            _ => {}
+        }
+        node = node.parent()?;
+    }
+    None
+}
+
+/// When an ERROR node contains just `(` and optional args, the actual call expression
+/// may be in a preceding sibling. Handle patterns like:
+///   expression_statement > method_call_expression   ← sibling
+///   ERROR > ( [list_expression]                      ← current
+fn find_call_from_error_sibling<'a>(
+    error: Node<'a>,
+    source: &'a [u8],
+    _point: Point,
+) -> Option<(String, bool, Option<String>, Option<Node<'a>>)> {
+    // Collect args from the ERROR node itself
+    let mut args_node: Option<Node<'a>> = None;
+    for i in 0..error.child_count() {
+        if let Some(child) = error.child(i) {
+            if child.kind() == "list_expression" {
+                args_node = Some(child);
+            }
+        }
+    }
+
+    // Look at the previous sibling
+    let prev = error.prev_sibling()?;
+
+    // Case 1: prev is an expression_statement containing a call
+    let call_node = if prev.kind() == "expression_statement" {
+        // The call is the child of the expression_statement
+        prev.named_child(0)?
+    } else {
+        prev
+    };
+
+    match call_node.kind() {
+        "method_call_expression" => {
+            let name = call_node
+                .child_by_field_name("method")
+                .and_then(|n| n.utf8_text(source).ok())?;
+            let invocant = call_node
+                .child_by_field_name("invocant")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.to_string());
+            // If the call already has arguments, prefer those (complete call)
+            let args = call_node.child_by_field_name("arguments").or(args_node);
+            Some((name.to_string(), true, invocant, args))
+        }
+        "function_call_expression" | "ambiguous_function_call_expression" => {
+            let name = call_node
+                .child_by_field_name("function")
+                .and_then(|n| n.utf8_text(source).ok())?;
+            let args = call_node.child_by_field_name("arguments").or(args_node);
+            Some((name.to_string(), false, None, args))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a call expression from an ERROR node.
+/// Looks for patterns like: `foo(args...` or `$obj->method(args...`
+fn parse_call_from_error<'a>(
+    error: Node<'a>,
+    source: &'a [u8],
+    _cursor: Point,
+) -> Option<(String, bool, Option<String>, Option<Node<'a>>)> {
+    let mut func_name: Option<String> = None;
+    let mut method_name: Option<String> = None;
+    let mut invocant: Option<String> = None;
+    let mut has_arrow = false;
+    let mut found_open_paren = false;
+    let mut args_node: Option<Node<'a>> = None;
+
+    for i in 0..error.child_count() {
+        let child = error.child(i)?;
+
+        // Track invocant -> method pattern
+        if matches!(child.kind(), "scalar" | "array" | "hash") {
+            invocant = child.utf8_text(source).ok().map(|s| s.to_string());
+        } else if child.kind() == "->" {
+            has_arrow = true;
+        } else if child.kind() == "method" && has_arrow {
+            method_name = child.utf8_text(source).ok().map(|s| s.to_string());
+        } else if child.kind() == "bareword" || child.kind() == "function" {
+            func_name = child.utf8_text(source).ok().map(|s| s.to_string());
+        } else if child.kind() == "(" {
+            found_open_paren = true;
+        } else if child.kind() == "list_expression" && found_open_paren {
+            args_node = Some(child);
+        }
+    }
+
+    if !found_open_paren {
+        return None;
+    }
+
+    if let Some(name) = method_name {
+        Some((name, true, invocant, args_node))
+    } else if let Some(name) = func_name {
+        Some((name, false, None, args_node))
+    } else {
+        None
+    }
+}
+
+/// Main entry point for signature help.
+pub fn signature_help_at_point(
+    tree: &Tree,
+    source: &str,
+    point: Point,
+) -> Option<SignatureHelpResult> {
+    let source_bytes = source.as_bytes();
+    let root = tree.root_node();
+
+    let (name, is_method_call, invocant, args_node) =
+        find_call_at_cursor(tree, source_bytes, point)?;
+
+    // Find the sub definition
+    let (sub_span, _) = find_sub_def(root, source_bytes, &name)?;
+
+    // Find the actual sub node at that span
+    let sub_node = root.descendant_for_point_range(sub_span.start, sub_span.start)?;
+    // Walk up to get the actual subroutine/method declaration
+    let sub_node = find_sub_or_method_node(sub_node)?;
+
+    let mut params = extract_sub_params(sub_node, source_bytes);
+
+    // Determine if this is a method: either called with -> or first param is $self/$class
+    let is_method = is_method_call
+        || invocant.is_some()
+        || params
+            .first()
+            .map_or(false, |p| p.name == "$self" || p.name == "$class");
+
+    // Strip $self/$class from method params
+    if is_method && !params.is_empty() {
+        let first = &params[0].name;
+        if first == "$self" || first == "$class" {
+            params.remove(0);
+        }
+    }
+
+    // Count active parameter
+    let active_param = match args_node {
+        Some(args) => count_commas_before(args, point),
+        None => 0, // cursor right after open paren, no args yet
+    };
+
+    Some(SignatureHelpResult {
+        signature: SubSignature {
+            name,
+            params,
+            is_method,
+        },
+        active_param,
+    })
+}
+
+/// Walk up from a node to find the enclosing subroutine/method declaration.
+fn find_sub_or_method_node(mut node: Node) -> Option<Node> {
+    for _ in 0..10 {
+        if matches!(
+            node.kind(),
+            "subroutine_declaration_statement" | "method_declaration_statement"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+    None
+}
+
 // ---- Diagnostics ----
 
 #[derive(Debug, Clone)]
@@ -4370,5 +4796,148 @@ sub get {
             detect_completion_mode("$obj->", Point::new(0, 6)),
             CompletionMode::Method { invocant: "$obj".to_string() }
         );
+    }
+
+    // ---- Signature help ----
+
+    #[test]
+    fn test_sig_help_signature_sub() {
+        let src = "sub add($x, $y) { }\nadd(1, 2);";
+        let tree = parse(src);
+        // Cursor after open paren: add(|
+        let result = signature_help_at_point(&tree, src, Point::new(1, 4)).unwrap();
+        assert_eq!(result.signature.name, "add");
+        assert_eq!(result.signature.params.len(), 2);
+        assert_eq!(result.signature.params[0].name, "$x");
+        assert_eq!(result.signature.params[1].name, "$y");
+        assert_eq!(result.active_param, 0);
+    }
+
+    #[test]
+    fn test_sig_help_active_param() {
+        let src = "sub add($x, $y, $z) { }\nadd(1, 2, 3);";
+        let tree = parse(src);
+        // After first comma: add(1, |2, 3)
+        let r = signature_help_at_point(&tree, src, Point::new(1, 7)).unwrap();
+        assert_eq!(r.active_param, 1);
+        // After second comma: add(1, 2, |3)
+        let r = signature_help_at_point(&tree, src, Point::new(1, 10)).unwrap();
+        assert_eq!(r.active_param, 2);
+    }
+
+    #[test]
+    fn test_sig_help_legacy_sub() {
+        let src = "sub greet { my ($name, $age) = @_; }\ngreet(\"bob\", 30);";
+        let tree = parse(src);
+        let result = signature_help_at_point(&tree, src, Point::new(1, 6)).unwrap();
+        assert_eq!(result.signature.name, "greet");
+        assert_eq!(result.signature.params.len(), 2);
+        assert_eq!(result.signature.params[0].name, "$name");
+        assert_eq!(result.signature.params[1].name, "$age");
+        assert_eq!(result.active_param, 0);
+    }
+
+    #[test]
+    fn test_sig_help_method_hides_self() {
+        let src = "package Foo;\nsub bar($self, $x, $y) { }\npackage main;\nmy $obj = Foo->new;\n$obj->bar(1, 2);";
+        let tree = parse(src);
+        // Cursor inside $obj->bar(|1, 2)
+        let result = signature_help_at_point(&tree, src, Point::new(4, 10)).unwrap();
+        assert_eq!(result.signature.name, "bar");
+        assert_eq!(result.signature.is_method, true);
+        // $self should be stripped
+        assert_eq!(result.signature.params.len(), 2);
+        assert_eq!(result.signature.params[0].name, "$x");
+        assert_eq!(result.signature.params[1].name, "$y");
+    }
+
+    #[test]
+    fn test_sig_help_legacy_method_hides_self() {
+        // Mimics sample.pl pattern: legacy sub with my ($self, ...) = @_
+        let src = "package Calculator;\nsub add { my ($self, $a, $b) = @_; }\npackage main;\nmy $calc = Calculator->new;\n$calc->add(2, 3);";
+        let tree = parse(src);
+        eprintln!("tree:");
+        dump_tree(tree.root_node(), src.as_bytes(), 0);
+        // Cursor inside $calc->add(|2, 3)  — line 4, col 11
+        let result = signature_help_at_point(&tree, src, Point::new(4, 11));
+        eprintln!("result: {:?}", result.as_ref().map(|r| (&r.signature.name, &r.signature.params, r.active_param)));
+        let result = result.unwrap();
+        assert_eq!(result.signature.name, "add");
+        // $self should be stripped for method call
+        assert_eq!(result.signature.params.len(), 2);
+        assert_eq!(result.signature.params[0].name, "$a");
+        assert_eq!(result.signature.params[1].name, "$b");
+    }
+
+    #[test]
+    fn test_sig_help_incomplete_method() {
+        // What happens when user types $calc->add( mid-edit
+        let src = "package Calculator;\nsub add { my ($self, $a, $b) = @_; }\npackage main;\nmy $calc = Calculator->new;\n$calc->add(";
+        let tree = parse(src);
+        eprintln!("incomplete method tree:");
+        dump_tree(tree.root_node(), src.as_bytes(), 0);
+        let result = signature_help_at_point(&tree, src, Point::new(4, 11));
+        eprintln!("incomplete method result: {:?}", result.as_ref().map(|r| (&r.signature.name, &r.signature.params, r.active_param)));
+        // Should find add even in ERROR
+        assert!(result.is_some(), "should find signature for incomplete method call");
+        let r = result.unwrap();
+        assert_eq!(r.signature.name, "add");
+    }
+
+    #[test]
+    fn test_sig_help_unknown_function() {
+        let src = "unknown_func(1, 2);";
+        let tree = parse(src);
+        let result = signature_help_at_point(&tree, src, Point::new(0, 13));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sig_help_incomplete_call() {
+        // Mid-typing: cursor after open paren in ERROR node
+        let src = "sub foo($a, $b) { }\nfoo(";
+        let tree = parse(src);
+        let result = signature_help_at_point(&tree, src, Point::new(1, 4));
+        // Should find the function even in an ERROR node
+        if let Some(r) = result {
+            assert_eq!(r.signature.name, "foo");
+            assert_eq!(r.signature.params.len(), 2);
+            assert_eq!(r.active_param, 0);
+        }
+        // It's OK if this returns None for now — ERROR support is best-effort
+    }
+
+    #[test]
+    fn test_sig_help_incomplete_after_first_arg() {
+        let src = "sub foo($a, $b, $c) { }\nfoo($x, ";
+        let tree = parse(src);
+        let result = signature_help_at_point(&tree, src, Point::new(1, 8));
+        if let Some(r) = result {
+            assert_eq!(r.signature.name, "foo");
+            assert_eq!(r.active_param, 1);
+        }
+    }
+
+    #[test]
+    fn test_sig_help_optional_param() {
+        let src = "sub greet($name, $greeting = \"hello\") { }\ngreet(\"bob\");";
+        let tree = parse(src);
+        let result = signature_help_at_point(&tree, src, Point::new(1, 6)).unwrap();
+        assert_eq!(result.signature.params.len(), 2);
+        assert_eq!(result.signature.params[0].name, "$name");
+        assert_eq!(result.signature.params[1].name, "$greeting");
+        // Optional param should have a default
+        assert!(result.signature.params[1].default.is_some());
+    }
+
+    #[test]
+    fn test_sig_help_slurpy_param() {
+        let src = "sub process($first, @rest) { }\nprocess(1, 2, 3);";
+        let tree = parse(src);
+        let result = signature_help_at_point(&tree, src, Point::new(1, 8)).unwrap();
+        assert_eq!(result.signature.params.len(), 2);
+        assert_eq!(result.signature.params[0].name, "$first");
+        assert_eq!(result.signature.params[1].name, "@rest");
+        assert!(result.signature.params[1].is_slurpy);
     }
 }

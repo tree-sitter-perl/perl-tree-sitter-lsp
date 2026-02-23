@@ -65,6 +65,11 @@ impl LanguageServer for Backend {
                     ]),
                     ..Default::default()
                 }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: Some(vec![")".to_string()]),
+                    work_done_progress_options: Default::default(),
+                }),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
@@ -209,6 +214,19 @@ impl LanguageServer for Backend {
         } else {
             Ok(Some(CompletionResponse::Array(items)))
         }
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> Result<Option<SignatureHelp>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let doc = match self.documents.get(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        Ok(symbols::signature_help(&doc.tree, &doc.text, pos))
     }
 
     async fn document_highlight(

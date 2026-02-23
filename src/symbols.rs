@@ -199,6 +199,56 @@ pub fn folding_ranges(tree: &Tree, source: &str) -> Vec<FoldingRange> {
         .collect()
 }
 
+// ---- Signature help ----
+
+pub fn signature_help(tree: &Tree, text: &str, pos: Position) -> Option<SignatureHelp> {
+    let result = analysis::signature_help_at_point(tree, text, position_to_point(pos))?;
+    let sig = &result.signature;
+
+    let params: Vec<ParameterInformation> = sig
+        .params
+        .iter()
+        .map(|p| {
+            let label = if let Some(ref default) = p.default {
+                format!("{} = {}", p.name, default)
+            } else {
+                p.name.clone()
+            };
+            ParameterInformation {
+                label: ParameterLabel::Simple(label),
+                documentation: None,
+            }
+        })
+        .collect();
+
+    let label = format!(
+        "{}({})",
+        sig.name,
+        sig.params
+            .iter()
+            .map(|p| {
+                if let Some(ref default) = p.default {
+                    format!("{} = {}", p.name, default)
+                } else {
+                    p.name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label,
+            documentation: None,
+            parameters: Some(params),
+            active_parameter: Some(result.active_param as u32),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(result.active_param as u32),
+    })
+}
+
 // ---- Semantic tokens ----
 
 // Legend indices — must match the order in SEMANTIC_TOKEN_TYPES / SEMANTIC_TOKEN_MODIFIERS

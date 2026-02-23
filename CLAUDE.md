@@ -57,6 +57,7 @@ python3 /tmp/test_lsp2.py ./target/debug/perl-lsp ./test_files/sample.pl
 - `textDocument/hover` — shows declaration line, class-aware for methods
 - `textDocument/rename` — scope-aware for variables, file-wide for functions/packages
 - `textDocument/completion` — scope-aware variables (cross-sigil forms), subs, methods (type-inferred), packages
+- `textDocument/signatureHelp` — parameter info for subs/methods (signature syntax + legacy @_ pattern), triggers on `(` and `,`
 - `textDocument/documentHighlight` — highlight all occurrences with read/write distinction
 - `textDocument/selectionRange` — expand/shrink selection via tree-sitter node hierarchy
 - `textDocument/foldingRange` — blocks, subs, classes, pod sections

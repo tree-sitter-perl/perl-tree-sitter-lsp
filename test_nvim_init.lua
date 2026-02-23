@@ -113,6 +113,34 @@ vim.api.nvim_create_autocmd("LspAttach", {
       callback = function() sel_stack = {} end,
     })
 
+    -- Signature help: auto-trigger on ( and , ; re-trigger while inside parens
+    vim.keymap.set("i", "<C-s>", vim.lsp.buf.signature_help, opts)
+    vim.api.nvim_create_autocmd("TextChangedI", {
+      buffer = buf,
+      callback = function()
+        local col = vim.fn.col(".") - 1
+        if col <= 0 then return end
+        local line = vim.api.nvim_get_current_line()
+        local before = line:sub(1, col)
+        local char = before:sub(-1)
+        -- Always trigger right after ( or ,
+        if char == "(" or char == "," then
+          vim.schedule(function()
+            if vim.fn.mode() == "i" then vim.lsp.buf.signature_help() end
+          end)
+          return
+        end
+        -- For any other char (space, letters, etc.), re-trigger if inside parens
+        local opens = select(2, before:gsub("%(", ""))
+        local closes = select(2, before:gsub("%)", ""))
+        if opens > closes then
+          vim.schedule(function()
+            if vim.fn.mode() == "i" then vim.lsp.buf.signature_help() end
+          end)
+        end
+      end,
+    })
+
     -- Format
     vim.keymap.set("n", "<leader>f", vim.lsp.buf.format, opts)
 
