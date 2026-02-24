@@ -2149,6 +2149,334 @@ fn owners_match(a: &HashKeyOwner, b: &HashKeyOwner) -> bool {
     }
 }
 
+// ---- Keyval arg completion ----
+
+/// Count both `,` and `=>` separators before cursor at top-level depth.
+/// Even = key position, odd = value position.
+fn count_separators_before(node: Node, cursor: Point) -> usize {
+    let mut count = 0;
+    let mut depth = 0;
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.start_position() >= cursor {
+                break;
+            }
+            match child.kind() {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                "," | "=>" if depth == 0 => count += 1,
+                _ => {}
+            }
+        }
+    }
+    count
+}
+
+/// Collect keys already used at the call site (barewords/strings before `=>`).
+fn collect_used_keys_at_callsite(args: Node, source: &[u8]) -> std::collections::HashSet<String> {
+    let mut used = std::collections::HashSet::new();
+    for i in 0..args.child_count() {
+        if let Some(child) = args.child(i) {
+            // Check if next sibling is `=>`
+            if let Some(next) = child.next_sibling() {
+                if next.kind() == "=>" {
+                    if let Some((key, _)) = extract_key_text(child, source) {
+                        used.insert(key);
+                    }
+                }
+            }
+        }
+    }
+    used
+}
+
+/// Collect hash keys accessed via a specific base name inside a subtree.
+/// E.g., for base_name "args", finds keys from `$args{host}`, `$args{port}`, etc.
+fn collect_hash_keys_for_base_name(
+    node: Node,
+    source: &[u8],
+    base_name: &str,
+    keys: &mut Vec<String>,
+) {
+    if node.kind() == "hash_element_expression" {
+        if let Some(var_text) = get_hash_from_element(node, source) {
+            // Check if the base name matches (strip sigil)
+            let var_base = get_varname_from_text(&var_text);
+            if var_base == base_name {
+                if let Some(key_node) = node.child_by_field_name("key") {
+                    if let Some((key_text, is_dynamic)) = extract_key_text(key_node, source) {
+                        if !is_dynamic {
+                            keys.push(key_text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_hash_keys_for_base_name(child, source, base_name, keys);
+        }
+    }
+}
+
+/// Extract the bare variable name from a text like "$args", "%opts", "@list".
+fn get_varname_from_text(text: &str) -> &str {
+    if text.starts_with('$') || text.starts_with('@') || text.starts_with('%') {
+        &text[1..]
+    } else {
+        text
+    }
+}
+
+/// Try to offer keyval arg completions if we're at a call site in key position.
+fn collect_keyval_arg_completions(
+    tree: &Tree,
+    source: &[u8],
+    point: Point,
+) -> Vec<CompletionCandidate> {
+    let (name, is_method, invocant, args_node) =
+        match find_call_at_cursor(tree, source, point) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+    // Check key position: even separator count = key, odd = value
+    if let Some(ref args) = args_node {
+        let sep_count = count_separators_before(*args, point);
+        if sep_count % 2 != 0 {
+            return Vec::new(); // value position
+        }
+    }
+
+    let root = tree.root_node();
+
+    // Resolve the class name for scoped lookup
+    let class_name = if is_method {
+        invocant.as_deref().and_then(|inv| {
+            // Bareword invocant = class name directly (e.g. Calculator->new)
+            if !inv.starts_with('$') { return Some(inv); }
+            // Variable invocant = try to infer class from bless pattern
+            infer_class_from_variable(root, source, inv)
+        }).map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    // For core class constructors (class Foo { field $x :param; }),
+    // collect :param fields — there's no explicit sub new
+    if name == "new" {
+        if let Some(ref cn) = class_name {
+            if let Some(candidates) = collect_class_param_completions(root, source, cn, &args_node) {
+                if !candidates.is_empty() {
+                    return candidates;
+                }
+            }
+        }
+    }
+
+    // Find the sub definition, scoped to class if known
+    let sub_def = if let Some(ref cn) = class_name {
+        find_sub_def_in_scope(root, source, &name, cn)
+    } else {
+        find_sub_def(root, source, &name)
+    };
+
+    let (sub_span, _) = match sub_def {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let sub_node = match root
+        .descendant_for_point_range(sub_span.start, sub_span.start)
+        .and_then(find_sub_or_method_node)
+    {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+
+    let params = extract_sub_params(sub_node, source);
+
+    // Find slurpy %hash param
+    let slurpy = params
+        .iter()
+        .find(|p| p.is_slurpy && p.name.starts_with('%'));
+    let slurpy_name = match slurpy {
+        Some(p) => get_varname_from_text(&p.name),
+        None => return Vec::new(),
+    };
+
+    // Collect keys accessed in the sub body
+    let body = match sub_node.child_by_field_name("body") {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let mut keys = Vec::new();
+    collect_hash_keys_for_base_name(body, source, slurpy_name, &mut keys);
+
+    // Deduplicate
+    keys.sort();
+    keys.dedup();
+
+    // Filter out already-typed keys at the call site
+    let used = args_node
+        .map(|a| collect_used_keys_at_callsite(a, source))
+        .unwrap_or_default();
+
+    keys.into_iter()
+        .filter(|k| !used.contains(k))
+        .map(|k| CompletionCandidate {
+            label: format!("{} =>", k),
+            kind: SymbolKind::Variable,
+            detail: Some(format!("{}(%{})", name, slurpy_name)),
+            insert_text: Some(format!("{} => ", k)),
+            sort_priority: 0,
+        })
+        .collect()
+}
+
+/// Collect :param field names from a core class as keyval completions.
+fn collect_class_param_completions(
+    root: Node,
+    source: &[u8],
+    class_name: &str,
+    args_node: &Option<Node>,
+) -> Option<Vec<CompletionCandidate>> {
+    let class_node = find_class_node(root, source, class_name)?;
+    let class_info = parse_class_node(class_node, source)?;
+    let param_fields: Vec<&FieldInfo> = class_info
+        .fields
+        .iter()
+        .filter(|f| f.attributes.contains(&"param".to_string()))
+        .collect();
+    if param_fields.is_empty() {
+        return None;
+    }
+    let used = match args_node {
+        Some(a) => collect_used_keys_at_callsite(*a, source),
+        None => std::collections::HashSet::new(),
+    };
+    let candidates = param_fields
+        .into_iter()
+        .map(|f| f.name.trim_start_matches('$').trim_start_matches('@').trim_start_matches('%').to_string())
+        .filter(|k| !used.contains(k))
+        .map(|k| CompletionCandidate {
+            label: format!("{} =>", k),
+            kind: SymbolKind::Variable,
+            detail: Some(format!("{}->new(:param)", class_name)),
+            insert_text: Some(format!("{} => ", k)),
+            sort_priority: 0,
+        })
+        .collect();
+    Some(candidates)
+}
+
+/// Find a class_statement node by name.
+fn find_class_node<'a>(node: Node<'a>, source: &[u8], name: &str) -> Option<Node<'a>> {
+    if node.kind() == "class_statement" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            if name_node.utf8_text(source).ok() == Some(name) {
+                return Some(node);
+            }
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if let Some(found) = find_class_node(child, source, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Find a sub/method definition scoped to a specific package or class.
+fn find_sub_def_in_scope(root: Node, source: &[u8], sub_name: &str, scope_name: &str) -> Option<(Span, Span)> {
+    find_sub_def_in_scope_walk(root, source, sub_name, scope_name, &mut None)
+}
+
+fn find_sub_def_in_scope_walk(
+    node: Node,
+    source: &[u8],
+    sub_name: &str,
+    scope_name: &str,
+    current_package: &mut Option<String>,
+) -> Option<(Span, Span)> {
+    match node.kind() {
+        "package_statement" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(text) = name_node.utf8_text(source) {
+                    *current_package = Some(text.to_string());
+                }
+            }
+        }
+        "class_statement" => {
+            let class_name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok());
+            if class_name == Some(scope_name) {
+                // Search within this class block
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        if child.kind() == "block" {
+                            if let Some(result) = find_sub_def_walk(child, source, sub_name) {
+                                return Some(result);
+                            }
+                        }
+                    }
+                }
+            }
+            return None; // Don't recurse into other classes
+        }
+        "subroutine_declaration_statement" | "method_declaration_statement" => {
+            if current_package.as_deref() == Some(scope_name) {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    if name_node.utf8_text(source).ok() == Some(sub_name) {
+                        return Some((node_to_span(node), node_to_span(name_node)));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.kind() == "class_statement" {
+                // Handle class separately (don't inherit current_package into it)
+                let class_name = child.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok());
+                if class_name == Some(scope_name) {
+                    for j in 0..child.child_count() {
+                        if let Some(block) = child.child(j) {
+                            if block.kind() == "block" {
+                                if let Some(result) = find_sub_def_walk(block, source, sub_name) {
+                                    return Some(result);
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(result) = find_sub_def_in_scope_walk(child, source, sub_name, scope_name, current_package) {
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
+/// Try to infer the class name from a variable's bless pattern.
+fn infer_class_from_variable<'a>(root: Node, source: &[u8], var_text: &str) -> Option<&'a str> {
+    // TODO: trace $var back to bless { }, $class or ClassName->new(...)
+    // For now, return None — variables fall back to global sub search
+    let _ = (root, source, var_text);
+    None
+}
+
 // ---- Completion ----
 
 pub fn collect_completions(tree: &Tree, source: &str, point: Point) -> Vec<CompletionCandidate> {
@@ -2167,6 +2495,8 @@ pub fn collect_completions(tree: &Tree, source: &str, point: Point) -> Vec<Compl
         }
         CompletionMode::General => {
             let mut candidates = Vec::new();
+            // Keyval arg completions (if inside a call at key position)
+            candidates.extend(collect_keyval_arg_completions(tree, source_bytes, point));
             // Variables (all sigils)
             for sigil in ['$', '@', '%'] {
                 candidates.extend(collect_variable_completions(
@@ -2702,17 +3032,61 @@ fn collect_method_completions(
     invocant: &str,
     point: Point,
 ) -> Vec<CompletionCandidate> {
-    let mut candidates = Vec::new();
+    let root = tree.root_node();
 
-    // Try type inference
-    if let Some(class_name) = infer_variable_class(tree.root_node(), source, invocant, point) {
+    // Resolve class name: bareword invocant = direct class name, variable = type inference
+    let class_name = if !invocant.starts_with('$') && !invocant.starts_with('@') && !invocant.starts_with('%') {
+        Some(invocant.to_string())
+    } else {
+        infer_variable_class(root, source, invocant, point)
+    };
+
+    if let Some(ref cn) = class_name {
+        // Check if it's a core class (class_statement)
+        if let Some(class_node) = find_class_node(root, source, cn) {
+            let mut candidates = Vec::new();
+            // Implicit new for core classes
+            candidates.push(CompletionCandidate {
+                label: "new".to_string(),
+                kind: SymbolKind::Method,
+                detail: Some(format!("{}->new", cn)),
+                insert_text: None,
+                sort_priority: 0,
+            });
+            // Collect declared methods from the class block
+            for i in 0..class_node.child_count() {
+                if let Some(child) = class_node.child(i) {
+                    if child.kind() == "block" {
+                        collect_class_methods(child, source, cn, &mut candidates);
+                    }
+                }
+            }
+            return candidates;
+        }
+
+        // Check if it's a package — collect subs scoped to that package
+        let scoped = collect_package_subs(root, source, cn);
+        if !scoped.is_empty() {
+            return scoped;
+        }
+
+        // Try extract_classes as fallback (handles class methods found via type inference)
         let classes = extract_classes(tree, std::str::from_utf8(source).unwrap_or(""));
-        if let Some(class) = classes.iter().find(|c| c.name == class_name) {
+        if let Some(class) = classes.iter().find(|c| c.name == *cn) {
+            let mut candidates = Vec::new();
+            // Implicit new for core classes
+            candidates.push(CompletionCandidate {
+                label: "new".to_string(),
+                kind: SymbolKind::Method,
+                detail: Some(format!("{}->new", cn)),
+                insert_text: None,
+                sort_priority: 0,
+            });
             for method in &class.methods {
                 candidates.push(CompletionCandidate {
                     label: method.name.clone(),
                     kind: SymbolKind::Method,
-                    detail: Some(class_name.clone()),
+                    detail: Some(cn.clone()),
                     insert_text: None,
                     sort_priority: 0,
                 });
@@ -2722,7 +3096,80 @@ fn collect_method_completions(
     }
 
     // Fall back: all subs and methods in file
-    collect_all_subs(tree.root_node(), source)
+    collect_all_subs(root, source)
+}
+
+/// Collect method declarations from a class block
+fn collect_class_methods(block: Node, source: &[u8], class_name: &str, out: &mut Vec<CompletionCandidate>) {
+    for i in 0..block.child_count() {
+        if let Some(child) = block.child(i) {
+            if child.kind() == "method_declaration_statement" {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    if let Ok(name) = name_node.utf8_text(source) {
+                        out.push(CompletionCandidate {
+                            label: name.to_string(),
+                            kind: SymbolKind::Method,
+                            detail: Some(class_name.to_string()),
+                            insert_text: None,
+                            sort_priority: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Collect subs defined under a specific package
+fn collect_package_subs(root: Node, source: &[u8], package_name: &str) -> Vec<CompletionCandidate> {
+    let mut candidates = Vec::new();
+    let mut current_package: Option<String> = None;
+    collect_package_subs_walk(root, source, package_name, &mut current_package, &mut candidates);
+    candidates
+}
+
+fn collect_package_subs_walk(
+    node: Node,
+    source: &[u8],
+    package_name: &str,
+    current_package: &mut Option<String>,
+    out: &mut Vec<CompletionCandidate>,
+) {
+    match node.kind() {
+        "package_statement" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(text) = name_node.utf8_text(source) {
+                    *current_package = Some(text.to_string());
+                }
+            }
+        }
+        "subroutine_declaration_statement" | "method_declaration_statement" => {
+            if current_package.as_deref() == Some(package_name) {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Ok(name) = name_node.utf8_text(source) {
+                        let is_method = node.kind() == "method_declaration_statement";
+                        out.push(CompletionCandidate {
+                            label: name.to_string(),
+                            kind: if is_method { SymbolKind::Method } else { SymbolKind::Function },
+                            detail: Some(package_name.to_string()),
+                            insert_text: None,
+                            sort_priority: 0,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            // Don't recurse into class blocks — they have their own handler
+            if child.kind() != "class_statement" {
+                collect_package_subs_walk(child, source, package_name, current_package, out);
+            }
+        }
+    }
 }
 
 fn collect_all_subs(node: Node, source: &[u8]) -> Vec<CompletionCandidate> {
@@ -3166,6 +3613,25 @@ fn find_call_at_cursor<'a>(
             return Some(result);
         }
     }
+
+    // Fallback: cursor may be in trailing whitespace after an ERROR node.
+    // Walk root's children for nearby ERROR nodes that end on the same line.
+    let root = tree.root_node();
+    for i in 0..root.child_count() {
+        if let Some(child) = root.child(i) {
+            if child.kind() == "ERROR"
+                && child.end_position().row == point.row
+                && child.end_position() <= point
+            {
+                if let Some(result) = parse_call_from_error(child, source, point) {
+                    return Some(result);
+                }
+                if let Some(result) = find_call_from_error_sibling(child, source, point) {
+                    return Some(result);
+                }
+            }
+        }
+    }
     None
 }
 
@@ -3289,6 +3755,11 @@ fn find_call_from_error_sibling<'a>(
             let args = call_node.child_by_field_name("arguments").or(args_node);
             Some((name.to_string(), false, None, args))
         }
+        // Bare function name: expression_statement > bareword("new") + ERROR > (
+        "bareword" => {
+            let name = call_node.utf8_text(source).ok()?;
+            Some((name.to_string(), false, None, args_node))
+        }
         _ => None,
     }
 }
@@ -3311,10 +3782,14 @@ fn parse_call_from_error<'a>(
         let child = error.child(i)?;
 
         // Track invocant -> method pattern
-        if matches!(child.kind(), "scalar" | "array" | "hash") {
+        if matches!(child.kind(), "scalar" | "array" | "hash" | "package") {
             invocant = child.utf8_text(source).ok().map(|s| s.to_string());
         } else if child.kind() == "->" {
             has_arrow = true;
+            // If we previously saw a bareword as func_name, it's actually the invocant
+            if invocant.is_none() {
+                invocant = func_name.take();
+            }
         } else if child.kind() == "method" && has_arrow {
             method_name = child.utf8_text(source).ok().map(|s| s.to_string());
         } else if child.kind() == "bareword" || child.kind() == "function" {
@@ -3335,6 +3810,26 @@ fn parse_call_from_error<'a>(
     } else if let Some(name) = func_name {
         Some((name, false, None, args_node))
     } else {
+        // Fallback: tree-sitter sometimes drops barewords from ERROR nodes.
+        // Recover the function name from source text before the `(`.
+        let paren_byte = error.child(0)
+            .filter(|c| c.kind() == "(")
+            .map(|c| c.start_byte())
+            .or_else(|| {
+                (0..error.child_count())
+                    .filter_map(|i| error.child(i))
+                    .find(|c| c.kind() == "(")
+                    .map(|c| c.start_byte())
+            });
+        if let Some(pb) = paren_byte {
+            let start = error.start_byte();
+            if pb > start {
+                let text = std::str::from_utf8(&source[start..pb]).unwrap_or("").trim();
+                if !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                    return Some((text.to_string(), false, None, args_node));
+                }
+            }
+        }
         None
     }
 }
@@ -4939,5 +5434,134 @@ sub get {
         assert_eq!(result.signature.params[0].name, "$first");
         assert_eq!(result.signature.params[1].name, "@rest");
         assert!(result.signature.params[1].is_slurpy);
+    }
+
+    // ---- Keyval arg completion ----
+
+    #[test]
+    fn test_keyval_signature_sub() {
+        let src = "sub connect($self, %opts) {\n    my $h = $opts{host};\n    my $p = $opts{port};\n}\n$obj->connect(";
+        let tree = parse(src);
+        // Cursor right after ( — key position (line 4, col 14)
+        let candidates = collect_keyval_arg_completions(&tree, src.as_bytes(), Point::new(4, 14));
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"host =>"), "should suggest host, got: {:?}", labels);
+        assert!(labels.contains(&"port =>"), "should suggest port, got: {:?}", labels);
+    }
+
+    #[test]
+    fn test_keyval_legacy_sub() {
+        // Bare function call — tree-sitter drops "new" from ERROR, recovered from source
+        let src = "sub new {\n    my ($class, %args) = @_;\n    my $v = $args{verbose};\n}\nnew(";
+        let tree = parse(src);
+        let candidates = collect_keyval_arg_completions(&tree, src.as_bytes(), Point::new(4, 4));
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"verbose =>"), "should suggest verbose, got: {:?}", labels);
+    }
+
+    #[test]
+    fn test_keyval_value_position() {
+        // After `=>` we're in value position — no keyval completions
+        let src = "sub connect($self, %opts) {\n    $opts{host};\n}\n$obj->connect(host => ";
+        let tree = parse(src);
+        let candidates = collect_keyval_arg_completions(&tree, src.as_bytes(), Point::new(3, 22));
+        assert!(candidates.is_empty(), "should be empty in value position, got: {:?}", candidates.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_keyval_filters_used_keys() {
+        let src = "sub connect($self, %opts) {\n    $opts{host};\n    $opts{port};\n}\n$obj->connect(host => 'x', ";
+        let tree = parse(src);
+        let candidates = collect_keyval_arg_completions(&tree, src.as_bytes(), Point::new(4, 27));
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(!labels.contains(&"host =>"), "host should be filtered out");
+        assert!(labels.contains(&"port =>"), "port should still be suggested");
+    }
+
+    #[test]
+    fn test_keyval_no_slurpy() {
+        // Sub without slurpy hash — no keyval completions
+        let src = "sub add($x, $y) { }\nadd(";
+        let tree = parse(src);
+        let candidates = collect_keyval_arg_completions(&tree, src.as_bytes(), Point::new(1, 4));
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_keyval_through_general_completion() {
+        // Verify keyval candidates appear in the full completion flow (bare call)
+        let src = "sub new {\n    my ($class, %args) = @_;\n    $args{verbose};\n}\nnew(";
+        let tree = parse(src);
+        let all = collect_completions(&tree, src, Point::new(4, 4));
+        let has_keyval = all.iter().any(|c| c.label == "verbose =>");
+        assert!(has_keyval, "keyval should appear in general completions, got: {:?}", all.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_keyval_bare_call_mid_file() {
+        // Bare function call with code after it — tree splits into
+        // expression_statement > bareword("new") + ERROR > (
+        let src = "sub new {\n    my ($class, %args) = @_;\n    $args{verbose};\n}\nnew(\nmy $x = 1;\n";
+        let tree = parse(src);
+        let candidates = collect_keyval_arg_completions(&tree, src.as_bytes(), Point::new(4, 4));
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"verbose =>"), "bare call mid-file should suggest verbose, got: {:?}", labels);
+    }
+
+    #[test]
+    fn test_keyval_core_class_params() {
+        // Core class with :param fields — implicit new should suggest field names
+        let src = "use v5.38;\nclass Point {\n    field $x :param;\n    field $y :param;\n    field $label = 'pt';\n}\nPoint->new(";
+        let tree = parse(src);
+        let candidates = collect_keyval_arg_completions(&tree, src.as_bytes(), Point::new(6, 11));
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"x =>"), "should suggest x, got: {:?}", labels);
+        assert!(labels.contains(&"y =>"), "should suggest y, got: {:?}", labels);
+        // $label has no :param, should not appear
+        assert!(!labels.contains(&"label =>"), "label has no :param, should not appear");
+    }
+
+    #[test]
+    fn test_keyval_core_class_filters_used() {
+        let src = "use v5.38;\nclass Point {\n    field $x :param;\n    field $y :param;\n}\nPoint->new(x => 1, ";
+        let tree = parse(src);
+        let candidates = collect_keyval_arg_completions(&tree, src.as_bytes(), Point::new(5, 19));
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(!labels.contains(&"x =>"), "x should be filtered out");
+        assert!(labels.contains(&"y =>"), "y should still be suggested");
+    }
+
+    #[test]
+    fn test_keyval_scoped_to_class() {
+        // Two packages with sub new — should resolve to the correct one
+        let src = "package Foo;\nsub new {\n    my ($class, %args) = @_;\n    $args{alpha};\n}\npackage Bar;\nsub new {\n    my ($class, %args) = @_;\n    $args{beta};\n}\nBar->new(";
+        let tree = parse(src);
+        // Bar->new( is on line 10 (0-indexed), cursor after (
+        let candidates = collect_keyval_arg_completions(&tree, src.as_bytes(), Point::new(10, 9));
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"beta =>"), "should suggest beta (Bar's key), got: {:?}", labels);
+        assert!(!labels.contains(&"alpha =>"), "should NOT suggest alpha (Foo's key)");
+    }
+
+    #[test]
+    fn test_method_completion_core_class_has_new() {
+        // Core class (class keyword) should always suggest `new` even without explicit sub new
+        let src = "use v5.38;\nclass Point {\n    field $x :param;\n    method magnitude() { sqrt($x) }\n}\nPoint->";
+        let tree = parse(src);
+        let candidates = collect_completions(&tree, std::str::from_utf8(src.as_bytes()).unwrap(), Point::new(5, 7));
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"new"), "should suggest implicit new, got: {:?}", labels);
+        assert!(labels.contains(&"magnitude"), "should suggest declared method, got: {:?}", labels);
+    }
+
+    #[test]
+    fn test_method_completion_package_scoped() {
+        // Package invocant should only show that package's subs
+        let src = "package Foo;\nsub alpha { 1 }\npackage Bar;\nsub beta { 2 }\nBar->";
+        let tree = parse(src);
+        let candidates = collect_completions(&tree, std::str::from_utf8(src.as_bytes()).unwrap(), Point::new(4, 5));
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"beta"), "should suggest beta, got: {:?}", labels);
+        assert!(!labels.contains(&"alpha"), "should NOT suggest alpha (Foo's sub)");
     }
 }
