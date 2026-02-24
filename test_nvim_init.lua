@@ -148,14 +148,57 @@ vim.api.nvim_create_autocmd("LspAttach", {
     vim.keymap.set("n", "[d", vim.diagnostic.goto_prev, opts)
     vim.keymap.set("n", "]d", vim.diagnostic.goto_next, opts)
 
-    -- Completion: use omnifunc backed by LSP
+    -- Completion: omnifunc backed by LSP
     vim.bo[buf].omnifunc = "v:lua.vim.lsp.omnifunc"
 
-    -- Auto-trigger completion on Perl sigils and ->
+    -- Auto-trigger completion on Perl sigils, ->, and call-site triggers
     for _, char in ipairs({ "$", "@", "%" }) do
       vim.keymap.set("i", char, char .. "<C-x><C-o>", { buffer = buf })
     end
     vim.keymap.set("i", "->", "-><C-x><C-o>", { buffer = buf })
+    vim.keymap.set("i", "(", "(<C-x><C-o>", { buffer = buf })
+    vim.keymap.set("i", ",", ",<C-x><C-o>", { buffer = buf })
+
+    -- Auto-trigger completion while typing
+    vim.api.nvim_create_autocmd("TextChangedI", {
+      buffer = buf,
+      callback = function()
+        -- Skip if completion menu is already visible
+        if vim.fn.pumvisible() == 1 then return end
+        local col = vim.fn.col(".") - 1
+        if col <= 0 then return end
+        local line = vim.api.nvim_get_current_line()
+        local before = line:sub(1, col)
+
+        local function trigger()
+          vim.schedule(function()
+            if vim.fn.mode() == "i" and vim.fn.pumvisible() == 0 then
+              vim.api.nvim_feedkeys(
+                vim.api.nvim_replace_termcodes("<C-x><C-o>", true, false, true),
+                "n", false)
+            end
+          end)
+        end
+
+        -- Inside parens: re-trigger for keyval arg editing
+        local opens = select(2, before:gsub("%(", ""))
+        local closes = select(2, before:gsub("%)", ""))
+        if opens > closes then
+          local last = before:sub(-1)
+          if last:match("[%w_]") or (last == " " and before:sub(-2, -2) == ",") then
+            trigger()
+          end
+          return
+        end
+
+        -- General bareword completion: trigger after 2+ word chars
+        -- (catches package names like Point, function names, etc.)
+        local word = before:match("[%a_][%w_:]*$")
+        if word and #word >= 2 then
+          trigger()
+        end
+      end,
+    })
 
     print("perl-lsp attached! gd=def gr=refs K=hover <leader>rn=rename <leader>o=symbols <leader>f=format C-x C-o=complete")
   end,
