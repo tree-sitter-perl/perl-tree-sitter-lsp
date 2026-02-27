@@ -5,7 +5,7 @@
 //!
 //! Designed to compose into a project index: `HashMap<PathBuf, FileAnalysis>`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::Point;
 
 use crate::analysis::{FoldKind, FoldRange, Span};
@@ -1052,6 +1052,696 @@ impl FileAnalysis {
 
         tokens.sort_by_key(|t| (t.span.start.row, t.span.start.column));
         tokens
+    }
+}
+
+// ---- Completion types ----
+
+/// A completion candidate from FileAnalysis resolution (pure table lookup).
+#[derive(Debug, Clone)]
+pub struct CompletionCandidate {
+    pub label: String,
+    pub kind: SymKind,
+    pub detail: Option<String>,
+    pub insert_text: Option<String>,
+    pub sort_priority: u8,
+}
+
+/// Signature info for a sub/method, resolved from the symbol table.
+#[derive(Debug, Clone)]
+pub struct SignatureInfo {
+    pub name: String,
+    pub params: Vec<ParamInfo>,
+    pub is_method: bool,
+}
+
+// ---- Completion query methods ----
+
+impl FileAnalysis {
+    /// Complete variables at a point with cross-sigil forms.
+    pub fn complete_variables(&self, point: Point, sigil: char) -> Vec<CompletionCandidate> {
+        let visible = self.visible_symbols(point);
+        let mut seen = HashSet::<(String, char)>::new();
+        let mut candidates = Vec::new();
+
+        // Sort by scope size (innermost first) — stable priority ordering
+        let mut vars: Vec<(&Symbol, usize)> = visible
+            .into_iter()
+            .filter(|s| matches!(s.kind, SymKind::Variable | SymKind::Field))
+            .filter_map(|s| {
+                if let SymbolDetail::Variable { sigil: decl_sigil, .. } = &s.detail {
+                    let scope = &self.scopes[s.scope.0 as usize];
+                    let scope_size = span_size(&scope.span);
+                    Some((s, scope_size))
+                } else if let SymbolDetail::Field { sigil: field_sigil, .. } = &s.detail {
+                    let scope = &self.scopes[s.scope.0 as usize];
+                    let scope_size = span_size(&scope.span);
+                    Some((s, scope_size))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        vars.sort_by_key(|(_, sz)| *sz);
+
+        for (sym, scope_size) in vars {
+            let (bare_name, decl_sigil) = match &sym.detail {
+                SymbolDetail::Variable { sigil: ds, .. } => {
+                    (sym.name[1..].to_string(), *ds)
+                }
+                SymbolDetail::Field { sigil: ds, .. } => {
+                    (sym.name[1..].to_string(), *ds)
+                }
+                _ => continue,
+            };
+            let key = (bare_name.clone(), decl_sigil);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+
+            let priority = std::cmp::min(scope_size, 255) as u8;
+            let detail = match &sym.detail {
+                SymbolDetail::Variable { decl_kind, .. } => {
+                    Some(match decl_kind {
+                        DeclKind::My => "my".to_string(),
+                        DeclKind::Our => "our".to_string(),
+                        DeclKind::State => "state".to_string(),
+                        DeclKind::Field => "field".to_string(),
+                        DeclKind::Param => "param".to_string(),
+                        DeclKind::ForVar => "for".to_string(),
+                    })
+                }
+                _ => None,
+            };
+
+            generate_cross_sigil_candidates(
+                &bare_name,
+                decl_sigil,
+                sigil,
+                detail,
+                priority,
+                &mut candidates,
+            );
+        }
+
+        candidates
+    }
+
+    /// Complete methods for an invocant (variable or class name) at a point.
+    pub fn complete_methods(&self, invocant: &str, point: Point) -> Vec<CompletionCandidate> {
+        // Resolve invocant → class name
+        let class_name = if !invocant.starts_with('$')
+            && !invocant.starts_with('@')
+            && !invocant.starts_with('%')
+        {
+            Some(invocant.to_string())
+        } else {
+            self.resolve_invocant_class(
+                invocant,
+                self.scope_at(point).unwrap_or(ScopeId(0)),
+                point,
+            )
+        };
+
+        if let Some(ref cn) = class_name {
+            // Try to find methods scoped to this class
+            let mut candidates = Vec::new();
+            let mut found_class = false;
+
+            // Check for class definition → collect its methods
+            for sym in &self.symbols {
+                if matches!(sym.kind, SymKind::Class) && sym.name == *cn {
+                    found_class = true;
+                    // Implicit new for core classes
+                    candidates.push(CompletionCandidate {
+                        label: "new".to_string(),
+                        kind: SymKind::Method,
+                        detail: Some(format!("{}->new", cn)),
+                        insert_text: None,
+                        sort_priority: 0,
+                    });
+                    break;
+                }
+            }
+
+            // Find all subs/methods in this class/package
+            for sym in &self.symbols {
+                if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                    if self.symbol_in_class(sym.id, cn) {
+                        candidates.push(CompletionCandidate {
+                            label: sym.name.clone(),
+                            kind: sym.kind,
+                            detail: Some(cn.clone()),
+                            insert_text: None,
+                            sort_priority: 0,
+                        });
+                    }
+                }
+            }
+
+            if !candidates.is_empty() {
+                return candidates;
+            }
+
+            // Package with subs
+            if !found_class {
+                for sym in &self.symbols {
+                    if matches!(sym.kind, SymKind::Package) && sym.name == *cn {
+                        found_class = true;
+                        break;
+                    }
+                }
+            }
+            if found_class {
+                // Return subs scoped to this package
+                for sym in &self.symbols {
+                    if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                        if self.symbol_in_class(sym.id, cn) {
+                            candidates.push(CompletionCandidate {
+                                label: sym.name.clone(),
+                                kind: sym.kind,
+                                detail: Some(cn.clone()),
+                                insert_text: None,
+                                sort_priority: 0,
+                            });
+                        }
+                    }
+                }
+                if !candidates.is_empty() {
+                    return candidates;
+                }
+            }
+        }
+
+        // Fallback: all subs/methods in file
+        self.symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .map(|s| CompletionCandidate {
+                label: s.name.clone(),
+                kind: s.kind,
+                detail: Some(
+                    if matches!(s.kind, SymKind::Method) {
+                        "method"
+                    } else {
+                        "sub"
+                    }
+                    .to_string(),
+                ),
+                insert_text: None,
+                sort_priority: 10,
+            })
+            .collect()
+    }
+
+    /// Complete hash keys for a variable at a point.
+    pub fn complete_hash_keys(&self, var_text: &str, point: Point) -> Vec<CompletionCandidate> {
+        let owner = self.resolve_hash_key_owner(var_text, point);
+        let owner = match owner {
+            Some(o) => o,
+            None => return Vec::new(),
+        };
+
+        let defs = self.hash_key_defs_for_owner(&owner);
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+
+        for def in defs {
+            if seen.contains(&def.name) {
+                continue;
+            }
+            seen.insert(def.name.clone());
+
+            let is_dynamic = matches!(
+                &def.detail,
+                SymbolDetail::HashKeyDef { is_dynamic: true, .. }
+            );
+
+            let detail = match &owner {
+                HashKeyOwner::Class(name) => Some(format!("{}->{{{}}}", name, def.name)),
+                HashKeyOwner::Variable { name, .. } => {
+                    Some(format!("{}{{{}}}", name, def.name))
+                }
+            };
+
+            candidates.push(CompletionCandidate {
+                label: def.name.clone(),
+                kind: SymKind::Variable,
+                detail,
+                insert_text: None,
+                sort_priority: if is_dynamic { 50 } else { 10 },
+            });
+        }
+
+        candidates
+    }
+
+    /// General completion: all variables (all sigils) + subs + packages.
+    pub fn complete_general(&self, point: Point) -> Vec<CompletionCandidate> {
+        let mut candidates = Vec::new();
+
+        // Variables (all sigils)
+        for sigil in ['$', '@', '%'] {
+            candidates.extend(self.complete_variables(point, sigil));
+        }
+
+        // Subs
+        for sym in &self.symbols {
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                candidates.push(CompletionCandidate {
+                    label: sym.name.clone(),
+                    kind: sym.kind,
+                    detail: Some(
+                        if matches!(sym.kind, SymKind::Method) {
+                            "method"
+                        } else {
+                            "sub"
+                        }
+                        .to_string(),
+                    ),
+                    insert_text: None,
+                    sort_priority: 10,
+                });
+            }
+        }
+
+        // Packages/classes
+        for sym in &self.symbols {
+            if matches!(sym.kind, SymKind::Package | SymKind::Class) {
+                candidates.push(CompletionCandidate {
+                    label: sym.name.clone(),
+                    kind: sym.kind,
+                    detail: Some(
+                        if matches!(sym.kind, SymKind::Class) {
+                            "class"
+                        } else {
+                            "package"
+                        }
+                        .to_string(),
+                    ),
+                    insert_text: None,
+                    sort_priority: 20,
+                });
+            }
+        }
+
+        candidates
+    }
+
+    /// Complete keyval args at a call site.
+    /// Returns `key =>` completions for unused keys.
+    pub fn complete_keyval_args(
+        &self,
+        call_name: &str,
+        is_method: bool,
+        invocant: Option<&str>,
+        point: Point,
+        used_keys: &HashSet<String>,
+    ) -> Vec<CompletionCandidate> {
+        // For `new` calls on a class, check for :param fields
+        if call_name == "new" {
+            if let Some(inv) = invocant {
+                let class_name = if !inv.starts_with('$') {
+                    Some(inv.to_string())
+                } else {
+                    self.resolve_invocant_class(
+                        inv,
+                        self.scope_at(point).unwrap_or(ScopeId(0)),
+                        point,
+                    )
+                };
+                if let Some(ref cn) = class_name {
+                    let param_candidates = self.class_param_completions(cn, used_keys);
+                    if !param_candidates.is_empty() {
+                        return param_candidates;
+                    }
+                }
+            }
+        }
+
+        // Find the sub definition
+        let sub_sym = self.find_sub_for_call(call_name, is_method, invocant, point);
+        let sub_sym = match sub_sym {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        // Get params
+        let params = match &sub_sym.detail {
+            SymbolDetail::Sub { params, .. } => params,
+            _ => return Vec::new(),
+        };
+
+        // Find slurpy %hash param
+        let slurpy = params
+            .iter()
+            .find(|p| p.is_slurpy && p.name.starts_with('%'));
+        let slurpy_name = match slurpy {
+            Some(p) => {
+                if p.name.starts_with('%') || p.name.starts_with('$') || p.name.starts_with('@') {
+                    &p.name[1..]
+                } else {
+                    &p.name
+                }
+            }
+            None => return Vec::new(),
+        };
+
+        // Find hash key accesses for this param name within the sub's body scope
+        let body_scope = self.find_body_scope(sub_sym);
+        let keys = match body_scope {
+            Some(scope_id) => self.hash_keys_in_scope(slurpy_name, scope_id),
+            None => Vec::new(),
+        };
+
+        keys.into_iter()
+            .filter(|k| !used_keys.contains(k))
+            .map(|k| CompletionCandidate {
+                label: format!("{} =>", k),
+                kind: SymKind::Variable,
+                detail: Some(format!("{}(%{})", call_name, slurpy_name)),
+                insert_text: Some(format!("{} => ", k)),
+                sort_priority: 0,
+            })
+            .collect()
+    }
+
+    /// Resolve signature info for a call (sub/method name).
+    pub fn signature_for_call(
+        &self,
+        name: &str,
+        is_method: bool,
+        invocant: Option<&str>,
+        point: Point,
+    ) -> Option<SignatureInfo> {
+        let sub_sym = self.find_sub_for_call(name, is_method, invocant, point)?;
+
+        let (params, sym_is_method) = match &sub_sym.detail {
+            SymbolDetail::Sub { params, is_method } => (params.clone(), *is_method),
+            _ => return None,
+        };
+
+        let mut params = params;
+        let is_method = is_method
+            || sym_is_method
+            || params
+                .first()
+                .map_or(false, |p| p.name == "$self" || p.name == "$class");
+
+        // Strip $self/$class from method params
+        if is_method && !params.is_empty() {
+            let first = &params[0].name;
+            if first == "$self" || first == "$class" {
+                params.remove(0);
+            }
+        }
+
+        Some(SignatureInfo {
+            name: name.to_string(),
+            params,
+            is_method,
+        })
+    }
+
+    // ---- Internal completion helpers ----
+
+    /// Find a sub/method symbol by name, optionally scoped to a class.
+    fn find_sub_for_call(
+        &self,
+        name: &str,
+        is_method: bool,
+        invocant: Option<&str>,
+        point: Point,
+    ) -> Option<&Symbol> {
+        // Resolve class name for scoped lookup
+        let class_name = if is_method {
+            invocant.and_then(|inv| {
+                if !inv.starts_with('$') && !inv.starts_with('@') && !inv.starts_with('%') {
+                    Some(inv.to_string())
+                } else {
+                    self.resolve_invocant_class(
+                        inv,
+                        self.scope_at(point).unwrap_or(ScopeId(0)),
+                        point,
+                    )
+                }
+            })
+        } else {
+            None
+        };
+
+        // Try class-scoped first
+        if let Some(ref cn) = class_name {
+            for &sid in self.symbols_named(name) {
+                let sym = self.symbol(sid);
+                if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                    if self.symbol_in_class(sid, cn) {
+                        return Some(sym);
+                    }
+                }
+            }
+        }
+
+        // Fallback: any sub/method with that name
+        for &sid in self.symbols_named(name) {
+            let sym = self.symbol(sid);
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                return Some(sym);
+            }
+        }
+
+        None
+    }
+
+    /// Resolve a variable text to a HashKeyOwner for hash key completion.
+    fn resolve_hash_key_owner(&self, var_text: &str, point: Point) -> Option<HashKeyOwner> {
+        let bare_name = if var_text.starts_with('$') || var_text.starts_with('@') || var_text.starts_with('%') {
+            &var_text[1..]
+        } else {
+            var_text
+        };
+
+        // Try type inference → class owner
+        if let Some(it) = self.inferred_type(var_text, point) {
+            let class_name = match it {
+                InferredType::ClassName(n) => Some(n.clone()),
+                InferredType::FirstParam { package } => Some(package.clone()),
+                InferredType::BlessResult { package } => Some(package.clone()),
+            };
+            if let Some(cn) = class_name {
+                return Some(HashKeyOwner::Class(cn));
+            }
+        }
+
+        // Try resolving the variable declaration → Variable owner
+        // For $hash{}, try %hash first
+        let try_names: Vec<String> = if var_text.starts_with('$') {
+            vec![format!("%{}", bare_name), var_text.to_string()]
+        } else {
+            vec![var_text.to_string()]
+        };
+
+        for name in &try_names {
+            if let Some(sym) = self.resolve_variable(name, point) {
+                return Some(HashKeyOwner::Variable {
+                    name: name.clone(),
+                    def_scope: sym.scope,
+                });
+            }
+        }
+
+        // Check if any existing hash key refs/defs use this bare_name
+        for sym in &self.symbols {
+            if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
+                match owner {
+                    HashKeyOwner::Variable { name, .. } => {
+                        let owner_bare = if name.starts_with('$') || name.starts_with('@') || name.starts_with('%') {
+                            &name[1..]
+                        } else {
+                            name
+                        };
+                        if owner_bare == bare_name {
+                            return Some(owner.clone());
+                        }
+                    }
+                    HashKeyOwner::Class(_) => {}
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Collect :param field names from a core class as keyval completions.
+    fn class_param_completions(
+        &self,
+        class_name: &str,
+        used_keys: &HashSet<String>,
+    ) -> Vec<CompletionCandidate> {
+        let mut candidates = Vec::new();
+        for sym in &self.symbols {
+            if matches!(sym.kind, SymKind::Field) {
+                if let SymbolDetail::Field { ref attributes, .. } = sym.detail {
+                    if attributes.contains(&"param".to_string()) {
+                        // Check this field belongs to the class
+                        if self.symbol_in_class(sym.id, class_name) {
+                            let key = sym
+                                .name
+                                .trim_start_matches('$')
+                                .trim_start_matches('@')
+                                .trim_start_matches('%')
+                                .to_string();
+                            if !used_keys.contains(&key) {
+                                candidates.push(CompletionCandidate {
+                                    label: format!("{} =>", key),
+                                    kind: SymKind::Variable,
+                                    detail: Some(format!("{}->new(:param)", class_name)),
+                                    insert_text: Some(format!("{} => ", key)),
+                                    sort_priority: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    /// Find hash key names accessed via a variable in a specific scope.
+    fn hash_keys_in_scope(&self, var_bare_name: &str, scope_id: ScopeId) -> Vec<String> {
+        let scope_span = &self.scopes[scope_id.0 as usize].span;
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+
+        for r in &self.refs {
+            if let RefKind::HashKeyAccess { ref var_text, .. } = r.kind {
+                // Check the var_text's bare name matches
+                let ref_bare = if var_text.starts_with('$')
+                    || var_text.starts_with('@')
+                    || var_text.starts_with('%')
+                {
+                    &var_text[1..]
+                } else {
+                    var_text.as_str()
+                };
+                if ref_bare == var_bare_name && contains_point(scope_span, r.span.start) {
+                    if !seen.contains(&r.target_name) {
+                        seen.insert(r.target_name.clone());
+                        keys.push(r.target_name.clone());
+                    }
+                }
+            }
+        }
+
+        keys
+    }
+}
+
+/// Generate cross-sigil completion candidates for a variable.
+fn generate_cross_sigil_candidates(
+    bare_name: &str,
+    decl_sigil: char,
+    requested_sigil: char,
+    detail: Option<String>,
+    priority: u8,
+    out: &mut Vec<CompletionCandidate>,
+) {
+    match requested_sigil {
+        '$' => {
+            if decl_sigil == '$' {
+                out.push(CompletionCandidate {
+                    label: format!("${}", bare_name),
+                    kind: SymKind::Variable,
+                    detail: detail.clone(),
+                    insert_text: Some(bare_name.to_string()),
+                    sort_priority: priority,
+                });
+            }
+            if decl_sigil == '@' {
+                out.push(CompletionCandidate {
+                    label: format!("${}[]", bare_name),
+                    kind: SymKind::Variable,
+                    detail: detail.clone().or(Some(format!("@{}", bare_name))),
+                    insert_text: Some(format!("{}[", bare_name)),
+                    sort_priority: priority,
+                });
+                out.push(CompletionCandidate {
+                    label: format!("$#{}", bare_name),
+                    kind: SymKind::Variable,
+                    detail: detail
+                        .clone()
+                        .or(Some(format!("last index of @{}", bare_name))),
+                    insert_text: Some(format!("#{}", bare_name)),
+                    sort_priority: priority.saturating_add(1),
+                });
+            }
+            if decl_sigil == '%' {
+                out.push(CompletionCandidate {
+                    label: format!("${}{{}}", bare_name),
+                    kind: SymKind::Variable,
+                    detail: detail.clone().or(Some(format!("%{}", bare_name))),
+                    insert_text: Some(format!("{}{{", bare_name)),
+                    sort_priority: priority,
+                });
+            }
+        }
+        '@' => {
+            if decl_sigil == '@' {
+                out.push(CompletionCandidate {
+                    label: format!("@{}", bare_name),
+                    kind: SymKind::Variable,
+                    detail: detail.clone(),
+                    insert_text: Some(bare_name.to_string()),
+                    sort_priority: priority,
+                });
+                out.push(CompletionCandidate {
+                    label: format!("@{}[]", bare_name),
+                    kind: SymKind::Variable,
+                    detail: Some("array slice".to_string()),
+                    insert_text: Some(format!("{}[", bare_name)),
+                    sort_priority: priority.saturating_add(1),
+                });
+            }
+            if decl_sigil == '%' {
+                out.push(CompletionCandidate {
+                    label: format!("@{}{{}}", bare_name),
+                    kind: SymKind::Variable,
+                    detail: detail.clone().or(Some("hash slice".to_string())),
+                    insert_text: Some(format!("{}{{", bare_name)),
+                    sort_priority: priority,
+                });
+            }
+        }
+        '%' => {
+            if decl_sigil == '%' {
+                out.push(CompletionCandidate {
+                    label: format!("%{}", bare_name),
+                    kind: SymKind::Variable,
+                    detail: detail.clone(),
+                    insert_text: Some(bare_name.to_string()),
+                    sort_priority: priority,
+                });
+                out.push(CompletionCandidate {
+                    label: format!("%{}{{}}", bare_name),
+                    kind: SymKind::Variable,
+                    detail: Some("hash kv slice".to_string()),
+                    insert_text: Some(format!("{}{{", bare_name)),
+                    sort_priority: priority.saturating_add(1),
+                });
+            }
+            if decl_sigil == '@' {
+                out.push(CompletionCandidate {
+                    label: format!("%{}[]", bare_name),
+                    kind: SymKind::Variable,
+                    detail: Some("array kv slice".to_string()),
+                    insert_text: Some(format!("{}[", bare_name)),
+                    sort_priority: priority,
+                });
+            }
+        }
+        _ => {}
     }
 }
 

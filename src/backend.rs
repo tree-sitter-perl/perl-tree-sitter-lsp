@@ -210,7 +210,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let items = symbols::completion_items(&doc.tree, &doc.text, pos);
+        let items = symbols::completion_items(&doc.analysis, &doc.tree, &doc.text, pos);
         if items.is_empty() {
             Ok(None)
         } else {
@@ -228,7 +228,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        Ok(symbols::signature_help(&doc.tree, &doc.text, pos))
+        Ok(symbols::signature_help(&doc.analysis, &doc.tree, &doc.text, pos))
     }
 
     async fn document_highlight(

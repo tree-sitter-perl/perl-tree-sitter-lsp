@@ -3,7 +3,10 @@ use tower_lsp::lsp_types::*;
 use tree_sitter::{Point, Tree};
 
 use crate::analysis;
-use crate::file_analysis::{FileAnalysis, OutlineSymbol, SymKind as FaSymKind, VarModifier};
+use crate::cursor_context::{self, CursorContext};
+use crate::file_analysis::{
+    CompletionCandidate, FileAnalysis, OutlineSymbol, SymKind as FaSymKind, VarModifier,
+};
 
 // ---- Coordinate conversion ----
 
@@ -115,30 +118,66 @@ pub fn rename(
     })
 }
 
-fn completion_kind(kind: &analysis::SymbolKind) -> CompletionItemKind {
+fn fa_completion_kind(kind: &FaSymKind) -> CompletionItemKind {
     match kind {
-        analysis::SymbolKind::Function => CompletionItemKind::FUNCTION,
-        analysis::SymbolKind::Method => CompletionItemKind::METHOD,
-        analysis::SymbolKind::Variable => CompletionItemKind::VARIABLE,
-        analysis::SymbolKind::Package => CompletionItemKind::CLASS,
-        analysis::SymbolKind::Class => CompletionItemKind::CLASS,
-        analysis::SymbolKind::Module => CompletionItemKind::MODULE,
+        FaSymKind::Sub => CompletionItemKind::FUNCTION,
+        FaSymKind::Method => CompletionItemKind::METHOD,
+        FaSymKind::Variable | FaSymKind::Field => CompletionItemKind::VARIABLE,
+        FaSymKind::Package => CompletionItemKind::CLASS,
+        FaSymKind::Class => CompletionItemKind::CLASS,
+        FaSymKind::Module => CompletionItemKind::MODULE,
+        FaSymKind::HashKeyDef => CompletionItemKind::PROPERTY,
     }
 }
 
-pub fn completion_items(tree: &Tree, source: &str, pos: Position) -> Vec<CompletionItem> {
-    let candidates = analysis::collect_completions(tree, source, position_to_point(pos));
+fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
+    CompletionItem {
+        label: c.label,
+        kind: Some(fa_completion_kind(&c.kind)),
+        detail: c.detail,
+        insert_text: c.insert_text,
+        sort_text: Some(format!("{:03}", c.sort_priority)),
+        ..Default::default()
+    }
+}
+
+pub fn completion_items(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &str,
+    pos: Position,
+) -> Vec<CompletionItem> {
+    let point = position_to_point(pos);
+    let ctx = cursor_context::detect_cursor_context(source, point);
+
+    let mut candidates: Vec<CompletionCandidate> = match ctx {
+        CursorContext::Variable { sigil } => analysis.complete_variables(point, sigil),
+        CursorContext::Method { ref invocant } => analysis.complete_methods(invocant, point),
+        CursorContext::HashKey { ref var_text } => analysis.complete_hash_keys(var_text, point),
+        CursorContext::General => {
+            let mut items = Vec::new();
+            // Keyval arg completions if inside a call at key position
+            if let Some(call_ctx) =
+                cursor_context::find_call_context(tree, source.as_bytes(), point)
+            {
+                if call_ctx.at_key_position {
+                    items.extend(analysis.complete_keyval_args(
+                        &call_ctx.name,
+                        call_ctx.is_method,
+                        call_ctx.invocant.as_deref(),
+                        point,
+                        &call_ctx.used_keys,
+                    ));
+                }
+            }
+            items.extend(analysis.complete_general(point));
+            items
+        }
+    };
 
     candidates
-        .into_iter()
-        .map(|c| CompletionItem {
-            label: c.label,
-            kind: Some(completion_kind(&c.kind)),
-            detail: c.detail,
-            insert_text: c.insert_text,
-            sort_text: Some(format!("{:03}", c.sort_priority)),
-            ..Default::default()
-        })
+        .drain(..)
+        .map(candidate_to_completion_item)
         .collect()
 }
 
@@ -168,7 +207,7 @@ pub fn document_highlights(analysis: &FileAnalysis, pos: Position) -> Vec<Docume
 }
 
 pub fn selection_ranges(tree: &Tree, pos: Position) -> SelectionRange {
-    let spans = analysis::selection_ranges(tree, position_to_point(pos));
+    let spans = cursor_context::selection_ranges(tree, position_to_point(pos));
     // Build linked list from innermost to outermost
     let mut result: Option<SelectionRange> = None;
     for span in spans.into_iter().rev() {
@@ -202,11 +241,26 @@ pub fn folding_ranges(analysis: &FileAnalysis) -> Vec<FoldingRange> {
 
 // ---- Signature help ----
 
-pub fn signature_help(tree: &Tree, text: &str, pos: Position) -> Option<SignatureHelp> {
-    let result = analysis::signature_help_at_point(tree, text, position_to_point(pos))?;
-    let sig = &result.signature;
+pub fn signature_help(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    text: &str,
+    pos: Position,
+) -> Option<SignatureHelp> {
+    let point = position_to_point(pos);
 
-    let params: Vec<ParameterInformation> = sig
+    // Step 1: cursor_context finds the enclosing call
+    let call_ctx = cursor_context::find_call_context(tree, text.as_bytes(), point)?;
+
+    // Step 2: file_analysis resolves the sub signature (pure table lookup)
+    let sig_info = analysis.signature_for_call(
+        &call_ctx.name,
+        call_ctx.is_method,
+        call_ctx.invocant.as_deref(),
+        point,
+    )?;
+
+    let params: Vec<ParameterInformation> = sig_info
         .params
         .iter()
         .map(|p| {
@@ -224,8 +278,9 @@ pub fn signature_help(tree: &Tree, text: &str, pos: Position) -> Option<Signatur
 
     let label = format!(
         "{}({})",
-        sig.name,
-        sig.params
+        sig_info.name,
+        sig_info
+            .params
             .iter()
             .map(|p| {
                 if let Some(ref default) = p.default {
@@ -243,10 +298,10 @@ pub fn signature_help(tree: &Tree, text: &str, pos: Position) -> Option<Signatur
             label,
             documentation: None,
             parameters: Some(params),
-            active_parameter: Some(result.active_param as u32),
+            active_parameter: Some(call_ctx.active_param as u32),
         }],
         active_signature: Some(0),
-        active_parameter: Some(result.active_param as u32),
+        active_parameter: Some(call_ctx.active_param as u32),
     })
 }
 

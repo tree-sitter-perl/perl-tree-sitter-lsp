@@ -1,6 +1,7 @@
 mod analysis;
 mod backend;
 mod builder;
+mod cursor_context;
 mod document;
 mod file_analysis;
 mod symbols;
