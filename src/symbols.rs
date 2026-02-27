@@ -3,7 +3,7 @@ use tower_lsp::lsp_types::*;
 use tree_sitter::{Point, Tree};
 
 use crate::analysis;
-use crate::file_analysis::FileAnalysis;
+use crate::file_analysis::{FileAnalysis, OutlineSymbol, SymKind as FaSymKind, VarModifier};
 
 // ---- Coordinate conversion ----
 
@@ -27,24 +27,25 @@ fn span_to_range(span: analysis::Span) -> Range {
 
 // ---- Symbol conversion ----
 
-fn symbol_kind_to_lsp(kind: &analysis::SymbolKind) -> SymbolKind {
+fn fa_sym_kind_to_lsp(kind: &FaSymKind) -> SymbolKind {
     match kind {
-        analysis::SymbolKind::Function => SymbolKind::FUNCTION,
-        analysis::SymbolKind::Method => SymbolKind::METHOD,
-        analysis::SymbolKind::Variable => SymbolKind::VARIABLE,
-        analysis::SymbolKind::Package => SymbolKind::NAMESPACE,
-        analysis::SymbolKind::Class => SymbolKind::CLASS,
-        analysis::SymbolKind::Module => SymbolKind::MODULE,
+        FaSymKind::Sub => SymbolKind::FUNCTION,
+        FaSymKind::Method => SymbolKind::METHOD,
+        FaSymKind::Variable | FaSymKind::Field => SymbolKind::VARIABLE,
+        FaSymKind::Package => SymbolKind::NAMESPACE,
+        FaSymKind::Class => SymbolKind::CLASS,
+        FaSymKind::Module => SymbolKind::MODULE,
+        FaSymKind::HashKeyDef => SymbolKind::KEY,
     }
 }
 
 #[allow(deprecated)]
-fn to_document_symbol(s: &analysis::SymbolInfo) -> DocumentSymbol {
-    let children: Vec<DocumentSymbol> = s.children.iter().map(to_document_symbol).collect();
+fn outline_to_document_symbol(s: &OutlineSymbol) -> DocumentSymbol {
+    let children: Vec<DocumentSymbol> = s.children.iter().map(outline_to_document_symbol).collect();
     DocumentSymbol {
         name: s.name.clone(),
         detail: s.detail.clone(),
-        kind: symbol_kind_to_lsp(&s.kind),
+        kind: fa_sym_kind_to_lsp(&s.kind),
         tags: None,
         deprecated: None,
         range: span_to_range(s.span),
@@ -60,10 +61,10 @@ fn to_document_symbol(s: &analysis::SymbolInfo) -> DocumentSymbol {
 // ---- Public LSP adapter functions ----
 
 #[allow(deprecated)]
-pub fn extract_symbols(tree: &Tree, source: &str) -> Vec<DocumentSymbol> {
-    analysis::extract_symbols(tree, source)
+pub fn extract_symbols(analysis: &FileAnalysis) -> Vec<DocumentSymbol> {
+    analysis.document_symbols()
         .iter()
-        .map(to_document_symbol)
+        .map(outline_to_document_symbol)
         .collect()
 }
 
@@ -276,8 +277,8 @@ pub fn semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
     ]
 }
 
-pub fn semantic_tokens(tree: &Tree, source: &str) -> Vec<SemanticToken> {
-    let var_tokens = analysis::collect_semantic_tokens(tree, source);
+pub fn semantic_tokens(analysis: &FileAnalysis) -> Vec<SemanticToken> {
+    let var_tokens = analysis.semantic_tokens();
 
     let mut result = Vec::new();
     let mut prev_line: u32 = 0;
@@ -310,9 +311,9 @@ pub fn semantic_tokens(tree: &Tree, source: &str) -> Vec<SemanticToken> {
             modifiers |= 1 << TOKEN_MOD_MODIFICATION;
         }
         match vt.var_type {
-            analysis::VarModifier::Scalar => modifiers |= 1 << TOKEN_MOD_SCALAR,
-            analysis::VarModifier::Array => modifiers |= 1 << TOKEN_MOD_ARRAY,
-            analysis::VarModifier::Hash => modifiers |= 1 << TOKEN_MOD_HASH,
+            VarModifier::Scalar => modifiers |= 1 << TOKEN_MOD_SCALAR,
+            VarModifier::Array => modifiers |= 1 << TOKEN_MOD_ARRAY,
+            VarModifier::Hash => modifiers |= 1 << TOKEN_MOD_HASH,
         }
 
         result.push(SemanticToken {

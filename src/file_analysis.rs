@@ -189,6 +189,43 @@ pub enum HashKeyOwner {
     Variable { name: String, def_scope: ScopeId },
 }
 
+// ---- Outline ----
+
+pub struct OutlineSymbol {
+    pub name: String,
+    pub detail: Option<String>,
+    pub kind: SymKind,
+    pub span: Span,
+    pub selection_span: Span,
+    pub children: Vec<OutlineSymbol>,
+}
+
+// ---- Semantic tokens ----
+
+#[derive(Debug, Clone)]
+pub struct SemanticVarToken {
+    pub span: Span,
+    pub var_type: VarModifier,
+    pub is_declaration: bool,
+    pub is_modification: bool,
+    pub is_readonly: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarModifier {
+    Scalar,
+    Array,
+    Hash,
+}
+
+fn sigil_to_var_modifier(sigil: char) -> VarModifier {
+    match sigil {
+        '@' => VarModifier::Array,
+        '%' => VarModifier::Hash,
+        _ => VarModifier::Scalar,
+    }
+}
+
 // ---- FileAnalysis ----
 
 pub struct FileAnalysis {
@@ -869,6 +906,152 @@ impl FileAnalysis {
     fn format_symbol_hover(&self, sym: &Symbol, source: &str) -> String {
         let line = source_line_at(source, sym.span.start.row);
         format!("```perl\n{}\n```", line.trim())
+    }
+
+    // ---- Document outline ----
+
+    /// Build document outline as a nested symbol tree.
+    /// Returns (name, detail, kind, span, selection_span, children) tuples.
+    pub fn document_symbols(&self) -> Vec<OutlineSymbol> {
+        // Find the file scope (ScopeId(0))
+        let file_scope = ScopeId(0);
+        self.outline_children_of(file_scope)
+    }
+
+    fn outline_children_of(&self, parent_scope: ScopeId) -> Vec<OutlineSymbol> {
+        let mut result = Vec::new();
+
+        for sym in &self.symbols {
+            if sym.scope != parent_scope {
+                continue;
+            }
+
+            let (name, detail, children) = match sym.kind {
+                SymKind::Sub => {
+                    let body_scope = self.find_body_scope(sym);
+                    let children = body_scope
+                        .map(|s| self.outline_children_of(s))
+                        .unwrap_or_default();
+                    (format!("sub {}", sym.name), None, children)
+                }
+                SymKind::Method => {
+                    let body_scope = self.find_body_scope(sym);
+                    let children = body_scope
+                        .map(|s| self.outline_children_of(s))
+                        .unwrap_or_default();
+                    (format!("method {}", sym.name), None, children)
+                }
+                SymKind::Class => {
+                    let body_scope = self.find_body_scope(sym);
+                    let children = body_scope
+                        .map(|s| self.outline_children_of(s))
+                        .unwrap_or_default();
+                    (sym.name.clone(), Some("class".to_string()), children)
+                }
+                SymKind::Package => {
+                    (sym.name.clone(), Some("package".to_string()), Vec::new())
+                }
+                SymKind::Module => {
+                    (format!("use {}", sym.name), None, Vec::new())
+                }
+                SymKind::Variable => {
+                    let detail = match &sym.detail {
+                        SymbolDetail::Variable { decl_kind, .. } => match decl_kind {
+                            DeclKind::My => "my",
+                            DeclKind::Our => "our",
+                            DeclKind::State => "state",
+                            DeclKind::Field => "field",
+                            DeclKind::Param => "param",
+                            DeclKind::ForVar => "for",
+                        },
+                        _ => "my",
+                    };
+                    (sym.name.clone(), Some(detail.to_string()), Vec::new())
+                }
+                SymKind::Field => {
+                    (sym.name.clone(), Some("field".to_string()), Vec::new())
+                }
+                SymKind::HashKeyDef => continue, // Skip hash key defs from outline
+            };
+
+            result.push(OutlineSymbol {
+                name,
+                detail,
+                kind: sym.kind,
+                span: sym.span,
+                selection_span: sym.selection_span,
+                children,
+            });
+        }
+
+        result
+    }
+
+    /// Find the body scope for a sub/method/class symbol.
+    fn find_body_scope(&self, sym: &Symbol) -> Option<ScopeId> {
+        self.scopes.iter().find(|s| {
+            let kind_matches = match (&s.kind, &sym.kind) {
+                (ScopeKind::Sub { name: sn }, SymKind::Sub) => sn == &sym.name,
+                (ScopeKind::Method { name: mn }, SymKind::Method) => mn == &sym.name,
+                (ScopeKind::Class { name: cn }, SymKind::Class) => cn == &sym.name,
+                _ => false,
+            };
+            kind_matches && s.span == sym.span
+        }).map(|s| s.id)
+    }
+
+    // ---- Semantic tokens ----
+
+    /// Collect semantic tokens for all variable references and declarations.
+    pub fn semantic_tokens(&self) -> Vec<SemanticVarToken> {
+        let mut tokens: Vec<SemanticVarToken> = Vec::new();
+
+        // Variable declarations (from symbols)
+        for sym in &self.symbols {
+            if !matches!(sym.kind, SymKind::Variable | SymKind::Field) {
+                continue;
+            }
+            let (sigil, is_readonly) = match &sym.detail {
+                SymbolDetail::Variable { sigil, decl_kind } => {
+                    let readonly = matches!(decl_kind, DeclKind::Field);
+                    (*sigil, readonly)
+                }
+                SymbolDetail::Field { sigil, attributes } => {
+                    let readonly = !attributes.iter().any(|a| a == "writer" || a == "mutator" || a == "accessor");
+                    (*sigil, readonly)
+                }
+                _ => continue,
+            };
+            tokens.push(SemanticVarToken {
+                span: sym.selection_span,
+                var_type: sigil_to_var_modifier(sigil),
+                is_declaration: true,
+                is_modification: false,
+                is_readonly,
+            });
+        }
+
+        // Variable references (from refs)
+        for r in &self.refs {
+            let sigil = match &r.kind {
+                RefKind::Variable => r.target_name.chars().next().unwrap_or('$'),
+                RefKind::ContainerAccess => {
+                    // Container access sigil is the displayed sigil, not the underlying
+                    r.target_name.chars().next().unwrap_or('$')
+                }
+                _ => continue,
+            };
+            tokens.push(SemanticVarToken {
+                span: r.span,
+                var_type: sigil_to_var_modifier(sigil),
+                is_declaration: false,
+                is_modification: matches!(r.access, AccessKind::Write),
+                is_readonly: false,
+            });
+        }
+
+        tokens.sort_by_key(|t| (t.span.start.row, t.span.start.column));
+        tokens
     }
 }
 

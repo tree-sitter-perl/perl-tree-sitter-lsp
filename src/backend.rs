@@ -147,7 +147,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let syms = symbols::extract_symbols(&doc.tree, &doc.text); // TODO: migrate to FileAnalysis
+        let syms = symbols::extract_symbols(&doc.analysis);
         Ok(Some(DocumentSymbolResponse::Nested(syms)))
     }
 
@@ -377,7 +377,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let tokens = symbols::semantic_tokens(&doc.tree, &doc.text);
+        let tokens = symbols::semantic_tokens(&doc.analysis);
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data: tokens,
