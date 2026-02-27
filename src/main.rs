@@ -1,6 +1,8 @@
 mod analysis;
 mod backend;
+mod builder;
 mod document;
+mod file_analysis;
 mod symbols;
 
 use backend::Backend;

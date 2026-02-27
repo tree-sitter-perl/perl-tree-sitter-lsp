@@ -1,15 +1,20 @@
 use tree_sitter::{InputEdit, Parser, Point, Tree};
 
+use crate::builder;
+use crate::file_analysis::FileAnalysis;
+
 pub struct Document {
     pub text: String,
     pub tree: Tree,
+    pub analysis: FileAnalysis,
 }
 
 impl Document {
     pub fn new(text: String) -> Option<Self> {
         let mut parser = create_parser();
         let tree = parser.parse(&text, None)?;
-        Some(Document { text, tree })
+        let analysis = builder::build(&tree, text.as_bytes());
+        Some(Document { text, tree, analysis })
     }
 
     pub fn update(&mut self, new_text: String) {
@@ -59,6 +64,7 @@ impl Document {
             self.tree = tree;
         }
         self.text = new_text;
+        self.analysis = builder::build(&self.tree, self.text.as_bytes());
     }
 }
 
