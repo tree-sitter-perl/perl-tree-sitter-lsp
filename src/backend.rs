@@ -21,7 +21,7 @@ impl Backend {
 
     async fn publish_diagnostics(&self, uri: &Url) {
         let diagnostics = match self.documents.get(uri) {
-            Some(doc) => symbols::collect_diagnostics(&doc.tree, &doc.text),
+            Some(doc) => symbols::collect_diagnostics(&doc.analysis),
             None => vec![],
         };
         self.client
@@ -147,7 +147,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let syms = symbols::extract_symbols(&doc.tree, &doc.text);
+        let syms = symbols::extract_symbols(&doc.tree, &doc.text); // TODO: migrate to FileAnalysis
         Ok(Some(DocumentSymbolResponse::Nested(syms)))
     }
 
@@ -161,7 +161,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        Ok(symbols::find_definition(&doc.tree, &doc.text, pos, uri))
+        Ok(symbols::find_definition(&doc.analysis, pos, uri))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -171,7 +171,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let refs = symbols::find_references(&doc.tree, &doc.text, pos, uri);
+        let refs = symbols::find_references(&doc.analysis, pos, uri);
         if refs.is_empty() {
             Ok(None)
         } else {
@@ -187,7 +187,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        Ok(symbols::rename(&doc.tree, &doc.text, pos, uri, new_name))
+        Ok(symbols::rename(&doc.analysis, pos, uri, new_name))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -197,7 +197,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        Ok(symbols::hover_info(&doc.tree, &doc.text, pos))
+        Ok(symbols::hover_info(&doc.analysis, &doc.text, pos))
     }
 
     async fn completion(
@@ -241,7 +241,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let highlights = symbols::document_highlights(&doc.tree, &doc.text, pos);
+        let highlights = symbols::document_highlights(&doc.analysis, pos);
         if highlights.is_empty() {
             Ok(None)
         } else {
@@ -275,7 +275,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let ranges = symbols::folding_ranges(&doc.tree, &doc.text);
+        let ranges = symbols::folding_ranges(&doc.analysis);
         if ranges.is_empty() {
             Ok(None)
         } else {

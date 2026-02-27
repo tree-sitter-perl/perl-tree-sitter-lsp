@@ -3,6 +3,7 @@ use tower_lsp::lsp_types::*;
 use tree_sitter::{Point, Tree};
 
 use crate::analysis;
+use crate::file_analysis::FileAnalysis;
 
 // ---- Coordinate conversion ----
 
@@ -67,20 +68,19 @@ pub fn extract_symbols(tree: &Tree, source: &str) -> Vec<DocumentSymbol> {
 }
 
 pub fn find_definition(
-    tree: &Tree,
-    source: &str,
+    analysis: &FileAnalysis,
     pos: Position,
     uri: &Url,
 ) -> Option<GotoDefinitionResponse> {
-    let span = analysis::find_definition(tree, source, position_to_point(pos))?;
+    let span = analysis.find_definition(position_to_point(pos))?;
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: uri.clone(),
         range: span_to_range(span),
     }))
 }
 
-pub fn find_references(tree: &Tree, source: &str, pos: Position, uri: &Url) -> Vec<Location> {
-    analysis::find_references(tree, source, position_to_point(pos))
+pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url) -> Vec<Location> {
+    analysis.find_references(position_to_point(pos))
         .into_iter()
         .map(|span| Location {
             uri: uri.clone(),
@@ -90,19 +90,18 @@ pub fn find_references(tree: &Tree, source: &str, pos: Position, uri: &Url) -> V
 }
 
 pub fn rename(
-    tree: &Tree,
-    source: &str,
+    analysis: &FileAnalysis,
     pos: Position,
     uri: &Url,
     new_name: &str,
 ) -> Option<WorkspaceEdit> {
-    let edits = analysis::rename(tree, source, position_to_point(pos), new_name)?;
+    let edits = analysis.rename_at(position_to_point(pos), new_name)?;
 
     let text_edits: Vec<TextEdit> = edits
         .into_iter()
-        .map(|e| TextEdit {
-            range: span_to_range(e.span),
-            new_text: e.new_text,
+        .map(|(span, new_text)| TextEdit {
+            range: span_to_range(span),
+            new_text,
         })
         .collect();
 
@@ -142,25 +141,26 @@ pub fn completion_items(tree: &Tree, source: &str, pos: Position) -> Vec<Complet
         .collect()
 }
 
-pub fn hover_info(tree: &Tree, source: &str, pos: Position) -> Option<Hover> {
-    let result = analysis::hover_info(tree, source, position_to_point(pos))?;
+pub fn hover_info(analysis: &FileAnalysis, source: &str, pos: Position) -> Option<Hover> {
+    let markdown = analysis.hover_info(position_to_point(pos), source)?;
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: result.markdown,
+            value: markdown,
         }),
         range: None,
     })
 }
 
-pub fn document_highlights(tree: &Tree, source: &str, pos: Position) -> Vec<DocumentHighlight> {
-    analysis::document_highlights(tree, source, position_to_point(pos))
+pub fn document_highlights(analysis: &FileAnalysis, pos: Position) -> Vec<DocumentHighlight> {
+    use crate::file_analysis::AccessKind;
+    analysis.find_highlights(position_to_point(pos))
         .into_iter()
-        .map(|h| DocumentHighlight {
-            range: span_to_range(h.span),
-            kind: Some(match h.kind {
-                analysis::HighlightKind::Write => DocumentHighlightKind::WRITE,
-                analysis::HighlightKind::Read => DocumentHighlightKind::READ,
+        .map(|(span, access)| DocumentHighlight {
+            range: span_to_range(span),
+            kind: Some(match access {
+                AccessKind::Write => DocumentHighlightKind::WRITE,
+                _ => DocumentHighlightKind::READ,
             }),
         })
         .collect()
@@ -182,9 +182,9 @@ pub fn selection_ranges(tree: &Tree, pos: Position) -> SelectionRange {
     })
 }
 
-pub fn folding_ranges(tree: &Tree, source: &str) -> Vec<FoldingRange> {
-    analysis::folding_ranges(tree, source)
-        .into_iter()
+pub fn folding_ranges(analysis: &FileAnalysis) -> Vec<FoldingRange> {
+    analysis.fold_ranges
+        .iter()
         .map(|f| FoldingRange {
             start_line: f.start_line as u32,
             start_character: None,
@@ -332,18 +332,8 @@ pub fn semantic_tokens(tree: &Tree, source: &str) -> Vec<SemanticToken> {
 
 // ---- Diagnostics ----
 
-pub fn collect_diagnostics(tree: &Tree, source: &str) -> Vec<Diagnostic> {
-    analysis::collect_diagnostics(tree, source)
-        .into_iter()
-        .map(|d| Diagnostic {
-            range: span_to_range(d.span),
-            severity: Some(match d.severity {
-                analysis::DiagnosticSeverity::Error => tower_lsp::lsp_types::DiagnosticSeverity::ERROR,
-                analysis::DiagnosticSeverity::Warning => tower_lsp::lsp_types::DiagnosticSeverity::WARNING,
-            }),
-            source: Some("perl-lsp".to_string()),
-            message: d.message,
-            ..Default::default()
-        })
-        .collect()
+pub fn collect_diagnostics(_analysis: &FileAnalysis) -> Vec<Diagnostic> {
+    // Diagnostic infrastructure — currently a stub.
+    // Will be populated as FileAnalysis gains diagnostic capabilities.
+    Vec::new()
 }

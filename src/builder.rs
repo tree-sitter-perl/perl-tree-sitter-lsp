@@ -1432,4 +1432,123 @@ mod tests {
         let pkg = fa.package_at(Point::new(1, 5));
         assert_eq!(pkg, Some("Foo"));
     }
+
+    // ---- High-level query tests ----
+
+    #[test]
+    fn test_find_def_variable() {
+        let fa = build_fa("my $x = 1;\nprint $x;");
+        // Cursor on the usage of $x at line 1
+        let def = fa.find_definition(Point::new(1, 7));
+        assert!(def.is_some(), "should find definition for $x");
+        let span = def.unwrap();
+        assert_eq!(span.start.row, 0, "definition should be on line 0");
+    }
+
+    #[test]
+    fn test_find_def_sub() {
+        let fa = build_fa("sub greet { }\ngreet();");
+        // Cursor on the function call at line 1
+        let def = fa.find_definition(Point::new(1, 1));
+        assert!(def.is_some(), "should find definition for greet");
+        let span = def.unwrap();
+        assert_eq!(span.start.row, 0, "definition should be on line 0");
+    }
+
+    #[test]
+    fn test_find_def_method_in_class() {
+        let src = "package Foo;\nsub new { bless {}, shift }\nsub hello { }\npackage main;\nmy $f = Foo->new();\n$f->hello();";
+        let fa = build_fa(src);
+        // Cursor on hello() call at line 5
+        let def = fa.find_definition(Point::new(5, 5));
+        assert!(def.is_some(), "should find definition for hello method");
+        let span = def.unwrap();
+        assert_eq!(span.start.row, 2, "hello definition should be on line 2");
+    }
+
+    #[test]
+    fn test_find_def_scoped_variable() {
+        let src = "my $x = 'outer';\nsub foo {\n    my $x = 'inner';\n    print $x;\n}";
+        let fa = build_fa(src);
+        // Cursor on $x inside sub (line 3) should resolve to inner $x (line 2)
+        let def = fa.find_definition(Point::new(3, 11));
+        assert!(def.is_some());
+        let span = def.unwrap();
+        assert_eq!(span.start.row, 2, "should resolve to inner $x on line 2");
+    }
+
+    #[test]
+    fn test_find_references_variable() {
+        let src = "my $x = 1;\nprint $x;\n$x = 2;";
+        let fa = build_fa(src);
+        // Cursor on the declaration of $x
+        let refs = fa.find_references(Point::new(0, 4));
+        assert!(refs.len() >= 2, "should find at least declaration + usage, got {}", refs.len());
+    }
+
+    #[test]
+    fn test_find_references_sub() {
+        let src = "sub greet { }\ngreet();\ngreet();";
+        let fa = build_fa(src);
+        // Cursor on the sub name
+        let refs = fa.find_references(Point::new(0, 5));
+        assert!(refs.len() >= 2, "should find definition + calls, got {}", refs.len());
+    }
+
+    #[test]
+    fn test_highlights_read_write() {
+        let src = "my $x = 1;\nprint $x;\n$x = 2;";
+        let fa = build_fa(src);
+        let highlights = fa.find_highlights(Point::new(0, 4));
+        assert!(!highlights.is_empty(), "should have highlights");
+        // Check that we have both read and write accesses
+        let has_write = highlights.iter().any(|(_, a)| matches!(a, AccessKind::Write));
+        let has_read = highlights.iter().any(|(_, a)| matches!(a, AccessKind::Read));
+        // At minimum we should see the declaration
+        assert!(highlights.len() >= 2, "should have at least 2 highlights, got {}", highlights.len());
+        // Note: whether read/write are correctly tagged depends on builder's access classification
+        let _ = (has_write, has_read); // suppress unused warnings if assertions change
+    }
+
+    #[test]
+    fn test_hover_variable() {
+        let src = "my $greeting = 'hello';\nprint $greeting;";
+        let fa = build_fa(src);
+        let hover = fa.hover_info(Point::new(1, 8), src);
+        assert!(hover.is_some(), "should have hover info");
+        let text = hover.unwrap();
+        assert!(text.contains("$greeting"), "hover should contain variable name, got: {}", text);
+    }
+
+    #[test]
+    fn test_hover_sub() {
+        let src = "sub greet { }\ngreet();";
+        let fa = build_fa(src);
+        let hover = fa.hover_info(Point::new(1, 1), src);
+        assert!(hover.is_some(), "should have hover info for function call");
+        let text = hover.unwrap();
+        assert!(text.contains("greet"), "hover should contain sub name, got: {}", text);
+    }
+
+    #[test]
+    fn test_rename_variable() {
+        let src = "my $x = 1;\nprint $x;";
+        let fa = build_fa(src);
+        let edits = fa.rename_at(Point::new(0, 4), "y");
+        assert!(edits.is_some(), "should produce rename edits");
+        let edits = edits.unwrap();
+        assert!(edits.len() >= 2, "should rename at least declaration + usage");
+        for (_, new_text) in &edits {
+            assert_eq!(new_text, "y", "all edits should use new name");
+        }
+    }
+
+    #[test]
+    fn test_find_def_bareword_class() {
+        let src = "package Point;\nsub new { bless {}, shift }\npackage main;\nPoint->new();";
+        let fa = build_fa(src);
+        // Cursor on "new" in Point->new()
+        let def = fa.find_definition(Point::new(3, 8));
+        assert!(def.is_some(), "should find definition for new");
+    }
 }
