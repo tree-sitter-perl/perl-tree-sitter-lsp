@@ -654,6 +654,25 @@ impl<'a> Builder<'a> {
             }
         }
 
+        // Check for block-based dereference: @{expr}, %{expr}, ${expr}
+        // In tree-sitter-perl these parse as scalar/array/hash with a varname
+        // child containing a block. The block holds the real expressions.
+        // Don't record a variable ref for the whole dereference — just recurse.
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.kind() == "varname" {
+                    for j in 0..child.child_count() {
+                        if let Some(gc) = child.child(j) {
+                            if gc.kind() == "block" {
+                                self.visit_children(gc);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Ok(text) = node.utf8_text(self.source) {
             let access = self.determine_access(node);
             self.add_ref(
@@ -1550,5 +1569,64 @@ mod tests {
         // Cursor on "new" in Point->new()
         let def = fa.find_definition(Point::new(3, 8));
         assert!(def.is_some(), "should find definition for new");
+    }
+
+    // ---- Block dereference descent tests ----
+    // @{expr}, %{expr}, ${expr} parse as scalar/array/hash with varname→block.
+    // The builder must recurse into the block to find inner refs.
+
+    #[test]
+    fn test_deref_block_produces_inner_variable_ref() {
+        // @{$arr} — the inner $arr should produce a Variable ref
+        let fa = build_fa("my @data = (1,2,3);\nmy $arr = \\@data;\npush @{$arr}, 4;");
+        let inner_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "$arr" && matches!(r.kind, RefKind::Variable) && r.access == AccessKind::Read)
+            .collect();
+        assert!(!inner_refs.is_empty(), "should find $arr ref inside @{{$arr}}");
+        // Should NOT have a bogus ref for the whole @{$arr}
+        let bogus: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name.contains("{$arr}"))
+            .collect();
+        assert!(bogus.is_empty(), "should not record bogus ref for whole deref expression");
+    }
+
+    #[test]
+    fn test_deref_block_produces_hash_key_ref() {
+        // @{$self->{items}} — inner hash_element_expression should produce:
+        // 1. Variable ref for $self
+        // 2. HashKeyAccess ref for "items"
+        let fa = build_fa("my %h = (items => []);\n@{$h{items}};");
+        let key_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "items" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        assert!(!key_refs.is_empty(), "should find hash key ref 'items' inside deref block");
+    }
+
+    #[test]
+    fn test_deref_block_resolves_variable() {
+        // Variable inside deref block should resolve to its declaration
+        let fa = build_fa("my @xs = (1,2);\nmy $ref = \\@xs;\nprint @{$ref};");
+        let inner_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "$ref" && r.access == AccessKind::Read)
+            .collect();
+        assert!(!inner_refs.is_empty(), "$ref ref should exist");
+        assert!(inner_refs[0].resolves_to.is_some(), "$ref inside deref should resolve to declaration");
+    }
+
+    #[test]
+    fn test_deref_self_and_hash_key() {
+        // Full integration: constructor defines hash keys, method accesses them through deref
+        let src = "package Calculator;\nsub new {\n    my ($class, %args) = @_;\n    my $self = bless {\n        history => [],\n        verbose => 0,\n    }, $class;\n    return $self;\n}\nsub add {\n    my ($self, $a, $b) = @_;\n    my $result = $a + $b;\n    push @{$self->{history}}, \"add\";\n    return $result;\n}";
+        let fa = build_fa(src);
+
+        // $self at line 12 (push @{$self->{history}}, ...)
+        let def_self = fa.find_definition(Point::new(12, 12));
+        assert!(def_self.is_some(), "should find definition for $self in deref");
+        assert_eq!(def_self.unwrap().start.row, 10, "$self should resolve to declaration on line 10");
+
+        // history key at line 12
+        let def_history = fa.find_definition(Point::new(12, 20));
+        assert!(def_history.is_some(), "should find definition for history hash key");
+        assert_eq!(def_history.unwrap().start.row, 4, "history key should resolve to definition on line 4");
     }
 }
