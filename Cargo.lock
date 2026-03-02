@@ -568,6 +568,7 @@ dependencies = [
  "dashmap 6.1.0",
  "env_logger",
  "log",
+ "serde_json",
  "tokio",
  "tower-lsp",
  "tree-sitter",

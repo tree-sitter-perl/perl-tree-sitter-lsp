@@ -601,8 +601,318 @@ fn resolve_imported_function<'a>(
 
 // ---- Diagnostics ----
 
-pub fn collect_diagnostics(_analysis: &FileAnalysis) -> Vec<Diagnostic> {
-    // Diagnostic infrastructure — currently a stub.
-    // Will be populated as FileAnalysis gains diagnostic capabilities.
-    Vec::new()
+/// Sorted list of Perl built-in functions. Used to avoid false-positive
+/// "unresolved function" diagnostics. Checked via binary_search.
+static PERL_BUILTINS: &[&str] = &[
+    "abs", "accept", "alarm", "atan2",
+    "bind", "binmode", "bless",
+    "caller", "chdir", "chmod", "chomp", "chop", "chown", "chr", "chroot", "close",
+    "closedir", "connect", "cos", "crypt",
+    "dbmclose", "dbmopen", "defined", "delete", "die", "do", "dump",
+    "each", "endgrent", "endhostent", "endnetent", "endprotoent", "endpwent",
+    "endservent", "eof", "eval", "exec", "exists", "exit",
+    "fcntl", "fileno", "flock", "fork", "format", "formline",
+    "getc", "getgrent", "getgrgid", "getgrnam", "gethostbyaddr", "gethostbyname",
+    "gethostent", "getlogin", "getnetbyaddr", "getnetbyname", "getnetent",
+    "getpeername", "getpgrp", "getppid", "getpriority", "getprotobyname",
+    "getprotobynumber", "getprotoent", "getpwent", "getpwnam", "getpwuid",
+    "getservbyname", "getservbyport", "getservent", "getsockname", "getsockopt",
+    "glob", "gmtime", "goto", "grep",
+    "hex",
+    "import", "index", "int", "ioctl",
+    "join",
+    "keys", "kill",
+    "last", "lc", "lcfirst", "length", "link", "listen", "local", "localtime", "log",
+    "lstat",
+    "map", "mkdir", "msgctl", "msgget", "msgrcv", "msgsnd",
+    "my",
+    "new", "next", "no",
+    "oct", "open", "opendir", "ord", "our",
+    "pack", "pipe", "pop", "pos", "print", "printf", "prototype", "push",
+    "quotemeta",
+    "rand", "read", "readdir", "readline", "readlink", "readpipe", "recv", "redo",
+    "ref", "rename", "require", "reset", "return", "reverse", "rewinddir", "rindex",
+    "rmdir",
+    "say", "scalar", "seek", "seekdir", "select", "semctl", "semget", "semop", "send",
+    "setgrent", "sethostent", "setnetent", "setpgrp", "setpriority", "setprotoent",
+    "setpwent", "setservent", "setsockopt", "shift", "shmctl", "shmget", "shmread",
+    "shmwrite", "shutdown", "sin", "sleep", "socket", "socketpair", "sort", "splice",
+    "split", "sprintf", "sqrt", "srand", "stat", "state", "study", "sub", "substr",
+    "symlink", "syscall", "sysopen", "sysread", "sysseek", "system", "syswrite",
+    "tell", "telldir", "tie", "tied", "time", "times", "truncate",
+    "uc", "ucfirst", "umask", "undef", "unlink", "unpack", "unshift", "untie", "use",
+    "utime",
+    "values", "vec",
+    "wait", "waitpid", "wantarray", "warn", "write",
+];
+
+fn is_perl_builtin(name: &str) -> bool {
+    PERL_BUILTINS.binary_search(&name).is_ok()
+}
+
+pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for r in &analysis.refs {
+        if !matches!(r.kind, RefKind::FunctionCall) {
+            continue;
+        }
+        let name = &r.target_name;
+
+        // Skip package-qualified calls like Foo::bar()
+        if name.contains("::") {
+            continue;
+        }
+
+        // Skip Perl builtins
+        if is_perl_builtin(name) {
+            continue;
+        }
+
+        // Skip locally defined subs
+        if !analysis.symbols_named(name).is_empty() {
+            continue;
+        }
+
+        // Skip if explicitly listed in any import's qw(...)
+        let explicitly_imported = analysis
+            .imports
+            .iter()
+            .any(|imp| imp.imported_symbols.iter().any(|s| s == name));
+        if explicitly_imported {
+            continue;
+        }
+
+        // Check if an imported module exports this function
+        let range = span_to_range(r.span);
+        if let Some((import, _path)) = resolve_imported_function(analysis, name, module_index) {
+            // Importable but not yet in the qw() list → actionable hint
+            diagnostics.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::HINT),
+                code: Some(NumberOrString::String("unresolved-function".into())),
+                source: Some("perl-lsp".into()),
+                message: format!(
+                    "'{}' is exported by {} but not imported",
+                    name, import.module_name,
+                ),
+                data: Some(serde_json::json!({
+                    "module": import.module_name,
+                    "function": name,
+                })),
+                ..Default::default()
+            });
+        } else {
+            // Unknown function — informational only
+            diagnostics.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::INFORMATION),
+                code: Some(NumberOrString::String("unresolved-function".into())),
+                source: Some("perl-lsp".into()),
+                message: format!("'{}' is not defined in this file", name),
+                ..Default::default()
+            });
+        }
+    }
+
+    diagnostics
+}
+
+// ---- Code actions ----
+
+pub fn code_actions(
+    diagnostics: &[Diagnostic],
+    analysis: &FileAnalysis,
+    uri: &Url,
+) -> Vec<CodeActionOrCommand> {
+    let mut actions = Vec::new();
+
+    for diag in diagnostics {
+        // Only handle our "unresolved-function" diagnostics with data
+        let code_matches = matches!(
+            &diag.code,
+            Some(NumberOrString::String(s)) if s == "unresolved-function"
+        );
+        if !code_matches {
+            continue;
+        }
+        let data = match &diag.data {
+            Some(d) => d,
+            None => continue,
+        };
+        let module_name = match data.get("module").and_then(|v| v.as_str()) {
+            Some(m) => m,
+            None => continue,
+        };
+        let func_name = match data.get("function").and_then(|v| v.as_str()) {
+            Some(f) => f,
+            None => continue,
+        };
+
+        // Find the matching import with a qw() list we can edit
+        let import = analysis
+            .imports
+            .iter()
+            .find(|imp| imp.module_name == module_name);
+        let import = match import {
+            Some(imp) => imp,
+            None => continue,
+        };
+        let close_pos = match import.qw_close_paren {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Insert ` func_name` just before the closing paren of qw()
+        let insert_pos = point_to_position(close_pos);
+        let edit = TextEdit {
+            range: Range {
+                start: insert_pos,
+                end: insert_pos,
+            },
+            new_text: format!(" {}", func_name),
+        };
+
+        let mut changes = HashMap::new();
+        changes.insert(uri.clone(), vec![edit]);
+
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Import '{}' from {}", func_name, module_name),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diag.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            is_preferred: Some(true),
+            ..Default::default()
+        }));
+    }
+
+    actions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder;
+
+    fn parse_analysis(source: &str) -> FileAnalysis {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_perl::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        builder::build(&tree, source.as_bytes())
+    }
+
+    #[test]
+    fn test_builtins_sorted() {
+        for window in PERL_BUILTINS.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "PERL_BUILTINS not sorted: '{}' >= '{}'",
+                window[0],
+                window[1],
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_perl_builtin() {
+        assert!(is_perl_builtin("print"));
+        assert!(is_perl_builtin("chomp"));
+        assert!(is_perl_builtin("die"));
+        assert!(!is_perl_builtin("frobnicate"));
+        assert!(!is_perl_builtin("my_custom_sub"));
+    }
+
+    #[test]
+    fn test_diagnostics_skips_builtins() {
+        let source = "use Carp qw(croak);\nprint 'hello';\ndie 'oops';\n";
+        let analysis = parse_analysis(source);
+        let module_index = crate::module_index::ModuleIndex::new();
+        let diags = collect_diagnostics(&analysis, &module_index);
+        // print and die are builtins, croak is explicitly imported — no diagnostics
+        assert!(
+            diags.is_empty(),
+            "Expected no diagnostics for builtins/imported, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_unresolved_function() {
+        let source = "frobnicate();\n";
+        let analysis = parse_analysis(source);
+        let module_index = crate::module_index::ModuleIndex::new();
+        let diags = collect_diagnostics(&analysis, &module_index);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::INFORMATION));
+        assert!(diags[0].message.contains("frobnicate"));
+    }
+
+    #[test]
+    fn test_diagnostics_skips_local_sub() {
+        let source = "sub helper { 1 }\nhelper();\n";
+        let analysis = parse_analysis(source);
+        let module_index = crate::module_index::ModuleIndex::new();
+        let diags = collect_diagnostics(&analysis, &module_index);
+        assert!(
+            diags.is_empty(),
+            "Locally defined sub should not produce diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_skips_package_qualified() {
+        let source = "Foo::Bar::baz();\n";
+        let analysis = parse_analysis(source);
+        let module_index = crate::module_index::ModuleIndex::new();
+        let diags = collect_diagnostics(&analysis, &module_index);
+        assert!(
+            diags.is_empty(),
+            "Package-qualified calls should not produce diagnostic",
+        );
+    }
+
+    #[test]
+    fn test_code_action_from_diagnostic() {
+        let source = "use Carp qw(croak);\ncarp('oops');\n";
+        let analysis = parse_analysis(source);
+        let uri = Url::parse("file:///test.pl").unwrap();
+
+        // Simulate a HINT diagnostic with data (as collect_diagnostics would produce
+        // if module_index had resolved Carp)
+        let diag = Diagnostic {
+            range: Range {
+                start: Position { line: 1, character: 0 },
+                end: Position { line: 1, character: 4 },
+            },
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unresolved-function".into())),
+            source: Some("perl-lsp".into()),
+            message: "'carp' is exported by Carp but not imported".into(),
+            data: Some(serde_json::json!({"module": "Carp", "function": "carp"})),
+            ..Default::default()
+        };
+
+        let actions = code_actions(&[diag], &analysis, &uri);
+        assert_eq!(actions.len(), 1);
+        if let CodeActionOrCommand::CodeAction(action) = &actions[0] {
+            assert_eq!(action.title, "Import 'carp' from Carp");
+            assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+            assert_eq!(action.is_preferred, Some(true));
+
+            // Verify the edit inserts " carp" at the qw close paren
+            let edit = action.edit.as_ref().unwrap();
+            let changes = edit.changes.as_ref().unwrap();
+            let text_edits = changes.get(&uri).unwrap();
+            assert_eq!(text_edits.len(), 1);
+            assert_eq!(text_edits[0].new_text, " carp");
+        } else {
+            panic!("Expected CodeAction, got Command");
+        }
+    }
 }

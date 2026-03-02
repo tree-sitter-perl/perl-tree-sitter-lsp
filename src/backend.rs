@@ -24,7 +24,7 @@ impl Backend {
 
     async fn publish_diagnostics(&self, uri: &Url) {
         let diagnostics = match self.documents.get(uri) {
-            Some(doc) => symbols::collect_diagnostics(&doc.analysis),
+            Some(doc) => symbols::collect_diagnostics(&doc.analysis, &self.module_index),
             None => vec![],
         };
         self.client
@@ -77,6 +77,7 @@ impl LanguageServer for Backend {
                 }),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
@@ -389,6 +390,20 @@ impl LanguageServer for Backend {
             },
             new_text: formatted,
         }]))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = &params.text_document.uri;
+        let doc = match self.documents.get(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let actions = symbols::code_actions(&params.context.diagnostics, &doc.analysis, uri);
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
     }
 
     async fn semantic_tokens_full(
