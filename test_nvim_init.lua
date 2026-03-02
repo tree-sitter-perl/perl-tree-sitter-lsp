@@ -1,10 +1,12 @@
 -- Throwaway nvim config for testing perl-lsp
--- Usage: nvim -u test_nvim_init.lua test_files/sample.pl
+-- Usage: nvim --clean -u test_nvim_init.lua test_files/sample.pl
 
 -- Minimal settings
 vim.opt.number = true
 vim.opt.signcolumn = "yes"
 vim.opt.updatetime = 300
+vim.opt.completeopt = { "menuone", "noselect", "popup" }
+vim.opt.pumheight = 15
 
 -- Path to the built binary
 local lsp_bin = vim.fn.fnamemodify("target/release/perl-lsp", ":p")
@@ -21,7 +23,13 @@ vim.lsp.enable("perl-lsp")
 vim.api.nvim_create_autocmd("LspAttach", {
   callback = function(args)
     local buf = args.buf
+    local client_id = args.data.client_id
     local opts = { buffer = buf }
+
+    -- Built-in LSP completion (nvim 0.11+)
+    -- autotrigger: fires on trigger characters from the server ($, @, %, ->, etc.)
+    -- Use C-x C-o for manual trigger, C-y to accept, C-n/C-p to navigate
+    vim.lsp.completion.enable(true, client_id, buf, { autotrigger = true })
 
     -- Navigation
     vim.keymap.set("n", "gd", vim.lsp.buf.definition, opts)
@@ -148,65 +156,39 @@ vim.api.nvim_create_autocmd("LspAttach", {
     vim.keymap.set("n", "[d", vim.diagnostic.goto_prev, opts)
     vim.keymap.set("n", "]d", vim.diagnostic.goto_next, opts)
 
-    -- Completion: omnifunc backed by LSP
-    vim.bo[buf].omnifunc = "v:lua.vim.lsp.omnifunc"
+    -- Manual trigger with C-Space
+    vim.keymap.set("i", "<C-Space>", function()
+      vim.lsp.completion.get()
+    end, opts)
 
-    -- Auto-trigger completion on Perl sigils, ->, and call-site triggers
-    for _, char in ipairs({ "$", "@", "%" }) do
-      vim.keymap.set("i", char, char .. "<C-x><C-o>", { buffer = buf })
-    end
-    vim.keymap.set("i", "->", "-><C-x><C-o>", { buffer = buf })
-    vim.keymap.set("i", "(", "(<C-x><C-o>", { buffer = buf })
-    vim.keymap.set("i", ",", ",<C-x><C-o>", { buffer = buf })
-
-    -- Auto-trigger completion while typing
-    vim.api.nvim_create_autocmd("TextChangedI", {
+    -- Auto-trigger completion on bareword typing
+    -- Uses InsertCharPre (like nvim's own autotrigger) to avoid TextChangedI loops
+    vim.api.nvim_create_autocmd("InsertCharPre", {
       buffer = buf,
       callback = function()
-        -- Skip if completion menu is already visible
         if vim.fn.pumvisible() == 1 then return end
-        local col = vim.fn.col(".") - 1
+        local char = vim.v.char
+        -- Only trigger on word characters (letters, digits, underscore)
+        if not char:match("[%w_]") then return end
+        -- Check that we're building a word of at least 2 chars
+        local col = vim.fn.col(".") - 1  -- before the char being inserted
         if col <= 0 then return end
         local line = vim.api.nvim_get_current_line()
         local before = line:sub(1, col)
-
-        local function trigger()
-          vim.schedule(function()
-            if vim.fn.mode() == "i" and vim.fn.pumvisible() == 0 then
-              vim.api.nvim_feedkeys(
-                vim.api.nvim_replace_termcodes("<C-x><C-o>", true, false, true),
-                "n", false)
-            end
-          end)
-        end
-
-        -- Inside parens: re-trigger for keyval arg editing
-        local opens = select(2, before:gsub("%(", ""))
-        local closes = select(2, before:gsub("%)", ""))
-        if opens > closes then
-          local last = before:sub(-1)
-          if last:match("[%w_]") or (last == " " and before:sub(-2, -2) == ",") then
-            trigger()
-          end
-          return
-        end
-
-        -- General bareword completion: trigger after 2+ word chars
-        -- (catches package names like Point, function names, etc.)
         local word = before:match("[%a_][%w_:]*$")
-        if word and #word >= 2 then
-          trigger()
-        end
+        -- word + the char being typed = 2+ chars
+        if not word then return end
+        vim.schedule(function()
+          if vim.fn.mode() == "i" and vim.fn.pumvisible() == 0 then
+            vim.lsp.completion.get()
+          end
+        end)
       end,
     })
 
-    print("perl-lsp attached! gd=def gr=refs K=hover <leader>rn=rename <leader>o=symbols <leader>f=format C-x C-o=complete")
+    print("perl-lsp attached! gd=def gr=refs K=hover <leader>rn=rename <leader>o=symbols <leader>f=format")
   end,
 })
-
--- Completion menu settings
-vim.opt.completeopt = { "menuone", "noinsert", "preview" }
-vim.opt.pumheight = 15
 
 -- Semantic token highlight groups for perl-lsp custom modifiers
 -- These map @lsp.mod.<modifier>.perl to colors.
