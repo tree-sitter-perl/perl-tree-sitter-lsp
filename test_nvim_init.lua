@@ -11,9 +11,26 @@ vim.opt.pumheight = 15
 -- Path to the built binary
 local lsp_bin = vim.fn.fnamemodify("target/release/perl-lsp", ":p")
 
+-- Debug mode: set PERL_LSP_DEBUG=1 env var before launching nvim to enable.
+--   PERL_LSP_DEBUG=1 nvim --clean -u test_nvim_init.lua test_files/sample.pl
+-- Then tail the log: tail -f /tmp/perl-lsp.log
+local debug_mode = vim.env.PERL_LSP_DEBUG == "1"
+local log_level = debug_mode and "debug" or "warn"
+local log_file = "/tmp/perl-lsp.log"
+
 -- Set up perl-lsp via vim.lsp.config (nvim 0.11+)
+local cmd
+if debug_mode then
+  cmd = {
+    "sh", "-c",
+    "RUST_LOG=perl_lsp=" .. log_level .. " exec " .. vim.fn.shellescape(lsp_bin) .. " 2>>" .. log_file,
+  }
+else
+  cmd = { lsp_bin }
+end
+
 vim.lsp.config["perl-lsp"] = {
-  cmd = { lsp_bin },
+  cmd = cmd,
   filetypes = { "perl" },
   root_markers = { ".git", "Makefile", "cpanfile", "Makefile.PL", "Build.PL" },
 }

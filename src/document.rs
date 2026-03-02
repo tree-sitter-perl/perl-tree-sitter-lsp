@@ -12,12 +12,25 @@ pub struct Document {
 impl Document {
     pub fn new(text: String) -> Option<Self> {
         let mut parser = create_parser();
+        let t0 = std::time::Instant::now();
         let tree = parser.parse(&text, None)?;
+        let elapsed = t0.elapsed();
+        if elapsed.as_millis() > 100 {
+            log::warn!("Slow parse (new): {:?} for {} bytes", elapsed, text.len());
+        }
         let analysis = builder::build(&tree, text.as_bytes());
         Some(Document { text, tree, analysis })
     }
 
     pub fn update(&mut self, new_text: String) {
+        // Dump the text we're about to parse so we can reproduce hangs.
+        // Written *before* parsing — if we hang, this file has the culprit.
+        if log::log_enabled!(log::Level::Debug) {
+            let dump_path = "/tmp/perl-lsp-last-update.pl";
+            let _ = std::fs::write(dump_path, &new_text);
+            log::debug!("Wrote {} bytes to {}", new_text.len(), dump_path);
+        }
+
         // Diff old vs new to find the changed region, then tell tree-sitter
         // exactly what changed so it can do targeted incremental reparsing.
         // This preserves valid nodes outside the edit, producing much better
@@ -60,8 +73,13 @@ impl Document {
         }
 
         let mut parser = create_parser();
+        let t0 = std::time::Instant::now();
         if let Some(tree) = parser.parse(&new_text, Some(&self.tree)) {
             self.tree = tree;
+        }
+        let elapsed = t0.elapsed();
+        if elapsed.as_millis() > 100 {
+            log::warn!("Slow parse (update): {:?} for {} bytes", elapsed, new_text.len());
         }
         self.text = new_text;
         self.analysis = builder::build(&self.tree, self.text.as_bytes());

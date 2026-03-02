@@ -162,6 +162,66 @@ nvim -u test_nvim_init.lua test_files/sample.pl
 
 Alternatively, a `.vscode/settings.json` for this repo is included — just install the extension and open the workspace.
 
+## Debugging
+
+The LSP server uses `env_logger` for logging. Set `RUST_LOG` to control verbosity.
+
+### Enabling logs
+
+Debug mode is opt-in via the `PERL_LSP_DEBUG` env var. The included `test_nvim_init.lua` config checks for it:
+
+```bash
+# Normal usage — no logging, no overhead
+nvim --clean -u test_nvim_init.lua test_files/sample.pl
+
+# Debug mode — full logging to /tmp/perl-lsp.log
+PERL_LSP_DEBUG=1 nvim --clean -u test_nvim_init.lua test_files/sample.pl
+```
+
+Then tail the log in a separate terminal:
+
+```bash
+tail -f /tmp/perl-lsp.log
+```
+
+For a standalone nvim config, wrap the command to redirect stderr:
+
+```lua
+vim.lsp.config["perl-lsp"] = {
+  cmd = {
+    "sh", "-c",
+    "RUST_LOG=perl_lsp=debug exec /path/to/perl-lsp 2>>/tmp/perl-lsp.log",
+  },
+  filetypes = { "perl" },
+  root_markers = { ".git", "Makefile", "cpanfile", "Makefile.PL", "Build.PL" },
+}
+```
+
+### What gets logged
+
+| Level | What |
+|---|---|
+| `info` | Module resolution: which modules are queued, resolved, and their export counts |
+| `warn` | Slow parses (>100ms), subprocess timeouts (SIGKILL'd), skipped files (too large) |
+| `debug` | Every `did_change` dumps the full document text to `/tmp/perl-lsp-last-update.pl` |
+
+### Reproducing parser hangs
+
+tree-sitter-perl's external scanner can occasionally enter an infinite loop on certain malformed input. When this happens:
+
+1. Force-kill the hung nvim session
+2. The file `/tmp/perl-lsp-last-update.pl` contains the exact document text that was sent to the parser right before it hung
+3. Reproduce in isolation:
+   ```bash
+   # For module resolution hangs:
+   ./target/release/perl-lsp --parse-exports /tmp/perl-lsp-last-update.pl
+
+   # Or feed to tree-sitter directly:
+   cd ../tree-sitter-perl && tree-sitter parse /tmp/perl-lsp-last-update.pl
+   ```
+
+Module resolution runs in isolated child processes with a 5-second timeout — if a `.pm` file triggers an infinite loop, the child is SIGKILL'd and the module is skipped. The main LSP process stays alive.
+
 ## LSP Features (Priority Order)
 
 ### Phase 1 — Core navigation

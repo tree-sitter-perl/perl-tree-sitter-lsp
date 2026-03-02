@@ -4,16 +4,23 @@
 //! Used for cross-file intelligence: completion, go-to-def, hover for imported
 //! functions.
 //!
-//! Architecture: all filesystem I/O runs on a dedicated `std::thread`. Async
-//! LSP handlers only read the `DashMap` cache (zero I/O). The resolver thread
-//! owns a single reusable `tree_sitter::Parser` for export extraction.
+//! Architecture: a coordinator `std::thread` drains a work queue and dispatches
+//! each module parse to an **isolated child process** with a hard timeout. If
+//! tree-sitter's external scanner hangs (opaque C code that `set_timeout_micros`
+//! cannot interrupt), the child is SIGKILL'd — no leaked spinning threads.
+//! Async LSP handlers only read the `DashMap` cache (zero I/O).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use tree_sitter::Parser;
+
+/// Hard timeout for parsing a single .pm file. The parse runs in a child
+/// process; if it exceeds this limit, the child is SIGKILL'd.
+const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---- Public types ----
 
@@ -40,12 +47,12 @@ struct ResolveNotify {
     cv: Condvar,
 }
 
-/// Concurrent cache of module exports with a dedicated background resolver thread.
+/// Concurrent cache of module exports with a dedicated background resolver.
 ///
-/// Architecture: all filesystem I/O runs on a single `std::thread`. The async
-/// handlers only ever read the `DashMap` cache (zero I/O). New module names are
-/// pushed into a `Mutex<Vec>` + `Condvar` queue; the resolver thread drains
-/// it and populates the shared `Arc<DashMap>` cache.
+/// A coordinator thread drains a `Mutex<Vec>` + `Condvar` queue and dispatches
+/// each module parse to an isolated child process with a hard timeout. If the
+/// child hangs, it's SIGKILL'd. Async LSP handlers only read the `DashMap`
+/// cache (zero I/O).
 pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<ModuleExports>>>,
     queue: Arc<ResolveQueue>,
@@ -64,7 +71,9 @@ impl ModuleIndex {
             cv: Condvar::new(),
         });
 
-        // Dedicated I/O thread — the only place that touches the filesystem.
+        // Coordinator thread — dispatches each parse to an isolated child
+        // process. If tree-sitter's external scanner hangs, the child is
+        // SIGKILL'd after PARSE_TIMEOUT — no leaked spinning threads.
         let thread_cache = Arc::clone(&cache);
         let thread_queue = Arc::clone(&queue);
         let thread_resolved = Arc::clone(&resolved);
@@ -72,9 +81,6 @@ impl ModuleIndex {
             .name("module-resolver".into())
             .spawn(move || {
                 let inc_paths = discover_inc_paths();
-
-                // Single parser instance, reused for every module.
-                let mut parser = create_parser();
                 let mut seen = HashSet::new();
 
                 loop {
@@ -90,7 +96,16 @@ impl ModuleIndex {
                         if !seen.insert(module_name.clone()) {
                             continue;
                         }
-                        let result = resolve_and_parse(&inc_paths, &module_name, &mut parser);
+
+                        log::info!("Resolving module '{}'", module_name);
+                        let result = parse_module(&inc_paths, &module_name);
+                        match &result {
+                            Some(e) => log::info!(
+                                "Resolved '{}': {} export, {} export_ok",
+                                module_name, e.export.len(), e.export_ok.len()
+                            ),
+                            None => log::info!("No exports found for '{}'", module_name),
+                        }
                         thread_cache.insert(module_name, result);
 
                         // Signal waiters that a module was resolved.
@@ -176,6 +191,108 @@ impl ModuleIndex {
     pub fn resolve_module(&self, module_name: &str) -> Option<PathBuf> {
         let inc_paths = discover_inc_paths();
         resolve_module_path(&inc_paths, module_name)
+    }
+}
+
+/// In production: subprocess isolation with hard timeout (SIGKILL on hang).
+/// In tests: direct parsing (the test binary doesn't handle --parse-exports).
+#[cfg(not(test))]
+fn parse_module(inc_paths: &[PathBuf], module_name: &str) -> Option<ModuleExports> {
+    parse_in_subprocess(inc_paths, module_name)
+}
+
+#[cfg(test)]
+fn parse_module(inc_paths: &[PathBuf], module_name: &str) -> Option<ModuleExports> {
+    let mut parser = create_parser();
+    resolve_and_parse(inc_paths, module_name, &mut parser)
+}
+
+/// Resolve a module and parse its exports in an isolated child process.
+/// If the child hangs (e.g. external scanner infinite loop), it's SIGKILL'd
+/// after PARSE_TIMEOUT — the OS fully cleans up the process.
+fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<ModuleExports> {
+    let path = resolve_module_path(inc_paths, module_name)?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    let file_size = metadata.len();
+    if file_size > 1_000_000 {
+        log::warn!("Skipping '{}' — file too large ({} bytes): {:?}", module_name, file_size, path);
+        return None;
+    }
+    log::info!("Subprocess parse '{}' ({} bytes): {:?}", module_name, file_size, path);
+
+    let exe = std::env::current_exe().ok()?;
+    let mut child = std::process::Command::new(exe)
+        .arg("--parse-exports")
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Read stdout on a helper thread so we can apply a timeout.
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name(format!("read-{}", module_name))
+        .spawn(move || {
+            let result = std::io::read_to_string(stdout);
+            let _ = tx.send(result);
+        })
+        .ok()?;
+
+    let output = match rx.recv_timeout(PARSE_TIMEOUT) {
+        Ok(Ok(s)) => s,
+        _ => {
+            // Timeout or read error — kill the child (SIGKILL on Unix).
+            let _ = child.kill();
+            let _ = child.wait();
+            log::warn!("Timed out parsing module '{}'", module_name);
+            return None;
+        }
+    };
+    let _ = child.wait(); // reap
+
+    // Parse the JSON output from the child.
+    let json: serde_json::Value = serde_json::from_str(&output).ok()?;
+    let export: Vec<String> = json
+        .get("export")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let export_ok: Vec<String> = json
+        .get("export_ok")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    if export.is_empty() && export_ok.is_empty() {
+        return None;
+    }
+
+    Some(ModuleExports { path, export, export_ok })
+}
+
+/// Entry point for `--parse-exports <path>` subprocess mode.
+/// Reads the .pm file, parses with tree-sitter, prints exports as JSON to stdout.
+pub fn subprocess_main(path: &str) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("{{}}");
+            return;
+        }
+    };
+    let mut parser = create_parser();
+    match extract_exports(&mut parser, &source) {
+        Some((export, export_ok)) => {
+            let json = serde_json::json!({
+                "export": export,
+                "export_ok": export_ok,
+            });
+            println!("{}", json);
+        }
+        None => println!("{{}}"),
     }
 }
 
