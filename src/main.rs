@@ -4,6 +4,7 @@ mod builder;
 mod cursor_context;
 mod document;
 mod file_analysis;
+mod module_index;
 mod symbols;
 
 use backend::Backend;

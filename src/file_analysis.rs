@@ -189,6 +189,22 @@ pub enum HashKeyOwner {
     Variable { name: String, def_scope: ScopeId },
 }
 
+// ---- Import ----
+
+/// A `use Foo::Bar qw(func1 func2)` statement parsed from the source.
+#[derive(Debug, Clone)]
+pub struct Import {
+    /// Module name, e.g. "List::Util".
+    pub module_name: String,
+    /// Explicitly imported symbols from `qw(...)`. Empty = bare `use Foo;`.
+    pub imported_symbols: Vec<String>,
+    /// Span of the entire `use` statement.
+    pub span: Span,
+    /// Position of the closing delimiter of the `qw()` list (the `)` character).
+    /// Used to insert new imports into an existing qw list.
+    pub qw_close_paren: Option<Point>,
+}
+
 // ---- Outline ----
 
 pub struct OutlineSymbol {
@@ -235,6 +251,7 @@ pub struct FileAnalysis {
     pub refs: Vec<Ref>,
     pub type_constraints: Vec<TypeConstraint>,
     pub fold_ranges: Vec<FoldRange>,
+    pub imports: Vec<Import>,
 
     // Indices (built in post-pass)
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
@@ -252,6 +269,7 @@ impl FileAnalysis {
         refs: Vec<Ref>,
         type_constraints: Vec<TypeConstraint>,
         fold_ranges: Vec<FoldRange>,
+        imports: Vec<Import>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -259,6 +277,7 @@ impl FileAnalysis {
             refs,
             type_constraints,
             fold_ranges,
+            imports,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -1065,6 +1084,8 @@ pub struct CompletionCandidate {
     pub detail: Option<String>,
     pub insert_text: Option<String>,
     pub sort_priority: u8,
+    /// Additional text edits applied when this candidate is accepted (e.g. auto-import).
+    pub additional_edits: Vec<(Span, String)>,
 }
 
 /// Signature info for a sub/method, resolved from the symbol table.
@@ -1180,6 +1201,7 @@ impl FileAnalysis {
                         detail: Some(format!("{}->new", cn)),
                         insert_text: None,
                         sort_priority: 0,
+                    additional_edits: vec![],
                     });
                     break;
                 }
@@ -1195,6 +1217,7 @@ impl FileAnalysis {
                             detail: Some(cn.clone()),
                             insert_text: None,
                             sort_priority: 0,
+                    additional_edits: vec![],
                         });
                     }
                 }
@@ -1224,6 +1247,7 @@ impl FileAnalysis {
                                 detail: Some(cn.clone()),
                                 insert_text: None,
                                 sort_priority: 0,
+                    additional_edits: vec![],
                             });
                         }
                     }
@@ -1251,6 +1275,7 @@ impl FileAnalysis {
                 ),
                 insert_text: None,
                 sort_priority: 10,
+                    additional_edits: vec![],
             })
             .collect()
     }
@@ -1291,6 +1316,7 @@ impl FileAnalysis {
                 detail,
                 insert_text: None,
                 sort_priority: if is_dynamic { 50 } else { 10 },
+                    additional_edits: vec![],
             });
         }
 
@@ -1322,6 +1348,7 @@ impl FileAnalysis {
                     ),
                     insert_text: None,
                     sort_priority: 10,
+                    additional_edits: vec![],
                 });
             }
         }
@@ -1342,6 +1369,7 @@ impl FileAnalysis {
                     ),
                     insert_text: None,
                     sort_priority: 20,
+                    additional_edits: vec![],
                 });
             }
         }
@@ -1423,6 +1451,7 @@ impl FileAnalysis {
                 detail: Some(format!("{}(%{})", call_name, slurpy_name)),
                 insert_text: Some(format!("{} => ", k)),
                 sort_priority: 0,
+                    additional_edits: vec![],
             })
             .collect()
     }
@@ -1599,6 +1628,7 @@ impl FileAnalysis {
                                     detail: Some(format!("{}->new(:param)", class_name)),
                                     insert_text: Some(format!("{} => ", key)),
                                     sort_priority: 0,
+                    additional_edits: vec![],
                                 });
                             }
                         }
@@ -1657,6 +1687,7 @@ fn generate_cross_sigil_candidates(
                     detail: detail.clone(),
                     insert_text: Some(bare_name.to_string()),
                     sort_priority: priority,
+                    additional_edits: vec![],
                 });
             }
             if decl_sigil == '@' {
@@ -1666,6 +1697,7 @@ fn generate_cross_sigil_candidates(
                     detail: detail.clone().or(Some(format!("@{}", bare_name))),
                     insert_text: Some(format!("{}[", bare_name)),
                     sort_priority: priority,
+                    additional_edits: vec![],
                 });
                 out.push(CompletionCandidate {
                     label: format!("$#{}", bare_name),
@@ -1675,6 +1707,7 @@ fn generate_cross_sigil_candidates(
                         .or(Some(format!("last index of @{}", bare_name))),
                     insert_text: Some(format!("#{}", bare_name)),
                     sort_priority: priority.saturating_add(1),
+                    additional_edits: vec![],
                 });
             }
             if decl_sigil == '%' {
@@ -1684,6 +1717,7 @@ fn generate_cross_sigil_candidates(
                     detail: detail.clone().or(Some(format!("%{}", bare_name))),
                     insert_text: Some(format!("{}{{", bare_name)),
                     sort_priority: priority,
+                    additional_edits: vec![],
                 });
             }
         }
@@ -1695,6 +1729,7 @@ fn generate_cross_sigil_candidates(
                     detail: detail.clone(),
                     insert_text: Some(bare_name.to_string()),
                     sort_priority: priority,
+                    additional_edits: vec![],
                 });
                 out.push(CompletionCandidate {
                     label: format!("@{}[]", bare_name),
@@ -1702,6 +1737,7 @@ fn generate_cross_sigil_candidates(
                     detail: Some("array slice".to_string()),
                     insert_text: Some(format!("{}[", bare_name)),
                     sort_priority: priority.saturating_add(1),
+                    additional_edits: vec![],
                 });
             }
             if decl_sigil == '%' {
@@ -1711,6 +1747,7 @@ fn generate_cross_sigil_candidates(
                     detail: detail.clone().or(Some("hash slice".to_string())),
                     insert_text: Some(format!("{}{{", bare_name)),
                     sort_priority: priority,
+                    additional_edits: vec![],
                 });
             }
         }
@@ -1722,6 +1759,7 @@ fn generate_cross_sigil_candidates(
                     detail: detail.clone(),
                     insert_text: Some(bare_name.to_string()),
                     sort_priority: priority,
+                    additional_edits: vec![],
                 });
                 out.push(CompletionCandidate {
                     label: format!("%{}{{}}", bare_name),
@@ -1729,6 +1767,7 @@ fn generate_cross_sigil_candidates(
                     detail: Some("hash kv slice".to_string()),
                     insert_text: Some(format!("{}{{", bare_name)),
                     sort_priority: priority.saturating_add(1),
+                    additional_edits: vec![],
                 });
             }
             if decl_sigil == '@' {
@@ -1738,6 +1777,7 @@ fn generate_cross_sigil_candidates(
                     detail: Some("array kv slice".to_string()),
                     insert_text: Some(format!("{}[", bare_name)),
                     sort_priority: priority,
+                    additional_edits: vec![],
                 });
             }
         }

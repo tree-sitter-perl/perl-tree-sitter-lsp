@@ -5,8 +5,9 @@ use tree_sitter::{Point, Tree};
 use crate::analysis;
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
-    CompletionCandidate, FileAnalysis, OutlineSymbol, SymKind as FaSymKind, VarModifier,
+    CompletionCandidate, FileAnalysis, OutlineSymbol, RefKind, SymKind as FaSymKind, VarModifier,
 };
+use crate::module_index::ModuleIndex;
 
 // ---- Coordinate conversion ----
 
@@ -75,12 +76,50 @@ pub fn find_definition(
     analysis: &FileAnalysis,
     pos: Position,
     uri: &Url,
+    module_index: &ModuleIndex,
 ) -> Option<GotoDefinitionResponse> {
-    let span = analysis.find_definition(position_to_point(pos))?;
-    Some(GotoDefinitionResponse::Scalar(Location {
-        uri: uri.clone(),
-        range: span_to_range(span),
-    }))
+    let point = position_to_point(pos);
+
+    // Try local definition first
+    if let Some(span) = analysis.find_definition(point) {
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range: span_to_range(span),
+        }));
+    }
+
+    // Check if cursor is on a function call that matches an imported symbol
+    if let Some(r) = analysis.ref_at(point) {
+        if matches!(r.kind, RefKind::FunctionCall) {
+            if let Some((import, module_path)) =
+                resolve_imported_function(analysis, &r.target_name, module_index)
+            {
+                // Jump to the module's use statement in the current file
+                // (or the .pm file if we can resolve it)
+                if let Ok(module_uri) = Url::from_file_path(&module_path) {
+                    return Some(GotoDefinitionResponse::Array(vec![
+                        // First: the use statement in this file
+                        Location {
+                            uri: uri.clone(),
+                            range: span_to_range(import.span),
+                        },
+                        // Second: the .pm file itself (line 1)
+                        Location {
+                            uri: module_uri,
+                            range: Range::default(),
+                        },
+                    ]));
+                }
+                // Fall back to just the use statement
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: uri.clone(),
+                    range: span_to_range(import.span),
+                }));
+            }
+        }
+    }
+
+    None
 }
 
 pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url) -> Vec<Location> {
@@ -131,12 +170,26 @@ fn fa_completion_kind(kind: &FaSymKind) -> CompletionItemKind {
 }
 
 fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
+    let additional_text_edits = if c.additional_edits.is_empty() {
+        None
+    } else {
+        Some(
+            c.additional_edits
+                .iter()
+                .map(|(span, text)| TextEdit {
+                    range: span_to_range(*span),
+                    new_text: text.clone(),
+                })
+                .collect(),
+        )
+    };
     CompletionItem {
         label: c.label,
         kind: Some(fa_completion_kind(&c.kind)),
         detail: c.detail,
         insert_text: c.insert_text,
         sort_text: Some(format!("{:03}", c.sort_priority)),
+        additional_text_edits,
         ..Default::default()
     }
 }
@@ -146,6 +199,7 @@ pub fn completion_items(
     tree: &Tree,
     source: &str,
     pos: Position,
+    module_index: &ModuleIndex,
 ) -> Vec<CompletionItem> {
     let point = position_to_point(pos);
     let ctx = cursor_context::detect_cursor_context(source, point);
@@ -171,6 +225,10 @@ pub fn completion_items(
                 }
             }
             items.extend(analysis.complete_general(point));
+
+            // Add imported function completions
+            items.extend(imported_function_completions(analysis, module_index));
+
             items
         }
     };
@@ -181,15 +239,47 @@ pub fn completion_items(
         .collect()
 }
 
-pub fn hover_info(analysis: &FileAnalysis, source: &str, pos: Position) -> Option<Hover> {
-    let markdown = analysis.hover_info(position_to_point(pos), source)?;
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: markdown,
-        }),
-        range: None,
-    })
+pub fn hover_info(
+    analysis: &FileAnalysis,
+    source: &str,
+    pos: Position,
+    module_index: &ModuleIndex,
+) -> Option<Hover> {
+    let point = position_to_point(pos);
+
+    // Try local hover first
+    if let Some(markdown) = analysis.hover_info(point, source) {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: markdown,
+            }),
+            range: None,
+        });
+    }
+
+    // Check if cursor is on an imported function call
+    if let Some(r) = analysis.ref_at(point) {
+        if matches!(r.kind, RefKind::FunctionCall) {
+            if let Some((import, _path)) =
+                resolve_imported_function(analysis, &r.target_name, module_index)
+            {
+                let markdown = format!(
+                    "```perl\nuse {} qw({});\n```\n\n*imported from `{}`*",
+                    import.module_name, r.target_name, import.module_name,
+                );
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: markdown,
+                    }),
+                    range: None,
+                });
+            }
+        }
+    }
+
+    None
 }
 
 pub fn document_highlights(analysis: &FileAnalysis, pos: Position) -> Vec<DocumentHighlight> {
@@ -384,6 +474,129 @@ pub fn semantic_tokens(analysis: &FileAnalysis) -> Vec<SemanticToken> {
     }
 
     result
+}
+
+// ---- Import resolution helpers ----
+
+/// Build completion candidates for functions imported via `use` statements.
+/// Offers all @EXPORT_OK from already-imported modules — not just the ones
+/// currently in the qw() list. Functions not yet imported get an auto-import
+/// edit that adds them to the existing qw() list.
+fn imported_function_completions(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+) -> Vec<CompletionCandidate> {
+    use crate::analysis::Span;
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for import in &analysis.imports {
+        let exports = module_index.get_exports_cached(&import.module_name);
+
+        // 1. Always offer explicitly imported symbols (from the qw list)
+        for name in &import.imported_symbols {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if !analysis.symbols_named(name).is_empty() {
+                continue;
+            }
+            candidates.push(CompletionCandidate {
+                label: name.clone(),
+                kind: FaSymKind::Sub,
+                detail: Some(format!("imported from {}", import.module_name)),
+                insert_text: None,
+                sort_priority: 12,
+                additional_edits: vec![],
+            });
+        }
+
+        // 2. Offer additional @EXPORT_OK functions (not yet imported) if we can resolve the module
+        if let Some(ref exports) = exports {
+            let all_exported: Vec<&String> = if import.imported_symbols.is_empty() {
+                // Bare `use Foo;` — offer @EXPORT
+                exports.export.iter().collect()
+            } else {
+                // `use Foo qw(bar)` — offer remaining @EXPORT + @EXPORT_OK
+                let mut all = Vec::new();
+                all.extend(exports.export.iter());
+                all.extend(exports.export_ok.iter());
+                all
+            };
+
+            for name in all_exported {
+                // Skip already-offered (explicitly imported) and locally defined
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if !analysis.symbols_named(name).is_empty() {
+                    continue;
+                }
+
+                let (detail, priority, additional_edits) =
+                    if let Some(close_pos) = import.qw_close_paren {
+                        // Auto-add to existing qw() list
+                        let insert_point = Span {
+                            start: close_pos,
+                            end: close_pos,
+                        };
+                        (
+                            format!("{} (auto-import)", import.module_name),
+                            18u8,
+                            vec![(insert_point, format!(" {}", name))],
+                        )
+                    } else {
+                        // No qw() list to edit (bare `use Foo;`)
+                        (
+                            format!("imported from {}", import.module_name),
+                            15u8,
+                            vec![],
+                        )
+                    };
+
+                candidates.push(CompletionCandidate {
+                    label: name.clone(),
+                    kind: FaSymKind::Sub,
+                    detail: Some(detail),
+                    insert_text: None,
+                    sort_priority: priority,
+                    additional_edits,
+                });
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Find which import provides a given function name.
+/// Checks both explicitly imported symbols and all @EXPORT/@EXPORT_OK
+/// from already-imported modules.
+fn resolve_imported_function<'a>(
+    analysis: &'a FileAnalysis,
+    func_name: &str,
+    module_index: &ModuleIndex,
+) -> Option<(&'a crate::file_analysis::Import, std::path::PathBuf)> {
+    for import in &analysis.imports {
+        // Check explicit import list first
+        if import.imported_symbols.iter().any(|s| s == func_name) {
+            if let Some(path) = module_index.module_path_cached(&import.module_name) {
+                return Some((import, path));
+            }
+        }
+
+        // Check module's export lists
+        if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
+            let in_exports = exports.export.contains(&func_name.to_string())
+                || exports.export_ok.contains(&func_name.to_string());
+            if in_exports {
+                if let Some(path) = module_index.module_path_cached(&import.module_name) {
+                    return Some((import, path));
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---- Diagnostics ----

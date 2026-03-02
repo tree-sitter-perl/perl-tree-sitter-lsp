@@ -24,6 +24,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         refs: Vec::new(),
         type_constraints: Vec::new(),
         fold_ranges: Vec::new(),
+        imports: Vec::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -48,6 +49,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         b.refs,
         b.type_constraints,
         b.fold_ranges,
+        b.imports,
     )
 }
 
@@ -59,6 +61,7 @@ struct Builder<'a> {
     refs: Vec<Ref>,
     type_constraints: Vec<TypeConstraint>,
     fold_ranges: Vec<FoldRange>,
+    imports: Vec<Import>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -607,9 +610,87 @@ impl<'a> Builder<'a> {
                     node_to_span(module_node),
                     SymbolDetail::None,
                 );
+
+                // Extract imported symbols from qw(...) or list
+                let (imported_symbols, qw_close_paren) = self.extract_use_import_list(node);
+                self.imports.push(Import {
+                    module_name: module_name.to_string(),
+                    imported_symbols,
+                    span: node_to_span(node),
+                    qw_close_paren,
+                });
             }
         }
         // Don't recurse — use statements don't contain interesting sub-nodes
+    }
+
+    /// Extract the import list from a use statement.
+    /// Handles `use Foo qw(bar baz)` and `use Foo ('bar', 'baz')`.
+    /// Returns (imported_symbols, qw_close_paren_position).
+    fn extract_use_import_list(&self, node: Node<'a>) -> (Vec<String>, Option<Point>) {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                match child.kind() {
+                    "quoted_word_list" => {
+                        // qw(word1 word2 ...) — find the closing delimiter
+                        let mut words = Vec::new();
+                        for j in 0..child.named_child_count() {
+                            if let Some(sc) = child.named_child(j) {
+                                if sc.kind() == "string_content" {
+                                    if let Ok(text) = sc.utf8_text(self.source) {
+                                        for word in text.split_whitespace() {
+                                            if !word.is_empty() {
+                                                words.push(word.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // The closing delimiter is the last byte of the qw node
+                        // e.g. for `qw(foo bar)`, end_position points just past `)`
+                        let end = child.end_position();
+                        let close_pos = Point::new(end.row, end.column.saturating_sub(1));
+                        return (words, Some(close_pos));
+                    }
+                    "parenthesized_expression" | "list_expression" => {
+                        // ('foo', 'bar', ...)
+                        let mut words = Vec::new();
+                        self.collect_string_values(child, &mut words);
+                        if !words.is_empty() {
+                            return (words, None);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (vec![], None)
+    }
+
+    /// Collect string literal values from a list/paren expression.
+    fn collect_string_values(&self, node: Node<'a>, words: &mut Vec<String>) {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                match child.kind() {
+                    "string_literal" | "interpolated_string_literal" => {
+                        for j in 0..child.named_child_count() {
+                            if let Some(content) = child.named_child(j) {
+                                if content.kind() == "string_content" {
+                                    if let Ok(text) = content.utf8_text(self.source) {
+                                        words.push(text.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "list_expression" | "parenthesized_expression" => {
+                        self.collect_string_values(child, words);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     fn visit_assignment(&mut self, node: Node<'a>) {
@@ -1628,5 +1709,64 @@ mod tests {
         let def_history = fa.find_definition(Point::new(12, 20));
         assert!(def_history.is_some(), "should find definition for history hash key");
         assert_eq!(def_history.unwrap().start.row, 4, "history key should resolve to definition on line 4");
+    }
+
+    #[test]
+    fn test_imports_qw() {
+        let source = "use List::Util qw(first any all);\nuse Scalar::Util qw(blessed);\n";
+        let fa = build_fa(source);
+
+        assert_eq!(fa.imports.len(), 2);
+
+        assert_eq!(fa.imports[0].module_name, "List::Util");
+        assert_eq!(fa.imports[0].imported_symbols, vec!["first", "any", "all"]);
+
+        assert_eq!(fa.imports[1].module_name, "Scalar::Util");
+        assert_eq!(fa.imports[1].imported_symbols, vec!["blessed"]);
+    }
+
+    #[test]
+    fn test_imports_qw_close_paren_position() {
+        // "use List::Util qw(first);\n"
+        //  0123456789...
+        //                  ^18    ^24 = )
+        let source = "use List::Util qw(first);\n";
+        let fa = build_fa(source);
+
+        assert_eq!(fa.imports.len(), 1);
+        let imp = &fa.imports[0];
+        assert!(imp.qw_close_paren.is_some(), "qw_close_paren should be set");
+        let pos = imp.qw_close_paren.unwrap();
+        // The ) is at column 23 in "use List::Util qw(first);"
+        eprintln!("qw_close_paren = row={}, col={}", pos.row, pos.column);
+        assert_eq!(pos.row, 0);
+        assert_eq!(pos.column, 23, "close paren should be at column 23");
+    }
+
+    #[test]
+    fn test_imports_bare() {
+        let source = "use strict;\nuse warnings;\nuse Carp;\n";
+        let fa = build_fa(source);
+
+        // strict/warnings/Carp all produce imports with empty imported_symbols
+        let carp = fa.imports.iter().find(|i| i.module_name == "Carp");
+        assert!(carp.is_some());
+        assert!(carp.unwrap().imported_symbols.is_empty());
+    }
+
+    #[test]
+    fn test_imports_module_symbol_created() {
+        let source = "use List::Util qw(first);\n";
+        let fa = build_fa(source);
+
+        // Module symbol should exist
+        let module_syms: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Module && s.name == "List::Util")
+            .collect();
+        assert_eq!(module_syms.len(), 1);
+
+        // Import should exist
+        assert_eq!(fa.imports.len(), 1);
+        assert_eq!(fa.imports[0].imported_symbols, vec!["first"]);
     }
 }

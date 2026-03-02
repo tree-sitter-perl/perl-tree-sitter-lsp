@@ -4,11 +4,13 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::document::Document;
+use crate::module_index::ModuleIndex;
 use crate::symbols;
 
 pub struct Backend {
     client: Client,
     documents: DashMap<Url, Document>,
+    module_index: ModuleIndex,
 }
 
 impl Backend {
@@ -16,6 +18,7 @@ impl Backend {
         Backend {
             client,
             documents: DashMap::new(),
+            module_index: ModuleIndex::new(),
         }
     }
 
@@ -109,6 +112,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
         if let Some(doc) = Document::new(text) {
+            // Enqueue imports for background resolution (non-blocking).
+            for imp in &doc.analysis.imports {
+                self.module_index.request_resolve(&imp.module_name);
+            }
             self.documents.insert(uri.clone(), doc);
         }
         self.publish_diagnostics(&uri).await;
@@ -161,7 +168,12 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        Ok(symbols::find_definition(&doc.analysis, pos, uri))
+        Ok(symbols::find_definition(
+            &doc.analysis,
+            pos,
+            uri,
+            &self.module_index,
+        ))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -197,7 +209,12 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        Ok(symbols::hover_info(&doc.analysis, &doc.text, pos))
+        Ok(symbols::hover_info(
+            &doc.analysis,
+            &doc.text,
+            pos,
+            &self.module_index,
+        ))
     }
 
     async fn completion(
@@ -210,7 +227,13 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let items = symbols::completion_items(&doc.analysis, &doc.tree, &doc.text, pos);
+        let items = symbols::completion_items(
+            &doc.analysis,
+            &doc.tree,
+            &doc.text,
+            pos,
+            &self.module_index,
+        );
         if items.is_empty() {
             Ok(None)
         } else {
