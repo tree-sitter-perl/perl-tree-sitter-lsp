@@ -99,15 +99,17 @@ nvim -u test_nvim_init.lua test_files/sample.pl
 
 ```
 src/
-├── main.rs            Entry point, stdio transport, --parse-exports subprocess mode
-├── backend.rs         LanguageServer trait impl (tower-lsp), request routing
-├── document.rs        Document store with tree-sitter parsing
-├── analysis.rs        Legacy analysis (being migrated to builder/file_analysis)
-├── file_analysis.rs   Data model: scopes, symbols, refs, imports, type inference
-├── builder.rs         Single-pass CST → FileAnalysis builder
-├── cursor_context.rs  Cursor position analysis: completion/signature/selection context
-├── symbols.rs         LSP adapter: converts FileAnalysis types to LSP types
-└── module_index.rs    Cross-file: module resolution, SQLite cache, cpanfile parsing
+├── main.rs              Entry point, stdio transport, --parse-exports subprocess mode
+├── backend.rs           LanguageServer trait impl (tower-lsp), request routing
+├── document.rs          Document store with tree-sitter parsing
+├── file_analysis.rs     Data model: scopes, symbols, refs, imports, type inference
+├── builder.rs           Single-pass CST → FileAnalysis builder
+├── cursor_context.rs    Cursor position analysis: completion/signature/selection context
+├── symbols.rs           LSP adapter: converts FileAnalysis types to LSP types
+├── module_index.rs      Cross-file: public API, reverse index, concurrent cache
+├── module_resolver.rs   Background resolver thread, subprocess isolation, export extraction
+├── module_cache.rs      SQLite persistence, schema migrations, mtime validation
+└── cpanfile.rs          cpanfile parsing via tree-sitter queries
 ```
 
 ### Key dependencies
@@ -124,9 +126,11 @@ src/
 
 1. When a file is opened/edited, `use` statements trigger background module resolution
 2. A dedicated `std::thread` (not tokio) does all filesystem I/O — never blocks the async runtime
-3. Modules are located via `@INC`, exports extracted via string matching (not tree-sitter — avoids memory blowup)
+3. Modules are located via `@INC`, exports extracted by tree-sitter parsing in isolated subprocesses
 4. Results stored in `Arc<DashMap>` (async handlers read) + SQLite (persists across restarts)
-5. At startup, `cpanfile` is parsed with tree-sitter queries to pre-resolve project dependencies
+5. A reverse index (`function → modules`) enables O(1) exporter lookup for diagnostics and completions
+6. At startup, `cpanfile` is parsed with tree-sitter queries to pre-resolve project dependencies
+7. After module resolution, diagnostics are refreshed for all open files (no stale false positives)
 
 ## Debugging
 
@@ -171,6 +175,7 @@ The file `/tmp/perl-lsp-last-update.pl` contains the last document text sent to 
 - Framework submodule whitelist (`Mojo::*`, `Moose::*` patterns)
 - OOP framework stubs (Moo, Moose, Class::Accessor) — declarative DSL → class shape mapping
 - Bulk `@INC` scan for go-to-def into any installed module
+- Subprocess batching: parse multiple modules per child process to reduce spawn overhead for bulk scans
 
 ### Future
 - Workspace-wide references and rename

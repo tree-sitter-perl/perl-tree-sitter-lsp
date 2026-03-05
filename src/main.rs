@@ -1,10 +1,12 @@
-mod analysis;
 mod backend;
 mod builder;
+mod cpanfile;
 mod cursor_context;
 mod document;
 mod file_analysis;
+mod module_cache;
 mod module_index;
+mod module_resolver;
 mod symbols;
 
 use backend::Backend;

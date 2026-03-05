@@ -5,7 +5,6 @@
 
 use tree_sitter::{Node, Point, Tree};
 
-use crate::analysis::{FoldKind, FoldRange, Span};
 use crate::file_analysis::*;
 
 fn node_to_span(node: Node) -> Span {

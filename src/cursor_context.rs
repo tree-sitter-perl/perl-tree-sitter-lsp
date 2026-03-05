@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use tree_sitter::{Node, Point, Tree};
 
-use crate::analysis::Span;
+use crate::file_analysis::Span;
 
 // ---- Types ----
 

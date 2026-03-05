@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use tower_lsp::lsp_types::*;
 use tree_sitter::{Point, Tree};
 
-use crate::analysis;
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
-    CompletionCandidate, FileAnalysis, OutlineSymbol, RefKind, SymKind as FaSymKind, VarModifier,
+    CompletionCandidate, FileAnalysis, FoldKind, OutlineSymbol, RefKind, Span,
+    SymKind as FaSymKind, VarModifier,
+    PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT, PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
 use crate::module_index::ModuleIndex;
 
@@ -22,7 +23,7 @@ fn position_to_point(pos: Position) -> Point {
     Point::new(pos.line as usize, pos.character as usize)
 }
 
-fn span_to_range(span: analysis::Span) -> Range {
+fn span_to_range(span: Span) -> Range {
     Range {
         start: point_to_position(span.start),
         end: point_to_position(span.end),
@@ -324,8 +325,8 @@ pub fn folding_ranges(analysis: &FileAnalysis) -> Vec<FoldingRange> {
             end_line: f.end_line as u32,
             end_character: None,
             kind: Some(match f.kind {
-                analysis::FoldKind::Region => FoldingRangeKind::Region,
-                analysis::FoldKind::Comment => FoldingRangeKind::Comment,
+                FoldKind::Region => FoldingRangeKind::Region,
+                FoldKind::Comment => FoldingRangeKind::Comment,
             }),
             collapsed_text: None,
         })
@@ -489,7 +490,7 @@ fn imported_function_completions(
     analysis: &FileAnalysis,
     module_index: &ModuleIndex,
 ) -> Vec<CompletionCandidate> {
-    use crate::analysis::Span;
+    use crate::file_analysis::Span;
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -509,7 +510,7 @@ fn imported_function_completions(
                 kind: FaSymKind::Sub,
                 detail: Some(format!("imported from {}", import.module_name)),
                 insert_text: None,
-                sort_priority: 12,
+                sort_priority: PRIORITY_EXPLICIT_IMPORT,
                 additional_edits: vec![],
             });
         }
@@ -545,14 +546,14 @@ fn imported_function_completions(
                         };
                         (
                             format!("{} (auto-import)", import.module_name),
-                            18u8,
+                            PRIORITY_AUTO_ADD_QW,
                             vec![(insert_point, format!(" {}", name))],
                         )
                     } else {
                         // No qw() list to edit (bare `use Foo;`)
                         (
                             format!("imported from {}", import.module_name),
-                            15u8,
+                            PRIORITY_BARE_IMPORT,
                             vec![],
                         )
                     };
@@ -579,7 +580,7 @@ fn unimported_function_completions(
     analysis: &FileAnalysis,
     module_index: &ModuleIndex,
 ) -> Vec<CompletionCandidate> {
-    use crate::analysis::Span;
+    use crate::file_analysis::Span;
     let mut candidates = Vec::new();
 
     // Collect already-imported module names so we skip them.
@@ -617,7 +618,7 @@ fn unimported_function_completions(
                 kind: FaSymKind::Sub,
                 detail: Some(format!("{} (auto-import)", module_name)),
                 insert_text: None,
-                sort_priority: 25, // Lower than local (5) and already-imported (12/15/18)
+                sort_priority: PRIORITY_UNIMPORTED,
                 additional_edits: vec![(
                     insert_span,
                     format!("use {} qw({});\n", module_name, name),
@@ -633,28 +634,24 @@ fn unimported_function_completions(
 
 /// Find which import provides a given function name.
 /// Checks both explicitly imported symbols and all @EXPORT/@EXPORT_OK
-/// from already-imported modules.
+/// from already-imported modules. Single DashMap lookup per module.
 fn resolve_imported_function<'a>(
     analysis: &'a FileAnalysis,
     func_name: &str,
     module_index: &ModuleIndex,
 ) -> Option<(&'a crate::file_analysis::Import, std::path::PathBuf)> {
     for import in &analysis.imports {
-        // Check explicit import list first
-        if import.imported_symbols.iter().any(|s| s == func_name) {
+        if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
+            let explicitly_imported = import.imported_symbols.iter().any(|s| s == func_name);
+            let in_export_lists = exports.export.iter().any(|s| s == func_name)
+                || exports.export_ok.iter().any(|s| s == func_name);
+            if explicitly_imported || in_export_lists {
+                return Some((import, exports.path.clone()));
+            }
+        } else if import.imported_symbols.iter().any(|s| s == func_name) {
+            // Module not cached yet but explicitly listed in qw() — trust the import.
             if let Some(path) = module_index.module_path_cached(&import.module_name) {
                 return Some((import, path));
-            }
-        }
-
-        // Check module's export lists
-        if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
-            let in_exports = exports.export.contains(&func_name.to_string())
-                || exports.export_ok.contains(&func_name.to_string());
-            if in_exports {
-                if let Some(path) = module_index.module_path_cached(&import.module_name) {
-                    return Some((import, path));
-                }
             }
         }
     }

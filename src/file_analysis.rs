@@ -8,7 +8,26 @@
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Point;
 
-use crate::analysis::{FoldKind, FoldRange, Span};
+// ---- Shared types (formerly in analysis.rs) ----
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Span {
+    pub start: Point,
+    pub end: Point,
+}
+
+#[derive(Debug, Clone)]
+pub struct FoldRange {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: FoldKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldKind {
+    Region,
+    Comment,
+}
 
 // ---- IDs ----
 
@@ -1074,6 +1093,28 @@ impl FileAnalysis {
     }
 }
 
+// ---- Completion priority constants ----
+//
+// Lower numbers sort first. Used by both file_analysis (local completions)
+// and symbols.rs (cross-file completions).
+
+/// Variables, local subs, methods — direct scope match.
+pub const PRIORITY_LOCAL: u8 = 0;
+/// General subs, hash keys, keyval args — file-wide match.
+pub const PRIORITY_FILE_WIDE: u8 = 10;
+/// Explicitly imported via `use Foo qw(bar)`.
+pub const PRIORITY_EXPLICIT_IMPORT: u8 = 12;
+/// Bare `use Foo;` @EXPORT symbol (no qw list to edit).
+pub const PRIORITY_BARE_IMPORT: u8 = 15;
+/// Auto-add to existing `qw()` list.
+pub const PRIORITY_AUTO_ADD_QW: u8 = 18;
+/// Sub already used as first param (less relevant).
+pub const PRIORITY_LESS_RELEVANT: u8 = 20;
+/// Unimported module — inserts full `use` statement.
+pub const PRIORITY_UNIMPORTED: u8 = 25;
+/// Dynamic hash keys (may not exist).
+pub const PRIORITY_DYNAMIC: u8 = 50;
+
 // ---- Completion types ----
 
 /// A completion candidate from FileAnalysis resolution (pure table lookup).
@@ -1200,7 +1241,7 @@ impl FileAnalysis {
                         kind: SymKind::Method,
                         detail: Some(format!("{}->new", cn)),
                         insert_text: None,
-                        sort_priority: 0,
+                        sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
                     });
                     break;
@@ -1216,7 +1257,7 @@ impl FileAnalysis {
                             kind: sym.kind,
                             detail: Some(cn.clone()),
                             insert_text: None,
-                            sort_priority: 0,
+                            sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
                         });
                     }
@@ -1246,7 +1287,7 @@ impl FileAnalysis {
                                 kind: sym.kind,
                                 detail: Some(cn.clone()),
                                 insert_text: None,
-                                sort_priority: 0,
+                                sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
                             });
                         }
@@ -1274,7 +1315,7 @@ impl FileAnalysis {
                     .to_string(),
                 ),
                 insert_text: None,
-                sort_priority: 10,
+                sort_priority: PRIORITY_FILE_WIDE,
                     additional_edits: vec![],
             })
             .collect()
@@ -1315,7 +1356,7 @@ impl FileAnalysis {
                 kind: SymKind::Variable,
                 detail,
                 insert_text: None,
-                sort_priority: if is_dynamic { 50 } else { 10 },
+                sort_priority: if is_dynamic { PRIORITY_DYNAMIC } else { PRIORITY_FILE_WIDE },
                     additional_edits: vec![],
             });
         }
@@ -1347,7 +1388,7 @@ impl FileAnalysis {
                         .to_string(),
                     ),
                     insert_text: None,
-                    sort_priority: 10,
+                    sort_priority: PRIORITY_FILE_WIDE,
                     additional_edits: vec![],
                 });
             }
@@ -1368,7 +1409,7 @@ impl FileAnalysis {
                         .to_string(),
                     ),
                     insert_text: None,
-                    sort_priority: 20,
+                    sort_priority: PRIORITY_LESS_RELEVANT,
                     additional_edits: vec![],
                 });
             }
@@ -1450,7 +1491,7 @@ impl FileAnalysis {
                 kind: SymKind::Variable,
                 detail: Some(format!("{}(%{})", call_name, slurpy_name)),
                 insert_text: Some(format!("{} => ", k)),
-                sort_priority: 0,
+                sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
             })
             .collect()
@@ -1627,7 +1668,7 @@ impl FileAnalysis {
                                     kind: SymKind::Variable,
                                     detail: Some(format!("{}->new(:param)", class_name)),
                                     insert_text: Some(format!("{} => ", key)),
-                                    sort_priority: 0,
+                                    sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
                                 });
                             }

@@ -20,12 +20,14 @@ cd ../tree-sitter-perl && tree-sitter generate
 - `src/main.rs` — Entry point, stdio transport, `--parse-exports` subprocess mode
 - `src/backend.rs` — `LanguageServer` trait implementation (tower-lsp), request routing
 - `src/document.rs` — Document store with tree-sitter parsing
-- `src/analysis.rs` — Legacy analysis module (being migrated to builder/file_analysis)
-- `src/file_analysis.rs` — Data model: scopes, symbols, refs, imports, type inference
+- `src/file_analysis.rs` — Data model: scopes, symbols, refs, imports, type inference, priority constants
 - `src/builder.rs` — Single-pass CST → FileAnalysis builder
 - `src/cursor_context.rs` — Cursor position analysis: completion/signature/selection context
 - `src/symbols.rs` — LSP adapter layer (converts FileAnalysis types to LSP types)
-- `src/module_index.rs` — Cross-file module resolution, SQLite cache, cpanfile parsing
+- `src/module_index.rs` — Cross-file: public API, reverse index (`func → modules`), concurrent cache
+- `src/module_resolver.rs` — Background resolver thread, subprocess isolation, export extraction
+- `src/module_cache.rs` — SQLite persistence, schema migrations, mtime validation
+- `src/cpanfile.rs` — cpanfile parsing via tree-sitter queries
 
 ## Key Dependencies
 
@@ -52,17 +54,19 @@ Key nodes and their fields:
 ## Testing
 
 ```
-cargo test           # run all 192 tests
+cargo test           # run all tests
 ```
 
 ## Cross-file Module Resolution
 
 - `ModuleIndex` uses a dedicated `std::thread` for filesystem I/O (never blocks tokio)
 - `Arc<DashMap>` shared between resolver thread and async LSP handlers
-- Export extraction uses string matching (not tree-sitter) to avoid memory blowup
+- Reverse index: `DashMap<func_name, Vec<module_name>>` for O(1) exporter lookup
+- Export extraction uses tree-sitter in isolated subprocesses (5s timeout + SIGKILL)
 - cpanfile parsed with tree-sitter queries at startup, deps pre-resolved with progress reporting
 - SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`)
 - Async handlers only use `_cached` methods — zero I/O
+- After resolution, diagnostics are refreshed for all open files (clears stale false positives)
 
 ## LSP Capabilities
 
