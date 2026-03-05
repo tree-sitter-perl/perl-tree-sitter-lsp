@@ -110,9 +110,10 @@ are zero matches from `cpanfile`/`import` sources?
 
 ## Implementation Checklist
 
-- [ ] Add `source` column to modules table (schema version bump)
-- [ ] Parse cpanfile with tree-sitter in `initialize()`
-- [ ] Pass source tag through `request_resolve()` → `save_to_db()`
-- [ ] Filter `unimported_function_completions()` by source tag
-- [ ] Add `$/progress` reporting to resolver thread
-- [ ] Tests: cpanfile parsing, source tag filtering, progress messages
+- [x] Add `source` column to modules table (schema v2)
+- [x] Parse cpanfile with tree-sitter queries in resolver thread
+- [x] Pass source tag through `save_to_db()` ("cpanfile" vs "import")
+- [x] Add `$/progress` reporting to resolver thread
+- [x] Tests: cpanfile parsing, DB source column, progress flow
+- [ ] Phase-aware filtering (`cpanfile-test` tag, `t/` directory guard)
+- [ ] Framework submodule whitelist (`extraModules` config)
