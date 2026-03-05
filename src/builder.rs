@@ -278,12 +278,24 @@ impl<'a> Builder<'a> {
             },
         );
 
-        // Push class scope and visit body
-        self.add_fold_range(node);
-        self.push_scope(ScopeKind::Class { name: name.clone() }, node_to_span(node), Some(name));
-        // Visit children — the block will be visited via visit_children
-        self.visit_children(node);
-        self.pop_scope();
+        let has_block = node.child_by_field_name("body").is_some()
+            || (0..node.child_count()).any(|i| node.child(i).map_or(false, |c| c.kind() == "block"));
+
+        if has_block {
+            // Block class: push/pop scope, restore package after block
+            self.add_fold_range(node);
+            let prev_package = self.current_package.take();
+            self.current_package = Some(name.clone());
+            self.push_scope(ScopeKind::Class { name: name.clone() }, node_to_span(node), Some(name));
+            self.visit_children(node);
+            self.pop_scope();
+            self.current_package = prev_package;
+        } else {
+            // Flat class (class Foo;): like package, stays in effect until next package/class
+            self.current_package = Some(name.clone());
+            let scope = self.current_scope();
+            self.scopes[scope.0 as usize].package = Some(name);
+        }
     }
 
     fn collect_field_details(&self, block: Node<'a>, out: &mut Vec<FieldDetail>) {
@@ -1490,6 +1502,55 @@ $p->;
         assert!(names.contains(&"magnitude"), "missing magnitude, got: {:?}", names);
         assert!(names.contains(&"to_string"), "missing to_string, got: {:?}", names);
         assert!(names.contains(&"x"), "missing reader x, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_complete_methods_class_after_package_main() {
+        // Real-world: package main; ... class Point {} ... $p->
+        let source = r#"package main;
+my $calc = Calculator->new();
+1;
+use v5.38;
+class Point {
+    field $x :param :reader;
+    field $y :param;
+    method magnitude () { }
+    method to_string () { }
+}
+my $p = Point->new(x => 3, y => 4);
+$p->;
+"#;
+        let fa = build_fa(source);
+
+        let candidates = fa.complete_methods("$p", Point::new(11, 4));
+        let names: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(names.contains(&"new"), "missing new, got: {:?}", names);
+        assert!(names.contains(&"magnitude"), "missing magnitude, got: {:?}", names);
+        assert!(names.contains(&"to_string"), "missing to_string, got: {:?}", names);
+        assert!(names.contains(&"x"), "missing reader x, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_complete_methods_flat_class() {
+        // class Foo; (no block) — methods follow as siblings, like package
+        let source = "use v5.38;\nclass Foo;\nmethod bar () { }\nmethod baz () { }\n";
+        let fa = build_fa(source);
+        let candidates = fa.complete_methods("Foo", Point::new(3, 0));
+        let names: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(names.contains(&"bar"), "missing bar, got: {:?}", names);
+        assert!(names.contains(&"baz"), "missing baz, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_goto_def_method_after_package_main() {
+        // go-to-def on $p->magnitude() should find the method, not the class
+        let source = "package main;\n1;\nuse v5.38;\nclass Point {\n    field $x :param :reader;\n    method magnitude () { }\n}\nmy $p = Point->new(x => 3);\n$p->magnitude();\n";
+        let fa = build_fa(source);
+        // cursor on `magnitude` in `$p->magnitude()` — line 8, col 5
+        let def = fa.find_definition(Point::new(8, 5));
+        assert!(def.is_some(), "should find definition for magnitude");
+        let span = def.unwrap();
+        assert_eq!(span.start.row, 5, "should point to method declaration line, got row {}", span.start.row);
     }
 
     #[test]
