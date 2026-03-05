@@ -16,9 +16,9 @@ pub struct Backend {
 impl Backend {
     pub fn new(client: Client) -> Self {
         Backend {
+            module_index: ModuleIndex::new(client.clone()),
             client,
             documents: DashMap::new(),
-            module_index: ModuleIndex::new(),
         }
     }
 

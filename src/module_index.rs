@@ -16,6 +16,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use dashmap::DashMap;
+use tower_lsp::lsp_types::*;
+use tower_lsp::lsp_types::{notification, request};
+use tower_lsp::Client;
 use tree_sitter::Parser;
 
 /// Hard timeout for parsing a single .pm file. The parse runs in a child
@@ -68,7 +71,7 @@ pub struct ModuleIndex {
 }
 
 impl ModuleIndex {
-    pub fn new() -> Self {
+    pub fn new(client: Client) -> Self {
         let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
         let queue = Arc::new(ResolveQueue {
             pending: Mutex::new(Vec::new()),
@@ -82,6 +85,9 @@ impl ModuleIndex {
             root: Mutex::new(None),
             condvar: Condvar::new(),
         });
+
+        // Capture tokio handle so the resolver thread can send LSP notifications.
+        let handle = tokio::runtime::Handle::current();
 
         // Coordinator thread — dispatches each parse to an isolated child
         // process. If tree-sitter's external scanner hangs, the child is
@@ -126,6 +132,83 @@ impl ModuleIndex {
 
                 let mut seen = HashSet::new();
 
+                // Pre-resolve cpanfile dependencies.
+                if let Some(ref root_uri) = ws_root {
+                    if let Some(root_path) = uri_to_path(root_uri) {
+                        let cpanfile_modules = parse_cpanfile(&root_path);
+                        let to_resolve: Vec<String> = cpanfile_modules
+                            .into_iter()
+                            .filter(|m| !thread_cache.contains_key(m.as_str()))
+                            .collect();
+
+                        if !to_resolve.is_empty() {
+                            let total = to_resolve.len();
+                            log::info!("cpanfile: {} modules to index", total);
+
+                            // Begin progress.
+                            let token = NumberOrString::String(
+                                "perl-lsp/indexing".to_string(),
+                            );
+                            let _ = handle.block_on(client.send_request::<request::WorkDoneProgressCreate>(
+                                WorkDoneProgressCreateParams {
+                                    token: token.clone(),
+                                },
+                            ));
+                            handle.block_on(client.send_notification::<notification::Progress>(
+                                ProgressParams {
+                                    token: token.clone(),
+                                    value: ProgressParamsValue::WorkDone(
+                                        WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                                            title: "Indexing Perl modules".into(),
+                                            cancellable: Some(false),
+                                            message: None,
+                                            percentage: Some(0),
+                                        }),
+                                    ),
+                                },
+                            ));
+
+                            for (i, module_name) in to_resolve.iter().enumerate() {
+                                let pct = ((i + 1) * 100 / total) as u32;
+                                handle.block_on(client.send_notification::<notification::Progress>(
+                                    ProgressParams {
+                                        token: token.clone(),
+                                        value: ProgressParamsValue::WorkDone(
+                                            WorkDoneProgress::Report(WorkDoneProgressReport {
+                                                cancellable: Some(false),
+                                                message: Some(format!(
+                                                    "{} ({}/{})", module_name, i + 1, total
+                                                )),
+                                                percentage: Some(pct),
+                                            }),
+                                        ),
+                                    },
+                                ));
+
+                                log::info!("cpanfile: resolving '{}' ({}/{})", module_name, i + 1, total);
+                                let result = parse_module(&inc_paths, module_name);
+                                thread_cache.insert(module_name.clone(), result.clone());
+                                if let Some(ref conn) = db {
+                                    save_to_db(conn, module_name, &result, "cpanfile");
+                                }
+                                seen.insert(module_name.clone());
+                            }
+
+                            // End progress.
+                            handle.block_on(client.send_notification::<notification::Progress>(
+                                ProgressParams {
+                                    token,
+                                    value: ProgressParamsValue::WorkDone(
+                                        WorkDoneProgress::End(WorkDoneProgressEnd {
+                                            message: Some(format!("Indexed {} modules", total)),
+                                        }),
+                                    ),
+                                },
+                            ));
+                        }
+                    }
+                }
+
                 loop {
                     let batch = {
                         let mut pending = thread_queue.pending.lock().unwrap();
@@ -153,7 +236,7 @@ impl ModuleIndex {
 
                         // Persist to SQLite for next session.
                         if let Some(ref conn) = db {
-                            save_to_db(conn, &module_name, &result);
+                            save_to_db(conn, &module_name, &result, "import");
                         }
 
                         // Signal waiters that a module was resolved.
@@ -230,6 +313,90 @@ impl ModuleIndex {
         }
         result.sort();
         result
+    }
+
+    /// Create a ModuleIndex for testing — no resolver thread, no Client needed.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
+        let queue = Arc::new(ResolveQueue {
+            pending: Mutex::new(Vec::new()),
+            condvar: Condvar::new(),
+        });
+        let resolved = Arc::new(ResolveNotify {
+            mu: Mutex::new(()),
+            cv: Condvar::new(),
+        });
+        let workspace_root = Arc::new(WorkspaceRootChannel {
+            root: Mutex::new(None),
+            condvar: Condvar::new(),
+        });
+
+        // Spawn a minimal resolver thread (no Client, no progress reporting).
+        let thread_cache = Arc::clone(&cache);
+        let thread_queue = Arc::clone(&queue);
+        let thread_resolved = Arc::clone(&resolved);
+        let thread_ws_root = Arc::clone(&workspace_root);
+        std::thread::Builder::new()
+            .name("module-resolver-test".into())
+            .spawn(move || {
+                let inc_paths = discover_inc_paths();
+
+                let ws_root = {
+                    let mut guard = thread_ws_root.root.lock().unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    while guard.is_none() {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let (g, _) = thread_ws_root
+                            .condvar
+                            .wait_timeout(guard, remaining)
+                            .unwrap();
+                        guard = g;
+                    }
+                    guard.clone().flatten()
+                };
+
+                let db = open_cache_db(ws_root.as_deref());
+                if let Some(ref conn) = db {
+                    let _ = validate_inc_paths(conn, &inc_paths);
+                    let _ = warm_cache(conn, &thread_cache);
+                }
+
+                let mut seen = HashSet::new();
+                loop {
+                    let batch = {
+                        let mut pending = thread_queue.pending.lock().unwrap();
+                        while pending.is_empty() {
+                            pending = thread_queue.condvar.wait(pending).unwrap();
+                        }
+                        std::mem::take(&mut *pending)
+                    };
+                    for module_name in batch {
+                        if !seen.insert(module_name.clone()) {
+                            continue;
+                        }
+                        let result = parse_module(&inc_paths, &module_name);
+                        thread_cache.insert(module_name.clone(), result.clone());
+                        if let Some(ref conn) = db {
+                            save_to_db(conn, &module_name, &result, "import");
+                        }
+                        let _g = thread_resolved.mu.lock().unwrap();
+                        thread_resolved.cv.notify_all();
+                    }
+                }
+            })
+            .expect("failed to spawn test module-resolver thread");
+
+        ModuleIndex {
+            cache,
+            queue,
+            resolved,
+            workspace_root,
+        }
     }
 
     /// Insert a module directly into the cache (for testing).
@@ -607,7 +774,7 @@ fn collect_string_literals(node: tree_sitter::Node, source: &[u8], words: &mut V
 use rusqlite::{params, Connection};
 use std::time::SystemTime;
 
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
 
 fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
@@ -682,7 +849,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             mtime_secs  INTEGER NOT NULL,
             file_size   INTEGER NOT NULL,
             export      TEXT NOT NULL,
-            export_ok   TEXT NOT NULL
+            export_ok   TEXT NOT NULL,
+            source      TEXT NOT NULL DEFAULT 'import'
         );",
     )?;
 
@@ -705,7 +873,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                     mtime_secs  INTEGER NOT NULL,
                     file_size   INTEGER NOT NULL,
                     export      TEXT NOT NULL,
-                    export_ok   TEXT NOT NULL
+                    export_ok   TEXT NOT NULL,
+                    source      TEXT NOT NULL DEFAULT 'import'
                 );",
             )?;
             conn.execute(
@@ -825,7 +994,7 @@ fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExports>>)
     count
 }
 
-fn save_to_db(conn: &Connection, module_name: &str, result: &Option<ModuleExports>) {
+fn save_to_db(conn: &Connection, module_name: &str, result: &Option<ModuleExports>, source: &str) {
     let (path_str, mtime, size, export_json, export_ok_json) = match result {
         Some(exports) => {
             let (mtime, size) = mtime_as_secs(&exports.path).unwrap_or((0, 0));
@@ -837,12 +1006,98 @@ fn save_to_db(conn: &Connection, module_name: &str, result: &Option<ModuleExport
     };
 
     let r = conn.execute(
-        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![module_name, path_str, mtime, size, export_json, export_ok_json],
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![module_name, path_str, mtime, size, export_json, export_ok_json, source],
     );
     if let Err(e) = r {
         log::warn!("Failed to save module cache for '{}': {}", module_name, e);
+    }
+}
+
+// ---- URI / path helpers ----
+
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    uri.strip_prefix("file://").map(PathBuf::from)
+}
+
+// ---- cpanfile parsing ----
+
+/// Parse a cpanfile at `{root}/cpanfile` using tree-sitter and extract
+/// module names from `requires 'Module::Name'` calls.
+fn parse_cpanfile(root_path: &std::path::Path) -> Vec<String> {
+    let cpanfile = root_path.join("cpanfile");
+    let source = match std::fs::read_to_string(&cpanfile) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let mut parser = create_parser();
+    let tree = match parser.parse(&source, None) {
+        Some(t) => t,
+        None => return vec![],
+    };
+
+    let mut modules = Vec::new();
+    collect_requires(tree.root_node(), source.as_bytes(), &mut modules);
+    modules.sort();
+    modules.dedup();
+    log::info!("cpanfile: found {} requires: {:?}", modules.len(), modules);
+    modules
+}
+
+/// Use a tree-sitter query to find all `requires 'Module::Name'` calls.
+fn collect_requires(root: tree_sitter::Node, source: &[u8], modules: &mut Vec<String>) {
+    use tree_sitter::{Query, QueryCursor, StreamingIterator};
+
+    // Match both `requires 'Foo'` (ambiguous) and `requires('Foo')` (explicit).
+    // The `#eq?` predicate filters to only calls where the function name is "requires".
+    // Single arg:  `requires 'DBI'`  → string_literal is direct arguments: child
+    // Multi arg:   `requires 'Mojo', '>= 9.0'` → args wrapped in list_expression
+    // Both node types (ambiguous = no parens, function_call = with parens) need both patterns.
+    // The `.` anchor on list_expression ensures only the first string (module name) matches.
+    let query_src = r#"
+        [
+          (function_call_expression
+            function: (_) @fn
+            (string_literal (string_content) @module))
+          (function_call_expression
+            function: (_) @fn
+            (list_expression . (string_literal (string_content) @module)))
+          (ambiguous_function_call_expression
+            function: (_) @fn
+            (string_literal (string_content) @module))
+          (ambiguous_function_call_expression
+            function: (_) @fn
+            (list_expression . (string_literal (string_content) @module)))
+        ]
+        (#eq? @fn "requires")
+    "#;
+
+    let lang = tree_sitter_perl::LANGUAGE.into();
+    let query = match Query::new(&lang, query_src) {
+        Ok(q) => q,
+        Err(e) => {
+            log::error!("cpanfile query error: {}", e);
+            return;
+        }
+    };
+
+    let module_idx = match query.capture_index_for_name("module") {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, source);
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if cap.index == module_idx {
+                if let Ok(name) = cap.node.utf8_text(source) {
+                    modules.push(name.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -854,7 +1109,7 @@ mod tests {
 
     #[test]
     fn test_resolve_module_list_util() {
-        let idx = ModuleIndex::new();
+        let idx = ModuleIndex::new_for_test();
         let path = idx.resolve_module("List::Util");
         if !idx.inc_paths().is_empty() {
             assert!(path.is_some(), "List::Util should be resolvable");
@@ -880,7 +1135,7 @@ our @EXPORT = qw(delta);
 
     #[test]
     fn test_extract_exports_list_util() {
-        let idx = ModuleIndex::new();
+        let idx = ModuleIndex::new_for_test();
         if idx.inc_paths().is_empty() {
             return;
         }
@@ -916,7 +1171,7 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
 
     #[test]
     fn test_module_resolution_not_found() {
-        let idx = ModuleIndex::new();
+        let idx = ModuleIndex::new_for_test();
         assert!(idx.resolve_module("Nonexistent::Module::XYZ123").is_none());
     }
 
@@ -930,7 +1185,7 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
 
     #[test]
     fn test_resolver_thread_flow() {
-        let idx = ModuleIndex::new();
+        let idx = ModuleIndex::new_for_test();
         // Unblock the resolver thread (no workspace root = global cache).
         idx.set_workspace_root(None);
         if idx.inc_paths().is_empty() {
@@ -975,7 +1230,7 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
             export: vec!["foo".into(), "bar".into()],
             export_ok: vec!["baz".into()],
         });
-        save_to_db(&conn, "TestModule", &exports);
+        save_to_db(&conn, "TestModule", &exports, "import");
 
         // Load into a fresh DashMap.
         let cache = DashMap::new();
@@ -994,7 +1249,7 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
     #[test]
     fn test_db_negative_result_roundtrip() {
         let conn = test_db();
-        save_to_db(&conn, "Nonexistent::Module", &None);
+        save_to_db(&conn, "Nonexistent::Module", &None, "import");
 
         let cache = DashMap::new();
         let n = warm_cache(&conn, &cache);
@@ -1018,7 +1273,7 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
             export: vec!["old".into()],
             export_ok: vec![],
         });
-        save_to_db(&conn, "StaleModule", &exports);
+        save_to_db(&conn, "StaleModule", &exports, "import");
 
         // Modify the file so mtime/size changes.
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1043,7 +1298,7 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
         ];
 
         validate_inc_paths(&conn, &paths1).unwrap();
-        save_to_db(&conn, "Foo", &None);
+        save_to_db(&conn, "Foo", &None, "import");
 
         // Changing @INC should clear the table.
         validate_inc_paths(&conn, &paths2).unwrap();
@@ -1062,7 +1317,7 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
             [],
         )
         .unwrap();
-        save_to_db(&conn, "OldModule", &None);
+        save_to_db(&conn, "OldModule", &None, "import");
 
         // Re-init should drop and recreate.
         init_schema(&conn).unwrap();
@@ -1073,7 +1328,7 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
 
     #[test]
     fn test_find_exporters() {
-        let idx = ModuleIndex::new();
+        let idx = ModuleIndex::new_for_test();
         idx.cache.insert(
             "Foo::Bar".to_string(),
             Some(ModuleExports {
@@ -1094,6 +1349,84 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
         assert_eq!(idx.find_exporters("alpha"), vec!["Foo::Bar"]);
         assert_eq!(idx.find_exporters("beta"), vec!["Baz::Qux", "Foo::Bar"]);
         assert!(idx.find_exporters("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_parse_cpanfile_basic() {
+        let dir = std::env::temp_dir().join("perl_lsp_test_cpanfile");
+        let _ = std::fs::create_dir_all(&dir);
+        let cpanfile = dir.join("cpanfile");
+        std::fs::write(
+            &cpanfile,
+            r#"requires 'Mojolicious', '>= 9.0';
+requires 'DBI';
+requires 'JSON::XS';
+
+on test => sub {
+    requires 'Test::More';
+    requires 'Test::Deep';
+};
+"#,
+        )
+        .unwrap();
+
+        let modules = parse_cpanfile(&dir);
+        assert!(modules.contains(&"Mojolicious".to_string()), "got: {:?}", modules);
+        assert!(modules.contains(&"DBI".to_string()), "got: {:?}", modules);
+        assert!(modules.contains(&"JSON::XS".to_string()), "got: {:?}", modules);
+        assert!(modules.contains(&"Test::More".to_string()), "got: {:?}", modules);
+        assert!(modules.contains(&"Test::Deep".to_string()), "got: {:?}", modules);
+        assert_eq!(modules.len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_cpanfile_missing() {
+        let dir = std::env::temp_dir().join("perl_lsp_test_no_cpanfile");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.join("cpanfile")); // ensure it doesn't exist
+
+        let modules = parse_cpanfile(&dir);
+        assert!(modules.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_uri_to_path() {
+        assert_eq!(
+            uri_to_path("file:///Users/foo/project"),
+            Some(PathBuf::from("/Users/foo/project"))
+        );
+        assert_eq!(uri_to_path("http://example.com"), None);
+    }
+
+    #[test]
+    fn test_db_source_column() {
+        let conn = test_db();
+        let dir = std::env::temp_dir();
+        let pm = dir.join("SourceTest.pm");
+        std::fs::write(&pm, "package SourceTest; 1;").unwrap();
+
+        let exports = Some(ModuleExports {
+            path: pm.clone(),
+            export: vec!["foo".into()],
+            export_ok: vec![],
+        });
+        save_to_db(&conn, "SourceTest", &exports, "cpanfile");
+
+        // Verify source column was saved.
+        let source: String = conn
+            .query_row(
+                "SELECT source FROM modules WHERE module_name = 'SourceTest'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "cpanfile");
+
+        let _ = std::fs::remove_file(&pm);
     }
 
     #[test]

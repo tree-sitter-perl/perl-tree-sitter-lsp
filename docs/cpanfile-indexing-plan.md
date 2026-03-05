@@ -79,6 +79,23 @@ Tagged as `cpanfile` (same priority as direct deps).
 
 Not implementing now — depth 0 (direct cpanfile deps) gives immediate value.
 
+## Future: Phase-Aware Filtering
+
+cpanfile `on test` deps (Test::More, Test::Deep, etc.) should only
+auto-complete in test files, not pollute completions in lib code.
+
+Proposed rules:
+- `on test` requires → tagged `cpanfile-test` in source column
+- Auto-import completions for `cpanfile-test` modules only shown when:
+  - File path is under `t/` directory, OR
+  - File already imports a `Test::` module (signals test context)
+- Go-to-def and hover still work everywhere regardless of tag
+
+Requires: adding `source` field to `ModuleExports` struct (or a parallel
+`DashMap<String, String>` for source tags), threading phase info from
+`parse_cpanfile` through the resolver, and filtering in
+`unimported_function_completions`.
+
 ## Future: Bulk @INC Scan
 
 For go-to-def into any installed module (without polluting completions):

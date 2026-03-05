@@ -971,7 +971,7 @@ mod tests {
     fn test_diagnostics_skips_builtins() {
         let source = "use Carp qw(croak);\nprint 'hello';\ndie 'oops';\n";
         let analysis = parse_analysis(source);
-        let module_index = crate::module_index::ModuleIndex::new();
+        let module_index = crate::module_index::ModuleIndex::new_for_test();
         let diags = collect_diagnostics(&analysis, &module_index);
         // print and die are builtins, croak is explicitly imported — no diagnostics
         assert!(
@@ -985,7 +985,7 @@ mod tests {
     fn test_diagnostics_unresolved_function() {
         let source = "frobnicate();\n";
         let analysis = parse_analysis(source);
-        let module_index = crate::module_index::ModuleIndex::new();
+        let module_index = crate::module_index::ModuleIndex::new_for_test();
         let diags = collect_diagnostics(&analysis, &module_index);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Some(DiagnosticSeverity::INFORMATION));
@@ -996,7 +996,7 @@ mod tests {
     fn test_diagnostics_skips_local_sub() {
         let source = "sub helper { 1 }\nhelper();\n";
         let analysis = parse_analysis(source);
-        let module_index = crate::module_index::ModuleIndex::new();
+        let module_index = crate::module_index::ModuleIndex::new_for_test();
         let diags = collect_diagnostics(&analysis, &module_index);
         assert!(
             diags.is_empty(),
@@ -1009,7 +1009,7 @@ mod tests {
     fn test_diagnostics_skips_package_qualified() {
         let source = "Foo::Bar::baz();\n";
         let analysis = parse_analysis(source);
-        let module_index = crate::module_index::ModuleIndex::new();
+        let module_index = crate::module_index::ModuleIndex::new_for_test();
         let diags = collect_diagnostics(&analysis, &module_index);
         assert!(
             diags.is_empty(),
@@ -1100,7 +1100,7 @@ mod tests {
         let analysis = parse_analysis(source);
 
         // Simulate a cached module that exports "first"
-        let idx = ModuleIndex::new();
+        let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
         // Insert directly into cache for testing
         idx.insert_cache(
@@ -1149,7 +1149,7 @@ mod tests {
         let source = "use List::Util qw(max);\nfir\n";
         let analysis = parse_analysis(source);
 
-        let idx = ModuleIndex::new();
+        let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
         idx.insert_cache(
             "List::Util",
