@@ -229,6 +229,9 @@ pub fn completion_items(
             // Add imported function completions
             items.extend(imported_function_completions(analysis, module_index));
 
+            // Add completions from unimported modules (with auto-import edits)
+            items.extend(unimported_function_completions(analysis, module_index));
+
             items
         }
     };
@@ -569,6 +572,65 @@ fn imported_function_completions(
     candidates
 }
 
+/// Build completion candidates for functions from modules that aren't imported
+/// at all. Each candidate carries an `additional_edit` that inserts a full
+/// `use Module qw(func);` statement.
+fn unimported_function_completions(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+) -> Vec<CompletionCandidate> {
+    use crate::analysis::Span;
+    let mut candidates = Vec::new();
+
+    // Collect already-imported module names so we skip them.
+    let imported_modules: std::collections::HashSet<&str> = analysis
+        .imports
+        .iter()
+        .map(|i| i.module_name.as_str())
+        .collect();
+
+    let insert_pos = find_use_insertion_position(analysis);
+    let insert_span = Span {
+        start: tree_sitter::Point {
+            row: insert_pos.line as usize,
+            column: insert_pos.character as usize,
+        },
+        end: tree_sitter::Point {
+            row: insert_pos.line as usize,
+            column: insert_pos.character as usize,
+        },
+    };
+
+    module_index.for_each_cached(|module_name, exports| {
+        if imported_modules.contains(module_name) {
+            return;
+        }
+
+        let all_exported = exports.export.iter().chain(exports.export_ok.iter());
+        for name in all_exported {
+            // Skip functions already defined locally
+            if !analysis.symbols_named(name).is_empty() {
+                continue;
+            }
+            candidates.push(CompletionCandidate {
+                label: name.clone(),
+                kind: FaSymKind::Sub,
+                detail: Some(format!("{} (auto-import)", module_name)),
+                insert_text: None,
+                sort_priority: 25, // Lower than local (5) and already-imported (12/15/18)
+                additional_edits: vec![(
+                    insert_span,
+                    format!("use {} qw({});\n", module_name, name),
+                )],
+            });
+        }
+    });
+
+    // Sort for deterministic order
+    candidates.sort_by(|a, b| a.label.cmp(&b.label).then(a.detail.cmp(&b.detail)));
+    candidates
+}
+
 /// Find which import provides a given function name.
 /// Checks both explicitly imported symbols and all @EXPORT/@EXPORT_OK
 /// from already-imported modules.
@@ -703,15 +765,44 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
                 ..Default::default()
             });
         } else {
-            // Unknown function — informational only
-            diagnostics.push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::INFORMATION),
-                code: Some(NumberOrString::String("unresolved-function".into())),
-                source: Some("perl-lsp".into()),
-                message: format!("'{}' is not defined in this file", name),
-                ..Default::default()
-            });
+            // Search ALL cached modules for this function.
+            let exporters = module_index.find_exporters(name);
+            if !exporters.is_empty() {
+                let msg = if exporters.len() == 1 {
+                    format!(
+                        "'{}' is exported by {} (not yet imported)",
+                        name, exporters[0],
+                    )
+                } else {
+                    format!(
+                        "'{}' is exported by {} and {} other module(s)",
+                        name,
+                        exporters[0],
+                        exporters.len() - 1,
+                    )
+                };
+                diagnostics.push(Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::HINT),
+                    code: Some(NumberOrString::String("unresolved-function".into())),
+                    source: Some("perl-lsp".into()),
+                    message: msg,
+                    data: Some(serde_json::json!({
+                        "modules": exporters,
+                        "function": name,
+                    })),
+                    ..Default::default()
+                });
+            } else {
+                diagnostics.push(Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::INFORMATION),
+                    code: Some(NumberOrString::String("unresolved-function".into())),
+                    source: Some("perl-lsp".into()),
+                    message: format!("'{}' is not defined in this file", name),
+                    ..Default::default()
+                });
+            }
         }
     }
 
@@ -719,6 +810,22 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
 }
 
 // ---- Code actions ----
+
+/// Find the position to insert a new `use` statement.
+/// Returns the start of the line after the last existing `use`.
+fn find_use_insertion_position(analysis: &FileAnalysis) -> Position {
+    if let Some(last_import) = analysis.imports.last() {
+        Position {
+            line: last_import.span.end.row as u32 + 1,
+            character: 0,
+        }
+    } else {
+        Position {
+            line: 0,
+            character: 0,
+        }
+    }
+}
 
 pub fn code_actions(
     diagnostics: &[Diagnostic],
@@ -728,7 +835,6 @@ pub fn code_actions(
     let mut actions = Vec::new();
 
     for diag in diagnostics {
-        // Only handle our "unresolved-function" diagnostics with data
         let code_matches = matches!(
             &diag.code,
             Some(NumberOrString::String(s)) if s == "unresolved-function"
@@ -740,56 +846,90 @@ pub fn code_actions(
             Some(d) => d,
             None => continue,
         };
-        let module_name = match data.get("module").and_then(|v| v.as_str()) {
-            Some(m) => m,
-            None => continue,
-        };
         let func_name = match data.get("function").and_then(|v| v.as_str()) {
             Some(f) => f,
             None => continue,
         };
 
-        // Find the matching import with a qw() list we can edit
-        let import = analysis
-            .imports
-            .iter()
-            .find(|imp| imp.module_name == module_name);
-        let import = match import {
-            Some(imp) => imp,
-            None => continue,
-        };
-        let close_pos = match import.qw_close_paren {
-            Some(p) => p,
-            None => continue,
-        };
+        // Case 1: Already-imported module — add function to existing qw() list
+        if let Some(module_name) = data.get("module").and_then(|v| v.as_str()) {
+            if let Some(action) =
+                make_add_to_qw_action(analysis, uri, diag, module_name, func_name)
+            {
+                actions.push(action);
+            }
+            continue;
+        }
 
-        // Insert ` func_name` just before the closing paren of qw()
-        let insert_pos = point_to_position(close_pos);
-        let edit = TextEdit {
-            range: Range {
-                start: insert_pos,
-                end: insert_pos,
-            },
-            new_text: format!(" {}", func_name),
-        };
+        // Case 2: New import — add `use Module qw(func);` statement
+        if let Some(modules) = data.get("modules").and_then(|v| v.as_array()) {
+            let insert_pos = find_use_insertion_position(analysis);
+            for (i, module_val) in modules.iter().enumerate() {
+                if let Some(module_name) = module_val.as_str() {
+                    let new_text = format!("use {} qw({});\n", module_name, func_name);
+                    let edit = TextEdit {
+                        range: Range {
+                            start: insert_pos,
+                            end: insert_pos,
+                        },
+                        new_text,
+                    };
+                    let mut changes = HashMap::new();
+                    changes.insert(uri.clone(), vec![edit]);
 
-        let mut changes = HashMap::new();
-        changes.insert(uri.clone(), vec![edit]);
-
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!("Import '{}' from {}", func_name, module_name),
-            kind: Some(CodeActionKind::QUICKFIX),
-            diagnostics: Some(vec![diag.clone()]),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            is_preferred: Some(true),
-            ..Default::default()
-        }));
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Add 'use {} qw({})'", module_name, func_name),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: Some(vec![diag.clone()]),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        is_preferred: Some(i == 0 && modules.len() == 1),
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
     }
 
     actions
+}
+
+/// Generate a code action that adds a function to an existing `qw()` import list.
+fn make_add_to_qw_action(
+    analysis: &FileAnalysis,
+    uri: &Url,
+    diag: &Diagnostic,
+    module_name: &str,
+    func_name: &str,
+) -> Option<CodeActionOrCommand> {
+    let import = analysis
+        .imports
+        .iter()
+        .find(|imp| imp.module_name == module_name)?;
+    let close_pos = import.qw_close_paren?;
+    let insert_pos = point_to_position(close_pos);
+    let edit = TextEdit {
+        range: Range {
+            start: insert_pos,
+            end: insert_pos,
+        },
+        new_text: format!(" {}", func_name),
+    };
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Import '{}' from {}", func_name, module_name),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        is_preferred: Some(true),
+        ..Default::default()
+    }))
 }
 
 #[cfg(test)]
@@ -913,6 +1053,182 @@ mod tests {
             assert_eq!(text_edits[0].new_text, " carp");
         } else {
             panic!("Expected CodeAction, got Command");
+        }
+    }
+
+    #[test]
+    fn test_code_action_new_use_statement() {
+        let source = "use strict;\nuse warnings;\nfrobnicate();\n";
+        let analysis = parse_analysis(source);
+        let uri = Url::parse("file:///test.pl").unwrap();
+
+        let diag = Diagnostic {
+            range: Range {
+                start: Position { line: 2, character: 0 },
+                end: Position { line: 2, character: 11 },
+            },
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unresolved-function".into())),
+            source: Some("perl-lsp".into()),
+            message: "'frobnicate' is exported by Some::Module (not yet imported)".into(),
+            data: Some(serde_json::json!({
+                "modules": ["Some::Module"],
+                "function": "frobnicate",
+            })),
+            ..Default::default()
+        };
+
+        let actions = code_actions(&[diag], &analysis, &uri);
+        assert_eq!(actions.len(), 1);
+        if let CodeActionOrCommand::CodeAction(action) = &actions[0] {
+            assert_eq!(action.title, "Add 'use Some::Module qw(frobnicate)'");
+            assert_eq!(action.is_preferred, Some(true));
+            let edit = action.edit.as_ref().unwrap();
+            let changes = edit.changes.as_ref().unwrap();
+            let text_edits = changes.get(&uri).unwrap();
+            assert_eq!(text_edits[0].new_text, "use Some::Module qw(frobnicate);\n");
+            // Inserted after last use statement (line 2)
+            assert_eq!(text_edits[0].range.start.line, 2);
+        } else {
+            panic!("Expected CodeAction");
+        }
+    }
+
+    #[test]
+    fn test_unimported_completion_with_auto_import() {
+        let source = "use strict;\nuse warnings;\n\nfir\n";
+        let analysis = parse_analysis(source);
+
+        // Simulate a cached module that exports "first"
+        let idx = ModuleIndex::new();
+        idx.set_workspace_root(None);
+        // Insert directly into cache for testing
+        idx.insert_cache(
+            "List::Util",
+            Some(crate::module_index::ModuleExports {
+                path: std::path::PathBuf::from("/usr/lib/perl5/List/Util.pm"),
+                export: vec![],
+                export_ok: vec!["first".into(), "max".into(), "min".into()],
+            }),
+        );
+
+        let tree = crate::document::Document::new(source.to_string()).unwrap().tree;
+        let items = completion_items(
+            &analysis,
+            &tree,
+            source,
+            Position { line: 3, character: 3 },
+            &idx,
+        );
+
+        // Should find "first" from List::Util
+        let first_item = items.iter().find(|i| i.label == "first");
+        assert!(first_item.is_some(), "Should offer 'first' from unimported List::Util");
+
+        let first_item = first_item.unwrap();
+        assert!(
+            first_item.detail.as_ref().unwrap().contains("List::Util"),
+            "Detail should mention the module"
+        );
+        assert!(
+            first_item.detail.as_ref().unwrap().contains("auto-import"),
+            "Detail should indicate auto-import"
+        );
+
+        // Should have additional text edit inserting `use List::Util qw(first);`
+        let edits = first_item.additional_text_edits.as_ref().unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "use List::Util qw(first);\n");
+        // Should insert after the last use statement (line 2)
+        assert_eq!(edits[0].range.start.line, 2);
+    }
+
+    #[test]
+    fn test_unimported_completion_skips_imported_modules() {
+        // List::Util is already imported — its exports should NOT appear as unimported completions
+        let source = "use List::Util qw(max);\nfir\n";
+        let analysis = parse_analysis(source);
+
+        let idx = ModuleIndex::new();
+        idx.set_workspace_root(None);
+        idx.insert_cache(
+            "List::Util",
+            Some(crate::module_index::ModuleExports {
+                path: std::path::PathBuf::from("/usr/lib/perl5/List/Util.pm"),
+                export: vec![],
+                export_ok: vec!["first".into(), "max".into(), "min".into()],
+            }),
+        );
+        idx.insert_cache(
+            "Scalar::Util",
+            Some(crate::module_index::ModuleExports {
+                path: std::path::PathBuf::from("/usr/lib/perl5/Scalar/Util.pm"),
+                export: vec![],
+                export_ok: vec!["blessed".into(), "reftype".into()],
+            }),
+        );
+
+        let tree = crate::document::Document::new(source.to_string()).unwrap().tree;
+        let items = completion_items(
+            &analysis,
+            &tree,
+            source,
+            Position { line: 1, character: 3 },
+            &idx,
+        );
+
+        // "first" should appear via imported_function_completions (auto-add to qw),
+        // NOT via unimported_function_completions
+        let first_items: Vec<_> = items.iter().filter(|i| i.label == "first").collect();
+        assert!(!first_items.is_empty(), "Should offer 'first'");
+        // It should come from the imported path (adds to qw) not unimported
+        for item in &first_items {
+            if let Some(ref detail) = item.detail {
+                assert!(
+                    !detail.contains("auto-import") || detail.contains("List::Util"),
+                    "first should come from List::Util context"
+                );
+            }
+        }
+
+        // "blessed" should appear as unimported (Scalar::Util not imported)
+        let blessed_item = items.iter().find(|i| i.label == "blessed");
+        assert!(blessed_item.is_some(), "Should offer 'blessed' from unimported Scalar::Util");
+        let blessed_item = blessed_item.unwrap();
+        assert!(blessed_item.detail.as_ref().unwrap().contains("Scalar::Util"));
+        let edits = blessed_item.additional_text_edits.as_ref().unwrap();
+        assert!(edits[0].new_text.contains("use Scalar::Util qw(blessed)"));
+    }
+
+    #[test]
+    fn test_code_action_multiple_exporters_not_preferred() {
+        let source = "use strict;\nfirst();\n";
+        let analysis = parse_analysis(source);
+        let uri = Url::parse("file:///test.pl").unwrap();
+
+        let diag = Diagnostic {
+            range: Range {
+                start: Position { line: 1, character: 0 },
+                end: Position { line: 1, character: 5 },
+            },
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unresolved-function".into())),
+            source: Some("perl-lsp".into()),
+            message: "...".into(),
+            data: Some(serde_json::json!({
+                "modules": ["List::Util", "List::MoreUtils"],
+                "function": "first",
+            })),
+            ..Default::default()
+        };
+
+        let actions = code_actions(&[diag], &analysis, &uri);
+        assert_eq!(actions.len(), 2);
+        // Neither should be preferred (ambiguous)
+        for action in &actions {
+            if let CodeActionOrCommand::CodeAction(a) = action {
+                assert_eq!(a.is_preferred, Some(false));
+            }
         }
     }
 }

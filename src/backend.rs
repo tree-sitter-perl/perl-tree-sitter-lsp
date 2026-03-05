@@ -35,7 +35,21 @@ impl Backend {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Notify resolver thread of workspace root for per-project cache.
+        let root = params
+            .root_uri
+            .as_ref()
+            .map(|u| u.as_str())
+            .or_else(|| {
+                params
+                    .workspace_folders
+                    .as_ref()
+                    .and_then(|f| f.first())
+                    .map(|f| f.uri.as_str())
+            });
+        self.module_index.set_workspace_root(root);
+
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "perl-lsp".to_string(),
@@ -127,6 +141,10 @@ impl LanguageServer for Backend {
         if let Some(change) = params.content_changes.into_iter().next() {
             if let Some(mut doc) = self.documents.get_mut(&uri) {
                 doc.update(change.text);
+                // Resolve any new imports that appeared during editing.
+                for imp in &doc.analysis.imports {
+                    self.module_index.request_resolve(&imp.module_name);
+                }
             }
         }
         self.publish_diagnostics(&uri).await;

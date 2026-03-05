@@ -47,6 +47,13 @@ struct ResolveNotify {
     cv: Condvar,
 }
 
+/// Channel for passing workspace root from initialize() to the resolver thread.
+struct WorkspaceRootChannel {
+    /// None = not yet received. Some(Some(root)) = have root. Some(None) = no root available.
+    root: Mutex<Option<Option<String>>>,
+    condvar: Condvar,
+}
+
 /// Concurrent cache of module exports with a dedicated background resolver.
 ///
 /// A coordinator thread drains a `Mutex<Vec>` + `Condvar` queue and dispatches
@@ -57,6 +64,7 @@ pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<ModuleExports>>>,
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
+    workspace_root: Arc<WorkspaceRootChannel>,
 }
 
 impl ModuleIndex {
@@ -70,6 +78,10 @@ impl ModuleIndex {
             mu: Mutex::new(()),
             cv: Condvar::new(),
         });
+        let workspace_root = Arc::new(WorkspaceRootChannel {
+            root: Mutex::new(None),
+            condvar: Condvar::new(),
+        });
 
         // Coordinator thread — dispatches each parse to an isolated child
         // process. If tree-sitter's external scanner hangs, the child is
@@ -77,10 +89,41 @@ impl ModuleIndex {
         let thread_cache = Arc::clone(&cache);
         let thread_queue = Arc::clone(&queue);
         let thread_resolved = Arc::clone(&resolved);
+        let thread_ws_root = Arc::clone(&workspace_root);
         std::thread::Builder::new()
             .name("module-resolver".into())
             .spawn(move || {
                 let inc_paths = discover_inc_paths();
+
+                // Wait for workspace root from initialize() for per-project cache path.
+                // Normally arrives in < 1ms. Timeout after 10s (bad client or no root).
+                let ws_root = {
+                    let mut guard = thread_ws_root.root.lock().unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    while guard.is_none() {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            log::warn!("Timed out waiting for workspace root; using global cache");
+                            break;
+                        }
+                        let (g, _) = thread_ws_root
+                            .condvar
+                            .wait_timeout(guard, remaining)
+                            .unwrap();
+                        guard = g;
+                    }
+                    guard.clone().flatten()
+                };
+
+                // Warm the in-memory cache from SQLite.
+                let db = open_cache_db(ws_root.as_deref());
+                if let Some(ref conn) = db {
+                    let _ = validate_inc_paths(conn, &inc_paths);
+                    let n = warm_cache(conn, &thread_cache);
+                    log::info!("Warmed module cache: {} entries loaded from disk", n);
+                }
+
                 let mut seen = HashSet::new();
 
                 loop {
@@ -106,7 +149,12 @@ impl ModuleIndex {
                             ),
                             None => log::info!("No exports found for '{}'", module_name),
                         }
-                        thread_cache.insert(module_name, result);
+                        thread_cache.insert(module_name.clone(), result.clone());
+
+                        // Persist to SQLite for next session.
+                        if let Some(ref conn) = db {
+                            save_to_db(conn, &module_name, &result);
+                        }
 
                         // Signal waiters that a module was resolved.
                         let _g = thread_resolved.mu.lock().unwrap();
@@ -120,7 +168,19 @@ impl ModuleIndex {
             cache,
             queue,
             resolved,
+            workspace_root,
         }
+    }
+
+    /// Notify the resolver thread of the workspace root (from LSP initialize).
+    /// Pass `Some(uri)` for per-project cache, or `None` if client sent no root.
+    pub fn set_workspace_root(&self, root: Option<&str>) {
+        let mut guard = self.workspace_root.root.lock().unwrap();
+        if root.is_none() {
+            log::warn!("No workspace root from client; using global module cache");
+        }
+        *guard = Some(root.map(String::from));
+        self.workspace_root.condvar.notify_one();
     }
 
     /// Request that a module be resolved in the background.
@@ -144,6 +204,38 @@ impl ModuleIndex {
         self.cache
             .get(module_name)
             .and_then(|entry| entry.as_ref().map(|e| e.path.clone()))
+    }
+
+    /// Find all cached modules that export the given function name.
+    /// Zero I/O — reads DashMap only. Safe from async handlers.
+    /// Iterate all cached module exports. Callback receives (module_name, exports).
+    pub fn for_each_cached<F: FnMut(&str, &ModuleExports)>(&self, mut f: F) {
+        for entry in self.cache.iter() {
+            if let Some(ref exports) = *entry.value() {
+                f(entry.key(), exports);
+            }
+        }
+    }
+
+    pub fn find_exporters(&self, func_name: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        for entry in self.cache.iter() {
+            if let Some(ref exports) = *entry.value() {
+                if exports.export.iter().any(|s| s == func_name)
+                    || exports.export_ok.iter().any(|s| s == func_name)
+                {
+                    result.push(entry.key().clone());
+                }
+            }
+        }
+        result.sort();
+        result
+    }
+
+    /// Insert a module directly into the cache (for testing).
+    #[cfg(test)]
+    pub fn insert_cache(&self, module_name: &str, exports: Option<ModuleExports>) {
+        self.cache.insert(module_name.to_string(), exports);
     }
 
     /// Block until `module_name` appears in the cache, or timeout.
@@ -510,6 +602,250 @@ fn collect_string_literals(node: tree_sitter::Node, source: &[u8], words: &mut V
     }
 }
 
+// ---- SQLite persistence ----
+
+use rusqlite::{params, Connection};
+use std::time::SystemTime;
+
+const SCHEMA_VERSION: &str = "1";
+
+fn cache_base_dir() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("perl-lsp"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return Some(PathBuf::from(home).join(".cache").join("perl-lsp"));
+    }
+    None
+}
+
+fn cache_dir_for_workspace(workspace_root: Option<&str>) -> Option<PathBuf> {
+    let base = cache_base_dir()?;
+    match workspace_root {
+        Some(root) => {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            root.hash(&mut hasher);
+            Some(base.join(format!("{:016x}", hasher.finish())))
+        }
+        None => Some(base),
+    }
+}
+
+#[cfg(not(test))]
+fn open_cache_db(workspace_root: Option<&str>) -> Option<Connection> {
+    let dir = cache_dir_for_workspace(workspace_root)?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let db_path = dir.join("modules.db");
+    log::info!("Module cache: {:?}", db_path);
+
+    match Connection::open(&db_path) {
+        Ok(conn) => {
+            let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+            match init_schema(&conn) {
+                Ok(()) => Some(conn),
+                Err(e) => {
+                    log::warn!("Cache DB schema init failed: {}. Recreating.", e);
+                    drop(conn);
+                    let _ = std::fs::remove_file(&db_path);
+                    let conn = Connection::open(&db_path).ok()?;
+                    let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+                    init_schema(&conn).ok()?;
+                    Some(conn)
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to open cache DB: {}", e);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+fn open_cache_db(_workspace_root: Option<&str>) -> Option<Connection> {
+    None
+}
+
+fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS modules (
+            module_name TEXT PRIMARY KEY,
+            path        TEXT NOT NULL,
+            mtime_secs  INTEGER NOT NULL,
+            file_size   INTEGER NOT NULL,
+            export      TEXT NOT NULL,
+            export_ok   TEXT NOT NULL
+        );",
+    )?;
+
+    let version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    match version.as_deref() {
+        Some(SCHEMA_VERSION) => Ok(()),
+        Some(_) => {
+            conn.execute_batch("DROP TABLE IF EXISTS modules;")?;
+            conn.execute_batch(
+                "CREATE TABLE modules (
+                    module_name TEXT PRIMARY KEY,
+                    path        TEXT NOT NULL,
+                    mtime_secs  INTEGER NOT NULL,
+                    file_size   INTEGER NOT NULL,
+                    export      TEXT NOT NULL,
+                    export_ok   TEXT NOT NULL
+                );",
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
+                params![SCHEMA_VERSION],
+            )?;
+            Ok(())
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
+                params![SCHEMA_VERSION],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn compute_inc_hash(inc_paths: &[PathBuf]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for p in inc_paths {
+        p.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+fn validate_inc_paths(conn: &Connection, inc_paths: &[PathBuf]) -> rusqlite::Result<()> {
+    let current_hash = compute_inc_hash(inc_paths);
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'inc_hash'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if stored.as_deref() != Some(&current_hash) {
+        log::info!(
+            "@INC changed (was {:?}, now {}), clearing module cache",
+            stored,
+            current_hash
+        );
+        conn.execute("DELETE FROM modules", [])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('inc_hash', ?1)",
+            params![current_hash],
+        )?;
+    }
+    Ok(())
+}
+
+fn mtime_as_secs(path: &std::path::Path) -> Option<(i64, i64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let secs = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let size = meta.len() as i64;
+    Some((secs, size))
+}
+
+fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExports>>) -> usize {
+    let mut stmt = match conn.prepare(
+        "SELECT module_name, path, mtime_secs, file_size, export, export_ok FROM modules",
+    ) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+
+    let mut count = 0usize;
+    for row in rows.flatten() {
+        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json) = row;
+
+        // Negative sentinel
+        if path_str.is_empty() {
+            cache.insert(module_name, None);
+            count += 1;
+            continue;
+        }
+
+        let path = PathBuf::from(&path_str);
+
+        // Validate mtime — skip stale entries
+        if let Some((disk_mtime, disk_size)) = mtime_as_secs(&path) {
+            if disk_mtime != cached_mtime || disk_size != cached_size {
+                continue;
+            }
+        } else {
+            continue; // file deleted
+        }
+
+        let export: Vec<String> = serde_json::from_str(&export_json).unwrap_or_default();
+        let export_ok: Vec<String> = serde_json::from_str(&export_ok_json).unwrap_or_default();
+
+        if export.is_empty() && export_ok.is_empty() {
+            cache.insert(module_name, None);
+        } else {
+            cache.insert(module_name, Some(ModuleExports { path, export, export_ok }));
+        }
+        count += 1;
+    }
+
+    count
+}
+
+fn save_to_db(conn: &Connection, module_name: &str, result: &Option<ModuleExports>) {
+    let (path_str, mtime, size, export_json, export_ok_json) = match result {
+        Some(exports) => {
+            let (mtime, size) = mtime_as_secs(&exports.path).unwrap_or((0, 0));
+            let ej = serde_json::to_string(&exports.export).unwrap_or_default();
+            let eoj = serde_json::to_string(&exports.export_ok).unwrap_or_default();
+            (exports.path.to_string_lossy().to_string(), mtime, size, ej, eoj)
+        }
+        None => (String::new(), 0i64, 0i64, "[]".to_string(), "[]".to_string()),
+    };
+
+    let r = conn.execute(
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![module_name, path_str, mtime, size, export_json, export_ok_json],
+    );
+    if let Err(e) = r {
+        log::warn!("Failed to save module cache for '{}': {}", module_name, e);
+    }
+}
+
 // ---- Tests ----
 
 #[cfg(test)]
@@ -595,6 +931,8 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
     #[test]
     fn test_resolver_thread_flow() {
         let idx = ModuleIndex::new();
+        // Unblock the resolver thread (no workspace root = global cache).
+        idx.set_workspace_root(None);
         if idx.inc_paths().is_empty() {
             return;
         }
@@ -612,6 +950,163 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
         assert!(
             exports.export.contains(&"croak".to_string()),
             "Carp should export 'croak'"
+        );
+    }
+
+    // ---- SQLite persistence tests (in-memory DB) ----
+
+    fn test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_db_save_and_load_roundtrip() {
+        let conn = test_db();
+
+        // Create a real temp file so mtime validation works.
+        let dir = std::env::temp_dir();
+        let pm = dir.join("TestModule.pm");
+        std::fs::write(&pm, "package TestModule; 1;").unwrap();
+
+        let exports = Some(ModuleExports {
+            path: pm.clone(),
+            export: vec!["foo".into(), "bar".into()],
+            export_ok: vec!["baz".into()],
+        });
+        save_to_db(&conn, "TestModule", &exports);
+
+        // Load into a fresh DashMap.
+        let cache = DashMap::new();
+        let n = warm_cache(&conn, &cache);
+        assert_eq!(n, 1);
+
+        let loaded = cache.get("TestModule").unwrap();
+        let loaded = loaded.as_ref().unwrap();
+        assert_eq!(loaded.export, vec!["foo", "bar"]);
+        assert_eq!(loaded.export_ok, vec!["baz"]);
+        assert_eq!(loaded.path, pm);
+
+        let _ = std::fs::remove_file(&pm);
+    }
+
+    #[test]
+    fn test_db_negative_result_roundtrip() {
+        let conn = test_db();
+        save_to_db(&conn, "Nonexistent::Module", &None);
+
+        let cache = DashMap::new();
+        let n = warm_cache(&conn, &cache);
+        assert_eq!(n, 1);
+
+        let entry = cache.get("Nonexistent::Module").unwrap();
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn test_db_stale_entry_skipped() {
+        let conn = test_db();
+
+        // Create a file, save to DB, then modify it.
+        let dir = std::env::temp_dir();
+        let pm = dir.join("StaleModule.pm");
+        std::fs::write(&pm, "v1").unwrap();
+
+        let exports = Some(ModuleExports {
+            path: pm.clone(),
+            export: vec!["old".into()],
+            export_ok: vec![],
+        });
+        save_to_db(&conn, "StaleModule", &exports);
+
+        // Modify the file so mtime/size changes.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::write(&pm, "v2 with more content").unwrap();
+
+        // Warm should skip the stale entry.
+        let cache = DashMap::new();
+        let n = warm_cache(&conn, &cache);
+        assert_eq!(n, 0, "stale entry should not be loaded");
+        assert!(!cache.contains_key("StaleModule"));
+
+        let _ = std::fs::remove_file(&pm);
+    }
+
+    #[test]
+    fn test_db_inc_hash_invalidation() {
+        let conn = test_db();
+        let paths1 = vec![PathBuf::from("/usr/lib/perl5")];
+        let paths2 = vec![
+            PathBuf::from("/usr/lib/perl5"),
+            PathBuf::from("/home/user/lib"),
+        ];
+
+        validate_inc_paths(&conn, &paths1).unwrap();
+        save_to_db(&conn, "Foo", &None);
+
+        // Changing @INC should clear the table.
+        validate_inc_paths(&conn, &paths2).unwrap();
+        let cache = DashMap::new();
+        let n = warm_cache(&conn, &cache);
+        assert_eq!(n, 0, "cache should be empty after @INC change");
+    }
+
+    #[test]
+    fn test_db_schema_version_migration() {
+        let conn = test_db();
+
+        // Simulate an old schema version.
+        conn.execute(
+            "UPDATE meta SET value = '0' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        save_to_db(&conn, "OldModule", &None);
+
+        // Re-init should drop and recreate.
+        init_schema(&conn).unwrap();
+        let cache = DashMap::new();
+        let n = warm_cache(&conn, &cache);
+        assert_eq!(n, 0, "old data should be gone after migration");
+    }
+
+    #[test]
+    fn test_find_exporters() {
+        let idx = ModuleIndex::new();
+        idx.cache.insert(
+            "Foo::Bar".to_string(),
+            Some(ModuleExports {
+                path: PathBuf::from("/fake/Foo/Bar.pm"),
+                export: vec!["alpha".into()],
+                export_ok: vec!["beta".into()],
+            }),
+        );
+        idx.cache.insert(
+            "Baz::Qux".to_string(),
+            Some(ModuleExports {
+                path: PathBuf::from("/fake/Baz/Qux.pm"),
+                export: vec![],
+                export_ok: vec!["beta".into(), "gamma".into()],
+            }),
+        );
+
+        assert_eq!(idx.find_exporters("alpha"), vec!["Foo::Bar"]);
+        assert_eq!(idx.find_exporters("beta"), vec!["Baz::Qux", "Foo::Bar"]);
+        assert!(idx.find_exporters("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_workspace_cache_dir_uniqueness() {
+        let d1 = cache_dir_for_workspace(Some("file:///home/user/project-a"));
+        let d2 = cache_dir_for_workspace(Some("file:///home/user/project-b"));
+        let d_none = cache_dir_for_workspace(None);
+        assert_ne!(d1, d2, "Different roots should produce different paths");
+        assert_ne!(d1, d_none, "Root vs no-root should differ");
+        assert_eq!(
+            d1,
+            cache_dir_for_workspace(Some("file:///home/user/project-a")),
+            "Same root should produce same path"
         );
     }
 }
