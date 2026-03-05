@@ -81,14 +81,17 @@ pub fn detect_cursor_context(source: &str, point: Point) -> CursorContext {
         }
     }
 
-    // Check for -> (method completion)
-    if trimmed.ends_with("->") {
-        let prefix = trimmed[..trimmed.len() - 2].trim_end();
-        let invocant = extract_invocant_from_prefix(prefix);
-        if !invocant.is_empty() {
-            return CursorContext::Method {
-                invocant: invocant.to_string(),
-            };
+    // Check for -> (method completion), including mid-word: $p->mag
+    {
+        let check = strip_trailing_identifier(trimmed);
+        if check.ends_with("->") {
+            let prefix = check[..check.len() - 2].trim_end();
+            let invocant = extract_invocant_from_prefix(prefix);
+            if !invocant.is_empty() {
+                return CursorContext::Method {
+                    invocant: invocant.to_string(),
+                };
+            }
         }
     }
 
@@ -100,6 +103,22 @@ pub fn detect_cursor_context(source: &str, point: Point) -> CursorContext {
     }
 
     CursorContext::General
+}
+
+/// Strip trailing identifier chars (partial method name typed so far).
+/// `"$p->mag"` → `"$p->"`, `"$p->"` → `"$p->"` (unchanged).
+fn strip_trailing_identifier(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        let ch = bytes[i - 1] as char;
+        if ch.is_alphanumeric() || ch == '_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    &s[..i]
 }
 
 /// Extract the invocant token from the text before `->` or `{`.
@@ -505,6 +524,31 @@ mod tests {
             ctx,
             CursorContext::Method {
                 invocant: "$obj".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_method_context_mid_word() {
+        // Typing `$p->mag` should still be Method context
+        let source = "$p->mag";
+        let ctx = detect_cursor_context(source, Point::new(0, 7));
+        assert_eq!(
+            ctx,
+            CursorContext::Method {
+                invocant: "$p".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_method_context_class_mid_word() {
+        let source = "Foo->ne";
+        let ctx = detect_cursor_context(source, Point::new(0, 7));
+        assert_eq!(
+            ctx,
+            CursorContext::Method {
+                invocant: "Foo".to_string()
             }
         );
     }

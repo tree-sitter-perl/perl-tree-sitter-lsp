@@ -543,11 +543,62 @@ impl<'a> Builder<'a> {
                 name.clone(),
                 AccessKind::Declaration,
             );
+
+            // Synthesize accessor methods for `field $x :reader` / `:writer`
+            if decl_kind == DeclKind::Field {
+                let bare_name = &name[1..]; // strip sigil
+                let attrs = self.collect_attributes(node);
+                if attrs.iter().any(|a| a == "reader") {
+                    self.add_symbol(
+                        bare_name.to_string(),
+                        SymKind::Method,
+                        node_to_span(node),
+                        *var_span,
+                        SymbolDetail::Sub { params: vec![], is_method: true },
+                    );
+                }
+                if attrs.iter().any(|a| a == "writer") {
+                    let writer_name = format!("set_{}", bare_name);
+                    self.add_symbol(
+                        writer_name,
+                        SymKind::Method,
+                        node_to_span(node),
+                        *var_span,
+                        SymbolDetail::Sub {
+                            params: vec![ParamInfo {
+                                name: format!("${}", bare_name),
+                                default: None,
+                                is_slurpy: false,
+                            }],
+                            is_method: true,
+                        },
+                    );
+                }
+            }
         }
 
         // Don't recurse into children — we've already extracted what we need
         // But DO check for assignment RHS (for type inference)
         // The parent assignment_expression handles that.
+    }
+
+    /// Collect attribute names from a node's `attributes` field (e.g. `:param :reader`).
+    fn collect_attributes(&self, node: Node<'a>) -> Vec<String> {
+        let mut attrs = Vec::new();
+        if let Some(attrlist) = node.child_by_field_name("attributes") {
+            for i in 0..attrlist.named_child_count() {
+                if let Some(attr) = attrlist.named_child(i) {
+                    if attr.kind() == "attribute" {
+                        if let Some(name_node) = attr.child_by_field_name("name") {
+                            if let Ok(name) = name_node.utf8_text(self.source) {
+                                attrs.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        attrs
     }
 
     fn visit_for(&mut self, node: Node<'a>) {
@@ -1380,6 +1431,38 @@ mod tests {
             .collect();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "$x");
+    }
+
+    #[test]
+    fn test_field_reader_synthesizes_method() {
+        let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param :reader;\n    field $y :param;\n}");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1, "got: {:?}", methods.iter().map(|m| &m.name).collect::<Vec<_>>());
+        assert_eq!(methods[0].name, "x");
+    }
+
+    #[test]
+    fn test_field_writer_synthesizes_method() {
+        let fa = build_fa("use v5.38;\nclass Point {\n    field $label :reader :writer = \"point\";\n}");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Method)
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(methods.contains(&"label".to_string()), "missing reader, got: {:?}", methods);
+        assert!(methods.contains(&"set_label".to_string()), "missing writer, got: {:?}", methods);
+    }
+
+    #[test]
+    fn test_field_reader_goto_def() {
+        // go-to-def on $p->x should find the reader method, which points to the field
+        let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param :reader;\n    method mag() { }\n}\nmy $p = Point->new(x => 1);\n$p->x;");
+        let def = fa.find_definition(Point::new(6, 5)); // cursor on `x` in `$p->x`
+        assert!(def.is_some(), "should find definition for reader method");
+        // The reader method's selection_span points to the field declaration
+        let span = def.unwrap();
+        assert_eq!(span.start.row, 2, "should point to field declaration line");
     }
 
     #[test]
