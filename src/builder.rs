@@ -1455,6 +1455,44 @@ mod tests {
     }
 
     #[test]
+    fn test_complete_methods_in_class() {
+        let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param :reader;\n    field $y :param;\n    method magnitude() { }\n    method to_string() { }\n}\nmy $p = Point->new(x => 1);\n$p->;\n");
+        // $p-> is at line 8, col 4
+        let candidates = fa.complete_methods("$p", Point::new(8, 4));
+        let names: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(names.contains(&"new"), "missing new, got: {:?}", names);
+        assert!(names.contains(&"magnitude"), "missing magnitude, got: {:?}", names);
+        assert!(names.contains(&"to_string"), "missing to_string, got: {:?}", names);
+        assert!(names.contains(&"x"), "missing reader x, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_complete_methods_sample_file_layout() {
+        // Matches sample.pl: class defined after package main, $p usage at end
+        let source = r#"use v5.38;
+class Point {
+    field $x :param :reader;
+    field $y :param;
+    method magnitude () { }
+    method to_string () { }
+}
+my $p = Point->new(x => 3, y => 4);
+$p->;
+"#;
+        let fa = build_fa(source);
+
+        // Check type inference resolved $p → Point
+        let inferred = fa.inferred_type("$p", Point::new(8, 4));
+        assert!(inferred.is_some(), "type inference for $p should resolve");
+
+        let candidates = fa.complete_methods("$p", Point::new(10, 4));
+        let names: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(names.contains(&"magnitude"), "missing magnitude, got: {:?}", names);
+        assert!(names.contains(&"to_string"), "missing to_string, got: {:?}", names);
+        assert!(names.contains(&"x"), "missing reader x, got: {:?}", names);
+    }
+
+    #[test]
     fn test_field_reader_goto_def() {
         // go-to-def on $p->x should find the reader method, which points to the field
         let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param :reader;\n    method mag() { }\n}\nmy $p = Point->new(x => 1);\n$p->x;");
@@ -1820,7 +1858,6 @@ mod tests {
         assert!(imp.qw_close_paren.is_some(), "qw_close_paren should be set");
         let pos = imp.qw_close_paren.unwrap();
         // The ) is at column 23 in "use List::Util qw(first);"
-        eprintln!("qw_close_paren = row={}, col={}", pos.row, pos.column);
         assert_eq!(pos.row, 0);
         assert_eq!(pos.column, 23, "close paren should be at column 23");
     }
