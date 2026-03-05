@@ -55,6 +55,7 @@ pub(crate) struct WorkspaceRootChannel {
 ///
 /// Async LSP handlers read from `cache` (zero I/O). The background resolver
 /// thread populates the cache by parsing `.pm` files in isolated child processes.
+#[allow(dead_code)]
 pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<ModuleExports>>>,
     /// Reverse index: function name → list of module names that export it.

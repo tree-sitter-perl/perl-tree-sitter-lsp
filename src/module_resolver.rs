@@ -19,6 +19,7 @@ use crate::module_cache;
 use crate::module_index::{ModuleExports, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
 
 /// Hard timeout for parsing a single .pm file in a child process.
+#[cfg(not(test))]
 const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Callback invoked after each module is resolved. Used to trigger diagnostic refresh.
@@ -327,6 +328,7 @@ fn parse_module(inc_paths: &[PathBuf], module_name: &str) -> Option<ModuleExport
     resolve_and_parse(inc_paths, module_name, &mut parser)
 }
 
+#[cfg(not(test))]
 fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<ModuleExports> {
     let path = resolve_module_path(inc_paths, module_name)?;
     let metadata = std::fs::metadata(&path).ok()?;
@@ -452,6 +454,7 @@ pub fn resolve_module_path(inc_paths: &[PathBuf], module_name: &str) -> Option<P
     None
 }
 
+#[allow(dead_code)]
 pub fn resolve_and_parse(
     inc_paths: &[PathBuf],
     module_name: &str,

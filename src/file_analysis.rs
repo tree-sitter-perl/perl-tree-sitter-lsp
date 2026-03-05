@@ -24,6 +24,7 @@ pub struct FoldRange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum FoldKind {
     Region,
     Comment,
@@ -52,6 +53,7 @@ pub struct Scope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ScopeKind {
     File,
     /// Region after `package Foo;` until next package statement or EOF.
@@ -96,6 +98,7 @@ pub enum SymKind {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum SymbolDetail {
     Variable {
         sigil: char,
@@ -140,6 +143,7 @@ pub struct ParamInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FieldDetail {
     pub name: String,
     pub sigil: char,
@@ -160,6 +164,7 @@ pub struct Ref {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum RefKind {
     Variable,
     FunctionCall,
@@ -191,6 +196,7 @@ pub struct TypeConstraint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum InferredType {
     /// `$p = Point->new(...)` — variable is an instance of ClassName.
     ClassName(String),
@@ -445,6 +451,7 @@ impl FileAnalysis {
     }
 
     /// Get the enclosing package name at a point.
+    #[allow(dead_code)]
     pub fn package_at(&self, point: Point) -> Option<&str> {
         let scope = self.scope_at(point)?;
         let chain = self.scope_chain(scope);
@@ -463,11 +470,13 @@ impl FileAnalysis {
     }
 
     /// Find all symbols in a given scope.
+    #[allow(dead_code)]
     pub fn symbols_in_scope(&self, scope: ScopeId) -> &[SymbolId] {
         self.symbols_by_scope.get(&scope).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Find all refs with a given target name.
+    #[allow(dead_code)]
     pub fn refs_named(&self, name: &str) -> Vec<&Ref> {
         self.refs_by_name.get(name)
             .map(|idxs| idxs.iter().map(|&i| &self.refs[i]).collect())
@@ -475,6 +484,7 @@ impl FileAnalysis {
     }
 
     /// Find all refs that resolve to a specific symbol.
+    #[allow(dead_code)]
     pub fn refs_to(&self, target: SymbolId) -> Vec<&Ref> {
         self.refs.iter()
             .filter(|r| r.resolves_to == Some(target))
@@ -482,6 +492,7 @@ impl FileAnalysis {
     }
 
     /// Find all hash key accesses/definitions for a given owner.
+    #[allow(dead_code)]
     pub fn hash_keys_for_owner(&self, owner: &HashKeyOwner) -> Vec<&Ref> {
         self.refs.iter()
             .filter(|r| {
@@ -1131,6 +1142,7 @@ pub struct CompletionCandidate {
 
 /// Signature info for a sub/method, resolved from the symbol table.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SignatureInfo {
     pub name: String,
     pub params: Vec<ParamInfo>,
@@ -1151,11 +1163,11 @@ impl FileAnalysis {
             .into_iter()
             .filter(|s| matches!(s.kind, SymKind::Variable | SymKind::Field))
             .filter_map(|s| {
-                if let SymbolDetail::Variable { sigil: decl_sigil, .. } = &s.detail {
+                if let SymbolDetail::Variable { .. } = &s.detail {
                     let scope = &self.scopes[s.scope.0 as usize];
                     let scope_size = span_size(&scope.span);
                     Some((s, scope_size))
-                } else if let SymbolDetail::Field { sigil: field_sigil, .. } = &s.detail {
+                } else if let SymbolDetail::Field { .. } = &s.detail {
                     let scope = &self.scopes[s.scope.0 as usize];
                     let scope_size = span_size(&scope.span);
                     Some((s, scope_size))
