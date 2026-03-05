@@ -1,0 +1,380 @@
+//! Module index: public API for cross-file Perl module intelligence.
+//!
+//! Wraps a concurrent cache (`DashMap`) backed by a background resolver thread.
+//! Async LSP handlers only read from the cache (zero I/O). The resolver thread
+//! handles @INC discovery, subprocess parsing, SQLite persistence, and cpanfile
+//! pre-scanning.
+//!
+//! See also:
+//! - `module_resolver.rs` — resolver thread, subprocess isolation, export extraction
+//! - `module_cache.rs` — SQLite persistence
+//! - `cpanfile.rs` — cpanfile parsing
+
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+
+use dashmap::DashMap;
+use tower_lsp::Client;
+
+use crate::module_resolver;
+
+// ---- Public types ----
+
+/// Exports extracted from a .pm file.
+#[derive(Debug, Clone)]
+pub struct ModuleExports {
+    /// Filesystem path to the .pm file.
+    pub path: PathBuf,
+    /// @EXPORT — auto-imported on bare `use Foo;`.
+    pub export: Vec<String>,
+    /// @EXPORT_OK — available on request via `use Foo qw(...)`.
+    pub export_ok: Vec<String>,
+}
+
+// ---- Internal sync primitives (pub(crate) for resolver thread) ----
+
+/// Thread-safe queue: Mutex<Vec> + Condvar.
+pub(crate) struct ResolveQueue {
+    pub pending: Mutex<Vec<String>>,
+    pub condvar: Condvar,
+}
+
+/// Signaled after each module is resolved.
+pub(crate) struct ResolveNotify {
+    pub mu: Mutex<()>,
+    pub cv: Condvar,
+}
+
+/// Channel for workspace root from initialize() → resolver thread.
+pub(crate) struct WorkspaceRootChannel {
+    pub root: Mutex<Option<Option<String>>>,
+    pub condvar: Condvar,
+}
+
+/// Concurrent module cache with background resolution.
+///
+/// Async LSP handlers read from `cache` (zero I/O). The background resolver
+/// thread populates the cache by parsing `.pm` files in isolated child processes.
+pub struct ModuleIndex {
+    cache: Arc<DashMap<String, Option<ModuleExports>>>,
+    /// Reverse index: function name → list of module names that export it.
+    reverse_index: Arc<DashMap<String, Vec<String>>>,
+    queue: Arc<ResolveQueue>,
+    resolved: Arc<ResolveNotify>,
+    workspace_root: Arc<WorkspaceRootChannel>,
+    /// Callback to trigger diagnostic re-publish after module resolution.
+    refresh_diagnostics: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl ModuleIndex {
+    pub fn new(client: Client, on_diagnostics_refresh: impl Fn() + Send + Sync + 'static) -> Self {
+        let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
+        let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let queue = Arc::new(ResolveQueue {
+            pending: Mutex::new(Vec::new()),
+            condvar: Condvar::new(),
+        });
+        let resolved = Arc::new(ResolveNotify {
+            mu: Mutex::new(()),
+            cv: Condvar::new(),
+        });
+        let workspace_root = Arc::new(WorkspaceRootChannel {
+            root: Mutex::new(None),
+            condvar: Condvar::new(),
+        });
+
+        let refresh = Arc::new(on_diagnostics_refresh);
+        let refresh_clone = Arc::clone(&refresh);
+
+        module_resolver::spawn_resolver(
+            Arc::clone(&cache),
+            Arc::clone(&reverse_index),
+            Arc::clone(&queue),
+            Arc::clone(&resolved),
+            Arc::clone(&workspace_root),
+            client,
+            Box::new(move || refresh_clone()),
+        );
+
+        ModuleIndex {
+            cache,
+            reverse_index,
+            queue,
+            resolved,
+            workspace_root,
+            refresh_diagnostics: refresh,
+        }
+    }
+
+    /// Notify the resolver thread of the workspace root (from LSP initialize).
+    pub fn set_workspace_root(&self, root: Option<&str>) {
+        let mut guard = self.workspace_root.root.lock().unwrap();
+        if root.is_none() {
+            log::warn!("No workspace root from client; using global module cache");
+        }
+        *guard = Some(root.map(String::from));
+        self.workspace_root.condvar.notify_one();
+    }
+
+    /// Request background resolution for a module. Non-blocking.
+    pub fn request_resolve(&self, module_name: &str) {
+        if self.cache.contains_key(module_name) {
+            return;
+        }
+        let mut pending = self.queue.pending.lock().unwrap();
+        pending.push(module_name.to_string());
+        self.queue.condvar.notify_one();
+    }
+
+    /// Return cached exports only — never does I/O.
+    pub fn get_exports_cached(&self, module_name: &str) -> Option<ModuleExports> {
+        self.cache.get(module_name).and_then(|entry| entry.clone())
+    }
+
+    /// Return cached module path only — never does I/O.
+    pub fn module_path_cached(&self, module_name: &str) -> Option<PathBuf> {
+        self.cache
+            .get(module_name)
+            .and_then(|entry| entry.as_ref().map(|e| e.path.clone()))
+    }
+
+    /// Iterate all cached module exports. Callback receives (module_name, exports).
+    pub fn for_each_cached<F: FnMut(&str, &ModuleExports)>(&self, mut f: F) {
+        for entry in self.cache.iter() {
+            if let Some(ref exports) = *entry.value() {
+                f(entry.key(), exports);
+            }
+        }
+    }
+
+    /// Find all cached modules that export the given function name.
+    /// Uses the reverse index — O(1) lookup instead of scanning all modules.
+    pub fn find_exporters(&self, func_name: &str) -> Vec<String> {
+        match self.reverse_index.get(func_name) {
+            Some(modules) => {
+                let mut result = modules.clone();
+                result.sort();
+                result.dedup();
+                result
+            }
+            None => vec![],
+        }
+    }
+
+    // ---- Test-only methods ----
+
+    /// Create a ModuleIndex for testing — no Client, no progress reporting.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
+        let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let queue = Arc::new(ResolveQueue {
+            pending: Mutex::new(Vec::new()),
+            condvar: Condvar::new(),
+        });
+        let resolved = Arc::new(ResolveNotify {
+            mu: Mutex::new(()),
+            cv: Condvar::new(),
+        });
+        let workspace_root = Arc::new(WorkspaceRootChannel {
+            root: Mutex::new(None),
+            condvar: Condvar::new(),
+        });
+
+        module_resolver::spawn_test_resolver(
+            Arc::clone(&cache),
+            Arc::clone(&reverse_index),
+            Arc::clone(&queue),
+            Arc::clone(&resolved),
+            Arc::clone(&workspace_root),
+        );
+
+        ModuleIndex {
+            cache,
+            reverse_index,
+            queue,
+            resolved,
+            workspace_root,
+            refresh_diagnostics: Arc::new(|| {}),
+        }
+    }
+
+    /// Insert a module directly into the cache (for testing).
+    #[cfg(test)]
+    pub fn insert_cache(&self, module_name: &str, exports: Option<ModuleExports>) {
+        // Update reverse index.
+        if let Some(ref e) = exports {
+            for func in e.export.iter().chain(e.export_ok.iter()) {
+                self.reverse_index
+                    .entry(func.clone())
+                    .or_default()
+                    .push(module_name.to_string());
+            }
+        }
+        self.cache.insert(module_name.to_string(), exports);
+    }
+
+    /// Block until `module_name` appears in the cache, or timeout.
+    #[cfg(test)]
+    pub fn wait_resolved(&self, module_name: &str, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.resolved.mu.lock().unwrap();
+        loop {
+            if self.cache.contains_key(module_name) {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (g, result) = self.resolved.cv.wait_timeout(guard, remaining).unwrap();
+            guard = g;
+            if result.timed_out() && !self.cache.contains_key(module_name) {
+                return false;
+            }
+        }
+    }
+
+    /// Get exports synchronously. WARNING: Does blocking I/O. Only for tests.
+    #[cfg(test)]
+    pub fn get_exports(&self, module_name: &str) -> Option<ModuleExports> {
+        if let Some(entry) = self.cache.get(module_name) {
+            return entry.clone();
+        }
+        let inc_paths = module_resolver::discover_inc_paths();
+        let mut parser = module_resolver::create_parser();
+        let result = module_resolver::resolve_and_parse(&inc_paths, module_name, &mut parser);
+        self.cache.insert(module_name.to_string(), result.clone());
+        result
+    }
+
+    #[cfg(test)]
+    fn inc_paths(&self) -> Vec<PathBuf> {
+        module_resolver::discover_inc_paths()
+    }
+
+    #[cfg(test)]
+    pub fn resolve_module(&self, module_name: &str) -> Option<PathBuf> {
+        let inc_paths = module_resolver::discover_inc_paths();
+        module_resolver::resolve_module_path(&inc_paths, module_name)
+    }
+}
+
+/// Entry point for `--parse-exports <path>` subprocess mode.
+pub fn subprocess_main(path: &str) {
+    module_resolver::subprocess_main(path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_module_list_util() {
+        let idx = ModuleIndex::new_for_test();
+        let path = idx.resolve_module("List::Util");
+        if !idx.inc_paths().is_empty() {
+            assert!(path.is_some(), "List::Util should be resolvable");
+            let p = path.unwrap();
+            assert!(p.to_str().unwrap().contains("List/Util.pm"));
+        }
+    }
+
+    #[test]
+    fn test_extract_exports_list_util() {
+        let idx = ModuleIndex::new_for_test();
+        if idx.inc_paths().is_empty() {
+            return;
+        }
+        let exports = idx.get_exports("List::Util");
+        assert!(exports.is_some(), "Should parse List::Util exports");
+        let exports = exports.unwrap();
+        assert!(
+            exports.export_ok.contains(&"first".to_string()),
+            "List::Util should export_ok 'first', got: {:?}",
+            exports.export_ok
+        );
+        assert!(
+            exports.export_ok.contains(&"any".to_string()),
+            "List::Util should export_ok 'any'"
+        );
+        assert!(
+            exports.export_ok.contains(&"min".to_string()),
+            "List::Util should export_ok 'min'"
+        );
+    }
+
+    #[test]
+    fn test_module_resolution_not_found() {
+        let idx = ModuleIndex::new_for_test();
+        assert!(idx.resolve_module("Nonexistent::Module::XYZ123").is_none());
+    }
+
+    #[test]
+    fn test_resolver_thread_flow() {
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+        if idx.inc_paths().is_empty() {
+            return;
+        }
+        idx.request_resolve("Carp");
+        assert!(
+            idx.wait_resolved("Carp", std::time::Duration::from_secs(10)),
+            "Carp should be resolved via thread"
+        );
+        let exports = idx.get_exports_cached("Carp").unwrap();
+        assert!(
+            exports.export.contains(&"carp".to_string()),
+            "Carp should export 'carp', got: {:?}",
+            exports.export
+        );
+        assert!(
+            exports.export.contains(&"croak".to_string()),
+            "Carp should export 'croak'"
+        );
+    }
+
+    #[test]
+    fn test_find_exporters() {
+        let idx = ModuleIndex::new_for_test();
+        idx.insert_cache(
+            "Foo::Bar",
+            Some(ModuleExports {
+                path: PathBuf::from("/fake/Foo/Bar.pm"),
+                export: vec!["alpha".into()],
+                export_ok: vec!["beta".into()],
+            }),
+        );
+        idx.insert_cache(
+            "Baz::Qux",
+            Some(ModuleExports {
+                path: PathBuf::from("/fake/Baz/Qux.pm"),
+                export: vec![],
+                export_ok: vec!["beta".into(), "gamma".into()],
+            }),
+        );
+
+        assert_eq!(idx.find_exporters("alpha"), vec!["Foo::Bar"]);
+        assert_eq!(idx.find_exporters("beta"), vec!["Baz::Qux", "Foo::Bar"]);
+        assert!(idx.find_exporters("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_find_exporters_uses_reverse_index() {
+        let idx = ModuleIndex::new_for_test();
+        idx.insert_cache(
+            "My::Mod",
+            Some(ModuleExports {
+                path: PathBuf::from("/fake/My/Mod.pm"),
+                export: vec!["foo".into()],
+                export_ok: vec!["bar".into()],
+            }),
+        );
+
+        // Verify reverse index was populated.
+        assert!(idx.reverse_index.contains_key("foo"));
+        assert!(idx.reverse_index.contains_key("bar"));
+        assert_eq!(idx.find_exporters("foo"), vec!["My::Mod"]);
+        assert_eq!(idx.find_exporters("bar"), vec!["My::Mod"]);
+    }
+}

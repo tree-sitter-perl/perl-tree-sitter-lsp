@@ -1,93 +1,10 @@
-# perl-tree-sitter-lsp
+# perl-lsp
 
-A Language Server Protocol (LSP) implementation for Perl, built on tree-sitter for parsing and scope graphs for name resolution.
+A Language Server Protocol (LSP) implementation for Perl, built on [tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl) for fast, incremental, error-tolerant parsing.
 
 ## Motivation
 
-Perl has no good LSP. The existing options (Perl::LanguageServer, PLS) are slow, incomplete, and struggle with Perl's dynamic nature. This project takes a different approach: use tree-sitter for fast, incremental, error-tolerant parsing, and scope graphs for principled name resolution — rather than trying to bolt IDE features onto the Perl interpreter.
-
-## Architecture
-
-```
-┌─────────────┐     ┌──────────────────┐     ┌───────────┐
-│  Editor      │◄───►│  LSP Server       │◄───►│  Scope    │
-│  (any LSP    │     │  (tower-lsp)      │     │  Graph    │
-│   client)    │     │                    │     │  Engine   │
-└─────────────┘     └────────┬───────────┘     └─────┬─────┘
-                             │                       │
-                     ┌───────▼───────┐       ┌───────▼───────┐
-                     │  tree-sitter   │       │  scopegraphs  │
-                     │  (perl grammar)│       │  (rust crate) │
-                     └───────────────┘       └───────────────┘
-```
-
-### Components
-
-1. **[tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl)** — Our tree-sitter grammar for Perl. Produces a concrete syntax tree (CST) that the rest of the system works from. Already handles much of Perl's parsing oddities (context-sensitive tokenization, regex vs division ambiguity, etc.).
-
-2. **Scope graph builder** — Walks the tree-sitter CST and builds a scope graph using the `scopegraphs` Rust crate ([metaborg/rust-scopegraphs](https://github.com/metaborg/rust-scopegraphs)). This is where Perl's scoping rules get encoded.
-
-3. **LSP server** — A Rust binary using `tower-lsp` that exposes standard LSP capabilities backed by the scope graph. Handles document synchronization, incremental re-parsing, and translates LSP requests into scope graph queries.
-
-## Key Dependencies
-
-| Crate | Purpose |
-|---|---|
-| `tree-sitter` | Incremental parsing framework |
-| `tree-sitter-perl` | Perl grammar ([tree-sitter-perl/tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl)) |
-| `scopegraphs` | Scope graph construction and querying ([docs](https://docs.rs/scopegraphs/latest/scopegraphs/)) |
-| `tower-lsp` | LSP server framework |
-
-## Background: Why Scope Graphs
-
-[Scope graphs](https://pl.ewi.tudelft.nl/research/projects/scope-graphs/) are a language-agnostic formalism for modeling name resolution. They encode which names are defined in which scopes and how scopes relate to each other (nesting, imports, inheritance). You build the graph, then query it to resolve references to definitions.
-
-GitHub's [stack-graphs](https://github.com/github/stack-graphs) (now archived, Sept 2025) was an adaptation of this theory. It used declarative `.tsg` files to map tree-sitter nodes to graph operations, but maintaining those files proved unsustainable — they only ever covered 4 languages.
-
-The `scopegraphs` crate from Metaborg is the canonical Rust implementation of the underlying theory. Instead of declarative `.tsg` rules, you write Rust code that walks the CST and imperatively builds the scope graph. This is more work upfront but far more flexible — which matters for Perl.
-
-Key properties of scope graphs:
-- **Incremental**: graph construction and querying can happen concurrently
-- **Language-agnostic**: the framework doesn't care about the language, you encode the rules
-- **Principled**: based on the formal theory from ["Scopes as Types" (van Antwerpen et al., 2018)](https://pl.ewi.tudelft.nl/research/projects/scope-graphs/)
-
-## Perl Scoping Challenges
-
-Perl's scoping is notoriously complex. The scope graph builder must handle:
-
-### Lexical scoping (`my`, `state`)
-- `my $x` introduces a lexical variable visible from declaration to end of enclosing block
-- `state $x` is lexical but persistent across calls
-- Lexical variables shadow outer scopes
-
-### Dynamic scoping (`local`)
-- `local $x` temporarily replaces the value of a package variable for the dynamic extent of the enclosing block
-- This is runtime behavior — the scope graph can model the declaration site but not the dynamic resolution
-
-### Package variables and namespaces
-- `$Foo::bar`, `@Foo::baz` — fully qualified package variables
-- `package Foo;` switches the current namespace
-- `our $x` declares a lexical alias to a package variable
-
-### Imports and exports
-- `use Module qw(func1 func2)` — imports names into the current namespace
-- `use Module;` — calls `Module->import()`, which can inject arbitrary names
-- Exporter-based patterns (`@EXPORT`, `@EXPORT_OK`)
-- `use parent`, `use base` — inheritance, affects method resolution
-
-### Subroutines
-- `sub foo { }` — named subroutine in current package
-- `my $f = sub { }` — anonymous sub, lexical variable
-- `sub foo :prototype($$) { }` — prototypes affect parsing of call sites
-- Method resolution via `@ISA` / C3 linearization (`use mro 'c3'`)
-
-### Special variables
-- `$_`, `@_`, `$!`, `$/`, etc. — implicitly scoped, some dynamically scoped
-- `$self` — convention, not a keyword
-
-### Closures
-- Subroutines close over lexical variables from enclosing scopes
-- This is critical for go-to-definition to work across closure boundaries
+Perl has no good LSP. The existing options (Perl::LanguageServer, PLS) are slow, incomplete, and struggle with Perl's dynamic nature. This project takes a different approach: use tree-sitter for parsing and a hand-built scope graph for name resolution — rather than trying to bolt IDE features onto the Perl interpreter.
 
 ## Building
 
@@ -133,14 +50,6 @@ Or test with the included throwaway config:
 nvim -u test_nvim_init.lua test_files/sample.pl
 ```
 
-**Keybindings** (with the test config or standard Neovim LSP defaults):
-
-| Key | Action |
-|---|---|
-| `gd` | Go to definition |
-| `gr` | Find references |
-| `K` | Hover info |
-
 ### VS Code
 
 1. Install the **[Generic LSP Client](https://marketplace.visualstudio.com/items?itemName=nicolo-ribaudo.vscode-glsp-client)** extension (or any generic LSP extension).
@@ -160,39 +69,122 @@ nvim -u test_nvim_init.lua test_files/sample.pl
 }
 ```
 
-Alternatively, a `.vscode/settings.json` for this repo is included — just install the extension and open the workspace.
+## LSP Features
 
-## LSP Features (Priority Order)
+### Single-file
 
-### Phase 1 — Core navigation
-- [x] `textDocument/definition` — go to definition of variables, subs, packages
-- [x] `textDocument/references` — find all references to a symbol
-- [x] `textDocument/hover` — show type/scope info for a symbol
-- [x] `textDocument/documentSymbol` — outline of subs, packages, variables in a file
+- **documentSymbol** — outline of subs, packages, variables, classes (with fields/methods as children)
+- **definition** — go-to-def for variables (scope-aware), subs, methods (type-inferred), packages/classes, hash keys
+- **references** — scope-aware for variables, file-wide for functions/packages/hash keys
+- **hover** — shows declaration line, class-aware for methods, hash key info
+- **rename** — scope-aware for variables, file-wide for functions/packages/hash keys
+- **completion** — scope-aware variables (cross-sigil forms), subs, methods (type-inferred), packages, hash keys (class-aware)
+- **signatureHelp** — parameter info for subs/methods (signature syntax + legacy `@_` pattern), triggers on `(` and `,`
+- **documentHighlight** — highlight all occurrences with read/write distinction
+- **selectionRange** — expand/shrink selection via tree-sitter node hierarchy
+- **foldingRange** — blocks, subs, classes, pod sections
+- **formatting** — shells out to perltidy (respects .perltidyrc)
+- **semanticTokens/full** — variable tokens with modifiers: scalar/array/hash, declaration, modification
+- **codeAction** — auto-import: adds `use Module qw(func);` for unresolved functions
 
-### Phase 2 — Cross-file intelligence
-- [ ] `textDocument/completion` — autocomplete variables, subs, package names
-- [ ] Workspace-wide indexing — resolve `use` statements, track cross-file definitions
-- [ ] `textDocument/rename` — rename a symbol across its scope
+### Cross-file
 
-### Phase 3 — Diagnostics and advanced features
-- [ ] `textDocument/diagnostic` — report undeclared variables, unused imports
-- [ ] `textDocument/signatureHelp` — sub signatures and prototypes
-- [ ] Method resolution across inheritance hierarchies
+- **Module resolution** — resolves `@EXPORT` / `@EXPORT_OK` from imported modules via `@INC`
+- **cpanfile pre-scan** — indexes project dependencies at startup with progress reporting
+- **Auto-import completions** — suggests exported functions from cached modules with `additionalTextEdits`
+- **Diagnostics** — warns on unresolved function calls (skips builtins, local subs, imported functions)
+- **SQLite cache** — per-project persistent cache, survives restarts, validates against `@INC` changes
 
-## Development Plan
+## Architecture
 
-1. **tree-sitter-perl is ready** — the grammar lives at [tree-sitter-perl/tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl) and is maintained in-house. Grammar improvements needed for the LSP can be done upstream.
-2. **Prototype the scope graph builder** — start with lexical scoping (`my`, `our`, `local`, `sub`). Get go-to-definition working for variables within a single file.
-3. **Wire up the LSP** — minimal `tower-lsp` server that does document sync + go-to-definition.
-4. **Expand incrementally** — add cross-file resolution, completion, references, diagnostics.
+```
+src/
+├── main.rs              Entry point, stdio transport, --parse-exports subprocess mode
+├── backend.rs           LanguageServer trait impl (tower-lsp), request routing
+├── document.rs          Document store with tree-sitter parsing
+├── file_analysis.rs     Data model: scopes, symbols, refs, imports, type inference
+├── builder.rs           Single-pass CST → FileAnalysis builder
+├── cursor_context.rs    Cursor position analysis: completion/signature/selection context
+├── symbols.rs           LSP adapter: converts FileAnalysis types to LSP types
+├── module_index.rs      Cross-file: public API, reverse index, concurrent cache
+├── module_resolver.rs   Background resolver thread, subprocess isolation, export extraction
+├── module_cache.rs      SQLite persistence, schema migrations, mtime validation
+└── cpanfile.rs          cpanfile parsing via tree-sitter queries
+```
+
+### Key dependencies
+
+| Crate | Purpose |
+|---|---|
+| `tower-lsp 0.20` | LSP framework (`#[tower_lsp::async_trait]`) |
+| `tree-sitter 0.25` | Incremental parsing |
+| `tree-sitter-perl` | Perl grammar (path dep to `../tree-sitter-perl`) |
+| `dashmap 6` | Concurrent document store + module cache |
+| `rusqlite 0.32` | SQLite persistence for module index (bundled) |
+
+### How module resolution works
+
+1. When a file is opened/edited, `use` statements trigger background module resolution
+2. A dedicated `std::thread` (not tokio) does all filesystem I/O — never blocks the async runtime
+3. Modules are located via `@INC`, exports extracted by tree-sitter parsing in isolated subprocesses
+4. Results stored in `Arc<DashMap>` (async handlers read) + SQLite (persists across restarts)
+5. A reverse index (`function → modules`) enables O(1) exporter lookup for diagnostics and completions
+6. At startup, `cpanfile` is parsed with tree-sitter queries to pre-resolve project dependencies
+7. After module resolution, diagnostics are refreshed for all open files (no stale false positives)
+
+## Debugging
+
+The LSP server uses `env_logger`. Debug mode is opt-in via `PERL_LSP_DEBUG`:
+
+```bash
+# Normal usage — no logging
+nvim --clean -u test_nvim_init.lua test_files/sample.pl
+
+# Debug mode — full logging to /tmp/perl-lsp.log
+PERL_LSP_DEBUG=1 nvim --clean -u test_nvim_init.lua test_files/sample.pl
+```
+
+Then tail the log: `tail -f /tmp/perl-lsp.log`
+
+| Level | What |
+|---|---|
+| `info` | Module resolution: queued, resolved, export counts; cpanfile parsing |
+| `warn` | Slow parses (>100ms), subprocess timeouts, skipped files |
+| `debug` | Every `did_change` dumps document text to `/tmp/perl-lsp-last-update.pl` |
+
+### Reproducing parser hangs
+
+tree-sitter-perl's external scanner can occasionally enter an infinite loop. Module resolution runs in isolated child processes with a 5-second timeout — the child is SIGKILL'd and the module skipped. The main LSP process stays alive.
+
+The file `/tmp/perl-lsp-last-update.pl` contains the last document text sent to the parser, useful for reproducing hangs.
+
+## Roadmap
+
+### Done
+- Single-file: all core LSP features (definition, references, hover, rename, completion, signature help, highlights, selection range, folding, formatting, semantic tokens)
+- Scope-aware variable resolution (my, our, state, signatures, for-loops, class fields)
+- Core Perl `class` support (5.38+): class extraction, field/method symbols, type-inferred method resolution
+- Hash key intelligence: go-to-def, refs, rename, hover, completion (class-aware via bless patterns)
+- Cross-file module resolution with background resolver thread
+- cpanfile pre-scan with tree-sitter queries and progress reporting
+- Auto-import completions and code actions
+- SQLite persistence with per-project cache segregation
+
+### Next
+- Phase-aware cpanfile filtering (test deps only in `t/` files) — [design doc](docs/cpanfile-indexing-plan.md)
+- Framework submodule whitelist (`Mojo::*`, `Moose::*` patterns)
+- OOP framework stubs (Moo, Moose, Class::Accessor) — declarative DSL → class shape mapping
+- Bulk `@INC` scan for go-to-def into any installed module
+- Subprocess batching: parse multiple modules per child process to reduce spawn overhead for bulk scans
+
+### Future
+- Workspace-wide references and rename
+- Return type tracking and parameter type inference
+- Method resolution across inheritance hierarchies (`@ISA` / C3)
 
 ## References
 
-- [scopegraphs crate](https://docs.rs/scopegraphs/latest/scopegraphs/)
-- [metaborg/rust-scopegraphs](https://github.com/metaborg/rust-scopegraphs)
-- [Scope Graphs: A Theory of Name Resolution](https://pl.ewi.tudelft.nl/research/projects/scope-graphs/)
-- [github/stack-graphs (archived)](https://github.com/github/stack-graphs) — prior art, useful for understanding the approach
+- [tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl)
 - [tower-lsp](https://github.com/ebkalderon/tower-lsp)
-- [tree-sitter-perl/tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl)
 - [tree-sitter](https://tree-sitter.github.io/tree-sitter/)
+- [Scope Graphs: A Theory of Name Resolution](https://pl.ewi.tudelft.nl/research/projects/scope-graphs/) — influenced our approach to name resolution
