@@ -493,6 +493,8 @@ pub fn discover_inc_paths() -> Vec<PathBuf> {
 // ---- Export extraction ----
 
 fn extract_exports(parser: &mut Parser, source: &str) -> Option<(Vec<String>, Vec<String>)> {
+    use tree_sitter::{QueryCursor, StreamingIterator};
+
     let tree = parser.parse(source, None)?;
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -500,143 +502,60 @@ fn extract_exports(parser: &mut Parser, source: &str) -> Option<(Vec<String>, Ve
     let mut export = Vec::new();
     let mut export_ok = Vec::new();
 
-    collect_exports(root, bytes, &mut export, &mut export_ok);
+    // Query 1: @EXPORT = qw(...)
+    let qw_query = crate::query_cache::exports_qw();
+    let qw_var_idx = qw_query.capture_index_for_name("var").unwrap();
+    let qw_words_idx = qw_query.capture_index_for_name("words").unwrap();
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(qw_query, root, bytes);
+    while let Some(m) = matches.next() {
+        let mut var_name = "";
+        let mut words = Vec::new();
+        for cap in m.captures {
+            let text = cap.node.utf8_text(bytes).unwrap_or("");
+            if cap.index == qw_var_idx {
+                var_name = text;
+            } else if cap.index == qw_words_idx {
+                words.extend(text.split_whitespace().map(String::from));
+            }
+        }
+        match var_name {
+            "@EXPORT_OK" => export_ok.extend(words),
+            "@EXPORT" => export.extend(words),
+            _ => {}
+        }
+    }
+
+    // Query 2: @EXPORT = ('foo', 'bar')
+    let paren_query = crate::query_cache::exports_paren_list();
+    let paren_var_idx = paren_query.capture_index_for_name("var").unwrap();
+    let paren_word_idx = paren_query.capture_index_for_name("word").unwrap();
+
+    let mut cursor2 = QueryCursor::new();
+    let mut matches2 = cursor2.matches(paren_query, root, bytes);
+    while let Some(m) = matches2.next() {
+        let mut var_name = "";
+        let mut words = Vec::new();
+        for cap in m.captures {
+            let text = cap.node.utf8_text(bytes).unwrap_or("");
+            if cap.index == paren_var_idx {
+                var_name = text;
+            } else if cap.index == paren_word_idx {
+                words.push(text.to_string());
+            }
+        }
+        match var_name {
+            "@EXPORT_OK" => export_ok.extend(words),
+            "@EXPORT" => export.extend(words),
+            _ => {}
+        }
+    }
 
     if export.is_empty() && export_ok.is_empty() {
         return None;
     }
     Some((export, export_ok))
-}
-
-fn collect_exports(
-    node: tree_sitter::Node,
-    source: &[u8],
-    export: &mut Vec<String>,
-    export_ok: &mut Vec<String>,
-) {
-    match node.kind() {
-        "assignment_expression" => {
-            if let Some((var_name, words)) = extract_export_assignment(node, source) {
-                match var_name.as_str() {
-                    "@EXPORT_OK" | "EXPORT_OK" => export_ok.extend(words),
-                    "@EXPORT" | "EXPORT" => export.extend(words),
-                    _ => {}
-                }
-            }
-        }
-        _ => {
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    collect_exports(child, source, export, export_ok);
-                }
-            }
-        }
-    }
-}
-
-fn extract_export_assignment(
-    node: tree_sitter::Node,
-    source: &[u8],
-) -> Option<(String, Vec<String>)> {
-    let left = node.child_by_field_name("left")?;
-
-    let var_name = extract_array_var_name(left, source)?;
-    if !matches!(
-        var_name.as_str(),
-        "@EXPORT" | "EXPORT" | "@EXPORT_OK" | "EXPORT_OK"
-    ) {
-        return None;
-    }
-
-    let mut words = Vec::new();
-    if let Some(right) = node.child_by_field_name("right") {
-        words = extract_word_list(right, source);
-    }
-    if words.is_empty() {
-        for i in 0..node.named_child_count() {
-            if let Some(child) = node.named_child(i) {
-                let w = extract_word_list(child, source);
-                if !w.is_empty() {
-                    words = w;
-                    break;
-                }
-            }
-        }
-    }
-    if words.is_empty() {
-        return None;
-    }
-
-    Some((var_name, words))
-}
-
-fn extract_array_var_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "variable_declaration" => {
-            for i in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(i) {
-                    if child.kind() == "array" {
-                        return child.utf8_text(source).ok().map(|s| s.to_string());
-                    }
-                }
-            }
-            None
-        }
-        "array" => node.utf8_text(source).ok().map(|s| s.to_string()),
-        _ => None,
-    }
-}
-
-fn extract_word_list(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
-    match node.kind() {
-        "quoted_word_list" => {
-            let mut words = Vec::new();
-            for i in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(i) {
-                    if child.kind() == "string_content" {
-                        if let Ok(text) = child.utf8_text(source) {
-                            for word in text.split_whitespace() {
-                                if !word.is_empty() {
-                                    words.push(word.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            words
-        }
-        "parenthesized_expression" | "list_expression" => {
-            let mut words = Vec::new();
-            collect_string_literals(node, source, &mut words);
-            words
-        }
-        _ => vec![],
-    }
-}
-
-fn collect_string_literals(node: tree_sitter::Node, source: &[u8], words: &mut Vec<String>) {
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            match child.kind() {
-                "string_literal" | "interpolated_string_literal" => {
-                    for j in 0..child.named_child_count() {
-                        if let Some(content) = child.named_child(j) {
-                            if content.kind() == "string_content" {
-                                if let Ok(text) = content.utf8_text(source) {
-                                    words.push(text.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                "list_expression" | "parenthesized_expression" => {
-                    collect_string_literals(child, source, words);
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {

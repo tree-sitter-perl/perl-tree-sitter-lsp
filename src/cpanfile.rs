@@ -27,50 +27,18 @@ pub fn parse_cpanfile(root_path: &std::path::Path) -> Vec<String> {
     modules
 }
 
-/// Use a tree-sitter query to find all `requires 'Module::Name'` calls.
+/// Use a pre-compiled tree-sitter query to find all `requires 'Module::Name'` calls.
 fn collect_requires(root: tree_sitter::Node, source: &[u8], modules: &mut Vec<String>) {
-    use tree_sitter::{Query, QueryCursor, StreamingIterator};
+    use tree_sitter::{QueryCursor, StreamingIterator};
 
-    // Match both `requires 'Foo'` (ambiguous) and `requires('Foo')` (explicit).
-    // The `#eq?` predicate filters to only calls where the function name is "requires".
-    // Single arg:  `requires 'DBI'`  → string_literal is direct arguments: child
-    // Multi arg:   `requires 'Mojo', '>= 9.0'` → args wrapped in list_expression
-    // Both node types (ambiguous = no parens, function_call = with parens) need both patterns.
-    // The `.` anchor on list_expression ensures only the first string (module name) matches.
-    let query_src = r#"
-        [
-          (function_call_expression
-            function: (_) @fn
-            (string_literal (string_content) @module))
-          (function_call_expression
-            function: (_) @fn
-            (list_expression . (string_literal (string_content) @module)))
-          (ambiguous_function_call_expression
-            function: (_) @fn
-            (string_literal (string_content) @module))
-          (ambiguous_function_call_expression
-            function: (_) @fn
-            (list_expression . (string_literal (string_content) @module)))
-        ]
-        (#eq? @fn "requires")
-    "#;
-
-    let lang = tree_sitter_perl::LANGUAGE.into();
-    let query = match Query::new(&lang, query_src) {
-        Ok(q) => q,
-        Err(e) => {
-            log::error!("cpanfile query error: {}", e);
-            return;
-        }
-    };
-
+    let query = crate::query_cache::cpanfile_requires();
     let module_idx = match query.capture_index_for_name("module") {
         Some(idx) => idx,
         None => return,
     };
 
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, root, source);
+    let mut matches = cursor.matches(query, root, source);
     while let Some(m) = matches.next() {
         for cap in m.captures {
             if cap.index == module_idx {
