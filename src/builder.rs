@@ -198,6 +198,10 @@ impl<'a> Builder<'a> {
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 self.visit_function_call(node);
             }
+            // Built-in calls: abs($x), length($s), time(), etc.
+            "func1op_call_expression" | "func0op_call_expression" => {
+                self.visit_func1op(node);
+            }
             "method_call_expression" => self.visit_method_call(node),
 
             // Hash access
@@ -888,11 +892,13 @@ impl<'a> Builder<'a> {
                 self.visit_variable_decl(left);
             }
             if let Some(right) = node.child_by_field_name("right") {
-                // Try constructor class first (Foo->new()), then literal types
+                // Try constructor class first, then literal types, then expression type
                 let inferred = if let Some(class_name) = self.extract_constructor_class(right) {
                     Some(InferredType::ClassName(class_name))
+                } else if let Some(t) = Self::infer_literal_type(right) {
+                    Some(t)
                 } else {
-                    Self::infer_literal_type(right)
+                    self.infer_expression_result_type(right)
                 };
                 if let Some(it) = inferred {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
@@ -963,6 +969,10 @@ impl<'a> Builder<'a> {
         if let Some(class_name) = self.extract_constructor_class(child) {
             return Some(InferredType::ClassName(class_name));
         }
+        // Try expression result type: return $a + $b → Numeric
+        if let Some(t) = self.infer_expression_result_type(child) {
+            return Some(t);
+        }
         // Try variable lookup: return $self, return $var
         if child.kind() == "scalar" {
             if let Ok(var_text) = child.utf8_text(self.source) {
@@ -993,6 +1003,27 @@ impl<'a> Builder<'a> {
                     inferred_type,
                 });
             }
+        }
+    }
+
+    /// Infer the result type of an expression (not its operands — those are handled elsewhere).
+    /// e.g. `$a + $b` produces Numeric, `$a . $b` produces String.
+    fn infer_expression_result_type(&self, node: Node<'a>) -> Option<InferredType> {
+        match node.kind() {
+            "binary_expression" => {
+                let op = self.get_operator_text(node);
+                match op.as_deref() {
+                    Some("+" | "-" | "*" | "/" | "%" | "**") => Some(InferredType::Numeric),
+                    Some("." | "x") => Some(InferredType::String),
+                    _ => None,
+                }
+            }
+            "postinc_expression" | "preinc_expression" => Some(InferredType::Numeric),
+            "func1op_call_expression" | "func0op_call_expression" => {
+                let name = node.child(0)?.utf8_text(self.source).ok()?;
+                builtin_return_type(name)
+            }
+            _ => None,
         }
     }
 
@@ -1196,9 +1227,39 @@ impl<'a> Builder<'a> {
                     name.to_string(),
                     AccessKind::Read,
                 );
+                // Push type constraints on arguments of known builtins
+                if let Some(arg_type) = crate::file_analysis::builtin_first_arg_type(name) {
+                    if let Some(first_arg) = self.first_call_arg(node) {
+                        self.push_var_type_constraint(first_arg, node, arg_type);
+                    }
+                }
             }
         }
         self.visit_children(node);
+    }
+
+    /// Handle func1op_call_expression: abs($x), length($s), int($n), etc.
+    /// The function name is the first child (keyword), the arg is a named child.
+    fn visit_func1op(&mut self, node: Node<'a>) {
+        let name = node.child(0)
+            .and_then(|c| c.utf8_text(self.source).ok())
+            .unwrap_or("");
+        // Push type constraint on the argument
+        if let Some(arg_type) = builtin_first_arg_type(name) {
+            if let Some(arg) = node.named_child(0) {
+                self.push_var_type_constraint(arg, node, arg_type);
+            }
+        }
+        self.visit_children(node);
+    }
+
+    /// Extract the first argument node from a function call.
+    fn first_call_arg(&self, call_node: Node<'a>) -> Option<Node<'a>> {
+        let args = call_node.child_by_field_name("arguments")?;
+        match args.kind() {
+            "list_expression" | "parenthesized_expression" => args.named_child(0),
+            _ => Some(args), // single arg (ambiguous_function_call_expression)
+        }
     }
 
     fn visit_method_call(&mut self, node: Node<'a>) {
@@ -1393,6 +1454,10 @@ impl<'a> Builder<'a> {
                 } else {
                     None
                 }
+            }
+            "method_call_expression" => {
+                let method = node.child_by_field_name("method")?;
+                Some(method.utf8_text(self.source).ok()?.to_string())
             }
             _ => None,
         }
@@ -1699,12 +1764,15 @@ impl<'a> Builder<'a> {
         // a variable assignment. Not handled here.
         let mut new_constraints = Vec::new();
         for binding in &self.call_bindings {
-            if let Some(rt) = return_types.get(&binding.func_name) {
+            let rt = return_types.get(&binding.func_name)
+                .cloned()
+                .or_else(|| builtin_return_type(&binding.func_name));
+            if let Some(rt) = rt {
                 new_constraints.push(TypeConstraint {
                     variable: binding.variable.clone(),
                     scope: binding.scope,
                     constraint_span: binding.span,
-                    inferred_type: rt.clone(),
+                    inferred_type: rt,
                 });
             }
         }
@@ -2326,6 +2394,20 @@ $p->;
     }
 
     #[test]
+    fn test_assignment_from_binary_numeric_infers_result() {
+        let fa = build_fa("my $a = 1;\nmy $b = 2;\nmy $result = $a + $b;\n$result;");
+        let ty = fa.inferred_type("$result", Point::new(3, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "$result = $a + $b should be Numeric");
+    }
+
+    #[test]
+    fn test_assignment_from_string_concat_infers_result() {
+        let fa = build_fa("my $a = 'x';\nmy $b = 'y';\nmy $s = $a . $b;\n$s;");
+        let ty = fa.inferred_type("$s", Point::new(3, 0));
+        assert_eq!(ty, Some(&InferredType::String), "$s = $a . $b should be String");
+    }
+
+    #[test]
     fn test_string_concat_infers_string() {
         let fa = build_fa("my $s;\nmy $a = $s . \"x\";\nmy $z;");
         let ty = fa.inferred_type("$s", Point::new(2, 0));
@@ -2403,6 +2485,51 @@ $p->;
         assert_eq!(ty, None, "@arr should not get Numeric constraint");
     }
 
+    // ---- Builtin type inference tests ----
+
+    #[test]
+    fn test_builtin_push_infers_arrayref() {
+        // push @{$aref} triggers array_deref_expression which already infers ArrayRef
+        let fa = build_fa("my $aref;\npush @{$aref}, 1;\nmy $z;");
+        let ty = fa.inferred_type("$aref", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::ArrayRef), "push deref should infer ArrayRef");
+    }
+
+    #[test]
+    fn test_builtin_length_infers_string_arg() {
+        let fa = build_fa("my $s;\nmy $n = length($s);\nmy $z;");
+        let ty = fa.inferred_type("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::String), "length arg should be String");
+    }
+
+    #[test]
+    fn test_builtin_abs_infers_numeric_arg() {
+        let fa = build_fa("my $x;\nmy $n = abs($x);\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "abs arg should be Numeric");
+    }
+
+    #[test]
+    fn test_builtin_return_type_propagates() {
+        let fa = build_fa("my $t = time();\n$t;");
+        let ty = fa.inferred_type("$t", Point::new(1, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "time() should return Numeric");
+    }
+
+    #[test]
+    fn test_builtin_join_return_type() {
+        let fa = build_fa("my $s = join(',', @arr);\n$s;");
+        let ty = fa.inferred_type("$s", Point::new(1, 0));
+        assert_eq!(ty, Some(&InferredType::String), "join() should return String");
+    }
+
+    #[test]
+    fn test_builtin_length_return_type() {
+        let fa = build_fa("my $n = length('hello');\n$n;");
+        let ty = fa.inferred_type("$n", Point::new(1, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "length() should return Numeric");
+    }
+
     // ---- Return type inference tests (Step 4) ----
 
     #[test]
@@ -2450,6 +2577,15 @@ $p->;
         assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
         let ty = fa.inferred_type("$cfg", Point::new(4, 0));
         assert_eq!(ty, Some(&InferredType::HashRef), "call site should get return type");
+    }
+
+    #[test]
+    fn test_return_type_propagation_method_call() {
+        let src = "package Calculator;\nsub new { bless {}, shift }\nsub add {\n    my ($self, $a, $b) = @_;\n    my $result = $a + $b;\n    return $result;\n}\npackage main;\nmy $calc = Calculator->new();\nmy $sum = $calc->add(2, 3);\n$sum;";
+        let fa = build_fa(src);
+        assert_eq!(fa.sub_return_type("add"), Some(&InferredType::Numeric), "add should return Numeric");
+        let ty = fa.inferred_type("$sum", Point::new(10, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "$sum should be Numeric via method call binding");
     }
 
     #[test]
@@ -2864,6 +3000,46 @@ $calc->get_self->get_config->{host};
         assert!(hover.is_some(), "should have hover info for function call");
         let text = hover.unwrap();
         assert!(text.contains("greet"), "hover should contain sub name, got: {}", text);
+    }
+
+    #[test]
+    fn test_hover_shows_inferred_type() {
+        let src = "package Point;\nsub new { bless {}, shift }\npackage main;\nmy $p = Point->new();\n$p;";
+        let fa = build_fa(src);
+        // Hover on $p usage at line 4
+        let hover = fa.hover_info(Point::new(4, 1), src, None);
+        assert!(hover.is_some(), "should have hover info");
+        let text = hover.unwrap();
+        assert!(text.contains("Point"), "hover should show inferred type Point, got: {}", text);
+    }
+
+    #[test]
+    fn test_hover_type_at_usage_after_reassignment() {
+        // $x starts as Point, gets reassigned to Foo — hover at each usage should reflect the type at that point
+        let src = "package Point;\nsub new { bless {}, shift }\npackage Foo;\nsub new { bless {}, shift }\npackage main;\nmy $x = Point->new();\n$x;\n$x = Foo->new();\n$x;";
+        let fa = build_fa(src);
+        // line 6: $x; — should be Point
+        let hover1 = fa.hover_info(Point::new(6, 1), src, None);
+        assert!(hover1.is_some());
+        let text1 = hover1.unwrap();
+        assert!(text1.contains("Point"), "at line 6 should be Point, got: {}", text1);
+        // line 8: $x; — should be Foo (after reassignment)
+        let hover2 = fa.hover_info(Point::new(8, 1), src, None);
+        assert!(hover2.is_some());
+        let text2 = hover2.unwrap();
+        assert!(text2.contains("Foo"), "at line 8 should be Foo, got: {}", text2);
+    }
+
+    #[test]
+    fn test_hover_shows_return_type() {
+        let src = "package Foo;\nsub make { return Foo->new() }\nsub new { bless {}, shift }\npackage main;\nmake();";
+        let fa = build_fa(src);
+        // Hover on sub make definition
+        let hover = fa.hover_info(Point::new(1, 5), src, None);
+        assert!(hover.is_some(), "should have hover info for sub");
+        let text = hover.unwrap();
+        assert!(text.contains("returns"), "hover should show return type, got: {}", text);
+        assert!(text.contains("Foo"), "hover return type should mention Foo, got: {}", text);
     }
 
     #[test]

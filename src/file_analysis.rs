@@ -582,6 +582,11 @@ impl FileAnalysis {
                 let func_node = node.child_by_field_name("function")?;
                 let name = func_node.utf8_text(source).ok()?;
                 self.sub_return_type(name).cloned()
+                    .or_else(|| builtin_return_type(name))
+            }
+            "func1op_call_expression" | "func0op_call_expression" => {
+                let name = node.child(0)?.utf8_text(source).ok()?;
+                builtin_return_type(name)
             }
             "hash_element_expression" => {
                 // For chaining: resolve the base expression
@@ -809,7 +814,9 @@ impl FileAnalysis {
 
     /// Find the ref at a given point (cursor position).
     pub fn ref_at(&self, point: Point) -> Option<&Ref> {
-        self.refs.iter().find(|r| contains_point(&r.span, point))
+        self.refs.iter()
+            .filter(|r| contains_point(&r.span, point))
+            .min_by_key(|r| span_size(&r.span))
     }
 
     /// Find the symbol whose selection_span contains the point.
@@ -1048,11 +1055,11 @@ impl FileAnalysis {
                 RefKind::Variable | RefKind::ContainerAccess => {
                     if let Some(sym_id) = r.resolves_to {
                         let sym = self.symbol(sym_id);
-                        return Some(self.format_symbol_hover(sym, source));
+                        return Some(self.format_symbol_hover_at(sym, source, point));
                     }
                     // Unresolved variable — try resolve ourselves
                     if let Some(sym) = self.resolve_variable(&r.target_name, point) {
-                        return Some(self.format_symbol_hover(sym, source));
+                        return Some(self.format_symbol_hover_at(sym, source, point));
                     }
                 }
                 RefKind::FunctionCall => {
@@ -1070,7 +1077,11 @@ impl FileAnalysis {
                     if let Some(ref cn) = class_name {
                         if let Some(span) = self.find_method_in_class(cn, &r.target_name) {
                             let line = source_line_at(source, span.start.row);
-                            return Some(format!("```perl\n{}\n```\n\n*class {}*", line.trim(), cn));
+                            let mut text = format!("```perl\n{}\n```\n\n*class {}*", line.trim(), cn);
+                            if let Some(ref rt) = self.find_method_return_type(cn, &r.target_name) {
+                                text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+                            }
+                            return Some(text);
                         }
                     }
                     // Fallback
@@ -1326,8 +1337,28 @@ impl FileAnalysis {
     }
 
     fn format_symbol_hover(&self, sym: &Symbol, source: &str) -> String {
+        self.format_symbol_hover_at(sym, source, sym.selection_span.end)
+    }
+
+    fn format_symbol_hover_at(&self, sym: &Symbol, source: &str, at: Point) -> String {
         let line = source_line_at(source, sym.span.start.row);
-        format!("```perl\n{}\n```", line.trim())
+        let mut text = format!("```perl\n{}\n```", line.trim());
+
+        // Append inferred type for variables/fields
+        if matches!(sym.kind, SymKind::Variable | SymKind::Field) {
+            if let Some(it) = self.inferred_type(&sym.name, at) {
+                text.push_str(&format!("\n\n*type: {}*", format_inferred_type(it)));
+            }
+        }
+
+        // Append return type for subs/methods
+        if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+            if let SymbolDetail::Sub { return_type: Some(ref rt), .. } = sym.detail {
+                text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+            }
+        }
+
+        text
     }
 
     // ---- Document outline ----
@@ -2299,6 +2330,53 @@ fn span_size(span: &Span) -> usize {
 
 fn source_line_at(source: &str, row: usize) -> &str {
     source.lines().nth(row).unwrap_or("")
+}
+
+/// Return the known return type for a Perl builtin function, if any.
+pub(crate) fn builtin_return_type(name: &str) -> Option<InferredType> {
+    match name {
+        // Numeric returns
+        "time" | "length" | "index" | "rindex" | "abs" | "int" | "sqrt"
+        | "hex" | "oct" | "ord" | "rand" | "pos" | "tell"
+        | "fileno" => Some(InferredType::Numeric),
+
+        // String returns
+        "join" | "uc" | "lc" | "ucfirst" | "lcfirst" | "substr" | "sprintf"
+        | "ref" | "chr" | "crypt" | "quotemeta" | "pack" | "readline"
+        | "readlink" => Some(InferredType::String),
+
+        _ => None,
+    }
+}
+
+/// Type constraint to push on the first argument of a Perl builtin.
+pub(crate) fn builtin_first_arg_type(name: &str) -> Option<InferredType> {
+    match name {
+        // Numeric arg builtins
+        "abs" | "int" | "sqrt" | "chr"
+        | "sin" | "cos" | "atan2" | "log" | "exp" => Some(InferredType::Numeric),
+
+        // String arg builtins
+        "uc" | "lc" | "ucfirst" | "lcfirst" | "length" | "chomp" | "chop"
+        | "substr" | "index" | "rindex" | "quotemeta"
+        | "hex" | "oct" | "ord" => Some(InferredType::String),
+
+        _ => None,
+    }
+}
+
+fn format_inferred_type(ty: &InferredType) -> String {
+    match ty {
+        InferredType::ClassName(name) => name.clone(),
+        InferredType::FirstParam { package } => package.clone(),
+        InferredType::BlessResult { package } => package.clone(),
+        InferredType::HashRef => "HashRef".to_string(),
+        InferredType::ArrayRef => "ArrayRef".to_string(),
+        InferredType::CodeRef => "CodeRef".to_string(),
+        InferredType::Regexp => "Regexp".to_string(),
+        InferredType::Numeric => "Numeric".to_string(),
+        InferredType::String => "String".to_string(),
+    }
 }
 
 #[cfg(test)]

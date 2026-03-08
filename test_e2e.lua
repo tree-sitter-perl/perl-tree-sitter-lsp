@@ -113,6 +113,17 @@ t.test("hover: sub add shows signature", function()
   end
 end)
 
+t.test("hover: $sum shows Numeric type from method return", function()
+  local N = "hover: $sum shows Numeric type from method return"
+  local line, col = b.find_pos(buf, "my $sum = $calc->add")
+  if not t.ok(N, line, "couldn't find '$sum' line") then return end
+  local text = lsp.hover_text(buf, line, col + 4)  -- on $sum
+  if not t.ok(N, text, "no hover result") then return end
+  if t.ok(N, type(text) == "string" and text:find("Numeric"), "hover should show Numeric type, got: " .. text) then
+    t.pass(N)
+  end
+end)
+
 t.test("references: $pi finds declaration and usage", function()
   local N = "references: $pi finds declaration and usage"
   local decl = b.find_line(buf, "my $pi = ")
