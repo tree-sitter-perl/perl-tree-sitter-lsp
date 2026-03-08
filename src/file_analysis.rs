@@ -107,6 +107,8 @@ pub enum SymbolDetail {
     Sub {
         params: Vec<ParamInfo>,
         is_method: bool,
+        /// Inferred return type from analyzing return statements.
+        return_type: Option<InferredType>,
     },
     Class {
         parent: Option<String>,
@@ -227,6 +229,41 @@ impl InferredType {
             _ => None,
         }
     }
+
+    /// True if this is any Object variant (ClassName, FirstParam, BlessResult).
+    pub fn is_object(&self) -> bool {
+        self.class_name().is_some()
+    }
+}
+
+/// Resolve a return type from a list of inferred types (one per return statement).
+///
+/// Rules (from spec):
+/// - All agree → that type
+/// - Object subsumes HashRef (overloaded objects are common)
+/// - Disagreement → None (Unknown)
+///
+/// The input should already have bare returns / undef filtered out.
+pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType> {
+    if return_types.is_empty() {
+        return None;
+    }
+    let first = &return_types[0];
+    if return_types.iter().all(|t| t == first) {
+        return Some(first.clone());
+    }
+    // Object subsumes HashRef: if some returns are Object(X) and others are HashRef,
+    // the Object wins (overloaded hash access is common in Perl).
+    let mut object = None;
+    for t in return_types {
+        if t.is_object() {
+            object = Some(t.clone());
+        } else if *t != InferredType::HashRef {
+            // Non-HashRef, non-Object disagreement → Unknown
+            return None;
+        }
+    }
+    object
 }
 
 // ---- Hash key owner (for scope graph) ----
@@ -471,6 +508,18 @@ impl FileAnalysis {
             }
         }
         best.map(|tc| &tc.inferred_type)
+    }
+
+    /// Get the return type of a named sub/method.
+    pub fn sub_return_type(&self, name: &str) -> Option<&InferredType> {
+        for sym in &self.symbols {
+            if sym.name == name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
+                    return return_type.as_ref();
+                }
+            }
+        }
+        None
     }
 
     /// Get the enclosing package name at a point.
@@ -1539,7 +1588,7 @@ impl FileAnalysis {
         let sub_sym = self.find_sub_for_call(name, is_method, invocant, point)?;
 
         let (params, sym_is_method) = match &sub_sym.detail {
-            SymbolDetail::Sub { params, is_method } => (params.clone(), *is_method),
+            SymbolDetail::Sub { params, is_method, .. } => (params.clone(), *is_method),
             _ => return None,
         };
 
@@ -1854,7 +1903,7 @@ fn generate_cross_sigil_candidates(
 
 // ---- Helpers ----
 
-fn contains_point(span: &Span, point: Point) -> bool {
+pub(crate) fn contains_point(span: &Span, point: Point) -> bool {
     (span.start.row < point.row || (span.start.row == point.row && span.start.column <= point.column))
         && (point.row < span.end.row || (point.row == span.end.row && point.column <= span.end.column))
 }
@@ -1952,6 +2001,102 @@ mod tests {
         ]);
         assert_eq!(fa.inferred_type("$x", Point::new(1, 0)), Some(&InferredType::HashRef));
         assert_eq!(fa.inferred_type("$x", Point::new(4, 0)), Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_resolve_sub_return_type() {
+        // Hand-craft a FileAnalysis with a sub that has a return type
+        let fa = FileAnalysis::new(
+            vec![Scope {
+                id: ScopeId(0),
+                parent: None,
+                kind: ScopeKind::File,
+                span: Span { start: Point::new(0, 0), end: Point::new(10, 0) },
+                package: None,
+            }],
+            vec![Symbol {
+                id: SymbolId(0),
+                name: "get_config".to_string(),
+                kind: SymKind::Sub,
+                span: Span { start: Point::new(0, 0), end: Point::new(2, 1) },
+                selection_span: Span { start: Point::new(0, 4), end: Point::new(0, 14) },
+                scope: ScopeId(0),
+                detail: SymbolDetail::Sub {
+                    params: vec![],
+                    is_method: false,
+                    return_type: Some(InferredType::HashRef),
+                },
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type("nonexistent"), None);
+    }
+
+    // ---- Return type resolution tests (decoupled, pure function) ----
+
+    #[test]
+    fn test_resolve_return_type_all_agree() {
+        assert_eq!(
+            resolve_return_type(&[InferredType::HashRef, InferredType::HashRef]),
+            Some(InferredType::HashRef),
+        );
+    }
+
+    #[test]
+    fn test_resolve_return_type_disagreement() {
+        assert_eq!(
+            resolve_return_type(&[InferredType::HashRef, InferredType::ArrayRef]),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_resolve_return_type_empty() {
+        assert_eq!(resolve_return_type(&[]), None);
+    }
+
+    #[test]
+    fn test_resolve_return_type_object_subsumes_hashref() {
+        // Object + HashRef → Object wins (overloaded objects)
+        assert_eq!(
+            resolve_return_type(&[
+                InferredType::ClassName("Foo".into()),
+                InferredType::HashRef,
+            ]),
+            Some(InferredType::ClassName("Foo".into())),
+        );
+        // Order shouldn't matter
+        assert_eq!(
+            resolve_return_type(&[
+                InferredType::HashRef,
+                InferredType::ClassName("Foo".into()),
+            ]),
+            Some(InferredType::ClassName("Foo".into())),
+        );
+    }
+
+    #[test]
+    fn test_resolve_return_type_object_does_not_subsume_arrayref() {
+        // Object + ArrayRef → disagreement
+        assert_eq!(
+            resolve_return_type(&[
+                InferredType::ClassName("Foo".into()),
+                InferredType::ArrayRef,
+            ]),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_resolve_return_type_single() {
+        assert_eq!(
+            resolve_return_type(&[InferredType::CodeRef]),
+            Some(InferredType::CodeRef),
+        );
     }
 
     #[test]

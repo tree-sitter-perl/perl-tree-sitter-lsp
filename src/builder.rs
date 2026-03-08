@@ -24,6 +24,9 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         type_constraints: Vec::new(),
         fold_ranges: Vec::new(),
         imports: Vec::new(),
+        return_infos: Vec::new(),
+        last_expr_type: std::collections::HashMap::new(),
+        call_bindings: Vec::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -42,6 +45,9 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     // Post-pass 2: resolve hash key owners from type constraints
     b.resolve_hash_key_owners();
 
+    // Post-pass 3: infer return types for subs/methods
+    b.resolve_return_types();
+
     FileAnalysis::new(
         b.scopes,
         b.symbols,
@@ -50,6 +56,23 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         b.fold_ranges,
         b.imports,
     )
+}
+
+/// A return value type collected during the walk, before post-pass resolution.
+struct ReturnInfo {
+    /// The scope (Sub/Method) this return belongs to.
+    scope: ScopeId,
+    /// The inferred type of the return value, if determinable from literals/constructors.
+    inferred_type: Option<InferredType>,
+}
+
+/// An assignment where the RHS is a function call: `my $cfg = get_config()`.
+/// Recorded during the walk, resolved in the return-type post-pass.
+struct CallBinding {
+    variable: String,
+    func_name: String,
+    scope: ScopeId,
+    span: Span,
 }
 
 struct Builder<'a> {
@@ -61,6 +84,12 @@ struct Builder<'a> {
     type_constraints: Vec<TypeConstraint>,
     fold_ranges: Vec<FoldRange>,
     imports: Vec<Import>,
+    /// Return values collected during the walk (explicit `return` + implicit last expr).
+    return_infos: Vec<ReturnInfo>,
+    /// For each Sub/Method scope, the type of the last expression (implicit return).
+    last_expr_type: std::collections::HashMap<ScopeId, Option<InferredType>>,
+    /// Assignments where RHS is a function call — resolved in return-type post-pass.
+    call_bindings: Vec<CallBinding>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -217,6 +246,31 @@ impl<'a> Builder<'a> {
                     self.push_var_type_constraint(operand, node, InferredType::Numeric);
                 }
                 self.visit_children(node);
+            }
+
+            // Return expressions → collect return types for post-pass
+            "return_expression" => {
+                if let Some(scope) = self.enclosing_sub_scope() {
+                    let ret_type = self.infer_return_value_type(node);
+                    self.return_infos.push(ReturnInfo {
+                        scope,
+                        inferred_type: ret_type,
+                    });
+                }
+                self.visit_children(node);
+            }
+
+            // Expression statements inside sub bodies → track last expression type
+            "expression_statement" => {
+                self.visit_children(node);
+                // Track the type of the last expression in the innermost sub/method scope
+                if let Some(scope) = self.enclosing_sub_scope() {
+                    let expr_type = node.named_child(0).and_then(|child| {
+                        Self::infer_literal_type(child)
+                            .or_else(|| self.extract_constructor_class(child).map(InferredType::ClassName))
+                    });
+                    self.last_expr_type.insert(scope, expr_type);
+                }
             }
 
             // Hash construction
@@ -410,7 +464,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method },
+            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None },
         );
 
         // Push sub scope
@@ -624,7 +678,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true },
+                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None },
                     );
                 }
                 if attrs.iter().any(|a| a == "writer") {
@@ -641,6 +695,7 @@ impl<'a> Builder<'a> {
                                 is_slurpy: false,
                             }],
                             is_method: true,
+                            return_type: None,
                         },
                     );
                 }
@@ -836,6 +891,16 @@ impl<'a> Builder<'a> {
                             inferred_type: it,
                         });
                     }
+                } else if let Some(func_name) = self.extract_call_name(right) {
+                    // RHS is a function call — record binding for return-type post-pass
+                    if let Some(vt) = self.get_var_text_from_lhs(left) {
+                        self.call_bindings.push(CallBinding {
+                            variable: vt,
+                            func_name,
+                            scope: self.current_scope(),
+                            span: node_to_span(node),
+                        });
+                    }
                 }
                 // Visit the RHS (may contain refs, calls, etc.)
                 self.visit_node(right);
@@ -859,6 +924,50 @@ impl<'a> Builder<'a> {
             "quoted_regexp" => Some(InferredType::Regexp),
             _ => None,
         }
+    }
+
+    /// Infer the type of a return expression's value.
+    ///
+    /// Handles:
+    /// - Bare `return` / `return undef` → None (skip signal)
+    /// - `return { ... }` / `return [ ... ]` / `return sub { }` / `return qr//` → literal type
+    /// - `return Foo->new()` → Object(Foo)
+    /// - `return $self` → lookup variable's type constraint at this point
+    /// - `return $var` → lookup variable's type constraint at this point
+    fn infer_return_value_type(&self, return_node: Node<'a>) -> Option<InferredType> {
+        let child = match return_node.named_child(0) {
+            Some(c) => c,
+            None => return None, // bare `return` — skip signal
+        };
+        // `return undef` — skip
+        if child.kind() == "undef" {
+            return None;
+        }
+        // Try literal types first
+        if let Some(t) = Self::infer_literal_type(child) {
+            return Some(t);
+        }
+        // Try constructor: return Foo->new()
+        if let Some(class_name) = self.extract_constructor_class(child) {
+            return Some(InferredType::ClassName(class_name));
+        }
+        // Try variable lookup: return $self, return $var
+        if child.kind() == "scalar" {
+            if let Ok(var_text) = child.utf8_text(self.source) {
+                // Look up the variable's type constraint at this point
+                let point = child.start_position();
+                for tc in self.type_constraints.iter().rev() {
+                    if tc.variable == var_text && tc.constraint_span.start <= point {
+                        // Check scope containment
+                        let scope = &self.scopes[tc.scope.0 as usize];
+                        if contains_point(&scope.span, point) {
+                            return Some(tc.inferred_type.clone());
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Push a type constraint on a variable node if it's a scalar.
@@ -1252,6 +1361,23 @@ impl<'a> Builder<'a> {
         text.to_string()
     }
 
+    /// Extract the function name from a call expression (function_call or ambiguous_function_call).
+    fn extract_call_name(&self, node: Node<'a>) -> Option<String> {
+        match node.kind() {
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                let func_node = node.child_by_field_name("function")?;
+                let text = func_node.utf8_text(self.source).ok()?;
+                // Only bare function names (not $ref->() or Foo::bar())
+                if !text.contains(':') && !text.starts_with('$') {
+                    Some(text.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn extract_constructor_class(&self, node: Node<'a>) -> Option<String> {
         if node.kind() == "method_call_expression" {
             let method = node.child_by_field_name("method")?;
@@ -1389,6 +1515,17 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Find the nearest enclosing Sub or Method scope from the current scope stack.
+    fn enclosing_sub_scope(&self) -> Option<ScopeId> {
+        for &scope_id in self.scope_stack.iter().rev() {
+            match &self.scopes[scope_id.0 as usize].kind {
+                ScopeKind::Sub { .. } | ScopeKind::Method { .. } => return Some(scope_id),
+                _ => {}
+            }
+        }
+        None
+    }
+
     // ---- Post-passes ----
 
     fn resolve_variable_refs(&mut self) {
@@ -1431,6 +1568,77 @@ impl<'a> Builder<'a> {
                 current = self.scopes[scope_id.0 as usize].parent;
             }
         }
+    }
+
+    fn resolve_return_types(&mut self) {
+        // Group return infos by scope
+        let mut returns_by_scope: std::collections::HashMap<ScopeId, Vec<Option<InferredType>>> =
+            std::collections::HashMap::new();
+        for ri in &self.return_infos {
+            returns_by_scope
+                .entry(ri.scope)
+                .or_default()
+                .push(ri.inferred_type.clone());
+        }
+
+        // For each Sub/Method scope, determine return type
+        let mut return_types: std::collections::HashMap<String, InferredType> =
+            std::collections::HashMap::new();
+
+        for scope in &self.scopes {
+            let sub_name = match &scope.kind {
+                ScopeKind::Sub { name } | ScopeKind::Method { name } => name.clone(),
+                _ => continue,
+            };
+
+            let explicit_returns = returns_by_scope.get(&scope.id);
+            let has_explicit = explicit_returns.map_or(false, |r| !r.is_empty());
+
+            let resolved = if has_explicit {
+                // Filter out bare returns (None) — they're exit points, not type signals
+                let typed_returns: Vec<InferredType> = explicit_returns.unwrap()
+                    .iter()
+                    .filter_map(|r| r.clone())
+                    .collect();
+                resolve_return_type(&typed_returns)
+            } else {
+                // No explicit returns — use last expression type
+                self.last_expr_type.get(&scope.id).and_then(|t| t.clone())
+            };
+
+            if let Some(rt) = resolved {
+                return_types.insert(sub_name, rt);
+            }
+        }
+
+        // Set return_type on matching Sub/Method symbols
+        for sym in &mut self.symbols {
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                if let SymbolDetail::Sub { ref mut return_type, .. } = sym.detail {
+                    if let Some(rt) = return_types.get(&sym.name) {
+                        *return_type = Some(rt.clone());
+                    }
+                }
+            }
+        }
+
+        // Propagate return types to call sites via structural bindings
+        // recorded during the walk (my $cfg = get_config()).
+        // TODO: inline expression propagation (get_config()->{key}) is a separate
+        // code path — needs return type resolution at the expression level without
+        // a variable assignment. Not handled here.
+        let mut new_constraints = Vec::new();
+        for binding in &self.call_bindings {
+            if let Some(rt) = return_types.get(&binding.func_name) {
+                new_constraints.push(TypeConstraint {
+                    variable: binding.variable.clone(),
+                    scope: binding.scope,
+                    constraint_span: binding.span,
+                    inferred_type: rt.clone(),
+                });
+            }
+        }
+        self.type_constraints.extend(new_constraints);
     }
 
     fn resolve_hash_key_owners(&mut self) {
@@ -1596,7 +1804,7 @@ mod tests {
             .filter(|s| s.kind == SymKind::Sub && s.name == "connect")
             .collect();
         assert_eq!(subs.len(), 1);
-        if let SymbolDetail::Sub { params, is_method } = &subs[0].detail {
+        if let SymbolDetail::Sub { params, is_method, .. } = &subs[0].detail {
             assert!(!is_method);
             assert_eq!(params.len(), 2);
             assert_eq!(params[0].name, "$self");
@@ -2107,6 +2315,92 @@ $p->;
         let fa = build_fa("my @arr;\nmy $n = @arr + 1;\nmy $z;");
         let ty = fa.inferred_type("@arr", Point::new(2, 0));
         assert_eq!(ty, None, "@arr should not get Numeric constraint");
+    }
+
+    // ---- Return type inference tests (Step 4) ----
+
+    #[test]
+    fn test_return_type_hashref() {
+        let fa = build_fa("sub get_config {\n    return { host => \"localhost\" };\n}");
+        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_return_type_arrayref() {
+        let fa = build_fa("sub get_tags {\n    return [1, 2, 3];\n}");
+        assert_eq!(fa.sub_return_type("get_tags"), Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_return_type_coderef() {
+        let fa = build_fa("sub get_handler {\n    return sub { 1 };\n}");
+        assert_eq!(fa.sub_return_type("get_handler"), Some(&InferredType::CodeRef));
+    }
+
+    #[test]
+    fn test_return_type_implicit_last_expr() {
+        // No explicit return — last expression is the implicit return
+        let fa = build_fa("sub get_data {\n    { key => \"val\" };\n}");
+        assert_eq!(fa.sub_return_type("get_data"), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_return_type_conflicting_returns_unknown() {
+        // Two returns with different types → None (unknown)
+        let fa = build_fa("sub ambiguous {\n    if (1) { return {} }\n    return [];\n}");
+        assert_eq!(fa.sub_return_type("ambiguous"), None);
+    }
+
+    #[test]
+    fn test_return_type_consistent_returns() {
+        // Multiple returns all hashref → HashRef
+        let fa = build_fa("sub consistent {\n    if (1) { return { a => 1 } }\n    return { b => 2 };\n}");
+        assert_eq!(fa.sub_return_type("consistent"), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_return_type_propagation_to_call_site() {
+        let fa = build_fa("sub get_config {\n    return { host => 1 };\n}\nmy $cfg = get_config();\nmy $z;");
+        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        let ty = fa.inferred_type("$cfg", Point::new(4, 0));
+        assert_eq!(ty, Some(&InferredType::HashRef), "call site should get return type");
+    }
+
+    #[test]
+    fn test_return_type_constructor() {
+        let fa = build_fa("package User;\nsub new { bless {}, shift }\npackage main;\nsub get_user {\n    return User->new();\n}");
+        assert_eq!(fa.sub_return_type("get_user"), Some(&InferredType::ClassName("User".into())));
+    }
+
+    #[test]
+    fn test_return_type_self_variable() {
+        // return $self where $self has a type constraint
+        let fa = build_fa("package Foo;\nsub new { bless {}, shift }\nsub clone {\n    my ($self) = @_;\n    return $self;\n}");
+        assert_eq!(
+            fa.sub_return_type("clone"),
+            Some(&InferredType::FirstParam { package: "Foo".into() }),
+        );
+    }
+
+    #[test]
+    fn test_return_type_bare_return_filtered() {
+        // Bare return + typed return → bare is filtered, typed return wins
+        let fa = build_fa("sub get_config {\n    return unless 1;\n    return { host => 1 };\n}");
+        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_return_type_all_bare_returns() {
+        // All bare returns → no return type
+        let fa = build_fa("sub noop {\n    return;\n}");
+        assert_eq!(fa.sub_return_type("noop"), None);
+    }
+
+    #[test]
+    fn test_return_type_undef_filtered() {
+        // return undef + typed return → undef is filtered, typed return wins
+        let fa = build_fa("sub maybe {\n    return undef unless 1;\n    return { a => 1 };\n}");
+        assert_eq!(fa.sub_return_type("maybe"), Some(&InferredType::HashRef));
     }
 
     #[test]
