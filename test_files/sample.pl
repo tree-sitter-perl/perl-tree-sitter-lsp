@@ -44,12 +44,25 @@ sub circumference {
     return $result;
 }
 
+sub get_config {
+    return { host => "localhost", port => 5432, name => "mydb" };
+}
+
+sub get_self {
+    my ($self) = @_;
+    return $self;
+}
+
 package main;
 
 my $calc = Calculator->new(verbose => 1);
 my $sum = $calc->add(2, 3);
 my $diff = $calc->subtract(10, 4);
 my @history = $calc->get_history();
+my $db_config = get_config();
+$db_config->{host};
+$calc->get_self()->add(1, 2);
+$calc->get_self->get_config->{host};
 
 for my $entry (@history) {
     print "$entry\n";

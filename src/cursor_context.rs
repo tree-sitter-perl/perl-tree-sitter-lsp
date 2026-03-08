@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use tree_sitter::{Node, Point, Tree};
 
-use crate::file_analysis::Span;
+use crate::file_analysis::{FileAnalysis, InferredType, Span};
 
 // ---- Types ----
 
@@ -17,10 +17,16 @@ use crate::file_analysis::Span;
 pub enum CursorContext {
     /// After `$`, `@`, or `%` — variable completion.
     Variable { sigil: char },
-    /// After `->` — method completion.
+    /// After `->` — method completion (simple variable/bareword invocant).
     Method { invocant: String },
+    /// After `->` — method completion on a complex expression (call chain).
+    MethodOnExpression { invocant_type: InferredType },
     /// After `$var->{` or `$hash{` — hash key completion.
     HashKey { var_text: String },
+    /// After `->{` on a complex expression (call chain).
+    /// `source_sub` is the function/method name whose return value we're accessing,
+    /// needed to look up hash key defs from `HashKeyOwner::Sub`.
+    HashKeyOnExpression { owner_type: InferredType, source_sub: Option<String> },
     /// No specific trigger — general completion.
     General,
 }
@@ -59,25 +65,28 @@ pub fn detect_cursor_context(source: &str, point: Point) -> CursorContext {
     };
     let trimmed = before.trim_end();
 
-    // Check for hash key completion: $hash{ or $self->{
-    if trimmed.ends_with('{') {
-        let prefix = trimmed[..trimmed.len() - 1].trim_end();
-        // Arrow hash access: $var->{
-        if prefix.ends_with("->") {
-            let var_prefix = prefix[..prefix.len() - 2].trim_end();
-            let var_text = extract_invocant_from_prefix(var_prefix);
-            if !var_text.is_empty() {
+    // Check for hash key completion: $hash{ or $self->{ (including mid-word: $var->{ho)
+    {
+        let check = strip_trailing_identifier(trimmed);
+        if check.ends_with('{') {
+            let prefix = check[..check.len() - 1].trim_end();
+            // Arrow hash access: $var->{
+            if prefix.ends_with("->") {
+                let var_prefix = prefix[..prefix.len() - 2].trim_end();
+                let var_text = extract_invocant_from_prefix(var_prefix);
+                if !var_text.is_empty() {
+                    return CursorContext::HashKey {
+                        var_text: var_text.to_string(),
+                    };
+                }
+            }
+            // Direct hash access: $hash{
+            let var_text = extract_invocant_from_prefix(prefix);
+            if !var_text.is_empty() && var_text.starts_with('$') {
                 return CursorContext::HashKey {
                     var_text: var_text.to_string(),
                 };
             }
-        }
-        // Direct hash access: $hash{
-        let var_text = extract_invocant_from_prefix(prefix);
-        if !var_text.is_empty() && var_text.starts_with('$') {
-            return CursorContext::HashKey {
-                var_text: var_text.to_string(),
-            };
         }
     }
 
@@ -138,6 +147,158 @@ fn extract_invocant_from_prefix(prefix: &str) -> &str {
         return &prefix[i + 1..end];
     }
     &prefix[..end]
+}
+
+// ---- Tree-based cursor context detection ----
+
+/// Detect cursor context using the tree + analysis for expression type resolution.
+///
+/// Handles cases the text-based detector can't: call-expression invocants
+/// like `get_config()->` or `$obj->get_bar()->`.
+///
+/// Returns `None` if no expression-based context is detected (caller should
+/// fall back to text-based detection).
+pub fn detect_cursor_context_tree(
+    tree: &Tree,
+    source: &[u8],
+    point: Point,
+    analysis: &FileAnalysis,
+) -> Option<CursorContext> {
+    // Find the node at/just before the cursor
+    let check_point = if point.column > 0 {
+        Point::new(point.row, point.column - 1)
+    } else {
+        point
+    };
+    let node = tree.root_node().descendant_for_point_range(check_point, check_point)?;
+
+    // Walk up looking for an incomplete method_call_expression or hash_element_expression
+    // where the invocant is a complex expression (not a simple $var or bareword)
+    let mut current = node;
+    for _ in 0..20 {
+        match current.kind() {
+            "method_call_expression" => {
+                // Check if cursor is after -> (in the method position)
+                if let Some(invocant_node) = current.child_by_field_name("invocant") {
+                    if invocant_node.end_position() < point {
+                        // Cursor is past the invocant — we're completing a method
+                        if is_complex_expression(invocant_node) {
+                            if let Some(ty) = analysis.resolve_expression_type(invocant_node, source) {
+                                return Some(CursorContext::MethodOnExpression { invocant_type: ty });
+                            }
+                        }
+                    }
+                }
+            }
+            "hash_element_expression" => {
+                // Check if cursor is inside the {key} part
+                if let Some(base) = current.named_child(0) {
+                    if base.end_position() < point {
+                        if is_complex_expression(base) {
+                            if let Some(ty) = analysis.resolve_expression_type(base, source) {
+                                let source_sub = extract_call_name_from_node(base, source);
+                                return Some(CursorContext::HashKeyOnExpression { owner_type: ty, source_sub });
+                            }
+                        }
+                    }
+                }
+            }
+            "ERROR" => {
+                // Incomplete expression: look for `expr->{` or `expr->` patterns
+                // in error recovery
+                if let Some(ctx) = detect_from_error_node(current, source, point, analysis) {
+                    return Some(ctx);
+                }
+            }
+            _ => {}
+        }
+        current = current.parent()?;
+    }
+    None
+}
+
+/// Extract the function/method name from an expression node.
+/// For `method_call_expression`: returns the method name.
+/// For `function_call_expression`/`ambiguous_function_call_expression`: returns the function name.
+fn extract_call_name_from_node(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "method_call_expression" => {
+            node.child_by_field_name("method")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.to_string())
+        }
+        "function_call_expression" | "ambiguous_function_call_expression" => {
+            node.child_by_field_name("function")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Check if a node is a "complex" expression (not a simple $var or bareword).
+fn is_complex_expression(node: Node) -> bool {
+    !matches!(node.kind(), "scalar" | "array" | "hash" | "bareword" | "package")
+}
+
+/// Try to detect expression context from an ERROR node.
+///
+/// When typing `get_config()->` or `$obj->get_bar()->`, tree-sitter often
+/// wraps the incomplete expression in an ERROR node. Look for patterns like:
+/// - `[call_expr] -> [method?]` → method completion on call expression
+/// - `[call_expr] -> {` → hash key completion on call expression
+fn detect_from_error_node(
+    error: Node,
+    source: &[u8],
+    point: Point,
+    analysis: &FileAnalysis,
+) -> Option<CursorContext> {
+    let mut last_expr: Option<Node> = None;
+    let mut saw_arrow = false;
+    let mut saw_brace = false;
+
+    for i in 0..error.child_count() {
+        let child = error.child(i)?;
+        if child.start_position() > point {
+            break;
+        }
+
+        match child.kind() {
+            "method_call_expression" | "function_call_expression"
+            | "ambiguous_function_call_expression" | "hash_element_expression" => {
+                last_expr = Some(child);
+                saw_arrow = false;
+                saw_brace = false;
+            }
+            "->" => {
+                saw_arrow = true;
+                saw_brace = false;
+            }
+            "{" if saw_arrow => {
+                saw_brace = true;
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_arrow {
+        return None;
+    }
+
+    if let Some(expr) = last_expr {
+        if is_complex_expression(expr) {
+            if let Some(ty) = analysis.resolve_expression_type(expr, source) {
+                if saw_brace {
+                    let source_sub = extract_call_name_from_node(expr, source);
+                    return Some(CursorContext::HashKeyOnExpression { owner_type: ty, source_sub });
+                } else {
+                    return Some(CursorContext::MethodOnExpression { invocant_type: ty });
+                }
+            }
+        }
+    }
+
+    None
 }
 
 // ---- Call context detection (tree-based) ----
@@ -566,6 +727,30 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_hashkey_arrow_midword() {
+        let source = "$self->{ho";
+        let ctx = detect_cursor_context(source, Point::new(0, 10));
+        assert_eq!(
+            ctx,
+            CursorContext::HashKey {
+                var_text: "$self".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_hashkey_direct_midword() {
+        let source = "$hash{ver";
+        let ctx = detect_cursor_context(source, Point::new(0, 9));
+        assert_eq!(
+            ctx,
+            CursorContext::HashKey {
+                var_text: "$hash".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn test_detect_hashkey_direct() {
         let source = "$hash{";
         let ctx = detect_cursor_context(source, Point::new(0, 6));
@@ -645,5 +830,75 @@ mod tests {
         assert!(!ranges.is_empty());
         // Innermost should be the variable node
         assert!(ranges.len() >= 2);
+    }
+
+    fn build_fa(source: &str) -> (Tree, crate::file_analysis::FileAnalysis) {
+        let tree = parse(source);
+        let fa = crate::builder::build(&tree, source.as_bytes());
+        (tree, fa)
+    }
+
+    #[test]
+    fn test_tree_context_method_on_function_call() {
+        // get_config()-> should detect MethodOnExpression with HashRef
+        let source = "sub get_config {\n    return { host => 1 };\n}\nget_config()->";
+        let (tree, fa) = build_fa(source);
+        // Cursor at end of line 3 (after "->")
+        let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), Point::new(3, 14), &fa);
+        assert!(
+            matches!(ctx, Some(CursorContext::MethodOnExpression { ref invocant_type }) if *invocant_type == InferredType::HashRef),
+            "expected MethodOnExpression(HashRef), got {:?}", ctx,
+        );
+    }
+
+    #[test]
+    fn test_tree_context_method_on_chained_call() {
+        // $f->get_bar()-> where get_bar returns Object(Bar)
+        let source = "package Foo;\nsub new { bless {}, shift }\nsub get_bar {\n    return Bar->new();\n}\npackage Bar;\nsub new { bless {}, shift }\npackage main;\nmy $f = Foo->new();\n$f->get_bar()->";
+        let (tree, fa) = build_fa(source);
+        // Line 9: $f->get_bar()->   cursor at end
+        let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), Point::new(9, 15), &fa);
+        assert!(
+            matches!(ctx, Some(CursorContext::MethodOnExpression { ref invocant_type }) if invocant_type.class_name() == Some("Bar")),
+            "expected MethodOnExpression(Object(Bar)), got {:?}", ctx,
+        );
+    }
+
+    #[test]
+    fn test_tree_context_hashkey_on_chained_call() {
+        // $calc->get_self->get_config->{ should detect HashKeyOnExpression
+        let source = "\
+package Calculator;
+sub new { bless {}, shift }
+sub get_self {
+    my ($self) = @_;
+    return $self;
+}
+sub get_config {
+    return { host => 'localhost', port => 5432 };
+}
+package main;
+my $calc = Calculator->new();
+$calc->get_self->get_config->{";
+        let (tree, fa) = build_fa(source);
+        // Last line: "$calc->get_self->get_config->{"
+        // Count lines: 0=package, 1=sub new, 2=sub get_self, 3=my, 4=return, 5=}, 6=sub get_config, 7=return, 8=}, 9=package, 10=my $calc, 11=$calc->...
+        let cursor = Point::new(11, 30); // after "{"
+        let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), cursor, &fa);
+        assert!(
+            matches!(ctx, Some(CursorContext::HashKeyOnExpression { ref owner_type, ref source_sub })
+                if *owner_type == InferredType::HashRef && *source_sub == Some("get_config".to_string())),
+            "expected HashKeyOnExpression(HashRef, get_config), got {:?}", ctx,
+        );
+    }
+
+    #[test]
+    fn test_tree_context_simple_var_returns_none() {
+        // $obj-> should return None (handled by text-based detector)
+        let source = "my $obj = Foo->new();\n$obj->";
+        let (tree, fa) = build_fa(source);
+        let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), Point::new(1, 6), &fa);
+        // Simple $var invocant → None (text-based handles it)
+        assert_eq!(ctx, None);
     }
 }

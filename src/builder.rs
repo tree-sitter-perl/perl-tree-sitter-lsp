@@ -55,6 +55,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         b.type_constraints,
         b.fold_ranges,
         b.imports,
+        b.call_bindings,
     )
 }
 
@@ -64,15 +65,6 @@ struct ReturnInfo {
     scope: ScopeId,
     /// The inferred type of the return value, if determinable from literals/constructors.
     inferred_type: Option<InferredType>,
-}
-
-/// An assignment where the RHS is a function call: `my $cfg = get_config()`.
-/// Recorded during the walk, resolved in the return-type post-pass.
-struct CallBinding {
-    variable: String,
-    func_name: String,
-    scope: ScopeId,
-    span: Span,
 }
 
 struct Builder<'a> {
@@ -654,12 +646,18 @@ impl<'a> Builder<'a> {
         for (name, var_span) in &vars {
             let sigil = name.chars().next().unwrap_or('$');
             let sym_kind = if decl_kind == DeclKind::Field { SymKind::Field } else { SymKind::Variable };
+            let detail = if decl_kind == DeclKind::Field {
+                let attributes = self.collect_attributes(node);
+                SymbolDetail::Field { sigil, attributes }
+            } else {
+                SymbolDetail::Variable { sigil, decl_kind }
+            };
             self.add_symbol(
                 name.clone(),
                 sym_kind,
                 node_to_span(node),
                 *var_span,
-                SymbolDetail::Variable { sigil, decl_kind },
+                detail,
             );
             self.add_ref(
                 RefKind::Variable,
@@ -671,8 +669,22 @@ impl<'a> Builder<'a> {
             // Synthesize accessor methods for `field $x :reader` / `:writer`
             if decl_kind == DeclKind::Field {
                 let bare_name = &name[1..]; // strip sigil
-                let attrs = self.collect_attributes(node);
-                if attrs.iter().any(|a| a == "reader") {
+                // Re-read attrs from the symbol we just stored (avoid re-collecting)
+                let has_reader;
+                let has_writer;
+                if let Some(last_sym) = self.symbols.last() {
+                    if let SymbolDetail::Field { ref attributes, .. } = last_sym.detail {
+                        has_reader = attributes.iter().any(|a| a == "reader");
+                        has_writer = attributes.iter().any(|a| a == "writer");
+                    } else {
+                        has_reader = false;
+                        has_writer = false;
+                    }
+                } else {
+                    has_reader = false;
+                    has_writer = false;
+                }
+                if has_reader {
                     self.add_symbol(
                         bare_name.to_string(),
                         SymKind::Method,
@@ -681,7 +693,7 @@ impl<'a> Builder<'a> {
                         SymbolDetail::Sub { params: vec![], is_method: true, return_type: None },
                     );
                 }
-                if attrs.iter().any(|a| a == "writer") {
+                if has_writer {
                     let writer_name = format!("set_{}", bare_name);
                     self.add_symbol(
                         writer_name,
@@ -1193,13 +1205,21 @@ impl<'a> Builder<'a> {
         let method_name = node.child_by_field_name("method")
             .and_then(|n| n.utf8_text(self.source).ok())
             .map(|s| s.to_string());
-        let invocant = node.child_by_field_name("invocant")
+        let invocant_node = node.child_by_field_name("invocant");
+        let invocant = invocant_node
             .and_then(|n| n.utf8_text(self.source).ok())
             .map(|s| s.to_string());
+        // Store invocant span for complex expressions (call chains etc.)
+        let invocant_span = invocant_node
+            .filter(|n| !matches!(n.kind(), "scalar" | "array" | "hash" | "bareword" | "package"))
+            .map(|n| node_to_span(n));
 
         if let Some(name) = method_name {
             self.add_ref(
-                RefKind::MethodCall { invocant: invocant.unwrap_or_default() },
+                RefKind::MethodCall {
+                    invocant: invocant.unwrap_or_default(),
+                    invocant_span,
+                },
                 node_to_span(node),
                 name,
                 AccessKind::Read,
@@ -1454,17 +1474,25 @@ impl<'a> Builder<'a> {
     }
 
     fn detect_anon_hash_owner(&self, anon_hash: Node<'a>) -> Option<HashKeyOwner> {
-        // Check if this is inside a bless call
         let mut ancestor = anon_hash.parent()?;
         for _ in 0..5 {
+            // Check if this is inside a bless call
             if self.is_bless_call(ancestor) {
                 if let Some(ref pkg) = self.current_package {
                     return Some(HashKeyOwner::Class(pkg.clone()));
                 }
-                // Try to find package from scope
                 let scope = self.current_scope();
                 if let Some(ref pkg) = self.scopes[scope.0 as usize].package {
                     return Some(HashKeyOwner::Class(pkg.clone()));
+                }
+            }
+            // Check if this is inside a return expression of a sub
+            if ancestor.kind() == "return_expression" {
+                if let Some(sub_scope) = self.enclosing_sub_scope() {
+                    let scope = &self.scopes[sub_scope.0 as usize];
+                    if let ScopeKind::Sub { ref name } | ScopeKind::Method { ref name } = scope.kind {
+                        return Some(HashKeyOwner::Sub(name.clone()));
+                    }
                 }
             }
             ancestor = ancestor.parent()?;
@@ -1639,6 +1667,22 @@ impl<'a> Builder<'a> {
             }
         }
         self.type_constraints.extend(new_constraints);
+
+        // Fixup: update HashKeyAccess owners for variables bound to sub calls
+        // that return HashRef. This runs after call binding propagation so the
+        // type constraints are available.
+        let binding_map: std::collections::HashMap<&str, &str> = self.call_bindings.iter()
+            .filter(|b| return_types.get(&b.func_name).map_or(false, |t| *t == InferredType::HashRef))
+            .map(|b| (b.variable.as_str(), b.func_name.as_str()))
+            .collect();
+
+        for r in &mut self.refs {
+            if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
+                if let Some(func_name) = binding_map.get(var_text.as_str()) {
+                    *owner = Some(HashKeyOwner::Sub(func_name.to_string()));
+                }
+            }
+        }
     }
 
     fn resolve_hash_key_owners(&mut self) {
@@ -2011,7 +2055,7 @@ $p->;
         let source = "package main;\n1;\nuse v5.38;\nclass Point {\n    field $x :param :reader;\n    method magnitude () { }\n}\nmy $p = Point->new(x => 3);\n$p->magnitude();\n";
         let fa = build_fa(source);
         // cursor on `magnitude` in `$p->magnitude()` — line 8, col 5
-        let def = fa.find_definition(Point::new(8, 5));
+        let def = fa.find_definition(Point::new(8, 5), None, None);
         assert!(def.is_some(), "should find definition for magnitude");
         let span = def.unwrap();
         assert_eq!(span.start.row, 5, "should point to method declaration line, got row {}", span.start.row);
@@ -2021,7 +2065,7 @@ $p->;
     fn test_field_reader_goto_def() {
         // go-to-def on $p->x should find the reader method, which points to the field
         let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param :reader;\n    method mag() { }\n}\nmy $p = Point->new(x => 1);\n$p->x;");
-        let def = fa.find_definition(Point::new(6, 5)); // cursor on `x` in `$p->x`
+        let def = fa.find_definition(Point::new(6, 5), None, None); // cursor on `x` in `$p->x`
         assert!(def.is_some(), "should find definition for reader method");
         // The reader method's selection_span points to the field declaration
         let span = def.unwrap();
@@ -2068,7 +2112,7 @@ $p->;
             .filter(|r| r.target_name == "method" && matches!(r.kind, RefKind::MethodCall { .. }))
             .collect();
         assert_eq!(method_refs.len(), 1);
-        if let RefKind::MethodCall { ref invocant } = method_refs[0].kind {
+        if let RefKind::MethodCall { ref invocant, .. } = method_refs[0].kind {
             assert_eq!(invocant, "$obj");
         }
     }
@@ -2403,6 +2447,144 @@ $p->;
         assert_eq!(fa.sub_return_type("maybe"), Some(&InferredType::HashRef));
     }
 
+    // ---- resolve_expression_type tests ----
+
+    /// Find the first node of given kind at/after a point (searches all children).
+    fn find_node_at<'a>(node: tree_sitter::Node<'a>, point: Point, kind: &str) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == kind && node.start_position() >= point {
+            return Some(node);
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if let Some(found) = find_node_at(child, point, kind) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_resolve_expr_type_function_call() {
+        let src = "sub get_config {\n    return { host => 1 };\n}\nget_config();\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // Find the function_call_expression on line 3
+        let call_node = find_node_at(tree.root_node(), Point::new(3, 0), "function_call_expression")
+            .expect("should find function_call_expression");
+        let ty = fa.resolve_expression_type(call_node, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_method_call_return() {
+        let src = "package Foo;\nsub new { bless {}, shift }\nsub get_bar {\n    return Bar->new();\n}\npackage Bar;\nsub new { bless {}, shift }\nsub do_thing { }\npackage main;\nmy $f = Foo->new();\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // $f->get_bar() should resolve to Object(Bar)
+        // First verify get_bar has the right return type
+        assert_eq!(fa.sub_return_type("get_bar"), Some(&InferredType::ClassName("Bar".into())));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_scalar_variable() {
+        let src = "my $x = {};\n$x;\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // Find the scalar $x on line 1
+        let scalar_node = find_node_at(tree.root_node(), Point::new(1, 0), "scalar")
+            .expect("should find scalar");
+        let ty = fa.resolve_expression_type(scalar_node, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_chained_method() {
+        let src = "package Foo;\nsub new { bless {}, shift }\nsub get_bar {\n    return Bar->new();\n}\npackage Bar;\nsub new { bless {}, shift }\nsub get_name {\n    return { name => 'test' };\n}\npackage main;\nmy $f = Foo->new();\n$f->get_bar()->get_name();\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // Line 12: $f->get_bar()->get_name();
+        // The outermost method_call_expression starts at column 0
+        // Use descendant_for_point_range to find the node at the start of that line
+        let node = tree.root_node()
+            .descendant_for_point_range(Point::new(12, 0), Point::new(12, 25))
+            .expect("should find node");
+        // Walk up to find the outermost method_call_expression
+        let mut n = node;
+        while n.kind() != "method_call_expression" || n.parent().map_or(false, |p| p.kind() == "method_call_expression") {
+            n = match n.parent() {
+                Some(p) => p,
+                None => panic!("should find outermost method_call_expression"),
+            };
+        }
+        assert_eq!(n.kind(), "method_call_expression");
+        let ty = fa.resolve_expression_type(n, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_constructor() {
+        let src = "package Foo;\nsub new { bless {}, shift }\npackage main;\nFoo->new();\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        let call = find_node_at(tree.root_node(), Point::new(3, 0), "method_call_expression")
+            .expect("should find method_call_expression");
+        let ty = fa.resolve_expression_type(call, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::ClassName("Foo".into())));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_triple_chain() {
+        // $calc->get_self->get_config->{host} — no parens on method calls
+        let src = "\
+package Calculator;
+sub new { bless {}, shift }
+sub get_self {
+    my ($self) = @_;
+    return $self;
+}
+sub get_config {
+    return { host => 'localhost', port => 5432 };
+}
+package main;
+my $calc = Calculator->new();
+$calc->get_self->get_config->{host};
+";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+
+        // Verify get_self returns an object type for Calculator
+        let get_self_rt = fa.sub_return_type("get_self");
+        assert_eq!(get_self_rt.and_then(|t| t.class_name()), Some("Calculator"),
+            "get_self should return Calculator");
+
+        // Verify get_config returns HashRef
+        let get_config_rt = fa.sub_return_type("get_config");
+        assert_eq!(get_config_rt, Some(&InferredType::HashRef),
+            "get_config should return HashRef");
+
+        // The outermost expression is hash_element_expression wrapping the chain
+        // Find the method_call_expression for get_config (inner chain)
+        // Line 11: $calc->get_self->get_config->{host}
+        let node = tree.root_node()
+            .descendant_for_point_range(Point::new(11, 0), Point::new(11, 0))
+            .expect("should find node");
+        let mut n = node;
+        // Walk up to find hash_element_expression
+        loop {
+            if n.kind() == "hash_element_expression" {
+                break;
+            }
+            n = n.parent().expect("should find hash_element_expression");
+        }
+        // The base of hash_element_expression is the method chain
+        let base = n.named_child(0).expect("should have base");
+        assert_eq!(base.kind(), "method_call_expression");
+        let ty = fa.resolve_expression_type(base, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::HashRef),
+            "the chain $calc->get_self->get_config should resolve to HashRef");
+    }
+
     #[test]
     fn test_package_at() {
         let fa = build_fa("package Foo;\nsub bar { }");
@@ -2453,7 +2635,7 @@ $p->;
     fn test_find_def_variable() {
         let fa = build_fa("my $x = 1;\nprint $x;");
         // Cursor on the usage of $x at line 1
-        let def = fa.find_definition(Point::new(1, 7));
+        let def = fa.find_definition(Point::new(1, 7), None, None);
         assert!(def.is_some(), "should find definition for $x");
         let span = def.unwrap();
         assert_eq!(span.start.row, 0, "definition should be on line 0");
@@ -2463,7 +2645,7 @@ $p->;
     fn test_find_def_sub() {
         let fa = build_fa("sub greet { }\ngreet();");
         // Cursor on the function call at line 1
-        let def = fa.find_definition(Point::new(1, 1));
+        let def = fa.find_definition(Point::new(1, 1), None, None);
         assert!(def.is_some(), "should find definition for greet");
         let span = def.unwrap();
         assert_eq!(span.start.row, 0, "definition should be on line 0");
@@ -2474,7 +2656,7 @@ $p->;
         let src = "package Foo;\nsub new { bless {}, shift }\nsub hello { }\npackage main;\nmy $f = Foo->new();\n$f->hello();";
         let fa = build_fa(src);
         // Cursor on hello() call at line 5
-        let def = fa.find_definition(Point::new(5, 5));
+        let def = fa.find_definition(Point::new(5, 5), None, None);
         assert!(def.is_some(), "should find definition for hello method");
         let span = def.unwrap();
         assert_eq!(span.start.row, 2, "hello definition should be on line 2");
@@ -2485,7 +2667,7 @@ $p->;
         let src = "my $x = 'outer';\nsub foo {\n    my $x = 'inner';\n    print $x;\n}";
         let fa = build_fa(src);
         // Cursor on $x inside sub (line 3) should resolve to inner $x (line 2)
-        let def = fa.find_definition(Point::new(3, 11));
+        let def = fa.find_definition(Point::new(3, 11), None, None);
         assert!(def.is_some());
         let span = def.unwrap();
         assert_eq!(span.start.row, 2, "should resolve to inner $x on line 2");
@@ -2496,7 +2678,7 @@ $p->;
         let src = "my $x = 1;\nprint $x;\n$x = 2;";
         let fa = build_fa(src);
         // Cursor on the declaration of $x
-        let refs = fa.find_references(Point::new(0, 4));
+        let refs = fa.find_references(Point::new(0, 4), None, None);
         assert!(refs.len() >= 2, "should find at least declaration + usage, got {}", refs.len());
     }
 
@@ -2505,15 +2687,87 @@ $p->;
         let src = "sub greet { }\ngreet();\ngreet();";
         let fa = build_fa(src);
         // Cursor on the sub name
-        let refs = fa.find_references(Point::new(0, 5));
+        let refs = fa.find_references(Point::new(0, 5), None, None);
         assert!(refs.len() >= 2, "should find definition + calls, got {}", refs.len());
+    }
+
+    #[test]
+    fn test_hash_key_def_in_return_gets_sub_owner() {
+        let src = "sub get_config {\n    return { host => 'localhost', port => 5432 };\n}\nmy $cfg = get_config();\n$cfg->{host};\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+
+        // Verify hash key defs exist with Sub owner
+        let host_defs: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "host" && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
+            .collect();
+        assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
+        if let SymbolDetail::HashKeyDef { ref owner, .. } = host_defs[0].detail {
+            assert_eq!(*owner, HashKeyOwner::Sub("get_config".to_string()),
+                "host def should have Sub(get_config) owner, got {:?}", owner);
+        }
+
+        // Verify HashKeyAccess ref for $cfg->{host} has Sub owner
+        let host_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        assert!(!host_refs.is_empty(), "should find HashKeyAccess for 'host'");
+        if let RefKind::HashKeyAccess { ref owner, .. } = host_refs[0].kind {
+            assert_eq!(*owner, Some(HashKeyOwner::Sub("get_config".to_string())),
+                "host ref should have Sub(get_config) owner, got {:?}", owner);
+        }
+
+        // Verify go-to-references from the def finds the usage
+        let host_def_point = host_defs[0].selection_span.start;
+        let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()));
+        // symbol_at returns include_decl=false, so only usages are returned
+        assert!(refs.len() >= 1, "should find at least 1 usage, got {} refs", refs.len());
+
+        // Verify go-to-references from the usage finds back to the def
+        let host_ref_point = host_refs[0].span.start;
+        let refs_from_usage = fa.find_references(host_ref_point, Some(&tree), Some(src.as_bytes()));
+        // ref resolves to def → include_decl=true, so def + usage
+        assert!(refs_from_usage.len() >= 2, "should find def + usage, got {} refs", refs_from_usage.len());
+    }
+
+    #[test]
+    fn test_hash_key_refs_chained_tree_fallback() {
+        // Chained method calls produce refs with owner: None that need tree-based resolution
+        let src = r#"package Calculator;
+sub new { bless {}, shift }
+sub get_self { my ($self) = @_; return $self; }
+sub get_config { return { host => "localhost", port => 5432 }; }
+package main;
+my $calc = Calculator->new();
+$calc->get_self->get_config->{host};
+"#;
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+
+        // Find the hash key def for "host" in get_config's return
+        let host_defs: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "host" && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
+            .collect();
+        assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
+
+        // The chained ref should have owner: None (can't resolve at build time)
+        let chained_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { owner: None, .. }))
+            .collect();
+        assert!(!chained_refs.is_empty(), "chained hash access should have owner: None, refs: {:?}",
+            fa.refs.iter().filter(|r| r.target_name == "host").collect::<Vec<_>>());
+
+        // find_references from the def should find the chained usage via tree fallback
+        let host_def_point = host_defs[0].selection_span.start;
+        let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()));
+        assert!(refs.len() >= 1, "should find chained usage via tree fallback, got {} refs", refs.len());
     }
 
     #[test]
     fn test_highlights_read_write() {
         let src = "my $x = 1;\nprint $x;\n$x = 2;";
         let fa = build_fa(src);
-        let highlights = fa.find_highlights(Point::new(0, 4));
+        let highlights = fa.find_highlights(Point::new(0, 4), None, None);
         assert!(!highlights.is_empty(), "should have highlights");
         // Check that we have both read and write accesses
         let has_write = highlights.iter().any(|(_, a)| matches!(a, AccessKind::Write));
@@ -2528,7 +2782,7 @@ $p->;
     fn test_hover_variable() {
         let src = "my $greeting = 'hello';\nprint $greeting;";
         let fa = build_fa(src);
-        let hover = fa.hover_info(Point::new(1, 8), src);
+        let hover = fa.hover_info(Point::new(1, 8), src, None);
         assert!(hover.is_some(), "should have hover info");
         let text = hover.unwrap();
         assert!(text.contains("$greeting"), "hover should contain variable name, got: {}", text);
@@ -2538,7 +2792,7 @@ $p->;
     fn test_hover_sub() {
         let src = "sub greet { }\ngreet();";
         let fa = build_fa(src);
-        let hover = fa.hover_info(Point::new(1, 1), src);
+        let hover = fa.hover_info(Point::new(1, 1), src, None);
         assert!(hover.is_some(), "should have hover info for function call");
         let text = hover.unwrap();
         assert!(text.contains("greet"), "hover should contain sub name, got: {}", text);
@@ -2562,7 +2816,7 @@ $p->;
         let src = "package Point;\nsub new { bless {}, shift }\npackage main;\nPoint->new();";
         let fa = build_fa(src);
         // Cursor on "new" in Point->new()
-        let def = fa.find_definition(Point::new(3, 8));
+        let def = fa.find_definition(Point::new(3, 8), None, None);
         assert!(def.is_some(), "should find definition for new");
     }
 
@@ -2615,12 +2869,12 @@ $p->;
         let fa = build_fa(src);
 
         // $self at line 12 (push @{$self->{history}}, ...)
-        let def_self = fa.find_definition(Point::new(12, 12));
+        let def_self = fa.find_definition(Point::new(12, 12), None, None);
         assert!(def_self.is_some(), "should find definition for $self in deref");
         assert_eq!(def_self.unwrap().start.row, 10, "$self should resolve to declaration on line 10");
 
         // history key at line 12
-        let def_history = fa.find_definition(Point::new(12, 20));
+        let def_history = fa.find_definition(Point::new(12, 20), None, None);
         assert!(def_history.is_some(), "should find definition for history hash key");
         assert_eq!(def_history.unwrap().start.row, 4, "history key should resolve to definition on line 4");
     }
@@ -2681,5 +2935,62 @@ $p->;
         // Import should exist
         assert_eq!(fa.imports.len(), 1);
         assert_eq!(fa.imports[0].imported_symbols, vec!["first"]);
+    }
+
+    #[test]
+    fn test_goto_def_slurpy_hash_arg_at_call_site() {
+        // Calculator->new(verbose => 1): cursor on "verbose" should go to
+        // the bless hash key def, NOT to sub new.
+        let src = r#"package Calculator;
+sub new {
+    my ($class, %args) = @_;
+    my $self = bless {
+        verbose => $args{verbose} // 0,
+    }, $class;
+    return $self;
+}
+package main;
+my $calc = Calculator->new(verbose => 1);
+"#;
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // "verbose" at call site is line 9, after "Calculator->new("
+        // Calculator->new(verbose => 1)
+        // 0123456789012345678901234567
+        //                 ^16 = v of verbose
+        // my $calc = Calculator->new(verbose => 1);
+        // 0         1         2         3
+        // 0123456789012345678901234567890123456789
+        //                            ^27 = v of verbose
+        let def = fa.find_definition(Point::new(9, 27), Some(&tree), Some(src.as_bytes()));
+        assert!(def.is_some(), "should find definition for verbose at call site");
+        // Should go to line 4: "verbose => $args{verbose} // 0,"
+        assert_eq!(def.unwrap().start.row, 4,
+            "verbose should resolve to bless hash key def on line 4, not sub new");
+    }
+
+    #[test]
+    fn test_goto_def_param_field_at_call_site() {
+        // Point->new(x => 3, y => 4): cursor on "x" should go to "field $x :param"
+        let src = r#"use v5.38;
+class Point {
+    field $x :param :reader;
+    field $y :param;
+    method magnitude() { }
+}
+my $p = Point->new(x => 3, y => 4);
+"#;
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // my $p = Point->new(x => 3, y => 4);
+        // 0         1         2
+        // 0123456789012345678901234
+        //                    ^19 = x
+
+        let def = fa.find_definition(Point::new(6, 19), Some(&tree), Some(src.as_bytes()));
+        assert!(def.is_some(), "should find definition for x at call site");
+        // Should go to line 2: "field $x :param :reader;"
+        assert_eq!(def.unwrap().start.row, 2,
+            "x should resolve to field $x on line 2, not the class");
     }
 }

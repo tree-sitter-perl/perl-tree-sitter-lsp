@@ -78,11 +78,13 @@ pub fn find_definition(
     pos: Position,
     uri: &Url,
     module_index: &ModuleIndex,
+    tree: &Tree,
+    source: &str,
 ) -> Option<GotoDefinitionResponse> {
     let point = position_to_point(pos);
 
     // Try local definition first
-    if let Some(span) = analysis.find_definition(point) {
+    if let Some(span) = analysis.find_definition(point, Some(tree), Some(source.as_bytes())) {
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
             range: span_to_range(span),
@@ -123,8 +125,8 @@ pub fn find_definition(
     None
 }
 
-pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url) -> Vec<Location> {
-    analysis.find_references(position_to_point(pos))
+pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url, tree: &Tree, source: &str) -> Vec<Location> {
+    analysis.find_references(position_to_point(pos), Some(tree), Some(source.as_bytes()))
         .into_iter()
         .map(|span| Location {
             uri: uri.clone(),
@@ -203,12 +205,33 @@ pub fn completion_items(
     module_index: &ModuleIndex,
 ) -> Vec<CompletionItem> {
     let point = position_to_point(pos);
-    let ctx = cursor_context::detect_cursor_context(source, point);
+
+    // Try tree-based detection first for expression-based contexts
+    let ctx = cursor_context::detect_cursor_context_tree(tree, source.as_bytes(), point, analysis)
+        .unwrap_or_else(|| cursor_context::detect_cursor_context(source, point));
 
     let mut candidates: Vec<CompletionCandidate> = match ctx {
         CursorContext::Variable { sigil } => analysis.complete_variables(point, sigil),
         CursorContext::Method { ref invocant } => analysis.complete_methods(invocant, point),
+        CursorContext::MethodOnExpression { ref invocant_type } => {
+            if let Some(cn) = invocant_type.class_name() {
+                analysis.complete_methods_for_class(cn)
+            } else {
+                Vec::new()
+            }
+        }
         CursorContext::HashKey { ref var_text } => analysis.complete_hash_keys(var_text, point),
+        CursorContext::HashKeyOnExpression { ref owner_type, ref source_sub } => {
+            if let Some(cn) = owner_type.class_name() {
+                // Object type → offer hash keys for that class
+                analysis.complete_hash_keys_for_class(cn, point)
+            } else if let Some(ref sub_name) = source_sub {
+                // HashRef from a known sub → look up return value hash keys
+                analysis.complete_hash_keys_for_sub(sub_name, point)
+            } else {
+                Vec::new()
+            }
+        }
         CursorContext::General => {
             let mut items = Vec::new();
             // Keyval arg completions if inside a call at key position
@@ -248,11 +271,12 @@ pub fn hover_info(
     source: &str,
     pos: Position,
     module_index: &ModuleIndex,
+    tree: &Tree,
 ) -> Option<Hover> {
     let point = position_to_point(pos);
 
     // Try local hover first
-    if let Some(markdown) = analysis.hover_info(point, source) {
+    if let Some(markdown) = analysis.hover_info(point, source, Some(tree)) {
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -286,9 +310,9 @@ pub fn hover_info(
     None
 }
 
-pub fn document_highlights(analysis: &FileAnalysis, pos: Position) -> Vec<DocumentHighlight> {
+pub fn document_highlights(analysis: &FileAnalysis, pos: Position, tree: &tree_sitter::Tree, source: &str) -> Vec<DocumentHighlight> {
     use crate::file_analysis::AccessKind;
-    analysis.find_highlights(position_to_point(pos))
+    analysis.find_highlights(position_to_point(pos), Some(tree), Some(source.as_bytes()))
         .into_iter()
         .map(|(span, access)| DocumentHighlight {
             range: span_to_range(span),
