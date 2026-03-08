@@ -74,7 +74,8 @@ class Point :isa(Base) :does(Printable) {
     }
 
     method to_string () {
-        return "$label: ($x, $y)";
+        my $m = $self->magnitude();
+        return "$label: ($x, $y) mag=$m";
     }
 }
 

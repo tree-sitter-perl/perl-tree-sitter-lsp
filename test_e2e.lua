@@ -78,6 +78,30 @@ t.test("completion: $p-> returns Point methods", function()
   if ok then t.pass(N) end
 end)
 
+t.test("completion: $self-> inside method returns sibling methods", function()
+  local N = "completion: $self-> inside method returns sibling methods"
+  -- to_string has: my $m = $self->magnitude();
+  local line, col = b.find_pos(buf, "$self->magnitude()")
+  if not t.ok(N, line, "couldn't find '$self->magnitude()' in file") then return end
+  col = col + 7  -- after "$self->"
+  local labels = lsp.completion_labels(buf, line, col)
+  local ok = t.contains(N, labels, "magnitude", "completions")
+  ok = t.contains(N, labels, "to_string", "completions") and ok
+  ok = t.contains(N, labels, "x", "completions") and ok
+  if ok then t.pass(N) end
+end)
+
+t.test("goto-def: $self->magnitude inside method jumps to method", function()
+  local N = "goto-def: $self->magnitude inside method"
+  local line, col = b.find_pos(buf, "$self->magnitude()")
+  if not t.ok(N, line, "couldn't find '$self->magnitude()'") then return end
+  col = col + 7  -- on "magnitude"
+  local def = lsp.def_line(buf, line, col)
+  local expected = b.find_line(buf, "^    method magnitude")
+  if not t.ok(N, def, "no definition result") then return end
+  if t.eq(N, expected, def, "definition line") then t.pass(N) end
+end)
+
 t.test("hover: sub add shows signature", function()
   local N = "hover: sub add shows signature"
   local line = b.find_line(buf, "^sub add ")

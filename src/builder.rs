@@ -386,6 +386,26 @@ impl<'a> Builder<'a> {
         // Record signature params as Variable symbols in the sub scope
         self.record_signature_params(node, &params);
 
+        // Perl 5.38 methods: synthesize implicit $self with type → enclosing class
+        if is_method {
+            if let Some(pkg) = self.current_package.clone() {
+                let span = node_to_span(name_node);
+                self.add_symbol(
+                    "$self".to_string(),
+                    SymKind::Variable,
+                    span,
+                    span,
+                    SymbolDetail::Variable { sigil: '$', decl_kind: DeclKind::Param },
+                );
+                self.type_constraints.push(TypeConstraint {
+                    variable: "$self".to_string(),
+                    scope: self.current_scope(),
+                    inferred_type: InferredType::ClassName(pkg),
+                    constraint_span: span,
+                });
+            }
+        }
+
         // Detect first-param-is-self pattern
         self.detect_first_param_type(&params, node);
 
@@ -1453,6 +1473,46 @@ mod tests {
             .collect();
         assert_eq!(methods.len(), 1, "got: {:?}", methods.iter().map(|m| &m.name).collect::<Vec<_>>());
         assert_eq!(methods[0].name, "x");
+    }
+
+    #[test]
+    fn test_implicit_self_in_method() {
+        // $self is implicitly available in Perl 5.38 method blocks
+        let source = "use v5.38;\nclass Point {\n    field $x :param :reader;\n    method magnitude () {\n        $self->x;\n    }\n}\n";
+        let fa = build_fa(source);
+
+        // $self should be resolvable as a variable inside the method
+        let resolved = fa.resolve_variable("$self", Point::new(4, 8));
+        assert!(resolved.is_some(), "$self should resolve inside method body");
+    }
+
+    #[test]
+    fn test_implicit_self_type_inference() {
+        // $self should be type-inferred to the enclosing class
+        let source = "use v5.38;\nclass Point {\n    field $x :param :reader;\n    method magnitude () {\n        $self->x;\n    }\n}\n";
+        let fa = build_fa(source);
+
+        // Type inference: $self → Point
+        let inferred = fa.inferred_type("$self", Point::new(4, 8));
+        assert!(inferred.is_some(), "$self type should be inferred");
+        match inferred.unwrap() {
+            InferredType::ClassName(name) => assert_eq!(name, "Point"),
+            InferredType::FirstParam { package } => assert_eq!(package, "Point"),
+            other => panic!("expected ClassName or FirstParam, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_self_completion_inside_method() {
+        // $self-> inside a method should complete with sibling methods
+        let source = "use v5.38;\nclass Point {\n    field $x :param :reader;\n    method magnitude () { }\n    method to_string () {\n        $self->;\n    }\n}\n";
+        let fa = build_fa(source);
+
+        let candidates = fa.complete_methods("$self", Point::new(5, 14));
+        let names: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(names.contains(&"magnitude"), "missing magnitude, got: {:?}", names);
+        assert!(names.contains(&"to_string"), "missing to_string, got: {:?}", names);
+        assert!(names.contains(&"x"), "missing reader x, got: {:?}", names);
     }
 
     #[test]
