@@ -77,6 +77,37 @@ function M.symbol_names(buf)
   return names
 end
 
+--- Get completion items (full) for a position.
+function M.completion_items(buf, line, col)
+  local result = M.request(buf, "textDocument/completion", M.pos_params(buf, line, col))
+  if not result then return {} end
+  return result.items or result
+end
+
+--- Get inlay hints for a line range (0-indexed, inclusive).
+function M.inlay_hints(buf, start_line, end_line)
+  local result = M.request(buf, "textDocument/inlayHint", {
+    textDocument = { uri = vim.uri_from_bufnr(buf) },
+    range = {
+      start = { line = start_line, character = 0 },
+      ["end"] = { line = end_line + 1, character = 0 },
+    },
+  })
+  return result or {}
+end
+
+--- Get signature help at a position.
+function M.signature_label(buf, line, col)
+  local result = M.request(buf, "textDocument/signatureHelp", M.pos_params(buf, line, col))
+  if not result or not result.signatures or #result.signatures == 0 then return nil end
+  return result.signatures[1].label
+end
+
+--- Get diagnostics for the buffer.
+function M.diagnostics(buf)
+  return vim.diagnostic.get(buf)
+end
+
 --- Open a file, wait for LSP to attach. Returns buf or calls vim.cmd("cquit! 1").
 function M.open_and_attach(path)
   local abs = vim.fn.fnamemodify(path, ":p")

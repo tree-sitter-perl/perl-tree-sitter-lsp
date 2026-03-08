@@ -704,6 +704,15 @@ impl FileAnalysis {
         None
     }
 
+    /// Format a method completion detail string, appending return type if known.
+    fn method_detail(&self, class_name: &str, method_name: &str) -> String {
+        if let Some(ref rt) = self.find_method_return_type(class_name, method_name) {
+            format!("{} → {}", class_name, format_inferred_type(rt))
+        } else {
+            class_name.to_string()
+        }
+    }
+
     /// Complete methods for a known class name (no invocant resolution needed).
     pub fn complete_methods_for_class(&self, class_name: &str) -> Vec<CompletionCandidate> {
         let mut candidates = Vec::new();
@@ -714,7 +723,7 @@ impl FileAnalysis {
                 candidates.push(CompletionCandidate {
                     label: "new".to_string(),
                     kind: SymKind::Method,
-                    detail: Some(format!("{}->new", class_name)),
+                    detail: Some(self.method_detail(class_name, "new")),
                     insert_text: None,
                     sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
@@ -730,7 +739,7 @@ impl FileAnalysis {
                     candidates.push(CompletionCandidate {
                         label: sym.name.clone(),
                         kind: sym.kind,
-                        detail: Some(class_name.to_string()),
+                        detail: Some(self.method_detail(class_name, &sym.name)),
                         insert_text: None,
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
@@ -1305,7 +1314,7 @@ impl FileAnalysis {
     }
 
     /// Check if a symbol is defined within a class/package.
-    fn symbol_in_class(&self, sym_id: SymbolId, class_name: &str) -> bool {
+    pub(crate) fn symbol_in_class(&self, sym_id: SymbolId, class_name: &str) -> bool {
         let sym = self.symbol(sym_id);
         // Use scope_at to find the innermost scope containing this symbol.
         // For subs, this finds the Sub scope (which has the correct package
@@ -1551,6 +1560,8 @@ pub struct SignatureInfo {
     pub name: String,
     pub params: Vec<ParamInfo>,
     pub is_method: bool,
+    /// End of the sub body — used to query inferred types for params.
+    pub body_end: Point,
 }
 
 // ---- Completion query methods ----
@@ -1656,7 +1667,7 @@ impl FileAnalysis {
                     candidates.push(CompletionCandidate {
                         label: "new".to_string(),
                         kind: SymKind::Method,
-                        detail: Some(format!("{}->new", cn)),
+                        detail: Some(self.method_detail(cn, "new")),
                         insert_text: None,
                         sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
@@ -1672,7 +1683,7 @@ impl FileAnalysis {
                         candidates.push(CompletionCandidate {
                             label: sym.name.clone(),
                             kind: sym.kind,
-                            detail: Some(cn.clone()),
+                            detail: Some(self.method_detail(cn, &sym.name)),
                             insert_text: None,
                             sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
@@ -1702,7 +1713,7 @@ impl FileAnalysis {
                             candidates.push(CompletionCandidate {
                                 label: sym.name.clone(),
                                 kind: sym.kind,
-                                detail: Some(cn.clone()),
+                                detail: Some(self.method_detail(cn, &sym.name)),
                                 insert_text: None,
                                 sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
@@ -1997,6 +2008,7 @@ impl FileAnalysis {
             name: name.to_string(),
             params,
             is_method,
+            body_end: sub_sym.span.end,
         })
     }
 
@@ -2365,7 +2377,7 @@ pub(crate) fn builtin_first_arg_type(name: &str) -> Option<InferredType> {
     }
 }
 
-fn format_inferred_type(ty: &InferredType) -> String {
+pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
     match ty {
         InferredType::ClassName(name) => name.clone(),
         InferredType::FirstParam { package } => package.clone(),

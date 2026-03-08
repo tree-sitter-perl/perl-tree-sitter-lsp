@@ -48,6 +48,9 @@ vim.api.nvim_create_autocmd("LspAttach", {
     -- Use C-x C-o for manual trigger, C-y to accept, C-n/C-p to navigate
     vim.lsp.completion.enable(true, client_id, buf, { autotrigger = true })
 
+    -- Inlay hints (type annotations inline)
+    vim.lsp.inlay_hint.enable(true, { bufnr = buf })
+
     -- Navigation
     vim.keymap.set("n", "gd", vim.lsp.buf.definition, opts)
     vim.keymap.set("n", "gr", vim.lsp.buf.references, opts)

@@ -213,6 +213,94 @@ t.test("goto-def: verbose in Calculator->new(verbose => 1) jumps to bless hash k
   if t.eq(N, expected, def, "definition line") then t.pass(N) end
 end)
 
+-- ── 5a: inlay hints ─────────────────────────────────────────────────
+
+t.test("inlay hint: $calc shows Calculator type", function()
+  local N = "inlay hint: $calc shows Calculator type"
+  local line, _ = b.find_pos(buf, "my $calc = Calculator->new")
+  if not t.ok(N, line, "couldn't find '$calc' declaration") then return end
+  local hints = lsp.inlay_hints(buf, line, line)
+  if not t.ok(N, #hints > 0, "no inlay hints returned") then return end
+  local found = false
+  for _, h in ipairs(hints) do
+    local label = type(h.label) == "string" and h.label or (h.label[1] and h.label[1].value or "")
+    if label:find("Calculator") then found = true; break end
+  end
+  if t.ok(N, found, "no hint mentioning Calculator") then t.pass(N) end
+end)
+
+t.test("inlay hint: $p shows Point type", function()
+  local N = "inlay hint: $p shows Point type"
+  local line, _ = b.find_pos(buf, "my $p = Point->new")
+  if not t.ok(N, line, "couldn't find '$p' declaration") then return end
+  local hints = lsp.inlay_hints(buf, line, line)
+  if not t.ok(N, #hints > 0, "no inlay hints returned") then return end
+  local found = false
+  for _, h in ipairs(hints) do
+    local label = type(h.label) == "string" and h.label or (h.label[1] and h.label[1].value or "")
+    if label:find("Point") then found = true; break end
+  end
+  if t.ok(N, found, "no hint mentioning Point") then t.pass(N) end
+end)
+
+t.test("inlay hint: $db_config shows HashRef type", function()
+  local N = "inlay hint: $db_config shows HashRef type"
+  local line, _ = b.find_pos(buf, "my $db_config = get_config")
+  if not t.ok(N, line, "couldn't find '$db_config' declaration") then return end
+  local hints = lsp.inlay_hints(buf, line, line)
+  if not t.ok(N, #hints > 0, "no inlay hints returned") then return end
+  local found = false
+  for _, h in ipairs(hints) do
+    local label = type(h.label) == "string" and h.label or (h.label[1] and h.label[1].value or "")
+    if label:find("HashRef") then found = true; break end
+  end
+  if t.ok(N, found, "no hint mentioning HashRef") then t.pass(N) end
+end)
+
+t.test("inlay hint: sub get_config shows → HashRef", function()
+  local N = "inlay hint: sub get_config shows → HashRef"
+  local line = b.find_line(buf, "^sub get_config")
+  if not t.ok(N, line, "couldn't find 'sub get_config'") then return end
+  local hints = lsp.inlay_hints(buf, line, line)
+  if not t.ok(N, #hints > 0, "no inlay hints returned") then return end
+  local found = false
+  for _, h in ipairs(hints) do
+    local label = type(h.label) == "string" and h.label or (h.label[1] and h.label[1].value or "")
+    if label:find("HashRef") then found = true; break end
+  end
+  if t.ok(N, found, "no return type hint for get_config") then t.pass(N) end
+end)
+
+-- ── 5b: completion detail with return types ─────────────────────────
+
+t.test("completion detail: $calc->add shows return type", function()
+  local N = "completion detail: $calc->add shows return type"
+  local line, col = b.find_pos(buf, "$calc->add(2, 3)")
+  if not t.ok(N, line, "couldn't find '$calc->add'") then return end
+  local items = lsp.completion_items(buf, line, col + 7)
+  local found = false
+  for _, item in ipairs(items) do
+    if item.label == "add" and item.detail and item.detail:find("Numeric") then
+      found = true; break
+    end
+  end
+  if t.ok(N, found, "no 'add' completion with Numeric detail") then t.pass(N) end
+end)
+
+t.test("completion detail: $calc->get_self shows return type", function()
+  local N = "completion detail: $calc->get_self shows return type"
+  local line, col = b.find_pos(buf, "$calc->get_self()->add")
+  if not t.ok(N, line, "couldn't find chained call") then return end
+  local items = lsp.completion_items(buf, line, col + 7)
+  local found = false
+  for _, item in ipairs(items) do
+    if item.label == "get_self" and item.detail and item.detail:find("Calculator") then
+      found = true; break
+    end
+  end
+  if t.ok(N, found, "no 'get_self' completion with Calculator detail") then t.pass(N) end
+end)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()
