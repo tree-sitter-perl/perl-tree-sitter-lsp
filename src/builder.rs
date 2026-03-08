@@ -181,6 +181,43 @@ impl<'a> Builder<'a> {
             // Hash access
             "hash_element_expression" => self.visit_hash_element(node),
 
+            // Dereference expressions → type constraints on operand
+            "array_element_expression" => {
+                self.infer_deref_type(node, InferredType::ArrayRef);
+                self.visit_children(node);
+            }
+            "coderef_call_expression" => {
+                self.infer_deref_type(node, InferredType::CodeRef);
+                self.visit_children(node);
+            }
+            "array_deref_expression" => {
+                self.infer_deref_type(node, InferredType::ArrayRef);
+                self.visit_children(node);
+            }
+            "hash_deref_expression" => {
+                self.infer_deref_type(node, InferredType::HashRef);
+                self.visit_children(node);
+            }
+
+            // Binary operators → type constraints on variable operands
+            "binary_expression" => {
+                self.infer_binary_op_type(node);
+                self.visit_children(node);
+            }
+            "equality_expression" | "relational_expression" => {
+                self.infer_comparison_type(node);
+                self.visit_children(node);
+            }
+
+            // Unary operators
+            "postinc_expression" | "preinc_expression" => {
+                // $x++ / $x-- / ++$x / --$x → Numeric
+                if let Some(operand) = node.named_child(0) {
+                    self.push_var_type_constraint(operand, node, InferredType::Numeric);
+                }
+                self.visit_children(node);
+            }
+
             // Hash construction
             "anonymous_hash_expression" => self.visit_anon_hash(node),
 
@@ -823,6 +860,96 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Push a type constraint on a variable node if it's a scalar.
+    fn push_var_type_constraint(&mut self, var_node: Node<'a>, context_node: Node<'a>, inferred_type: InferredType) {
+        if var_node.kind() == "scalar" {
+            if let Ok(text) = var_node.utf8_text(self.source) {
+                self.type_constraints.push(TypeConstraint {
+                    variable: text.to_string(),
+                    scope: self.current_scope(),
+                    constraint_span: node_to_span(context_node),
+                    inferred_type,
+                });
+            }
+        }
+    }
+
+    /// Infer a type on the first named child (the operand) of a dereference expression.
+    fn infer_deref_type(&mut self, node: Node<'a>, inferred_type: InferredType) {
+        if let Some(operand) = node.named_child(0) {
+            self.push_var_type_constraint(operand, node, inferred_type);
+        }
+    }
+
+    /// Infer types from binary operator expressions.
+    fn infer_binary_op_type(&mut self, node: Node<'a>) {
+        let op = self.get_operator_text(node);
+        match op.as_deref() {
+            // Numeric operators: both operands are Numeric
+            Some("+" | "-" | "*" | "/" | "%" | "**") => {
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        self.push_var_type_constraint(child, node, InferredType::Numeric);
+                    }
+                }
+            }
+            // String operators: both operands are String
+            Some("." | "x") => {
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        self.push_var_type_constraint(child, node, InferredType::String);
+                    }
+                }
+            }
+            // Regex match: LHS is String, RHS is Regexp
+            Some("=~" | "!~") => {
+                if let Some(lhs) = node.named_child(0) {
+                    self.push_var_type_constraint(lhs, node, InferredType::String);
+                }
+                if let Some(rhs) = node.named_child(1) {
+                    self.push_var_type_constraint(rhs, node, InferredType::Regexp);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Infer types from comparison operators (equality_expression, relational_expression).
+    fn infer_comparison_type(&mut self, node: Node<'a>) {
+        let op = self.get_operator_text(node);
+        let inferred = match op.as_deref() {
+            // Numeric comparisons
+            Some("==" | "!=" | "<=>" | "<" | ">" | "<=" | ">=") => Some(InferredType::Numeric),
+            // String comparisons
+            Some("eq" | "ne" | "lt" | "gt" | "le" | "ge" | "cmp") => Some(InferredType::String),
+            _ => None,
+        };
+        if let Some(it) = inferred {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    self.push_var_type_constraint(child, node, it.clone());
+                }
+            }
+        }
+    }
+
+    /// Get the operator text from a binary/comparison/equality expression.
+    /// The operator is the first unnamed child between the two named children.
+    fn get_operator_text(&self, node: Node<'a>) -> Option<String> {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if !child.is_named() {
+                    let text = child.utf8_text(self.source).ok()?;
+                    // Skip parens, brackets, etc.
+                    if !matches!(text, "(" | ")" | "[" | "]" | "{" | "}" | "," | ";") {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn visit_var_ref(&mut self, node: Node<'a>) {
         // Skip if parent is a variable_declaration (handled by visit_variable_decl)
         if let Some(parent) = node.parent() {
@@ -833,16 +960,38 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Check for block-based dereference: @{expr}, %{expr}, ${expr}
+        // Check for block-based dereference: @{expr}, %{expr}
         // In tree-sitter-perl these parse as scalar/array/hash with a varname
         // child containing a block. The block holds the real expressions.
-        // Don't record a variable ref for the whole dereference — just recurse.
+        // Push a type constraint on inner scalars, then recurse (don't record a ref for the outer).
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "varname" {
                     for j in 0..child.child_count() {
                         if let Some(gc) = child.child(j) {
                             if gc.kind() == "block" {
+                                // Infer type from the outer sigil
+                                let deref_type = match node.kind() {
+                                    "array" => Some(InferredType::ArrayRef),
+                                    "hash" => Some(InferredType::HashRef),
+                                    _ => None,
+                                };
+                                if let Some(it) = deref_type {
+                                    // Find the scalar inside the block: {$x}
+                                    for k in 0..gc.named_child_count() {
+                                        if let Some(stmt) = gc.named_child(k) {
+                                            // expression_statement wraps the scalar
+                                            let inner = if stmt.kind() == "expression_statement" {
+                                                stmt.named_child(0)
+                                            } else {
+                                                Some(stmt)
+                                            };
+                                            if let Some(var) = inner {
+                                                self.push_var_type_constraint(var, node, it.clone());
+                                            }
+                                        }
+                                    }
+                                }
                                 self.visit_children(gc);
                                 return;
                             }
@@ -881,16 +1030,50 @@ impl<'a> Builder<'a> {
 
     fn visit_function_call(&mut self, node: Node<'a>) {
         if let Some(func_node) = node.child_by_field_name("function") {
-            if let Ok(name) = func_node.utf8_text(self.source) {
-                self.add_ref(
-                    RefKind::FunctionCall,
-                    node_to_span(func_node),
-                    name.to_string(),
-                    AccessKind::Read,
-                );
+            // Check for &{$z}() — code ref block dereference call
+            if let Ok(func_text) = func_node.utf8_text(self.source) {
+                if func_text.starts_with("&{") {
+                    // Find the scalar inside: & → varname → block → expression_statement → scalar
+                    self.infer_block_coderef(func_node, node);
+                } else {
+                    self.add_ref(
+                        RefKind::FunctionCall,
+                        node_to_span(func_node),
+                        func_text.to_string(),
+                        AccessKind::Read,
+                    );
+                }
             }
         }
         self.visit_children(node);
+    }
+
+    /// Infer CodeRef on the scalar inside &{$var}.
+    fn infer_block_coderef(&mut self, func_node: Node<'a>, context_node: Node<'a>) {
+        for i in 0..func_node.child_count() {
+            if let Some(child) = func_node.child(i) {
+                if child.kind() == "varname" {
+                    for j in 0..child.child_count() {
+                        if let Some(gc) = child.child(j) {
+                            if gc.kind() == "block" {
+                                for k in 0..gc.named_child_count() {
+                                    if let Some(stmt) = gc.named_child(k) {
+                                        let inner = if stmt.kind() == "expression_statement" {
+                                            stmt.named_child(0)
+                                        } else {
+                                            Some(stmt)
+                                        };
+                                        if let Some(var) = inner {
+                                            self.push_var_type_constraint(var, context_node, InferredType::CodeRef);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn visit_method_call(&mut self, node: Node<'a>) {
@@ -913,6 +1096,9 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_hash_element(&mut self, node: Node<'a>) {
+        // Infer HashRef on the operand variable (e.g. $x in $x->{key})
+        self.infer_deref_type(node, InferredType::HashRef);
+
         // Record the hash variable access
         let var_text = self.get_hash_var_from_element(node);
 
@@ -1791,6 +1977,132 @@ $p->;
         let fa = build_fa("my $obj = Foo->new();");
         let ty = fa.inferred_type("$obj", Point::new(0, 21));
         assert_eq!(ty, Some(&InferredType::ClassName("Foo".into())));
+    }
+
+    // ---- Operator-based type inference tests (Step 3) ----
+
+    #[test]
+    fn test_arrow_hash_deref_infers_hashref() {
+        let fa = build_fa("my $x;\n$x->{key};");
+        let ty = fa.inferred_type("$x", Point::new(1, 10));
+        assert_eq!(ty, Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_arrow_array_deref_infers_arrayref() {
+        let fa = build_fa("my $x;\n$x->[0];");
+        let ty = fa.inferred_type("$x", Point::new(1, 8));
+        assert_eq!(ty, Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_arrow_code_deref_infers_coderef() {
+        let fa = build_fa("my $x;\n$x->(1, 2);");
+        let ty = fa.inferred_type("$x", Point::new(1, 10));
+        assert_eq!(ty, Some(&InferredType::CodeRef));
+    }
+
+    #[test]
+    fn test_postfix_array_deref_infers_arrayref() {
+        let fa = build_fa("my $x;\nmy @a = $x->@*;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_postfix_hash_deref_infers_hashref() {
+        let fa = build_fa("my $y;\nmy %h = $y->%*;\nmy $z;");
+        let ty = fa.inferred_type("$y", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_binary_numeric_ops_infer_numeric() {
+        let fa = build_fa("my $x;\nmy $a = $x + 1;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "+ operator");
+
+        let fa = build_fa("my $x;\nmy $a = $x * 2;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "* operator");
+    }
+
+    #[test]
+    fn test_string_concat_infers_string() {
+        let fa = build_fa("my $s;\nmy $a = $s . \"x\";\nmy $z;");
+        let ty = fa.inferred_type("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::String), ". operator");
+    }
+
+    #[test]
+    fn test_string_repeat_infers_string() {
+        let fa = build_fa("my $s;\n$s x 3;\nmy $z;");
+        let ty = fa.inferred_type("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::String), "x operator");
+    }
+
+    #[test]
+    fn test_numeric_comparison_infers_numeric() {
+        let fa = build_fa("my $x;\nmy $y;\n$x == $y;\nmy $z;");
+        assert_eq!(fa.inferred_type("$x", Point::new(3, 0)), Some(&InferredType::Numeric));
+        assert_eq!(fa.inferred_type("$y", Point::new(3, 0)), Some(&InferredType::Numeric));
+    }
+
+    #[test]
+    fn test_string_comparison_infers_string() {
+        let fa = build_fa("my $x;\nmy $y;\n$x eq $y;\nmy $z;");
+        assert_eq!(fa.inferred_type("$x", Point::new(3, 0)), Some(&InferredType::String));
+        assert_eq!(fa.inferred_type("$y", Point::new(3, 0)), Some(&InferredType::String));
+    }
+
+    #[test]
+    fn test_increment_infers_numeric() {
+        let fa = build_fa("my $x;\n$x++;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric));
+    }
+
+    #[test]
+    fn test_regex_match_infers_string() {
+        let fa = build_fa("my $s;\n$s =~ /pattern/;\nmy $z;");
+        let ty = fa.inferred_type("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::String));
+    }
+
+    #[test]
+    fn test_preinc_infers_numeric() {
+        let fa = build_fa("my $x;\n++$x;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric));
+    }
+
+    #[test]
+    fn test_block_array_deref_infers_arrayref() {
+        let fa = build_fa("my $x;\nmy @items = @{$x};\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_block_hash_deref_infers_hashref() {
+        let fa = build_fa("my $y;\nmy %t = %{$y};\nmy $z;");
+        let ty = fa.inferred_type("$y", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_block_code_deref_infers_coderef() {
+        let fa = build_fa("my $z;\n&{$z}();\nmy $w;");
+        let ty = fa.inferred_type("$z", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::CodeRef));
+    }
+
+    #[test]
+    fn test_no_numeric_on_array_variable() {
+        // @arr + 1 should NOT push Numeric on @arr
+        let fa = build_fa("my @arr;\nmy $n = @arr + 1;\nmy $z;");
+        let ty = fa.inferred_type("@arr", Point::new(2, 0));
+        assert_eq!(ty, None, "@arr should not get Numeric constraint");
     }
 
     #[test]
