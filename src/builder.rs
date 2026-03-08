@@ -1488,10 +1488,15 @@ impl<'a> Builder<'a> {
             }
             // Check if this is inside a return expression of a sub
             if ancestor.kind() == "return_expression" {
-                if let Some(sub_scope) = self.enclosing_sub_scope() {
-                    let scope = &self.scopes[sub_scope.0 as usize];
-                    if let ScopeKind::Sub { ref name } | ScopeKind::Method { ref name } = scope.kind {
-                        return Some(HashKeyOwner::Sub(name.clone()));
+                if let Some(name) = self.enclosing_sub_name() {
+                    return Some(HashKeyOwner::Sub(name));
+                }
+            }
+            // Check if this is the last expression in a sub body (implicit return)
+            if ancestor.kind() == "expression_statement" {
+                if self.is_last_statement_in_sub(ancestor) {
+                    if let Some(name) = self.enclosing_sub_name() {
+                        return Some(HashKeyOwner::Sub(name));
                     }
                 }
             }
@@ -1552,6 +1557,43 @@ impl<'a> Builder<'a> {
             }
         }
         None
+    }
+
+    /// Get the name of the enclosing sub/method, if any.
+    fn enclosing_sub_name(&self) -> Option<String> {
+        let scope_id = self.enclosing_sub_scope()?;
+        match &self.scopes[scope_id.0 as usize].kind {
+            ScopeKind::Sub { ref name } | ScopeKind::Method { ref name } => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Check if a node is the last statement in a sub/method body block.
+    fn is_last_statement_in_sub(&self, node: Node<'a>) -> bool {
+        let parent = match node.parent() {
+            Some(p) => p,
+            None => return false,
+        };
+        // The parent should be a block that is a sub/method body
+        if parent.kind() != "block" {
+            return false;
+        }
+        if let Some(grandparent) = parent.parent() {
+            if !matches!(grandparent.kind(),
+                "subroutine_declaration_statement" | "method_declaration_statement"
+                | "anonymous_subroutine_expression"
+            ) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        // Check this is the last named child in the block
+        if let Some(last) = parent.named_child(parent.named_child_count().saturating_sub(1)) {
+            last.id() == node.id()
+        } else {
+            false
+        }
     }
 
     // ---- Post-passes ----
@@ -2680,6 +2722,32 @@ $calc->get_self->get_config->{host};
         // Cursor on the declaration of $x
         let refs = fa.find_references(Point::new(0, 4), None, None);
         assert!(refs.len() >= 2, "should find at least declaration + usage, got {}", refs.len());
+    }
+
+    #[test]
+    fn test_hash_key_def_implicit_return_gets_sub_owner() {
+        // Implicit return: last expression in sub body, no explicit `return`
+        let src = "sub get_config { { host => 'localhost', port => 5432 } }\nmy $cfg = get_config();\n$cfg->{host};\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+
+        let host_defs: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "host" && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
+            .collect();
+        assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
+        if let SymbolDetail::HashKeyDef { ref owner, .. } = host_defs[0].detail {
+            assert_eq!(*owner, HashKeyOwner::Sub("get_config".to_string()),
+                "implicit return hash key should have Sub(get_config) owner, got {:?}", owner);
+        }
+
+        // Go-to-def from $cfg->{host} should reach the hash key in the implicit return
+        let host_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        assert!(!host_refs.is_empty(), "should find HashKeyAccess for 'host'");
+        let def = fa.find_definition(host_refs[0].span.start, Some(&tree), Some(src.as_bytes()));
+        assert!(def.is_some(), "should find definition for host");
+        assert_eq!(def.unwrap().start.row, 0, "host def should be on line 0");
     }
 
     #[test]
