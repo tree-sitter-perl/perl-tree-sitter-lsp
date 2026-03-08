@@ -148,7 +148,8 @@ impl<'a> Builder<'a> {
                 let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
                 if !matches!(parent_kind,
                     "subroutine_declaration_statement" | "method_declaration_statement" |
-                    "class_statement" | "for_statement" | "foreach_statement"
+                    "class_statement" | "for_statement" | "foreach_statement" |
+                    "varname" // block-deref: @{expr}, %{expr}, &{expr}
                 ) {
                     self.add_fold_range(node);
                     self.push_scope(ScopeKind::Block, node_to_span(node), None);
@@ -960,44 +961,34 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Check for block-based dereference: @{expr}, %{expr}
-        // In tree-sitter-perl these parse as scalar/array/hash with a varname
+        // Check for block-based dereference: @{expr}, %{expr}, &{expr}
+        // In tree-sitter-perl these parse as array/hash/function with a varname
         // child containing a block. The block holds the real expressions.
-        // Push a type constraint on inner scalars, then recurse (don't record a ref for the outer).
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                if child.kind() == "varname" {
-                    for j in 0..child.child_count() {
-                        if let Some(gc) = child.child(j) {
-                            if gc.kind() == "block" {
-                                // Infer type from the outer sigil
-                                let deref_type = match node.kind() {
-                                    "array" => Some(InferredType::ArrayRef),
-                                    "hash" => Some(InferredType::HashRef),
-                                    _ => None,
-                                };
-                                if let Some(it) = deref_type {
-                                    // Find the scalar inside the block: {$x}
-                                    for k in 0..gc.named_child_count() {
-                                        if let Some(stmt) = gc.named_child(k) {
-                                            // expression_statement wraps the scalar
-                                            let inner = if stmt.kind() == "expression_statement" {
-                                                stmt.named_child(0)
-                                            } else {
-                                                Some(stmt)
-                                            };
-                                            if let Some(var) = inner {
-                                                self.push_var_type_constraint(var, node, it.clone());
-                                            }
-                                        }
-                                    }
+        // Don't record a variable ref for the outer — just recurse into the block.
+        if self.is_block_deref(node) {
+            // Recurse into the block to visit inner expressions
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    if child.kind() == "varname" {
+                        for j in 0..child.child_count() {
+                            if let Some(gc) = child.child(j) {
+                                if gc.kind() == "block" {
+                                    self.visit_children(gc);
+                                    return;
                                 }
-                                self.visit_children(gc);
-                                return;
                             }
                         }
                     }
                 }
+            }
+            return;
+        }
+
+        // If this scalar is inside a block-deref, infer the type from the outer sigil.
+        // Parent chain: scalar → expression_statement → block → varname → outer_node
+        if node.kind() == "scalar" {
+            if let Some((deref_type, context)) = self.block_deref_context(node) {
+                self.push_var_type_constraint(node, context, deref_type);
             }
         }
 
@@ -1009,6 +1000,53 @@ impl<'a> Builder<'a> {
                 text.to_string(),
                 access,
             );
+        }
+    }
+
+    /// Check if this node is a block-deref outer node (e.g. @{...} or %{...}).
+    fn is_block_deref(&self, node: Node<'a>) -> bool {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.kind() == "varname" {
+                    for j in 0..child.child_count() {
+                        if let Some(gc) = child.child(j) {
+                            if gc.kind() == "block" {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Walk up from a scalar to detect block-deref context.
+    /// Returns the inferred type and a context node (for constraint span) if inside
+    /// @{$x}, %{$y}, or &{$z}.
+    ///
+    /// Parent chain: scalar → expression_statement → block → varname → outer_node
+    /// where outer_node.kind() is "array" (@{}), "hash" (%{}), or "function" (&{}).
+    fn block_deref_context(&self, node: Node<'a>) -> Option<(InferredType, Node<'a>)> {
+        let stmt = node.parent()?;
+        if stmt.kind() != "expression_statement" { return None; }
+        let block = stmt.parent()?;
+        if block.kind() != "block" { return None; }
+        let varname = block.parent()?;
+        if varname.kind() != "varname" { return None; }
+        let outer = varname.parent()?;
+        match outer.kind() {
+            "array" => Some((InferredType::ArrayRef, outer)),
+            "hash" => Some((InferredType::HashRef, outer)),
+            "function" => {
+                if let Ok(text) = outer.utf8_text(self.source) {
+                    if text.starts_with("&{") {
+                        return Some((InferredType::CodeRef, outer));
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -1030,50 +1068,16 @@ impl<'a> Builder<'a> {
 
     fn visit_function_call(&mut self, node: Node<'a>) {
         if let Some(func_node) = node.child_by_field_name("function") {
-            // Check for &{$z}() — code ref block dereference call
-            if let Ok(func_text) = func_node.utf8_text(self.source) {
-                if func_text.starts_with("&{") {
-                    // Find the scalar inside: & → varname → block → expression_statement → scalar
-                    self.infer_block_coderef(func_node, node);
-                } else {
-                    self.add_ref(
-                        RefKind::FunctionCall,
-                        node_to_span(func_node),
-                        func_text.to_string(),
-                        AccessKind::Read,
-                    );
-                }
+            if let Ok(name) = func_node.utf8_text(self.source) {
+                self.add_ref(
+                    RefKind::FunctionCall,
+                    node_to_span(func_node),
+                    name.to_string(),
+                    AccessKind::Read,
+                );
             }
         }
         self.visit_children(node);
-    }
-
-    /// Infer CodeRef on the scalar inside &{$var}.
-    fn infer_block_coderef(&mut self, func_node: Node<'a>, context_node: Node<'a>) {
-        for i in 0..func_node.child_count() {
-            if let Some(child) = func_node.child(i) {
-                if child.kind() == "varname" {
-                    for j in 0..child.child_count() {
-                        if let Some(gc) = child.child(j) {
-                            if gc.kind() == "block" {
-                                for k in 0..gc.named_child_count() {
-                                    if let Some(stmt) = gc.named_child(k) {
-                                        let inner = if stmt.kind() == "expression_statement" {
-                                            stmt.named_child(0)
-                                        } else {
-                                            Some(stmt)
-                                        };
-                                        if let Some(var) = inner {
-                                            self.push_var_type_constraint(var, context_node, InferredType::CodeRef);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     fn visit_method_call(&mut self, node: Node<'a>) {
