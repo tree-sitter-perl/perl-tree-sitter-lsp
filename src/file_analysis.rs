@@ -196,7 +196,6 @@ pub struct TypeConstraint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum InferredType {
     /// `$p = Point->new(...)` — variable is an instance of ClassName.
     ClassName(String),
@@ -204,6 +203,30 @@ pub enum InferredType {
     FirstParam { package: String },
     /// `bless { ... }, 'Foo'` — result is a Foo.
     BlessResult { package: String },
+    /// `$x = {}` or `$x = { ... }` — unblessed hash reference.
+    HashRef,
+    /// `$x = []` or `$x = [ ... ]` — unblessed array reference.
+    ArrayRef,
+    /// `$x = sub { ... }` — code reference.
+    CodeRef,
+    /// `$x = qr/.../` — compiled regular expression.
+    Regexp,
+    /// Used in numeric context (`+`, `-`, `==`, etc.).
+    Numeric,
+    /// Used in string context (`.`, `eq`, `=~`, etc.).
+    String,
+}
+
+impl InferredType {
+    /// Extract the class name if this is an object type (ClassName, FirstParam, or BlessResult).
+    pub fn class_name(&self) -> Option<&str> {
+        match self {
+            InferredType::ClassName(name) => Some(name.as_str()),
+            InferredType::FirstParam { package } => Some(package.as_str()),
+            InferredType::BlessResult { package } => Some(package.as_str()),
+            _ => None,
+        }
+    }
 }
 
 // ---- Hash key owner (for scope graph) ----
@@ -882,11 +905,7 @@ impl FileAnalysis {
         if invocant.starts_with('$') || invocant.starts_with('@') || invocant.starts_with('%') {
             // Variable invocant → infer type
             self.inferred_type(invocant, point)
-                .and_then(|t| match t {
-                    InferredType::ClassName(name) => Some(name.clone()),
-                    InferredType::FirstParam { package } => Some(package.clone()),
-                    InferredType::BlessResult { package } => Some(package.clone()),
-                })
+                .and_then(|t| t.class_name().map(|s| s.to_string()))
                 .or_else(|| {
                     // Check if we're inside a class and $self is the invocant
                     let chain = self.scope_chain(scope);
@@ -1606,13 +1625,8 @@ impl FileAnalysis {
 
         // Try type inference → class owner
         if let Some(it) = self.inferred_type(var_text, point) {
-            let class_name = match it {
-                InferredType::ClassName(n) => Some(n.clone()),
-                InferredType::FirstParam { package } => Some(package.clone()),
-                InferredType::BlessResult { package } => Some(package.clone()),
-            };
-            if let Some(cn) = class_name {
-                return Some(HashKeyOwner::Class(cn));
+            if let Some(cn) = it.class_name() {
+                return Some(HashKeyOwner::Class(cn.to_string()));
             }
         }
 
@@ -1858,4 +1872,98 @@ fn span_size(span: &Span) -> usize {
 
 fn source_line_at(source: &str, row: usize) -> &str {
     source.lines().nth(row).unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Point;
+
+    /// Helper: build a minimal FileAnalysis with a single file scope and given type constraints.
+    fn fa_with_constraints(constraints: Vec<TypeConstraint>) -> FileAnalysis {
+        FileAnalysis::new(
+            vec![Scope {
+                id: ScopeId(0),
+                parent: None,
+                kind: ScopeKind::File,
+                span: Span { start: Point::new(0, 0), end: Point::new(10, 0) },
+                package: None,
+            }],
+            vec![],
+            vec![],
+            constraints,
+            vec![],
+            vec![],
+        )
+    }
+
+    fn constraint(var: &str, row: usize, inferred_type: InferredType) -> TypeConstraint {
+        TypeConstraint {
+            variable: var.to_string(),
+            scope: ScopeId(0),
+            constraint_span: Span { start: Point::new(row, 0), end: Point::new(row, 20) },
+            inferred_type,
+        }
+    }
+
+    // ---- Type constraint resolution tests ----
+
+    #[test]
+    fn test_resolve_hashref_type() {
+        let fa = fa_with_constraints(vec![constraint("$href", 0, InferredType::HashRef)]);
+        assert_eq!(fa.inferred_type("$href", Point::new(1, 0)), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_resolve_arrayref_type() {
+        let fa = fa_with_constraints(vec![constraint("$aref", 0, InferredType::ArrayRef)]);
+        assert_eq!(fa.inferred_type("$aref", Point::new(1, 0)), Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_resolve_coderef_type() {
+        let fa = fa_with_constraints(vec![constraint("$cref", 0, InferredType::CodeRef)]);
+        assert_eq!(fa.inferred_type("$cref", Point::new(1, 0)), Some(&InferredType::CodeRef));
+    }
+
+    #[test]
+    fn test_resolve_regexp_type() {
+        let fa = fa_with_constraints(vec![constraint("$re", 0, InferredType::Regexp)]);
+        assert_eq!(fa.inferred_type("$re", Point::new(1, 0)), Some(&InferredType::Regexp));
+    }
+
+    #[test]
+    fn test_resolve_numeric_type() {
+        let fa = fa_with_constraints(vec![constraint("$n", 0, InferredType::Numeric)]);
+        assert_eq!(fa.inferred_type("$n", Point::new(1, 0)), Some(&InferredType::Numeric));
+    }
+
+    #[test]
+    fn test_resolve_string_type() {
+        let fa = fa_with_constraints(vec![constraint("$s", 0, InferredType::String)]);
+        assert_eq!(fa.inferred_type("$s", Point::new(1, 0)), Some(&InferredType::String));
+    }
+
+    #[test]
+    fn test_resolve_reassignment_changes_type() {
+        let fa = fa_with_constraints(vec![
+            constraint("$x", 0, InferredType::HashRef),
+            constraint("$x", 3, InferredType::ArrayRef),
+        ]);
+        assert_eq!(fa.inferred_type("$x", Point::new(1, 0)), Some(&InferredType::HashRef));
+        assert_eq!(fa.inferred_type("$x", Point::new(4, 0)), Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_class_name_helper() {
+        assert_eq!(InferredType::ClassName("Foo".into()).class_name(), Some("Foo"));
+        assert_eq!(InferredType::FirstParam { package: "Bar".into() }.class_name(), Some("Bar"));
+        assert_eq!(InferredType::BlessResult { package: "Baz".into() }.class_name(), Some("Baz"));
+        assert_eq!(InferredType::HashRef.class_name(), None);
+        assert_eq!(InferredType::ArrayRef.class_name(), None);
+        assert_eq!(InferredType::CodeRef.class_name(), None);
+        assert_eq!(InferredType::Regexp.class_name(), None);
+        assert_eq!(InferredType::Numeric.class_name(), None);
+        assert_eq!(InferredType::String.class_name(), None);
+    }
 }

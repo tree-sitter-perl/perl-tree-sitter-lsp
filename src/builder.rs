@@ -776,21 +776,26 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_assignment(&mut self, node: Node<'a>) {
-        // Check for type inference: $var = ClassName->new(...)
+        // Check for type inference from RHS
         if let Some(left) = node.child_by_field_name("left") {
             if left.kind() == "variable_declaration" {
                 // Visit the declaration
                 self.visit_variable_decl(left);
             }
             if let Some(right) = node.child_by_field_name("right") {
-                if let Some(class_name) = self.extract_constructor_class(right) {
-                    let var_text = self.get_var_text_from_lhs(left);
-                    if let Some(vt) = var_text {
+                // Try constructor class first (Foo->new()), then literal types
+                let inferred = if let Some(class_name) = self.extract_constructor_class(right) {
+                    Some(InferredType::ClassName(class_name))
+                } else {
+                    Self::infer_literal_type(right)
+                };
+                if let Some(it) = inferred {
+                    if let Some(vt) = self.get_var_text_from_lhs(left) {
                         self.type_constraints.push(TypeConstraint {
                             variable: vt,
                             scope: self.current_scope(),
                             constraint_span: node_to_span(node),
-                            inferred_type: InferredType::ClassName(class_name),
+                            inferred_type: it,
                         });
                     }
                 }
@@ -804,6 +809,17 @@ impl<'a> Builder<'a> {
         } else {
             // No left field — just visit children
             self.visit_children(node);
+        }
+    }
+
+    /// Infer a type from a literal RHS node (no CST walk, just node kind check).
+    fn infer_literal_type(node: Node) -> Option<InferredType> {
+        match node.kind() {
+            "anonymous_hash_expression" => Some(InferredType::HashRef),
+            "anonymous_array_expression" => Some(InferredType::ArrayRef),
+            "anonymous_subroutine_expression" => Some(InferredType::CodeRef),
+            "quoted_regexp" => Some(InferredType::Regexp),
+            _ => None,
         }
     }
 
@@ -1269,19 +1285,9 @@ impl<'a> Builder<'a> {
                     'outer: while let Some(sid) = scope {
                         for (tc_scope, tc_type, tc_point) in constraints {
                             if *tc_scope == sid && *tc_point <= r.span.start {
-                                match tc_type {
-                                    InferredType::ClassName(cn) => {
-                                        *owner = Some(HashKeyOwner::Class(cn.clone()));
-                                        break 'outer;
-                                    }
-                                    InferredType::FirstParam { package } => {
-                                        *owner = Some(HashKeyOwner::Class(package.clone()));
-                                        break 'outer;
-                                    }
-                                    InferredType::BlessResult { package } => {
-                                        *owner = Some(HashKeyOwner::Class(package.clone()));
-                                        break 'outer;
-                                    }
+                                if let Some(cn) = tc_type.class_name() {
+                                    *owner = Some(HashKeyOwner::Class(cn.to_string()));
+                                    break 'outer;
                                 }
                             }
                         }
@@ -1728,6 +1734,63 @@ $p->;
         } else {
             panic!("expected FirstParam, got {:?}", ty);
         }
+    }
+
+    // ---- Literal constructor extraction tests (via build_fa) ----
+
+    #[test]
+    fn test_extract_hashref_literal() {
+        let fa = build_fa("my $href = {};");
+        let ty = fa.inferred_type("$href", Point::new(0, 14));
+        assert_eq!(ty, Some(&InferredType::HashRef), "empty hash ref literal");
+
+        let fa = build_fa("my $href = { a => 1, b => 2 };");
+        let ty = fa.inferred_type("$href", Point::new(0, 30));
+        assert_eq!(ty, Some(&InferredType::HashRef), "populated hash ref literal");
+    }
+
+    #[test]
+    fn test_extract_arrayref_literal() {
+        let fa = build_fa("my $aref = [];");
+        let ty = fa.inferred_type("$aref", Point::new(0, 14));
+        assert_eq!(ty, Some(&InferredType::ArrayRef), "empty array ref literal");
+
+        let fa = build_fa("my $aref = [1, 2, 3];");
+        let ty = fa.inferred_type("$aref", Point::new(0, 21));
+        assert_eq!(ty, Some(&InferredType::ArrayRef), "populated array ref literal");
+    }
+
+    #[test]
+    fn test_extract_coderef_literal() {
+        let fa = build_fa("my $cref = sub { 42 };");
+        let ty = fa.inferred_type("$cref", Point::new(0, 22));
+        assert_eq!(ty, Some(&InferredType::CodeRef), "anonymous sub");
+    }
+
+    #[test]
+    fn test_extract_regexp_literal() {
+        let fa = build_fa("my $re = qr/pattern/;");
+        let ty = fa.inferred_type("$re", Point::new(0, 21));
+        assert_eq!(ty, Some(&InferredType::Regexp), "qr// literal");
+    }
+
+    #[test]
+    fn test_extract_reassignment_type_change() {
+        let fa = build_fa("my $x = {};\n$x = [];");
+        // After line 0 → HashRef
+        let ty = fa.inferred_type("$x", Point::new(0, 11));
+        assert_eq!(ty, Some(&InferredType::HashRef), "initial hashref");
+        // After line 1 → ArrayRef
+        let ty = fa.inferred_type("$x", Point::new(1, 8));
+        assert_eq!(ty, Some(&InferredType::ArrayRef), "reassigned to arrayref");
+    }
+
+    #[test]
+    fn test_extract_constructor_still_works() {
+        // Existing constructor detection should still work
+        let fa = build_fa("my $obj = Foo->new();");
+        let ty = fa.inferred_type("$obj", Point::new(0, 21));
+        assert_eq!(ty, Some(&InferredType::ClassName("Foo".into())));
     }
 
     #[test]
