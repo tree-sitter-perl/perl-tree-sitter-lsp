@@ -4,15 +4,17 @@
 //! Validates entries against mtime + file size to detect stale data.
 //! Invalidates the entire cache when `@INC` changes.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use dashmap::DashMap;
 use rusqlite::{params, Connection};
 
+use crate::file_analysis::{inferred_type_from_tag, inferred_type_to_tag, InferredType};
 use crate::module_index::ModuleExports;
 
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "4";
 
 pub fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
@@ -82,13 +84,15 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             value TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS modules (
-            module_name TEXT PRIMARY KEY,
-            path        TEXT NOT NULL,
-            mtime_secs  INTEGER NOT NULL,
-            file_size   INTEGER NOT NULL,
-            export      TEXT NOT NULL,
-            export_ok   TEXT NOT NULL,
-            source      TEXT NOT NULL DEFAULT 'import'
+            module_name  TEXT PRIMARY KEY,
+            path         TEXT NOT NULL,
+            mtime_secs   INTEGER NOT NULL,
+            file_size    INTEGER NOT NULL,
+            export       TEXT NOT NULL,
+            export_ok    TEXT NOT NULL,
+            source       TEXT NOT NULL DEFAULT 'import',
+            return_types TEXT NOT NULL DEFAULT '{}',
+            hash_keys    TEXT NOT NULL DEFAULT '{}'
         );",
     )?;
 
@@ -106,13 +110,15 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             conn.execute_batch("DROP TABLE IF EXISTS modules;")?;
             conn.execute_batch(
                 "CREATE TABLE modules (
-                    module_name TEXT PRIMARY KEY,
-                    path        TEXT NOT NULL,
-                    mtime_secs  INTEGER NOT NULL,
-                    file_size   INTEGER NOT NULL,
-                    export      TEXT NOT NULL,
-                    export_ok   TEXT NOT NULL,
-                    source      TEXT NOT NULL DEFAULT 'import'
+                    module_name  TEXT PRIMARY KEY,
+                    path         TEXT NOT NULL,
+                    mtime_secs   INTEGER NOT NULL,
+                    file_size    INTEGER NOT NULL,
+                    export       TEXT NOT NULL,
+                    export_ok    TEXT NOT NULL,
+                    source       TEXT NOT NULL DEFAULT 'import',
+                    return_types TEXT NOT NULL DEFAULT '{}',
+                    hash_keys    TEXT NOT NULL DEFAULT '{}'
                 );",
             )?;
             conn.execute(
@@ -176,7 +182,7 @@ fn mtime_as_secs(path: &std::path::Path) -> Option<(i64, i64)> {
 
 pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExports>>) -> usize {
     let mut stmt = match conn.prepare(
-        "SELECT module_name, path, mtime_secs, file_size, export, export_ok FROM modules",
+        "SELECT module_name, path, mtime_secs, file_size, export, export_ok, return_types, hash_keys FROM modules",
     ) {
         Ok(s) => s,
         Err(_) => return 0,
@@ -190,6 +196,8 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
             row.get::<_, i64>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
         ))
     }) {
         Ok(r) => r,
@@ -198,7 +206,7 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
 
     let mut count = 0usize;
     for row in rows.flatten() {
-        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json) = row;
+        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json, return_types_json, hash_keys_json) = row;
 
         // Negative sentinel
         if path_str.is_empty() {
@@ -221,6 +229,18 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
         let export: Vec<String> = serde_json::from_str(&export_json).unwrap_or_default();
         let export_ok: Vec<String> = serde_json::from_str(&export_ok_json).unwrap_or_default();
 
+        // Deserialize return types: JSON map of name → type_tag
+        let return_types: HashMap<String, InferredType> =
+            serde_json::from_str::<HashMap<String, String>>(&return_types_json)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(k, v)| inferred_type_from_tag(&v).map(|ty| (k, ty)))
+                .collect();
+
+        // Deserialize hash keys: JSON map of func_name → [key_names]
+        let hash_keys: HashMap<String, Vec<String>> =
+            serde_json::from_str(&hash_keys_json).unwrap_or_default();
+
         if export.is_empty() && export_ok.is_empty() {
             cache.insert(module_name, None);
         } else {
@@ -230,6 +250,8 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
                     path,
                     export,
                     export_ok,
+                    return_types,
+                    hash_keys,
                 }),
             );
         }
@@ -245,17 +267,27 @@ pub fn save_to_db(
     result: &Option<ModuleExports>,
     source: &str,
 ) {
-    let (path_str, mtime, size, export_json, export_ok_json) = match result {
+    let (path_str, mtime, size, export_json, export_ok_json, return_types_json, hash_keys_json) = match result {
         Some(exports) => {
             let (mtime, size) = mtime_as_secs(&exports.path).unwrap_or((0, 0));
             let ej = serde_json::to_string(&exports.export).unwrap_or_default();
             let eoj = serde_json::to_string(&exports.export_ok).unwrap_or_default();
+            // Serialize return types as name → type_tag
+            let rt_tags: HashMap<&str, String> = exports
+                .return_types
+                .iter()
+                .map(|(k, v)| (k.as_str(), inferred_type_to_tag(v)))
+                .collect();
+            let rtj = serde_json::to_string(&rt_tags).unwrap_or_else(|_| "{}".to_string());
+            let hkj = serde_json::to_string(&exports.hash_keys).unwrap_or_else(|_| "{}".to_string());
             (
                 exports.path.to_string_lossy().to_string(),
                 mtime,
                 size,
                 ej,
                 eoj,
+                rtj,
+                hkj,
             )
         }
         None => (
@@ -264,13 +296,15 @@ pub fn save_to_db(
             0i64,
             "[]".to_string(),
             "[]".to_string(),
+            "{}".to_string(),
+            "{}".to_string(),
         ),
     };
 
     let r = conn.execute(
-        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![module_name, path_str, mtime, size, export_json, export_ok_json, source],
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source, return_types, hash_keys)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![module_name, path_str, mtime, size, export_json, export_ok_json, source, return_types_json, hash_keys_json],
     );
     if let Err(e) = r {
         log::warn!("Failed to save module cache for '{}': {}", module_name, e);
@@ -300,6 +334,8 @@ mod tests {
             path: pm.clone(),
             export: vec!["foo".into(), "bar".into()],
             export_ok: vec!["baz".into()],
+            return_types: HashMap::new(),
+            hash_keys: HashMap::new(),
         });
         save_to_db(&conn, "TestModule", &exports, "import");
 
@@ -341,6 +377,8 @@ mod tests {
             path: pm.clone(),
             export: vec!["old".into()],
             export_ok: vec![],
+            return_types: HashMap::new(),
+            hash_keys: HashMap::new(),
         });
         save_to_db(&conn, "StaleModule", &exports, "import");
 
@@ -391,6 +429,60 @@ mod tests {
     }
 
     #[test]
+    fn test_db_migration_v2_to_v3_supports_return_types() {
+        // Simulate a v2 database (no return_types column)
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+             CREATE TABLE modules (
+                 module_name TEXT PRIMARY KEY,
+                 path        TEXT NOT NULL,
+                 mtime_secs  INTEGER NOT NULL,
+                 file_size   INTEGER NOT NULL,
+                 export      TEXT NOT NULL,
+                 export_ok   TEXT NOT NULL,
+                 source      TEXT NOT NULL DEFAULT 'import'
+             );",
+        )
+        .unwrap();
+
+        // Run migration
+        init_schema(&conn).unwrap();
+
+        // Now save with return_types — should not fail
+        let dir = std::env::temp_dir();
+        let pm = dir.join("MigratedModule.pm");
+        std::fs::write(&pm, "package MigratedModule; 1;").unwrap();
+
+        let mut rt = HashMap::new();
+        rt.insert("get_data".to_string(), InferredType::HashRef);
+
+        let exports = Some(ModuleExports {
+            path: pm.clone(),
+            export: vec!["get_data".into()],
+            export_ok: vec![],
+            return_types: rt,
+            hash_keys: HashMap::new(),
+        });
+        save_to_db(&conn, "MigratedModule", &exports, "import");
+
+        // Verify it round-trips
+        let cache = DashMap::new();
+        let n = warm_cache(&conn, &cache);
+        assert_eq!(n, 1);
+        let loaded = cache.get("MigratedModule").unwrap();
+        let loaded = loaded.as_ref().unwrap();
+        assert_eq!(
+            loaded.return_types.get("get_data"),
+            Some(&InferredType::HashRef),
+            "return_types should survive v2→v3 migration + roundtrip"
+        );
+
+        let _ = std::fs::remove_file(&pm);
+    }
+
+    #[test]
     fn test_db_source_column() {
         let conn = test_db();
         let dir = std::env::temp_dir();
@@ -401,6 +493,8 @@ mod tests {
             path: pm.clone(),
             export: vec!["foo".into()],
             export_ok: vec![],
+            return_types: HashMap::new(),
+            hash_keys: HashMap::new(),
         });
         save_to_db(&conn, "SourceTest", &exports, "cpanfile");
 
@@ -428,5 +522,43 @@ mod tests {
             cache_dir_for_workspace(Some("file:///home/user/project-a")),
             "Same root should produce same path"
         );
+    }
+
+    #[test]
+    fn test_db_return_types_roundtrip() {
+        let conn = test_db();
+
+        let dir = std::env::temp_dir();
+        let pm = dir.join("ReturnTypeTest.pm");
+        std::fs::write(&pm, "package ReturnTypeTest; 1;").unwrap();
+
+        let mut rt = HashMap::new();
+        rt.insert("get_config".to_string(), InferredType::HashRef);
+        rt.insert("make_items".to_string(), InferredType::ArrayRef);
+        rt.insert("new_obj".to_string(), InferredType::ClassName("MyObj".into()));
+
+        let exports = Some(ModuleExports {
+            path: pm.clone(),
+            export: vec!["get_config".into()],
+            export_ok: vec!["make_items".into(), "new_obj".into()],
+            return_types: rt,
+            hash_keys: HashMap::new(),
+        });
+        save_to_db(&conn, "ReturnTypeTest", &exports, "import");
+
+        let cache = DashMap::new();
+        let n = warm_cache(&conn, &cache);
+        assert_eq!(n, 1);
+
+        let loaded = cache.get("ReturnTypeTest").unwrap();
+        let loaded = loaded.as_ref().unwrap();
+        assert_eq!(loaded.return_types.get("get_config"), Some(&InferredType::HashRef));
+        assert_eq!(loaded.return_types.get("make_items"), Some(&InferredType::ArrayRef));
+        assert_eq!(
+            loaded.return_types.get("new_obj"),
+            Some(&InferredType::ClassName("MyObj".into()))
+        );
+
+        let _ = std::fs::remove_file(&pm);
     }
 }
