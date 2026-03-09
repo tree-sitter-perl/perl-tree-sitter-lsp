@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use tree_sitter::{Node, Point, Tree};
 
-use crate::file_analysis::Span;
+use crate::file_analysis::{extract_call_name, node_to_span, FileAnalysis, InferredType, Span};
 
 // ---- Types ----
 
@@ -17,10 +17,10 @@ use crate::file_analysis::Span;
 pub enum CursorContext {
     /// After `$`, `@`, or `%` — variable completion.
     Variable { sigil: char },
-    /// After `->` — method completion.
-    Method { invocant: String },
-    /// After `$var->{` or `$hash{` — hash key completion.
-    HashKey { var_text: String },
+    /// After `->` — method completion. Type is resolved when available.
+    Method { invocant_type: Option<InferredType>, invocant_text: String },
+    /// After `$var->{` or `$hash{` — hash key completion. Type is resolved when available.
+    HashKey { owner_type: Option<InferredType>, var_text: String, source_sub: Option<String> },
     /// No specific trigger — general completion.
     General,
 }
@@ -47,7 +47,8 @@ pub struct CallContext {
 // ---- Cursor context detection (text-only, no tree) ----
 
 /// Detect what the user is doing at the cursor from the text before cursor.
-pub fn detect_cursor_context(source: &str, point: Point) -> CursorContext {
+/// When `analysis` is provided, also tries to resolve invocant/owner types.
+pub fn detect_cursor_context(source: &str, point: Point, analysis: Option<&FileAnalysis>) -> CursorContext {
     let line = match source.lines().nth(point.row) {
         Some(l) => l,
         None => return CursorContext::General,
@@ -59,25 +60,34 @@ pub fn detect_cursor_context(source: &str, point: Point) -> CursorContext {
     };
     let trimmed = before.trim_end();
 
-    // Check for hash key completion: $hash{ or $self->{
-    if trimmed.ends_with('{') {
-        let prefix = trimmed[..trimmed.len() - 1].trim_end();
-        // Arrow hash access: $var->{
-        if prefix.ends_with("->") {
-            let var_prefix = prefix[..prefix.len() - 2].trim_end();
-            let var_text = extract_invocant_from_prefix(var_prefix);
-            if !var_text.is_empty() {
+    // Check for hash key completion: $hash{ or $self->{ (including mid-word: $var->{ho)
+    {
+        let check = strip_trailing_identifier(trimmed);
+        if check.ends_with('{') {
+            let prefix = check[..check.len() - 1].trim_end();
+            // Arrow hash access: $var->{
+            if prefix.ends_with("->") {
+                let var_prefix = prefix[..prefix.len() - 2].trim_end();
+                let var_text = extract_invocant_from_prefix(var_prefix);
+                if !var_text.is_empty() {
+                    let owner_type = resolve_text_invocant(var_text, point, analysis);
+                    return CursorContext::HashKey {
+                        owner_type,
+                        var_text: var_text.to_string(),
+                        source_sub: None,
+                    };
+                }
+            }
+            // Direct hash access: $hash{
+            let var_text = extract_invocant_from_prefix(prefix);
+            if !var_text.is_empty() && var_text.starts_with('$') {
+                let owner_type = resolve_text_invocant(var_text, point, analysis);
                 return CursorContext::HashKey {
+                    owner_type,
                     var_text: var_text.to_string(),
+                    source_sub: None,
                 };
             }
-        }
-        // Direct hash access: $hash{
-        let var_text = extract_invocant_from_prefix(prefix);
-        if !var_text.is_empty() && var_text.starts_with('$') {
-            return CursorContext::HashKey {
-                var_text: var_text.to_string(),
-            };
         }
     }
 
@@ -88,8 +98,10 @@ pub fn detect_cursor_context(source: &str, point: Point) -> CursorContext {
             let prefix = check[..check.len() - 2].trim_end();
             let invocant = extract_invocant_from_prefix(prefix);
             if !invocant.is_empty() {
+                let invocant_type = resolve_text_invocant(invocant, point, analysis);
                 return CursorContext::Method {
-                    invocant: invocant.to_string(),
+                    invocant_type,
+                    invocant_text: invocant.to_string(),
                 };
             }
         }
@@ -103,6 +115,18 @@ pub fn detect_cursor_context(source: &str, point: Point) -> CursorContext {
     }
 
     CursorContext::General
+}
+
+/// Resolve an invocant type from its text, using analysis when available.
+fn resolve_text_invocant(text: &str, point: Point, analysis: Option<&FileAnalysis>) -> Option<InferredType> {
+    if !text.starts_with('$') && !text.starts_with('@') && !text.starts_with('%') {
+        // Bareword — treat as class name
+        Some(InferredType::ClassName(text.to_string()))
+    } else if let Some(a) = analysis {
+        a.inferred_type(text, point).cloned()
+    } else {
+        None
+    }
 }
 
 /// Strip trailing identifier chars (partial method name typed so far).
@@ -138,6 +162,143 @@ fn extract_invocant_from_prefix(prefix: &str) -> &str {
         return &prefix[i + 1..end];
     }
     &prefix[..end]
+}
+
+// ---- Tree-based cursor context detection ----
+
+/// Detect cursor context using the tree + analysis for expression type resolution.
+///
+/// Handles cases the text-based detector can't: call-expression invocants
+/// like `get_config()->` or `$obj->get_bar()->`.
+///
+/// Returns `None` if no expression-based context is detected (caller should
+/// fall back to text-based detection).
+pub fn detect_cursor_context_tree(
+    tree: &Tree,
+    source: &[u8],
+    point: Point,
+    analysis: &FileAnalysis,
+) -> Option<CursorContext> {
+    // Find the node at/just before the cursor
+    let check_point = if point.column > 0 {
+        Point::new(point.row, point.column - 1)
+    } else {
+        point
+    };
+    let node = tree.root_node().descendant_for_point_range(check_point, check_point)?;
+
+    // Walk up looking for an incomplete method_call_expression or hash_element_expression
+    let mut current = node;
+    for _ in 0..20 {
+        match current.kind() {
+            "method_call_expression" => {
+                // Check if cursor is after -> (in the method position)
+                if let Some(invocant_node) = current.child_by_field_name("invocant") {
+                    if invocant_node.end_position() < point {
+                        let invocant_text = invocant_node.utf8_text(source).unwrap_or("").to_string();
+                        let invocant_type = resolve_node_type(invocant_node, source, analysis, point);
+                        return Some(CursorContext::Method { invocant_type, invocant_text });
+                    }
+                }
+            }
+            "hash_element_expression" => {
+                // Check if cursor is inside the {key} part
+                if let Some(base) = current.named_child(0) {
+                    if base.end_position() < point {
+                        let var_text = base.utf8_text(source).unwrap_or("").to_string();
+                        let owner_type = resolve_node_type(base, source, analysis, point);
+                        let source_sub = extract_call_name(base, source);
+                        return Some(CursorContext::HashKey { owner_type, var_text, source_sub });
+                    }
+                }
+            }
+            "ERROR" => {
+                // Incomplete expression: look for `expr->{` or `expr->` patterns
+                // in error recovery
+                if let Some(ctx) = detect_from_error_node(current, source, point, analysis) {
+                    return Some(ctx);
+                }
+            }
+            _ => {}
+        }
+        current = current.parent()?;
+    }
+    None
+}
+
+/// Resolve the type of a tree-sitter node used as an invocant or hash owner.
+/// Handles both simple variables (via `inferred_type`) and complex expressions.
+fn resolve_node_type(node: Node, source: &[u8], analysis: &FileAnalysis, point: Point) -> Option<InferredType> {
+    match node.kind() {
+        "scalar" | "array" | "hash" => {
+            let text = node.utf8_text(source).ok()?;
+            analysis.inferred_type(text, point).cloned()
+        }
+        "bareword" | "package" => {
+            let text = node.utf8_text(source).ok()?;
+            Some(InferredType::ClassName(text.to_string()))
+        }
+        _ => analysis.resolve_expression_type(node, source),
+    }
+}
+
+/// Try to detect expression context from an ERROR node.
+///
+/// When typing `get_config()->` or `$obj->get_bar()->`, tree-sitter often
+/// wraps the incomplete expression in an ERROR node. Look for patterns like:
+/// - `[call_expr] -> [method?]` → method completion on call expression
+/// - `[call_expr] -> {` → hash key completion on call expression
+fn detect_from_error_node(
+    error: Node,
+    source: &[u8],
+    point: Point,
+    analysis: &FileAnalysis,
+) -> Option<CursorContext> {
+    let mut last_expr: Option<Node> = None;
+    let mut saw_arrow = false;
+    let mut saw_brace = false;
+
+    for i in 0..error.child_count() {
+        let child = error.child(i)?;
+        if child.start_position() > point {
+            break;
+        }
+
+        match child.kind() {
+            "method_call_expression" | "function_call_expression"
+            | "ambiguous_function_call_expression" | "hash_element_expression"
+            | "scalar" | "array" | "hash" | "bareword" | "package" => {
+                last_expr = Some(child);
+                saw_arrow = false;
+                saw_brace = false;
+            }
+            "->" => {
+                saw_arrow = true;
+                saw_brace = false;
+            }
+            "{" if saw_arrow => {
+                saw_brace = true;
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_arrow {
+        return None;
+    }
+
+    if let Some(expr) = last_expr {
+        let text = expr.utf8_text(source).unwrap_or("").to_string();
+        let resolved_type = resolve_node_type(expr, source, analysis, point);
+        if saw_brace {
+            let source_sub = extract_call_name(expr, source);
+            return Some(CursorContext::HashKey { owner_type: resolved_type, var_text: text, source_sub });
+        } else {
+            return Some(CursorContext::Method { invocant_type: resolved_type, invocant_text: text });
+        }
+    }
+
+    None
 }
 
 // ---- Call context detection (tree-based) ----
@@ -497,13 +658,6 @@ pub fn selection_ranges(tree: &Tree, point: Point) -> Vec<Span> {
     ranges
 }
 
-fn node_to_span(node: Node) -> Span {
-    Span {
-        start: node.start_position(),
-        end: node.end_position(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +665,7 @@ mod tests {
     #[test]
     fn test_detect_variable_context() {
         let source = "my $x = $";
-        let ctx = detect_cursor_context(source, Point::new(0, 9));
+        let ctx = detect_cursor_context(source, Point::new(0, 9), None);
         assert_eq!(ctx, CursorContext::Variable { sigil: '$' });
     }
 
@@ -519,11 +673,12 @@ mod tests {
     fn test_detect_method_context() {
         let source = "my $obj = Foo->new; $obj->";
         // Column 26 = after the `>` in `->`
-        let ctx = detect_cursor_context(source, Point::new(0, 26));
+        let ctx = detect_cursor_context(source, Point::new(0, 26), None);
         assert_eq!(
             ctx,
             CursorContext::Method {
-                invocant: "$obj".to_string()
+                invocant_type: None,
+                invocant_text: "$obj".to_string(),
             }
         );
     }
@@ -532,11 +687,12 @@ mod tests {
     fn test_detect_method_context_mid_word() {
         // Typing `$p->mag` should still be Method context
         let source = "$p->mag";
-        let ctx = detect_cursor_context(source, Point::new(0, 7));
+        let ctx = detect_cursor_context(source, Point::new(0, 7), None);
         assert_eq!(
             ctx,
             CursorContext::Method {
-                invocant: "$p".to_string()
+                invocant_type: None,
+                invocant_text: "$p".to_string(),
             }
         );
     }
@@ -544,11 +700,12 @@ mod tests {
     #[test]
     fn test_detect_method_context_class_mid_word() {
         let source = "Foo->ne";
-        let ctx = detect_cursor_context(source, Point::new(0, 7));
+        let ctx = detect_cursor_context(source, Point::new(0, 7), None);
         assert_eq!(
             ctx,
             CursorContext::Method {
-                invocant: "Foo".to_string()
+                invocant_type: Some(InferredType::ClassName("Foo".to_string())),
+                invocant_text: "Foo".to_string(),
             }
         );
     }
@@ -556,11 +713,41 @@ mod tests {
     #[test]
     fn test_detect_hashkey_arrow() {
         let source = "$self->{";
-        let ctx = detect_cursor_context(source, Point::new(0, 8));
+        let ctx = detect_cursor_context(source, Point::new(0, 8), None);
         assert_eq!(
             ctx,
             CursorContext::HashKey {
-                var_text: "$self".to_string()
+                owner_type: None,
+                var_text: "$self".to_string(),
+                source_sub: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_hashkey_arrow_midword() {
+        let source = "$self->{ho";
+        let ctx = detect_cursor_context(source, Point::new(0, 10), None);
+        assert_eq!(
+            ctx,
+            CursorContext::HashKey {
+                owner_type: None,
+                var_text: "$self".to_string(),
+                source_sub: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_hashkey_direct_midword() {
+        let source = "$hash{ver";
+        let ctx = detect_cursor_context(source, Point::new(0, 9), None);
+        assert_eq!(
+            ctx,
+            CursorContext::HashKey {
+                owner_type: None,
+                var_text: "$hash".to_string(),
+                source_sub: None,
             }
         );
     }
@@ -568,11 +755,13 @@ mod tests {
     #[test]
     fn test_detect_hashkey_direct() {
         let source = "$hash{";
-        let ctx = detect_cursor_context(source, Point::new(0, 6));
+        let ctx = detect_cursor_context(source, Point::new(0, 6), None);
         assert_eq!(
             ctx,
             CursorContext::HashKey {
-                var_text: "$hash".to_string()
+                owner_type: None,
+                var_text: "$hash".to_string(),
+                source_sub: None,
             }
         );
     }
@@ -580,18 +769,19 @@ mod tests {
     #[test]
     fn test_detect_general() {
         let source = "my $x = foo";
-        let ctx = detect_cursor_context(source, Point::new(0, 11));
+        let ctx = detect_cursor_context(source, Point::new(0, 11), None);
         assert_eq!(ctx, CursorContext::General);
     }
 
     #[test]
     fn test_detect_class_method_context() {
         let source = "Calculator->";
-        let ctx = detect_cursor_context(source, Point::new(0, 12));
+        let ctx = detect_cursor_context(source, Point::new(0, 12), None);
         assert_eq!(
             ctx,
             CursorContext::Method {
-                invocant: "Calculator".to_string()
+                invocant_type: Some(InferredType::ClassName("Calculator".to_string())),
+                invocant_text: "Calculator".to_string(),
             }
         );
     }
@@ -645,5 +835,85 @@ mod tests {
         assert!(!ranges.is_empty());
         // Innermost should be the variable node
         assert!(ranges.len() >= 2);
+    }
+
+    fn build_fa(source: &str) -> (Tree, crate::file_analysis::FileAnalysis) {
+        let tree = parse(source);
+        let fa = crate::builder::build(&tree, source.as_bytes());
+        (tree, fa)
+    }
+
+    #[test]
+    fn test_tree_context_method_on_function_call() {
+        // get_config()-> should detect Method with HashRef type
+        let source = "sub get_config {\n    return { host => 1 };\n}\nget_config()->";
+        let (tree, fa) = build_fa(source);
+        // Cursor at end of line 3 (after "->")
+        let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), Point::new(3, 14), &fa);
+        assert!(
+            matches!(ctx, Some(CursorContext::Method { ref invocant_type, .. }) if *invocant_type == Some(InferredType::HashRef)),
+            "expected Method with HashRef type, got {:?}", ctx,
+        );
+    }
+
+    #[test]
+    fn test_tree_context_method_on_chained_call() {
+        // $f->get_bar()-> where get_bar returns Object(Bar)
+        let source = "package Foo;\nsub new { bless {}, shift }\nsub get_bar {\n    return Bar->new();\n}\npackage Bar;\nsub new { bless {}, shift }\npackage main;\nmy $f = Foo->new();\n$f->get_bar()->";
+        let (tree, fa) = build_fa(source);
+        // Line 9: $f->get_bar()->   cursor at end
+        let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), Point::new(9, 15), &fa);
+        assert!(
+            matches!(ctx, Some(CursorContext::Method { ref invocant_type, .. })
+                if invocant_type.as_ref().and_then(|t| t.class_name()) == Some("Bar")),
+            "expected Method with Object(Bar) type, got {:?}", ctx,
+        );
+    }
+
+    #[test]
+    fn test_tree_context_hashkey_on_chained_call() {
+        // $calc->get_self->get_config->{ should detect HashKey with resolved type
+        let source = "\
+package Calculator;
+sub new { bless {}, shift }
+sub get_self {
+    my ($self) = @_;
+    return $self;
+}
+sub get_config {
+    return { host => 'localhost', port => 5432 };
+}
+package main;
+my $calc = Calculator->new();
+$calc->get_self->get_config->{";
+        let (tree, fa) = build_fa(source);
+        // Last line: "$calc->get_self->get_config->{"
+        let cursor = Point::new(11, 30); // after "{"
+        let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), cursor, &fa);
+        assert!(
+            matches!(ctx, Some(CursorContext::HashKey { ref owner_type, ref source_sub, .. })
+                if *owner_type == Some(InferredType::HashRef) && *source_sub == Some("get_config".to_string())),
+            "expected HashKey with HashRef type and get_config source, got {:?}", ctx,
+        );
+    }
+
+    #[test]
+    fn test_tree_context_simple_var_returns_none() {
+        // $obj-> with nothing after: tree-sitter splits $obj and -> into separate nodes,
+        // so tree-based detection returns None. Text-based fallback handles it.
+        let source = "my $obj = Foo->new();\n$obj->";
+        let (tree, fa) = build_fa(source);
+        let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), Point::new(1, 6), &fa);
+        assert_eq!(ctx, None);
+
+        // Text-based fallback with analysis resolves the type
+        let ctx = detect_cursor_context(source, Point::new(1, 6), Some(&fa));
+        assert_eq!(
+            ctx,
+            CursorContext::Method {
+                invocant_type: Some(InferredType::ClassName("Foo".to_string())),
+                invocant_text: "$obj".to_string(),
+            }
+        );
     }
 }

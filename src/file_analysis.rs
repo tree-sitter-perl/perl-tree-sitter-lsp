@@ -16,6 +16,28 @@ pub struct Span {
     pub end: Point,
 }
 
+/// Extract the function/method name from a call expression node.
+pub(crate) fn extract_call_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "method_call_expression" => node
+            .child_by_field_name("method")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.to_string()),
+        "function_call_expression" | "ambiguous_function_call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn node_to_span(node: tree_sitter::Node) -> Span {
+    Span {
+        start: node.start_position(),
+        end: node.end_position(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FoldRange {
     pub start_line: usize,
@@ -107,6 +129,8 @@ pub enum SymbolDetail {
     Sub {
         params: Vec<ParamInfo>,
         is_method: bool,
+        /// Inferred return type from analyzing return statements.
+        return_type: Option<InferredType>,
     },
     Class {
         parent: Option<String>,
@@ -168,7 +192,11 @@ pub struct Ref {
 pub enum RefKind {
     Variable,
     FunctionCall,
-    MethodCall { invocant: String },
+    MethodCall {
+        invocant: String,
+        /// Span of the invocant node (for complex expressions needing tree resolution).
+        invocant_span: Option<Span>,
+    },
     PackageRef,
     HashKeyAccess {
         var_text: String,
@@ -196,14 +224,69 @@ pub struct TypeConstraint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum InferredType {
     /// `$p = Point->new(...)` — variable is an instance of ClassName.
     ClassName(String),
     /// `my ($self) = @_` in `package Foo` — first param is the class.
     FirstParam { package: String },
-    /// `bless { ... }, 'Foo'` — result is a Foo.
-    BlessResult { package: String },
+    /// `$x = {}` or `$x = { ... }` — unblessed hash reference.
+    HashRef,
+    /// `$x = []` or `$x = [ ... ]` — unblessed array reference.
+    ArrayRef,
+    /// `$x = sub { ... }` — code reference.
+    CodeRef,
+    /// `$x = qr/.../` — compiled regular expression.
+    Regexp,
+    /// Used in numeric context (`+`, `-`, `==`, etc.).
+    Numeric,
+    /// Used in string context (`.`, `eq`, `=~`, etc.).
+    String,
+}
+
+impl InferredType {
+    /// Extract the class name if this is an object type (ClassName or FirstParam).
+    pub fn class_name(&self) -> Option<&str> {
+        match self {
+            InferredType::ClassName(name) => Some(name.as_str()),
+            InferredType::FirstParam { package } => Some(package.as_str()),
+            _ => None,
+        }
+    }
+
+    /// True if this is any Object variant (ClassName or FirstParam).
+    pub fn is_object(&self) -> bool {
+        self.class_name().is_some()
+    }
+}
+
+/// Resolve a return type from a list of inferred types (one per return statement).
+///
+/// Rules (from spec):
+/// - All agree → that type
+/// - Object subsumes HashRef (overloaded objects are common)
+/// - Disagreement → None (Unknown)
+///
+/// The input should already have bare returns / undef filtered out.
+pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType> {
+    if return_types.is_empty() {
+        return None;
+    }
+    let first = &return_types[0];
+    if return_types.iter().all(|t| t == first) {
+        return Some(first.clone());
+    }
+    // Object subsumes HashRef: if some returns are Object(X) and others are HashRef,
+    // the Object wins (overloaded hash access is common in Perl).
+    let mut object = None;
+    for t in return_types {
+        if t.is_object() {
+            object = Some(t.clone());
+        } else if *t != InferredType::HashRef {
+            // Non-HashRef, non-Object disagreement → Unknown
+            return None;
+        }
+    }
+    object
 }
 
 // ---- Hash key owner (for scope graph) ----
@@ -212,6 +295,20 @@ pub enum InferredType {
 pub enum HashKeyOwner {
     Class(String),
     Variable { name: String, def_scope: ScopeId },
+    /// Hash keys from a sub's return value: `sub get_config { return { host => 1 } }`
+    Sub(String),
+}
+
+// ---- Call binding ----
+
+/// A variable assigned from a function call: `my $cfg = get_config()`.
+/// Stored in FileAnalysis so query-time resolution can follow the chain.
+#[derive(Debug, Clone)]
+pub struct CallBinding {
+    pub variable: String,
+    pub func_name: String,
+    pub scope: ScopeId,
+    pub span: Span,
 }
 
 // ---- Import ----
@@ -277,6 +374,7 @@ pub struct FileAnalysis {
     pub type_constraints: Vec<TypeConstraint>,
     pub fold_ranges: Vec<FoldRange>,
     pub imports: Vec<Import>,
+    pub call_bindings: Vec<CallBinding>,
 
     // Indices (built in post-pass)
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
@@ -295,6 +393,7 @@ impl FileAnalysis {
         type_constraints: Vec<TypeConstraint>,
         fold_ranges: Vec<FoldRange>,
         imports: Vec<Import>,
+        call_bindings: Vec<CallBinding>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -303,6 +402,7 @@ impl FileAnalysis {
             type_constraints,
             fold_ranges,
             imports,
+            call_bindings,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -450,6 +550,226 @@ impl FileAnalysis {
         best.map(|tc| &tc.inferred_type)
     }
 
+    /// Get the return type of a named sub/method.
+    pub fn sub_return_type(&self, name: &str) -> Option<&InferredType> {
+        for sym in &self.symbols {
+            if sym.name == name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
+                    return return_type.as_ref();
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve the type of an arbitrary CST expression node.
+    ///
+    /// Recursive tree walk that composes existing atoms:
+    /// - `scalar` → `inferred_type(var_text, point)`
+    /// - bareword (class name) → `Object(ClassName)`
+    /// - `method_call_expression` → resolve invocant → find method → return type
+    /// - `function_call_expression` → `sub_return_type(name)`
+    /// - `hash_element_expression` → resolve base (for chaining)
+    ///
+    /// Used at query time (completion, goto-def, hover) — not during the build walk.
+    pub fn resolve_expression_type(&self, node: tree_sitter::Node, source: &[u8]) -> Option<InferredType> {
+        let point = node.start_position();
+        match node.kind() {
+            "scalar" => {
+                let text = node.utf8_text(source).ok()?;
+                self.inferred_type(text, point).cloned()
+            }
+            "package" | "bareword" => {
+                // Bareword = class name
+                let text = node.utf8_text(source).ok()?;
+                Some(InferredType::ClassName(text.to_string()))
+            }
+            "method_call_expression" => {
+                let invocant_node = node.child_by_field_name("invocant")?;
+                let invocant_type = self.resolve_expression_type(invocant_node, source)?;
+                let class_name = invocant_type.class_name()?;
+                let method_name = node.child_by_field_name("method")?;
+                let method_text = method_name.utf8_text(source).ok()?;
+                // Constructor call returns Object(ClassName)
+                if method_text == "new" {
+                    return Some(InferredType::ClassName(class_name.to_string()));
+                }
+                // Find method's return type
+                self.find_method_return_type(class_name, method_text)
+            }
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                let func_node = node.child_by_field_name("function")?;
+                let name = func_node.utf8_text(source).ok()?;
+                self.sub_return_type(name).cloned()
+                    .or_else(|| builtin_return_type(name))
+            }
+            "func1op_call_expression" | "func0op_call_expression" => {
+                let name = node.child(0)?.utf8_text(source).ok()?;
+                builtin_return_type(name)
+            }
+            "hash_element_expression" => {
+                // For chaining: resolve the base expression
+                let base = node.named_child(0)?;
+                self.resolve_expression_type(base, source)
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve the hash key owner from a tree node at a given point.
+    ///
+    /// Finds the enclosing `hash_element_expression`, resolves its base expression
+    /// type, and returns the appropriate `HashKeyOwner`. Used by goto-def,
+    /// references, completion, and highlights for chained hash access like
+    /// `$calc->get_self->get_config->{host}`.
+    pub fn resolve_hash_owner_from_tree(
+        &self,
+        tree: &tree_sitter::Tree,
+        source: &[u8],
+        point: Point,
+    ) -> Option<HashKeyOwner> {
+        let hash_elem = tree.root_node()
+            .descendant_for_point_range(point, point)
+            .and_then(|n| find_ancestor(n, "hash_element_expression"))?;
+        let base = hash_elem.named_child(0)?;
+        let ty = self.resolve_expression_type(base, source)?;
+
+        // Extract the function/method name for Sub owner
+        let sub_name = match base.kind() {
+            "method_call_expression" => base.child_by_field_name("method")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.to_string()),
+            "function_call_expression" | "ambiguous_function_call_expression" =>
+                base.child_by_field_name("function")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string()),
+            _ => None,
+        };
+
+        if let Some(name) = sub_name {
+            // Check Sub owner has defs; fall through to class if not
+            let sub_owner = HashKeyOwner::Sub(name);
+            if !self.hash_key_defs_for_owner(&sub_owner).is_empty() {
+                return Some(sub_owner);
+            }
+        }
+
+        if let Some(cn) = ty.class_name() {
+            return Some(HashKeyOwner::Class(cn.to_string()));
+        }
+
+        None
+    }
+
+    /// Check if cursor is on a bareword or string inside call arguments.
+    /// Returns the text if so (could be a named arg key).
+    fn call_arg_key_at(&self, tree: &tree_sitter::Tree, source: &[u8], point: Point) -> Option<String> {
+        let node = tree.root_node().descendant_for_point_range(point, point)?;
+        let key_node = match node.kind() {
+            "autoquoted_bareword" => node,
+            "string_literal" | "interpolated_string_literal" => node,
+            _ => {
+                let parent = node.parent()?;
+                if matches!(parent.kind(), "string_literal" | "interpolated_string_literal") {
+                    parent
+                } else {
+                    return None;
+                }
+            }
+        };
+        let text = key_node.utf8_text(source).ok()?;
+        if (text.starts_with('\'') || text.starts_with('"')) && text.len() >= 2 {
+            Some(text[1..text.len()-1].to_string())
+        } else if text.starts_with('\'') || text.starts_with('"') {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    }
+
+    /// Find a method's return type within a class/package.
+    fn find_method_return_type(&self, class_name: &str, method_name: &str) -> Option<InferredType> {
+        for sym in &self.symbols {
+            if sym.name == method_name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                if self.symbol_in_class(sym.id, class_name) {
+                    if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
+                        return return_type.clone();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a `:param` field in a class by its bare name (without sigil).
+    fn find_param_field(&self, class_name: &str, key: &str) -> Option<Span> {
+        for sym in &self.symbols {
+            if matches!(sym.kind, SymKind::Field) {
+                if let SymbolDetail::Field { ref attributes, .. } = sym.detail {
+                    if attributes.contains(&"param".to_string())
+                        && self.symbol_in_class(sym.id, class_name)
+                    {
+                        let bare = sym.name
+                            .trim_start_matches('$')
+                            .trim_start_matches('@')
+                            .trim_start_matches('%');
+                        if bare == key {
+                            return Some(sym.selection_span);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Format a method completion detail string, appending return type if known.
+    fn method_detail(&self, class_name: &str, method_name: &str) -> String {
+        if let Some(ref rt) = self.find_method_return_type(class_name, method_name) {
+            format!("{} → {}", class_name, format_inferred_type(rt))
+        } else {
+            class_name.to_string()
+        }
+    }
+
+    /// Complete methods for a known class name (no invocant resolution needed).
+    pub fn complete_methods_for_class(&self, class_name: &str) -> Vec<CompletionCandidate> {
+        let mut candidates = Vec::new();
+
+        // Check for class definition → implicit new
+        for sym in &self.symbols {
+            if matches!(sym.kind, SymKind::Class) && sym.name == class_name {
+                candidates.push(CompletionCandidate {
+                    label: "new".to_string(),
+                    kind: SymKind::Method,
+                    detail: Some(self.method_detail(class_name, "new")),
+                    insert_text: None,
+                    sort_priority: PRIORITY_LOCAL,
+                    additional_edits: vec![],
+                });
+                break;
+            }
+        }
+
+        // Find all subs/methods in this class/package
+        for sym in &self.symbols {
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                if self.symbol_in_class(sym.id, class_name) {
+                    candidates.push(CompletionCandidate {
+                        label: sym.name.clone(),
+                        kind: sym.kind,
+                        detail: Some(self.method_detail(class_name, &sym.name)),
+                        insert_text: None,
+                        sort_priority: PRIORITY_LOCAL,
+                        additional_edits: vec![],
+                    });
+                }
+            }
+        }
+
+        candidates
+    }
+
     /// Get the enclosing package name at a point.
     #[allow(dead_code)]
     pub fn package_at(&self, point: Point) -> Option<&str> {
@@ -522,7 +842,9 @@ impl FileAnalysis {
 
     /// Find the ref at a given point (cursor position).
     pub fn ref_at(&self, point: Point) -> Option<&Ref> {
-        self.refs.iter().find(|r| contains_point(&r.span, point))
+        self.refs.iter()
+            .filter(|r| contains_point(&r.span, point))
+            .min_by_key(|r| span_size(&r.span))
     }
 
     /// Find the symbol whose selection_span contains the point.
@@ -533,7 +855,7 @@ impl FileAnalysis {
     // ---- High-level queries ----
 
     /// Go-to-definition: resolve the symbol at cursor to its definition span.
-    pub fn find_definition(&self, point: Point) -> Option<Span> {
+    pub fn find_definition(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Option<Span> {
         // 1. Check if cursor is on a ref
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
@@ -550,8 +872,27 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::MethodCall { invocant } => {
-                    let class_name = self.resolve_invocant_class(invocant, r.scope, point);
+                RefKind::MethodCall { ref invocant, ref invocant_span, .. } => {
+                    let class_name = self.resolve_method_invocant(invocant, invocant_span, r.scope, point, tree, source_bytes);
+
+                    // Check if cursor is on a named arg key in the call args,
+                    // not on the method name itself. Resolve to hash key def or :param field.
+                    if let (Some(t), Some(s), Some(ref cn)) = (tree, source_bytes, &class_name) {
+                        if let Some(key_name) = self.call_arg_key_at(t, s, point) {
+                            // Try hash key defs (bless hash)
+                            let owner = HashKeyOwner::Class(cn.to_string());
+                            for def in self.hash_key_defs_for_owner(&owner) {
+                                if def.name == key_name {
+                                    return Some(def.selection_span);
+                                }
+                            }
+                            // Try :param fields (Perl 5.38+ classes)
+                            if let Some(span) = self.find_param_field(cn, &key_name) {
+                                return Some(span);
+                            }
+                        }
+                    }
+
                     if let Some(ref cn) = class_name {
                         // Find method in the resolved class
                         if let Some(span) = self.find_method_in_class(cn, &r.target_name) {
@@ -573,8 +914,14 @@ impl FileAnalysis {
                 RefKind::PackageRef => {
                     return self.find_package_or_class(&r.target_name);
                 }
-                RefKind::HashKeyAccess { owner, .. } => {
-                    if let Some(ref owner) = owner {
+                RefKind::HashKeyAccess { ref owner, .. } => {
+                    // Try the pre-resolved owner first
+                    let resolved_owner = owner.clone().or_else(|| {
+                        let tree = tree?;
+                        let source = source_bytes?;
+                        self.resolve_hash_owner_from_tree(tree, source, r.span.start)
+                    });
+                    if let Some(ref owner) = resolved_owner {
                         for def in self.hash_key_defs_for_owner(owner) {
                             if def.name == r.target_name {
                                 return Some(def.selection_span);
@@ -598,118 +945,108 @@ impl FileAnalysis {
     }
 
     /// Find all references to the symbol at cursor.
-    pub fn find_references(&self, point: Point) -> Vec<Span> {
-        if let Some((target_id, include_decl)) = self.resolve_target_at(point) {
-            let sym = self.symbol(target_id);
-            let mut spans: Vec<Span> = Vec::new();
-
-            // Include the declaration itself
-            if include_decl {
-                spans.push(sym.selection_span);
-            }
-
-            // Collect all refs that resolve to this symbol
-            for r in &self.refs {
-                if r.resolves_to == Some(target_id) {
-                    spans.push(r.span);
-                }
-            }
-
-            // For subs/methods/packages/classes, also find refs by name
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
-                for r in &self.refs {
-                    if r.target_name == sym.name && r.resolves_to.is_none() {
-                        match (&r.kind, &sym.kind) {
-                            (RefKind::FunctionCall, SymKind::Sub) => spans.push(r.span),
-                            (RefKind::MethodCall { .. }, SymKind::Sub | SymKind::Method) => spans.push(r.span),
-                            (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module) => spans.push(r.span),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            // For hash key definitions, find all accesses with same owner + key name
-            if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
-                for r in &self.refs {
-                    if let RefKind::HashKeyAccess { owner: Some(ref ro), .. } = r.kind {
-                        if ro == owner && r.target_name == sym.name {
-                            spans.push(r.span);
-                        }
-                    }
-                }
-            }
-
-            spans.sort_by_key(|s| (s.start.row, s.start.column));
-            spans.dedup_by(|a, b| a.start == b.start && a.end == b.end);
-            spans
+    pub fn find_references(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Vec<Span> {
+        if let Some((target_id, include_decl)) = self.resolve_target_at(point, tree, source_bytes) {
+            let mut results = self.collect_refs_for_target(target_id, include_decl, tree, source_bytes);
+            results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
+            results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
+            results.into_iter().map(|(span, _)| span).collect()
         } else {
             Vec::new()
         }
     }
 
     /// Document highlights: like references but with read/write annotation.
-    pub fn find_highlights(&self, point: Point) -> Vec<(Span, AccessKind)> {
-        if let Some((target_id, _)) = self.resolve_target_at(point) {
-            let sym = self.symbol(target_id);
-            let mut highlights: Vec<(Span, AccessKind)> = Vec::new();
-
-            // Declaration
-            highlights.push((sym.selection_span, AccessKind::Declaration));
-
-            // All refs
-            for r in &self.refs {
-                if r.resolves_to == Some(target_id) {
-                    highlights.push((r.span, r.access));
-                }
-            }
-
-            // Name-matched refs for subs/packages
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
-                for r in &self.refs {
-                    if r.target_name == sym.name && r.resolves_to.is_none() {
-                        match (&r.kind, &sym.kind) {
-                            (RefKind::FunctionCall, SymKind::Sub) => highlights.push((r.span, r.access)),
-                            (RefKind::MethodCall { .. }, SymKind::Sub | SymKind::Method) => highlights.push((r.span, r.access)),
-                            (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module) => highlights.push((r.span, r.access)),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            // Hash key refs
-            if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
-                for r in &self.refs {
-                    if let RefKind::HashKeyAccess { owner: Some(ref ro), .. } = r.kind {
-                        if ro == owner && r.target_name == sym.name {
-                            highlights.push((r.span, r.access));
-                        }
-                    }
-                }
-            }
-
-            highlights.sort_by_key(|(s, _)| (s.start.row, s.start.column));
-            highlights.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
-            highlights
+    pub fn find_highlights(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Vec<(Span, AccessKind)> {
+        if let Some((target_id, _)) = self.resolve_target_at(point, tree, source_bytes) {
+            let mut results = self.collect_refs_for_target(target_id, true, tree, source_bytes);
+            results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
+            results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
+            results
         } else {
             Vec::new()
         }
     }
 
+    /// Shared implementation for find_references and find_highlights.
+    fn collect_refs_for_target(
+        &self,
+        target_id: SymbolId,
+        include_decl: bool,
+        tree: Option<&tree_sitter::Tree>,
+        source_bytes: Option<&[u8]>,
+    ) -> Vec<(Span, AccessKind)> {
+        let sym = self.symbol(target_id);
+        let mut results: Vec<(Span, AccessKind)> = Vec::new();
+
+        // Include the declaration itself
+        if include_decl {
+            results.push((sym.selection_span, AccessKind::Declaration));
+        }
+
+        // Collect all refs that resolve to this symbol
+        for r in &self.refs {
+            if r.resolves_to == Some(target_id) {
+                results.push((r.span, r.access));
+            }
+        }
+
+        // For subs/methods/packages/classes, also find refs by name
+        if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
+            for r in &self.refs {
+                if r.target_name == sym.name && r.resolves_to.is_none() {
+                    match (&r.kind, &sym.kind) {
+                        (RefKind::FunctionCall, SymKind::Sub) => results.push((r.span, r.access)),
+                        (RefKind::MethodCall { .. }, SymKind::Sub | SymKind::Method) => results.push((r.span, r.access)),
+                        (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module) => results.push((r.span, r.access)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // For hash key definitions, find all accesses with same owner + key name
+        if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
+            for r in &self.refs {
+                if let RefKind::HashKeyAccess { owner: ref ro, .. } = r.kind {
+                    if r.target_name != sym.name {
+                        continue;
+                    }
+                    let matches = match ro {
+                        Some(ref ro) => ro == owner,
+                        None => {
+                            if let (Some(t), Some(s)) = (tree, source_bytes) {
+                                self.resolve_hash_owner_from_tree(t, s, r.span.start)
+                                    .as_ref()
+                                    .map_or(false, |resolved| resolved == owner)
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if matches {
+                        results.push((r.span, r.access));
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
     /// Hover info: return display text for the symbol at cursor.
-    pub fn hover_info(&self, point: Point, source: &str) -> Option<String> {
+    pub fn hover_info(&self, point: Point, source: &str, tree: Option<&tree_sitter::Tree>) -> Option<String> {
         // Check refs first
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => {
                     if let Some(sym_id) = r.resolves_to {
                         let sym = self.symbol(sym_id);
-                        return Some(self.format_symbol_hover(sym, source));
+                        return Some(self.format_symbol_hover_at(sym, source, point));
                     }
                     // Unresolved variable — try resolve ourselves
                     if let Some(sym) = self.resolve_variable(&r.target_name, point) {
-                        return Some(self.format_symbol_hover(sym, source));
+                        return Some(self.format_symbol_hover_at(sym, source, point));
                     }
                 }
                 RefKind::FunctionCall => {
@@ -720,12 +1057,18 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::MethodCall { invocant } => {
-                    let class_name = self.resolve_invocant_class(invocant, r.scope, point);
+                RefKind::MethodCall { ref invocant, ref invocant_span, .. } => {
+                    let class_name = self.resolve_method_invocant(
+                        invocant, invocant_span, r.scope, point, tree, Some(source.as_bytes()),
+                    );
                     if let Some(ref cn) = class_name {
                         if let Some(span) = self.find_method_in_class(cn, &r.target_name) {
                             let line = source_line_at(source, span.start.row);
-                            return Some(format!("```perl\n{}\n```\n\n*class {}*", line.trim(), cn));
+                            let mut text = format!("```perl\n{}\n```\n\n*class {}*", line.trim(), cn);
+                            if let Some(ref rt) = self.find_method_return_type(cn, &r.target_name) {
+                                text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+                            }
+                            return Some(text);
                         }
                     }
                     // Fallback
@@ -774,7 +1117,7 @@ impl FileAnalysis {
 
     /// Rename: return all spans + new text for renaming the symbol at cursor.
     pub fn rename_at(&self, point: Point, new_name: &str) -> Option<Vec<(Span, String)>> {
-        let refs = self.find_references(point);
+        let refs = self.find_references(point, None, None);
         if refs.is_empty() {
             return None;
         }
@@ -810,7 +1153,7 @@ impl FileAnalysis {
     // ---- Internal resolution helpers ----
 
     /// Find the target symbol for the thing at cursor. Returns (SymbolId, include_decl_in_refs).
-    fn resolve_target_at(&self, point: Point) -> Option<(SymbolId, bool)> {
+    fn resolve_target_at(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Option<(SymbolId, bool)> {
         // Check refs first
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
@@ -830,8 +1173,10 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::MethodCall { invocant } => {
-                    let class_name = self.resolve_invocant_class(invocant, r.scope, point);
+                RefKind::MethodCall { ref invocant, ref invocant_span } => {
+                    let class_name = self.resolve_method_invocant(
+                        invocant, invocant_span, r.scope, point, tree, source_bytes,
+                    );
                     // Try class-specific method first
                     if let Some(ref cn) = class_name {
                         for &sid in self.symbols_named(&r.target_name) {
@@ -857,8 +1202,13 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::HashKeyAccess { owner, .. } => {
-                    if let Some(ref owner) = owner {
+                RefKind::HashKeyAccess { ref owner, .. } => {
+                    let resolved_owner = owner.clone().or_else(|| {
+                        let tree = tree?;
+                        let source = source_bytes?;
+                        self.resolve_hash_owner_from_tree(tree, source, r.span.start)
+                    });
+                    if let Some(ref owner) = resolved_owner {
                         for def in self.hash_key_defs_for_owner(owner) {
                             if def.name == r.target_name {
                                 return Some((def.id, true));
@@ -877,16 +1227,39 @@ impl FileAnalysis {
         None
     }
 
+    /// Resolve a method call's invocant to a class name, using tree-based resolution
+    /// for complex expressions when available.
+    fn resolve_method_invocant(
+        &self,
+        invocant: &str,
+        invocant_span: &Option<Span>,
+        scope: ScopeId,
+        point: Point,
+        tree: Option<&tree_sitter::Tree>,
+        source_bytes: Option<&[u8]>,
+    ) -> Option<String> {
+        // Try tree-based resolution for complex invocants, fall through on failure
+        if let (Some(span), Some(tree), Some(src)) = (invocant_span, tree, source_bytes) {
+            if let Some(node) = tree.root_node()
+                .descendant_for_point_range(span.start, span.end)
+            {
+                if let Some(ty) = self.resolve_expression_type(node, src) {
+                    if let Some(cn) = ty.class_name() {
+                        return Some(cn.to_string());
+                    }
+                }
+            }
+        }
+        // Fall back to string-based resolution
+        self.resolve_invocant_class(invocant, scope, point)
+    }
+
     /// Resolve an invocant string to a class name.
     fn resolve_invocant_class(&self, invocant: &str, scope: ScopeId, point: Point) -> Option<String> {
         if invocant.starts_with('$') || invocant.starts_with('@') || invocant.starts_with('%') {
             // Variable invocant → infer type
             self.inferred_type(invocant, point)
-                .and_then(|t| match t {
-                    InferredType::ClassName(name) => Some(name.clone()),
-                    InferredType::FirstParam { package } => Some(package.clone()),
-                    InferredType::BlessResult { package } => Some(package.clone()),
-                })
+                .and_then(|t| t.class_name().map(|s| s.to_string()))
                 .or_else(|| {
                     // Check if we're inside a class and $self is the invocant
                     let chain = self.scope_chain(scope);
@@ -921,7 +1294,7 @@ impl FileAnalysis {
     }
 
     /// Check if a symbol is defined within a class/package.
-    fn symbol_in_class(&self, sym_id: SymbolId, class_name: &str) -> bool {
+    pub(crate) fn symbol_in_class(&self, sym_id: SymbolId, class_name: &str) -> bool {
         let sym = self.symbol(sym_id);
         // Use scope_at to find the innermost scope containing this symbol.
         // For subs, this finds the Sub scope (which has the correct package
@@ -953,8 +1326,28 @@ impl FileAnalysis {
     }
 
     fn format_symbol_hover(&self, sym: &Symbol, source: &str) -> String {
+        self.format_symbol_hover_at(sym, source, sym.selection_span.end)
+    }
+
+    fn format_symbol_hover_at(&self, sym: &Symbol, source: &str, at: Point) -> String {
         let line = source_line_at(source, sym.span.start.row);
-        format!("```perl\n{}\n```", line.trim())
+        let mut text = format!("```perl\n{}\n```", line.trim());
+
+        // Append inferred type for variables/fields
+        if matches!(sym.kind, SymKind::Variable | SymKind::Field) {
+            if let Some(it) = self.inferred_type(&sym.name, at) {
+                text.push_str(&format!("\n\n*type: {}*", format_inferred_type(it)));
+            }
+        }
+
+        // Append return type for subs/methods
+        if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+            if let SymbolDetail::Sub { return_type: Some(ref rt), .. } = sym.detail {
+                text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+            }
+        }
+
+        text
     }
 
     // ---- Document outline ----
@@ -1147,6 +1540,8 @@ pub struct SignatureInfo {
     pub name: String,
     pub params: Vec<ParamInfo>,
     pub is_method: bool,
+    /// End of the sub body — used to query inferred types for params.
+    pub body_end: Point,
 }
 
 // ---- Completion query methods ----
@@ -1206,6 +1601,7 @@ impl FileAnalysis {
                         DeclKind::ForVar => "for".to_string(),
                     })
                 }
+                SymbolDetail::Field { .. } => Some("field".to_string()),
                 _ => None,
             };
 
@@ -1224,7 +1620,6 @@ impl FileAnalysis {
 
     /// Complete methods for an invocant (variable or class name) at a point.
     pub fn complete_methods(&self, invocant: &str, point: Point) -> Vec<CompletionCandidate> {
-        // Resolve invocant → class name
         let class_name = if !invocant.starts_with('$')
             && !invocant.starts_with('@')
             && !invocant.starts_with('%')
@@ -1239,75 +1634,9 @@ impl FileAnalysis {
         };
 
         if let Some(ref cn) = class_name {
-            // Try to find methods scoped to this class
-            let mut candidates = Vec::new();
-            let mut found_class = false;
-
-            // Check for class definition → collect its methods
-            for sym in &self.symbols {
-                if matches!(sym.kind, SymKind::Class) && sym.name == *cn {
-                    found_class = true;
-                    // Implicit new for core classes
-                    candidates.push(CompletionCandidate {
-                        label: "new".to_string(),
-                        kind: SymKind::Method,
-                        detail: Some(format!("{}->new", cn)),
-                        insert_text: None,
-                        sort_priority: PRIORITY_LOCAL,
-                    additional_edits: vec![],
-                    });
-                    break;
-                }
-            }
-
-            // Find all subs/methods in this class/package
-            for sym in &self.symbols {
-                if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                    if self.symbol_in_class(sym.id, cn) {
-                        candidates.push(CompletionCandidate {
-                            label: sym.name.clone(),
-                            kind: sym.kind,
-                            detail: Some(cn.clone()),
-                            insert_text: None,
-                            sort_priority: PRIORITY_LOCAL,
-                    additional_edits: vec![],
-                        });
-                    }
-                }
-            }
-
+            let candidates = self.complete_methods_for_class(cn);
             if !candidates.is_empty() {
                 return candidates;
-            }
-
-            // Package with subs
-            if !found_class {
-                for sym in &self.symbols {
-                    if matches!(sym.kind, SymKind::Package) && sym.name == *cn {
-                        found_class = true;
-                        break;
-                    }
-                }
-            }
-            if found_class {
-                // Return subs scoped to this package
-                for sym in &self.symbols {
-                    if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                        if self.symbol_in_class(sym.id, cn) {
-                            candidates.push(CompletionCandidate {
-                                label: sym.name.clone(),
-                                kind: sym.kind,
-                                detail: Some(cn.clone()),
-                                insert_text: None,
-                                sort_priority: PRIORITY_LOCAL,
-                    additional_edits: vec![],
-                            });
-                        }
-                    }
-                }
-                if !candidates.is_empty() {
-                    return candidates;
-                }
             }
         }
 
@@ -1328,52 +1657,62 @@ impl FileAnalysis {
                 ),
                 insert_text: None,
                 sort_priority: PRIORITY_FILE_WIDE,
-                    additional_edits: vec![],
+                additional_edits: vec![],
             })
             .collect()
     }
 
-    /// Complete hash keys for a variable at a point.
-    pub fn complete_hash_keys(&self, var_text: &str, point: Point) -> Vec<CompletionCandidate> {
-        let owner = self.resolve_hash_key_owner(var_text, point);
-        let owner = match owner {
-            Some(o) => o,
-            None => return Vec::new(),
-        };
-
-        let defs = self.hash_key_defs_for_owner(&owner);
+    /// Complete hash keys for a resolved owner.
+    fn complete_hash_keys_for_owner(&self, owner: &HashKeyOwner) -> Vec<CompletionCandidate> {
+        let defs = self.hash_key_defs_for_owner(owner);
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
 
         for def in defs {
-            if seen.contains(&def.name) {
+            if !seen.insert(def.name.clone()) {
                 continue;
             }
-            seen.insert(def.name.clone());
 
             let is_dynamic = matches!(
                 &def.detail,
                 SymbolDetail::HashKeyDef { is_dynamic: true, .. }
             );
 
-            let detail = match &owner {
-                HashKeyOwner::Class(name) => Some(format!("{}->{{{}}}", name, def.name)),
-                HashKeyOwner::Variable { name, .. } => {
-                    Some(format!("{}{{{}}}", name, def.name))
-                }
+            let detail = match owner {
+                HashKeyOwner::Class(name) => format!("{}->{{{}}}", name, def.name),
+                HashKeyOwner::Variable { name, .. } => format!("{}{{{}}}", name, def.name),
+                HashKeyOwner::Sub(name) => format!("{}()->{{{}}}", name, def.name),
             };
 
             candidates.push(CompletionCandidate {
                 label: def.name.clone(),
                 kind: SymKind::Variable,
-                detail,
+                detail: Some(detail),
                 insert_text: None,
                 sort_priority: if is_dynamic { PRIORITY_DYNAMIC } else { PRIORITY_FILE_WIDE },
-                    additional_edits: vec![],
+                additional_edits: vec![],
             });
         }
 
         candidates
+    }
+
+    /// Complete hash keys for a variable at a point.
+    pub fn complete_hash_keys(&self, var_text: &str, point: Point) -> Vec<CompletionCandidate> {
+        match self.resolve_hash_key_owner(var_text, point) {
+            Some(owner) => self.complete_hash_keys_for_owner(&owner),
+            None => Vec::new(),
+        }
+    }
+
+    /// Complete hash keys for a known class name (from expression type resolution).
+    pub fn complete_hash_keys_for_class(&self, class_name: &str, _point: Point) -> Vec<CompletionCandidate> {
+        self.complete_hash_keys_for_owner(&HashKeyOwner::Class(class_name.to_string()))
+    }
+
+    /// Complete hash keys for a sub's return value (from expression type resolution).
+    pub fn complete_hash_keys_for_sub(&self, sub_name: &str, _point: Point) -> Vec<CompletionCandidate> {
+        self.complete_hash_keys_for_owner(&HashKeyOwner::Sub(sub_name.to_string()))
     }
 
     /// General completion: all variables (all sigils) + subs + packages.
@@ -1520,7 +1859,7 @@ impl FileAnalysis {
         let sub_sym = self.find_sub_for_call(name, is_method, invocant, point)?;
 
         let (params, sym_is_method) = match &sub_sym.detail {
-            SymbolDetail::Sub { params, is_method } => (params.clone(), *is_method),
+            SymbolDetail::Sub { params, is_method, .. } => (params.clone(), *is_method),
             _ => return None,
         };
 
@@ -1543,6 +1882,7 @@ impl FileAnalysis {
             name: name.to_string(),
             params,
             is_method,
+            body_end: sub_sym.span.end,
         })
     }
 
@@ -1606,13 +1946,18 @@ impl FileAnalysis {
 
         // Try type inference → class owner
         if let Some(it) = self.inferred_type(var_text, point) {
-            let class_name = match it {
-                InferredType::ClassName(n) => Some(n.clone()),
-                InferredType::FirstParam { package } => Some(package.clone()),
-                InferredType::BlessResult { package } => Some(package.clone()),
-            };
-            if let Some(cn) = class_name {
-                return Some(HashKeyOwner::Class(cn));
+            if let Some(cn) = it.class_name() {
+                return Some(HashKeyOwner::Class(cn.to_string()));
+            }
+        }
+
+        // Check call bindings → follow to sub's return hash keys
+        for cb in &self.call_bindings {
+            if cb.variable == var_text
+                && cb.span.start <= point
+                && contains_point(&self.scopes[cb.scope.0 as usize].span, point)
+            {
+                return Some(HashKeyOwner::Sub(cb.func_name.clone()));
             }
         }
 
@@ -1647,7 +1992,7 @@ impl FileAnalysis {
                             return Some(owner.clone());
                         }
                     }
-                    HashKeyOwner::Class(_) => {}
+                    HashKeyOwner::Class(_) | HashKeyOwner::Sub(_) => {}
                 }
             }
         }
@@ -1840,9 +2185,21 @@ fn generate_cross_sigil_candidates(
 
 // ---- Helpers ----
 
-fn contains_point(span: &Span, point: Point) -> bool {
+pub(crate) fn contains_point(span: &Span, point: Point) -> bool {
     (span.start.row < point.row || (span.start.row == point.row && span.start.column <= point.column))
         && (point.row < span.end.row || (point.row == span.end.row && point.column <= span.end.column))
+}
+
+/// Walk up from a node to find an ancestor of the given kind.
+fn find_ancestor<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    let mut current = node;
+    for _ in 0..20 {
+        if current.kind() == kind {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+    None
 }
 
 fn span_size(span: &Span) -> usize {
@@ -1858,4 +2215,241 @@ fn span_size(span: &Span) -> usize {
 
 fn source_line_at(source: &str, row: usize) -> &str {
     source.lines().nth(row).unwrap_or("")
+}
+
+/// Return the known return type for a Perl builtin function, if any.
+pub(crate) fn builtin_return_type(name: &str) -> Option<InferredType> {
+    match name {
+        // Numeric returns
+        "time" | "length" | "index" | "rindex" | "abs" | "int" | "sqrt"
+        | "hex" | "oct" | "ord" | "rand" | "pos" | "tell"
+        | "fileno" => Some(InferredType::Numeric),
+
+        // String returns
+        "join" | "uc" | "lc" | "ucfirst" | "lcfirst" | "substr" | "sprintf"
+        | "ref" | "chr" | "crypt" | "quotemeta" | "pack" | "readline"
+        | "readlink" => Some(InferredType::String),
+
+        _ => None,
+    }
+}
+
+/// Type constraint to push on the first argument of a Perl builtin.
+pub(crate) fn builtin_first_arg_type(name: &str) -> Option<InferredType> {
+    match name {
+        // Numeric arg builtins
+        "abs" | "int" | "sqrt" | "chr"
+        | "sin" | "cos" | "atan2" | "log" | "exp" => Some(InferredType::Numeric),
+
+        // String arg builtins
+        "uc" | "lc" | "ucfirst" | "lcfirst" | "length" | "chomp" | "chop"
+        | "substr" | "index" | "rindex" | "quotemeta"
+        | "hex" | "oct" | "ord" => Some(InferredType::String),
+
+        _ => None,
+    }
+}
+
+pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
+    match ty {
+        InferredType::ClassName(name) => name.clone(),
+        InferredType::FirstParam { package } => package.clone(),
+        InferredType::HashRef => "HashRef".to_string(),
+        InferredType::ArrayRef => "ArrayRef".to_string(),
+        InferredType::CodeRef => "CodeRef".to_string(),
+        InferredType::Regexp => "Regexp".to_string(),
+        InferredType::Numeric => "Numeric".to_string(),
+        InferredType::String => "String".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Point;
+
+    /// Helper: build a minimal FileAnalysis with a single file scope and given type constraints.
+    fn fa_with_constraints(constraints: Vec<TypeConstraint>) -> FileAnalysis {
+        FileAnalysis::new(
+            vec![Scope {
+                id: ScopeId(0),
+                parent: None,
+                kind: ScopeKind::File,
+                span: Span { start: Point::new(0, 0), end: Point::new(10, 0) },
+                package: None,
+            }],
+            vec![],
+            vec![],
+            constraints,
+            vec![],
+            vec![],
+            vec![],
+        )
+    }
+
+    fn constraint(var: &str, row: usize, inferred_type: InferredType) -> TypeConstraint {
+        TypeConstraint {
+            variable: var.to_string(),
+            scope: ScopeId(0),
+            constraint_span: Span { start: Point::new(row, 0), end: Point::new(row, 20) },
+            inferred_type,
+        }
+    }
+
+    // ---- Type constraint resolution tests ----
+
+    #[test]
+    fn test_resolve_hashref_type() {
+        let fa = fa_with_constraints(vec![constraint("$href", 0, InferredType::HashRef)]);
+        assert_eq!(fa.inferred_type("$href", Point::new(1, 0)), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_resolve_arrayref_type() {
+        let fa = fa_with_constraints(vec![constraint("$aref", 0, InferredType::ArrayRef)]);
+        assert_eq!(fa.inferred_type("$aref", Point::new(1, 0)), Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_resolve_coderef_type() {
+        let fa = fa_with_constraints(vec![constraint("$cref", 0, InferredType::CodeRef)]);
+        assert_eq!(fa.inferred_type("$cref", Point::new(1, 0)), Some(&InferredType::CodeRef));
+    }
+
+    #[test]
+    fn test_resolve_regexp_type() {
+        let fa = fa_with_constraints(vec![constraint("$re", 0, InferredType::Regexp)]);
+        assert_eq!(fa.inferred_type("$re", Point::new(1, 0)), Some(&InferredType::Regexp));
+    }
+
+    #[test]
+    fn test_resolve_numeric_type() {
+        let fa = fa_with_constraints(vec![constraint("$n", 0, InferredType::Numeric)]);
+        assert_eq!(fa.inferred_type("$n", Point::new(1, 0)), Some(&InferredType::Numeric));
+    }
+
+    #[test]
+    fn test_resolve_string_type() {
+        let fa = fa_with_constraints(vec![constraint("$s", 0, InferredType::String)]);
+        assert_eq!(fa.inferred_type("$s", Point::new(1, 0)), Some(&InferredType::String));
+    }
+
+    #[test]
+    fn test_resolve_reassignment_changes_type() {
+        let fa = fa_with_constraints(vec![
+            constraint("$x", 0, InferredType::HashRef),
+            constraint("$x", 3, InferredType::ArrayRef),
+        ]);
+        assert_eq!(fa.inferred_type("$x", Point::new(1, 0)), Some(&InferredType::HashRef));
+        assert_eq!(fa.inferred_type("$x", Point::new(4, 0)), Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_resolve_sub_return_type() {
+        // Hand-craft a FileAnalysis with a sub that has a return type
+        let fa = FileAnalysis::new(
+            vec![Scope {
+                id: ScopeId(0),
+                parent: None,
+                kind: ScopeKind::File,
+                span: Span { start: Point::new(0, 0), end: Point::new(10, 0) },
+                package: None,
+            }],
+            vec![Symbol {
+                id: SymbolId(0),
+                name: "get_config".to_string(),
+                kind: SymKind::Sub,
+                span: Span { start: Point::new(0, 0), end: Point::new(2, 1) },
+                selection_span: Span { start: Point::new(0, 4), end: Point::new(0, 14) },
+                scope: ScopeId(0),
+                detail: SymbolDetail::Sub {
+                    params: vec![],
+                    is_method: false,
+                    return_type: Some(InferredType::HashRef),
+                },
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type("nonexistent"), None);
+    }
+
+    // ---- Return type resolution tests (decoupled, pure function) ----
+
+    #[test]
+    fn test_resolve_return_type_all_agree() {
+        assert_eq!(
+            resolve_return_type(&[InferredType::HashRef, InferredType::HashRef]),
+            Some(InferredType::HashRef),
+        );
+    }
+
+    #[test]
+    fn test_resolve_return_type_disagreement() {
+        assert_eq!(
+            resolve_return_type(&[InferredType::HashRef, InferredType::ArrayRef]),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_resolve_return_type_empty() {
+        assert_eq!(resolve_return_type(&[]), None);
+    }
+
+    #[test]
+    fn test_resolve_return_type_object_subsumes_hashref() {
+        // Object + HashRef → Object wins (overloaded objects)
+        assert_eq!(
+            resolve_return_type(&[
+                InferredType::ClassName("Foo".into()),
+                InferredType::HashRef,
+            ]),
+            Some(InferredType::ClassName("Foo".into())),
+        );
+        // Order shouldn't matter
+        assert_eq!(
+            resolve_return_type(&[
+                InferredType::HashRef,
+                InferredType::ClassName("Foo".into()),
+            ]),
+            Some(InferredType::ClassName("Foo".into())),
+        );
+    }
+
+    #[test]
+    fn test_resolve_return_type_object_does_not_subsume_arrayref() {
+        // Object + ArrayRef → disagreement
+        assert_eq!(
+            resolve_return_type(&[
+                InferredType::ClassName("Foo".into()),
+                InferredType::ArrayRef,
+            ]),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_resolve_return_type_single() {
+        assert_eq!(
+            resolve_return_type(&[InferredType::CodeRef]),
+            Some(InferredType::CodeRef),
+        );
+    }
+
+    #[test]
+    fn test_class_name_helper() {
+        assert_eq!(InferredType::ClassName("Foo".into()).class_name(), Some("Foo"));
+        assert_eq!(InferredType::FirstParam { package: "Bar".into() }.class_name(), Some("Bar"));
+        assert_eq!(InferredType::HashRef.class_name(), None);
+        assert_eq!(InferredType::ArrayRef.class_name(), None);
+        assert_eq!(InferredType::CodeRef.class_name(), None);
+        assert_eq!(InferredType::Regexp.class_name(), None);
+        assert_eq!(InferredType::Numeric.class_name(), None);
+        assert_eq!(InferredType::String.class_name(), None);
+    }
 }

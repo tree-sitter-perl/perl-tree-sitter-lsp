@@ -4,8 +4,8 @@ use tree_sitter::{Point, Tree};
 
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
-    CompletionCandidate, FileAnalysis, FoldKind, OutlineSymbol, RefKind, Span,
-    SymKind as FaSymKind, VarModifier,
+    format_inferred_type, CompletionCandidate, FileAnalysis, FoldKind, InferredType, OutlineSymbol,
+    RefKind, Span, SymKind as FaSymKind, SymbolDetail, VarModifier,
     PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT, PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
 use crate::module_index::ModuleIndex;
@@ -78,11 +78,13 @@ pub fn find_definition(
     pos: Position,
     uri: &Url,
     module_index: &ModuleIndex,
+    tree: &Tree,
+    source: &str,
 ) -> Option<GotoDefinitionResponse> {
     let point = position_to_point(pos);
 
     // Try local definition first
-    if let Some(span) = analysis.find_definition(point) {
+    if let Some(span) = analysis.find_definition(point, Some(tree), Some(source.as_bytes())) {
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
             range: span_to_range(span),
@@ -123,8 +125,8 @@ pub fn find_definition(
     None
 }
 
-pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url) -> Vec<Location> {
-    analysis.find_references(position_to_point(pos))
+pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url, tree: &Tree, source: &str) -> Vec<Location> {
+    analysis.find_references(position_to_point(pos), Some(tree), Some(source.as_bytes()))
         .into_iter()
         .map(|span| Location {
             uri: uri.clone(),
@@ -203,12 +205,40 @@ pub fn completion_items(
     module_index: &ModuleIndex,
 ) -> Vec<CompletionItem> {
     let point = position_to_point(pos);
-    let ctx = cursor_context::detect_cursor_context(source, point);
+
+    // Try tree-based detection first for expression-based contexts
+    let ctx = cursor_context::detect_cursor_context_tree(tree, source.as_bytes(), point, analysis)
+        .unwrap_or_else(|| cursor_context::detect_cursor_context(source, point, Some(analysis)));
 
     let mut candidates: Vec<CompletionCandidate> = match ctx {
         CursorContext::Variable { sigil } => analysis.complete_variables(point, sigil),
-        CursorContext::Method { ref invocant } => analysis.complete_methods(invocant, point),
-        CursorContext::HashKey { ref var_text } => analysis.complete_hash_keys(var_text, point),
+        CursorContext::Method { ref invocant_type, ref invocant_text } => {
+            if let Some(ref ty) = invocant_type {
+                if let Some(cn) = ty.class_name() {
+                    analysis.complete_methods_for_class(cn)
+                } else {
+                    // Ref types get deref snippet completions (handled below)
+                    Vec::new()
+                }
+            } else {
+                analysis.complete_methods(invocant_text, point)
+            }
+        }
+        CursorContext::HashKey { ref owner_type, ref var_text, ref source_sub } => {
+            if let Some(ref ty) = owner_type {
+                if let Some(cn) = ty.class_name() {
+                    analysis.complete_hash_keys_for_class(cn, point)
+                } else if let Some(ref sub_name) = source_sub {
+                    analysis.complete_hash_keys_for_sub(sub_name, point)
+                } else {
+                    // HashRef with no source_sub from context — fall back to
+                    // resolve_hash_key_owner which checks call bindings
+                    analysis.complete_hash_keys(var_text, point)
+                }
+            } else {
+                analysis.complete_hash_keys(var_text, point)
+            }
+        }
         CursorContext::General => {
             let mut items = Vec::new();
             // Keyval arg completions if inside a call at key position
@@ -237,10 +267,55 @@ pub fn completion_items(
         }
     };
 
-    candidates
+    let mut items: Vec<CompletionItem> = candidates
         .drain(..)
         .map(candidate_to_completion_item)
-        .collect()
+        .collect();
+
+    // Ref-type deref snippets when completing after ->
+    if let CursorContext::Method { ref invocant_type, .. } = ctx {
+        if let Some(ref ty) = invocant_type {
+            if !ty.is_object() {
+                items.extend(ref_type_snippet_completions(ty));
+            }
+        }
+    }
+
+    items
+}
+
+/// Returns snippet completions for ref-type dereference after `->`.
+fn ref_type_snippet_completions(ty: &InferredType) -> Vec<CompletionItem> {
+    match ty {
+        InferredType::ArrayRef => vec![CompletionItem {
+            label: "[index]".to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            detail: Some("array dereference".to_string()),
+            insert_text: Some("[$0]".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            sort_text: Some("000".to_string()),
+            ..Default::default()
+        }],
+        InferredType::CodeRef => vec![CompletionItem {
+            label: "(args)".to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            detail: Some("code dereference".to_string()),
+            insert_text: Some("($0)".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            sort_text: Some("000".to_string()),
+            ..Default::default()
+        }],
+        InferredType::HashRef => vec![CompletionItem {
+            label: "{key}".to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            detail: Some("hash dereference".to_string()),
+            insert_text: Some("{$0}".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            sort_text: Some("000".to_string()),
+            ..Default::default()
+        }],
+        _ => Vec::new(),
+    }
 }
 
 pub fn hover_info(
@@ -248,11 +323,12 @@ pub fn hover_info(
     source: &str,
     pos: Position,
     module_index: &ModuleIndex,
+    tree: &Tree,
 ) -> Option<Hover> {
     let point = position_to_point(pos);
 
     // Try local hover first
-    if let Some(markdown) = analysis.hover_info(point, source) {
+    if let Some(markdown) = analysis.hover_info(point, source, Some(tree)) {
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -286,9 +362,9 @@ pub fn hover_info(
     None
 }
 
-pub fn document_highlights(analysis: &FileAnalysis, pos: Position) -> Vec<DocumentHighlight> {
+pub fn document_highlights(analysis: &FileAnalysis, pos: Position, tree: &tree_sitter::Tree, source: &str) -> Vec<DocumentHighlight> {
     use crate::file_analysis::AccessKind;
-    analysis.find_highlights(position_to_point(pos))
+    analysis.find_highlights(position_to_point(pos), Some(tree), Some(source.as_bytes()))
         .into_iter()
         .map(|(span, access)| DocumentHighlight {
             range: span_to_range(span),
@@ -354,38 +430,38 @@ pub fn signature_help(
         point,
     )?;
 
-    let params: Vec<ParameterInformation> = sig_info
+    // Build param labels with inferred types
+    let param_labels: Vec<String> = sig_info
         .params
         .iter()
         .map(|p| {
-            let label = if let Some(ref default) = p.default {
+            let base = if let Some(ref default) = p.default {
                 format!("{} = {}", p.name, default)
             } else {
                 p.name.clone()
             };
-            ParameterInformation {
-                label: ParameterLabel::Simple(label),
-                documentation: None,
+            // Look up inferred type at end of sub body (captures all operator usage)
+            // Skip $self/$class — type is obvious
+            if p.name == "$self" || p.name == "$class" {
+                return base;
+            }
+            if let Some(ty) = analysis.inferred_type(&p.name, sig_info.body_end) {
+                format!("{}: {}", base, format_inferred_type(ty))
+            } else {
+                base
             }
         })
         .collect();
 
-    let label = format!(
-        "{}({})",
-        sig_info.name,
-        sig_info
-            .params
-            .iter()
-            .map(|p| {
-                if let Some(ref default) = p.default {
-                    format!("{} = {}", p.name, default)
-                } else {
-                    p.name.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    let params: Vec<ParameterInformation> = param_labels
+        .iter()
+        .map(|label| ParameterInformation {
+            label: ParameterLabel::Simple(label.clone()),
+            documentation: None,
+        })
+        .collect();
+
+    let label = format!("{}({})", sig_info.name, param_labels.join(", "));
 
     Some(SignatureHelp {
         signatures: vec![SignatureInformation {
@@ -424,6 +500,70 @@ pub fn semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
         SemanticTokenModifier::new("array"),
         SemanticTokenModifier::new("hash"),
     ]
+}
+
+/// Returns inlay hints for the given range.
+///
+/// Shows type annotations for variable declarations with non-obvious inferred types,
+/// and return type annotations for sub/method declarations.
+pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
+    let start = position_to_point(range.start);
+    let end = position_to_point(range.end);
+    let mut hints = Vec::new();
+
+    for sym in &analysis.symbols {
+        let decl_point = sym.selection_span.end;
+        // Skip symbols outside the requested range
+        if decl_point.row < start.row || decl_point.row > end.row {
+            continue;
+        }
+
+        match sym.kind {
+            FaSymKind::Variable => {
+                // Skip $self — always the enclosing class, too noisy
+                if sym.name == "$self" {
+                    continue;
+                }
+                if let Some(ty) = analysis.inferred_type(&sym.name, sym.span.start) {
+                    // Only show Object/HashRef/ArrayRef/CodeRef/Regexp — not Numeric/String
+                    if matches!(ty, InferredType::Numeric | InferredType::String) {
+                        continue;
+                    }
+                    hints.push(InlayHint {
+                        position: point_to_position(decl_point),
+                        label: InlayHintLabel::String(format!(": {}", format_inferred_type(ty))),
+                        kind: Some(InlayHintKind::TYPE),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: Some(true),
+                        padding_right: None,
+                        data: None,
+                    });
+                }
+            }
+            FaSymKind::Sub | FaSymKind::Method => {
+                if let SymbolDetail::Sub { return_type: Some(ref rt), .. } = sym.detail {
+                    // Only show non-trivial return types
+                    if matches!(rt, InferredType::Numeric | InferredType::String) {
+                        continue;
+                    }
+                    hints.push(InlayHint {
+                        position: point_to_position(decl_point),
+                        label: InlayHintLabel::String(format!("→ {}", format_inferred_type(rt))),
+                        kind: Some(InlayHintKind::TYPE),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: Some(true),
+                        padding_right: None,
+                        data: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    hints
 }
 
 pub fn semantic_tokens(analysis: &FileAnalysis) -> Vec<SemanticToken> {
@@ -801,6 +941,77 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
                 });
             }
         }
+    }
+
+    // 5e: Unresolved method diagnostics for locally-defined classes
+    let universal_methods = [
+        "new", "AUTOLOAD", "DESTROY", "can", "isa", "DOES", "VERSION",
+    ];
+    for r in &analysis.refs {
+        let (invocant, _invocant_span) = match &r.kind {
+            RefKind::MethodCall { invocant, invocant_span } => (invocant, invocant_span),
+            _ => continue,
+        };
+        let method_name = &r.target_name;
+
+        // Skip universal methods
+        if universal_methods.contains(&method_name.as_str()) {
+            continue;
+        }
+
+        // Resolve invocant to class name
+        let class_name = if !invocant.starts_with('$')
+            && !invocant.starts_with('@')
+            && !invocant.starts_with('%')
+        {
+            Some(invocant.clone())
+        } else {
+            analysis.inferred_type(invocant, r.span.start)
+                .and_then(|ty| ty.class_name().map(|s| s.to_string()))
+        };
+        let class_name = match class_name {
+            Some(cn) => cn,
+            None => continue,
+        };
+
+        // Only fire for locally-defined classes
+        let is_local_class = analysis.symbols.iter().any(|s| {
+            matches!(s.kind, FaSymKind::Class | FaSymKind::Package) && s.name == class_name
+        });
+        if !is_local_class {
+            continue;
+        }
+
+        // Check the class has at least one method (otherwise likely external)
+        let has_methods = analysis.symbols.iter().any(|s| {
+            matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
+                && analysis.symbol_in_class(s.id, &class_name)
+        });
+        if !has_methods {
+            continue;
+        }
+
+        // Check if the method exists in the class
+        let method_exists = analysis.symbols.iter().any(|s| {
+            matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
+                && s.name == *method_name
+                && analysis.symbol_in_class(s.id, &class_name)
+        });
+        if method_exists {
+            continue;
+        }
+
+        diagnostics.push(Diagnostic {
+            range: span_to_range(r.span),
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unresolved-method".into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "'{}' is not defined in {}",
+                method_name, class_name,
+            ),
+            ..Default::default()
+        });
     }
 
     diagnostics

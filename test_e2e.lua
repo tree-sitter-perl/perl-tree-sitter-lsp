@@ -113,6 +113,17 @@ t.test("hover: sub add shows signature", function()
   end
 end)
 
+t.test("hover: $sum shows Numeric type from method return", function()
+  local N = "hover: $sum shows Numeric type from method return"
+  local line, col = b.find_pos(buf, "my $sum = $calc->add")
+  if not t.ok(N, line, "couldn't find '$sum' line") then return end
+  local text = lsp.hover_text(buf, line, col + 4)  -- on $sum
+  if not t.ok(N, text, "no hover result") then return end
+  if t.ok(N, type(text) == "string" and text:find("Numeric"), "hover should show Numeric type, got: " .. text) then
+    t.pass(N)
+  end
+end)
+
 t.test("references: $pi finds declaration and usage", function()
   local N = "references: $pi finds declaration and usage"
   local decl = b.find_line(buf, "my $pi = ")
@@ -122,6 +133,172 @@ t.test("references: $pi finds declaration and usage", function()
   local usage = b.find_line(buf, "%$pi %* %$radius")
   if not t.ok(N, usage, "couldn't find $pi usage line") then return end
   if t.contains(N, refs, usage, "ref lines") then t.pass(N) end
+end)
+
+t.test("completion: $db_config-> offers hash keys from return type", function()
+  local N = "completion: $db_config-> offers hash keys from return type"
+  local line, col = b.find_pos(buf, "$db_config->{host}")
+  if not t.ok(N, line, "couldn't find '$db_config->{host}'") then return end
+  local labels = lsp.completion_labels(buf, line, col + 13) -- after "$db_config->{"
+  local ok = t.contains(N, labels, "host", "completions")
+  ok = t.contains(N, labels, "port", "completions") and ok
+  ok = t.contains(N, labels, "name", "completions") and ok
+  if ok then t.pass(N) end
+end)
+
+t.test("goto-def: chained $calc->get_self()->add resolves to sub add", function()
+  local N = "goto-def: chained $calc->get_self()->add resolves to sub add"
+  local line, col = b.find_pos(buf, "->get_self()->add(1, 2)")
+  if not t.ok(N, line, "couldn't find chained call") then return end
+  -- Position cursor on "add" in the chain: skip "->get_self()->" (14 chars) then on "add"
+  local def = lsp.def_line(buf, line, col + 14)
+  local expected = b.find_line(buf, "^sub add ")
+  if not t.ok(N, def, "no definition result") then return end
+  if t.eq(N, expected, def, "definition line") then t.pass(N) end
+end)
+
+t.test("goto-def: $db_config->{host} jumps to key in get_config return", function()
+  local N = "goto-def: $db_config->{host} jumps to key in get_config return"
+  local line, col = b.find_pos(buf, "$db_config->{host}")
+  if not t.ok(N, line, "couldn't find '$db_config->{host}'") then return end
+  -- cursor on "host": after "$db_config->{" = 13 chars
+  local def = lsp.def_line(buf, line, col + 13)
+  local expected = b.find_line(buf, "host => \"localhost\"")
+  if not t.ok(N, def, "no definition result") then return end
+  if t.eq(N, expected, def, "definition line") then t.pass(N) end
+end)
+
+t.test("goto-def: $calc->get_self->get_config->{host} jumps to return hash key", function()
+  local N = "goto-def: chained get_config->{host}"
+  local line, col = b.find_pos(buf, "$calc->get_self->get_config->{host}")
+  if not t.ok(N, line, "couldn't find chained hash access") then return end
+  -- cursor on "host": "$calc->get_self->get_config->{" = 30 chars, so col+30
+  local def = lsp.def_line(buf, line, col + 30)
+  local expected = b.find_line(buf, "host => \"localhost\"")
+  if not t.ok(N, def, "no definition result") then return end
+  if t.eq(N, expected, def, "definition line") then t.pass(N) end
+end)
+
+t.test("completion: $calc->get_self->get_config->{ offers hash keys", function()
+  local N = "completion: $calc->get_self->get_config->{ offers hash keys"
+  local line, col = b.find_pos(buf, "$calc->get_self->get_config->{host}")
+  if not t.ok(N, line, "couldn't find chained hash access") then return end
+  -- cursor after "{": $calc->get_self->get_config->{ = 31 chars, cursor at col+31
+  local labels = lsp.completion_labels(buf, line, col + 31)
+  local ok = t.contains(N, labels, "host", "completions")
+  ok = t.contains(N, labels, "port", "completions") and ok
+  ok = t.contains(N, labels, "name", "completions") and ok
+  if ok then t.pass(N) end
+end)
+
+t.test("goto-def: x in Point->new(x => 3) jumps to field $x :param", function()
+  local N = "goto-def: x in Point->new(x => 3) jumps to field $x :param"
+  local line, col = b.find_pos(buf, "Point->new(x => 3")
+  if not t.ok(N, line, "couldn't find 'Point->new(x => 3'") then return end
+  -- cursor on "x": after "Point->new(" = 11 chars
+  local def = lsp.def_line(buf, line, col + 11)
+  local expected = b.find_line(buf, "field $x :param :reader")
+  if not t.ok(N, def, "no definition result") then return end
+  if t.eq(N, expected, def, "definition line") then t.pass(N) end
+end)
+
+t.test("goto-def: verbose in Calculator->new(verbose => 1) jumps to bless hash key", function()
+  local N = "goto-def: verbose in Calculator->new(verbose => 1) jumps to bless hash key"
+  local line, col = b.find_pos(buf, "Calculator->new(verbose")
+  if not t.ok(N, line, "couldn't find 'Calculator->new(verbose'") then return end
+  -- cursor on "verbose": after "Calculator->new(" = 16 chars
+  local def = lsp.def_line(buf, line, col + 16)
+  local expected = b.find_line(buf, "verbose => $args{verbose}")
+  if not t.ok(N, def, "no definition result") then return end
+  if t.eq(N, expected, def, "definition line") then t.pass(N) end
+end)
+
+-- ── 5a: inlay hints ─────────────────────────────────────────────────
+
+t.test("inlay hint: $calc shows Calculator type", function()
+  local N = "inlay hint: $calc shows Calculator type"
+  local line, _ = b.find_pos(buf, "my $calc = Calculator->new")
+  if not t.ok(N, line, "couldn't find '$calc' declaration") then return end
+  local hints = lsp.inlay_hints(buf, line, line)
+  if not t.ok(N, #hints > 0, "no inlay hints returned") then return end
+  local found = false
+  for _, h in ipairs(hints) do
+    local label = type(h.label) == "string" and h.label or (h.label[1] and h.label[1].value or "")
+    if label:find("Calculator") then found = true; break end
+  end
+  if t.ok(N, found, "no hint mentioning Calculator") then t.pass(N) end
+end)
+
+t.test("inlay hint: $p shows Point type", function()
+  local N = "inlay hint: $p shows Point type"
+  local line, _ = b.find_pos(buf, "my $p = Point->new")
+  if not t.ok(N, line, "couldn't find '$p' declaration") then return end
+  local hints = lsp.inlay_hints(buf, line, line)
+  if not t.ok(N, #hints > 0, "no inlay hints returned") then return end
+  local found = false
+  for _, h in ipairs(hints) do
+    local label = type(h.label) == "string" and h.label or (h.label[1] and h.label[1].value or "")
+    if label:find("Point") then found = true; break end
+  end
+  if t.ok(N, found, "no hint mentioning Point") then t.pass(N) end
+end)
+
+t.test("inlay hint: $db_config shows HashRef type", function()
+  local N = "inlay hint: $db_config shows HashRef type"
+  local line, _ = b.find_pos(buf, "my $db_config = get_config")
+  if not t.ok(N, line, "couldn't find '$db_config' declaration") then return end
+  local hints = lsp.inlay_hints(buf, line, line)
+  if not t.ok(N, #hints > 0, "no inlay hints returned") then return end
+  local found = false
+  for _, h in ipairs(hints) do
+    local label = type(h.label) == "string" and h.label or (h.label[1] and h.label[1].value or "")
+    if label:find("HashRef") then found = true; break end
+  end
+  if t.ok(N, found, "no hint mentioning HashRef") then t.pass(N) end
+end)
+
+t.test("inlay hint: sub get_config shows → HashRef", function()
+  local N = "inlay hint: sub get_config shows → HashRef"
+  local line = b.find_line(buf, "^sub get_config")
+  if not t.ok(N, line, "couldn't find 'sub get_config'") then return end
+  local hints = lsp.inlay_hints(buf, line, line)
+  if not t.ok(N, #hints > 0, "no inlay hints returned") then return end
+  local found = false
+  for _, h in ipairs(hints) do
+    local label = type(h.label) == "string" and h.label or (h.label[1] and h.label[1].value or "")
+    if label:find("HashRef") then found = true; break end
+  end
+  if t.ok(N, found, "no return type hint for get_config") then t.pass(N) end
+end)
+
+-- ── 5b: completion detail with return types ─────────────────────────
+
+t.test("completion detail: $calc->add shows return type", function()
+  local N = "completion detail: $calc->add shows return type"
+  local line, col = b.find_pos(buf, "$calc->add(2, 3)")
+  if not t.ok(N, line, "couldn't find '$calc->add'") then return end
+  local items = lsp.completion_items(buf, line, col + 7)
+  local found = false
+  for _, item in ipairs(items) do
+    if item.label == "add" and item.detail and item.detail:find("Numeric") then
+      found = true; break
+    end
+  end
+  if t.ok(N, found, "no 'add' completion with Numeric detail") then t.pass(N) end
+end)
+
+t.test("completion detail: $calc->get_self shows return type", function()
+  local N = "completion detail: $calc->get_self shows return type"
+  local line, col = b.find_pos(buf, "$calc->get_self()->add")
+  if not t.ok(N, line, "couldn't find chained call") then return end
+  local items = lsp.completion_items(buf, line, col + 7)
+  local found = false
+  for _, item in ipairs(items) do
+    if item.label == "get_self" and item.detail and item.detail:find("Calculator") then
+      found = true; break
+    end
+  end
+  if t.ok(N, found, "no 'get_self' completion with Calculator detail") then t.pass(N) end
 end)
 
 -- ── done ─────────────────────────────────────────────────────────────

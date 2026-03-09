@@ -129,6 +129,7 @@ impl LanguageServer for Backend {
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
@@ -228,6 +229,8 @@ impl LanguageServer for Backend {
             pos,
             uri,
             &self.module_index,
+            &doc.tree,
+            &doc.text,
         ))
     }
 
@@ -238,7 +241,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let refs = symbols::find_references(&doc.analysis, pos, uri);
+        let refs = symbols::find_references(&doc.analysis, pos, uri, &doc.tree, &doc.text);
         if refs.is_empty() {
             Ok(None)
         } else {
@@ -269,6 +272,7 @@ impl LanguageServer for Backend {
             &doc.text,
             pos,
             &self.module_index,
+            &doc.tree,
         ))
     }
 
@@ -319,7 +323,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let highlights = symbols::document_highlights(&doc.analysis, pos);
+        let highlights = symbols::document_highlights(&doc.analysis, pos, &doc.tree, &doc.text);
         if highlights.is_empty() {
             Ok(None)
         } else {
@@ -474,5 +478,19 @@ impl LanguageServer for Backend {
             result_id: None,
             data: tokens,
         })))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+        let doc = match self.documents.get(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let hints = symbols::inlay_hints(&doc.analysis, params.range);
+        if hints.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hints))
+        }
     }
 }

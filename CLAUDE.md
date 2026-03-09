@@ -71,16 +71,17 @@ cargo test           # run all tests
 ## LSP Capabilities
 
 - `textDocument/documentSymbol` — outline of subs, packages, variables, classes (with fields/methods as children)
-- `textDocument/definition` — go-to-def for variables (scope-aware), subs, methods (type-inferred), packages/classes, hash keys
-- `textDocument/references` — scope-aware for variables, file-wide for functions/packages/hash keys
-- `textDocument/hover` — shows declaration line, class-aware for methods
+- `textDocument/definition` — go-to-def for variables (scope-aware), subs, methods (type-inferred), packages/classes, hash keys; resolves through expression chains
+- `textDocument/references` — scope-aware for variables, file-wide for functions/packages/hash keys; resolves through expression chains
+- `textDocument/hover` — shows declaration line, inferred types, return types, class-aware for methods
 - `textDocument/rename` — scope-aware for variables, file-wide for functions/packages/hash keys
-- `textDocument/completion` — scope-aware variables (cross-sigil forms), subs, methods (type-inferred), packages, hash keys, auto-import from cached modules
-- `textDocument/signatureHelp` — parameter info for subs/methods (signature syntax + legacy @_ pattern), triggers on `(` and `,`
+- `textDocument/completion` — scope-aware variables (cross-sigil forms), subs, methods (type-inferred with return type detail), packages, hash keys, auto-import from cached modules, deref snippets for typed references
+- `textDocument/signatureHelp` — parameter info with inferred types for subs/methods (signature syntax + legacy @_ pattern), triggers on `(` and `,`
+- `textDocument/inlayHint` — type annotations for variables (Object/HashRef/ArrayRef/CodeRef) and sub return types
 - `textDocument/documentHighlight` — highlight all occurrences with read/write distinction
 - `textDocument/selectionRange` — expand/shrink selection via tree-sitter node hierarchy
 - `textDocument/foldingRange` — blocks, subs, classes, pod sections
 - `textDocument/formatting` — shells out to perltidy (respects .perltidyrc)
 - `textDocument/semanticTokens/full` — variable tokens with modifiers: scalar/array/hash, declaration, modification
 - `textDocument/codeAction` — auto-import for unresolved functions
-- Diagnostics — unresolved function warnings (skips builtins, local subs, imported functions)
+- Diagnostics — unresolved function/method warnings (skips builtins, local subs, imported functions)

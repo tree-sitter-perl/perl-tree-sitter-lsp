@@ -7,13 +7,6 @@ use tree_sitter::{Node, Point, Tree};
 
 use crate::file_analysis::*;
 
-fn node_to_span(node: Node) -> Span {
-    Span {
-        start: node.start_position(),
-        end: node.end_position(),
-    }
-}
-
 /// Build a FileAnalysis from a parsed tree in a single walk.
 pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     let mut b = Builder {
@@ -24,6 +17,9 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         type_constraints: Vec::new(),
         fold_ranges: Vec::new(),
         imports: Vec::new(),
+        return_infos: Vec::new(),
+        last_expr_type: std::collections::HashMap::new(),
+        call_bindings: Vec::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -42,6 +38,9 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     // Post-pass 2: resolve hash key owners from type constraints
     b.resolve_hash_key_owners();
 
+    // Post-pass 3: infer return types for subs/methods
+    b.resolve_return_types();
+
     FileAnalysis::new(
         b.scopes,
         b.symbols,
@@ -49,7 +48,16 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         b.type_constraints,
         b.fold_ranges,
         b.imports,
+        b.call_bindings,
     )
+}
+
+/// A return value type collected during the walk, before post-pass resolution.
+struct ReturnInfo {
+    /// The scope (Sub/Method) this return belongs to.
+    scope: ScopeId,
+    /// The inferred type of the return value, if determinable from literals/constructors.
+    inferred_type: Option<InferredType>,
 }
 
 struct Builder<'a> {
@@ -61,6 +69,12 @@ struct Builder<'a> {
     type_constraints: Vec<TypeConstraint>,
     fold_ranges: Vec<FoldRange>,
     imports: Vec<Import>,
+    /// Return values collected during the walk (explicit `return` + implicit last expr).
+    return_infos: Vec<ReturnInfo>,
+    /// For each Sub/Method scope, the type of the last expression (implicit return).
+    last_expr_type: std::collections::HashMap<ScopeId, Option<InferredType>>,
+    /// Assignments where RHS is a function call — resolved in return-type post-pass.
+    call_bindings: Vec<CallBinding>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -148,7 +162,8 @@ impl<'a> Builder<'a> {
                 let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
                 if !matches!(parent_kind,
                     "subroutine_declaration_statement" | "method_declaration_statement" |
-                    "class_statement" | "for_statement" | "foreach_statement"
+                    "class_statement" | "for_statement" | "foreach_statement" |
+                    "varname" // block-deref: @{expr}, %{expr}, &{expr}
                 ) {
                     self.add_fold_range(node);
                     self.push_scope(ScopeKind::Block, node_to_span(node), None);
@@ -176,10 +191,76 @@ impl<'a> Builder<'a> {
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 self.visit_function_call(node);
             }
+            // Built-in calls: abs($x), length($s), time(), etc.
+            "func1op_call_expression" | "func0op_call_expression" => {
+                self.visit_func1op(node);
+            }
             "method_call_expression" => self.visit_method_call(node),
 
             // Hash access
             "hash_element_expression" => self.visit_hash_element(node),
+
+            // Dereference expressions → type constraints on operand
+            "array_element_expression" => {
+                self.infer_deref_type(node, InferredType::ArrayRef);
+                self.visit_children(node);
+            }
+            "coderef_call_expression" => {
+                self.infer_deref_type(node, InferredType::CodeRef);
+                self.visit_children(node);
+            }
+            "array_deref_expression" => {
+                self.infer_deref_type(node, InferredType::ArrayRef);
+                self.visit_children(node);
+            }
+            "hash_deref_expression" => {
+                self.infer_deref_type(node, InferredType::HashRef);
+                self.visit_children(node);
+            }
+
+            // Binary operators → type constraints on variable operands
+            "binary_expression" => {
+                self.infer_binary_op_type(node);
+                self.visit_children(node);
+            }
+            "equality_expression" | "relational_expression" => {
+                self.infer_comparison_type(node);
+                self.visit_children(node);
+            }
+
+            // Unary operators
+            "postinc_expression" | "preinc_expression" => {
+                // $x++ / $x-- / ++$x / --$x → Numeric
+                if let Some(operand) = node.named_child(0) {
+                    self.push_var_type_constraint(operand, node, InferredType::Numeric);
+                }
+                self.visit_children(node);
+            }
+
+            // Return expressions → collect return types for post-pass
+            "return_expression" => {
+                if let Some(scope) = self.enclosing_sub_scope() {
+                    let ret_type = self.infer_return_value_type(node);
+                    self.return_infos.push(ReturnInfo {
+                        scope,
+                        inferred_type: ret_type,
+                    });
+                }
+                self.visit_children(node);
+            }
+
+            // Expression statements inside sub bodies → track last expression type
+            "expression_statement" => {
+                self.visit_children(node);
+                // Track the type of the last expression in the innermost sub/method scope
+                if let Some(scope) = self.enclosing_sub_scope() {
+                    let expr_type = node.named_child(0).and_then(|child| {
+                        Self::infer_literal_type(child)
+                            .or_else(|| self.extract_constructor_class(child).map(InferredType::ClassName))
+                    });
+                    self.last_expr_type.insert(scope, expr_type);
+                }
+            }
 
             // Hash construction
             "anonymous_hash_expression" => self.visit_anon_hash(node),
@@ -372,7 +453,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method },
+            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None },
         );
 
         // Push sub scope
@@ -562,12 +643,18 @@ impl<'a> Builder<'a> {
         for (name, var_span) in &vars {
             let sigil = name.chars().next().unwrap_or('$');
             let sym_kind = if decl_kind == DeclKind::Field { SymKind::Field } else { SymKind::Variable };
+            let detail = if decl_kind == DeclKind::Field {
+                let attributes = self.collect_attributes(node);
+                SymbolDetail::Field { sigil, attributes }
+            } else {
+                SymbolDetail::Variable { sigil, decl_kind }
+            };
             self.add_symbol(
                 name.clone(),
                 sym_kind,
                 node_to_span(node),
                 *var_span,
-                SymbolDetail::Variable { sigil, decl_kind },
+                detail,
             );
             self.add_ref(
                 RefKind::Variable,
@@ -579,17 +666,31 @@ impl<'a> Builder<'a> {
             // Synthesize accessor methods for `field $x :reader` / `:writer`
             if decl_kind == DeclKind::Field {
                 let bare_name = &name[1..]; // strip sigil
-                let attrs = self.collect_attributes(node);
-                if attrs.iter().any(|a| a == "reader") {
+                // Re-read attrs from the symbol we just stored (avoid re-collecting)
+                let has_reader;
+                let has_writer;
+                if let Some(last_sym) = self.symbols.last() {
+                    if let SymbolDetail::Field { ref attributes, .. } = last_sym.detail {
+                        has_reader = attributes.iter().any(|a| a == "reader");
+                        has_writer = attributes.iter().any(|a| a == "writer");
+                    } else {
+                        has_reader = false;
+                        has_writer = false;
+                    }
+                } else {
+                    has_reader = false;
+                    has_writer = false;
+                }
+                if has_reader {
                     self.add_symbol(
                         bare_name.to_string(),
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true },
+                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None },
                     );
                 }
-                if attrs.iter().any(|a| a == "writer") {
+                if has_writer {
                     let writer_name = format!("set_{}", bare_name);
                     self.add_symbol(
                         writer_name,
@@ -603,6 +704,7 @@ impl<'a> Builder<'a> {
                                 is_slurpy: false,
                             }],
                             is_method: true,
+                            return_type: None,
                         },
                     );
                 }
@@ -776,21 +878,38 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_assignment(&mut self, node: Node<'a>) {
-        // Check for type inference: $var = ClassName->new(...)
+        // Check for type inference from RHS
         if let Some(left) = node.child_by_field_name("left") {
             if left.kind() == "variable_declaration" {
                 // Visit the declaration
                 self.visit_variable_decl(left);
             }
             if let Some(right) = node.child_by_field_name("right") {
-                if let Some(class_name) = self.extract_constructor_class(right) {
-                    let var_text = self.get_var_text_from_lhs(left);
-                    if let Some(vt) = var_text {
+                // Try constructor class first, then literal types, then expression type
+                let inferred = if let Some(class_name) = self.extract_constructor_class(right) {
+                    Some(InferredType::ClassName(class_name))
+                } else if let Some(t) = Self::infer_literal_type(right) {
+                    Some(t)
+                } else {
+                    self.infer_expression_result_type(right)
+                };
+                if let Some(it) = inferred {
+                    if let Some(vt) = self.get_var_text_from_lhs(left) {
                         self.type_constraints.push(TypeConstraint {
                             variable: vt,
                             scope: self.current_scope(),
                             constraint_span: node_to_span(node),
-                            inferred_type: InferredType::ClassName(class_name),
+                            inferred_type: it,
+                        });
+                    }
+                } else if let Some(func_name) = self.extract_call_name(right) {
+                    // RHS is a function call — record binding for return-type post-pass
+                    if let Some(vt) = self.get_var_text_from_lhs(left) {
+                        self.call_bindings.push(CallBinding {
+                            variable: vt,
+                            func_name,
+                            scope: self.current_scope(),
+                            span: node_to_span(node),
                         });
                     }
                 }
@@ -807,6 +926,176 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Infer a type from a literal RHS node (no CST walk, just node kind check).
+    fn infer_literal_type(node: Node) -> Option<InferredType> {
+        match node.kind() {
+            "anonymous_hash_expression" => Some(InferredType::HashRef),
+            "anonymous_array_expression" => Some(InferredType::ArrayRef),
+            "anonymous_subroutine_expression" => Some(InferredType::CodeRef),
+            "quoted_regexp" => Some(InferredType::Regexp),
+            _ => None,
+        }
+    }
+
+    /// Infer the type of a return expression's value.
+    ///
+    /// Handles:
+    /// - Bare `return` / `return undef` → None (skip signal)
+    /// - `return { ... }` / `return [ ... ]` / `return sub { }` / `return qr//` → literal type
+    /// - `return Foo->new()` → Object(Foo)
+    /// - `return $self` → lookup variable's type constraint at this point
+    /// - `return $var` → lookup variable's type constraint at this point
+    fn infer_return_value_type(&self, return_node: Node<'a>) -> Option<InferredType> {
+        let child = match return_node.named_child(0) {
+            Some(c) => c,
+            None => return None, // bare `return` — skip signal
+        };
+        // `return undef` — skip
+        if child.kind() == "undef" {
+            return None;
+        }
+        // Try literal types first
+        if let Some(t) = Self::infer_literal_type(child) {
+            return Some(t);
+        }
+        // Try constructor: return Foo->new()
+        if let Some(class_name) = self.extract_constructor_class(child) {
+            return Some(InferredType::ClassName(class_name));
+        }
+        // Try expression result type: return $a + $b → Numeric
+        if let Some(t) = self.infer_expression_result_type(child) {
+            return Some(t);
+        }
+        // Try variable lookup: return $self, return $var
+        if child.kind() == "scalar" {
+            if let Ok(var_text) = child.utf8_text(self.source) {
+                // Look up the variable's type constraint at this point
+                let point = child.start_position();
+                for tc in self.type_constraints.iter().rev() {
+                    if tc.variable == var_text && tc.constraint_span.start <= point {
+                        // Check scope containment
+                        let scope = &self.scopes[tc.scope.0 as usize];
+                        if contains_point(&scope.span, point) {
+                            return Some(tc.inferred_type.clone());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Push a type constraint on a variable node if it's a scalar.
+    fn push_var_type_constraint(&mut self, var_node: Node<'a>, context_node: Node<'a>, inferred_type: InferredType) {
+        if var_node.kind() == "scalar" {
+            if let Ok(text) = var_node.utf8_text(self.source) {
+                self.type_constraints.push(TypeConstraint {
+                    variable: text.to_string(),
+                    scope: self.current_scope(),
+                    constraint_span: node_to_span(context_node),
+                    inferred_type,
+                });
+            }
+        }
+    }
+
+    /// Infer the result type of an expression (not its operands — those are handled elsewhere).
+    /// e.g. `$a + $b` produces Numeric, `$a . $b` produces String.
+    fn infer_expression_result_type(&self, node: Node<'a>) -> Option<InferredType> {
+        match node.kind() {
+            "binary_expression" => {
+                let op = self.get_operator_text(node);
+                match op.as_deref() {
+                    Some("+" | "-" | "*" | "/" | "%" | "**") => Some(InferredType::Numeric),
+                    Some("." | "x") => Some(InferredType::String),
+                    _ => None,
+                }
+            }
+            "postinc_expression" | "preinc_expression" => Some(InferredType::Numeric),
+            "func1op_call_expression" | "func0op_call_expression" => {
+                let name = node.child(0)?.utf8_text(self.source).ok()?;
+                builtin_return_type(name)
+            }
+            _ => None,
+        }
+    }
+
+    /// Infer a type on the first named child (the operand) of a dereference expression.
+    fn infer_deref_type(&mut self, node: Node<'a>, inferred_type: InferredType) {
+        if let Some(operand) = node.named_child(0) {
+            self.push_var_type_constraint(operand, node, inferred_type);
+        }
+    }
+
+    /// Infer types from binary operator expressions.
+    fn infer_binary_op_type(&mut self, node: Node<'a>) {
+        let op = self.get_operator_text(node);
+        match op.as_deref() {
+            // Numeric operators: both operands are Numeric
+            Some("+" | "-" | "*" | "/" | "%" | "**") => {
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        self.push_var_type_constraint(child, node, InferredType::Numeric);
+                    }
+                }
+            }
+            // String operators: both operands are String
+            Some("." | "x") => {
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        self.push_var_type_constraint(child, node, InferredType::String);
+                    }
+                }
+            }
+            // Regex match: LHS is String, RHS is Regexp
+            Some("=~" | "!~") => {
+                if let Some(lhs) = node.named_child(0) {
+                    self.push_var_type_constraint(lhs, node, InferredType::String);
+                }
+                if let Some(rhs) = node.named_child(1) {
+                    self.push_var_type_constraint(rhs, node, InferredType::Regexp);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Infer types from comparison operators (equality_expression, relational_expression).
+    fn infer_comparison_type(&mut self, node: Node<'a>) {
+        let op = self.get_operator_text(node);
+        let inferred = match op.as_deref() {
+            // Numeric comparisons
+            Some("==" | "!=" | "<=>" | "<" | ">" | "<=" | ">=") => Some(InferredType::Numeric),
+            // String comparisons
+            Some("eq" | "ne" | "lt" | "gt" | "le" | "ge" | "cmp") => Some(InferredType::String),
+            _ => None,
+        };
+        if let Some(it) = inferred {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    self.push_var_type_constraint(child, node, it.clone());
+                }
+            }
+        }
+    }
+
+    /// Get the operator text from a binary/comparison/equality expression.
+    /// The operator is the first unnamed child between the two named children.
+    fn get_operator_text(&self, node: Node<'a>) -> Option<String> {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if !child.is_named() {
+                    let text = child.utf8_text(self.source).ok()?;
+                    // Skip parens, brackets, etc.
+                    if !matches!(text, "(" | ")" | "[" | "]" | "{" | "}" | "," | ";") {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn visit_var_ref(&mut self, node: Node<'a>) {
         // Skip if parent is a variable_declaration (handled by visit_variable_decl)
         if let Some(parent) = node.parent() {
@@ -817,22 +1106,34 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Check for block-based dereference: @{expr}, %{expr}, ${expr}
-        // In tree-sitter-perl these parse as scalar/array/hash with a varname
+        // Check for block-based dereference: @{expr}, %{expr}, &{expr}
+        // In tree-sitter-perl these parse as array/hash/function with a varname
         // child containing a block. The block holds the real expressions.
-        // Don't record a variable ref for the whole dereference — just recurse.
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                if child.kind() == "varname" {
-                    for j in 0..child.child_count() {
-                        if let Some(gc) = child.child(j) {
-                            if gc.kind() == "block" {
-                                self.visit_children(gc);
-                                return;
+        // Don't record a variable ref for the outer — just recurse into the block.
+        if self.is_block_deref(node) {
+            // Recurse into the block to visit inner expressions
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    if child.kind() == "varname" {
+                        for j in 0..child.child_count() {
+                            if let Some(gc) = child.child(j) {
+                                if gc.kind() == "block" {
+                                    self.visit_children(gc);
+                                    return;
+                                }
                             }
                         }
                     }
                 }
+            }
+            return;
+        }
+
+        // If this scalar is inside a block-deref, infer the type from the outer sigil.
+        // Parent chain: scalar → expression_statement → block → varname → outer_node
+        if node.kind() == "scalar" {
+            if let Some((deref_type, context)) = self.block_deref_context(node) {
+                self.push_var_type_constraint(node, context, deref_type);
             }
         }
 
@@ -844,6 +1145,53 @@ impl<'a> Builder<'a> {
                 text.to_string(),
                 access,
             );
+        }
+    }
+
+    /// Check if this node is a block-deref outer node (e.g. @{...} or %{...}).
+    fn is_block_deref(&self, node: Node<'a>) -> bool {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.kind() == "varname" {
+                    for j in 0..child.child_count() {
+                        if let Some(gc) = child.child(j) {
+                            if gc.kind() == "block" {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Walk up from a scalar to detect block-deref context.
+    /// Returns the inferred type and a context node (for constraint span) if inside
+    /// @{$x}, %{$y}, or &{$z}.
+    ///
+    /// Parent chain: scalar → expression_statement → block → varname → outer_node
+    /// where outer_node.kind() is "array" (@{}), "hash" (%{}), or "function" (&{}).
+    fn block_deref_context(&self, node: Node<'a>) -> Option<(InferredType, Node<'a>)> {
+        let stmt = node.parent()?;
+        if stmt.kind() != "expression_statement" { return None; }
+        let block = stmt.parent()?;
+        if block.kind() != "block" { return None; }
+        let varname = block.parent()?;
+        if varname.kind() != "varname" { return None; }
+        let outer = varname.parent()?;
+        match outer.kind() {
+            "array" => Some((InferredType::ArrayRef, outer)),
+            "hash" => Some((InferredType::HashRef, outer)),
+            "function" => {
+                if let Ok(text) = outer.utf8_text(self.source) {
+                    if text.starts_with("&{") {
+                        return Some((InferredType::CodeRef, outer));
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -872,22 +1220,60 @@ impl<'a> Builder<'a> {
                     name.to_string(),
                     AccessKind::Read,
                 );
+                // Push type constraints on arguments of known builtins
+                if let Some(arg_type) = crate::file_analysis::builtin_first_arg_type(name) {
+                    if let Some(first_arg) = self.first_call_arg(node) {
+                        self.push_var_type_constraint(first_arg, node, arg_type);
+                    }
+                }
             }
         }
         self.visit_children(node);
+    }
+
+    /// Handle func1op_call_expression: abs($x), length($s), int($n), etc.
+    /// The function name is the first child (keyword), the arg is a named child.
+    fn visit_func1op(&mut self, node: Node<'a>) {
+        let name = node.child(0)
+            .and_then(|c| c.utf8_text(self.source).ok())
+            .unwrap_or("");
+        // Push type constraint on the argument
+        if let Some(arg_type) = builtin_first_arg_type(name) {
+            if let Some(arg) = node.named_child(0) {
+                self.push_var_type_constraint(arg, node, arg_type);
+            }
+        }
+        self.visit_children(node);
+    }
+
+    /// Extract the first argument node from a function call.
+    fn first_call_arg(&self, call_node: Node<'a>) -> Option<Node<'a>> {
+        let args = call_node.child_by_field_name("arguments")?;
+        match args.kind() {
+            "list_expression" | "parenthesized_expression" => args.named_child(0),
+            _ => Some(args), // single arg (ambiguous_function_call_expression)
+        }
     }
 
     fn visit_method_call(&mut self, node: Node<'a>) {
         let method_name = node.child_by_field_name("method")
             .and_then(|n| n.utf8_text(self.source).ok())
             .map(|s| s.to_string());
-        let invocant = node.child_by_field_name("invocant")
+        let invocant_node = node.child_by_field_name("invocant");
+        let invocant = invocant_node
             .and_then(|n| n.utf8_text(self.source).ok())
             .map(|s| s.to_string());
+        // Store invocant span for complex expressions (call chains etc.)
+        let invocant_span = invocant_node
+            .filter(|n| !matches!(n.kind(), "scalar" | "array" | "hash" | "bareword" | "package"))
+            .map(|n| node_to_span(n));
 
         if let Some(name) = method_name {
             self.add_ref(
-                RefKind::MethodCall { invocant: invocant.unwrap_or_default() },
+                RefKind::MethodCall {
+                    invocant: invocant.unwrap_or_default(),
+                    invocant_span,
+                },
                 node_to_span(node),
                 name,
                 AccessKind::Read,
@@ -897,6 +1283,9 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_hash_element(&mut self, node: Node<'a>) {
+        // Infer HashRef on the operand variable (e.g. $x in $x->{key})
+        self.infer_deref_type(node, InferredType::HashRef);
+
         // Record the hash variable access
         let var_text = self.get_hash_var_from_element(node);
 
@@ -1046,6 +1435,22 @@ impl<'a> Builder<'a> {
         text.to_string()
     }
 
+    /// Extract the function name from a call expression (function_call or ambiguous_function_call).
+    fn extract_call_name(&self, node: Node<'a>) -> Option<String> {
+        let name = crate::file_analysis::extract_call_name(node, self.source)?;
+        // For function calls, filter out qualified names ($ref->(), Foo::bar())
+        match node.kind() {
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                if name.contains(':') || name.starts_with('$') {
+                    None
+                } else {
+                    Some(name)
+                }
+            }
+            _ => Some(name),
+        }
+    }
+
     fn extract_constructor_class(&self, node: Node<'a>) -> Option<String> {
         if node.kind() == "method_call_expression" {
             let method = node.child_by_field_name("method")?;
@@ -1122,17 +1527,30 @@ impl<'a> Builder<'a> {
     }
 
     fn detect_anon_hash_owner(&self, anon_hash: Node<'a>) -> Option<HashKeyOwner> {
-        // Check if this is inside a bless call
         let mut ancestor = anon_hash.parent()?;
         for _ in 0..5 {
+            // Check if this is inside a bless call
             if self.is_bless_call(ancestor) {
                 if let Some(ref pkg) = self.current_package {
                     return Some(HashKeyOwner::Class(pkg.clone()));
                 }
-                // Try to find package from scope
                 let scope = self.current_scope();
                 if let Some(ref pkg) = self.scopes[scope.0 as usize].package {
                     return Some(HashKeyOwner::Class(pkg.clone()));
+                }
+            }
+            // Check if this is inside a return expression of a sub
+            if ancestor.kind() == "return_expression" {
+                if let Some(name) = self.enclosing_sub_name() {
+                    return Some(HashKeyOwner::Sub(name));
+                }
+            }
+            // Check if this is the last expression in a sub body (implicit return)
+            if ancestor.kind() == "expression_statement" {
+                if self.is_last_statement_in_sub(ancestor) {
+                    if let Some(name) = self.enclosing_sub_name() {
+                        return Some(HashKeyOwner::Sub(name));
+                    }
                 }
             }
             ancestor = ancestor.parent()?;
@@ -1183,6 +1601,54 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Find the nearest enclosing Sub or Method scope from the current scope stack.
+    fn enclosing_sub_scope(&self) -> Option<ScopeId> {
+        for &scope_id in self.scope_stack.iter().rev() {
+            match &self.scopes[scope_id.0 as usize].kind {
+                ScopeKind::Sub { .. } | ScopeKind::Method { .. } => return Some(scope_id),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Get the name of the enclosing sub/method, if any.
+    fn enclosing_sub_name(&self) -> Option<String> {
+        let scope_id = self.enclosing_sub_scope()?;
+        match &self.scopes[scope_id.0 as usize].kind {
+            ScopeKind::Sub { ref name } | ScopeKind::Method { ref name } => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Check if a node is the last statement in a sub/method body block.
+    fn is_last_statement_in_sub(&self, node: Node<'a>) -> bool {
+        let parent = match node.parent() {
+            Some(p) => p,
+            None => return false,
+        };
+        // The parent should be a block that is a sub/method body
+        if parent.kind() != "block" {
+            return false;
+        }
+        if let Some(grandparent) = parent.parent() {
+            if !matches!(grandparent.kind(),
+                "subroutine_declaration_statement" | "method_declaration_statement"
+                | "anonymous_subroutine_expression"
+            ) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        // Check this is the last named child in the block
+        if let Some(last) = parent.named_child(parent.named_child_count().saturating_sub(1)) {
+            last.id() == node.id()
+        } else {
+            false
+        }
+    }
+
     // ---- Post-passes ----
 
     fn resolve_variable_refs(&mut self) {
@@ -1223,6 +1689,96 @@ impl<'a> Builder<'a> {
                     }
                 }
                 current = self.scopes[scope_id.0 as usize].parent;
+            }
+        }
+    }
+
+    fn resolve_return_types(&mut self) {
+        // Group return infos by scope
+        let mut returns_by_scope: std::collections::HashMap<ScopeId, Vec<Option<InferredType>>> =
+            std::collections::HashMap::new();
+        for ri in &self.return_infos {
+            returns_by_scope
+                .entry(ri.scope)
+                .or_default()
+                .push(ri.inferred_type.clone());
+        }
+
+        // For each Sub/Method scope, determine return type
+        let mut return_types: std::collections::HashMap<String, InferredType> =
+            std::collections::HashMap::new();
+
+        for scope in &self.scopes {
+            let sub_name = match &scope.kind {
+                ScopeKind::Sub { name } | ScopeKind::Method { name } => name.clone(),
+                _ => continue,
+            };
+
+            let explicit_returns = returns_by_scope.get(&scope.id);
+            let has_explicit = explicit_returns.map_or(false, |r| !r.is_empty());
+
+            let resolved = if has_explicit {
+                // Filter out bare returns (None) — they're exit points, not type signals
+                let typed_returns: Vec<InferredType> = explicit_returns.unwrap()
+                    .iter()
+                    .filter_map(|r| r.clone())
+                    .collect();
+                resolve_return_type(&typed_returns)
+            } else {
+                // No explicit returns — use last expression type
+                self.last_expr_type.get(&scope.id).and_then(|t| t.clone())
+            };
+
+            if let Some(rt) = resolved {
+                return_types.insert(sub_name, rt);
+            }
+        }
+
+        // Set return_type on matching Sub/Method symbols
+        for sym in &mut self.symbols {
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                if let SymbolDetail::Sub { ref mut return_type, .. } = sym.detail {
+                    if let Some(rt) = return_types.get(&sym.name) {
+                        *return_type = Some(rt.clone());
+                    }
+                }
+            }
+        }
+
+        // Propagate return types to call sites via structural bindings
+        // recorded during the walk (my $cfg = get_config()).
+        // TODO: inline expression propagation (get_config()->{key}) is a separate
+        // code path — needs return type resolution at the expression level without
+        // a variable assignment. Not handled here.
+        let mut new_constraints = Vec::new();
+        for binding in &self.call_bindings {
+            let rt = return_types.get(&binding.func_name)
+                .cloned()
+                .or_else(|| builtin_return_type(&binding.func_name));
+            if let Some(rt) = rt {
+                new_constraints.push(TypeConstraint {
+                    variable: binding.variable.clone(),
+                    scope: binding.scope,
+                    constraint_span: binding.span,
+                    inferred_type: rt,
+                });
+            }
+        }
+        self.type_constraints.extend(new_constraints);
+
+        // Fixup: update HashKeyAccess owners for variables bound to sub calls
+        // that return HashRef. This runs after call binding propagation so the
+        // type constraints are available.
+        let binding_map: std::collections::HashMap<&str, &str> = self.call_bindings.iter()
+            .filter(|b| return_types.get(&b.func_name).map_or(false, |t| *t == InferredType::HashRef))
+            .map(|b| (b.variable.as_str(), b.func_name.as_str()))
+            .collect();
+
+        for r in &mut self.refs {
+            if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
+                if let Some(func_name) = binding_map.get(var_text.as_str()) {
+                    *owner = Some(HashKeyOwner::Sub(func_name.to_string()));
+                }
             }
         }
     }
@@ -1269,19 +1825,9 @@ impl<'a> Builder<'a> {
                     'outer: while let Some(sid) = scope {
                         for (tc_scope, tc_type, tc_point) in constraints {
                             if *tc_scope == sid && *tc_point <= r.span.start {
-                                match tc_type {
-                                    InferredType::ClassName(cn) => {
-                                        *owner = Some(HashKeyOwner::Class(cn.clone()));
-                                        break 'outer;
-                                    }
-                                    InferredType::FirstParam { package } => {
-                                        *owner = Some(HashKeyOwner::Class(package.clone()));
-                                        break 'outer;
-                                    }
-                                    InferredType::BlessResult { package } => {
-                                        *owner = Some(HashKeyOwner::Class(package.clone()));
-                                        break 'outer;
-                                    }
+                                if let Some(cn) = tc_type.class_name() {
+                                    *owner = Some(HashKeyOwner::Class(cn.to_string()));
+                                    break 'outer;
                                 }
                             }
                         }
@@ -1400,7 +1946,7 @@ mod tests {
             .filter(|s| s.kind == SymKind::Sub && s.name == "connect")
             .collect();
         assert_eq!(subs.len(), 1);
-        if let SymbolDetail::Sub { params, is_method } = &subs[0].detail {
+        if let SymbolDetail::Sub { params, is_method, .. } = &subs[0].detail {
             assert!(!is_method);
             assert_eq!(params.len(), 2);
             assert_eq!(params[0].name, "$self");
@@ -1607,7 +2153,7 @@ $p->;
         let source = "package main;\n1;\nuse v5.38;\nclass Point {\n    field $x :param :reader;\n    method magnitude () { }\n}\nmy $p = Point->new(x => 3);\n$p->magnitude();\n";
         let fa = build_fa(source);
         // cursor on `magnitude` in `$p->magnitude()` — line 8, col 5
-        let def = fa.find_definition(Point::new(8, 5));
+        let def = fa.find_definition(Point::new(8, 5), None, None);
         assert!(def.is_some(), "should find definition for magnitude");
         let span = def.unwrap();
         assert_eq!(span.start.row, 5, "should point to method declaration line, got row {}", span.start.row);
@@ -1617,7 +2163,7 @@ $p->;
     fn test_field_reader_goto_def() {
         // go-to-def on $p->x should find the reader method, which points to the field
         let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param :reader;\n    method mag() { }\n}\nmy $p = Point->new(x => 1);\n$p->x;");
-        let def = fa.find_definition(Point::new(6, 5)); // cursor on `x` in `$p->x`
+        let def = fa.find_definition(Point::new(6, 5), None, None); // cursor on `x` in `$p->x`
         assert!(def.is_some(), "should find definition for reader method");
         // The reader method's selection_span points to the field declaration
         let span = def.unwrap();
@@ -1664,7 +2210,7 @@ $p->;
             .filter(|r| r.target_name == "method" && matches!(r.kind, RefKind::MethodCall { .. }))
             .collect();
         assert_eq!(method_refs.len(), 1);
-        if let RefKind::MethodCall { ref invocant } = method_refs[0].kind {
+        if let RefKind::MethodCall { ref invocant, .. } = method_refs[0].kind {
             assert_eq!(invocant, "$obj");
         }
     }
@@ -1730,6 +2276,481 @@ $p->;
         }
     }
 
+    // ---- Literal constructor extraction tests (via build_fa) ----
+
+    #[test]
+    fn test_extract_hashref_literal() {
+        let fa = build_fa("my $href = {};");
+        let ty = fa.inferred_type("$href", Point::new(0, 14));
+        assert_eq!(ty, Some(&InferredType::HashRef), "empty hash ref literal");
+
+        let fa = build_fa("my $href = { a => 1, b => 2 };");
+        let ty = fa.inferred_type("$href", Point::new(0, 30));
+        assert_eq!(ty, Some(&InferredType::HashRef), "populated hash ref literal");
+    }
+
+    #[test]
+    fn test_extract_arrayref_literal() {
+        let fa = build_fa("my $aref = [];");
+        let ty = fa.inferred_type("$aref", Point::new(0, 14));
+        assert_eq!(ty, Some(&InferredType::ArrayRef), "empty array ref literal");
+
+        let fa = build_fa("my $aref = [1, 2, 3];");
+        let ty = fa.inferred_type("$aref", Point::new(0, 21));
+        assert_eq!(ty, Some(&InferredType::ArrayRef), "populated array ref literal");
+    }
+
+    #[test]
+    fn test_extract_coderef_literal() {
+        let fa = build_fa("my $cref = sub { 42 };");
+        let ty = fa.inferred_type("$cref", Point::new(0, 22));
+        assert_eq!(ty, Some(&InferredType::CodeRef), "anonymous sub");
+    }
+
+    #[test]
+    fn test_extract_regexp_literal() {
+        let fa = build_fa("my $re = qr/pattern/;");
+        let ty = fa.inferred_type("$re", Point::new(0, 21));
+        assert_eq!(ty, Some(&InferredType::Regexp), "qr// literal");
+    }
+
+    #[test]
+    fn test_extract_reassignment_type_change() {
+        let fa = build_fa("my $x = {};\n$x = [];");
+        // After line 0 → HashRef
+        let ty = fa.inferred_type("$x", Point::new(0, 11));
+        assert_eq!(ty, Some(&InferredType::HashRef), "initial hashref");
+        // After line 1 → ArrayRef
+        let ty = fa.inferred_type("$x", Point::new(1, 8));
+        assert_eq!(ty, Some(&InferredType::ArrayRef), "reassigned to arrayref");
+    }
+
+    #[test]
+    fn test_extract_constructor_still_works() {
+        // Existing constructor detection should still work
+        let fa = build_fa("my $obj = Foo->new();");
+        let ty = fa.inferred_type("$obj", Point::new(0, 21));
+        assert_eq!(ty, Some(&InferredType::ClassName("Foo".into())));
+    }
+
+    // ---- Operator-based type inference tests (Step 3) ----
+
+    #[test]
+    fn test_arrow_hash_deref_infers_hashref() {
+        let fa = build_fa("my $x;\n$x->{key};");
+        let ty = fa.inferred_type("$x", Point::new(1, 10));
+        assert_eq!(ty, Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_arrow_array_deref_infers_arrayref() {
+        let fa = build_fa("my $x;\n$x->[0];");
+        let ty = fa.inferred_type("$x", Point::new(1, 8));
+        assert_eq!(ty, Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_arrow_code_deref_infers_coderef() {
+        let fa = build_fa("my $x;\n$x->(1, 2);");
+        let ty = fa.inferred_type("$x", Point::new(1, 10));
+        assert_eq!(ty, Some(&InferredType::CodeRef));
+    }
+
+    #[test]
+    fn test_postfix_array_deref_infers_arrayref() {
+        let fa = build_fa("my $x;\nmy @a = $x->@*;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_postfix_hash_deref_infers_hashref() {
+        let fa = build_fa("my $y;\nmy %h = $y->%*;\nmy $z;");
+        let ty = fa.inferred_type("$y", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_binary_numeric_ops_infer_numeric() {
+        let fa = build_fa("my $x;\nmy $a = $x + 1;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "+ operator");
+
+        let fa = build_fa("my $x;\nmy $a = $x * 2;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "* operator");
+    }
+
+    #[test]
+    fn test_assignment_from_binary_numeric_infers_result() {
+        let fa = build_fa("my $a = 1;\nmy $b = 2;\nmy $result = $a + $b;\n$result;");
+        let ty = fa.inferred_type("$result", Point::new(3, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "$result = $a + $b should be Numeric");
+    }
+
+    #[test]
+    fn test_assignment_from_string_concat_infers_result() {
+        let fa = build_fa("my $a = 'x';\nmy $b = 'y';\nmy $s = $a . $b;\n$s;");
+        let ty = fa.inferred_type("$s", Point::new(3, 0));
+        assert_eq!(ty, Some(&InferredType::String), "$s = $a . $b should be String");
+    }
+
+    #[test]
+    fn test_string_concat_infers_string() {
+        let fa = build_fa("my $s;\nmy $a = $s . \"x\";\nmy $z;");
+        let ty = fa.inferred_type("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::String), ". operator");
+    }
+
+    #[test]
+    fn test_string_repeat_infers_string() {
+        let fa = build_fa("my $s;\n$s x 3;\nmy $z;");
+        let ty = fa.inferred_type("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::String), "x operator");
+    }
+
+    #[test]
+    fn test_numeric_comparison_infers_numeric() {
+        let fa = build_fa("my $x;\nmy $y;\n$x == $y;\nmy $z;");
+        assert_eq!(fa.inferred_type("$x", Point::new(3, 0)), Some(&InferredType::Numeric));
+        assert_eq!(fa.inferred_type("$y", Point::new(3, 0)), Some(&InferredType::Numeric));
+    }
+
+    #[test]
+    fn test_string_comparison_infers_string() {
+        let fa = build_fa("my $x;\nmy $y;\n$x eq $y;\nmy $z;");
+        assert_eq!(fa.inferred_type("$x", Point::new(3, 0)), Some(&InferredType::String));
+        assert_eq!(fa.inferred_type("$y", Point::new(3, 0)), Some(&InferredType::String));
+    }
+
+    #[test]
+    fn test_increment_infers_numeric() {
+        let fa = build_fa("my $x;\n$x++;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric));
+    }
+
+    #[test]
+    fn test_regex_match_infers_string() {
+        let fa = build_fa("my $s;\n$s =~ /pattern/;\nmy $z;");
+        let ty = fa.inferred_type("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::String));
+    }
+
+    #[test]
+    fn test_preinc_infers_numeric() {
+        let fa = build_fa("my $x;\n++$x;\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric));
+    }
+
+    #[test]
+    fn test_block_array_deref_infers_arrayref() {
+        let fa = build_fa("my $x;\nmy @items = @{$x};\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_block_hash_deref_infers_hashref() {
+        let fa = build_fa("my $y;\nmy %t = %{$y};\nmy $z;");
+        let ty = fa.inferred_type("$y", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_block_code_deref_infers_coderef() {
+        let fa = build_fa("my $z;\n&{$z}();\nmy $w;");
+        let ty = fa.inferred_type("$z", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::CodeRef));
+    }
+
+    #[test]
+    fn test_no_numeric_on_array_variable() {
+        // @arr + 1 should NOT push Numeric on @arr
+        let fa = build_fa("my @arr;\nmy $n = @arr + 1;\nmy $z;");
+        let ty = fa.inferred_type("@arr", Point::new(2, 0));
+        assert_eq!(ty, None, "@arr should not get Numeric constraint");
+    }
+
+    // ---- Builtin type inference tests ----
+
+    #[test]
+    fn test_builtin_push_infers_arrayref() {
+        // push @{$aref} triggers array_deref_expression which already infers ArrayRef
+        let fa = build_fa("my $aref;\npush @{$aref}, 1;\nmy $z;");
+        let ty = fa.inferred_type("$aref", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::ArrayRef), "push deref should infer ArrayRef");
+    }
+
+    #[test]
+    fn test_builtin_length_infers_string_arg() {
+        let fa = build_fa("my $s;\nmy $n = length($s);\nmy $z;");
+        let ty = fa.inferred_type("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::String), "length arg should be String");
+    }
+
+    #[test]
+    fn test_builtin_abs_infers_numeric_arg() {
+        let fa = build_fa("my $x;\nmy $n = abs($x);\nmy $z;");
+        let ty = fa.inferred_type("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "abs arg should be Numeric");
+    }
+
+    #[test]
+    fn test_builtin_return_type_propagates() {
+        let fa = build_fa("my $t = time();\n$t;");
+        let ty = fa.inferred_type("$t", Point::new(1, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "time() should return Numeric");
+    }
+
+    #[test]
+    fn test_builtin_join_return_type() {
+        let fa = build_fa("my $s = join(',', @arr);\n$s;");
+        let ty = fa.inferred_type("$s", Point::new(1, 0));
+        assert_eq!(ty, Some(&InferredType::String), "join() should return String");
+    }
+
+    #[test]
+    fn test_builtin_length_return_type() {
+        let fa = build_fa("my $n = length('hello');\n$n;");
+        let ty = fa.inferred_type("$n", Point::new(1, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "length() should return Numeric");
+    }
+
+    // ---- Return type inference tests (Step 4) ----
+
+    #[test]
+    fn test_return_type_hashref() {
+        let fa = build_fa("sub get_config {\n    return { host => \"localhost\" };\n}");
+        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_return_type_arrayref() {
+        let fa = build_fa("sub get_tags {\n    return [1, 2, 3];\n}");
+        assert_eq!(fa.sub_return_type("get_tags"), Some(&InferredType::ArrayRef));
+    }
+
+    #[test]
+    fn test_return_type_coderef() {
+        let fa = build_fa("sub get_handler {\n    return sub { 1 };\n}");
+        assert_eq!(fa.sub_return_type("get_handler"), Some(&InferredType::CodeRef));
+    }
+
+    #[test]
+    fn test_return_type_implicit_last_expr() {
+        // No explicit return — last expression is the implicit return
+        let fa = build_fa("sub get_data {\n    { key => \"val\" };\n}");
+        assert_eq!(fa.sub_return_type("get_data"), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_return_type_conflicting_returns_unknown() {
+        // Two returns with different types → None (unknown)
+        let fa = build_fa("sub ambiguous {\n    if (1) { return {} }\n    return [];\n}");
+        assert_eq!(fa.sub_return_type("ambiguous"), None);
+    }
+
+    #[test]
+    fn test_return_type_consistent_returns() {
+        // Multiple returns all hashref → HashRef
+        let fa = build_fa("sub consistent {\n    if (1) { return { a => 1 } }\n    return { b => 2 };\n}");
+        assert_eq!(fa.sub_return_type("consistent"), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_return_type_propagation_to_call_site() {
+        let fa = build_fa("sub get_config {\n    return { host => 1 };\n}\nmy $cfg = get_config();\nmy $z;");
+        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        let ty = fa.inferred_type("$cfg", Point::new(4, 0));
+        assert_eq!(ty, Some(&InferredType::HashRef), "call site should get return type");
+    }
+
+    #[test]
+    fn test_return_type_propagation_method_call() {
+        let src = "package Calculator;\nsub new { bless {}, shift }\nsub add {\n    my ($self, $a, $b) = @_;\n    my $result = $a + $b;\n    return $result;\n}\npackage main;\nmy $calc = Calculator->new();\nmy $sum = $calc->add(2, 3);\n$sum;";
+        let fa = build_fa(src);
+        assert_eq!(fa.sub_return_type("add"), Some(&InferredType::Numeric), "add should return Numeric");
+        let ty = fa.inferred_type("$sum", Point::new(10, 0));
+        assert_eq!(ty, Some(&InferredType::Numeric), "$sum should be Numeric via method call binding");
+    }
+
+    #[test]
+    fn test_return_type_constructor() {
+        let fa = build_fa("package User;\nsub new { bless {}, shift }\npackage main;\nsub get_user {\n    return User->new();\n}");
+        assert_eq!(fa.sub_return_type("get_user"), Some(&InferredType::ClassName("User".into())));
+    }
+
+    #[test]
+    fn test_return_type_self_variable() {
+        // return $self where $self has a type constraint
+        let fa = build_fa("package Foo;\nsub new { bless {}, shift }\nsub clone {\n    my ($self) = @_;\n    return $self;\n}");
+        assert_eq!(
+            fa.sub_return_type("clone"),
+            Some(&InferredType::FirstParam { package: "Foo".into() }),
+        );
+    }
+
+    #[test]
+    fn test_return_type_bare_return_filtered() {
+        // Bare return + typed return → bare is filtered, typed return wins
+        let fa = build_fa("sub get_config {\n    return unless 1;\n    return { host => 1 };\n}");
+        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_return_type_all_bare_returns() {
+        // All bare returns → no return type
+        let fa = build_fa("sub noop {\n    return;\n}");
+        assert_eq!(fa.sub_return_type("noop"), None);
+    }
+
+    #[test]
+    fn test_return_type_undef_filtered() {
+        // return undef + typed return → undef is filtered, typed return wins
+        let fa = build_fa("sub maybe {\n    return undef unless 1;\n    return { a => 1 };\n}");
+        assert_eq!(fa.sub_return_type("maybe"), Some(&InferredType::HashRef));
+    }
+
+    // ---- resolve_expression_type tests ----
+
+    /// Find the first node of given kind at/after a point (searches all children).
+    fn find_node_at<'a>(node: tree_sitter::Node<'a>, point: Point, kind: &str) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == kind && node.start_position() >= point {
+            return Some(node);
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if let Some(found) = find_node_at(child, point, kind) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_resolve_expr_type_function_call() {
+        let src = "sub get_config {\n    return { host => 1 };\n}\nget_config();\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // Find the function_call_expression on line 3
+        let call_node = find_node_at(tree.root_node(), Point::new(3, 0), "function_call_expression")
+            .expect("should find function_call_expression");
+        let ty = fa.resolve_expression_type(call_node, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_method_call_return() {
+        let src = "package Foo;\nsub new { bless {}, shift }\nsub get_bar {\n    return Bar->new();\n}\npackage Bar;\nsub new { bless {}, shift }\nsub do_thing { }\npackage main;\nmy $f = Foo->new();\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // $f->get_bar() should resolve to Object(Bar)
+        // First verify get_bar has the right return type
+        assert_eq!(fa.sub_return_type("get_bar"), Some(&InferredType::ClassName("Bar".into())));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_scalar_variable() {
+        let src = "my $x = {};\n$x;\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // Find the scalar $x on line 1
+        let scalar_node = find_node_at(tree.root_node(), Point::new(1, 0), "scalar")
+            .expect("should find scalar");
+        let ty = fa.resolve_expression_type(scalar_node, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_chained_method() {
+        let src = "package Foo;\nsub new { bless {}, shift }\nsub get_bar {\n    return Bar->new();\n}\npackage Bar;\nsub new { bless {}, shift }\nsub get_name {\n    return { name => 'test' };\n}\npackage main;\nmy $f = Foo->new();\n$f->get_bar()->get_name();\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // Line 12: $f->get_bar()->get_name();
+        // The outermost method_call_expression starts at column 0
+        // Use descendant_for_point_range to find the node at the start of that line
+        let node = tree.root_node()
+            .descendant_for_point_range(Point::new(12, 0), Point::new(12, 25))
+            .expect("should find node");
+        // Walk up to find the outermost method_call_expression
+        let mut n = node;
+        while n.kind() != "method_call_expression" || n.parent().map_or(false, |p| p.kind() == "method_call_expression") {
+            n = match n.parent() {
+                Some(p) => p,
+                None => panic!("should find outermost method_call_expression"),
+            };
+        }
+        assert_eq!(n.kind(), "method_call_expression");
+        let ty = fa.resolve_expression_type(n, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_constructor() {
+        let src = "package Foo;\nsub new { bless {}, shift }\npackage main;\nFoo->new();\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        let call = find_node_at(tree.root_node(), Point::new(3, 0), "method_call_expression")
+            .expect("should find method_call_expression");
+        let ty = fa.resolve_expression_type(call, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::ClassName("Foo".into())));
+    }
+
+    #[test]
+    fn test_resolve_expr_type_triple_chain() {
+        // $calc->get_self->get_config->{host} — no parens on method calls
+        let src = "\
+package Calculator;
+sub new { bless {}, shift }
+sub get_self {
+    my ($self) = @_;
+    return $self;
+}
+sub get_config {
+    return { host => 'localhost', port => 5432 };
+}
+package main;
+my $calc = Calculator->new();
+$calc->get_self->get_config->{host};
+";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+
+        // Verify get_self returns an object type for Calculator
+        let get_self_rt = fa.sub_return_type("get_self");
+        assert_eq!(get_self_rt.and_then(|t| t.class_name()), Some("Calculator"),
+            "get_self should return Calculator");
+
+        // Verify get_config returns HashRef
+        let get_config_rt = fa.sub_return_type("get_config");
+        assert_eq!(get_config_rt, Some(&InferredType::HashRef),
+            "get_config should return HashRef");
+
+        // The outermost expression is hash_element_expression wrapping the chain
+        // Find the method_call_expression for get_config (inner chain)
+        // Line 11: $calc->get_self->get_config->{host}
+        let node = tree.root_node()
+            .descendant_for_point_range(Point::new(11, 0), Point::new(11, 0))
+            .expect("should find node");
+        let mut n = node;
+        // Walk up to find hash_element_expression
+        loop {
+            if n.kind() == "hash_element_expression" {
+                break;
+            }
+            n = n.parent().expect("should find hash_element_expression");
+        }
+        // The base of hash_element_expression is the method chain
+        let base = n.named_child(0).expect("should have base");
+        assert_eq!(base.kind(), "method_call_expression");
+        let ty = fa.resolve_expression_type(base, src.as_bytes());
+        assert_eq!(ty, Some(InferredType::HashRef),
+            "the chain $calc->get_self->get_config should resolve to HashRef");
+    }
+
     #[test]
     fn test_package_at() {
         let fa = build_fa("package Foo;\nsub bar { }");
@@ -1780,7 +2801,7 @@ $p->;
     fn test_find_def_variable() {
         let fa = build_fa("my $x = 1;\nprint $x;");
         // Cursor on the usage of $x at line 1
-        let def = fa.find_definition(Point::new(1, 7));
+        let def = fa.find_definition(Point::new(1, 7), None, None);
         assert!(def.is_some(), "should find definition for $x");
         let span = def.unwrap();
         assert_eq!(span.start.row, 0, "definition should be on line 0");
@@ -1790,7 +2811,7 @@ $p->;
     fn test_find_def_sub() {
         let fa = build_fa("sub greet { }\ngreet();");
         // Cursor on the function call at line 1
-        let def = fa.find_definition(Point::new(1, 1));
+        let def = fa.find_definition(Point::new(1, 1), None, None);
         assert!(def.is_some(), "should find definition for greet");
         let span = def.unwrap();
         assert_eq!(span.start.row, 0, "definition should be on line 0");
@@ -1801,7 +2822,7 @@ $p->;
         let src = "package Foo;\nsub new { bless {}, shift }\nsub hello { }\npackage main;\nmy $f = Foo->new();\n$f->hello();";
         let fa = build_fa(src);
         // Cursor on hello() call at line 5
-        let def = fa.find_definition(Point::new(5, 5));
+        let def = fa.find_definition(Point::new(5, 5), None, None);
         assert!(def.is_some(), "should find definition for hello method");
         let span = def.unwrap();
         assert_eq!(span.start.row, 2, "hello definition should be on line 2");
@@ -1812,7 +2833,7 @@ $p->;
         let src = "my $x = 'outer';\nsub foo {\n    my $x = 'inner';\n    print $x;\n}";
         let fa = build_fa(src);
         // Cursor on $x inside sub (line 3) should resolve to inner $x (line 2)
-        let def = fa.find_definition(Point::new(3, 11));
+        let def = fa.find_definition(Point::new(3, 11), None, None);
         assert!(def.is_some());
         let span = def.unwrap();
         assert_eq!(span.start.row, 2, "should resolve to inner $x on line 2");
@@ -1823,8 +2844,34 @@ $p->;
         let src = "my $x = 1;\nprint $x;\n$x = 2;";
         let fa = build_fa(src);
         // Cursor on the declaration of $x
-        let refs = fa.find_references(Point::new(0, 4));
+        let refs = fa.find_references(Point::new(0, 4), None, None);
         assert!(refs.len() >= 2, "should find at least declaration + usage, got {}", refs.len());
+    }
+
+    #[test]
+    fn test_hash_key_def_implicit_return_gets_sub_owner() {
+        // Implicit return: last expression in sub body, no explicit `return`
+        let src = "sub get_config { { host => 'localhost', port => 5432 } }\nmy $cfg = get_config();\n$cfg->{host};\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+
+        let host_defs: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "host" && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
+            .collect();
+        assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
+        if let SymbolDetail::HashKeyDef { ref owner, .. } = host_defs[0].detail {
+            assert_eq!(*owner, HashKeyOwner::Sub("get_config".to_string()),
+                "implicit return hash key should have Sub(get_config) owner, got {:?}", owner);
+        }
+
+        // Go-to-def from $cfg->{host} should reach the hash key in the implicit return
+        let host_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        assert!(!host_refs.is_empty(), "should find HashKeyAccess for 'host'");
+        let def = fa.find_definition(host_refs[0].span.start, Some(&tree), Some(src.as_bytes()));
+        assert!(def.is_some(), "should find definition for host");
+        assert_eq!(def.unwrap().start.row, 0, "host def should be on line 0");
     }
 
     #[test]
@@ -1832,15 +2879,112 @@ $p->;
         let src = "sub greet { }\ngreet();\ngreet();";
         let fa = build_fa(src);
         // Cursor on the sub name
-        let refs = fa.find_references(Point::new(0, 5));
+        let refs = fa.find_references(Point::new(0, 5), None, None);
         assert!(refs.len() >= 2, "should find definition + calls, got {}", refs.len());
+    }
+
+    #[test]
+    fn test_find_references_method_through_chain() {
+        let src = "\
+package Foo;
+sub new { bless {}, shift }
+sub bar { 42 }
+package main;
+sub get_foo { return Foo->new() }
+my $f = Foo->new();
+$f->bar();
+get_foo()->bar();
+";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // Cursor on bar definition (line 2, col 4)
+        let refs = fa.find_references(Point::new(2, 5), Some(&tree), Some(src.as_bytes()));
+        // Should find: $f->bar() + get_foo()->bar() (definition may or may not be included)
+        let ref_lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
+        assert!(refs.len() >= 2,
+            "should find at least 2 refs, got {} at lines {:?}", refs.len(), ref_lines);
+        // The key assertion: chained call get_foo()->bar() is found (was broken before P0a fix)
+        assert!(ref_lines.contains(&7),
+            "should find chained get_foo()->bar() at line 7, got {:?}", ref_lines);
+    }
+
+    #[test]
+    fn test_hash_key_def_in_return_gets_sub_owner() {
+        let src = "sub get_config {\n    return { host => 'localhost', port => 5432 };\n}\nmy $cfg = get_config();\n$cfg->{host};\n";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+
+        // Verify hash key defs exist with Sub owner
+        let host_defs: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "host" && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
+            .collect();
+        assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
+        if let SymbolDetail::HashKeyDef { ref owner, .. } = host_defs[0].detail {
+            assert_eq!(*owner, HashKeyOwner::Sub("get_config".to_string()),
+                "host def should have Sub(get_config) owner, got {:?}", owner);
+        }
+
+        // Verify HashKeyAccess ref for $cfg->{host} has Sub owner
+        let host_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        assert!(!host_refs.is_empty(), "should find HashKeyAccess for 'host'");
+        if let RefKind::HashKeyAccess { ref owner, .. } = host_refs[0].kind {
+            assert_eq!(*owner, Some(HashKeyOwner::Sub("get_config".to_string())),
+                "host ref should have Sub(get_config) owner, got {:?}", owner);
+        }
+
+        // Verify go-to-references from the def finds the usage
+        let host_def_point = host_defs[0].selection_span.start;
+        let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()));
+        // symbol_at returns include_decl=false, so only usages are returned
+        assert!(refs.len() >= 1, "should find at least 1 usage, got {} refs", refs.len());
+
+        // Verify go-to-references from the usage finds back to the def
+        let host_ref_point = host_refs[0].span.start;
+        let refs_from_usage = fa.find_references(host_ref_point, Some(&tree), Some(src.as_bytes()));
+        // ref resolves to def → include_decl=true, so def + usage
+        assert!(refs_from_usage.len() >= 2, "should find def + usage, got {} refs", refs_from_usage.len());
+    }
+
+    #[test]
+    fn test_hash_key_refs_chained_tree_fallback() {
+        // Chained method calls produce refs with owner: None that need tree-based resolution
+        let src = r#"package Calculator;
+sub new { bless {}, shift }
+sub get_self { my ($self) = @_; return $self; }
+sub get_config { return { host => "localhost", port => 5432 }; }
+package main;
+my $calc = Calculator->new();
+$calc->get_self->get_config->{host};
+"#;
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+
+        // Find the hash key def for "host" in get_config's return
+        let host_defs: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "host" && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
+            .collect();
+        assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
+
+        // The chained ref should have owner: None (can't resolve at build time)
+        let chained_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { owner: None, .. }))
+            .collect();
+        assert!(!chained_refs.is_empty(), "chained hash access should have owner: None, refs: {:?}",
+            fa.refs.iter().filter(|r| r.target_name == "host").collect::<Vec<_>>());
+
+        // find_references from the def should find the chained usage via tree fallback
+        let host_def_point = host_defs[0].selection_span.start;
+        let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()));
+        assert!(refs.len() >= 1, "should find chained usage via tree fallback, got {} refs", refs.len());
     }
 
     #[test]
     fn test_highlights_read_write() {
         let src = "my $x = 1;\nprint $x;\n$x = 2;";
         let fa = build_fa(src);
-        let highlights = fa.find_highlights(Point::new(0, 4));
+        let highlights = fa.find_highlights(Point::new(0, 4), None, None);
         assert!(!highlights.is_empty(), "should have highlights");
         // Check that we have both read and write accesses
         let has_write = highlights.iter().any(|(_, a)| matches!(a, AccessKind::Write));
@@ -1855,7 +2999,7 @@ $p->;
     fn test_hover_variable() {
         let src = "my $greeting = 'hello';\nprint $greeting;";
         let fa = build_fa(src);
-        let hover = fa.hover_info(Point::new(1, 8), src);
+        let hover = fa.hover_info(Point::new(1, 8), src, None);
         assert!(hover.is_some(), "should have hover info");
         let text = hover.unwrap();
         assert!(text.contains("$greeting"), "hover should contain variable name, got: {}", text);
@@ -1865,10 +3009,50 @@ $p->;
     fn test_hover_sub() {
         let src = "sub greet { }\ngreet();";
         let fa = build_fa(src);
-        let hover = fa.hover_info(Point::new(1, 1), src);
+        let hover = fa.hover_info(Point::new(1, 1), src, None);
         assert!(hover.is_some(), "should have hover info for function call");
         let text = hover.unwrap();
         assert!(text.contains("greet"), "hover should contain sub name, got: {}", text);
+    }
+
+    #[test]
+    fn test_hover_shows_inferred_type() {
+        let src = "package Point;\nsub new { bless {}, shift }\npackage main;\nmy $p = Point->new();\n$p;";
+        let fa = build_fa(src);
+        // Hover on $p usage at line 4
+        let hover = fa.hover_info(Point::new(4, 1), src, None);
+        assert!(hover.is_some(), "should have hover info");
+        let text = hover.unwrap();
+        assert!(text.contains("Point"), "hover should show inferred type Point, got: {}", text);
+    }
+
+    #[test]
+    fn test_hover_type_at_usage_after_reassignment() {
+        // $x starts as Point, gets reassigned to Foo — hover at each usage should reflect the type at that point
+        let src = "package Point;\nsub new { bless {}, shift }\npackage Foo;\nsub new { bless {}, shift }\npackage main;\nmy $x = Point->new();\n$x;\n$x = Foo->new();\n$x;";
+        let fa = build_fa(src);
+        // line 6: $x; — should be Point
+        let hover1 = fa.hover_info(Point::new(6, 1), src, None);
+        assert!(hover1.is_some());
+        let text1 = hover1.unwrap();
+        assert!(text1.contains("Point"), "at line 6 should be Point, got: {}", text1);
+        // line 8: $x; — should be Foo (after reassignment)
+        let hover2 = fa.hover_info(Point::new(8, 1), src, None);
+        assert!(hover2.is_some());
+        let text2 = hover2.unwrap();
+        assert!(text2.contains("Foo"), "at line 8 should be Foo, got: {}", text2);
+    }
+
+    #[test]
+    fn test_hover_shows_return_type() {
+        let src = "package Foo;\nsub make { return Foo->new() }\nsub new { bless {}, shift }\npackage main;\nmake();";
+        let fa = build_fa(src);
+        // Hover on sub make definition
+        let hover = fa.hover_info(Point::new(1, 5), src, None);
+        assert!(hover.is_some(), "should have hover info for sub");
+        let text = hover.unwrap();
+        assert!(text.contains("returns"), "hover should show return type, got: {}", text);
+        assert!(text.contains("Foo"), "hover return type should mention Foo, got: {}", text);
     }
 
     #[test]
@@ -1889,7 +3073,7 @@ $p->;
         let src = "package Point;\nsub new { bless {}, shift }\npackage main;\nPoint->new();";
         let fa = build_fa(src);
         // Cursor on "new" in Point->new()
-        let def = fa.find_definition(Point::new(3, 8));
+        let def = fa.find_definition(Point::new(3, 8), None, None);
         assert!(def.is_some(), "should find definition for new");
     }
 
@@ -1942,12 +3126,12 @@ $p->;
         let fa = build_fa(src);
 
         // $self at line 12 (push @{$self->{history}}, ...)
-        let def_self = fa.find_definition(Point::new(12, 12));
+        let def_self = fa.find_definition(Point::new(12, 12), None, None);
         assert!(def_self.is_some(), "should find definition for $self in deref");
         assert_eq!(def_self.unwrap().start.row, 10, "$self should resolve to declaration on line 10");
 
         // history key at line 12
-        let def_history = fa.find_definition(Point::new(12, 20));
+        let def_history = fa.find_definition(Point::new(12, 20), None, None);
         assert!(def_history.is_some(), "should find definition for history hash key");
         assert_eq!(def_history.unwrap().start.row, 4, "history key should resolve to definition on line 4");
     }
@@ -2008,5 +3192,62 @@ $p->;
         // Import should exist
         assert_eq!(fa.imports.len(), 1);
         assert_eq!(fa.imports[0].imported_symbols, vec!["first"]);
+    }
+
+    #[test]
+    fn test_goto_def_slurpy_hash_arg_at_call_site() {
+        // Calculator->new(verbose => 1): cursor on "verbose" should go to
+        // the bless hash key def, NOT to sub new.
+        let src = r#"package Calculator;
+sub new {
+    my ($class, %args) = @_;
+    my $self = bless {
+        verbose => $args{verbose} // 0,
+    }, $class;
+    return $self;
+}
+package main;
+my $calc = Calculator->new(verbose => 1);
+"#;
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // "verbose" at call site is line 9, after "Calculator->new("
+        // Calculator->new(verbose => 1)
+        // 0123456789012345678901234567
+        //                 ^16 = v of verbose
+        // my $calc = Calculator->new(verbose => 1);
+        // 0         1         2         3
+        // 0123456789012345678901234567890123456789
+        //                            ^27 = v of verbose
+        let def = fa.find_definition(Point::new(9, 27), Some(&tree), Some(src.as_bytes()));
+        assert!(def.is_some(), "should find definition for verbose at call site");
+        // Should go to line 4: "verbose => $args{verbose} // 0,"
+        assert_eq!(def.unwrap().start.row, 4,
+            "verbose should resolve to bless hash key def on line 4, not sub new");
+    }
+
+    #[test]
+    fn test_goto_def_param_field_at_call_site() {
+        // Point->new(x => 3, y => 4): cursor on "x" should go to "field $x :param"
+        let src = r#"use v5.38;
+class Point {
+    field $x :param :reader;
+    field $y :param;
+    method magnitude() { }
+}
+my $p = Point->new(x => 3, y => 4);
+"#;
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // my $p = Point->new(x => 3, y => 4);
+        // 0         1         2
+        // 0123456789012345678901234
+        //                    ^19 = x
+
+        let def = fa.find_definition(Point::new(6, 19), Some(&tree), Some(src.as_bytes()));
+        assert!(def.is_some(), "should find definition for x at call site");
+        // Should go to line 2: "field $x :param :reader;"
+        assert_eq!(def.unwrap().start.row, 2,
+            "x should resolve to field $x on line 2, not the class");
     }
 }

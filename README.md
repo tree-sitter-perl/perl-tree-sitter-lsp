@@ -74,25 +74,27 @@ nvim -u test_nvim_init.lua test_files/sample.pl
 ### Single-file
 
 - **documentSymbol** — outline of subs, packages, variables, classes (with fields/methods as children)
-- **definition** — go-to-def for variables (scope-aware), subs, methods (type-inferred), packages/classes, hash keys
-- **references** — scope-aware for variables, file-wide for functions/packages/hash keys
-- **hover** — shows declaration line, class-aware for methods, hash key info
+- **definition** — go-to-def for variables (scope-aware), subs, methods (type-inferred), packages/classes, hash keys; works through expression chains (`$obj->get_foo()->bar()`)
+- **references** — scope-aware for variables, file-wide for functions/packages/hash keys; resolves through expression chains
+- **hover** — shows declaration line, inferred types, return types, class-aware for methods
 - **rename** — scope-aware for variables, file-wide for functions/packages/hash keys
-- **completion** — scope-aware variables (cross-sigil forms), subs, methods (type-inferred), packages, hash keys (class-aware)
-- **signatureHelp** — parameter info for subs/methods (signature syntax + legacy `@_` pattern), triggers on `(` and `,`
+- **completion** — scope-aware variables (cross-sigil forms), subs, methods (type-inferred with return type detail), packages, hash keys (class-aware), deref snippets (`[$0]`/`{$0}`/`($0)` for ArrayRef/HashRef/CodeRef)
+- **signatureHelp** — parameter info with inferred types for subs/methods (signature syntax + legacy `@_` pattern), triggers on `(` and `,`
+- **inlayHints** — type annotations for variables (Object/HashRef/ArrayRef/CodeRef) and sub return types
 - **documentHighlight** — highlight all occurrences with read/write distinction
 - **selectionRange** — expand/shrink selection via tree-sitter node hierarchy
 - **foldingRange** — blocks, subs, classes, pod sections
 - **formatting** — shells out to perltidy (respects .perltidyrc)
 - **semanticTokens/full** — variable tokens with modifiers: scalar/array/hash, declaration, modification
 - **codeAction** — auto-import: adds `use Module qw(func);` for unresolved functions
+- **Diagnostics** — unresolved function/method warnings (skips builtins, local subs, imported functions; method diagnostics check locally-defined classes)
 
 ### Cross-file
 
 - **Module resolution** — resolves `@EXPORT` / `@EXPORT_OK` from imported modules via `@INC`
 - **cpanfile pre-scan** — indexes project dependencies at startup with progress reporting
 - **Auto-import completions** — suggests exported functions from cached modules with `additionalTextEdits`
-- **Diagnostics** — warns on unresolved function calls (skips builtins, local subs, imported functions)
+- **Diagnostics** — warns on unresolved function calls (skips builtins, local subs, imported functions); auto-import code actions for functions found in cached modules
 - **SQLite cache** — per-project persistent cache, survives restarts, validates against `@INC` changes
 
 ## Architecture
@@ -102,7 +104,7 @@ src/
 ├── main.rs              Entry point, stdio transport, --parse-exports subprocess mode
 ├── backend.rs           LanguageServer trait impl (tower-lsp), request routing
 ├── document.rs          Document store with tree-sitter parsing
-├── file_analysis.rs     Data model: scopes, symbols, refs, imports, type inference
+├── file_analysis.rs     Data model: scopes, symbols, refs, imports, type inference engine
 ├── builder.rs           Single-pass CST → FileAnalysis builder
 ├── cursor_context.rs    Cursor position analysis: completion/signature/selection context
 ├── symbols.rs           LSP adapter: converts FileAnalysis types to LSP types
@@ -165,6 +167,10 @@ The file `/tmp/perl-lsp-last-update.pl` contains the last document text sent to 
 - Scope-aware variable resolution (my, our, state, signatures, for-loops, class fields)
 - Core Perl `class` support (5.38+): class extraction, field/method symbols, type-inferred method resolution
 - Hash key intelligence: go-to-def, refs, rename, hover, completion (class-aware via bless patterns)
+- Type inference: constructor tracking, builtin return types, expression chain resolution (`$obj->get_foo()->bar()`)
+- Inlay hints: variable type annotations and sub return types
+- Enhanced completion: method return types in detail, deref snippets for typed references
+- Enhanced signature help: inferred parameter types
 - Cross-file module resolution with background resolver thread
 - cpanfile pre-scan with tree-sitter queries and progress reporting
 - Auto-import completions and code actions
@@ -179,7 +185,6 @@ The file `/tmp/perl-lsp-last-update.pl` contains the last document text sent to 
 
 ### Future
 - Workspace-wide references and rename
-- Return type tracking and parameter type inference
 - Method resolution across inheritance hierarchies (`@ISA` / C3)
 
 ## References

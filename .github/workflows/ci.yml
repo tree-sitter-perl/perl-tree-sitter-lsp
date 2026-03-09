@@ -58,4 +58,6 @@ jobs:
           version: v0.11.0
 
       - name: Run e2e tests
-        run: nvim --headless --clean -u test_nvim_init.lua -l test_e2e.lua
+        run: |
+          nvim --headless --clean -u test_nvim_init.lua -l test_e2e.lua
+          nvim --headless --clean -u test_nvim_init.lua -l test_e2e_types.lua
