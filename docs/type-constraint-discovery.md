@@ -20,9 +20,8 @@ Round 1 expands this significantly.
 ```
 InferredType
 ├── Object(ClassName)         # blessed reference — has methods
-│   ├── ClassName(String)     # from Foo->new()
-│   ├── FirstParam(String)    # from my ($self) = @_ in package
-│   └── BlessResult(String)   # from bless {}, 'Foo'
+│   ├── ClassName(String)     # from Foo->new() or bless {}, 'Foo'
+│   └── FirstParam(String)    # from my ($self) = @_ in package
 ├── HashRef                   # unblessed hash reference
 ├── ArrayRef                  # unblessed array reference
 ├── CodeRef                   # code reference

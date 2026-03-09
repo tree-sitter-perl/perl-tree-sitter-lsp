@@ -229,8 +229,6 @@ pub enum InferredType {
     ClassName(String),
     /// `my ($self) = @_` in `package Foo` — first param is the class.
     FirstParam { package: String },
-    /// `bless { ... }, 'Foo'` — result is a Foo.
-    BlessResult { package: String },
     /// `$x = {}` or `$x = { ... }` — unblessed hash reference.
     HashRef,
     /// `$x = []` or `$x = [ ... ]` — unblessed array reference.
@@ -246,17 +244,16 @@ pub enum InferredType {
 }
 
 impl InferredType {
-    /// Extract the class name if this is an object type (ClassName, FirstParam, or BlessResult).
+    /// Extract the class name if this is an object type (ClassName or FirstParam).
     pub fn class_name(&self) -> Option<&str> {
         match self {
             InferredType::ClassName(name) => Some(name.as_str()),
             InferredType::FirstParam { package } => Some(package.as_str()),
-            InferredType::BlessResult { package } => Some(package.as_str()),
             _ => None,
         }
     }
 
-    /// True if this is any Object variant (ClassName, FirstParam, BlessResult).
+    /// True if this is any Object variant (ClassName or FirstParam).
     pub fn is_object(&self) -> bool {
         self.class_name().is_some()
     }
@@ -2257,7 +2254,6 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
     match ty {
         InferredType::ClassName(name) => name.clone(),
         InferredType::FirstParam { package } => package.clone(),
-        InferredType::BlessResult { package } => package.clone(),
         InferredType::HashRef => "HashRef".to_string(),
         InferredType::ArrayRef => "ArrayRef".to_string(),
         InferredType::CodeRef => "CodeRef".to_string(),
@@ -2449,7 +2445,6 @@ mod tests {
     fn test_class_name_helper() {
         assert_eq!(InferredType::ClassName("Foo".into()).class_name(), Some("Foo"));
         assert_eq!(InferredType::FirstParam { package: "Bar".into() }.class_name(), Some("Bar"));
-        assert_eq!(InferredType::BlessResult { package: "Baz".into() }.class_name(), Some("Baz"));
         assert_eq!(InferredType::HashRef.class_name(), None);
         assert_eq!(InferredType::ArrayRef.class_name(), None);
         assert_eq!(InferredType::CodeRef.class_name(), None);
