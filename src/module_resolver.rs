@@ -16,10 +16,10 @@ use tree_sitter::Parser;
 
 use crate::cpanfile;
 #[cfg(not(test))]
-use crate::file_analysis::{inferred_type_from_tag, InferredType};
+use crate::file_analysis::inferred_type_from_tag;
 use crate::file_analysis::inferred_type_to_tag;
 use crate::module_cache;
-use crate::module_index::{ModuleExports, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
+use crate::module_index::{ExportedParam, ExportedSub, ModuleExports, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
 
 /// Hard timeout for parsing a single .pm file in a child process.
 #[cfg(not(test))]
@@ -407,27 +407,40 @@ fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<Modul
         return None;
     }
 
-    // Parse return types from JSON
-    let return_types: HashMap<String, InferredType> = json
-        .get("return_types")
-        .and_then(|v| serde_json::from_value::<HashMap<String, String>>(v.clone()).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(k, v)| inferred_type_from_tag(&v).map(|ty| (k, ty)))
-        .collect();
-
-    // Parse hash keys from JSON
-    let hash_keys: HashMap<String, Vec<String>> = json
-        .get("hash_keys")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    // Parse subs metadata from JSON
+    let subs: HashMap<String, ExportedSub> = json
+        .get("subs")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter().filter_map(|(name, val)| {
+                let def_line = val.get("def_line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let is_method = val.get("is_method").and_then(|v| v.as_bool()).unwrap_or(false);
+                let params = val.get("params")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|p| {
+                        Some(ExportedParam {
+                            name: p.get("name")?.as_str()?.to_string(),
+                            is_slurpy: p.get("is_slurpy").and_then(|v| v.as_bool()).unwrap_or(false),
+                        })
+                    }).collect())
+                    .unwrap_or_default();
+                let return_type = val.get("return_type")
+                    .and_then(|v| v.as_str())
+                    .and_then(inferred_type_from_tag);
+                let hash_keys = val.get("hash_keys")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                Some((name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys }))
+            }).collect()
+        })
         .unwrap_or_default();
 
     Some(ModuleExports {
         path,
         export,
         export_ok,
-        return_types,
-        hash_keys,
+        subs,
     })
 }
 
@@ -451,23 +464,50 @@ pub fn subprocess_main(path: &str) {
         }
     };
 
-    // Run the builder to get return types and hash keys for exported functions
-    let mut return_types_map = serde_json::Map::new();
-    let mut hash_keys_map = serde_json::Map::new();
+    // Run the builder to get full sub metadata for exported functions
+    let mut subs_map = serde_json::Map::new();
     {
+        use crate::file_analysis::{SymKind, SymbolDetail};
         let analysis = crate::builder::build(&tree, source.as_bytes());
         for name in export.iter().chain(export_ok.iter()) {
-            if let Some(ty) = analysis.sub_return_type(name) {
-                return_types_map.insert(name.clone(), serde_json::Value::String(inferred_type_to_tag(ty)));
+            let mut sub_info = serde_json::Map::new();
+
+            // Find the sub symbol for definition line + params
+            for sym in &analysis.symbols {
+                if sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                    sub_info.insert("def_line".into(), sym.span.start.row.into());
+                    if let SymbolDetail::Sub { ref params, is_method, .. } = sym.detail {
+                        sub_info.insert("is_method".into(), is_method.into());
+                        let params_json: Vec<serde_json::Value> = params.iter()
+                            .map(|p| serde_json::json!({
+                                "name": p.name,
+                                "is_slurpy": p.is_slurpy,
+                            }))
+                            .collect();
+                        sub_info.insert("params".into(), params_json.into());
+                    }
+                    break;
+                }
             }
-            // Extract hash key names for subs that return HashRef
+
+            // Return type
+            if let Some(ty) = analysis.sub_return_type(name) {
+                sub_info.insert("return_type".into(),
+                    serde_json::Value::String(inferred_type_to_tag(ty)));
+            }
+
+            // Hash keys
             let owner = crate::file_analysis::HashKeyOwner::Sub(name.clone());
             let keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
                 .iter()
                 .map(|s| s.name.clone())
                 .collect();
             if !keys.is_empty() {
-                hash_keys_map.insert(name.clone(), serde_json::json!(keys));
+                sub_info.insert("hash_keys".into(), serde_json::json!(keys));
+            }
+
+            if !sub_info.is_empty() {
+                subs_map.insert(name.clone(), sub_info.into());
             }
         }
     }
@@ -475,8 +515,7 @@ pub fn subprocess_main(path: &str) {
     let json = serde_json::json!({
         "export": export,
         "export_ok": export_ok,
-        "return_types": return_types_map,
-        "hash_keys": hash_keys_map,
+        "subs": subs_map,
     });
     println!("{}", json);
 }
@@ -516,23 +555,37 @@ pub fn resolve_and_parse(
     let source = std::fs::read_to_string(&path).ok()?;
     let (export, export_ok, tree) = extract_exports(parser, &source)?;
 
-    // Extract return types and hash keys from builder analysis
-    let mut return_types = HashMap::new();
-    let mut hash_keys = HashMap::new();
+    // Extract full sub metadata from builder analysis
+    let mut subs = HashMap::new();
     {
+        use crate::file_analysis::{SymKind, SymbolDetail};
         let analysis = crate::builder::build(&tree, source.as_bytes());
         for name in export.iter().chain(export_ok.iter()) {
-            if let Some(ty) = analysis.sub_return_type(name) {
-                return_types.insert(name.clone(), ty.clone());
+            let mut def_line = 0u32;
+            let mut params = Vec::new();
+            let mut is_method = false;
+
+            for sym in &analysis.symbols {
+                if sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                    def_line = sym.span.start.row as u32;
+                    if let SymbolDetail::Sub { params: ref p, is_method: m, .. } = sym.detail {
+                        is_method = m;
+                        params = p.iter()
+                            .map(|pi| ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy })
+                            .collect();
+                    }
+                    break;
+                }
             }
+
+            let return_type = analysis.sub_return_type(name).cloned();
             let owner = crate::file_analysis::HashKeyOwner::Sub(name.clone());
-            let keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
+            let hash_keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
                 .iter()
                 .map(|s| s.name.clone())
                 .collect();
-            if !keys.is_empty() {
-                hash_keys.insert(name.clone(), keys);
-            }
+
+            subs.insert(name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys });
         }
     }
 
@@ -540,8 +593,7 @@ pub fn resolve_and_parse(
         path,
         export,
         export_ok,
-        return_types,
-        hash_keys,
+        subs,
     })
 }
 

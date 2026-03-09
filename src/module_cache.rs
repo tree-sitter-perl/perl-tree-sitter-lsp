@@ -11,10 +11,10 @@ use std::time::SystemTime;
 use dashmap::DashMap;
 use rusqlite::{params, Connection};
 
-use crate::file_analysis::{inferred_type_from_tag, inferred_type_to_tag, InferredType};
-use crate::module_index::ModuleExports;
+use crate::file_analysis::{inferred_type_from_tag, inferred_type_to_tag};
+use crate::module_index::{ExportedParam, ExportedSub, ModuleExports};
 
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 
 pub fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
@@ -91,8 +91,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             export       TEXT NOT NULL,
             export_ok    TEXT NOT NULL,
             source       TEXT NOT NULL DEFAULT 'import',
-            return_types TEXT NOT NULL DEFAULT '{}',
-            hash_keys    TEXT NOT NULL DEFAULT '{}'
+            subs         TEXT NOT NULL DEFAULT '{}'
         );",
     )?;
 
@@ -117,8 +116,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                     export       TEXT NOT NULL,
                     export_ok    TEXT NOT NULL,
                     source       TEXT NOT NULL DEFAULT 'import',
-                    return_types TEXT NOT NULL DEFAULT '{}',
-                    hash_keys    TEXT NOT NULL DEFAULT '{}'
+                    subs         TEXT NOT NULL DEFAULT '{}'
                 );",
             )?;
             conn.execute(
@@ -182,7 +180,7 @@ fn mtime_as_secs(path: &std::path::Path) -> Option<(i64, i64)> {
 
 pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExports>>) -> usize {
     let mut stmt = match conn.prepare(
-        "SELECT module_name, path, mtime_secs, file_size, export, export_ok, return_types, hash_keys FROM modules",
+        "SELECT module_name, path, mtime_secs, file_size, export, export_ok, subs FROM modules",
     ) {
         Ok(s) => s,
         Err(_) => return 0,
@@ -197,7 +195,6 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
         ))
     }) {
         Ok(r) => r,
@@ -206,7 +203,7 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
 
     let mut count = 0usize;
     for row in rows.flatten() {
-        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json, return_types_json, hash_keys_json) = row;
+        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json, subs_json) = row;
 
         // Negative sentinel
         if path_str.is_empty() {
@@ -229,17 +226,8 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
         let export: Vec<String> = serde_json::from_str(&export_json).unwrap_or_default();
         let export_ok: Vec<String> = serde_json::from_str(&export_ok_json).unwrap_or_default();
 
-        // Deserialize return types: JSON map of name → type_tag
-        let return_types: HashMap<String, InferredType> =
-            serde_json::from_str::<HashMap<String, String>>(&return_types_json)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|(k, v)| inferred_type_from_tag(&v).map(|ty| (k, ty)))
-                .collect();
-
-        // Deserialize hash keys: JSON map of func_name → [key_names]
-        let hash_keys: HashMap<String, Vec<String>> =
-            serde_json::from_str(&hash_keys_json).unwrap_or_default();
+        // Deserialize subs: JSON map of name → { def_line, params, is_method, return_type, hash_keys }
+        let subs = deserialize_subs_json(&subs_json);
 
         if export.is_empty() && export_ok.is_empty() {
             cache.insert(module_name, None);
@@ -250,8 +238,7 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
                     path,
                     export,
                     export_ok,
-                    return_types,
-                    hash_keys,
+                    subs,
                 }),
             );
         }
@@ -261,33 +248,74 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
     count
 }
 
+fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
+    let obj: HashMap<String, serde_json::Value> = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    obj.into_iter()
+        .filter_map(|(name, val)| {
+            let def_line = val.get("def_line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let is_method = val.get("is_method").and_then(|v| v.as_bool()).unwrap_or(false);
+            let params = val
+                .get("params")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| {
+                            Some(ExportedParam {
+                                name: p.get("name")?.as_str()?.to_string(),
+                                is_slurpy: p
+                                    .get("is_slurpy")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let return_type = val
+                .get("return_type")
+                .and_then(|v| v.as_str())
+                .and_then(inferred_type_from_tag);
+            let hash_keys = val
+                .get("hash_keys")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Some((
+                name,
+                ExportedSub {
+                    def_line,
+                    params,
+                    is_method,
+                    return_type,
+                    hash_keys,
+                },
+            ))
+        })
+        .collect()
+}
+
 pub fn save_to_db(
     conn: &Connection,
     module_name: &str,
     result: &Option<ModuleExports>,
     source: &str,
 ) {
-    let (path_str, mtime, size, export_json, export_ok_json, return_types_json, hash_keys_json) = match result {
+    let (path_str, mtime, size, export_json, export_ok_json, subs_json) = match result {
         Some(exports) => {
             let (mtime, size) = mtime_as_secs(&exports.path).unwrap_or((0, 0));
             let ej = serde_json::to_string(&exports.export).unwrap_or_default();
             let eoj = serde_json::to_string(&exports.export_ok).unwrap_or_default();
-            // Serialize return types as name → type_tag
-            let rt_tags: HashMap<&str, String> = exports
-                .return_types
-                .iter()
-                .map(|(k, v)| (k.as_str(), inferred_type_to_tag(v)))
-                .collect();
-            let rtj = serde_json::to_string(&rt_tags).unwrap_or_else(|_| "{}".to_string());
-            let hkj = serde_json::to_string(&exports.hash_keys).unwrap_or_else(|_| "{}".to_string());
+            let sj = serialize_subs_json(&exports.subs);
             (
                 exports.path.to_string_lossy().to_string(),
                 mtime,
                 size,
                 ej,
                 eoj,
-                rtj,
-                hkj,
+                sj,
             )
         }
         None => (
@@ -297,18 +325,48 @@ pub fn save_to_db(
             "[]".to_string(),
             "[]".to_string(),
             "{}".to_string(),
-            "{}".to_string(),
         ),
     };
 
     let r = conn.execute(
-        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source, return_types, hash_keys)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![module_name, path_str, mtime, size, export_json, export_ok_json, source, return_types_json, hash_keys_json],
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source, subs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![module_name, path_str, mtime, size, export_json, export_ok_json, source, subs_json],
     );
     if let Err(e) = r {
         log::warn!("Failed to save module cache for '{}': {}", module_name, e);
     }
+}
+
+fn serialize_subs_json(subs: &HashMap<String, ExportedSub>) -> String {
+    let mut map = serde_json::Map::new();
+    for (name, sub_info) in subs {
+        let mut obj = serde_json::Map::new();
+        obj.insert("def_line".into(), sub_info.def_line.into());
+        obj.insert("is_method".into(), sub_info.is_method.into());
+        let params: Vec<serde_json::Value> = sub_info
+            .params
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "name": p.name,
+                    "is_slurpy": p.is_slurpy,
+                })
+            })
+            .collect();
+        obj.insert("params".into(), params.into());
+        if let Some(ref rt) = sub_info.return_type {
+            obj.insert(
+                "return_type".into(),
+                serde_json::Value::String(inferred_type_to_tag(rt)),
+            );
+        }
+        if !sub_info.hash_keys.is_empty() {
+            obj.insert("hash_keys".into(), serde_json::json!(sub_info.hash_keys));
+        }
+        map.insert(name.clone(), obj.into());
+    }
+    serde_json::Value::Object(map).to_string()
 }
 
 #[cfg(test)]
@@ -334,8 +392,7 @@ mod tests {
             path: pm.clone(),
             export: vec!["foo".into(), "bar".into()],
             export_ok: vec!["baz".into()],
-            return_types: HashMap::new(),
-            hash_keys: HashMap::new(),
+            subs: HashMap::new(),
         });
         save_to_db(&conn, "TestModule", &exports, "import");
 
@@ -377,8 +434,7 @@ mod tests {
             path: pm.clone(),
             export: vec!["old".into()],
             export_ok: vec![],
-            return_types: HashMap::new(),
-            hash_keys: HashMap::new(),
+            subs: HashMap::new(),
         });
         save_to_db(&conn, "StaleModule", &exports, "import");
 
@@ -429,12 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn test_db_migration_v2_to_v3_supports_return_types() {
-        // Simulate a v2 database (no return_types column)
+    fn test_db_migration_old_to_v5_supports_subs() {
+        // Simulate an old database (different schema version)
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '4');
              CREATE TABLE modules (
                  module_name TEXT PRIMARY KEY,
                  path        TEXT NOT NULL,
@@ -442,7 +498,9 @@ mod tests {
                  file_size   INTEGER NOT NULL,
                  export      TEXT NOT NULL,
                  export_ok   TEXT NOT NULL,
-                 source      TEXT NOT NULL DEFAULT 'import'
+                 source      TEXT NOT NULL DEFAULT 'import',
+                 return_types TEXT NOT NULL DEFAULT '{}',
+                 hash_keys    TEXT NOT NULL DEFAULT '{}'
              );",
         )
         .unwrap();
@@ -450,20 +508,28 @@ mod tests {
         // Run migration
         init_schema(&conn).unwrap();
 
-        // Now save with return_types — should not fail
+        // Now save with subs — should not fail
         let dir = std::env::temp_dir();
         let pm = dir.join("MigratedModule.pm");
         std::fs::write(&pm, "package MigratedModule; 1;").unwrap();
 
-        let mut rt = HashMap::new();
-        rt.insert("get_data".to_string(), InferredType::HashRef);
+        let mut subs = HashMap::new();
+        subs.insert(
+            "get_data".to_string(),
+            ExportedSub {
+                def_line: 10,
+                params: vec![],
+                is_method: false,
+                return_type: Some(crate::file_analysis::InferredType::HashRef),
+                hash_keys: vec!["host".into()],
+            },
+        );
 
         let exports = Some(ModuleExports {
             path: pm.clone(),
             export: vec!["get_data".into()],
             export_ok: vec![],
-            return_types: rt,
-            hash_keys: HashMap::new(),
+            subs,
         });
         save_to_db(&conn, "MigratedModule", &exports, "import");
 
@@ -473,11 +539,14 @@ mod tests {
         assert_eq!(n, 1);
         let loaded = cache.get("MigratedModule").unwrap();
         let loaded = loaded.as_ref().unwrap();
+        let sub_info = loaded.subs.get("get_data").expect("should have get_data sub");
+        assert_eq!(sub_info.def_line, 10);
         assert_eq!(
-            loaded.return_types.get("get_data"),
-            Some(&InferredType::HashRef),
-            "return_types should survive v2→v3 migration + roundtrip"
+            sub_info.return_type,
+            Some(crate::file_analysis::InferredType::HashRef),
+            "return_type should survive migration + roundtrip"
         );
+        assert_eq!(sub_info.hash_keys, vec!["host"]);
 
         let _ = std::fs::remove_file(&pm);
     }
@@ -493,8 +562,7 @@ mod tests {
             path: pm.clone(),
             export: vec!["foo".into()],
             export_ok: vec![],
-            return_types: HashMap::new(),
-            hash_keys: HashMap::new(),
+            subs: HashMap::new(),
         });
         save_to_db(&conn, "SourceTest", &exports, "cpanfile");
 
@@ -525,39 +593,79 @@ mod tests {
     }
 
     #[test]
-    fn test_db_return_types_roundtrip() {
+    fn test_db_subs_roundtrip() {
+        use crate::file_analysis::InferredType;
+
         let conn = test_db();
 
         let dir = std::env::temp_dir();
-        let pm = dir.join("ReturnTypeTest.pm");
-        std::fs::write(&pm, "package ReturnTypeTest; 1;").unwrap();
+        let pm = dir.join("SubsTest.pm");
+        std::fs::write(&pm, "package SubsTest; 1;").unwrap();
 
-        let mut rt = HashMap::new();
-        rt.insert("get_config".to_string(), InferredType::HashRef);
-        rt.insert("make_items".to_string(), InferredType::ArrayRef);
-        rt.insert("new_obj".to_string(), InferredType::ClassName("MyObj".into()));
+        let mut subs = HashMap::new();
+        subs.insert(
+            "get_config".to_string(),
+            ExportedSub {
+                def_line: 5,
+                params: vec![
+                    ExportedParam { name: "$path".into(), is_slurpy: false },
+                ],
+                is_method: false,
+                return_type: Some(InferredType::HashRef),
+                hash_keys: vec!["host".into(), "port".into()],
+            },
+        );
+        subs.insert(
+            "make_items".to_string(),
+            ExportedSub {
+                def_line: 20,
+                params: vec![],
+                is_method: false,
+                return_type: Some(InferredType::ArrayRef),
+                hash_keys: vec![],
+            },
+        );
+        subs.insert(
+            "new_obj".to_string(),
+            ExportedSub {
+                def_line: 30,
+                params: vec![ExportedParam { name: "$class".into(), is_slurpy: false }],
+                is_method: true,
+                return_type: Some(InferredType::ClassName("MyObj".into())),
+                hash_keys: vec![],
+            },
+        );
 
         let exports = Some(ModuleExports {
             path: pm.clone(),
             export: vec!["get_config".into()],
             export_ok: vec!["make_items".into(), "new_obj".into()],
-            return_types: rt,
-            hash_keys: HashMap::new(),
+            subs,
         });
-        save_to_db(&conn, "ReturnTypeTest", &exports, "import");
+        save_to_db(&conn, "SubsTest", &exports, "import");
 
         let cache = DashMap::new();
         let n = warm_cache(&conn, &cache);
         assert_eq!(n, 1);
 
-        let loaded = cache.get("ReturnTypeTest").unwrap();
+        let loaded = cache.get("SubsTest").unwrap();
         let loaded = loaded.as_ref().unwrap();
-        assert_eq!(loaded.return_types.get("get_config"), Some(&InferredType::HashRef));
-        assert_eq!(loaded.return_types.get("make_items"), Some(&InferredType::ArrayRef));
-        assert_eq!(
-            loaded.return_types.get("new_obj"),
-            Some(&InferredType::ClassName("MyObj".into()))
-        );
+
+        let gc = loaded.subs.get("get_config").expect("get_config");
+        assert_eq!(gc.def_line, 5);
+        assert_eq!(gc.params.len(), 1);
+        assert_eq!(gc.params[0].name, "$path");
+        assert_eq!(gc.return_type, Some(InferredType::HashRef));
+        assert_eq!(gc.hash_keys, vec!["host", "port"]);
+
+        let mi = loaded.subs.get("make_items").expect("make_items");
+        assert_eq!(mi.def_line, 20);
+        assert_eq!(mi.return_type, Some(InferredType::ArrayRef));
+
+        let no = loaded.subs.get("new_obj").expect("new_obj");
+        assert_eq!(no.def_line, 30);
+        assert!(no.is_method);
+        assert_eq!(no.return_type, Some(InferredType::ClassName("MyObj".into())));
 
         let _ = std::fs::remove_file(&pm);
     }

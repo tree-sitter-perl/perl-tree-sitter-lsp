@@ -92,11 +92,13 @@ fn build_imported_return_types(
     let mut keys_map = HashMap::new();
     for import in &analysis.imports {
         if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
-            for (name, ty) in &exports.return_types {
-                type_map.insert(name.clone(), ty.clone());
-            }
-            for (name, keys) in &exports.hash_keys {
-                keys_map.insert(name.clone(), keys.clone());
+            for (name, sub_info) in &exports.subs {
+                if let Some(ref ty) = sub_info.return_type {
+                    type_map.insert(name.clone(), ty.clone());
+                }
+                if !sub_info.hash_keys.is_empty() {
+                    keys_map.insert(name.clone(), sub_info.hash_keys.clone());
+                }
             }
         }
     }
@@ -344,7 +346,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        Ok(symbols::signature_help(&doc.analysis, &doc.tree, &doc.text, pos))
+        Ok(symbols::signature_help(&doc.analysis, &doc.tree, &doc.text, pos, &self.module_index))
     }
 
     async fn document_highlight(

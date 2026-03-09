@@ -22,6 +22,27 @@ use crate::module_resolver;
 
 // ---- Public types ----
 
+/// Metadata for an exported function, extracted during module analysis.
+#[derive(Debug, Clone)]
+pub struct ExportedSub {
+    /// Line number of the `sub foo {` definition (0-indexed).
+    pub def_line: u32,
+    /// Parameter names with metadata.
+    pub params: Vec<ExportedParam>,
+    /// Whether this is a method (has $self/$class first param).
+    pub is_method: bool,
+    /// Inferred return type, if known.
+    pub return_type: Option<InferredType>,
+    /// Hash key names from return value, if returns HashRef.
+    pub hash_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportedParam {
+    pub name: String,
+    pub is_slurpy: bool,
+}
+
 /// Exports extracted from a .pm file.
 #[derive(Debug, Clone)]
 pub struct ModuleExports {
@@ -31,17 +52,22 @@ pub struct ModuleExports {
     pub export: Vec<String>,
     /// @EXPORT_OK — available on request via `use Foo qw(...)`.
     pub export_ok: Vec<String>,
-    /// Return types for exported functions (func_name → type).
-    pub return_types: HashMap<String, InferredType>,
-    /// Hash key names from exported functions' return values (func_name → key names).
-    pub hash_keys: HashMap<String, Vec<String>>,
+    /// Per-function metadata for exported subs.
+    pub subs: HashMap<String, ExportedSub>,
 }
 
 impl ModuleExports {
-    #[allow(dead_code)]
-    pub fn return_type(&self, func_name: &str) -> Option<&InferredType> {
-        self.return_types.get(func_name)
+    /// Look up metadata for an exported function.
+    pub fn sub_info(&self, name: &str) -> Option<&ExportedSub> {
+        self.subs.get(name)
     }
+
+    /// Convenience: return type for a function (used by test code).
+    #[cfg(test)]
+    pub fn return_type(&self, name: &str) -> Option<&InferredType> {
+        self.subs.get(name).and_then(|s| s.return_type.as_ref())
+    }
+
 }
 
 // ---- Internal sync primitives (pub(crate) for resolver thread) ----
@@ -168,7 +194,7 @@ impl ModuleIndex {
         for module_name in modules.value() {
             if let Some(entry) = self.cache.get(module_name) {
                 if let Some(ref exports) = *entry {
-                    if let Some(ty) = exports.return_types.get(func_name) {
+                    if let Some(ty) = exports.return_type(func_name) {
                         return Some(ty.clone());
                     }
                 }
@@ -373,8 +399,7 @@ mod tests {
                 path: PathBuf::from("/fake/Foo/Bar.pm"),
                 export: vec!["alpha".into()],
                 export_ok: vec!["beta".into()],
-                return_types: HashMap::new(),
-                hash_keys: HashMap::new(),
+                subs: HashMap::new(),
             }),
         );
         idx.insert_cache(
@@ -383,8 +408,7 @@ mod tests {
                 path: PathBuf::from("/fake/Baz/Qux.pm"),
                 export: vec![],
                 export_ok: vec!["beta".into(), "gamma".into()],
-                return_types: HashMap::new(),
-                hash_keys: HashMap::new(),
+                subs: HashMap::new(),
             }),
         );
 
@@ -402,8 +426,7 @@ mod tests {
                 path: PathBuf::from("/fake/My/Mod.pm"),
                 export: vec!["foo".into()],
                 export_ok: vec!["bar".into()],
-                return_types: HashMap::new(),
-                hash_keys: HashMap::new(),
+                subs: HashMap::new(),
             }),
         );
 
@@ -419,9 +442,21 @@ mod tests {
         use crate::file_analysis::InferredType;
 
         let idx = ModuleIndex::new_for_test();
-        let mut rt = HashMap::new();
-        rt.insert("get_config".to_string(), InferredType::HashRef);
-        rt.insert("make_obj".to_string(), InferredType::ClassName("MyClass".into()));
+        let mut subs = HashMap::new();
+        subs.insert("get_config".to_string(), ExportedSub {
+            def_line: 10,
+            params: vec![],
+            is_method: false,
+            return_type: Some(InferredType::HashRef),
+            hash_keys: vec![],
+        });
+        subs.insert("make_obj".to_string(), ExportedSub {
+            def_line: 20,
+            params: vec![],
+            is_method: false,
+            return_type: Some(InferredType::ClassName("MyClass".into())),
+            hash_keys: vec![],
+        });
 
         idx.insert_cache(
             "Config::DB",
@@ -429,8 +464,7 @@ mod tests {
                 path: PathBuf::from("/fake/Config/DB.pm"),
                 export: vec![],
                 export_ok: vec!["get_config".into(), "make_obj".into()],
-                return_types: rt,
-                hash_keys: HashMap::new(),
+                subs,
             }),
         );
 
