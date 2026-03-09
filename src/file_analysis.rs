@@ -1947,21 +1947,20 @@ impl FileAnalysis {
             var_text
         };
 
-        // Try type inference → class owner or sub return hash keys
+        // Try type inference → class owner
         if let Some(it) = self.inferred_type(var_text, point) {
             if let Some(cn) = it.class_name() {
                 return Some(HashKeyOwner::Class(cn.to_string()));
             }
-            // HashRef from a call binding → follow to sub's return hash keys
-            if *it == InferredType::HashRef {
-                for cb in &self.call_bindings {
-                    if cb.variable == var_text
-                        && cb.span.start <= point
-                        && contains_point(&self.scopes[cb.scope.0 as usize].span, point)
-                    {
-                        return Some(HashKeyOwner::Sub(cb.func_name.clone()));
-                    }
-                }
+        }
+
+        // Check call bindings → follow to sub's return hash keys
+        for cb in &self.call_bindings {
+            if cb.variable == var_text
+                && cb.span.start <= point
+                && contains_point(&self.scopes[cb.scope.0 as usize].span, point)
+            {
+                return Some(HashKeyOwner::Sub(cb.func_name.clone()));
             }
         }
 
