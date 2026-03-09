@@ -8,6 +8,7 @@ use crate::file_analysis::{
     RefKind, Span, SymKind as FaSymKind, SymbolDetail, VarModifier,
     PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT, PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
+use crate::module_index::ExportedSub;
 use crate::module_index::ModuleIndex;
 
 // ---- Coordinate conversion ----
@@ -100,16 +101,30 @@ pub fn find_definition(
                 // Jump to the module's use statement in the current file
                 // (or the .pm file if we can resolve it)
                 if let Ok(module_uri) = Url::from_file_path(&module_path) {
+                    // Try to get the actual definition line from the module index
+                    let def_line = module_index
+                        .get_exports_cached(&import.module_name)
+                        .as_ref()
+                        .and_then(|e| e.sub_info(&r.target_name))
+                        .map(|s| s.def_line);
+                    let def_range = match def_line {
+                        Some(line) => Range {
+                            start: Position { line, character: 0 },
+                            end: Position { line, character: 0 },
+                        },
+                        None => Range::default(),
+                    };
+
                     return Some(GotoDefinitionResponse::Array(vec![
                         // First: the use statement in this file
                         Location {
                             uri: uri.clone(),
                             range: span_to_range(import.span),
                         },
-                        // Second: the .pm file itself (line 1)
+                        // Second: the sub definition in the .pm file
                         Location {
                             uri: module_uri,
-                            range: Range::default(),
+                            range: def_range,
                         },
                     ]));
                 }
@@ -344,10 +359,18 @@ pub fn hover_info(
             if let Some((import, _path)) =
                 resolve_imported_function(analysis, &r.target_name, module_index)
             {
-                let markdown = format!(
-                    "```perl\nuse {} qw({});\n```\n\n*imported from `{}`*",
-                    import.module_name, r.target_name, import.module_name,
-                );
+                let mut parts = Vec::new();
+
+                // Show signature if available
+                if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
+                    if let Some(sub_info) = exports.sub_info(&r.target_name) {
+                        let sig = format_imported_signature(&r.target_name, sub_info);
+                        parts.push(format!("```perl\n{}\n```", sig));
+                    }
+                }
+
+                parts.push(format!("*imported from `{}`*", import.module_name));
+                let markdown = parts.join("\n\n");
                 return Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -416,6 +439,7 @@ pub fn signature_help(
     tree: &Tree,
     text: &str,
     pos: Position,
+    module_index: &ModuleIndex,
 ) -> Option<SignatureHelp> {
     let point = position_to_point(pos);
 
@@ -423,56 +447,91 @@ pub fn signature_help(
     let call_ctx = cursor_context::find_call_context(tree, text.as_bytes(), point)?;
 
     // Step 2: file_analysis resolves the sub signature (pure table lookup)
-    let sig_info = analysis.signature_for_call(
+    if let Some(sig_info) = analysis.signature_for_call(
         &call_ctx.name,
         call_ctx.is_method,
         call_ctx.invocant.as_deref(),
         point,
-    )?;
+    ) {
+        // Build param labels with inferred types
+        let param_labels: Vec<String> = sig_info
+            .params
+            .iter()
+            .map(|p| {
+                let base = if let Some(ref default) = p.default {
+                    format!("{} = {}", p.name, default)
+                } else {
+                    p.name.clone()
+                };
+                // Look up inferred type at end of sub body (captures all operator usage)
+                // Skip $self/$class — type is obvious
+                if p.name == "$self" || p.name == "$class" {
+                    return base;
+                }
+                if let Some(ty) = analysis.inferred_type(&p.name, sig_info.body_end) {
+                    format!("{}: {}", base, format_inferred_type(ty))
+                } else {
+                    base
+                }
+            })
+            .collect();
 
-    // Build param labels with inferred types
-    let param_labels: Vec<String> = sig_info
-        .params
-        .iter()
-        .map(|p| {
-            let base = if let Some(ref default) = p.default {
-                format!("{} = {}", p.name, default)
-            } else {
-                p.name.clone()
-            };
-            // Look up inferred type at end of sub body (captures all operator usage)
-            // Skip $self/$class — type is obvious
-            if p.name == "$self" || p.name == "$class" {
-                return base;
-            }
-            if let Some(ty) = analysis.inferred_type(&p.name, sig_info.body_end) {
-                format!("{}: {}", base, format_inferred_type(ty))
-            } else {
-                base
-            }
-        })
-        .collect();
+        let params: Vec<ParameterInformation> = param_labels
+            .iter()
+            .map(|label| ParameterInformation {
+                label: ParameterLabel::Simple(label.clone()),
+                documentation: None,
+            })
+            .collect();
 
-    let params: Vec<ParameterInformation> = param_labels
-        .iter()
-        .map(|label| ParameterInformation {
-            label: ParameterLabel::Simple(label.clone()),
-            documentation: None,
-        })
-        .collect();
+        let label = format!("{}({})", sig_info.name, param_labels.join(", "));
 
-    let label = format!("{}({})", sig_info.name, param_labels.join(", "));
-
-    Some(SignatureHelp {
-        signatures: vec![SignatureInformation {
-            label,
-            documentation: None,
-            parameters: Some(params),
+        return Some(SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label,
+                documentation: None,
+                parameters: Some(params),
+                active_parameter: Some(call_ctx.active_param as u32),
+            }],
+            active_signature: Some(0),
             active_parameter: Some(call_ctx.active_param as u32),
-        }],
-        active_signature: Some(0),
-        active_parameter: Some(call_ctx.active_param as u32),
-    })
+        });
+    }
+
+    // Fallback: imported function
+    if !call_ctx.is_method {
+        if let Some((import, _)) =
+            resolve_imported_function(analysis, &call_ctx.name, module_index)
+        {
+            if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
+                if let Some(sub_info) = exports.sub_info(&call_ctx.name) {
+                    let param_labels: Vec<String> =
+                        sub_info.params.iter().map(|p| p.name.clone()).collect();
+                    let params: Vec<ParameterInformation> = param_labels
+                        .iter()
+                        .map(|label| ParameterInformation {
+                            label: ParameterLabel::Simple(label.clone()),
+                            documentation: None,
+                        })
+                        .collect();
+                    let label =
+                        format!("{}({})", call_ctx.name, param_labels.join(", "));
+                    return Some(SignatureHelp {
+                        signatures: vec![SignatureInformation {
+                            label,
+                            documentation: None,
+                            parameters: Some(params),
+                            active_parameter: Some(call_ctx.active_param as u32),
+                        }],
+                        active_signature: Some(0),
+                        active_parameter: Some(call_ctx.active_param as u32),
+                    });
+                }
+            }
+        }
+    }
+
+    None
 }
 
 // ---- Semantic tokens ----
@@ -645,10 +704,11 @@ fn imported_function_completions(
             if !analysis.symbols_named(name).is_empty() {
                 continue;
             }
+            let detail = completion_detail_for_import(name, exports.as_ref(), &import.module_name);
             candidates.push(CompletionCandidate {
                 label: name.clone(),
                 kind: FaSymKind::Sub,
-                detail: Some(format!("imported from {}", import.module_name)),
+                detail: Some(detail),
                 insert_text: None,
                 sort_priority: PRIORITY_EXPLICIT_IMPORT,
                 additional_edits: vec![],
@@ -677,6 +737,11 @@ fn imported_function_completions(
                     continue;
                 }
 
+                let rt_prefix = exports.sub_info(name)
+                    .and_then(|s| s.return_type.as_ref())
+                    .map(|rt| format!("→ {} ", format_inferred_type(rt)))
+                    .unwrap_or_default();
+
                 let (detail, priority, additional_edits) =
                     if let Some(close_pos) = import.qw_close_paren {
                         // Auto-add to existing qw() list
@@ -685,14 +750,14 @@ fn imported_function_completions(
                             end: close_pos,
                         };
                         (
-                            format!("{} (auto-import)", import.module_name),
+                            format!("{}{} (auto-import)", rt_prefix, import.module_name),
                             PRIORITY_AUTO_ADD_QW,
                             vec![(insert_point, format!(" {}", name))],
                         )
                     } else {
                         // No qw() list to edit (bare `use Foo;`)
                         (
-                            format!("imported from {}", import.module_name),
+                            format!("{}imported from {}", rt_prefix, import.module_name),
                             PRIORITY_BARE_IMPORT,
                             vec![],
                         )
@@ -796,6 +861,35 @@ fn resolve_imported_function<'a>(
         }
     }
     None
+}
+
+fn completion_detail_for_import(
+    name: &str,
+    exports: Option<&crate::module_index::ModuleExports>,
+    module_name: &str,
+) -> String {
+    if let Some(exports) = exports {
+        if let Some(sub_info) = exports.sub_info(name) {
+            if let Some(ref rt) = sub_info.return_type {
+                return format!("→ {} ({})", format_inferred_type(rt), module_name);
+            }
+        }
+    }
+    format!("imported from {}", module_name)
+}
+
+fn format_imported_signature(name: &str, sub_info: &ExportedSub) -> String {
+    let params_str = sub_info
+        .params
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sig = format!("sub {}({})", name, params_str);
+    if let Some(ref rt) = sub_info.return_type {
+        sig.push_str(&format!(" → {}", format_inferred_type(rt)));
+    }
+    sig
 }
 
 // ---- Diagnostics ----
@@ -1317,8 +1411,7 @@ mod tests {
                 path: std::path::PathBuf::from("/usr/lib/perl5/List/Util.pm"),
                 export: vec![],
                 export_ok: vec!["first".into(), "max".into(), "min".into()],
-                return_types: std::collections::HashMap::new(),
-                hash_keys: std::collections::HashMap::new(),
+                subs: std::collections::HashMap::new(),
             }),
         );
 
@@ -1367,8 +1460,7 @@ mod tests {
                 path: std::path::PathBuf::from("/usr/lib/perl5/List/Util.pm"),
                 export: vec![],
                 export_ok: vec!["first".into(), "max".into(), "min".into()],
-                return_types: std::collections::HashMap::new(),
-                hash_keys: std::collections::HashMap::new(),
+                subs: std::collections::HashMap::new(),
             }),
         );
         idx.insert_cache(
@@ -1377,8 +1469,7 @@ mod tests {
                 path: std::path::PathBuf::from("/usr/lib/perl5/Scalar/Util.pm"),
                 export: vec![],
                 export_ok: vec!["blessed".into(), "reftype".into()],
-                return_types: std::collections::HashMap::new(),
-                hash_keys: std::collections::HashMap::new(),
+                subs: std::collections::HashMap::new(),
             }),
         );
 
