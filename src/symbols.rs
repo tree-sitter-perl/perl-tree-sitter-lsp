@@ -208,29 +208,33 @@ pub fn completion_items(
 
     // Try tree-based detection first for expression-based contexts
     let ctx = cursor_context::detect_cursor_context_tree(tree, source.as_bytes(), point, analysis)
-        .unwrap_or_else(|| cursor_context::detect_cursor_context(source, point));
+        .unwrap_or_else(|| cursor_context::detect_cursor_context(source, point, Some(analysis)));
 
     let mut candidates: Vec<CompletionCandidate> = match ctx {
         CursorContext::Variable { sigil } => analysis.complete_variables(point, sigil),
-        CursorContext::Method { ref invocant } => analysis.complete_methods(invocant, point),
-        CursorContext::MethodOnExpression { ref invocant_type } => {
-            if let Some(cn) = invocant_type.class_name() {
-                analysis.complete_methods_for_class(cn)
+        CursorContext::Method { ref invocant_type, ref invocant_text } => {
+            if let Some(ref ty) = invocant_type {
+                if let Some(cn) = ty.class_name() {
+                    analysis.complete_methods_for_class(cn)
+                } else {
+                    // Ref types get deref snippet completions (handled below)
+                    Vec::new()
+                }
             } else {
-                // Ref types get deref snippet completions (handled below)
-                Vec::new()
+                analysis.complete_methods(invocant_text, point)
             }
         }
-        CursorContext::HashKey { ref var_text } => analysis.complete_hash_keys(var_text, point),
-        CursorContext::HashKeyOnExpression { ref owner_type, ref source_sub } => {
-            if let Some(cn) = owner_type.class_name() {
-                // Object type → offer hash keys for that class
-                analysis.complete_hash_keys_for_class(cn, point)
-            } else if let Some(ref sub_name) = source_sub {
-                // HashRef from a known sub → look up return value hash keys
-                analysis.complete_hash_keys_for_sub(sub_name, point)
+        CursorContext::HashKey { ref owner_type, ref var_text, ref source_sub } => {
+            if let Some(ref ty) = owner_type {
+                if let Some(cn) = ty.class_name() {
+                    analysis.complete_hash_keys_for_class(cn, point)
+                } else if let Some(ref sub_name) = source_sub {
+                    analysis.complete_hash_keys_for_sub(sub_name, point)
+                } else {
+                    Vec::new()
+                }
             } else {
-                Vec::new()
+                analysis.complete_hash_keys(var_text, point)
             }
         }
         CursorContext::General => {
@@ -266,20 +270,13 @@ pub fn completion_items(
         .map(candidate_to_completion_item)
         .collect();
 
-    // 5d: ref-type deref snippets when completing after ->
-    match ctx {
-        CursorContext::MethodOnExpression { ref invocant_type } => {
-            items.extend(ref_type_snippet_completions(invocant_type));
-        }
-        CursorContext::Method { ref invocant } => {
-            // For $var-> where $var is a ref type, offer deref snippets
-            if let Some(ty) = analysis.inferred_type(invocant, point) {
-                if !ty.is_object() {
-                    items.extend(ref_type_snippet_completions(ty));
-                }
+    // Ref-type deref snippets when completing after ->
+    if let CursorContext::Method { ref invocant_type, .. } = ctx {
+        if let Some(ref ty) = invocant_type {
+            if !ty.is_object() {
+                items.extend(ref_type_snippet_completions(ty));
             }
         }
-        _ => {}
     }
 
     items

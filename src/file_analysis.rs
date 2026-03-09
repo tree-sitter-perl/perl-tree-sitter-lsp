@@ -16,6 +16,28 @@ pub struct Span {
     pub end: Point,
 }
 
+/// Extract the function/method name from a call expression node.
+pub(crate) fn extract_call_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "method_call_expression" => node
+            .child_by_field_name("method")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.to_string()),
+        "function_call_expression" | "ambiguous_function_call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn node_to_span(node: tree_sitter::Node) -> Span {
+    Span {
+        start: node.start_position(),
+        end: node.end_position(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FoldRange {
     pub start_line: usize,
@@ -928,65 +950,10 @@ impl FileAnalysis {
     /// Find all references to the symbol at cursor.
     pub fn find_references(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Vec<Span> {
         if let Some((target_id, include_decl)) = self.resolve_target_at(point, tree, source_bytes) {
-            let sym = self.symbol(target_id);
-            let mut spans: Vec<Span> = Vec::new();
-
-            // Include the declaration itself
-            if include_decl {
-                spans.push(sym.selection_span);
-            }
-
-            // Collect all refs that resolve to this symbol
-            for r in &self.refs {
-                if r.resolves_to == Some(target_id) {
-                    spans.push(r.span);
-                }
-            }
-
-            // For subs/methods/packages/classes, also find refs by name
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
-                for r in &self.refs {
-                    if r.target_name == sym.name && r.resolves_to.is_none() {
-                        match (&r.kind, &sym.kind) {
-                            (RefKind::FunctionCall, SymKind::Sub) => spans.push(r.span),
-                            (RefKind::MethodCall { .. }, SymKind::Sub | SymKind::Method) => spans.push(r.span),
-                            (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module) => spans.push(r.span),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            // For hash key definitions, find all accesses with same owner + key name
-            if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
-                for r in &self.refs {
-                    if let RefKind::HashKeyAccess { owner: ref ro, .. } = r.kind {
-                        if r.target_name != sym.name {
-                            continue;
-                        }
-                        let matches = match ro {
-                            Some(ref ro) => ro == owner,
-                            None => {
-                                // Try tree-based resolution for chained expressions
-                                if let (Some(t), Some(s)) = (tree, source_bytes) {
-                                    self.resolve_hash_owner_from_tree(t, s, r.span.start)
-                                        .as_ref()
-                                        .map_or(false, |resolved| resolved == owner)
-                                } else {
-                                    false
-                                }
-                            }
-                        };
-                        if matches {
-                            spans.push(r.span);
-                        }
-                    }
-                }
-            }
-
-            spans.sort_by_key(|s| (s.start.row, s.start.column));
-            spans.dedup_by(|a, b| a.start == b.start && a.end == b.end);
-            spans
+            let mut results = self.collect_refs_for_target(target_id, include_decl, tree, source_bytes);
+            results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
+            results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
+            results.into_iter().map(|(span, _)| span).collect()
         } else {
             Vec::new()
         }
@@ -995,65 +962,79 @@ impl FileAnalysis {
     /// Document highlights: like references but with read/write annotation.
     pub fn find_highlights(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Vec<(Span, AccessKind)> {
         if let Some((target_id, _)) = self.resolve_target_at(point, tree, source_bytes) {
-            let sym = self.symbol(target_id);
-            let mut highlights: Vec<(Span, AccessKind)> = Vec::new();
-
-            // Declaration
-            highlights.push((sym.selection_span, AccessKind::Declaration));
-
-            // All refs
-            for r in &self.refs {
-                if r.resolves_to == Some(target_id) {
-                    highlights.push((r.span, r.access));
-                }
-            }
-
-            // Name-matched refs for subs/packages
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
-                for r in &self.refs {
-                    if r.target_name == sym.name && r.resolves_to.is_none() {
-                        match (&r.kind, &sym.kind) {
-                            (RefKind::FunctionCall, SymKind::Sub) => highlights.push((r.span, r.access)),
-                            (RefKind::MethodCall { .. }, SymKind::Sub | SymKind::Method) => highlights.push((r.span, r.access)),
-                            (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module) => highlights.push((r.span, r.access)),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            // Hash key refs
-            if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
-                for r in &self.refs {
-                    if let RefKind::HashKeyAccess { owner: ref ro, .. } = r.kind {
-                        if r.target_name != sym.name {
-                            continue;
-                        }
-                        let matches = match ro {
-                            Some(ref ro) => ro == owner,
-                            None => {
-                                if let (Some(t), Some(s)) = (tree, source_bytes) {
-                                    self.resolve_hash_owner_from_tree(t, s, r.span.start)
-                                        .as_ref()
-                                        .map_or(false, |resolved| resolved == owner)
-                                } else {
-                                    false
-                                }
-                            }
-                        };
-                        if matches {
-                            highlights.push((r.span, r.access));
-                        }
-                    }
-                }
-            }
-
-            highlights.sort_by_key(|(s, _)| (s.start.row, s.start.column));
-            highlights.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
-            highlights
+            let mut results = self.collect_refs_for_target(target_id, true, tree, source_bytes);
+            results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
+            results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
+            results
         } else {
             Vec::new()
         }
+    }
+
+    /// Shared implementation for find_references and find_highlights.
+    fn collect_refs_for_target(
+        &self,
+        target_id: SymbolId,
+        include_decl: bool,
+        tree: Option<&tree_sitter::Tree>,
+        source_bytes: Option<&[u8]>,
+    ) -> Vec<(Span, AccessKind)> {
+        let sym = self.symbol(target_id);
+        let mut results: Vec<(Span, AccessKind)> = Vec::new();
+
+        // Include the declaration itself
+        if include_decl {
+            results.push((sym.selection_span, AccessKind::Declaration));
+        }
+
+        // Collect all refs that resolve to this symbol
+        for r in &self.refs {
+            if r.resolves_to == Some(target_id) {
+                results.push((r.span, r.access));
+            }
+        }
+
+        // For subs/methods/packages/classes, also find refs by name
+        if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
+            for r in &self.refs {
+                if r.target_name == sym.name && r.resolves_to.is_none() {
+                    match (&r.kind, &sym.kind) {
+                        (RefKind::FunctionCall, SymKind::Sub) => results.push((r.span, r.access)),
+                        (RefKind::MethodCall { .. }, SymKind::Sub | SymKind::Method) => results.push((r.span, r.access)),
+                        (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module) => results.push((r.span, r.access)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // For hash key definitions, find all accesses with same owner + key name
+        if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
+            for r in &self.refs {
+                if let RefKind::HashKeyAccess { owner: ref ro, .. } = r.kind {
+                    if r.target_name != sym.name {
+                        continue;
+                    }
+                    let matches = match ro {
+                        Some(ref ro) => ro == owner,
+                        None => {
+                            if let (Some(t), Some(s)) = (tree, source_bytes) {
+                                self.resolve_hash_owner_from_tree(t, s, r.span.start)
+                                    .as_ref()
+                                    .map_or(false, |resolved| resolved == owner)
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if matches {
+                        results.push((r.span, r.access));
+                    }
+                }
+            }
+        }
+
+        results
     }
 
     /// Hover info: return display text for the symbol at cursor.
@@ -1195,8 +1176,10 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::MethodCall { ref invocant, .. } => {
-                    let class_name = self.resolve_invocant_class(invocant, r.scope, point);
+                RefKind::MethodCall { ref invocant, ref invocant_span } => {
+                    let class_name = self.resolve_method_invocant(
+                        invocant, invocant_span, r.scope, point, tree, source_bytes,
+                    );
                     // Try class-specific method first
                     if let Some(ref cn) = class_name {
                         for &sid in self.symbols_named(&r.target_name) {
@@ -1640,7 +1623,6 @@ impl FileAnalysis {
 
     /// Complete methods for an invocant (variable or class name) at a point.
     pub fn complete_methods(&self, invocant: &str, point: Point) -> Vec<CompletionCandidate> {
-        // Resolve invocant → class name
         let class_name = if !invocant.starts_with('$')
             && !invocant.starts_with('@')
             && !invocant.starts_with('%')
@@ -1655,75 +1637,9 @@ impl FileAnalysis {
         };
 
         if let Some(ref cn) = class_name {
-            // Try to find methods scoped to this class
-            let mut candidates = Vec::new();
-            let mut found_class = false;
-
-            // Check for class definition → collect its methods
-            for sym in &self.symbols {
-                if matches!(sym.kind, SymKind::Class) && sym.name == *cn {
-                    found_class = true;
-                    // Implicit new for core classes
-                    candidates.push(CompletionCandidate {
-                        label: "new".to_string(),
-                        kind: SymKind::Method,
-                        detail: Some(self.method_detail(cn, "new")),
-                        insert_text: None,
-                        sort_priority: PRIORITY_LOCAL,
-                    additional_edits: vec![],
-                    });
-                    break;
-                }
-            }
-
-            // Find all subs/methods in this class/package
-            for sym in &self.symbols {
-                if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                    if self.symbol_in_class(sym.id, cn) {
-                        candidates.push(CompletionCandidate {
-                            label: sym.name.clone(),
-                            kind: sym.kind,
-                            detail: Some(self.method_detail(cn, &sym.name)),
-                            insert_text: None,
-                            sort_priority: PRIORITY_LOCAL,
-                    additional_edits: vec![],
-                        });
-                    }
-                }
-            }
-
+            let candidates = self.complete_methods_for_class(cn);
             if !candidates.is_empty() {
                 return candidates;
-            }
-
-            // Package with subs
-            if !found_class {
-                for sym in &self.symbols {
-                    if matches!(sym.kind, SymKind::Package) && sym.name == *cn {
-                        found_class = true;
-                        break;
-                    }
-                }
-            }
-            if found_class {
-                // Return subs scoped to this package
-                for sym in &self.symbols {
-                    if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                        if self.symbol_in_class(sym.id, cn) {
-                            candidates.push(CompletionCandidate {
-                                label: sym.name.clone(),
-                                kind: sym.kind,
-                                detail: Some(self.method_detail(cn, &sym.name)),
-                                insert_text: None,
-                                sort_priority: PRIORITY_LOCAL,
-                    additional_edits: vec![],
-                            });
-                        }
-                    }
-                }
-                if !candidates.is_empty() {
-                    return candidates;
-                }
             }
         }
 
@@ -1744,101 +1660,62 @@ impl FileAnalysis {
                 ),
                 insert_text: None,
                 sort_priority: PRIORITY_FILE_WIDE,
-                    additional_edits: vec![],
+                additional_edits: vec![],
             })
             .collect()
     }
 
-    /// Complete hash keys for a variable at a point.
-    pub fn complete_hash_keys(&self, var_text: &str, point: Point) -> Vec<CompletionCandidate> {
-        let owner = self.resolve_hash_key_owner(var_text, point);
-        let owner = match owner {
-            Some(o) => o,
-            None => return Vec::new(),
-        };
-
-        let defs = self.hash_key_defs_for_owner(&owner);
+    /// Complete hash keys for a resolved owner.
+    fn complete_hash_keys_for_owner(&self, owner: &HashKeyOwner) -> Vec<CompletionCandidate> {
+        let defs = self.hash_key_defs_for_owner(owner);
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
 
         for def in defs {
-            if seen.contains(&def.name) {
+            if !seen.insert(def.name.clone()) {
                 continue;
             }
-            seen.insert(def.name.clone());
 
             let is_dynamic = matches!(
                 &def.detail,
                 SymbolDetail::HashKeyDef { is_dynamic: true, .. }
             );
 
-            let detail = match &owner {
-                HashKeyOwner::Class(name) => Some(format!("{}->{{{}}}", name, def.name)),
-                HashKeyOwner::Variable { name, .. } => {
-                    Some(format!("{}{{{}}}", name, def.name))
-                }
-                HashKeyOwner::Sub(name) => Some(format!("{}()->{{{}}}", name, def.name)),
+            let detail = match owner {
+                HashKeyOwner::Class(name) => format!("{}->{{{}}}", name, def.name),
+                HashKeyOwner::Variable { name, .. } => format!("{}{{{}}}", name, def.name),
+                HashKeyOwner::Sub(name) => format!("{}()->{{{}}}", name, def.name),
             };
 
             candidates.push(CompletionCandidate {
                 label: def.name.clone(),
                 kind: SymKind::Variable,
-                detail,
+                detail: Some(detail),
                 insert_text: None,
                 sort_priority: if is_dynamic { PRIORITY_DYNAMIC } else { PRIORITY_FILE_WIDE },
-                    additional_edits: vec![],
+                additional_edits: vec![],
             });
         }
 
         candidates
+    }
+
+    /// Complete hash keys for a variable at a point.
+    pub fn complete_hash_keys(&self, var_text: &str, point: Point) -> Vec<CompletionCandidate> {
+        match self.resolve_hash_key_owner(var_text, point) {
+            Some(owner) => self.complete_hash_keys_for_owner(&owner),
+            None => Vec::new(),
+        }
     }
 
     /// Complete hash keys for a known class name (from expression type resolution).
     pub fn complete_hash_keys_for_class(&self, class_name: &str, _point: Point) -> Vec<CompletionCandidate> {
-        let owner = HashKeyOwner::Class(class_name.to_string());
-        let defs = self.hash_key_defs_for_owner(&owner);
-        let mut seen = HashSet::new();
-        let mut candidates = Vec::new();
-
-        for def in defs {
-            if seen.contains(&def.name) {
-                continue;
-            }
-            seen.insert(def.name.clone());
-            candidates.push(CompletionCandidate {
-                label: def.name.clone(),
-                kind: SymKind::Variable,
-                detail: Some(format!("{}->{{{}}}", class_name, def.name)),
-                insert_text: None,
-                sort_priority: PRIORITY_FILE_WIDE,
-                additional_edits: vec![],
-            });
-        }
-        candidates
+        self.complete_hash_keys_for_owner(&HashKeyOwner::Class(class_name.to_string()))
     }
 
     /// Complete hash keys for a sub's return value (from expression type resolution).
     pub fn complete_hash_keys_for_sub(&self, sub_name: &str, _point: Point) -> Vec<CompletionCandidate> {
-        let owner = HashKeyOwner::Sub(sub_name.to_string());
-        let defs = self.hash_key_defs_for_owner(&owner);
-        let mut seen = HashSet::new();
-        let mut candidates = Vec::new();
-
-        for def in defs {
-            if seen.contains(&def.name) {
-                continue;
-            }
-            seen.insert(def.name.clone());
-            candidates.push(CompletionCandidate {
-                label: def.name.clone(),
-                kind: SymKind::Variable,
-                detail: Some(format!("{}()->{{{}}}", sub_name, def.name)),
-                insert_text: None,
-                sort_priority: PRIORITY_FILE_WIDE,
-                additional_edits: vec![],
-            });
-        }
-        candidates
+        self.complete_hash_keys_for_owner(&HashKeyOwner::Sub(sub_name.to_string()))
     }
 
     /// General completion: all variables (all sigils) + subs + packages.

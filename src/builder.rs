@@ -7,13 +7,6 @@ use tree_sitter::{Node, Point, Tree};
 
 use crate::file_analysis::*;
 
-fn node_to_span(node: Node) -> Span {
-    Span {
-        start: node.start_position(),
-        end: node.end_position(),
-    }
-}
-
 /// Build a FileAnalysis from a parsed tree in a single walk.
 pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     let mut b = Builder {
@@ -1444,22 +1437,17 @@ impl<'a> Builder<'a> {
 
     /// Extract the function name from a call expression (function_call or ambiguous_function_call).
     fn extract_call_name(&self, node: Node<'a>) -> Option<String> {
+        let name = crate::file_analysis::extract_call_name(node, self.source)?;
+        // For function calls, filter out qualified names ($ref->(), Foo::bar())
         match node.kind() {
             "function_call_expression" | "ambiguous_function_call_expression" => {
-                let func_node = node.child_by_field_name("function")?;
-                let text = func_node.utf8_text(self.source).ok()?;
-                // Only bare function names (not $ref->() or Foo::bar())
-                if !text.contains(':') && !text.starts_with('$') {
-                    Some(text.to_string())
-                } else {
+                if name.contains(':') || name.starts_with('$') {
                     None
+                } else {
+                    Some(name)
                 }
             }
-            "method_call_expression" => {
-                let method = node.child_by_field_name("method")?;
-                Some(method.utf8_text(self.source).ok()?.to_string())
-            }
-            _ => None,
+            _ => Some(name),
         }
     }
 
@@ -2893,6 +2881,31 @@ $calc->get_self->get_config->{host};
         // Cursor on the sub name
         let refs = fa.find_references(Point::new(0, 5), None, None);
         assert!(refs.len() >= 2, "should find definition + calls, got {}", refs.len());
+    }
+
+    #[test]
+    fn test_find_references_method_through_chain() {
+        let src = "\
+package Foo;
+sub new { bless {}, shift }
+sub bar { 42 }
+package main;
+sub get_foo { return Foo->new() }
+my $f = Foo->new();
+$f->bar();
+get_foo()->bar();
+";
+        let tree = parse(src);
+        let fa = build(&tree, src.as_bytes());
+        // Cursor on bar definition (line 2, col 4)
+        let refs = fa.find_references(Point::new(2, 5), Some(&tree), Some(src.as_bytes()));
+        // Should find: $f->bar() + get_foo()->bar() (definition may or may not be included)
+        let ref_lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
+        assert!(refs.len() >= 2,
+            "should find at least 2 refs, got {} at lines {:?}", refs.len(), ref_lines);
+        // The key assertion: chained call get_foo()->bar() is found (was broken before P0a fix)
+        assert!(ref_lines.contains(&7),
+            "should find chained get_foo()->bar() at line 7, got {:?}", ref_lines);
     }
 
     #[test]
