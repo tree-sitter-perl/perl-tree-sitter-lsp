@@ -1317,6 +1317,8 @@ mod tests {
                 path: std::path::PathBuf::from("/usr/lib/perl5/List/Util.pm"),
                 export: vec![],
                 export_ok: vec!["first".into(), "max".into(), "min".into()],
+                return_types: std::collections::HashMap::new(),
+                hash_keys: std::collections::HashMap::new(),
             }),
         );
 
@@ -1365,6 +1367,8 @@ mod tests {
                 path: std::path::PathBuf::from("/usr/lib/perl5/List/Util.pm"),
                 export: vec![],
                 export_ok: vec!["first".into(), "max".into(), "min".into()],
+                return_types: std::collections::HashMap::new(),
+                hash_keys: std::collections::HashMap::new(),
             }),
         );
         idx.insert_cache(
@@ -1373,6 +1377,8 @@ mod tests {
                 path: std::path::PathBuf::from("/usr/lib/perl5/Scalar/Util.pm"),
                 export: vec![],
                 export_ok: vec!["blessed".into(), "reftype".into()],
+                return_types: std::collections::HashMap::new(),
+                hash_keys: std::collections::HashMap::new(),
             }),
         );
 

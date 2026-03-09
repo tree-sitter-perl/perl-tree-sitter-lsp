@@ -376,6 +376,13 @@ pub struct FileAnalysis {
     pub imports: Vec<Import>,
     pub call_bindings: Vec<CallBinding>,
 
+    /// Return types from imported functions (populated after build from module index).
+    pub imported_return_types: HashMap<String, InferredType>,
+
+    // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
+    base_type_constraint_count: usize,
+    base_symbol_count: usize,
+
     // Indices (built in post-pass)
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
@@ -403,6 +410,9 @@ impl FileAnalysis {
             fold_ranges,
             imports,
             call_bindings,
+            imported_return_types: HashMap::new(),
+            base_type_constraint_count: 0,
+            base_symbol_count: 0,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -410,6 +420,8 @@ impl FileAnalysis {
             type_constraints_by_var: HashMap::new(),
         };
         fa.build_indices();
+        fa.base_type_constraint_count = fa.type_constraints.len();
+        fa.base_symbol_count = fa.symbols.len();
         fa
     }
 
@@ -550,16 +562,114 @@ impl FileAnalysis {
         best.map(|tc| &tc.inferred_type)
     }
 
-    /// Get the return type of a named sub/method.
-    pub fn sub_return_type(&self, name: &str) -> Option<&InferredType> {
+    /// Get the return type of a named sub/method (local definitions only).
+    pub fn sub_return_type_local(&self, name: &str) -> Option<&InferredType> {
         for sym in &self.symbols {
             if sym.name == name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                 if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
-                    return return_type.as_ref();
+                    if return_type.is_some() {
+                        return return_type.as_ref();
+                    }
                 }
             }
         }
         None
+    }
+
+    /// Get the return type of a named sub/method.
+    /// Checks local definitions first, then falls back to imported return types.
+    pub fn sub_return_type(&self, name: &str) -> Option<&InferredType> {
+        self.sub_return_type_local(name)
+            .or_else(|| self.imported_return_types.get(name))
+    }
+
+    /// Convenience wrapper: enrich with return types only (no hash keys).
+    #[cfg(test)]
+    pub fn enrich_imported_types(&mut self, imported_returns: HashMap<String, InferredType>) {
+        self.enrich_imported_types_with_keys(imported_returns, HashMap::new());
+    }
+
+    /// Resolve call bindings for imported functions and inject hash key defs.
+    /// Call after building, when module index data is available.
+    pub fn enrich_imported_types_with_keys(
+        &mut self,
+        imported_returns: HashMap<String, InferredType>,
+        imported_hash_keys: HashMap<String, Vec<String>>,
+    ) {
+        // Truncate back to baseline so repeated enrichment doesn't accumulate duplicates.
+        self.type_constraints.truncate(self.base_type_constraint_count);
+        self.symbols.truncate(self.base_symbol_count);
+
+        let mut new_constraints = Vec::new();
+        for binding in &self.call_bindings {
+            // Skip if already resolved (local sub or builtin)
+            if self.sub_return_type_local(&binding.func_name).is_some()
+                || builtin_return_type(&binding.func_name).is_some()
+            {
+                continue;
+            }
+            if let Some(rt) = imported_returns.get(&binding.func_name) {
+                new_constraints.push(TypeConstraint {
+                    variable: binding.variable.clone(),
+                    scope: binding.scope,
+                    constraint_span: binding.span,
+                    inferred_type: rt.clone(),
+                });
+            }
+        }
+        self.type_constraints.extend(new_constraints);
+        self.imported_return_types = imported_returns;
+
+        // Inject synthetic HashKeyDef symbols for imported functions' hash keys.
+        for (func_name, keys) in &imported_hash_keys {
+            let owner = HashKeyOwner::Sub(func_name.clone());
+            for key_name in keys {
+                let id = SymbolId(self.symbols.len() as u32);
+                // Use a zero-size span at file start for synthetic symbols
+                let zero_span = Span {
+                    start: Point { row: 0, column: 0 },
+                    end: Point { row: 0, column: 0 },
+                };
+                self.symbols.push(Symbol {
+                    id,
+                    name: key_name.clone(),
+                    kind: SymKind::HashKeyDef,
+                    span: zero_span,
+                    selection_span: zero_span,
+                    scope: ScopeId(0),
+                    detail: SymbolDetail::HashKeyDef {
+                        owner: owner.clone(),
+                        is_dynamic: false,
+                    },
+                });
+            }
+        }
+
+        self.rebuild_enrichment_indices();
+    }
+
+    /// Rebuild indices affected by enrichment (type constraints + symbols).
+    fn rebuild_enrichment_indices(&mut self) {
+        self.type_constraints_by_var.clear();
+        for (i, tc) in self.type_constraints.iter().enumerate() {
+            self.type_constraints_by_var
+                .entry(tc.variable.clone())
+                .or_default()
+                .push(i);
+        }
+
+        self.symbols_by_name.clear();
+        self.symbols_by_scope.clear();
+        for sym in &self.symbols {
+            self.symbols_by_name
+                .entry(sym.name.clone())
+                .or_default()
+                .push(sym.id);
+            self.symbols_by_scope
+                .entry(sym.scope)
+                .or_default()
+                .push(sym.id);
+        }
     }
 
     /// Resolve the type of an arbitrary CST expression node.
@@ -2250,6 +2360,36 @@ pub(crate) fn builtin_first_arg_type(name: &str) -> Option<InferredType> {
     }
 }
 
+/// Serialize an InferredType to a simple string tag for JSON IPC and SQLite storage.
+pub fn inferred_type_to_tag(ty: &InferredType) -> String {
+    match ty {
+        InferredType::ClassName(name) => format!("Object:{}", name),
+        InferredType::FirstParam { package } => format!("Object:{}", package),
+        InferredType::HashRef => "HashRef".to_string(),
+        InferredType::ArrayRef => "ArrayRef".to_string(),
+        InferredType::CodeRef => "CodeRef".to_string(),
+        InferredType::Regexp => "Regexp".to_string(),
+        InferredType::Numeric => "Numeric".to_string(),
+        InferredType::String => "String".to_string(),
+    }
+}
+
+/// Deserialize a string tag back to an InferredType.
+pub fn inferred_type_from_tag(tag: &str) -> Option<InferredType> {
+    if let Some(class_name) = tag.strip_prefix("Object:") {
+        return Some(InferredType::ClassName(class_name.to_string()));
+    }
+    match tag {
+        "HashRef" => Some(InferredType::HashRef),
+        "ArrayRef" => Some(InferredType::ArrayRef),
+        "CodeRef" => Some(InferredType::CodeRef),
+        "Regexp" => Some(InferredType::Regexp),
+        "Numeric" => Some(InferredType::Numeric),
+        "String" => Some(InferredType::String),
+        _ => None,
+    }
+}
+
 pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
     match ty {
         InferredType::ClassName(name) => name.clone(),
@@ -2451,5 +2591,94 @@ mod tests {
         assert_eq!(InferredType::Regexp.class_name(), None);
         assert_eq!(InferredType::Numeric.class_name(), None);
         assert_eq!(InferredType::String.class_name(), None);
+    }
+
+    // ---- InferredType serialization roundtrip tests ----
+
+    #[test]
+    fn test_inferred_type_tag_roundtrip() {
+        let cases = vec![
+            InferredType::ClassName("Foo::Bar".into()),
+            InferredType::FirstParam { package: "Baz".into() },
+            InferredType::HashRef,
+            InferredType::ArrayRef,
+            InferredType::CodeRef,
+            InferredType::Regexp,
+            InferredType::Numeric,
+            InferredType::String,
+        ];
+        for ty in &cases {
+            let tag = inferred_type_to_tag(ty);
+            let restored = inferred_type_from_tag(&tag);
+            assert!(restored.is_some(), "Failed to deserialize tag: {}", tag);
+            // Note: FirstParam serializes as Object:X and deserializes as ClassName(X)
+            // This is intentional — cross-file we treat both as object types.
+            match ty {
+                InferredType::FirstParam { package } => {
+                    assert_eq!(restored.unwrap(), InferredType::ClassName(package.clone()));
+                }
+                _ => {
+                    assert_eq!(&restored.unwrap(), ty, "Roundtrip failed for tag: {}", tag);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_inferred_type_from_tag_unknown() {
+        assert_eq!(inferred_type_from_tag("UnknownTag"), None);
+        assert_eq!(inferred_type_from_tag(""), None);
+    }
+
+    // ---- sub_return_type fallback tests ----
+
+    #[test]
+    fn test_sub_return_type_imported_fallback() {
+        let mut fa = fa_with_constraints(vec![]);
+        let mut imported = HashMap::new();
+        imported.insert("get_config".to_string(), InferredType::HashRef);
+        fa.enrich_imported_types(imported);
+
+        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        // Local subs should still return None
+        assert_eq!(fa.sub_return_type("nonexistent"), None);
+    }
+
+    // ---- enrich_imported_types tests ----
+
+    #[test]
+    fn test_enrich_imported_types_pushes_constraints() {
+        let mut fa = FileAnalysis::new(
+            vec![Scope {
+                id: ScopeId(0),
+                parent: None,
+                kind: ScopeKind::File,
+                span: Span { start: Point::new(0, 0), end: Point::new(10, 0) },
+                package: None,
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            // A call binding: my $cfg = get_config()
+            vec![CallBinding {
+                variable: "$cfg".to_string(),
+                func_name: "get_config".to_string(),
+                scope: ScopeId(0),
+                span: Span { start: Point::new(2, 0), end: Point::new(2, 30) },
+            }],
+        );
+
+        let mut imported = HashMap::new();
+        imported.insert("get_config".to_string(), InferredType::HashRef);
+        fa.enrich_imported_types(imported);
+
+        // Should have pushed a type constraint for $cfg
+        assert_eq!(
+            fa.inferred_type("$cfg", Point::new(3, 0)),
+            Some(&InferredType::HashRef),
+            "Enrichment should propagate imported return type to call binding variable"
+        );
     }
 }

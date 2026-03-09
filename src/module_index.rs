@@ -10,12 +10,14 @@
 //! - `module_cache.rs` — SQLite persistence
 //! - `cpanfile.rs` — cpanfile parsing
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
 use dashmap::DashMap;
 use tower_lsp::Client;
 
+use crate::file_analysis::InferredType;
 use crate::module_resolver;
 
 // ---- Public types ----
@@ -29,6 +31,17 @@ pub struct ModuleExports {
     pub export: Vec<String>,
     /// @EXPORT_OK — available on request via `use Foo qw(...)`.
     pub export_ok: Vec<String>,
+    /// Return types for exported functions (func_name → type).
+    pub return_types: HashMap<String, InferredType>,
+    /// Hash key names from exported functions' return values (func_name → key names).
+    pub hash_keys: HashMap<String, Vec<String>>,
+}
+
+impl ModuleExports {
+    #[allow(dead_code)]
+    pub fn return_type(&self, func_name: &str) -> Option<&InferredType> {
+        self.return_types.get(func_name)
+    }
 }
 
 // ---- Internal sync primitives (pub(crate) for resolver thread) ----
@@ -146,6 +159,22 @@ impl ModuleIndex {
                 f(entry.key(), exports);
             }
         }
+    }
+
+    /// Look up the return type of an imported function. Zero I/O.
+    #[cfg(test)]
+    pub fn get_return_type_cached(&self, func_name: &str) -> Option<InferredType> {
+        let modules = self.reverse_index.get(func_name)?;
+        for module_name in modules.value() {
+            if let Some(entry) = self.cache.get(module_name) {
+                if let Some(ref exports) = *entry {
+                    if let Some(ty) = exports.return_types.get(func_name) {
+                        return Some(ty.clone());
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Find all cached modules that export the given function name.
@@ -344,6 +373,8 @@ mod tests {
                 path: PathBuf::from("/fake/Foo/Bar.pm"),
                 export: vec!["alpha".into()],
                 export_ok: vec!["beta".into()],
+                return_types: HashMap::new(),
+                hash_keys: HashMap::new(),
             }),
         );
         idx.insert_cache(
@@ -352,6 +383,8 @@ mod tests {
                 path: PathBuf::from("/fake/Baz/Qux.pm"),
                 export: vec![],
                 export_ok: vec!["beta".into(), "gamma".into()],
+                return_types: HashMap::new(),
+                hash_keys: HashMap::new(),
             }),
         );
 
@@ -369,6 +402,8 @@ mod tests {
                 path: PathBuf::from("/fake/My/Mod.pm"),
                 export: vec!["foo".into()],
                 export_ok: vec!["bar".into()],
+                return_types: HashMap::new(),
+                hash_keys: HashMap::new(),
             }),
         );
 
@@ -377,5 +412,36 @@ mod tests {
         assert!(idx.reverse_index.contains_key("bar"));
         assert_eq!(idx.find_exporters("foo"), vec!["My::Mod"]);
         assert_eq!(idx.find_exporters("bar"), vec!["My::Mod"]);
+    }
+
+    #[test]
+    fn test_get_return_type_cached() {
+        use crate::file_analysis::InferredType;
+
+        let idx = ModuleIndex::new_for_test();
+        let mut rt = HashMap::new();
+        rt.insert("get_config".to_string(), InferredType::HashRef);
+        rt.insert("make_obj".to_string(), InferredType::ClassName("MyClass".into()));
+
+        idx.insert_cache(
+            "Config::DB",
+            Some(ModuleExports {
+                path: PathBuf::from("/fake/Config/DB.pm"),
+                export: vec![],
+                export_ok: vec!["get_config".into(), "make_obj".into()],
+                return_types: rt,
+                hash_keys: HashMap::new(),
+            }),
+        );
+
+        assert_eq!(
+            idx.get_return_type_cached("get_config"),
+            Some(InferredType::HashRef)
+        );
+        assert_eq!(
+            idx.get_return_type_cached("make_obj"),
+            Some(InferredType::ClassName("MyClass".into()))
+        );
+        assert_eq!(idx.get_return_type_cached("nonexistent"), None);
     }
 }

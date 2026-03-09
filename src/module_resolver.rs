@@ -3,7 +3,7 @@
 //! Discovers `@INC` paths, locates `.pm` files, extracts `@EXPORT`/`@EXPORT_OK`,
 //! and handles subprocess isolation for safe parsing (tree-sitter hangs → SIGKILL).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +15,9 @@ use tower_lsp::Client;
 use tree_sitter::Parser;
 
 use crate::cpanfile;
+#[cfg(not(test))]
+use crate::file_analysis::{inferred_type_from_tag, InferredType};
+use crate::file_analysis::inferred_type_to_tag;
 use crate::module_cache;
 use crate::module_index::{ModuleExports, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
 
@@ -404,10 +407,27 @@ fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<Modul
         return None;
     }
 
+    // Parse return types from JSON
+    let return_types: HashMap<String, InferredType> = json
+        .get("return_types")
+        .and_then(|v| serde_json::from_value::<HashMap<String, String>>(v.clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| inferred_type_from_tag(&v).map(|ty| (k, ty)))
+        .collect();
+
+    // Parse hash keys from JSON
+    let hash_keys: HashMap<String, Vec<String>> = json
+        .get("hash_keys")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
     Some(ModuleExports {
         path,
         export,
         export_ok,
+        return_types,
+        hash_keys,
     })
 }
 
@@ -421,16 +441,44 @@ pub fn subprocess_main(path: &str) {
         }
     };
     let mut parser = create_parser();
-    match extract_exports(&mut parser, &source) {
-        Some((export, export_ok)) => {
-            let json = serde_json::json!({
-                "export": export,
-                "export_ok": export_ok,
-            });
-            println!("{}", json);
+
+    // Extract exports via tree-sitter queries (also returns the parsed tree)
+    let (export, export_ok, tree) = match extract_exports(&mut parser, &source) {
+        Some(tuple) => tuple,
+        None => {
+            println!("{{}}");
+            return;
         }
-        None => println!("{{}}"),
+    };
+
+    // Run the builder to get return types and hash keys for exported functions
+    let mut return_types_map = serde_json::Map::new();
+    let mut hash_keys_map = serde_json::Map::new();
+    {
+        let analysis = crate::builder::build(&tree, source.as_bytes());
+        for name in export.iter().chain(export_ok.iter()) {
+            if let Some(ty) = analysis.sub_return_type(name) {
+                return_types_map.insert(name.clone(), serde_json::Value::String(inferred_type_to_tag(ty)));
+            }
+            // Extract hash key names for subs that return HashRef
+            let owner = crate::file_analysis::HashKeyOwner::Sub(name.clone());
+            let keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            if !keys.is_empty() {
+                hash_keys_map.insert(name.clone(), serde_json::json!(keys));
+            }
+        }
     }
+
+    let json = serde_json::json!({
+        "export": export,
+        "export_ok": export_ok,
+        "return_types": return_types_map,
+        "hash_keys": hash_keys_map,
+    });
+    println!("{}", json);
 }
 
 pub fn create_parser() -> Parser {
@@ -466,11 +514,34 @@ pub fn resolve_and_parse(
         return None;
     }
     let source = std::fs::read_to_string(&path).ok()?;
-    let (export, export_ok) = extract_exports(parser, &source)?;
+    let (export, export_ok, tree) = extract_exports(parser, &source)?;
+
+    // Extract return types and hash keys from builder analysis
+    let mut return_types = HashMap::new();
+    let mut hash_keys = HashMap::new();
+    {
+        let analysis = crate::builder::build(&tree, source.as_bytes());
+        for name in export.iter().chain(export_ok.iter()) {
+            if let Some(ty) = analysis.sub_return_type(name) {
+                return_types.insert(name.clone(), ty.clone());
+            }
+            let owner = crate::file_analysis::HashKeyOwner::Sub(name.clone());
+            let keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            if !keys.is_empty() {
+                hash_keys.insert(name.clone(), keys);
+            }
+        }
+    }
+
     Some(ModuleExports {
         path,
         export,
         export_ok,
+        return_types,
+        hash_keys,
     })
 }
 
@@ -495,7 +566,7 @@ pub fn discover_inc_paths() -> Vec<PathBuf> {
 
 // ---- Export extraction ----
 
-fn extract_exports(parser: &mut Parser, source: &str) -> Option<(Vec<String>, Vec<String>)> {
+fn extract_exports(parser: &mut Parser, source: &str) -> Option<(Vec<String>, Vec<String>, tree_sitter::Tree)> {
     use tree_sitter::{QueryCursor, StreamingIterator};
 
     let tree = parser.parse(source, None)?;
@@ -558,7 +629,7 @@ fn extract_exports(parser: &mut Parser, source: &str) -> Option<(Vec<String>, Ve
     if export.is_empty() && export_ok.is_empty() {
         return None;
     }
-    Some((export, export_ok))
+    Some((export, export_ok, tree))
 }
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -591,7 +662,7 @@ our @EXPORT = qw(delta);
 1;
 "#;
         let mut parser = create_parser();
-        let (export, export_ok) = extract_exports(&mut parser, source).unwrap();
+        let (export, export_ok, _tree) = extract_exports(&mut parser, source).unwrap();
         assert_eq!(export, vec!["delta"]);
         assert_eq!(export_ok, vec!["alpha", "beta", "gamma"]);
     }
@@ -604,7 +675,7 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
 1;
 "#;
         let mut parser = create_parser();
-        let (_, export_ok) = extract_exports(&mut parser, source).unwrap();
+        let (_, export_ok, _tree) = extract_exports(&mut parser, source).unwrap();
         assert_eq!(export_ok, vec!["foo", "bar", "baz"]);
     }
 

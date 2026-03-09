@@ -63,10 +63,24 @@ cargo test           # run all tests
 - `Arc<DashMap>` shared between resolver thread and async LSP handlers
 - Reverse index: `DashMap<func_name, Vec<module_name>>` for O(1) exporter lookup
 - Export extraction uses tree-sitter in isolated subprocesses (5s timeout + SIGKILL)
+- Subprocess runs the full builder on each module to extract return types + hash key names per exported function
+- `ModuleExports` stores `return_types: HashMap<String, InferredType>` and `hash_keys: HashMap<String, Vec<String>>`
 - cpanfile parsed with tree-sitter queries at startup, deps pre-resolved with progress reporting
-- SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`)
+- SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`), schema v4 with `return_types`/`hash_keys` columns
 - Async handlers only use `_cached` methods — zero I/O
 - After resolution, diagnostics are refreshed for all open files (clears stale false positives)
+
+### Cross-file type enrichment
+
+Post-build enrichment propagates imported return types and hash keys into the local `FileAnalysis`. This is a layered step — the builder's single-pass architecture is unchanged.
+
+- `enrich_imported_types_with_keys()` on `FileAnalysis`: pushes `TypeConstraint`s for call bindings referencing imported functions, injects synthetic `HashKeyDef` symbols for cross-file hash key completion
+- `sub_return_type()` falls back to `imported_return_types` map after checking local subs; `sub_return_type_local()` checks only local symbols (used by the enrichment method to avoid self-referencing)
+- Idempotency: `base_type_constraint_count` / `base_symbol_count` set after initial build; enrichment truncates back to baseline before appending, so repeated calls don't accumulate duplicates
+- `rebuild_enrichment_indices()` rebuilds `type_constraints_by_var`, `symbols_by_name`, and `symbols_by_scope` after enrichment
+- Backend wiring: `Arc<ModuleIndex>` on `Backend`, refresh callback uses `OnceLock<Arc<ModuleIndex>>` for deferred init (resolver thread has no tokio context, spawns async work via captured `Handle`)
+- `enrich_analysis()` called from `publish_diagnostics()` and from the refresh callback (which re-enriches all open documents when a module resolves)
+- `InferredType` serialized as simple string tags (`"HashRef"`, `"Object:Foo"`, etc.) for JSON IPC and SQLite TEXT storage — no serde derives
 
 ## LSP Capabilities
 
