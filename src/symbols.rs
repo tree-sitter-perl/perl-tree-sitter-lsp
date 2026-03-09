@@ -231,7 +231,9 @@ pub fn completion_items(
                 } else if let Some(ref sub_name) = source_sub {
                     analysis.complete_hash_keys_for_sub(sub_name, point)
                 } else {
-                    Vec::new()
+                    // HashRef with no source_sub from context — fall back to
+                    // resolve_hash_key_owner which checks call bindings
+                    analysis.complete_hash_keys(var_text, point)
                 }
             } else {
                 analysis.complete_hash_keys(var_text, point)
