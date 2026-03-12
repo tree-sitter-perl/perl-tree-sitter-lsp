@@ -14,7 +14,7 @@ use rusqlite::{params, Connection};
 use crate::file_analysis::{inferred_type_from_tag, inferred_type_to_tag};
 use crate::module_index::{ExportedParam, ExportedSub, ModuleExports};
 
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 
 pub fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
@@ -283,6 +283,9 @@ fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
+            let doc = val.get("doc")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some((
                 name,
                 ExportedSub {
@@ -291,6 +294,7 @@ fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
                     is_method,
                     return_type,
                     hash_keys,
+                    doc,
                 },
             ))
         })
@@ -363,6 +367,9 @@ fn serialize_subs_json(subs: &HashMap<String, ExportedSub>) -> String {
         }
         if !sub_info.hash_keys.is_empty() {
             obj.insert("hash_keys".into(), serde_json::json!(sub_info.hash_keys));
+        }
+        if let Some(ref doc) = sub_info.doc {
+            obj.insert("doc".into(), serde_json::Value::String(doc.clone()));
         }
         map.insert(name.clone(), obj.into());
     }
@@ -522,6 +529,7 @@ mod tests {
                 is_method: false,
                 return_type: Some(crate::file_analysis::InferredType::HashRef),
                 hash_keys: vec!["host".into()],
+                doc: None,
             },
         );
 
@@ -613,6 +621,7 @@ mod tests {
                 is_method: false,
                 return_type: Some(InferredType::HashRef),
                 hash_keys: vec!["host".into(), "port".into()],
+                doc: None,
             },
         );
         subs.insert(
@@ -623,6 +632,7 @@ mod tests {
                 is_method: false,
                 return_type: Some(InferredType::ArrayRef),
                 hash_keys: vec![],
+                doc: None,
             },
         );
         subs.insert(
@@ -633,6 +643,7 @@ mod tests {
                 is_method: true,
                 return_type: Some(InferredType::ClassName("MyObj".into())),
                 hash_keys: vec![],
+                doc: None,
             },
         );
 

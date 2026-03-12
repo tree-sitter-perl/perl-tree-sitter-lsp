@@ -431,7 +431,10 @@ fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<Modul
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                     .unwrap_or_default();
-                Some((name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys }))
+                let doc = val.get("doc")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                Some((name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc }))
             }).collect()
         })
         .unwrap_or_default();
@@ -472,11 +475,11 @@ pub fn subprocess_main(path: &str) {
         for name in export.iter().chain(export_ok.iter()) {
             let mut sub_info = serde_json::Map::new();
 
-            // Find the sub symbol for definition line + params
+            // Find the sub symbol for definition line + params + doc
             for sym in &analysis.symbols {
                 if sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                     sub_info.insert("def_line".into(), sym.span.start.row.into());
-                    if let SymbolDetail::Sub { ref params, is_method, .. } = sym.detail {
+                    if let SymbolDetail::Sub { ref params, is_method, ref doc, .. } = sym.detail {
                         sub_info.insert("is_method".into(), is_method.into());
                         let params_json: Vec<serde_json::Value> = params.iter()
                             .map(|p| serde_json::json!({
@@ -485,6 +488,9 @@ pub fn subprocess_main(path: &str) {
                             }))
                             .collect();
                         sub_info.insert("params".into(), params_json.into());
+                        if let Some(ref d) = doc {
+                            sub_info.insert("doc".into(), serde_json::Value::String(d.clone()));
+                        }
                     }
                     break;
                 }
@@ -564,15 +570,17 @@ pub fn resolve_and_parse(
             let mut def_line = 0u32;
             let mut params = Vec::new();
             let mut is_method = false;
+            let mut doc = None;
 
             for sym in &analysis.symbols {
                 if sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                     def_line = sym.span.start.row as u32;
-                    if let SymbolDetail::Sub { params: ref p, is_method: m, .. } = sym.detail {
+                    if let SymbolDetail::Sub { params: ref p, is_method: m, doc: ref d, .. } = sym.detail {
                         is_method = m;
                         params = p.iter()
                             .map(|pi| ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy })
                             .collect();
+                        doc = d.clone();
                     }
                     break;
                 }
@@ -585,7 +593,7 @@ pub fn resolve_and_parse(
                 .map(|s| s.name.clone())
                 .collect();
 
-            subs.insert(name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys });
+            subs.insert(name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc });
         }
     }
 

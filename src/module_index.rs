@@ -35,6 +35,8 @@ pub struct ExportedSub {
     pub return_type: Option<InferredType>,
     /// Hash key names from return value, if returns HashRef.
     pub hash_keys: Vec<String>,
+    /// Pre-rendered markdown from POD or comments.
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +451,7 @@ mod tests {
             is_method: false,
             return_type: Some(InferredType::HashRef),
             hash_keys: vec![],
+            doc: None,
         });
         subs.insert("make_obj".to_string(), ExportedSub {
             def_line: 20,
@@ -456,6 +459,7 @@ mod tests {
             is_method: false,
             return_type: Some(InferredType::ClassName("MyClass".into())),
             hash_keys: vec![],
+            doc: None,
         });
 
         idx.insert_cache(

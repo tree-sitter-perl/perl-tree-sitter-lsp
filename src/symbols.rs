@@ -366,6 +366,9 @@ pub fn hover_info(
                     if let Some(sub_info) = exports.sub_info(&r.target_name) {
                         let sig = format_imported_signature(&r.target_name, sub_info);
                         parts.push(format!("```perl\n{}\n```", sig));
+                        if let Some(ref doc) = sub_info.doc {
+                            parts.push(doc.clone());
+                        }
                     }
                 }
 
