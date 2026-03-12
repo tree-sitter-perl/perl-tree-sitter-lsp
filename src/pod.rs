@@ -169,6 +169,69 @@ fn convert_inline(text: &str) -> String {
     }).to_string()
 }
 
+/// Extract method name from an =item line.
+/// Handles: `$obj->method(...)`, `Class->method(...)`, `C<method>`, `method(...)`, `method`
+fn extract_item_method_name(item_rest: &str) -> Option<&str> {
+    let s = item_rest.trim();
+    // Strip C<...> wrapper
+    let s = if s.starts_with("C<") {
+        let inner = s.strip_prefix("C<")?.strip_suffix('>')?;
+        // Also handle C<< ... >>
+        inner.trim()
+    } else if s.starts_with("C<<") {
+        let inner = s.strip_prefix("C<<")?.strip_suffix(">>")?;
+        inner.trim()
+    } else {
+        s
+    };
+    // Strip $obj-> or Class::Name-> prefix
+    let s = if let Some(idx) = s.find("->") {
+        &s[idx + 2..]
+    } else {
+        s
+    };
+    // Strip trailing (...) and whitespace
+    let s = if let Some(idx) = s.find('(') {
+        s[..idx].trim()
+    } else {
+        s.trim()
+    };
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Extract documentation for a sub from =item blocks within =over/=back.
+/// Falls back when extract_head2_section finds no =head2 match.
+pub fn extract_item_section(sub_name: &str, pod_text: &str) -> Option<String> {
+    let mut collecting = false;
+    let mut section = String::new();
+
+    for line in pod_text.lines() {
+        if collecting {
+            // Stop at next =item, =back, =head, or =cut
+            if line.starts_with("=item") || line.starts_with("=back")
+                || line.starts_with("=head") || line.starts_with("=cut")
+            {
+                break;
+            }
+            section.push_str(line);
+            section.push('\n');
+        } else if line.starts_with("=item") {
+            let rest = &line[5..].trim_start();
+            if let Some(name) = extract_item_method_name(rest) {
+                if name == sub_name {
+                    collecting = true;
+                }
+            }
+        }
+    }
+
+    if section.trim().is_empty() {
+        None
+    } else {
+        Some(section)
+    }
+}
+
 /// Extract a =head2 section for a given sub name from a POD block.
 /// Used by the builder's tail-POD post-pass.
 pub fn extract_head2_section(sub_name: &str, pod_text: &str) -> Option<String> {
@@ -280,5 +343,47 @@ mod tests {
     #[test]
     fn test_file_formatting() {
         assert_eq!(convert_inline("See F</etc/config>"), "See `/etc/config`");
+    }
+
+    #[test]
+    fn test_item_arrow_method() {
+        let pod = "=over\n\n=item $mech->get($url)\n\nPerforms a GET request.\n\n=item $mech->post($url)\n\nPerforms a POST.\n\n=back\n";
+        let section = extract_item_section("get", pod).unwrap();
+        assert!(section.contains("Performs a GET request."));
+        assert!(!section.contains("Performs a POST."));
+    }
+
+    #[test]
+    fn test_item_bare_name() {
+        let pod = "=over\n\n=item connect\n\nConnects to server.\n\n=item disconnect\n\nDisconnects.\n\n=back\n";
+        let section = extract_item_section("connect", pod).unwrap();
+        assert!(section.contains("Connects to server."));
+    }
+
+    #[test]
+    fn test_item_class_method() {
+        let pod = "=over\n\n=item DBI->connect($dsn)\n\nCreates a connection.\n\n=back\n";
+        let section = extract_item_section("connect", pod).unwrap();
+        assert!(section.contains("Creates a connection."));
+    }
+
+    #[test]
+    fn test_item_formatted_name() {
+        let pod = "=over\n\n=item C<new>\n\nConstructor.\n\n=back\n";
+        let section = extract_item_section("new", pod).unwrap();
+        assert!(section.contains("Constructor."));
+    }
+
+    #[test]
+    fn test_item_no_match() {
+        let pod = "=over\n\n=item $obj->foo()\n\nDoes foo.\n\n=back\n";
+        assert!(extract_item_section("bar", pod).is_none());
+    }
+
+    #[test]
+    fn test_head2_preferred_over_item() {
+        let pod = "=head2 path\n\nHead2 doc.\n\n=over\n\n=item $obj->path()\n\nItem doc.\n\n=back\n=cut\n";
+        let section = extract_head2_section("path", pod).unwrap();
+        assert!(section.contains("Head2 doc."));
     }
 }

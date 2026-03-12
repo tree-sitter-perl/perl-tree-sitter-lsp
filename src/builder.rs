@@ -1801,9 +1801,16 @@ impl<'a> Builder<'a> {
                 if doc.is_some() {
                     continue; // already has preceding doc
                 }
-                // Search pod texts for =head2 matching this sub name
+                // Search pod texts for =head2 matching this sub name, fall back to =item
                 for pod_text in &self.pod_texts {
                     if let Some(section) = crate::pod::extract_head2_section(&sym.name, pod_text) {
+                        let md = crate::pod::pod_to_markdown(&section);
+                        if !md.is_empty() {
+                            *doc = Some(md);
+                            break;
+                        }
+                    }
+                    if let Some(section) = crate::pod::extract_item_section(&sym.name, pod_text) {
                         let md = crate::pod::pod_to_markdown(&section);
                         if !md.is_empty() {
                             *doc = Some(md);
@@ -3592,6 +3599,39 @@ my $p = Point->new(x => 3, y => 4);
         assert_eq!(sig.params[0].name, "$first");
         assert_eq!(sig.params[1].name, "$file");
         assert_eq!(sig.params[2].name, "@opts");
+    }
+
+    #[test]
+    fn test_tail_pod_item_method() {
+        let fa = build_fa("
+            package WWW::Mech;
+            sub get { }
+            sub post { }
+
+=head1 METHODS
+
+=over
+
+=item $mech->get($url)
+
+Performs a GET request.
+
+=item $mech->post($url)
+
+Performs a POST request.
+
+=back
+
+=cut
+        ");
+        let get_doc = fa.symbols.iter()
+            .find(|s| s.name == "get")
+            .and_then(|s| match &s.detail {
+                SymbolDetail::Sub { doc, .. } => doc.as_ref(),
+                _ => None,
+            });
+        assert!(get_doc.is_some(), "get should have doc from =item");
+        assert!(get_doc.unwrap().contains("GET request"));
     }
 
 }
