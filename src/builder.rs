@@ -20,6 +20,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         return_infos: Vec::new(),
         last_expr_type: std::collections::HashMap::new(),
         call_bindings: Vec::new(),
+        pod_texts: Vec::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -40,6 +41,9 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
 
     // Post-pass 3: infer return types for subs/methods
     b.resolve_return_types();
+
+    // Post-pass 4: fill in tail POD docs for subs that didn't get preceding doc
+    b.resolve_tail_pod_docs();
 
     FileAnalysis::new(
         b.scopes,
@@ -75,6 +79,8 @@ struct Builder<'a> {
     last_expr_type: std::collections::HashMap<ScopeId, Option<InferredType>>,
     /// Assignments where RHS is a function call — resolved in return-type post-pass.
     call_bindings: Vec<CallBinding>,
+    /// Raw POD text blocks collected during the walk (for tail-POD post-pass).
+    pod_texts: Vec<String>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -265,6 +271,13 @@ impl<'a> Builder<'a> {
             // Hash construction
             "anonymous_hash_expression" => self.visit_anon_hash(node),
 
+            // POD blocks: collect text for tail-POD post-pass
+            "pod" => {
+                if let Ok(text) = node.utf8_text(self.source) {
+                    self.pod_texts.push(text.to_string());
+                }
+            }
+
             // ERROR nodes: recurse into children to extract what we can
             "ERROR" => self.visit_children(node),
 
@@ -448,12 +461,15 @@ impl<'a> Builder<'a> {
         // Extract params
         let params = self.extract_params(node);
 
+        // Extract preceding POD/comment documentation
+        let doc = self.extract_preceding_doc(node);
+
         self.add_symbol(
             name.clone(),
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None },
+            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc },
         );
 
         // Push sub scope
@@ -505,37 +521,146 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Fallback: `my (...) = @_` in body
+        // Fallback: scan body for shift, @_, and $_[N] patterns
         if let Some(body) = sub_node.child_by_field_name("body") {
+            let mut shift_params: Vec<ParamInfo> = Vec::new();
+
             for i in 0..body.named_child_count() {
-                if let Some(stmt) = body.named_child(i) {
-                    let assign = if stmt.kind() == "expression_statement" {
-                        stmt.named_child(0).filter(|n| n.kind() == "assignment_expression")
-                    } else if stmt.kind() == "assignment_expression" {
-                        Some(stmt)
-                    } else {
-                        None
-                    };
-                    if let Some(assign) = assign {
-                        if let Some(right) = assign.child_by_field_name("right") {
-                            if right.utf8_text(self.source).ok() == Some("@_") {
-                                if let Some(left) = assign.child_by_field_name("left") {
-                                    return self.collect_vars_from_decl(left)
-                                        .into_iter()
-                                        .map(|(name, _)| {
-                                            let is_slurpy = name.starts_with('@') || name.starts_with('%');
-                                            ParamInfo { name, default: None, is_slurpy }
-                                        })
-                                        .collect();
-                                }
+                let stmt = match body.named_child(i) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let assign = if stmt.kind() == "expression_statement" {
+                    stmt.named_child(0).filter(|n| n.kind() == "assignment_expression")
+                } else if stmt.kind() == "assignment_expression" {
+                    Some(stmt)
+                } else {
+                    None
+                };
+                let assign = match assign {
+                    Some(a) => a,
+                    None => break, // stop at first non-assignment statement
+                };
+
+                if let Some(right) = assign.child_by_field_name("right") {
+                    // Pattern: my (...) = @_
+                    if right.utf8_text(self.source).ok() == Some("@_") {
+                        if let Some(left) = assign.child_by_field_name("left") {
+                            let at_params: Vec<ParamInfo> = self.collect_vars_from_decl(left)
+                                .into_iter()
+                                .map(|(name, _)| {
+                                    let is_slurpy = name.starts_with('@') || name.starts_with('%');
+                                    ParamInfo { name, default: None, is_slurpy }
+                                })
+                                .collect();
+                            // Combine any preceding shift params with @_ params
+                            if !shift_params.is_empty() {
+                                shift_params.extend(at_params);
+                                return shift_params;
                             }
+                            return at_params;
                         }
                     }
+
+                    // Pattern: my $var = shift; or my $var = shift || default; or my $var = shift // default;
+                    if let Some((var_name, default)) = self.extract_shift_param(assign, right) {
+                        shift_params.push(ParamInfo {
+                            name: var_name,
+                            default,
+                            is_slurpy: false,
+                        });
+                        continue;
+                    }
+
+                    // Pattern: my $var = $_[N];
+                    if let Some(var_name) = self.extract_subscript_param(assign, right) {
+                        shift_params.push(ParamInfo {
+                            name: var_name,
+                            default: None,
+                            is_slurpy: false,
+                        });
+                        continue;
+                    }
                 }
+
+                // Not a recognized param pattern — stop collecting
+                break;
+            }
+
+            if !shift_params.is_empty() {
+                return shift_params;
             }
         }
 
         Vec::new()
+    }
+
+    /// Extract a shift-based parameter: `my $var = shift` or `my $var = shift || default`.
+    fn extract_shift_param(&self, assign: Node<'a>, right: Node<'a>) -> Option<(String, Option<String>)> {
+        let (shift_node, default) = if self.is_shift_call(right) {
+            (right, None)
+        } else if right.kind() == "binary_expression" {
+            // my $var = shift || default  or  my $var = shift // default
+            let op = self.get_operator_text(right);
+            if matches!(op.as_deref(), Some("||" | "//")) {
+                let lhs = right.named_child(0)?;
+                if self.is_shift_call(lhs) {
+                    let default_node = right.named_child(1)?;
+                    let default_text = default_node.utf8_text(self.source).ok()?.to_string();
+                    (lhs, Some(default_text))
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+        let _ = shift_node;
+
+        // Get variable name from LHS
+        let left = assign.child_by_field_name("left")?;
+        let var_name = self.get_var_text_from_lhs(left)?;
+        Some((var_name, default))
+    }
+
+    /// Extract a $_[N]-based parameter: `my $var = $_[N]`.
+    fn extract_subscript_param(&self, assign: Node<'a>, right: Node<'a>) -> Option<String> {
+        if right.kind() != "array_element_expression" {
+            return None;
+        }
+        // Check that it's $_ (container_variable for @_) being subscripted
+        let container = right.named_child(0)?;
+        if container.kind() != "container_variable" {
+            return None;
+        }
+        // container_variable text is "$_" for @_ subscript
+        let ct = container.utf8_text(self.source).ok()?;
+        if ct != "$_" {
+            return None;
+        }
+        let left = assign.child_by_field_name("left")?;
+        self.get_var_text_from_lhs(left)
+    }
+
+    /// Check if a node is a `shift` call (bare or with parens).
+    fn is_shift_call(&self, node: Node<'a>) -> bool {
+        match node.kind() {
+            "bareword" => node.utf8_text(self.source).ok() == Some("shift"),
+            "func1op_call_expression" => {
+                // shift without explicit args: func1op_call_expression with child "shift"
+                node.child(0)
+                    .and_then(|c| c.utf8_text(self.source).ok())
+                    == Some("shift")
+            }
+            "ambiguous_function_call_expression" | "function_call_expression" => {
+                node.child_by_field_name("function")
+                    .and_then(|f| f.utf8_text(self.source).ok())
+                    == Some("shift")
+            }
+            _ => false,
+        }
     }
 
     fn extract_signature_params(&self, sig: Node<'a>) -> Vec<ParamInfo> {
@@ -687,7 +812,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None },
+                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None },
                     );
                 }
                 if has_writer {
@@ -705,6 +830,7 @@ impl<'a> Builder<'a> {
                             }],
                             is_method: true,
                             return_type: None,
+                            doc: None,
                         },
                     );
                 }
@@ -1262,7 +1388,14 @@ impl<'a> Builder<'a> {
         let invocant_node = node.child_by_field_name("invocant");
         let invocant = invocant_node
             .and_then(|n| n.utf8_text(self.source).ok())
-            .map(|s| s.to_string());
+            .map(|s| {
+                // Resolve __PACKAGE__ to enclosing package name
+                if s == "__PACKAGE__" {
+                    self.current_package.clone().unwrap_or_else(|| s.to_string())
+                } else {
+                    s.to_string()
+                }
+            });
         // Store invocant span for complex expressions (call chains etc.)
         let invocant_span = invocant_node
             .filter(|n| !matches!(n.kind(), "scalar" | "array" | "hash" | "bareword" | "package"))
@@ -1459,6 +1592,10 @@ impl<'a> Builder<'a> {
                 let inv_text = invocant.utf8_text(self.source).ok()?;
                 // Invocant must be a package name (not a variable)
                 if !inv_text.starts_with('$') && !inv_text.starts_with('@') && !inv_text.starts_with('%') {
+                    // Resolve __PACKAGE__ to enclosing package name
+                    if inv_text == "__PACKAGE__" {
+                        return self.current_package.clone();
+                    }
                     return Some(inv_text.to_string());
                 }
             }
@@ -1613,6 +1750,78 @@ impl<'a> Builder<'a> {
     }
 
     /// Get the name of the enclosing sub/method, if any.
+    /// Extract POD or comment documentation immediately preceding a sub node.
+    /// Walks prev_sibling chain (tree-sitter CST traversal stays in builder).
+    fn extract_preceding_doc(&self, sub_node: Node<'a>) -> Option<String> {
+        let source_str = std::str::from_utf8(self.source).ok()?;
+        let mut prev = sub_node.prev_sibling();
+        let mut comment_lines: Vec<String> = Vec::new();
+
+        while let Some(node) = prev {
+            match node.kind() {
+                "pod" => {
+                    let text = &source_str[node.byte_range()];
+                    let md = crate::pod::pod_to_markdown(text);
+                    if !md.is_empty() {
+                        return Some(md);
+                    }
+                    break;
+                }
+                "comment" => {
+                    let text = source_str[node.byte_range()].trim();
+                    let stripped = text.strip_prefix('#').unwrap_or(text).trim();
+                    if !stripped.is_empty() {
+                        comment_lines.push(stripped.to_string());
+                    }
+                }
+                _ => break, // hit code, stop
+            }
+            prev = node.prev_sibling();
+        }
+
+        if !comment_lines.is_empty() {
+            comment_lines.reverse(); // collected bottom-up
+            return Some(comment_lines.join("\n"));
+        }
+
+        None
+    }
+
+    /// Post-pass: for subs with no preceding doc, scan collected pod_texts
+    /// for a =head2 section matching the sub name (tail POD style).
+    fn resolve_tail_pod_docs(&mut self) {
+        if self.pod_texts.is_empty() {
+            return;
+        }
+        for sym in &mut self.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                continue;
+            }
+            if let SymbolDetail::Sub { ref mut doc, .. } = sym.detail {
+                if doc.is_some() {
+                    continue; // already has preceding doc
+                }
+                // Search pod texts for =head2 matching this sub name, fall back to =item
+                for pod_text in &self.pod_texts {
+                    if let Some(section) = crate::pod::extract_head2_section(&sym.name, pod_text) {
+                        let md = crate::pod::pod_to_markdown(&section);
+                        if !md.is_empty() {
+                            *doc = Some(md);
+                            break;
+                        }
+                    }
+                    if let Some(section) = crate::pod::extract_item_section(&sym.name, pod_text) {
+                        let md = crate::pod::pod_to_markdown(&section);
+                        if !md.is_empty() {
+                            *doc = Some(md);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn enclosing_sub_name(&self) -> Option<String> {
         let scope_id = self.enclosing_sub_scope()?;
         match &self.scopes[scope_id.0 as usize].kind {
@@ -3250,4 +3459,179 @@ my $p = Point->new(x => 3, y => 4);
         assert_eq!(def.unwrap().start.row, 2,
             "x should resolve to field $x on line 2, not the class");
     }
+
+    // ---- Gap 1: __PACKAGE__ resolution ----
+
+    #[test]
+    fn test_dunder_package_resolution() {
+        let fa = build_fa("
+        package Mojo::File;
+        sub path { __PACKAGE__->new(@_) }
+        ");
+        let rt = fa.sub_return_type("path");
+        assert_eq!(rt, Some(&InferredType::ClassName("Mojo::File".into())));
+    }
+
+    #[test]
+    fn test_dunder_package_method_invocant() {
+        // __PACKAGE__->new() should store the resolved class in MethodCall invocant
+        let fa = build_fa("
+        package Foo;
+        __PACKAGE__->some_method();
+        ");
+        let method_ref = fa.refs.iter().find(|r| r.target_name == "some_method").unwrap();
+        match &method_ref.kind {
+            RefKind::MethodCall { invocant, .. } => {
+                assert_eq!(invocant, "Foo", "invocant should be resolved from __PACKAGE__");
+            }
+            _ => panic!("expected MethodCall ref"),
+        }
+    }
+
+    // ---- Gap 2: Shift parameter extraction ----
+
+    #[test]
+    fn test_shift_params() {
+        let fa = build_fa("
+        sub process {
+            my $self = shift;
+            my $file = shift;
+            my $opts = shift || {};
+        }
+        ");
+        // signature_for_call strips $self when first param is $self
+        let sig = fa.signature_for_call("process", false, None, Point::new(0, 0)).unwrap();
+        assert!(sig.is_method, "should detect method from $self first param");
+        assert_eq!(sig.params.len(), 2);
+        assert_eq!(sig.params[0].name, "$file");
+        assert_eq!(sig.params[1].name, "$opts");
+        assert_eq!(sig.params[1].default, Some("{}".into()));
+
+        // Check raw params via symbol detail
+        let sub_sym = fa.symbols.iter().find(|s| s.name == "process").unwrap();
+        if let SymbolDetail::Sub { ref params, .. } = sub_sym.detail {
+            assert_eq!(params.len(), 3);
+            assert_eq!(params[0].name, "$self");
+            assert_eq!(params[1].name, "$file");
+            assert_eq!(params[2].name, "$opts");
+            assert_eq!(params[2].default, Some("{}".into()));
+        } else {
+            panic!("expected Sub detail");
+        }
+    }
+
+    #[test]
+    fn test_shift_then_list_assign() {
+        let fa = build_fa("
+        sub process {
+            my $self = shift;
+            my ($file, @opts) = @_;
+        }
+        ");
+        let sig = fa.signature_for_call("process", false, None, Point::new(0, 0)).unwrap();
+        assert!(sig.is_method);
+        assert_eq!(sig.params.len(), 2, "should have $file and @opts (stripped $self)");
+        assert_eq!(sig.params[0].name, "$file");
+        assert_eq!(sig.params[1].name, "@opts");
+        assert!(sig.params[1].is_slurpy);
+
+        // Check raw params
+        let sub_sym = fa.symbols.iter().find(|s| s.name == "process").unwrap();
+        if let SymbolDetail::Sub { ref params, .. } = sub_sym.detail {
+            assert_eq!(params.len(), 3);
+            assert_eq!(params[0].name, "$self");
+        } else {
+            panic!("expected Sub detail");
+        }
+    }
+
+    #[test]
+    fn test_shift_with_double_pipe_default() {
+        let fa = build_fa("
+        sub handler {
+            my $self = shift;
+            my $timeout = shift || 30;
+        }
+        ");
+        let sig = fa.signature_for_call("handler", false, None, Point::new(0, 0)).unwrap();
+        assert_eq!(sig.params.len(), 1, "stripped $self");
+        assert_eq!(sig.params[0].name, "$timeout");
+        assert_eq!(sig.params[0].default, Some("30".into()));
+    }
+
+    #[test]
+    fn test_shift_with_defined_or_default() {
+        let fa = build_fa("
+        sub handler {
+            my $self = shift;
+            my $verbose = shift // 0;
+        }
+        ");
+        let sig = fa.signature_for_call("handler", false, None, Point::new(0, 0)).unwrap();
+        assert_eq!(sig.params.len(), 1, "stripped $self");
+        assert_eq!(sig.params[0].name, "$verbose");
+        assert_eq!(sig.params[0].default, Some("0".into()));
+    }
+
+    #[test]
+    fn test_subscript_param() {
+        let fa = build_fa("
+        sub handler {
+            my $self = $_[0];
+            my $data = $_[1];
+        }
+        ");
+        let sig = fa.signature_for_call("handler", false, None, Point::new(0, 0)).unwrap();
+        assert_eq!(sig.params.len(), 1, "stripped $self");
+        assert_eq!(sig.params[0].name, "$data");
+    }
+
+    #[test]
+    fn test_legacy_at_params_still_work() {
+        // Ensure the existing @_ pattern still works
+        let fa = build_fa("
+        sub process {
+            my ($first, $file, @opts) = @_;
+        }
+        ");
+        let sig = fa.signature_for_call("process", false, None, Point::new(0, 0)).unwrap();
+        assert_eq!(sig.params.len(), 3);
+        assert_eq!(sig.params[0].name, "$first");
+        assert_eq!(sig.params[1].name, "$file");
+        assert_eq!(sig.params[2].name, "@opts");
+    }
+
+    #[test]
+    fn test_tail_pod_item_method() {
+        let fa = build_fa("
+            package WWW::Mech;
+            sub get { }
+            sub post { }
+
+=head1 METHODS
+
+=over
+
+=item $mech->get($url)
+
+Performs a GET request.
+
+=item $mech->post($url)
+
+Performs a POST request.
+
+=back
+
+=cut
+        ");
+        let get_doc = fa.symbols.iter()
+            .find(|s| s.name == "get")
+            .and_then(|s| match &s.detail {
+                SymbolDetail::Sub { doc, .. } => doc.as_ref(),
+                _ => None,
+            });
+        assert!(get_doc.is_some(), "get should have doc from =item");
+        assert!(get_doc.unwrap().contains("GET request"));
+    }
+
 }

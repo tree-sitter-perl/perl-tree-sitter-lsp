@@ -17,11 +17,44 @@ cd ../tree-sitter-perl && tree-sitter generate
 
 ## Architecture
 
+### Layers (strict — read this before writing any code)
+
+The codebase has four layers. Data flows **down** only. Each layer may only depend on layers below it.
+
+```
+  LSP adapter      symbols.rs, backend.rs       → LSP protocol types
+  ─────────────────────────────────────────────────────────────────
+  Cross-file       module_index.rs,             → ModuleExports, ExportedSub
+                   module_resolver.rs,
+                   module_cache.rs
+  ─────────────────────────────────────────────────────────────────
+  Builder          builder.rs                   → produces FileAnalysis
+  ─────────────────────────────────────────────────────────────────
+  Data model       file_analysis.rs             → FileAnalysis, Symbol, Ref, types
+```
+
+**Rules:**
+
+1. **All tree-sitter CST traversal happens inside `build()`.** No other file should walk tree-sitter nodes, call `child_by_field_name`, iterate children, or use `TreeCursor`. The `build()` function in `builder.rs` is the single entry point that takes a `Tree` and returns a `FileAnalysis` — everything that needs the CST lives inside that call. **To add new CST-derived data:** add extraction to the relevant `visit_*` method in `builder.rs` and store the result in `FileAnalysis` (as a field on `Symbol`, a new map, etc.). The builder already visits every sub, package, class, and variable node — use that pass, don't create a second one. If the builder grows too monolithic, we can introduce builder plugins (separate functions called from `build()` that take `&mut FileAnalysis` + `&Tree` + `&[u8]`) to decouple concerns while preserving the single-entry-point invariant.
+
+2. **`file_analysis.rs` is the single source of truth.** All analysis results — symbols, refs, scopes, types, documentation, parameters — live in `FileAnalysis`. Query methods belong here. No `tree_sitter` imports allowed in this file.
+
+3. **`symbols.rs` is a thin adapter.** It converts `FileAnalysis` types to LSP protocol types. It does NOT perform analysis, walk trees, or make decisions about Perl semantics. If you find yourself writing an `if` about Perl language behavior in `symbols.rs`, it belongs in `builder.rs` or `file_analysis.rs`.
+
+4. **`module_resolver.rs` calls the builder, then queries `FileAnalysis`.** It should never walk the tree directly. The resolver's job is: find `.pm` file → call `builder::build()` → extract what it needs from the resulting `FileAnalysis` via query methods → serialize to `ExportedSub`/JSON.
+
+5. **DRY: shared extraction logic goes on `FileAnalysis`.** If two code paths (e.g., subprocess JSON serialization and direct parsing) need the same data from a `FileAnalysis`, add a method to `FileAnalysis` that both call. Never duplicate the extraction loop.
+
+6. **`cursor_context.rs` is the exception:** it receives a tree + source for cursor-position analysis (completion context, signature help context). This is acceptable because cursor context is inherently position-dependent and runs on the already-parsed tree. It should NOT modify `FileAnalysis`.
+
+### File map
+
 - `src/main.rs` — Entry point, stdio transport, `--parse-exports` subprocess mode
 - `src/backend.rs` — `LanguageServer` trait implementation (tower-lsp), request routing
 - `src/document.rs` — Document store with tree-sitter parsing
 - `src/file_analysis.rs` — Data model: scopes, symbols, refs, imports, type inference, priority constants
-- `src/builder.rs` — Single-pass CST → FileAnalysis builder
+- `src/builder.rs` — Single-pass CST → FileAnalysis builder (the ONLY tree-sitter consumer)
+- `src/pod.rs` — POD→markdown converter (pure string processing, no tree-sitter)
 - `src/cursor_context.rs` — Cursor position analysis: completion/signature/selection context
 - `src/symbols.rs` — LSP adapter layer (converts FileAnalysis types to LSP types)
 - `src/module_index.rs` — Cross-file: public API, reverse index (`func → modules`), concurrent cache
@@ -36,6 +69,7 @@ cd ../tree-sitter-perl && tree-sitter generate
 - `tree-sitter-perl` — Path dep to `../tree-sitter-perl`, exports `LANGUAGE: LanguageFn`
 - `dashmap 6` — Concurrent document store + module cache
 - `rusqlite 0.32` — SQLite persistence for module index (bundled)
+- `regex 1` — POD→markdown inline formatting conversion
 
 ## tree-sitter-perl Node Types
 
@@ -54,8 +88,11 @@ Key nodes and their fields:
 ## Testing
 
 ```
-cargo test           # run all tests
+cargo test                    # unit tests
+cargo build --release && ./run_e2e.sh   # e2e tests (requires nvim + release build)
 ```
+
+E2e tests use Neovim headless mode. They exercise the full LSP protocol over stdio.
 
 ## Cross-file Module Resolution
 
@@ -63,10 +100,10 @@ cargo test           # run all tests
 - `Arc<DashMap>` shared between resolver thread and async LSP handlers
 - Reverse index: `DashMap<func_name, Vec<module_name>>` for O(1) exporter lookup
 - Export extraction uses tree-sitter in isolated subprocesses (5s timeout + SIGKILL)
-- Subprocess runs the full builder on each module to extract return types + hash key names per exported function
-- `ModuleExports` stores `return_types: HashMap<String, InferredType>` and `hash_keys: HashMap<String, Vec<String>>`
+- Subprocess runs the full builder on each module, then queries `FileAnalysis` for per-export metadata
+- `ModuleExports` stores `subs: HashMap<String, ExportedSub>` — unified per-export metadata (def_line, params, is_method, return_type, hash_keys, doc)
 - cpanfile parsed with tree-sitter queries at startup, deps pre-resolved with progress reporting
-- SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`), schema v4 with `return_types`/`hash_keys` columns
+- SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`), schema v6 with `subs` JSON column
 - Async handlers only use `_cached` methods — zero I/O
 - After resolution, diagnostics are refreshed for all open files (clears stale false positives)
 

@@ -7,6 +7,7 @@ mod file_analysis;
 mod module_cache;
 mod module_index;
 mod module_resolver;
+mod pod;
 mod query_cache;
 mod symbols;
 

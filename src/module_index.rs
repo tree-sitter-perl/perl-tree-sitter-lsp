@@ -35,6 +35,8 @@ pub struct ExportedSub {
     pub return_type: Option<InferredType>,
     /// Hash key names from return value, if returns HashRef.
     pub hash_keys: Vec<String>,
+    /// Pre-rendered markdown from POD or comments.
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +76,9 @@ impl ModuleExports {
 
 /// Thread-safe queue: Mutex<Vec> + Condvar.
 pub(crate) struct ResolveQueue {
+    /// High priority: stale modules from open files. Drained first.
+    pub priority: Mutex<Vec<String>>,
+    /// Normal priority: missing modules.
     pub pending: Mutex<Vec<String>>,
     pub condvar: Condvar,
 }
@@ -99,6 +104,9 @@ pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<ModuleExports>>>,
     /// Reverse index: function name → list of module names that export it.
     reverse_index: Arc<DashMap<String, Vec<String>>>,
+    /// Modules loaded from cache with an old extract_version.
+    /// Eligible for priority re-resolution when requested.
+    stale_modules: Arc<DashMap<String, ()>>,
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
@@ -110,7 +118,9 @@ impl ModuleIndex {
     pub fn new(client: Client, on_diagnostics_refresh: impl Fn() + Send + Sync + 'static) -> Self {
         let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
         let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let queue = Arc::new(ResolveQueue {
+            priority: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             condvar: Condvar::new(),
         });
@@ -129,6 +139,7 @@ impl ModuleIndex {
         module_resolver::spawn_resolver(
             Arc::clone(&cache),
             Arc::clone(&reverse_index),
+            Arc::clone(&stale_modules),
             Arc::clone(&queue),
             Arc::clone(&resolved),
             Arc::clone(&workspace_root),
@@ -139,6 +150,7 @@ impl ModuleIndex {
         ModuleIndex {
             cache,
             reverse_index,
+            stale_modules,
             queue,
             resolved,
             workspace_root,
@@ -157,12 +169,21 @@ impl ModuleIndex {
     }
 
     /// Request background resolution for a module. Non-blocking.
+    /// Stale modules (old extract version) are queued with priority.
     pub fn request_resolve(&self, module_name: &str) {
-        if self.cache.contains_key(module_name) {
-            return;
+        let is_stale = self.stale_modules.contains_key(module_name);
+        if self.cache.contains_key(module_name) && !is_stale {
+            return; // fresh and cached
         }
-        let mut pending = self.queue.pending.lock().unwrap();
-        pending.push(module_name.to_string());
+        if is_stale {
+            let mut priority = self.queue.priority.lock().unwrap();
+            if !priority.contains(&module_name.to_string()) {
+                priority.push(module_name.to_string());
+            }
+        } else {
+            let mut pending = self.queue.pending.lock().unwrap();
+            pending.push(module_name.to_string());
+        }
         self.queue.condvar.notify_one();
     }
 
@@ -224,7 +245,9 @@ impl ModuleIndex {
     pub fn new_for_test() -> Self {
         let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
         let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let queue = Arc::new(ResolveQueue {
+            priority: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             condvar: Condvar::new(),
         });
@@ -240,6 +263,7 @@ impl ModuleIndex {
         module_resolver::spawn_test_resolver(
             Arc::clone(&cache),
             Arc::clone(&reverse_index),
+            Arc::clone(&stale_modules),
             Arc::clone(&queue),
             Arc::clone(&resolved),
             Arc::clone(&workspace_root),
@@ -248,6 +272,7 @@ impl ModuleIndex {
         ModuleIndex {
             cache,
             reverse_index,
+            stale_modules,
             queue,
             resolved,
             workspace_root,
@@ -449,6 +474,7 @@ mod tests {
             is_method: false,
             return_type: Some(InferredType::HashRef),
             hash_keys: vec![],
+            doc: None,
         });
         subs.insert("make_obj".to_string(), ExportedSub {
             def_line: 20,
@@ -456,6 +482,7 @@ mod tests {
             is_method: false,
             return_type: Some(InferredType::ClassName("MyClass".into())),
             hash_keys: vec![],
+            doc: None,
         });
 
         idx.insert_cache(

@@ -131,6 +131,8 @@ pub enum SymbolDetail {
         is_method: bool,
         /// Inferred return type from analyzing return statements.
         return_type: Option<InferredType>,
+        /// Pre-rendered markdown from POD or comments preceding this sub.
+        doc: Option<String>,
     },
     Class {
         parent: Option<String>,
@@ -2506,6 +2508,7 @@ mod tests {
                     params: vec![],
                     is_method: false,
                     return_type: Some(InferredType::HashRef),
+                    doc: None,
                 },
             }],
             vec![],

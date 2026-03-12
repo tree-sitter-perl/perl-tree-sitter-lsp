@@ -14,7 +14,12 @@ use rusqlite::{params, Connection};
 use crate::file_analysis::{inferred_type_from_tag, inferred_type_to_tag};
 use crate::module_index::{ExportedParam, ExportedSub, ModuleExports};
 
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "7";
+
+/// Bumped when extraction logic changes (new fields, better parsing).
+/// Unlike SCHEMA_VERSION, this doesn't drop the table — stale entries
+/// are re-resolved lazily with priority.
+pub const EXTRACT_VERSION: i64 = 1;
 
 pub fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
@@ -91,7 +96,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             export       TEXT NOT NULL,
             export_ok    TEXT NOT NULL,
             source       TEXT NOT NULL DEFAULT 'import',
-            subs         TEXT NOT NULL DEFAULT '{}'
+            subs         TEXT NOT NULL DEFAULT '{}',
+            extract_version INTEGER NOT NULL DEFAULT 0
         );",
     )?;
 
@@ -116,7 +122,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                     export       TEXT NOT NULL,
                     export_ok    TEXT NOT NULL,
                     source       TEXT NOT NULL DEFAULT 'import',
-                    subs         TEXT NOT NULL DEFAULT '{}'
+                    subs         TEXT NOT NULL DEFAULT '{}',
+                    extract_version INTEGER NOT NULL DEFAULT 0
                 );",
             )?;
             conn.execute(
@@ -178,12 +185,15 @@ fn mtime_as_secs(path: &std::path::Path) -> Option<(i64, i64)> {
     Some((secs, size))
 }
 
-pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExports>>) -> usize {
+pub fn warm_cache(
+    conn: &Connection,
+    cache: &DashMap<String, Option<ModuleExports>>,
+) -> (usize, Vec<String>) {
     let mut stmt = match conn.prepare(
-        "SELECT module_name, path, mtime_secs, file_size, export, export_ok, subs FROM modules",
+        "SELECT module_name, path, mtime_secs, file_size, export, export_ok, subs, extract_version FROM modules",
     ) {
         Ok(s) => s,
-        Err(_) => return 0,
+        Err(_) => return (0, Vec::new()),
     };
 
     let rows = match stmt.query_map([], |row| {
@@ -195,15 +205,17 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
         ))
     }) {
         Ok(r) => r,
-        Err(_) => return 0,
+        Err(_) => return (0, Vec::new()),
     };
 
     let mut count = 0usize;
+    let mut stale_names = Vec::new();
     for row in rows.flatten() {
-        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json, subs_json) = row;
+        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json, subs_json, row_extract_version) = row;
 
         // Negative sentinel
         if path_str.is_empty() {
@@ -214,7 +226,7 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
 
         let path = PathBuf::from(&path_str);
 
-        // Validate mtime — skip stale entries
+        // Validate mtime — skip entries where the file changed on disk
         if let Some((disk_mtime, disk_size)) = mtime_as_secs(&path) {
             if disk_mtime != cached_mtime || disk_size != cached_size {
                 continue;
@@ -232,6 +244,10 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
         if export.is_empty() && export_ok.is_empty() {
             cache.insert(module_name, None);
         } else {
+            // Check if this entry was produced by an older extraction version
+            if row_extract_version < EXTRACT_VERSION {
+                stale_names.push(module_name.clone());
+            }
             cache.insert(
                 module_name,
                 Some(ModuleExports {
@@ -245,7 +261,7 @@ pub fn warm_cache(conn: &Connection, cache: &DashMap<String, Option<ModuleExport
         count += 1;
     }
 
-    count
+    (count, stale_names)
 }
 
 fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
@@ -283,6 +299,9 @@ fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
+            let doc = val.get("doc")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some((
                 name,
                 ExportedSub {
@@ -291,6 +310,7 @@ fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
                     is_method,
                     return_type,
                     hash_keys,
+                    doc,
                 },
             ))
         })
@@ -329,9 +349,9 @@ pub fn save_to_db(
     };
 
     let r = conn.execute(
-        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source, subs)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![module_name, path_str, mtime, size, export_json, export_ok_json, source, subs_json],
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source, subs, extract_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![module_name, path_str, mtime, size, export_json, export_ok_json, source, subs_json, EXTRACT_VERSION],
     );
     if let Err(e) = r {
         log::warn!("Failed to save module cache for '{}': {}", module_name, e);
@@ -363,6 +383,9 @@ fn serialize_subs_json(subs: &HashMap<String, ExportedSub>) -> String {
         }
         if !sub_info.hash_keys.is_empty() {
             obj.insert("hash_keys".into(), serde_json::json!(sub_info.hash_keys));
+        }
+        if let Some(ref doc) = sub_info.doc {
+            obj.insert("doc".into(), serde_json::Value::String(doc.clone()));
         }
         map.insert(name.clone(), obj.into());
     }
@@ -397,8 +420,9 @@ mod tests {
         save_to_db(&conn, "TestModule", &exports, "import");
 
         let cache = DashMap::new();
-        let n = warm_cache(&conn, &cache);
+        let (n, stale) = warm_cache(&conn, &cache);
         assert_eq!(n, 1);
+        assert!(stale.is_empty());
 
         let loaded = cache.get("TestModule").unwrap();
         let loaded = loaded.as_ref().unwrap();
@@ -415,7 +439,7 @@ mod tests {
         save_to_db(&conn, "Nonexistent::Module", &None, "import");
 
         let cache = DashMap::new();
-        let n = warm_cache(&conn, &cache);
+        let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 1);
 
         let entry = cache.get("Nonexistent::Module").unwrap();
@@ -442,7 +466,7 @@ mod tests {
         std::fs::write(&pm, "v2 with more content").unwrap();
 
         let cache = DashMap::new();
-        let n = warm_cache(&conn, &cache);
+        let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 0, "stale entry should not be loaded");
         assert!(!cache.contains_key("StaleModule"));
 
@@ -463,7 +487,7 @@ mod tests {
 
         validate_inc_paths(&conn, &paths2).unwrap();
         let cache = DashMap::new();
-        let n = warm_cache(&conn, &cache);
+        let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 0, "cache should be empty after @INC change");
     }
 
@@ -480,7 +504,7 @@ mod tests {
 
         init_schema(&conn).unwrap();
         let cache = DashMap::new();
-        let n = warm_cache(&conn, &cache);
+        let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 0, "old data should be gone after migration");
     }
 
@@ -522,6 +546,7 @@ mod tests {
                 is_method: false,
                 return_type: Some(crate::file_analysis::InferredType::HashRef),
                 hash_keys: vec!["host".into()],
+                doc: None,
             },
         );
 
@@ -535,7 +560,7 @@ mod tests {
 
         // Verify it round-trips
         let cache = DashMap::new();
-        let n = warm_cache(&conn, &cache);
+        let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 1);
         let loaded = cache.get("MigratedModule").unwrap();
         let loaded = loaded.as_ref().unwrap();
@@ -613,6 +638,7 @@ mod tests {
                 is_method: false,
                 return_type: Some(InferredType::HashRef),
                 hash_keys: vec!["host".into(), "port".into()],
+                doc: None,
             },
         );
         subs.insert(
@@ -623,6 +649,7 @@ mod tests {
                 is_method: false,
                 return_type: Some(InferredType::ArrayRef),
                 hash_keys: vec![],
+                doc: None,
             },
         );
         subs.insert(
@@ -633,6 +660,7 @@ mod tests {
                 is_method: true,
                 return_type: Some(InferredType::ClassName("MyObj".into())),
                 hash_keys: vec![],
+                doc: None,
             },
         );
 
@@ -645,7 +673,7 @@ mod tests {
         save_to_db(&conn, "SubsTest", &exports, "import");
 
         let cache = DashMap::new();
-        let n = warm_cache(&conn, &cache);
+        let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 1);
 
         let loaded = cache.get("SubsTest").unwrap();
@@ -666,6 +694,78 @@ mod tests {
         assert_eq!(no.def_line, 30);
         assert!(no.is_method);
         assert_eq!(no.return_type, Some(InferredType::ClassName("MyObj".into())));
+
+        let _ = std::fs::remove_file(&pm);
+    }
+
+    #[test]
+    fn test_warm_reports_stale_entries() {
+        let conn = test_db();
+        let dir = std::env::temp_dir();
+        let pm = dir.join("StaleExtract.pm");
+        std::fs::write(&pm, "package StaleExtract; 1;").unwrap();
+
+        let (mtime, size) = mtime_as_secs(&pm).unwrap();
+
+        // Save with old extract version (0, below EXTRACT_VERSION)
+        conn.execute(
+            "INSERT INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, subs, extract_version)
+             VALUES ('StaleExtract', ?1, ?2, ?3, '[\"foo\"]', '[]', '{}', 0)",
+            params![pm.to_string_lossy(), mtime, size],
+        ).unwrap();
+
+        let cache = DashMap::new();
+        let (loaded, stale) = warm_cache(&conn, &cache);
+        assert_eq!(loaded, 1, "stale entry should still be loaded");
+        assert!(cache.contains_key("StaleExtract"), "stale entry should be in cache");
+        assert_eq!(stale, vec!["StaleExtract"], "should report as stale");
+
+        let _ = std::fs::remove_file(&pm);
+    }
+
+    #[test]
+    fn test_warm_fresh_not_stale() {
+        let conn = test_db();
+        let dir = std::env::temp_dir();
+        let pm = dir.join("FreshExtract.pm");
+        std::fs::write(&pm, "package FreshExtract; 1;").unwrap();
+
+        let exports = Some(ModuleExports {
+            path: pm.clone(),
+            export: vec!["foo".into()],
+            export_ok: vec![],
+            subs: HashMap::new(),
+        });
+        save_to_db(&conn, "FreshExtract", &exports, "import");
+
+        let cache = DashMap::new();
+        let (loaded, stale) = warm_cache(&conn, &cache);
+        assert_eq!(loaded, 1);
+        assert!(stale.is_empty(), "current-version entry should not be stale");
+
+        let _ = std::fs::remove_file(&pm);
+    }
+
+    #[test]
+    fn test_save_writes_extract_version() {
+        let conn = test_db();
+        let dir = std::env::temp_dir();
+        let pm = dir.join("VersionedSave.pm");
+        std::fs::write(&pm, "package VersionedSave; 1;").unwrap();
+
+        let exports = Some(ModuleExports {
+            path: pm.clone(),
+            export: vec!["foo".into()],
+            export_ok: vec![],
+            subs: HashMap::new(),
+        });
+        save_to_db(&conn, "VersionedSave", &exports, "import");
+
+        let ver: i64 = conn.query_row(
+            "SELECT extract_version FROM modules WHERE module_name = 'VersionedSave'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(ver, EXTRACT_VERSION);
 
         let _ = std::fs::remove_file(&pm);
     }

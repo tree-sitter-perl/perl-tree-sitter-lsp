@@ -3,7 +3,7 @@
 //! Discovers `@INC` paths, locates `.pm` files, extracts `@EXPORT`/`@EXPORT_OK`,
 //! and handles subprocess isolation for safe parsing (tree-sitter hangs → SIGKILL).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +35,7 @@ pub type OnResolved = Box<dyn Fn() + Send + Sync>;
 pub fn spawn_resolver(
     cache: Arc<DashMap<String, Option<ModuleExports>>>,
     reverse_index: Arc<DashMap<String, Vec<String>>>,
+    stale_modules: Arc<DashMap<String, ()>>,
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
@@ -55,15 +56,23 @@ pub fn spawn_resolver(
             let db = module_cache::open_cache_db(ws_root.as_deref());
             if let Some(ref conn) = db {
                 let _ = module_cache::validate_inc_paths(conn, &inc_paths);
-                let n = module_cache::warm_cache(conn, &cache);
-                log::info!("Warmed module cache: {} entries loaded from disk", n);
+                let (n, stale_names) = module_cache::warm_cache(conn, &cache);
+                log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
+                // Populate stale_modules set for priority re-resolution.
+                for name in stale_names {
+                    stale_modules.insert(name, ());
+                }
                 // Build reverse index from warmed cache.
                 rebuild_reverse_index(&cache, &reverse_index);
             }
 
-            let mut seen = HashSet::new();
+            // Track which extract version each module was resolved at.
+            let mut seen: HashMap<String, i64> = HashMap::new();
 
-            // Pre-resolve cpanfile dependencies.
+            // Queue cpanfile dependencies (non-blocking — lets priority items go first).
+            // Track total for progress reporting in the main loop.
+            let mut cpanfile_total = 0usize;
+            let mut cpanfile_done = 0usize;
             if let Some(ref root_uri) = ws_root {
                 if let Some(root_path) = uri_to_path(root_uri) {
                     let cpanfile_modules = cpanfile::parse_cpanfile(&root_path);
@@ -73,39 +82,55 @@ pub fn spawn_resolver(
                         .collect();
 
                     if !to_resolve.is_empty() {
-                        resolve_cpanfile_batch(
-                            &to_resolve,
-                            &inc_paths,
-                            &cache,
-                            &reverse_index,
-                            &db,
-                            &client,
-                            &handle,
-                            &on_resolved,
-                        );
-                        for m in &to_resolve {
-                            seen.insert(m.clone());
-                        }
+                        cpanfile_total = to_resolve.len();
+                        log::info!("cpanfile: {} modules queued for indexing", cpanfile_total);
+
+                        // Start progress bar.
+                        let token = NumberOrString::String("perl-lsp/indexing".to_string());
+                        let _ = handle.block_on(client.send_request::<request::WorkDoneProgressCreate>(
+                            WorkDoneProgressCreateParams { token: token.clone() },
+                        ));
+                        handle.block_on(client.send_notification::<notification::Progress>(
+                            ProgressParams {
+                                token,
+                                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                                    WorkDoneProgressBegin {
+                                        title: "Indexing Perl modules".into(),
+                                        cancellable: Some(false),
+                                        message: None,
+                                        percentage: Some(0),
+                                    },
+                                )),
+                            },
+                        ));
+
+                        let mut pending = queue.pending.lock().unwrap();
+                        pending.extend(to_resolve);
+                        queue.condvar.notify_one();
                     }
                 }
             }
 
-            // Main resolve loop — drain work queue.
+            // Main resolve loop — drain priority first, then pending.
             loop {
-                let batch = {
-                    let mut pending = queue.pending.lock().unwrap();
-                    while pending.is_empty() {
-                        pending = queue.condvar.wait(pending).unwrap();
-                    }
-                    std::mem::take(&mut *pending)
-                };
+                let batch = drain_next_batch(&queue);
 
                 for module_name in batch {
-                    if !seen.insert(module_name.clone()) {
-                        continue;
+                    // Allow re-resolution when extract version is outdated.
+                    if let Some(&ver) = seen.get(&module_name) {
+                        if ver >= module_cache::EXTRACT_VERSION {
+                            continue;
+                        }
+                    }
+                    seen.insert(module_name.clone(), module_cache::EXTRACT_VERSION);
+
+                    let is_re_resolve = stale_modules.contains_key(&module_name);
+                    if is_re_resolve {
+                        log::info!("Re-resolving stale module '{}'", module_name);
+                    } else {
+                        log::info!("Resolving module '{}'", module_name);
                     }
 
-                    log::info!("Resolving module '{}'", module_name);
                     let result = parse_module(&inc_paths, &module_name);
                     match &result {
                         Some(e) => log::info!(
@@ -127,6 +152,43 @@ pub fn spawn_resolver(
                         module_cache::save_to_db(conn, &module_name, &result, "import");
                     }
 
+                    // Remove from stale set after successful re-resolution.
+                    if is_re_resolve {
+                        stale_modules.remove(&module_name);
+                    }
+
+                    // Report cpanfile progress.
+                    if cpanfile_total > 0 && cpanfile_done < cpanfile_total {
+                        cpanfile_done += 1;
+                        let pct = (cpanfile_done * 100 / cpanfile_total) as u32;
+                        let token = NumberOrString::String("perl-lsp/indexing".to_string());
+                        if cpanfile_done < cpanfile_total {
+                            handle.block_on(client.send_notification::<notification::Progress>(
+                                ProgressParams {
+                                    token,
+                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                                        WorkDoneProgressReport {
+                                            cancellable: Some(false),
+                                            message: Some(format!("{} ({}/{})", module_name, cpanfile_done, cpanfile_total)),
+                                            percentage: Some(pct),
+                                        },
+                                    )),
+                                },
+                            ));
+                        } else {
+                            handle.block_on(client.send_notification::<notification::Progress>(
+                                ProgressParams {
+                                    token,
+                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                        WorkDoneProgressEnd {
+                                            message: Some(format!("Indexed {} modules", cpanfile_total)),
+                                        },
+                                    )),
+                                },
+                            ));
+                        }
+                    }
+
                     // Signal waiters and trigger diagnostic refresh.
                     {
                         let _g = resolved.mu.lock().unwrap();
@@ -139,11 +201,36 @@ pub fn spawn_resolver(
         .expect("failed to spawn module-resolver thread");
 }
 
+/// Drain the next batch from the queue, checking priority first.
+fn drain_next_batch(queue: &ResolveQueue) -> Vec<String> {
+    // Check priority first
+    {
+        let mut priority = queue.priority.lock().unwrap();
+        if !priority.is_empty() {
+            return std::mem::take(&mut *priority);
+        }
+    }
+    // Wait for pending
+    let mut pending = queue.pending.lock().unwrap();
+    loop {
+        if !pending.is_empty() {
+            // Before draining pending, re-check priority
+            let mut priority = queue.priority.lock().unwrap();
+            if !priority.is_empty() {
+                return std::mem::take(&mut *priority);
+            }
+            return std::mem::take(&mut *pending);
+        }
+        pending = queue.condvar.wait(pending).unwrap();
+    }
+}
+
 /// Simplified resolver for tests — no Client, no progress, no cpanfile.
 #[cfg(test)]
 pub fn spawn_test_resolver(
     cache: Arc<DashMap<String, Option<ModuleExports>>>,
     reverse_index: Arc<DashMap<String, Vec<String>>>,
+    stale_modules: Arc<DashMap<String, ()>>,
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
@@ -157,28 +244,30 @@ pub fn spawn_test_resolver(
             let db = module_cache::open_cache_db(ws_root.as_deref());
             if let Some(ref conn) = db {
                 let _ = module_cache::validate_inc_paths(conn, &inc_paths);
-                let _ = module_cache::warm_cache(conn, &cache);
+                let (_, stale_names) = module_cache::warm_cache(conn, &cache);
+                for name in stale_names {
+                    stale_modules.insert(name, ());
+                }
                 rebuild_reverse_index(&cache, &reverse_index);
             }
 
-            let mut seen = HashSet::new();
+            let mut seen: HashMap<String, i64> = HashMap::new();
             loop {
-                let batch = {
-                    let mut pending = queue.pending.lock().unwrap();
-                    while pending.is_empty() {
-                        pending = queue.condvar.wait(pending).unwrap();
-                    }
-                    std::mem::take(&mut *pending)
-                };
+                let batch = drain_next_batch(&queue);
                 for module_name in batch {
-                    if !seen.insert(module_name.clone()) {
-                        continue;
+                    if let Some(&ver) = seen.get(&module_name) {
+                        if ver >= module_cache::EXTRACT_VERSION {
+                            continue;
+                        }
                     }
+                    seen.insert(module_name.clone(), module_cache::EXTRACT_VERSION);
+
                     let result = parse_module(&inc_paths, &module_name);
                     insert_into_cache(&cache, &reverse_index, &module_name, result.clone());
                     if let Some(ref conn) = db {
                         module_cache::save_to_db(conn, &module_name, &result, "import");
                     }
+                    stale_modules.remove(&module_name);
                     let _g = resolved.mu.lock().unwrap();
                     resolved.cv.notify_all();
                 }
@@ -205,80 +294,6 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
         guard = g;
     }
     guard.clone().flatten()
-}
-
-fn resolve_cpanfile_batch(
-    to_resolve: &[String],
-    inc_paths: &[PathBuf],
-    cache: &Arc<DashMap<String, Option<ModuleExports>>>,
-    reverse_index: &Arc<DashMap<String, Vec<String>>>,
-    db: &Option<rusqlite::Connection>,
-    client: &Client,
-    handle: &tokio::runtime::Handle,
-    on_resolved: &OnResolved,
-) {
-    let total = to_resolve.len();
-    log::info!("cpanfile: {} modules to index", total);
-
-    let token = NumberOrString::String("perl-lsp/indexing".to_string());
-    let _ = handle.block_on(client.send_request::<request::WorkDoneProgressCreate>(
-        WorkDoneProgressCreateParams {
-            token: token.clone(),
-        },
-    ));
-    handle.block_on(client.send_notification::<notification::Progress>(
-        ProgressParams {
-            token: token.clone(),
-            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
-                WorkDoneProgressBegin {
-                    title: "Indexing Perl modules".into(),
-                    cancellable: Some(false),
-                    message: None,
-                    percentage: Some(0),
-                },
-            )),
-        },
-    ));
-
-    for (i, module_name) in to_resolve.iter().enumerate() {
-        let pct = ((i + 1) * 100 / total) as u32;
-        handle.block_on(client.send_notification::<notification::Progress>(
-            ProgressParams {
-                token: token.clone(),
-                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
-                    WorkDoneProgressReport {
-                        cancellable: Some(false),
-                        message: Some(format!("{} ({}/{})", module_name, i + 1, total)),
-                        percentage: Some(pct),
-                    },
-                )),
-            },
-        ));
-
-        log::info!(
-            "cpanfile: resolving '{}' ({}/{})",
-            module_name,
-            i + 1,
-            total
-        );
-        let result = parse_module(inc_paths, module_name);
-        insert_into_cache(cache, reverse_index, module_name, result.clone());
-        if let Some(ref conn) = db {
-            module_cache::save_to_db(conn, module_name, &result, "cpanfile");
-        }
-    }
-
-    handle.block_on(client.send_notification::<notification::Progress>(
-        ProgressParams {
-            token,
-            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
-                message: Some(format!("Indexed {} modules", total)),
-            })),
-        },
-    ));
-
-    // Trigger diagnostic refresh after cpanfile batch completes.
-    on_resolved();
 }
 
 /// Insert a resolved module into the cache and update the reverse index.
@@ -431,7 +446,10 @@ fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<Modul
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                     .unwrap_or_default();
-                Some((name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys }))
+                let doc = val.get("doc")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                Some((name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc }))
             }).collect()
         })
         .unwrap_or_default();
@@ -472,11 +490,11 @@ pub fn subprocess_main(path: &str) {
         for name in export.iter().chain(export_ok.iter()) {
             let mut sub_info = serde_json::Map::new();
 
-            // Find the sub symbol for definition line + params
+            // Find the sub symbol for definition line + params + doc
             for sym in &analysis.symbols {
                 if sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                     sub_info.insert("def_line".into(), sym.span.start.row.into());
-                    if let SymbolDetail::Sub { ref params, is_method, .. } = sym.detail {
+                    if let SymbolDetail::Sub { ref params, is_method, ref doc, .. } = sym.detail {
                         sub_info.insert("is_method".into(), is_method.into());
                         let params_json: Vec<serde_json::Value> = params.iter()
                             .map(|p| serde_json::json!({
@@ -485,6 +503,9 @@ pub fn subprocess_main(path: &str) {
                             }))
                             .collect();
                         sub_info.insert("params".into(), params_json.into());
+                        if let Some(ref d) = doc {
+                            sub_info.insert("doc".into(), serde_json::Value::String(d.clone()));
+                        }
                     }
                     break;
                 }
@@ -564,15 +585,17 @@ pub fn resolve_and_parse(
             let mut def_line = 0u32;
             let mut params = Vec::new();
             let mut is_method = false;
+            let mut doc = None;
 
             for sym in &analysis.symbols {
                 if sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                     def_line = sym.span.start.row as u32;
-                    if let SymbolDetail::Sub { params: ref p, is_method: m, .. } = sym.detail {
+                    if let SymbolDetail::Sub { params: ref p, is_method: m, doc: ref d, .. } = sym.detail {
                         is_method = m;
                         params = p.iter()
                             .map(|pi| ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy })
                             .collect();
+                        doc = d.clone();
                     }
                     break;
                 }
@@ -585,7 +608,7 @@ pub fn resolve_and_parse(
                 .map(|s| s.name.clone())
                 .collect();
 
-            subs.insert(name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys });
+            subs.insert(name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc });
         }
     }
 
