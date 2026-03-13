@@ -21,6 +21,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         last_expr_type: std::collections::HashMap::new(),
         call_bindings: Vec::new(),
         pod_texts: Vec::new(),
+        package_parents: std::collections::HashMap::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -53,6 +54,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         b.fold_ranges,
         b.imports,
         b.call_bindings,
+        b.package_parents,
     )
 }
 
@@ -81,6 +83,8 @@ struct Builder<'a> {
     call_bindings: Vec<CallBinding>,
     /// Raw POD text blocks collected during the walk (for tail-POD post-pass).
     pod_texts: Vec<String>,
+    /// Parent classes for each package (from use parent/base, @ISA, class :isa).
+    package_parents: std::collections::HashMap<String, Vec<String>>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -358,6 +362,14 @@ impl<'a> Builder<'a> {
                     self.collect_field_details(child, &mut field_details);
                 }
             }
+        }
+
+        // Write to package_parents for unified inheritance resolution
+        if let Some(ref p) = parent {
+            self.package_parents
+                .entry(name.clone())
+                .or_default()
+                .push(p.clone());
         }
 
         self.add_symbol(
@@ -921,6 +933,22 @@ impl<'a> Builder<'a> {
                     SymbolDetail::None,
                 );
 
+                // Extract parent classes from `use parent` / `use base`
+                if module_name == "parent" || module_name == "base" {
+                    if let Some(ref pkg) = self.current_package {
+                        let (parents, _) = self.extract_use_import_list(node);
+                        let parents: Vec<String> = parents.into_iter()
+                            .filter(|s| !s.starts_with('-')) // skip -norequire etc.
+                            .collect();
+                        if !parents.is_empty() {
+                            self.package_parents
+                                .entry(pkg.clone())
+                                .or_default()
+                                .extend(parents);
+                        }
+                    }
+                }
+
                 // Extract imported symbols from qw(...) or list
                 let (imported_symbols, qw_close_paren) = self.extract_use_import_list(node);
                 self.imports.push(Import {
@@ -971,6 +999,15 @@ impl<'a> Builder<'a> {
                             return (words, None);
                         }
                     }
+                    "string_literal" => {
+                        // bare 'Foo' (single string, no parens/qw)
+                        if let Ok(text) = child.utf8_text(self.source) {
+                            let unquoted = text.trim_matches(|c| c == '\'' || c == '"');
+                            if !unquoted.is_empty() {
+                                return (vec![unquoted.to_string()], None);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1004,6 +1041,47 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_assignment(&mut self, node: Node<'a>) {
+        // Check for @ISA assignment: `our @ISA = (...)`
+        if let Some(left) = node.child_by_field_name("left") {
+            let lhs_text = left.utf8_text(self.source).unwrap_or("");
+            if lhs_text == "@ISA" || lhs_text.ends_with("@ISA") {
+                if let Some(ref pkg) = self.current_package {
+                    // child_by_field_name("right") returns `(` paren, not the list.
+                    // Iterate named children to find list_expression/quoted_word_list.
+                    let mut parents = Vec::new();
+                    for i in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(i) {
+                            match child.kind() {
+                                "list_expression" | "parenthesized_expression" => {
+                                    self.collect_string_values(child, &mut parents);
+                                }
+                                "quoted_word_list" => {
+                                    for j in 0..child.named_child_count() {
+                                        if let Some(sc) = child.named_child(j) {
+                                            if sc.kind() == "string_content" {
+                                                if let Ok(text) = sc.utf8_text(self.source) {
+                                                    for word in text.split_whitespace() {
+                                                        if !word.is_empty() {
+                                                            parents.push(word.to_string());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if !parents.is_empty() {
+                        // @ISA = replaces (not appends)
+                        self.package_parents.insert(pkg.clone(), parents);
+                    }
+                }
+            }
+        }
+
         // Check for type inference from RHS
         if let Some(left) = node.child_by_field_name("left") {
             if left.kind() == "variable_declaration" {
@@ -2362,7 +2440,7 @@ $p->;
         let source = "package main;\n1;\nuse v5.38;\nclass Point {\n    field $x :param :reader;\n    method magnitude () { }\n}\nmy $p = Point->new(x => 3);\n$p->magnitude();\n";
         let fa = build_fa(source);
         // cursor on `magnitude` in `$p->magnitude()` — line 8, col 5
-        let def = fa.find_definition(Point::new(8, 5), None, None);
+        let def = fa.find_definition(Point::new(8, 5), None, None, None);
         assert!(def.is_some(), "should find definition for magnitude");
         let span = def.unwrap();
         assert_eq!(span.start.row, 5, "should point to method declaration line, got row {}", span.start.row);
@@ -2372,7 +2450,7 @@ $p->;
     fn test_field_reader_goto_def() {
         // go-to-def on $p->x should find the reader method, which points to the field
         let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param :reader;\n    method mag() { }\n}\nmy $p = Point->new(x => 1);\n$p->x;");
-        let def = fa.find_definition(Point::new(6, 5), None, None); // cursor on `x` in `$p->x`
+        let def = fa.find_definition(Point::new(6, 5), None, None, None); // cursor on `x` in `$p->x`
         assert!(def.is_some(), "should find definition for reader method");
         // The reader method's selection_span points to the field declaration
         let span = def.unwrap();
@@ -2847,7 +2925,7 @@ $p->;
         // Find the function_call_expression on line 3
         let call_node = find_node_at(tree.root_node(), Point::new(3, 0), "function_call_expression")
             .expect("should find function_call_expression");
-        let ty = fa.resolve_expression_type(call_node, src.as_bytes());
+        let ty = fa.resolve_expression_type(call_node, src.as_bytes(), None);
         assert_eq!(ty, Some(InferredType::HashRef));
     }
 
@@ -2869,7 +2947,7 @@ $p->;
         // Find the scalar $x on line 1
         let scalar_node = find_node_at(tree.root_node(), Point::new(1, 0), "scalar")
             .expect("should find scalar");
-        let ty = fa.resolve_expression_type(scalar_node, src.as_bytes());
+        let ty = fa.resolve_expression_type(scalar_node, src.as_bytes(), None);
         assert_eq!(ty, Some(InferredType::HashRef));
     }
 
@@ -2893,7 +2971,7 @@ $p->;
             };
         }
         assert_eq!(n.kind(), "method_call_expression");
-        let ty = fa.resolve_expression_type(n, src.as_bytes());
+        let ty = fa.resolve_expression_type(n, src.as_bytes(), None);
         assert_eq!(ty, Some(InferredType::HashRef));
     }
 
@@ -2904,7 +2982,7 @@ $p->;
         let fa = build(&tree, src.as_bytes());
         let call = find_node_at(tree.root_node(), Point::new(3, 0), "method_call_expression")
             .expect("should find method_call_expression");
-        let ty = fa.resolve_expression_type(call, src.as_bytes());
+        let ty = fa.resolve_expression_type(call, src.as_bytes(), None);
         assert_eq!(ty, Some(InferredType::ClassName("Foo".into())));
     }
 
@@ -2955,7 +3033,7 @@ $calc->get_self->get_config->{host};
         // The base of hash_element_expression is the method chain
         let base = n.named_child(0).expect("should have base");
         assert_eq!(base.kind(), "method_call_expression");
-        let ty = fa.resolve_expression_type(base, src.as_bytes());
+        let ty = fa.resolve_expression_type(base, src.as_bytes(), None);
         assert_eq!(ty, Some(InferredType::HashRef),
             "the chain $calc->get_self->get_config should resolve to HashRef");
     }
@@ -3010,7 +3088,7 @@ $calc->get_self->get_config->{host};
     fn test_find_def_variable() {
         let fa = build_fa("my $x = 1;\nprint $x;");
         // Cursor on the usage of $x at line 1
-        let def = fa.find_definition(Point::new(1, 7), None, None);
+        let def = fa.find_definition(Point::new(1, 7), None, None, None);
         assert!(def.is_some(), "should find definition for $x");
         let span = def.unwrap();
         assert_eq!(span.start.row, 0, "definition should be on line 0");
@@ -3020,7 +3098,7 @@ $calc->get_self->get_config->{host};
     fn test_find_def_sub() {
         let fa = build_fa("sub greet { }\ngreet();");
         // Cursor on the function call at line 1
-        let def = fa.find_definition(Point::new(1, 1), None, None);
+        let def = fa.find_definition(Point::new(1, 1), None, None, None);
         assert!(def.is_some(), "should find definition for greet");
         let span = def.unwrap();
         assert_eq!(span.start.row, 0, "definition should be on line 0");
@@ -3031,7 +3109,7 @@ $calc->get_self->get_config->{host};
         let src = "package Foo;\nsub new { bless {}, shift }\nsub hello { }\npackage main;\nmy $f = Foo->new();\n$f->hello();";
         let fa = build_fa(src);
         // Cursor on hello() call at line 5
-        let def = fa.find_definition(Point::new(5, 5), None, None);
+        let def = fa.find_definition(Point::new(5, 5), None, None, None);
         assert!(def.is_some(), "should find definition for hello method");
         let span = def.unwrap();
         assert_eq!(span.start.row, 2, "hello definition should be on line 2");
@@ -3042,7 +3120,7 @@ $calc->get_self->get_config->{host};
         let src = "my $x = 'outer';\nsub foo {\n    my $x = 'inner';\n    print $x;\n}";
         let fa = build_fa(src);
         // Cursor on $x inside sub (line 3) should resolve to inner $x (line 2)
-        let def = fa.find_definition(Point::new(3, 11), None, None);
+        let def = fa.find_definition(Point::new(3, 11), None, None, None);
         assert!(def.is_some());
         let span = def.unwrap();
         assert_eq!(span.start.row, 2, "should resolve to inner $x on line 2");
@@ -3078,7 +3156,7 @@ $calc->get_self->get_config->{host};
             .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
             .collect();
         assert!(!host_refs.is_empty(), "should find HashKeyAccess for 'host'");
-        let def = fa.find_definition(host_refs[0].span.start, Some(&tree), Some(src.as_bytes()));
+        let def = fa.find_definition(host_refs[0].span.start, Some(&tree), Some(src.as_bytes()), None);
         assert!(def.is_some(), "should find definition for host");
         assert_eq!(def.unwrap().start.row, 0, "host def should be on line 0");
     }
@@ -3208,7 +3286,7 @@ $calc->get_self->get_config->{host};
     fn test_hover_variable() {
         let src = "my $greeting = 'hello';\nprint $greeting;";
         let fa = build_fa(src);
-        let hover = fa.hover_info(Point::new(1, 8), src, None);
+        let hover = fa.hover_info(Point::new(1, 8), src, None, None);
         assert!(hover.is_some(), "should have hover info");
         let text = hover.unwrap();
         assert!(text.contains("$greeting"), "hover should contain variable name, got: {}", text);
@@ -3218,7 +3296,7 @@ $calc->get_self->get_config->{host};
     fn test_hover_sub() {
         let src = "sub greet { }\ngreet();";
         let fa = build_fa(src);
-        let hover = fa.hover_info(Point::new(1, 1), src, None);
+        let hover = fa.hover_info(Point::new(1, 1), src, None, None);
         assert!(hover.is_some(), "should have hover info for function call");
         let text = hover.unwrap();
         assert!(text.contains("greet"), "hover should contain sub name, got: {}", text);
@@ -3229,7 +3307,7 @@ $calc->get_self->get_config->{host};
         let src = "package Point;\nsub new { bless {}, shift }\npackage main;\nmy $p = Point->new();\n$p;";
         let fa = build_fa(src);
         // Hover on $p usage at line 4
-        let hover = fa.hover_info(Point::new(4, 1), src, None);
+        let hover = fa.hover_info(Point::new(4, 1), src, None, None);
         assert!(hover.is_some(), "should have hover info");
         let text = hover.unwrap();
         assert!(text.contains("Point"), "hover should show inferred type Point, got: {}", text);
@@ -3241,12 +3319,12 @@ $calc->get_self->get_config->{host};
         let src = "package Point;\nsub new { bless {}, shift }\npackage Foo;\nsub new { bless {}, shift }\npackage main;\nmy $x = Point->new();\n$x;\n$x = Foo->new();\n$x;";
         let fa = build_fa(src);
         // line 6: $x; — should be Point
-        let hover1 = fa.hover_info(Point::new(6, 1), src, None);
+        let hover1 = fa.hover_info(Point::new(6, 1), src, None, None);
         assert!(hover1.is_some());
         let text1 = hover1.unwrap();
         assert!(text1.contains("Point"), "at line 6 should be Point, got: {}", text1);
         // line 8: $x; — should be Foo (after reassignment)
-        let hover2 = fa.hover_info(Point::new(8, 1), src, None);
+        let hover2 = fa.hover_info(Point::new(8, 1), src, None, None);
         assert!(hover2.is_some());
         let text2 = hover2.unwrap();
         assert!(text2.contains("Foo"), "at line 8 should be Foo, got: {}", text2);
@@ -3257,7 +3335,7 @@ $calc->get_self->get_config->{host};
         let src = "package Foo;\nsub make { return Foo->new() }\nsub new { bless {}, shift }\npackage main;\nmake();";
         let fa = build_fa(src);
         // Hover on sub make definition
-        let hover = fa.hover_info(Point::new(1, 5), src, None);
+        let hover = fa.hover_info(Point::new(1, 5), src, None, None);
         assert!(hover.is_some(), "should have hover info for sub");
         let text = hover.unwrap();
         assert!(text.contains("returns"), "hover should show return type, got: {}", text);
@@ -3282,7 +3360,7 @@ $calc->get_self->get_config->{host};
         let src = "package Point;\nsub new { bless {}, shift }\npackage main;\nPoint->new();";
         let fa = build_fa(src);
         // Cursor on "new" in Point->new()
-        let def = fa.find_definition(Point::new(3, 8), None, None);
+        let def = fa.find_definition(Point::new(3, 8), None, None, None);
         assert!(def.is_some(), "should find definition for new");
     }
 
@@ -3335,12 +3413,12 @@ $calc->get_self->get_config->{host};
         let fa = build_fa(src);
 
         // $self at line 12 (push @{$self->{history}}, ...)
-        let def_self = fa.find_definition(Point::new(12, 12), None, None);
+        let def_self = fa.find_definition(Point::new(12, 12), None, None, None);
         assert!(def_self.is_some(), "should find definition for $self in deref");
         assert_eq!(def_self.unwrap().start.row, 10, "$self should resolve to declaration on line 10");
 
         // history key at line 12
-        let def_history = fa.find_definition(Point::new(12, 20), None, None);
+        let def_history = fa.find_definition(Point::new(12, 20), None, None, None);
         assert!(def_history.is_some(), "should find definition for history hash key");
         assert_eq!(def_history.unwrap().start.row, 4, "history key should resolve to definition on line 4");
     }
@@ -3428,7 +3506,7 @@ my $calc = Calculator->new(verbose => 1);
         // 0         1         2         3
         // 0123456789012345678901234567890123456789
         //                            ^27 = v of verbose
-        let def = fa.find_definition(Point::new(9, 27), Some(&tree), Some(src.as_bytes()));
+        let def = fa.find_definition(Point::new(9, 27), Some(&tree), Some(src.as_bytes()), None);
         assert!(def.is_some(), "should find definition for verbose at call site");
         // Should go to line 4: "verbose => $args{verbose} // 0,"
         assert_eq!(def.unwrap().start.row, 4,
@@ -3453,7 +3531,7 @@ my $p = Point->new(x => 3, y => 4);
         // 0123456789012345678901234
         //                    ^19 = x
 
-        let def = fa.find_definition(Point::new(6, 19), Some(&tree), Some(src.as_bytes()));
+        let def = fa.find_definition(Point::new(6, 19), Some(&tree), Some(src.as_bytes()), None);
         assert!(def.is_some(), "should find definition for x at call site");
         // Should go to line 2: "field $x :param :reader;"
         assert_eq!(def.unwrap().start.row, 2,
@@ -3634,4 +3712,309 @@ Performs a POST request.
         assert!(get_doc.unwrap().contains("GET request"));
     }
 
+    // ---- Inheritance extraction tests ----
+
+    #[test]
+    fn test_use_parent_single() {
+        let fa = build_fa("
+            package Child;
+            use parent 'Parent';
+            sub child_method { }
+        ");
+        assert_eq!(fa.package_parents.get("Child").unwrap(), &vec!["Parent".to_string()]);
+    }
+
+    #[test]
+    fn test_use_parent_multiple() {
+        let fa = build_fa("
+            package Multi;
+            use parent qw(Foo Bar);
+        ");
+        assert_eq!(fa.package_parents.get("Multi").unwrap(), &vec!["Foo".to_string(), "Bar".to_string()]);
+    }
+
+    #[test]
+    fn test_use_parent_norequire() {
+        let fa = build_fa("
+            package Local;
+            use parent -norequire, 'My::Base';
+        ");
+        assert_eq!(fa.package_parents.get("Local").unwrap(), &vec!["My::Base".to_string()]);
+    }
+
+    #[test]
+    fn test_use_base() {
+        let fa = build_fa("
+            package Old;
+            use base 'Legacy::Base';
+        ");
+        assert_eq!(fa.package_parents.get("Old").unwrap(), &vec!["Legacy::Base".to_string()]);
+    }
+
+    #[test]
+    fn test_isa_assignment() {
+        let fa = build_fa("
+            package Direct;
+            our @ISA = ('Alpha', 'Beta');
+        ");
+        assert_eq!(fa.package_parents.get("Direct").unwrap(), &vec!["Alpha".to_string(), "Beta".to_string()]);
+    }
+
+    #[test]
+    fn test_class_isa_populates_package_parents() {
+        let fa = build_fa("
+            class Child :isa(Parent) { }
+        ");
+        assert_eq!(fa.package_parents.get("Child").unwrap(), &vec!["Parent".to_string()]);
+    }
+
+    // ---- Inheritance method resolution tests ----
+
+    #[test]
+    fn test_inherited_method_completion() {
+        let fa = build_fa("
+            package Animal;
+            sub speak { }
+            sub eat { }
+
+            package Dog;
+            use parent 'Animal';
+            sub fetch { }
+        ");
+        let methods = fa.complete_methods_for_class("Dog", None);
+        let names: Vec<&str> = methods.iter().map(|c| c.label.as_str()).collect();
+        assert!(names.contains(&"fetch"), "own method");
+        assert!(names.contains(&"speak"), "inherited from Animal");
+        assert!(names.contains(&"eat"), "inherited from Animal");
+    }
+
+    #[test]
+    fn test_child_method_overrides_parent() {
+        let fa = build_fa("
+            package Base;
+            sub greet { }
+
+            package Override;
+            use parent 'Base';
+            sub greet { }
+        ");
+        let methods = fa.complete_methods_for_class("Override", None);
+        let greet_count = methods.iter().filter(|c| c.label == "greet").count();
+        assert_eq!(greet_count, 1, "child override should shadow parent");
+    }
+
+    #[test]
+    fn test_find_method_in_parent() {
+        let fa = build_fa("
+            package Base;
+            sub base_method { }
+
+            package Child;
+            use parent 'Base';
+        ");
+        let span = fa.find_method_in_class("Child", "base_method");
+        assert!(span.is_some(), "should find inherited method");
+    }
+
+    #[test]
+    fn test_inherited_return_type() {
+        let fa = build_fa("
+            package Factory;
+            sub create { Factory->new(@_) }
+
+            package SpecialFactory;
+            use parent 'Factory';
+        ");
+        let rt = fa.find_method_return_type("SpecialFactory", "create", None);
+        assert!(rt.is_some(), "should find return type from parent");
+    }
+
+    #[test]
+    fn test_multi_level_inheritance() {
+        let fa = build_fa("
+            package A;
+            sub from_a { }
+
+            package B;
+            use parent 'A';
+            sub from_b { }
+
+            package C;
+            use parent 'B';
+            sub from_c { }
+        ");
+        let methods = fa.complete_methods_for_class("C", None);
+        let names: Vec<&str> = methods.iter().map(|c| c.label.as_str()).collect();
+        assert!(names.contains(&"from_a"));
+        assert!(names.contains(&"from_b"));
+        assert!(names.contains(&"from_c"));
+    }
+
+    #[test]
+    fn test_class_isa_inherits_methods() {
+        let fa = build_fa("
+            class Parent {
+                method greet() { }
+            }
+            class Child :isa(Parent) {
+                method wave() { }
+            }
+        ");
+        let methods = fa.complete_methods_for_class("Child", None);
+        let names: Vec<&str> = methods.iter().map(|c| c.label.as_str()).collect();
+        assert!(names.contains(&"wave"), "own method");
+        assert!(names.contains(&"greet"), "inherited from Parent");
+    }
+
+    // ---- Cross-file inheritance tests ----
+
+    #[test]
+    fn test_cross_file_inherited_method_completion() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use crate::module_index::{ModuleIndex, ModuleExports, ExportedSub};
+
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+
+        // Grandparent: DBI has `connect`
+        idx.insert_cache("DBI", Some(ModuleExports {
+            path: PathBuf::from("/fake/DBI.pm"),
+            export: vec![],
+            export_ok: vec![],
+            subs: {
+                let mut s = HashMap::new();
+                s.insert("connect".into(), ExportedSub {
+                    def_line: 10, params: vec![], is_method: true,
+                    return_type: None, hash_keys: vec![], doc: None,
+                });
+                s
+            },
+            parents: vec![],
+        }));
+
+        // Parent: DBI::db inherits from DBI, has `prepare`
+        idx.insert_cache("DBI::db", Some(ModuleExports {
+            path: PathBuf::from("/fake/DBI/db.pm"),
+            export: vec![],
+            export_ok: vec![],
+            subs: {
+                let mut s = HashMap::new();
+                s.insert("prepare".into(), ExportedSub {
+                    def_line: 5, params: vec![], is_method: true,
+                    return_type: None, hash_keys: vec![], doc: None,
+                });
+                s
+            },
+            parents: vec!["DBI".into()],
+        }));
+
+        // Local code inherits from DBI::db
+        let fa = build_fa("
+            package MyDB;
+            use parent 'DBI::db';
+            sub custom_query { }
+        ");
+
+        let methods = fa.complete_methods_for_class("MyDB", Some(&idx));
+        let names: Vec<&str> = methods.iter().map(|c| c.label.as_str()).collect();
+        assert!(names.contains(&"custom_query"), "own method");
+        assert!(names.contains(&"prepare"), "from DBI::db");
+        assert!(names.contains(&"connect"), "from DBI (grandparent)");
+    }
+
+    #[test]
+    fn test_cross_file_method_override() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use crate::module_index::{ModuleIndex, ModuleExports, ExportedSub};
+
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+
+        // Parent has `process`
+        idx.insert_cache("Base::Worker", Some(ModuleExports {
+            path: PathBuf::from("/fake/Base/Worker.pm"),
+            export: vec![],
+            export_ok: vec![],
+            subs: {
+                let mut s = HashMap::new();
+                s.insert("process".into(), ExportedSub {
+                    def_line: 1, params: vec![], is_method: true,
+                    return_type: None, hash_keys: vec![], doc: None,
+                });
+                s
+            },
+            parents: vec![],
+        }));
+
+        // Local child overrides `process`
+        let fa = build_fa("
+            package MyWorker;
+            use parent 'Base::Worker';
+            sub process { }
+        ");
+
+        let methods = fa.complete_methods_for_class("MyWorker", Some(&idx));
+        let process_count = methods.iter().filter(|c| c.label == "process").count();
+        assert_eq!(process_count, 1, "local override should shadow parent");
+    }
+
+    #[test]
+    fn test_cross_file_return_type_through_inheritance() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use crate::file_analysis::InferredType;
+        use crate::module_index::{ModuleIndex, ModuleExports, ExportedSub};
+
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+
+        idx.insert_cache("Fetcher", Some(ModuleExports {
+            path: PathBuf::from("/fake/Fetcher.pm"),
+            export: vec![],
+            export_ok: vec![],
+            subs: {
+                let mut s = HashMap::new();
+                s.insert("fetch".into(), ExportedSub {
+                    def_line: 1, params: vec![], is_method: true,
+                    return_type: Some(InferredType::HashRef),
+                    hash_keys: vec!["status".into(), "body".into()],
+                    doc: None,
+                });
+                s
+            },
+            parents: vec![],
+        }));
+
+        let fa = build_fa("
+            package MyFetcher;
+            use parent 'Fetcher';
+        ");
+
+        let rt = fa.find_method_return_type("MyFetcher", "fetch", Some(&idx));
+        assert_eq!(rt, Some(InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_parents_cached() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use crate::module_index::{ModuleIndex, ModuleExports};
+
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+
+        idx.insert_cache("Child::Mod", Some(ModuleExports {
+            path: PathBuf::from("/fake/Child/Mod.pm"),
+            export: vec![],
+            export_ok: vec![],
+            subs: HashMap::new(),
+            parents: vec!["Parent::Mod".into(), "Mixin::Role".into()],
+        }));
+
+        let parents = idx.parents_cached("Child::Mod");
+        assert_eq!(parents, vec!["Parent::Mod", "Mixin::Role"]);
+        assert!(idx.parents_cached("Unknown::Mod").is_empty());
+    }
 }

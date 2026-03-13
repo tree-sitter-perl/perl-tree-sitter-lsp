@@ -85,7 +85,7 @@ pub fn find_definition(
     let point = position_to_point(pos);
 
     // Try local definition first
-    if let Some(span) = analysis.find_definition(point, Some(tree), Some(source.as_bytes())) {
+    if let Some(span) = analysis.find_definition(point, Some(tree), Some(source.as_bytes()), Some(module_index)) {
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
             range: span_to_range(span),
@@ -133,6 +133,32 @@ pub fn find_definition(
                     uri: uri.clone(),
                     range: span_to_range(import.span),
                 }));
+            }
+        }
+
+        // Cross-file method goto-def: resolve inherited methods through module index
+        if let RefKind::MethodCall { ref invocant, ref invocant_span } = r.kind {
+            use crate::file_analysis::MethodResolution;
+            let class_name = analysis.resolve_method_invocant_public(
+                invocant, invocant_span, r.scope, point, Some(tree), Some(source.as_bytes()), Some(module_index),
+            );
+            if let Some(ref cn) = class_name {
+                if let Some(MethodResolution::CrossFile { ref class }) = analysis.resolve_method_in_ancestors(cn, &r.target_name, Some(module_index)) {
+                    if let Some(exports) = module_index.get_exports_cached(class) {
+                        if let Some(sub_info) = exports.sub_info(&r.target_name) {
+                            if let Ok(module_uri) = Url::from_file_path(&exports.path) {
+                                let def_range = Range {
+                                    start: Position { line: sub_info.def_line, character: 0 },
+                                    end: Position { line: sub_info.def_line, character: 0 },
+                                };
+                                return Some(GotoDefinitionResponse::Scalar(Location {
+                                    uri: module_uri,
+                                    range: def_range,
+                                }));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -230,7 +256,7 @@ pub fn completion_items(
         CursorContext::Method { ref invocant_type, ref invocant_text } => {
             if let Some(ref ty) = invocant_type {
                 if let Some(cn) = ty.class_name() {
-                    analysis.complete_methods_for_class(cn)
+                    analysis.complete_methods_for_class(cn, Some(module_index))
                 } else {
                     // Ref types get deref snippet completions (handled below)
                     Vec::new()
@@ -343,7 +369,7 @@ pub fn hover_info(
     let point = position_to_point(pos);
 
     // Try local hover first
-    if let Some(markdown) = analysis.hover_info(point, source, Some(tree)) {
+    if let Some(markdown) = analysis.hover_info(point, source, Some(tree), Some(module_index)) {
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -1415,6 +1441,7 @@ mod tests {
                 export: vec![],
                 export_ok: vec!["first".into(), "max".into(), "min".into()],
                 subs: std::collections::HashMap::new(),
+                parents: vec![],
             }),
         );
 
@@ -1464,6 +1491,7 @@ mod tests {
                 export: vec![],
                 export_ok: vec!["first".into(), "max".into(), "min".into()],
                 subs: std::collections::HashMap::new(),
+                parents: vec![],
             }),
         );
         idx.insert_cache(
@@ -1473,6 +1501,7 @@ mod tests {
                 export: vec![],
                 export_ok: vec!["blessed".into(), "reftype".into()],
                 subs: std::collections::HashMap::new(),
+                parents: vec![],
             }),
         );
 

@@ -371,6 +371,7 @@ fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<Modul
     let mut child = std::process::Command::new(exe)
         .arg("--parse-exports")
         .arg(&path)
+        .arg(module_name)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -454,16 +455,28 @@ fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<Modul
         })
         .unwrap_or_default();
 
+    // Extract parents from subprocess JSON
+    let parents: Vec<String> = json
+        .get("parents")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(ModuleExports {
         path,
         export,
         export_ok,
         subs,
+        parents,
     })
 }
 
-/// Entry point for `--parse-exports <path>` subprocess mode.
-pub fn subprocess_main(path: &str) {
+/// Entry point for `--parse-exports <path> [module_name]` subprocess mode.
+pub fn subprocess_main(path: &str, module_name: Option<&str>) {
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(_) => {
@@ -484,9 +497,27 @@ pub fn subprocess_main(path: &str) {
 
     // Run the builder to get full sub metadata for exported functions
     let mut subs_map = serde_json::Map::new();
+    let mut parents: Vec<String> = Vec::new();
     {
         use crate::file_analysis::{SymKind, SymbolDetail};
         let analysis = crate::builder::build(&tree, source.as_bytes());
+
+        // Extract parents for the primary package
+        // Prefer exact match on module_name (e.g. "Foo::Bar"), then stem match, then single-entry or first
+        let expected_pkg = module_name.map(|m| m.replace("::", "::"));
+        if let Some(ref pkg_name) = expected_pkg {
+            if let Some(pkg_parents) = analysis.package_parents.get(pkg_name.as_str()) {
+                parents = pkg_parents.clone();
+            }
+        }
+        if parents.is_empty() {
+            if analysis.package_parents.len() == 1 {
+                if let Some((_pkg, pkg_parents)) = analysis.package_parents.iter().next() {
+                    parents = pkg_parents.clone();
+                }
+            }
+        }
+
         for name in export.iter().chain(export_ok.iter()) {
             let mut sub_info = serde_json::Map::new();
 
@@ -537,6 +568,7 @@ pub fn subprocess_main(path: &str) {
         "export": export,
         "export_ok": export_ok,
         "subs": subs_map,
+        "parents": parents,
     });
     println!("{}", json);
 }
@@ -576,11 +608,22 @@ pub fn resolve_and_parse(
     let source = std::fs::read_to_string(&path).ok()?;
     let (export, export_ok, tree) = extract_exports(parser, &source)?;
 
-    // Extract full sub metadata from builder analysis
+    // Extract full sub metadata and parents from builder analysis
     let mut subs = HashMap::new();
+    let mut parents: Vec<String> = Vec::new();
     {
         use crate::file_analysis::{SymKind, SymbolDetail};
         let analysis = crate::builder::build(&tree, source.as_bytes());
+
+        // Extract parents for the primary package
+        if let Some(pkg_parents) = analysis.package_parents.get(module_name) {
+            parents = pkg_parents.clone();
+        } else if analysis.package_parents.len() == 1 {
+            if let Some((_pkg, pkg_parents)) = analysis.package_parents.iter().next() {
+                parents = pkg_parents.clone();
+            }
+        }
+
         for name in export.iter().chain(export_ok.iter()) {
             let mut def_line = 0u32;
             let mut params = Vec::new();
@@ -617,6 +660,7 @@ pub fn resolve_and_parse(
         export,
         export_ok,
         subs,
+        parents,
     })
 }
 

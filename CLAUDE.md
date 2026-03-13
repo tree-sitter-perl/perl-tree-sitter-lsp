@@ -101,9 +101,9 @@ E2e tests use Neovim headless mode. They exercise the full LSP protocol over std
 - Reverse index: `DashMap<func_name, Vec<module_name>>` for O(1) exporter lookup
 - Export extraction uses tree-sitter in isolated subprocesses (5s timeout + SIGKILL)
 - Subprocess runs the full builder on each module, then queries `FileAnalysis` for per-export metadata
-- `ModuleExports` stores `subs: HashMap<String, ExportedSub>` — unified per-export metadata (def_line, params, is_method, return_type, hash_keys, doc)
+- `ModuleExports` stores `subs: HashMap<String, ExportedSub>` — unified per-export metadata (def_line, params, is_method, return_type, hash_keys, doc) — and `parents: Vec<String>` for inheritance chain
 - cpanfile parsed with tree-sitter queries at startup, deps pre-resolved with progress reporting
-- SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`), schema v6 with `subs` JSON column
+- SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`), schema v8 with `subs` JSON + `parents` JSON columns
 - Async handlers only use `_cached` methods — zero I/O
 - After resolution, diagnostics are refreshed for all open files (clears stale false positives)
 
@@ -118,6 +118,17 @@ Post-build enrichment propagates imported return types and hash keys into the lo
 - Backend wiring: `Arc<ModuleIndex>` on `Backend`, refresh callback uses `OnceLock<Arc<ModuleIndex>>` for deferred init (resolver thread has no tokio context, spawns async work via captured `Handle`)
 - `enrich_analysis()` called from `publish_diagnostics()` and from the refresh callback (which re-enriches all open documents when a module resolves)
 - `InferredType` serialized as simple string tags (`"HashRef"`, `"Object:Foo"`, etc.) for JSON IPC and SQLite TEXT storage — no serde derives
+- `EXTRACT_VERSION` tracks extraction logic version; stale entries loaded from cache but re-resolved with priority
+
+### Inheritance chain resolution
+
+- `FileAnalysis.package_parents: HashMap<String, Vec<String>>` — unified parent map from all inheritance sources
+- Sources: `use parent`, `use base`, `@ISA = (...)`, `class :isa(Parent)` — all feed `package_parents` during builder walk
+- `resolve_method_in_ancestors()` does DFS parent walk (matching Perl's default MRO), depth limit 20
+- `MethodResolution` enum: `Local { class, sym_id }` for same-file, `CrossFile { class }` for module index lookup
+- `complete_methods_for_class` walks ancestors, deduplicates by name (child methods shadow parent)
+- Cross-file: `ModuleExports.parents` stored in SQLite `parents` TEXT column (JSON array) and subprocess JSON output
+- `ModuleIndex.parents_cached(module_name)` returns parent list for cross-file inheritance walking
 
 ## LSP Capabilities
 

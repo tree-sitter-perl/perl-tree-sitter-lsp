@@ -14,12 +14,12 @@ use rusqlite::{params, Connection};
 use crate::file_analysis::{inferred_type_from_tag, inferred_type_to_tag};
 use crate::module_index::{ExportedParam, ExportedSub, ModuleExports};
 
-const SCHEMA_VERSION: &str = "7";
+const SCHEMA_VERSION: &str = "8";
 
 /// Bumped when extraction logic changes (new fields, better parsing).
 /// Unlike SCHEMA_VERSION, this doesn't drop the table — stale entries
 /// are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 1;
+pub const EXTRACT_VERSION: i64 = 2;
 
 pub fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
@@ -97,6 +97,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             export_ok    TEXT NOT NULL,
             source       TEXT NOT NULL DEFAULT 'import',
             subs         TEXT NOT NULL DEFAULT '{}',
+            parents      TEXT NOT NULL DEFAULT '[]',
             extract_version INTEGER NOT NULL DEFAULT 0
         );",
     )?;
@@ -123,6 +124,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                     export_ok    TEXT NOT NULL,
                     source       TEXT NOT NULL DEFAULT 'import',
                     subs         TEXT NOT NULL DEFAULT '{}',
+                    parents      TEXT NOT NULL DEFAULT '[]',
                     extract_version INTEGER NOT NULL DEFAULT 0
                 );",
             )?;
@@ -190,7 +192,7 @@ pub fn warm_cache(
     cache: &DashMap<String, Option<ModuleExports>>,
 ) -> (usize, Vec<String>) {
     let mut stmt = match conn.prepare(
-        "SELECT module_name, path, mtime_secs, file_size, export, export_ok, subs, extract_version FROM modules",
+        "SELECT module_name, path, mtime_secs, file_size, export, export_ok, subs, extract_version, parents FROM modules",
     ) {
         Ok(s) => s,
         Err(_) => return (0, Vec::new()),
@@ -206,6 +208,7 @@ pub fn warm_cache(
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
             row.get::<_, i64>(7)?,
+            row.get::<_, String>(8)?,
         ))
     }) {
         Ok(r) => r,
@@ -215,7 +218,7 @@ pub fn warm_cache(
     let mut count = 0usize;
     let mut stale_names = Vec::new();
     for row in rows.flatten() {
-        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json, subs_json, row_extract_version) = row;
+        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json, subs_json, row_extract_version, parents_json) = row;
 
         // Negative sentinel
         if path_str.is_empty() {
@@ -240,6 +243,7 @@ pub fn warm_cache(
 
         // Deserialize subs: JSON map of name → { def_line, params, is_method, return_type, hash_keys }
         let subs = deserialize_subs_json(&subs_json);
+        let parents: Vec<String> = serde_json::from_str(&parents_json).unwrap_or_default();
 
         if export.is_empty() && export_ok.is_empty() {
             cache.insert(module_name, None);
@@ -255,6 +259,7 @@ pub fn warm_cache(
                     export,
                     export_ok,
                     subs,
+                    parents,
                 }),
             );
         }
@@ -323,12 +328,13 @@ pub fn save_to_db(
     result: &Option<ModuleExports>,
     source: &str,
 ) {
-    let (path_str, mtime, size, export_json, export_ok_json, subs_json) = match result {
+    let (path_str, mtime, size, export_json, export_ok_json, subs_json, parents_json) = match result {
         Some(exports) => {
             let (mtime, size) = mtime_as_secs(&exports.path).unwrap_or((0, 0));
             let ej = serde_json::to_string(&exports.export).unwrap_or_default();
             let eoj = serde_json::to_string(&exports.export_ok).unwrap_or_default();
             let sj = serialize_subs_json(&exports.subs);
+            let pj = serde_json::to_string(&exports.parents).unwrap_or_else(|_| "[]".to_string());
             (
                 exports.path.to_string_lossy().to_string(),
                 mtime,
@@ -336,6 +342,7 @@ pub fn save_to_db(
                 ej,
                 eoj,
                 sj,
+                pj,
             )
         }
         None => (
@@ -345,13 +352,14 @@ pub fn save_to_db(
             "[]".to_string(),
             "[]".to_string(),
             "{}".to_string(),
+            "[]".to_string(),
         ),
     };
 
     let r = conn.execute(
-        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source, subs, extract_version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![module_name, path_str, mtime, size, export_json, export_ok_json, source, subs_json, EXTRACT_VERSION],
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source, subs, parents, extract_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![module_name, path_str, mtime, size, export_json, export_ok_json, source, subs_json, parents_json, EXTRACT_VERSION],
     );
     if let Err(e) = r {
         log::warn!("Failed to save module cache for '{}': {}", module_name, e);
@@ -416,6 +424,7 @@ mod tests {
             export: vec!["foo".into(), "bar".into()],
             export_ok: vec!["baz".into()],
             subs: HashMap::new(),
+            parents: vec![],
         });
         save_to_db(&conn, "TestModule", &exports, "import");
 
@@ -459,6 +468,7 @@ mod tests {
             export: vec!["old".into()],
             export_ok: vec![],
             subs: HashMap::new(),
+            parents: vec![],
         });
         save_to_db(&conn, "StaleModule", &exports, "import");
 
@@ -555,6 +565,7 @@ mod tests {
             export: vec!["get_data".into()],
             export_ok: vec![],
             subs,
+            parents: vec![],
         });
         save_to_db(&conn, "MigratedModule", &exports, "import");
 
@@ -588,6 +599,7 @@ mod tests {
             export: vec!["foo".into()],
             export_ok: vec![],
             subs: HashMap::new(),
+            parents: vec![],
         });
         save_to_db(&conn, "SourceTest", &exports, "cpanfile");
 
@@ -669,6 +681,7 @@ mod tests {
             export: vec!["get_config".into()],
             export_ok: vec!["make_items".into(), "new_obj".into()],
             subs,
+            parents: vec![],
         });
         save_to_db(&conn, "SubsTest", &exports, "import");
 
@@ -735,6 +748,7 @@ mod tests {
             export: vec!["foo".into()],
             export_ok: vec![],
             subs: HashMap::new(),
+            parents: vec![],
         });
         save_to_db(&conn, "FreshExtract", &exports, "import");
 
@@ -758,6 +772,7 @@ mod tests {
             export: vec!["foo".into()],
             export_ok: vec![],
             subs: HashMap::new(),
+            parents: vec![],
         });
         save_to_db(&conn, "VersionedSave", &exports, "import");
 

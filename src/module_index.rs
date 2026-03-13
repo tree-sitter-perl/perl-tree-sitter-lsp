@@ -56,6 +56,8 @@ pub struct ModuleExports {
     pub export_ok: Vec<String>,
     /// Per-function metadata for exported subs.
     pub subs: HashMap<String, ExportedSub>,
+    /// Parent classes for the primary package.
+    pub parents: Vec<String>,
 }
 
 impl ModuleExports {
@@ -197,6 +199,14 @@ impl ModuleIndex {
         self.cache
             .get(module_name)
             .and_then(|entry| entry.as_ref().map(|e| e.path.clone()))
+    }
+
+    /// Return cached parent classes for a module.
+    pub fn parents_cached(&self, module_name: &str) -> Vec<String> {
+        self.cache
+            .get(module_name)
+            .and_then(|entry| entry.as_ref().map(|e| e.parents.clone()))
+            .unwrap_or_default()
     }
 
     /// Iterate all cached module exports. Callback receives (module_name, exports).
@@ -342,8 +352,8 @@ impl ModuleIndex {
 }
 
 /// Entry point for `--parse-exports <path>` subprocess mode.
-pub fn subprocess_main(path: &str) {
-    module_resolver::subprocess_main(path);
+pub fn subprocess_main(path: &str, module_name: Option<&str>) {
+    module_resolver::subprocess_main(path, module_name);
 }
 
 #[cfg(test)]
@@ -425,6 +435,7 @@ mod tests {
                 export: vec!["alpha".into()],
                 export_ok: vec!["beta".into()],
                 subs: HashMap::new(),
+                parents: vec![],
             }),
         );
         idx.insert_cache(
@@ -434,6 +445,7 @@ mod tests {
                 export: vec![],
                 export_ok: vec!["beta".into(), "gamma".into()],
                 subs: HashMap::new(),
+                parents: vec![],
             }),
         );
 
@@ -452,6 +464,7 @@ mod tests {
                 export: vec!["foo".into()],
                 export_ok: vec!["bar".into()],
                 subs: HashMap::new(),
+                parents: vec![],
             }),
         );
 
@@ -492,6 +505,7 @@ mod tests {
                 export: vec![],
                 export_ok: vec!["get_config".into(), "make_obj".into()],
                 subs,
+                parents: vec![],
             }),
         );
 
