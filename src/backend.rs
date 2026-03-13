@@ -204,6 +204,12 @@ impl LanguageServer for Backend {
             for imp in &doc.analysis.imports {
                 self.module_index.request_resolve(&imp.module_name);
             }
+            // Enqueue parent classes for resolution (inheritance chain).
+            for parents in doc.analysis.package_parents.values() {
+                for parent in parents {
+                    self.module_index.request_resolve(parent);
+                }
+            }
             self.documents.insert(uri.clone(), doc);
         }
         self.publish_diagnostics(&uri).await;
@@ -217,6 +223,12 @@ impl LanguageServer for Backend {
                 // Resolve any new imports that appeared during editing.
                 for imp in &doc.analysis.imports {
                     self.module_index.request_resolve(&imp.module_name);
+                }
+                // Resolve parent classes for inheritance.
+                for parents in doc.analysis.package_parents.values() {
+                    for parent in parents {
+                        self.module_index.request_resolve(parent);
+                    }
                 }
             }
         }

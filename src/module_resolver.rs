@@ -419,10 +419,6 @@ fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<Modul
         })
         .unwrap_or_default();
 
-    if export.is_empty() && export_ok.is_empty() {
-        return None;
-    }
-
     // Parse subs metadata from JSON
     let subs: HashMap<String, ExportedSub> = json
         .get("subs")
@@ -562,6 +558,42 @@ pub fn subprocess_main(path: &str, module_name: Option<&str>) {
                 subs_map.insert(name.clone(), sub_info.into());
             }
         }
+
+        // Also include all subs not in @EXPORT/@EXPORT_OK — needed for inheritance.
+        for sym in &analysis.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+            if subs_map.contains_key(&sym.name) { continue; }
+            let is_method = matches!(sym.detail, SymbolDetail::Sub { is_method: true, .. })
+                || sym.kind == SymKind::Method;
+            let mut sub_info = serde_json::Map::new();
+            sub_info.insert("def_line".into(), sym.span.start.row.into());
+            sub_info.insert("is_method".into(), is_method.into());
+            if let SymbolDetail::Sub { ref params, ref doc, .. } = sym.detail {
+                let params_json: Vec<serde_json::Value> = params.iter()
+                    .map(|p| serde_json::json!({
+                        "name": p.name,
+                        "is_slurpy": p.is_slurpy,
+                    }))
+                    .collect();
+                sub_info.insert("params".into(), params_json.into());
+                if let Some(ref d) = doc {
+                    sub_info.insert("doc".into(), serde_json::Value::String(d.clone()));
+                }
+            }
+            if let Some(ty) = analysis.sub_return_type(&sym.name) {
+                sub_info.insert("return_type".into(),
+                    serde_json::Value::String(inferred_type_to_tag(ty)));
+            }
+            let owner = crate::file_analysis::HashKeyOwner::Sub(sym.name.clone());
+            let keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            if !keys.is_empty() {
+                sub_info.insert("hash_keys".into(), serde_json::json!(keys));
+            }
+            subs_map.insert(sym.name.clone(), sub_info.into());
+        }
     }
 
     let json = serde_json::json!({
@@ -652,6 +684,32 @@ pub fn resolve_and_parse(
                 .collect();
 
             subs.insert(name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc });
+        }
+
+        // Also include methods not in @EXPORT/@EXPORT_OK — needed for inheritance.
+        for sym in &analysis.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+            if subs.contains_key(&sym.name) { continue; }
+            let is_method_flag = matches!(sym.detail, SymbolDetail::Sub { is_method: true, .. })
+                || sym.kind == SymKind::Method;
+            let def_line = sym.span.start.row as u32;
+            let mut params = Vec::new();
+            let mut doc = None;
+            if let SymbolDetail::Sub { params: ref p, doc: ref d, .. } = sym.detail {
+                params = p.iter()
+                    .map(|pi| ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy })
+                    .collect();
+                doc = d.clone();
+            }
+            let return_type = analysis.sub_return_type(&sym.name).cloned();
+            let owner = crate::file_analysis::HashKeyOwner::Sub(sym.name.clone());
+            let hash_keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            subs.insert(sym.name.clone(), ExportedSub {
+                def_line, params, is_method: is_method_flag, return_type, hash_keys, doc,
+            });
         }
     }
 
@@ -745,9 +803,6 @@ fn extract_exports(parser: &mut Parser, source: &str) -> Option<(Vec<String>, Ve
         }
     }
 
-    if export.is_empty() && export_ok.is_empty() {
-        return None;
-    }
     Some((export, export_ok, tree))
 }
 

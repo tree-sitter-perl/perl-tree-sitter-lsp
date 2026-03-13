@@ -31,6 +31,17 @@ function M.def_line(buf, line, col)
   return nil
 end
 
+--- Get definition result as { uri, line } or nil.
+function M.def_location(buf, line, col)
+  local result = M.request(buf, "textDocument/definition", M.pos_params(buf, line, col))
+  if not result then return nil end
+  local loc = vim.islist(result) and result[1] or result
+  if loc and loc.range then
+    return { uri = loc.uri or loc.targetUri, line = loc.range.start.line }
+  end
+  return nil
+end
+
 --- Get completion labels as a plain list of strings.
 function M.completion_labels(buf, line, col)
   local result = M.request(buf, "textDocument/completion", M.pos_params(buf, line, col))

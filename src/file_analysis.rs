@@ -1115,8 +1115,16 @@ impl FileAnalysis {
 
                     if let Some(ref cn) = class_name {
                         // Find method in the resolved class (walks inheritance)
-                        if let Some(span) = self.find_method_in_class_with_index(cn, &r.target_name, module_index) {
-                            return Some(span);
+                        match self.resolve_method_in_ancestors(cn, &r.target_name, module_index) {
+                            Some(MethodResolution::Local { sym_id, .. }) => {
+                                return Some(self.symbol(sym_id).selection_span);
+                            }
+                            Some(MethodResolution::CrossFile { .. }) => {
+                                // Cross-file method — return None so the LSP adapter
+                                // can resolve it via ModuleIndex with the correct URI.
+                                return None;
+                            }
+                            None => {}
                         }
                         // Method not found (e.g. auto-generated "new") → go to class def
                         if let Some(span) = self.find_package_or_class(cn) {
