@@ -238,7 +238,7 @@ fn resolve_node_type(node: Node, source: &[u8], analysis: &FileAnalysis, point: 
             let text = node.utf8_text(source).ok()?;
             Some(InferredType::ClassName(text.to_string()))
         }
-        _ => analysis.resolve_expression_type(node, source),
+        _ => analysis.resolve_expression_type(node, source, None),
     }
 }
 

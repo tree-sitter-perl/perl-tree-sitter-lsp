@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Point;
 
+use crate::module_index::ModuleIndex;
+
 // ---- Shared types (formerly in analysis.rs) ----
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -378,6 +380,10 @@ pub struct FileAnalysis {
     pub imports: Vec<Import>,
     pub call_bindings: Vec<CallBinding>,
 
+    /// Parent classes for each package in this file.
+    /// Populated by the builder from use parent/base, @ISA, and class :isa.
+    pub package_parents: HashMap<String, Vec<String>>,
+
     /// Return types from imported functions (populated after build from module index).
     pub imported_return_types: HashMap<String, InferredType>,
 
@@ -403,6 +409,7 @@ impl FileAnalysis {
         fold_ranges: Vec<FoldRange>,
         imports: Vec<Import>,
         call_bindings: Vec<CallBinding>,
+        package_parents: HashMap<String, Vec<String>>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -412,6 +419,7 @@ impl FileAnalysis {
             fold_ranges,
             imports,
             call_bindings,
+            package_parents,
             imported_return_types: HashMap::new(),
             base_type_constraint_count: 0,
             base_symbol_count: 0,
@@ -684,7 +692,12 @@ impl FileAnalysis {
     /// - `hash_element_expression` → resolve base (for chaining)
     ///
     /// Used at query time (completion, goto-def, hover) — not during the build walk.
-    pub fn resolve_expression_type(&self, node: tree_sitter::Node, source: &[u8]) -> Option<InferredType> {
+    pub fn resolve_expression_type(
+        &self,
+        node: tree_sitter::Node,
+        source: &[u8],
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<InferredType> {
         let point = node.start_position();
         match node.kind() {
             "scalar" => {
@@ -698,7 +711,7 @@ impl FileAnalysis {
             }
             "method_call_expression" => {
                 let invocant_node = node.child_by_field_name("invocant")?;
-                let invocant_type = self.resolve_expression_type(invocant_node, source)?;
+                let invocant_type = self.resolve_expression_type(invocant_node, source, module_index)?;
                 let class_name = invocant_type.class_name()?;
                 let method_name = node.child_by_field_name("method")?;
                 let method_text = method_name.utf8_text(source).ok()?;
@@ -706,8 +719,7 @@ impl FileAnalysis {
                 if method_text == "new" {
                     return Some(InferredType::ClassName(class_name.to_string()));
                 }
-                // Find method's return type
-                self.find_method_return_type(class_name, method_text)
+                self.find_method_return_type(class_name, method_text, module_index)
             }
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 let func_node = node.child_by_field_name("function")?;
@@ -722,7 +734,7 @@ impl FileAnalysis {
             "hash_element_expression" => {
                 // For chaining: resolve the base expression
                 let base = node.named_child(0)?;
-                self.resolve_expression_type(base, source)
+                self.resolve_expression_type(base, source, module_index)
             }
             _ => None,
         }
@@ -739,12 +751,13 @@ impl FileAnalysis {
         tree: &tree_sitter::Tree,
         source: &[u8],
         point: Point,
+        module_index: Option<&ModuleIndex>,
     ) -> Option<HashKeyOwner> {
         let hash_elem = tree.root_node()
             .descendant_for_point_range(point, point)
             .and_then(|n| find_ancestor(n, "hash_element_expression"))?;
         let base = hash_elem.named_child(0)?;
-        let ty = self.resolve_expression_type(base, source)?;
+        let ty = self.resolve_expression_type(base, source, module_index)?;
 
         // Extract the function/method name for Sub owner
         let sub_name = match base.kind() {
@@ -799,18 +812,29 @@ impl FileAnalysis {
         }
     }
 
-    /// Find a method's return type within a class/package.
-    fn find_method_return_type(&self, class_name: &str, method_name: &str) -> Option<InferredType> {
-        for sym in &self.symbols {
-            if sym.name == method_name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                if self.symbol_in_class(sym.id, class_name) {
-                    if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
-                        return return_type.clone();
-                    }
+    /// Find a method's return type within a class/package, walking inheritance.
+    pub(crate) fn find_method_return_type(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<InferredType> {
+        match self.resolve_method_in_ancestors(class_name, method_name, module_index) {
+            Some(MethodResolution::Local { sym_id, .. }) => {
+                if let SymbolDetail::Sub { ref return_type, .. } = self.symbol(sym_id).detail {
+                    return_type.clone()
+                } else {
+                    None
                 }
             }
+            Some(MethodResolution::CrossFile { ref class }) => {
+                module_index.and_then(|idx| {
+                    idx.get_exports_cached(class)
+                        .and_then(|e| e.subs.get(method_name)?.return_type.clone())
+                })
+            }
+            None => None,
         }
-        None
     }
 
     /// Find a `:param` field in a class by its bare name (without sigil).
@@ -836,17 +860,37 @@ impl FileAnalysis {
     }
 
     /// Format a method completion detail string, appending return type if known.
-    fn method_detail(&self, class_name: &str, method_name: &str) -> String {
-        if let Some(ref rt) = self.find_method_return_type(class_name, method_name) {
-            format!("{} → {}", class_name, format_inferred_type(rt))
+    fn method_detail(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        defining_class: Option<&str>,
+        module_index: Option<&ModuleIndex>,
+    ) -> String {
+        let base = if let Some(dc) = defining_class {
+            if dc != class_name {
+                format!("{} (from {})", class_name, dc)
+            } else {
+                class_name.to_string()
+            }
         } else {
             class_name.to_string()
+        };
+        if let Some(ref rt) = self.find_method_return_type(class_name, method_name, module_index) {
+            format!("{} → {}", base, format_inferred_type(rt))
+        } else {
+            base
         }
     }
 
-    /// Complete methods for a known class name (no invocant resolution needed).
-    pub fn complete_methods_for_class(&self, class_name: &str) -> Vec<CompletionCandidate> {
+    /// Complete methods for a known class name, walking the inheritance chain.
+    pub fn complete_methods_for_class(
+        &self,
+        class_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Vec<CompletionCandidate> {
         let mut candidates = Vec::new();
+        let mut seen_names: HashSet<String> = HashSet::new();
 
         // Check for class definition → implicit new
         for sym in &self.symbols {
@@ -854,23 +898,46 @@ impl FileAnalysis {
                 candidates.push(CompletionCandidate {
                     label: "new".to_string(),
                     kind: SymKind::Method,
-                    detail: Some(self.method_detail(class_name, "new")),
+                    detail: Some(self.method_detail(class_name, "new", None, module_index)),
                     insert_text: None,
                     sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
                 });
+                seen_names.insert("new".to_string());
                 break;
             }
         }
 
-        // Find all subs/methods in this class/package
+        // Collect methods from this class and all ancestors
+        self.collect_ancestor_methods(class_name, class_name, module_index, &mut candidates, &mut seen_names, 0);
+
+        candidates
+    }
+
+    /// Recursively collect methods from a class and its ancestors, deduping by name.
+    fn collect_ancestor_methods(
+        &self,
+        original_class: &str,
+        class_name: &str,
+        module_index: Option<&ModuleIndex>,
+        candidates: &mut Vec<CompletionCandidate>,
+        seen_names: &mut HashSet<String>,
+        depth: usize,
+    ) {
+        if depth > 20 {
+            return;
+        }
+
+        // Local methods in this class
         for sym in &self.symbols {
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                if self.symbol_in_class(sym.id, class_name) {
+                if self.symbol_in_class(sym.id, class_name) && !seen_names.contains(&sym.name) {
+                    seen_names.insert(sym.name.clone());
+                    let defining = if class_name != original_class { Some(class_name) } else { None };
                     candidates.push(CompletionCandidate {
                         label: sym.name.clone(),
                         kind: sym.kind,
-                        detail: Some(self.method_detail(class_name, &sym.name)),
+                        detail: Some(self.method_detail(original_class, &sym.name, defining, module_index)),
                         insert_text: None,
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
@@ -879,7 +946,48 @@ impl FileAnalysis {
             }
         }
 
-        candidates
+        // Walk local parents
+        if let Some(parents) = self.package_parents.get(class_name) {
+            for parent in parents {
+                self.collect_ancestor_methods(
+                    original_class, parent, module_index, candidates, seen_names, depth + 1,
+                );
+            }
+        }
+
+        // Walk cross-file parents
+        if let Some(idx) = module_index {
+            // Methods from the cross-file module itself
+            if let Some(exports) = idx.get_exports_cached(class_name) {
+                for (name, sub_info) in &exports.subs {
+                    if !seen_names.contains(name) {
+                        seen_names.insert(name.clone());
+                        let kind = if sub_info.is_method { SymKind::Method } else { SymKind::Sub };
+                        let defining = if class_name != original_class { Some(class_name) } else { None };
+                        let detail = self.method_detail(original_class, name, defining, module_index);
+                        candidates.push(CompletionCandidate {
+                            label: name.clone(),
+                            kind,
+                            detail: Some(detail),
+                            insert_text: None,
+                            sort_priority: PRIORITY_LOCAL,
+                            additional_edits: vec![],
+                        });
+                    }
+                }
+            }
+
+            // Cross-file parents
+            let cross_parents = idx.parents_cached(class_name);
+            for parent in &cross_parents {
+                // Don't re-collect if it's a local package (already handled above)
+                if !self.package_parents.contains_key(parent.as_str()) {
+                    self.collect_ancestor_methods(
+                        original_class, parent, module_index, candidates, seen_names, depth + 1,
+                    );
+                }
+            }
+        }
     }
 
     /// Get the enclosing package name at a point.
@@ -967,7 +1075,7 @@ impl FileAnalysis {
     // ---- High-level queries ----
 
     /// Go-to-definition: resolve the symbol at cursor to its definition span.
-    pub fn find_definition(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Option<Span> {
+    pub fn find_definition(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>, module_index: Option<&ModuleIndex>) -> Option<Span> {
         // 1. Check if cursor is on a ref
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
@@ -985,7 +1093,7 @@ impl FileAnalysis {
                     }
                 }
                 RefKind::MethodCall { ref invocant, ref invocant_span, .. } => {
-                    let class_name = self.resolve_method_invocant(invocant, invocant_span, r.scope, point, tree, source_bytes);
+                    let class_name = self.resolve_method_invocant(invocant, invocant_span, r.scope, point, tree, source_bytes, module_index);
 
                     // Check if cursor is on a named arg key in the call args,
                     // not on the method name itself. Resolve to hash key def or :param field.
@@ -1006,9 +1114,17 @@ impl FileAnalysis {
                     }
 
                     if let Some(ref cn) = class_name {
-                        // Find method in the resolved class
-                        if let Some(span) = self.find_method_in_class(cn, &r.target_name) {
-                            return Some(span);
+                        // Find method in the resolved class (walks inheritance)
+                        match self.resolve_method_in_ancestors(cn, &r.target_name, module_index) {
+                            Some(MethodResolution::Local { sym_id, .. }) => {
+                                return Some(self.symbol(sym_id).selection_span);
+                            }
+                            Some(MethodResolution::CrossFile { .. }) => {
+                                // Cross-file method — return None so the LSP adapter
+                                // can resolve it via ModuleIndex with the correct URI.
+                                return None;
+                            }
+                            None => {}
                         }
                         // Method not found (e.g. auto-generated "new") → go to class def
                         if let Some(span) = self.find_package_or_class(cn) {
@@ -1031,7 +1147,7 @@ impl FileAnalysis {
                     let resolved_owner = owner.clone().or_else(|| {
                         let tree = tree?;
                         let source = source_bytes?;
-                        self.resolve_hash_owner_from_tree(tree, source, r.span.start)
+                        self.resolve_hash_owner_from_tree(tree, source, r.span.start, module_index)
                     });
                     if let Some(ref owner) = resolved_owner {
                         for def in self.hash_key_defs_for_owner(owner) {
@@ -1058,7 +1174,7 @@ impl FileAnalysis {
 
     /// Find all references to the symbol at cursor.
     pub fn find_references(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Vec<Span> {
-        if let Some((target_id, include_decl)) = self.resolve_target_at(point, tree, source_bytes) {
+        if let Some((target_id, include_decl)) = self.resolve_target_at(point, tree, source_bytes, None) {
             let mut results = self.collect_refs_for_target(target_id, include_decl, tree, source_bytes);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
             results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
@@ -1070,7 +1186,7 @@ impl FileAnalysis {
 
     /// Document highlights: like references but with read/write annotation.
     pub fn find_highlights(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Vec<(Span, AccessKind)> {
-        if let Some((target_id, _)) = self.resolve_target_at(point, tree, source_bytes) {
+        if let Some((target_id, _)) = self.resolve_target_at(point, tree, source_bytes, None) {
             let mut results = self.collect_refs_for_target(target_id, true, tree, source_bytes);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
             results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
@@ -1128,7 +1244,7 @@ impl FileAnalysis {
                         Some(ref ro) => ro == owner,
                         None => {
                             if let (Some(t), Some(s)) = (tree, source_bytes) {
-                                self.resolve_hash_owner_from_tree(t, s, r.span.start)
+                                self.resolve_hash_owner_from_tree(t, s, r.span.start, None)
                                     .as_ref()
                                     .map_or(false, |resolved| resolved == owner)
                             } else {
@@ -1147,7 +1263,7 @@ impl FileAnalysis {
     }
 
     /// Hover info: return display text for the symbol at cursor.
-    pub fn hover_info(&self, point: Point, source: &str, tree: Option<&tree_sitter::Tree>) -> Option<String> {
+    pub fn hover_info(&self, point: Point, source: &str, tree: Option<&tree_sitter::Tree>, module_index: Option<&ModuleIndex>) -> Option<String> {
         // Check refs first
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
@@ -1171,16 +1287,47 @@ impl FileAnalysis {
                 }
                 RefKind::MethodCall { ref invocant, ref invocant_span, .. } => {
                     let class_name = self.resolve_method_invocant(
-                        invocant, invocant_span, r.scope, point, tree, Some(source.as_bytes()),
+                        invocant, invocant_span, r.scope, point, tree, Some(source.as_bytes()), module_index,
                     );
                     if let Some(ref cn) = class_name {
-                        if let Some(span) = self.find_method_in_class(cn, &r.target_name) {
-                            let line = source_line_at(source, span.start.row);
-                            let mut text = format!("```perl\n{}\n```\n\n*class {}*", line.trim(), cn);
-                            if let Some(ref rt) = self.find_method_return_type(cn, &r.target_name) {
-                                text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+                        match self.resolve_method_in_ancestors(cn, &r.target_name, module_index) {
+                            Some(MethodResolution::Local { sym_id, class: ref defining_class, .. }) => {
+                                let sym = self.symbol(sym_id);
+                                let line = source_line_at(source, sym.selection_span.start.row);
+                                let class_label = if defining_class != cn {
+                                    format!("{} (from {})", cn, defining_class)
+                                } else {
+                                    cn.to_string()
+                                };
+                                let mut text = format!("```perl\n{}\n```\n\n*class {}*", line.trim(), class_label);
+                                if let Some(ref rt) = self.find_method_return_type(cn, &r.target_name, module_index) {
+                                    text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+                                }
+                                return Some(text);
                             }
-                            return Some(text);
+                            Some(MethodResolution::CrossFile { ref class }) => {
+                                if let Some(idx) = module_index {
+                                    if let Some(exports) = idx.get_exports_cached(class) {
+                                        if let Some(sub_info) = exports.sub_info(&r.target_name) {
+                                            let class_label = if class != cn {
+                                                format!("{} (from {})", cn, class)
+                                            } else {
+                                                cn.to_string()
+                                            };
+                                            let sig = format_cross_file_signature(&r.target_name, sub_info);
+                                            let mut text = format!("```perl\n{}\n```\n\n*class {}*", sig, class_label);
+                                            if let Some(ref rt) = sub_info.return_type {
+                                                text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+                                            }
+                                            if let Some(ref doc) = sub_info.doc {
+                                                text.push_str(&format!("\n\n{}", doc));
+                                            }
+                                            return Some(text);
+                                        }
+                                    }
+                                }
+                            }
+                            None => {}
                         }
                     }
                     // Fallback
@@ -1265,7 +1412,7 @@ impl FileAnalysis {
     // ---- Internal resolution helpers ----
 
     /// Find the target symbol for the thing at cursor. Returns (SymbolId, include_decl_in_refs).
-    fn resolve_target_at(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Option<(SymbolId, bool)> {
+    fn resolve_target_at(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>, module_index: Option<&ModuleIndex>) -> Option<(SymbolId, bool)> {
         // Check refs first
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
@@ -1287,17 +1434,18 @@ impl FileAnalysis {
                 }
                 RefKind::MethodCall { ref invocant, ref invocant_span } => {
                     let class_name = self.resolve_method_invocant(
-                        invocant, invocant_span, r.scope, point, tree, source_bytes,
+                        invocant, invocant_span, r.scope, point, tree, source_bytes, module_index,
                     );
-                    // Try class-specific method first
+                    // Try inheritance-aware resolution first
                     if let Some(ref cn) = class_name {
-                        for &sid in self.symbols_named(&r.target_name) {
-                            let sym = self.symbol(sid);
-                            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                                if self.symbol_in_class(sid, cn) {
-                                    return Some((sid, true));
-                                }
+                        match self.resolve_method_in_ancestors(cn, &r.target_name, module_index) {
+                            Some(MethodResolution::Local { sym_id, .. }) => {
+                                return Some((sym_id, true));
                             }
+                            Some(MethodResolution::CrossFile { .. }) => {
+                                // Cross-file: no local SymbolId, fall through to name match
+                            }
+                            None => {}
                         }
                     }
                     // Fallback: any method with that name
@@ -1318,7 +1466,7 @@ impl FileAnalysis {
                     let resolved_owner = owner.clone().or_else(|| {
                         let tree = tree?;
                         let source = source_bytes?;
-                        self.resolve_hash_owner_from_tree(tree, source, r.span.start)
+                        self.resolve_hash_owner_from_tree(tree, source, r.span.start, module_index)
                     });
                     if let Some(ref owner) = resolved_owner {
                         for def in self.hash_key_defs_for_owner(owner) {
@@ -1339,6 +1487,20 @@ impl FileAnalysis {
         None
     }
 
+    /// Resolve a method call's invocant to a class name (public API for cross-file goto-def).
+    pub fn resolve_method_invocant_public(
+        &self,
+        invocant: &str,
+        invocant_span: &Option<Span>,
+        scope: ScopeId,
+        point: Point,
+        tree: Option<&tree_sitter::Tree>,
+        source_bytes: Option<&[u8]>,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<String> {
+        self.resolve_method_invocant(invocant, invocant_span, scope, point, tree, source_bytes, module_index)
+    }
+
     /// Resolve a method call's invocant to a class name, using tree-based resolution
     /// for complex expressions when available.
     fn resolve_method_invocant(
@@ -1349,13 +1511,14 @@ impl FileAnalysis {
         point: Point,
         tree: Option<&tree_sitter::Tree>,
         source_bytes: Option<&[u8]>,
+        module_index: Option<&ModuleIndex>,
     ) -> Option<String> {
         // Try tree-based resolution for complex invocants, fall through on failure
         if let (Some(span), Some(tree), Some(src)) = (invocant_span, tree, source_bytes) {
             if let Some(node) = tree.root_node()
                 .descendant_for_point_range(span.start, span.end)
             {
-                if let Some(ty) = self.resolve_expression_type(node, src) {
+                if let Some(ty) = self.resolve_expression_type(node, src, module_index) {
                     if let Some(cn) = ty.class_name() {
                         return Some(cn.to_string());
                     }
@@ -1393,13 +1556,134 @@ impl FileAnalysis {
     }
 
     /// Find a method definition within a class/package.
-    fn find_method_in_class(&self, class_name: &str, method_name: &str) -> Option<Span> {
+    #[cfg(test)]
+    pub(crate) fn find_method_in_class(&self, class_name: &str, method_name: &str) -> Option<Span> {
+        self.find_method_in_class_with_index(class_name, method_name, None)
+    }
+
+    /// Find a method definition, walking the inheritance chain if needed.
+    #[cfg(test)]
+    fn find_method_in_class_with_index(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<Span> {
+        match self.resolve_method_in_ancestors(class_name, method_name, module_index) {
+            Some(MethodResolution::Local { sym_id, .. }) => {
+                Some(self.symbol(sym_id).selection_span)
+            }
+            Some(MethodResolution::CrossFile { .. }) => {
+                // Cross-file method found but no local span to return
+                // Caller should handle cross-file resolution via ModuleIndex
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Walk the inheritance chain to find a method (DFS, matches Perl's default MRO).
+    pub fn resolve_method_in_ancestors(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<MethodResolution> {
+        self.resolve_method_in_ancestors_inner(class_name, method_name, module_index, 0)
+    }
+
+    fn resolve_method_in_ancestors_inner(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+        depth: usize,
+    ) -> Option<MethodResolution> {
+        if depth > 20 {
+            return None; // safety limit
+        }
+
+        // Check class_name directly (local symbols)
         for &sid in self.symbols_named(method_name) {
             let sym = self.symbol(sid);
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                 if self.symbol_in_class(sid, class_name) {
-                    return Some(sym.selection_span);
+                    return Some(MethodResolution::Local {
+                        class: class_name.to_string(),
+                        sym_id: sid,
+                    });
                 }
+            }
+        }
+
+        // Check local parents from package_parents
+        if let Some(parents) = self.package_parents.get(class_name) {
+            for parent in parents {
+                if let Some(res) = self.resolve_method_in_ancestors_inner(
+                    parent, method_name, module_index, depth + 1,
+                ) {
+                    return Some(res);
+                }
+            }
+        }
+
+        // Check cross-file parents via ModuleIndex
+        if let Some(idx) = module_index {
+            if let Some(exports) = idx.get_exports_cached(class_name) {
+                if exports.subs.contains_key(method_name) {
+                    return Some(MethodResolution::CrossFile {
+                        class: class_name.to_string(),
+                    });
+                }
+            }
+            // Walk cross-file parent chain
+            let cross_parents = idx.parents_cached(class_name);
+            for parent in &cross_parents {
+                // Check if parent is a local package first
+                if self.package_parents.contains_key(parent.as_str()) {
+                    if let Some(res) = self.resolve_method_in_ancestors_inner(
+                        parent, method_name, module_index, depth + 1,
+                    ) {
+                        return Some(res);
+                    }
+                } else {
+                    // Fully cross-file parent
+                    if let Some(res) = self.resolve_cross_file_method(
+                        parent, method_name, idx, depth + 1,
+                    ) {
+                        return Some(res);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Resolve a method through the cross-file inheritance chain only.
+    fn resolve_cross_file_method(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: &ModuleIndex,
+        depth: usize,
+    ) -> Option<MethodResolution> {
+        if depth > 20 {
+            return None;
+        }
+        if let Some(exports) = module_index.get_exports_cached(class_name) {
+            if exports.subs.contains_key(method_name) {
+                return Some(MethodResolution::CrossFile {
+                    class: class_name.to_string(),
+                });
+            }
+        }
+        let parents = module_index.parents_cached(class_name);
+        for parent in &parents {
+            if let Some(res) = self.resolve_cross_file_method(
+                parent, method_name, module_index, depth + 1,
+            ) {
+                return Some(res);
             }
         }
         None
@@ -1631,6 +1915,18 @@ pub const PRIORITY_UNIMPORTED: u8 = 25;
 /// Dynamic hash keys (may not exist).
 pub const PRIORITY_DYNAMIC: u8 = 50;
 
+// ---- Method resolution types ----
+
+/// Result of resolving a method through the inheritance chain.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum MethodResolution {
+    /// Found in a local class within this file.
+    Local { class: String, sym_id: SymbolId },
+    /// Found in a cross-file module (use ModuleIndex to get details).
+    CrossFile { class: String },
+}
+
 // ---- Completion types ----
 
 /// A completion candidate from FileAnalysis resolution (pure table lookup).
@@ -1746,7 +2042,7 @@ impl FileAnalysis {
         };
 
         if let Some(ref cn) = class_name {
-            let candidates = self.complete_methods_for_class(cn);
+            let candidates = self.complete_methods_for_class(cn, None);
             if !candidates.is_empty() {
                 return candidates;
             }
@@ -2025,15 +2321,12 @@ impl FileAnalysis {
             None
         };
 
-        // Try class-scoped first
+        // Try inheritance-aware class-scoped lookup first
         if let Some(ref cn) = class_name {
-            for &sid in self.symbols_named(name) {
-                let sym = self.symbol(sid);
-                if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                    if self.symbol_in_class(sid, cn) {
-                        return Some(sym);
-                    }
-                }
+            if let Some(MethodResolution::Local { sym_id, .. }) =
+                self.resolve_method_in_ancestors(cn, name, None)
+            {
+                return Some(self.symbol(sym_id));
             }
         }
 
@@ -2392,6 +2685,16 @@ pub fn inferred_type_from_tag(tag: &str) -> Option<InferredType> {
     }
 }
 
+/// Format a cross-file method signature from ExportedSub metadata.
+fn format_cross_file_signature(method_name: &str, sub_info: &crate::module_index::ExportedSub) -> String {
+    if sub_info.params.is_empty() {
+        format!("sub {}()", method_name)
+    } else {
+        let params: Vec<&str> = sub_info.params.iter().map(|p| p.name.as_str()).collect();
+        format!("sub {}({})", method_name, params.join(", "))
+    }
+}
+
 pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
     match ty {
         InferredType::ClassName(name) => name.clone(),
@@ -2426,6 +2729,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
         )
     }
 
@@ -2516,6 +2820,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
         );
         assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
         assert_eq!(fa.sub_return_type("nonexistent"), None);
@@ -2671,6 +2976,7 @@ mod tests {
                 scope: ScopeId(0),
                 span: Span { start: Point::new(2, 0), end: Point::new(2, 30) },
             }],
+            HashMap::new(),
         );
 
         let mut imported = HashMap::new();
