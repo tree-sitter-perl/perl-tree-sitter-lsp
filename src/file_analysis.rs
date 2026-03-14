@@ -1436,15 +1436,16 @@ impl FileAnalysis {
                     let class_name = self.resolve_method_invocant(
                         invocant, invocant_span, r.scope, point, tree, source_bytes, module_index,
                     );
-                    // Try class-specific method first
+                    // Try inheritance-aware resolution first
                     if let Some(ref cn) = class_name {
-                        for &sid in self.symbols_named(&r.target_name) {
-                            let sym = self.symbol(sid);
-                            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                                if self.symbol_in_class(sid, cn) {
-                                    return Some((sid, true));
-                                }
+                        match self.resolve_method_in_ancestors(cn, &r.target_name, module_index) {
+                            Some(MethodResolution::Local { sym_id, .. }) => {
+                                return Some((sym_id, true));
                             }
+                            Some(MethodResolution::CrossFile { .. }) => {
+                                // Cross-file: no local SymbolId, fall through to name match
+                            }
+                            None => {}
                         }
                     }
                     // Fallback: any method with that name
@@ -2320,15 +2321,12 @@ impl FileAnalysis {
             None
         };
 
-        // Try class-scoped first
+        // Try inheritance-aware class-scoped lookup first
         if let Some(ref cn) = class_name {
-            for &sid in self.symbols_named(name) {
-                let sym = self.symbol(sid);
-                if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                    if self.symbol_in_class(sid, cn) {
-                        return Some(sym);
-                    }
-                }
+            if let Some(MethodResolution::Local { sym_id, .. }) =
+                self.resolve_method_in_ancestors(cn, name, None)
+            {
+                return Some(self.symbol(sym_id));
             }
         }
 
