@@ -474,7 +474,7 @@ impl<'a> Builder<'a> {
         let params = self.extract_params(node);
 
         // Extract preceding POD/comment documentation
-        let doc = self.extract_preceding_doc(node);
+        let doc = self.extract_preceding_doc(node, &name);
 
         self.add_symbol(
             name.clone(),
@@ -1830,7 +1830,7 @@ impl<'a> Builder<'a> {
     /// Get the name of the enclosing sub/method, if any.
     /// Extract POD or comment documentation immediately preceding a sub node.
     /// Walks prev_sibling chain (tree-sitter CST traversal stays in builder).
-    fn extract_preceding_doc(&self, sub_node: Node<'a>) -> Option<String> {
+    fn extract_preceding_doc(&self, sub_node: Node<'a>, sub_name: &str) -> Option<String> {
         let source_str = std::str::from_utf8(self.source).ok()?;
         let mut prev = sub_node.prev_sibling();
         let mut comment_lines: Vec<String> = Vec::new();
@@ -1839,6 +1839,20 @@ impl<'a> Builder<'a> {
             match node.kind() {
                 "pod" => {
                     let text = &source_str[node.byte_range()];
+                    // Try to extract just the section for this sub (=head2 or =item)
+                    if let Some(section) = crate::pod::extract_head2_section(sub_name, text) {
+                        let md = crate::pod::pod_to_markdown(&section);
+                        if !md.is_empty() {
+                            return Some(md);
+                        }
+                    }
+                    if let Some(section) = crate::pod::extract_item_section(sub_name, text) {
+                        let md = crate::pod::pod_to_markdown(&section);
+                        if !md.is_empty() {
+                            return Some(md);
+                        }
+                    }
+                    // Fallback: convert entire POD block (e.g. single-section pod)
                     let md = crate::pod::pod_to_markdown(text);
                     if !md.is_empty() {
                         return Some(md);
@@ -3710,6 +3724,37 @@ Performs a POST request.
             });
         assert!(get_doc.is_some(), "get should have doc from =item");
         assert!(get_doc.unwrap().contains("GET request"));
+    }
+
+    #[test]
+    fn test_pod_doc_extracted_per_function() {
+        let src = "\
+package DemoUtils;
+use Exporter 'import';
+our @EXPORT_OK = qw(fetch_data transform);
+
+=head2 fetch_data
+
+Fetches data from the given URL.
+
+=head2 transform
+
+Transforms items.
+
+=cut
+
+sub fetch_data { }
+sub transform { }
+";
+        let fa = build_fa(src);
+        let fd = fa.symbols.iter().find(|s| s.name == "fetch_data").unwrap();
+        if let SymbolDetail::Sub { ref doc, .. } = fd.detail {
+            let d = doc.as_ref().expect("fetch_data should have doc");
+            assert!(d.contains("Fetches data"), "should have fetch_data doc, got: {}", d);
+            assert!(!d.contains("Transforms items"), "should NOT have transform doc, got: {}", d);
+        } else {
+            panic!("fetch_data should be a Sub");
+        }
     }
 
     // ---- Inheritance extraction tests ----

@@ -1555,11 +1555,13 @@ impl FileAnalysis {
     }
 
     /// Find a method definition within a class/package.
+    #[cfg(test)]
     pub(crate) fn find_method_in_class(&self, class_name: &str, method_name: &str) -> Option<Span> {
         self.find_method_in_class_with_index(class_name, method_name, None)
     }
 
     /// Find a method definition, walking the inheritance chain if needed.
+    #[cfg(test)]
     fn find_method_in_class_with_index(
         &self,
         class_name: &str,

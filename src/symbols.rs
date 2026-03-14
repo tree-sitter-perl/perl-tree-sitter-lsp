@@ -1114,13 +1114,8 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
             continue;
         }
 
-        // Check if the method exists in the class
-        let method_exists = analysis.symbols.iter().any(|s| {
-            matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
-                && s.name == *method_name
-                && analysis.symbol_in_class(s.id, &class_name)
-        });
-        if method_exists {
+        // Check if the method exists in the class (walks inheritance chain)
+        if analysis.resolve_method_in_ancestors(&class_name, method_name, Some(module_index)).is_some() {
             continue;
         }
 
