@@ -23,6 +23,8 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
         package_parents: std::collections::HashMap::new(),
+        framework_modes: std::collections::HashMap::new(),
+        framework_imports: std::collections::HashSet::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -57,6 +59,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         b.call_bindings,
         b.package_parents,
         b.method_call_bindings,
+        b.framework_imports,
     )
 }
 
@@ -89,12 +92,23 @@ struct Builder<'a> {
     pod_texts: Vec<String>,
     /// Parent classes for each package (from use parent/base, @ISA, class :isa).
     package_parents: std::collections::HashMap<String, Vec<String>>,
+    /// Framework mode per package (Moo, Moose, MojoBase) for accessor synthesis.
+    framework_modes: std::collections::HashMap<String, FrameworkMode>,
+    /// Functions implicitly imported by OOP frameworks (has, extends, with, etc.)
+    framework_imports: std::collections::HashSet<String>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
     current_package: Option<String>,
     next_scope_id: u32,
     next_symbol_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FrameworkMode {
+    Moo,
+    Moose,
+    MojoBase,
 }
 
 impl<'a> Builder<'a> {
@@ -141,6 +155,7 @@ impl<'a> Builder<'a> {
             span,
             selection_span,
             scope: self.current_scope(),
+            package: self.current_package.clone(),
             detail,
         });
         id
@@ -319,12 +334,23 @@ impl<'a> Builder<'a> {
         self.scopes[scope.0 as usize].package = Some(name.clone());
 
         self.add_symbol(
-            name,
+            name.clone(),
             SymKind::Package,
             node_to_span(node),
             node_to_span(name_node),
             SymbolDetail::None,
         );
+
+        // Block packages: `package Foo { ... }` — recurse into the block
+        let has_block = (0..node.child_count())
+            .any(|i| node.child(i).map_or(false, |c| c.kind() == "block"));
+        if has_block {
+            self.add_fold_range(node);
+            let prev_package = self.current_package.take();
+            self.current_package = Some(name);
+            self.visit_children(node);
+            self.current_package = prev_package;
+        }
     }
 
     fn visit_class(&mut self, node: Node<'a>) {
@@ -937,6 +963,47 @@ impl<'a> Builder<'a> {
                     SymbolDetail::None,
                 );
 
+                // Detect framework mode from use statements
+                if let Some(pkg) = self.current_package.as_ref().cloned() {
+                    match module_name {
+                        "Moo" | "Moo::Role" => {
+                            self.framework_modes.insert(pkg, FrameworkMode::Moo);
+                            for kw in &["has", "with", "extends", "around", "before", "after"] {
+                                self.framework_imports.insert(kw.to_string());
+                            }
+                        }
+                        "Moose" | "Moose::Role" => {
+                            self.framework_modes.insert(pkg, FrameworkMode::Moose);
+                            for kw in &["has", "with", "extends", "around", "before", "after",
+                                        "override", "super", "inner", "augment", "confess", "blessed"] {
+                                self.framework_imports.insert(kw.to_string());
+                            }
+                        }
+                        "Mojo::Base" => {
+                            // Check args: -strict means no accessors, -base or 'Parent' means MojoBase mode
+                            // Collect all args including barewords (which extract_use_import_list skips)
+                            let all_args = self.extract_mojo_base_args(node);
+                            let is_strict = all_args.iter().any(|a| a == "-strict");
+                            if !is_strict {
+                                self.framework_modes.insert(pkg.clone(), FrameworkMode::MojoBase);
+                                self.framework_imports.insert("has".to_string());
+                                // 'Parent' arg (not starting with -) is an inheritance declaration
+                                let parents: Vec<String> = all_args.into_iter()
+                                    .filter(|s| !s.starts_with('-'))
+                                    .collect();
+                                if !parents.is_empty() {
+                                    self.emit_parent_class_refs(node, &parents);
+                                    self.package_parents
+                                        .entry(pkg)
+                                        .or_default()
+                                        .extend(parents);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Extract parent classes from `use parent` / `use base`
                 if module_name == "parent" || module_name == "base" {
                     if let Some(pkg) = self.current_package.clone() {
@@ -1347,6 +1414,38 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Infer the type of a Mojo::Base `has` default value.
+    ///
+    /// Handles: `has name => 'str'`, `has name => 42`, `has name => []`,
+    /// `has name => {}`, `has name => sub { [] }` (looks at sub body's
+    /// last expression), `has name => Foo->new`.
+    fn infer_mojo_default_type(&self, node: Node<'a>) -> Option<InferredType> {
+        match node.kind() {
+            "string_literal" | "interpolated_string_literal" => Some(InferredType::String),
+            "number" => Some(InferredType::Numeric),
+            "anonymous_hash_expression" => Some(InferredType::HashRef),
+            "anonymous_array_expression" => Some(InferredType::ArrayRef),
+            "anonymous_subroutine_expression" => {
+                // sub { ... } — look at the last expression in the block for the return type
+                let body = node.child_by_field_name("body")?;
+                let last_stmt = body.named_child(body.named_child_count().checked_sub(1)?)?;
+                let expr = if last_stmt.kind() == "expression_statement" {
+                    last_stmt.named_child(0)?
+                } else if last_stmt.kind() == "return_expression" {
+                    last_stmt.named_child(0)?
+                } else {
+                    last_stmt
+                };
+                self.infer_mojo_default_type(expr)
+            }
+            "method_call_expression" => {
+                // Foo->new — constructor
+                self.extract_constructor_class(node).map(InferredType::ClassName)
+            }
+            _ => None,
+        }
+    }
+
     /// Infer the type of a return expression's value.
     ///
     /// Handles:
@@ -1636,9 +1735,463 @@ impl<'a> Builder<'a> {
                         self.push_var_type_constraint(first_arg, node, arg_type);
                     }
                 }
+                // Framework accessor synthesis: `has` calls in Moo/Moose/Mojo::Base packages
+                if name == "has" {
+                    if let Some(mode) = self.current_package.as_ref()
+                        .and_then(|pkg| self.framework_modes.get(pkg).copied())
+                    {
+                        self.visit_has_call(node, mode);
+                    }
+                }
+                // Moose/Moo `extends 'Parent'` — register parent classes
+                if name == "extends" {
+                    if let Some(pkg) = self.current_package.clone() {
+                        if self.framework_modes.contains_key(&pkg) {
+                            self.visit_extends_call(node, &pkg);
+                        }
+                    }
+                }
             }
         }
         self.visit_children(node);
+    }
+
+    /// Synthesize accessor methods from `has` calls in Moo/Moose/Mojo::Base classes.
+    /// Handle Moose/Moo `extends 'Parent::Class', ...` — register parent classes.
+    fn visit_extends_call(&mut self, node: Node<'a>, pkg: &str) {
+        let args = match node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return,
+        };
+        let mut parents: Vec<String> = Vec::new();
+        let nodes: Vec<Node> = if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
+            (0..args.child_count()).filter_map(|i| args.child(i)).collect()
+        } else {
+            vec![args]
+        };
+        for child in &nodes {
+            if !child.is_named() { continue; }
+            match child.kind() {
+                "string_literal" | "interpolated_string_literal" => {
+                    if let Some(text) = self.extract_string_content(*child) {
+                        parents.push(text);
+                    }
+                }
+                "quoted_word_list" => {
+                    let mut names = Vec::new();
+                    self.extract_qw_words(*child, &mut names);
+                    for (name, _) in names {
+                        parents.push(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !parents.is_empty() {
+            self.emit_parent_class_refs(node, &parents);
+            self.package_parents
+                .entry(pkg.to_string())
+                .or_default()
+                .extend(parents);
+        }
+    }
+
+    fn visit_has_call(&mut self, node: Node<'a>, mode: FrameworkMode) {
+        // Extract attribute names and options from the `has` call arguments.
+        // CST: ambiguous_function_call_expression
+        //   function: "has"
+        //   arguments: list_expression
+        //     [0] string_literal 'name' | array_ref_expression [qw(a b)]
+        //     [1] list_expression (is => 'ro', isa => 'Str')   -- options (Moo/Moose)
+        //          OR absent (Mojo::Base: has 'name' or has 'name' => 'default')
+        let mut attr_names: Vec<(String, Span)> = Vec::new();
+        let mut is_value: Option<String> = None;
+        let mut isa_value: Option<String> = None;
+        let mut mojo_default_node: Option<Node<'a>> = None;
+
+        // Get the arguments node
+        let args = match node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return,
+        };
+
+        // The arguments node might be a list_expression or a single node
+        let args_children: Vec<Node> = if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
+            (0..args.child_count()).filter_map(|i| args.child(i)).collect()
+        } else {
+            // Single argument (e.g., has 'name')
+            vec![args]
+        };
+
+        let mut found_first_arg = false;
+        for child in &args_children {
+            if !child.is_named() { continue; }
+
+            if !found_first_arg {
+                found_first_arg = true;
+                match child.kind() {
+                    "string_literal" | "interpolated_string_literal" => {
+                        if let Some(text) = self.extract_string_content(*child) {
+                            if !text.starts_with('+') {
+                                attr_names.push((text, self.string_content_span(*child)));
+                            }
+                        }
+                    }
+                    "bareword" | "autoquoted_bareword" => {
+                        if let Ok(text) = child.utf8_text(self.source) {
+                            attr_names.push((text.to_string(), node_to_span(*child)));
+                        }
+                    }
+                    "array_ref_expression" | "anonymous_array_expression" => {
+                        self.extract_array_attr_names(*child, &mut attr_names);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // After first arg: options (Moo/Moose) or default value (Mojo::Base)
+            if mode == FrameworkMode::MojoBase {
+                // Capture default value node for type inference
+                if mojo_default_node.is_none() {
+                    mojo_default_node = Some(*child);
+                }
+            } else {
+                match child.kind() {
+                    "list_expression" | "parenthesized_expression" => {
+                        let pairs = self.extract_fat_comma_pairs(*child);
+                        for (key, val) in &pairs {
+                            match key.as_str() {
+                                "is" => is_value = Some(val.clone()),
+                                "isa" => isa_value = Some(val.clone()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if attr_names.is_empty() { return; }
+
+        // Map isa value to InferredType
+        let return_type = match mode {
+            FrameworkMode::Moo | FrameworkMode::Moose => {
+                isa_value.as_deref().and_then(|isa| self.map_isa_to_type(isa, mode))
+            }
+            FrameworkMode::MojoBase => {
+                // Fluent return: ClassName(current_package)
+                self.current_package.as_ref().map(|pkg| InferredType::ClassName(pkg.clone()))
+            }
+        };
+
+        // Determine what accessors to synthesize
+        match mode {
+            FrameworkMode::Moo | FrameworkMode::Moose => {
+                let is = is_value.as_deref();
+                match is {
+                    Some("bare") => return, // no accessor
+                    None => return,         // no `is` = no accessor (Moo/Moose default)
+                    _ => {}
+                }
+                let is_rw = matches!(is, Some("rw"));
+                let is_rwp = matches!(is, Some("rwp"));
+
+                for (name, sel_span) in &attr_names {
+                    // Getter (always present for ro/rw/lazy/rwp)
+                    self.add_symbol(
+                        name.clone(),
+                        SymKind::Method,
+                        node_to_span(node),
+                        *sel_span,
+                        SymbolDetail::Sub {
+                            params: vec![],
+                            is_method: true,
+                            return_type: return_type.clone(),
+                            doc: None,
+                        },
+                    );
+                    // Setter for rw
+                    if is_rw {
+                        self.add_symbol(
+                            name.clone(),
+                            SymKind::Method,
+                            node_to_span(node),
+                            *sel_span,
+                            SymbolDetail::Sub {
+                                params: vec![ParamInfo {
+                                    name: "$val".into(),
+                                    default: None,
+                                    is_slurpy: false,
+                                }],
+                                is_method: true,
+                                return_type: return_type.clone(),
+                                doc: None,
+                            },
+                        );
+                    }
+                    // Private writer for rwp (Moo only)
+                    if is_rwp {
+                        let writer_name = format!("_set_{}", name);
+                        self.add_symbol(
+                            writer_name,
+                            SymKind::Method,
+                            node_to_span(node),
+                            *sel_span,
+                            SymbolDetail::Sub {
+                                params: vec![ParamInfo {
+                                    name: "$val".into(),
+                                    default: None,
+                                    is_slurpy: false,
+                                }],
+                                is_method: true,
+                                return_type: return_type.clone(),
+                                doc: None,
+                            },
+                        );
+                    }
+                }
+            }
+            FrameworkMode::MojoBase => {
+                // Infer getter return type from default value if present
+                let getter_type = mojo_default_node
+                    .and_then(|n| self.infer_mojo_default_type(n));
+
+                // Mojo::Base `has` produces getter + setter (two symbols)
+                for (name, sel_span) in &attr_names {
+                    // Getter: no params, return type from default value (or None)
+                    self.add_symbol(
+                        name.clone(),
+                        SymKind::Method,
+                        node_to_span(node),
+                        *sel_span,
+                        SymbolDetail::Sub {
+                            params: vec![],
+                            is_method: true,
+                            return_type: getter_type.clone(),
+                            doc: None,
+                        },
+                    );
+                    // Setter: fluent, returns $self for chaining
+                    self.add_symbol(
+                        name.clone(),
+                        SymKind::Method,
+                        node_to_span(node),
+                        *sel_span,
+                        SymbolDetail::Sub {
+                            params: vec![ParamInfo {
+                                name: "$val".into(),
+                                default: None,
+                                is_slurpy: false,
+                            }],
+                            is_method: true,
+                            return_type: self.current_package.as_ref()
+                                .map(|pkg| InferredType::ClassName(pkg.clone())),
+                            doc: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Extract arguments from `use Mojo::Base ...` including barewords like -strict, -base.
+    fn extract_mojo_base_args(&self, node: Node<'a>) -> Vec<String> {
+        let mut args = Vec::new();
+        let module_end = node.child_by_field_name("module")
+            .map(|m| m.end_byte())
+            .unwrap_or(0);
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.start_byte() <= module_end { continue; }
+                match child.kind() {
+                    "autoquoted_bareword" | "bareword" => {
+                        if let Ok(text) = child.utf8_text(self.source) {
+                            args.push(text.to_string());
+                        }
+                    }
+                    "string_literal" | "interpolated_string_literal" => {
+                        if let Some(text) = self.extract_string_content(child) {
+                            args.push(text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if args.is_empty() {
+            // Fallback to standard extraction
+            let (standard, _) = self.extract_use_import_list(node);
+            return standard;
+        }
+        args
+    }
+
+    /// Extract string content from a string_literal node (strips quotes).
+    fn extract_string_content(&self, node: Node<'a>) -> Option<String> {
+        for i in 0..node.named_child_count() {
+            if let Some(content) = node.named_child(i) {
+                if content.kind() == "string_content" {
+                    return content.utf8_text(self.source).ok().map(|s| s.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the span of the string_content inside a string_literal (for selection_span).
+    fn string_content_span(&self, node: Node<'a>) -> Span {
+        for i in 0..node.named_child_count() {
+            if let Some(content) = node.named_child(i) {
+                if content.kind() == "string_content" {
+                    return node_to_span(content);
+                }
+            }
+        }
+        node_to_span(node)
+    }
+
+    /// Extract attribute names from an array ref expression: [qw(foo bar)] or ['foo', 'bar']
+    fn extract_array_attr_names(&self, node: Node<'a>, names: &mut Vec<(String, Span)>) {
+        // Handle the case where the node itself IS a quoted_word_list (e.g. bare qw() as method arg)
+        if node.kind() == "quoted_word_list" {
+            self.extract_qw_words(node, names);
+            return;
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                match child.kind() {
+                    "quoted_word_list" => {
+                        self.extract_qw_words(child, names);
+                    }
+                    "string_literal" | "interpolated_string_literal" => {
+                        if let Some(text) = self.extract_string_content(child) {
+                            names.push((text, self.string_content_span(child)));
+                        }
+                    }
+                    "list_expression" | "parenthesized_expression" => {
+                        self.extract_array_attr_names(child, names);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Extract individual words from a `quoted_word_list` node (qw(...)).
+    fn extract_qw_words(&self, qw_node: Node<'a>, names: &mut Vec<(String, Span)>) {
+        for j in 0..qw_node.named_child_count() {
+            if let Some(sc) = qw_node.named_child(j) {
+                if sc.kind() == "string_content" {
+                    if let Ok(text) = sc.utf8_text(self.source) {
+                        let sc_start = sc.start_position();
+                        let mut col_offset = 0usize;
+                        for word in text.split_whitespace() {
+                            if let Some(pos) = text[col_offset..].find(word) {
+                                let abs_col = sc_start.column + col_offset + pos;
+                                let span = Span {
+                                    start: Point::new(sc_start.row, abs_col),
+                                    end: Point::new(sc_start.row, abs_col + word.len()),
+                                };
+                                names.push((word.to_string(), span));
+                                col_offset += pos + word.len();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extract key-value pairs from a fat-comma list expression.
+    /// Returns pairs like [("is", "ro"), ("isa", "Str")].
+    fn extract_fat_comma_pairs(&self, node: Node<'a>) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        let mut i = 0;
+        let count = node.child_count();
+        while i < count {
+            let key_node = match node.child(i) {
+                Some(c) if c.is_named() => c,
+                _ => { i += 1; continue; }
+            };
+
+            // Key: bareword/autoquoted_bareword or string
+            let key = match key_node.kind() {
+                "bareword" | "autoquoted_bareword" => key_node.utf8_text(self.source).ok().map(|s| s.to_string()),
+                "string_literal" | "interpolated_string_literal" => self.extract_string_content(key_node),
+                _ => { i += 1; continue; }
+            };
+
+            let key = match key {
+                Some(k) => k,
+                None => { i += 1; continue; }
+            };
+
+            // Skip '=>'
+            i += 1;
+            while i < count {
+                match node.child(i) {
+                    Some(c) if c.kind() == "=>" => { i += 1; break; }
+                    Some(c) if !c.is_named() => { i += 1; }
+                    _ => break,
+                }
+            }
+
+            // Value: string, bareword, or skip complex values
+            if i < count {
+                if let Some(val_node) = node.child(i) {
+                    if val_node.is_named() {
+                        let val = match val_node.kind() {
+                            "bareword" | "autoquoted_bareword" => val_node.utf8_text(self.source).ok().map(|s| s.to_string()),
+                            "string_literal" | "interpolated_string_literal" => self.extract_string_content(val_node),
+                            _ => None,
+                        };
+                        if let Some(v) = val {
+                            pairs.push((key, v));
+                        }
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        pairs
+    }
+
+
+    /// Map a Moo/Moose `isa` type constraint string to an InferredType.
+    fn map_isa_to_type(&self, isa: &str, mode: FrameworkMode) -> Option<InferredType> {
+        match isa {
+            "Str" => Some(InferredType::String),
+            "Int" | "Num" => Some(InferredType::Numeric),
+            "Bool" => Some(InferredType::Numeric),
+            "HashRef" => Some(InferredType::HashRef),
+            "ArrayRef" => Some(InferredType::ArrayRef),
+            "CodeRef" => Some(InferredType::CodeRef),
+            "RegexpRef" => Some(InferredType::Regexp),
+            _ => {
+                // InstanceOf['Foo::Bar'] (Moo style)
+                if isa.starts_with("InstanceOf[") {
+                    let inner = isa.trim_start_matches("InstanceOf[")
+                        .trim_end_matches(']')
+                        .trim_matches('\'')
+                        .trim_matches('"');
+                    if !inner.is_empty() {
+                        return Some(InferredType::ClassName(inner.to_string()));
+                    }
+                }
+                // Moose allows class names as types (contains :: or starts uppercase)
+                if mode == FrameworkMode::Moose && (isa.contains("::") || isa.starts_with(|c: char| c.is_uppercase())) {
+                    // Avoid matching Moose type names like "Str", "Int" etc. already handled above
+                    if isa.contains("::") || isa.len() > 3 {
+                        return Some(InferredType::ClassName(isa.to_string()));
+                    }
+                }
+                None
+            }
+        }
     }
 
     /// Handle func1op_call_expression: abs($x), length($s), int($n), etc.
@@ -1670,33 +2223,230 @@ impl<'a> Builder<'a> {
             .and_then(|n| n.utf8_text(self.source).ok())
             .map(|s| s.to_string());
         let invocant_node = node.child_by_field_name("invocant");
-        let invocant = invocant_node
+        let invocant_text = invocant_node
             .and_then(|n| n.utf8_text(self.source).ok())
-            .map(|s| {
-                // Resolve __PACKAGE__ to enclosing package name
-                if s == "__PACKAGE__" {
-                    self.current_package.clone().unwrap_or_else(|| s.to_string())
-                } else {
-                    s.to_string()
-                }
-            });
+            .map(|s| s.to_string());
+        let invocant = invocant_text.as_ref().map(|s| {
+            // Resolve __PACKAGE__ to enclosing package name
+            if s == "__PACKAGE__" {
+                self.current_package.clone().unwrap_or_else(|| s.to_string())
+            } else {
+                s.to_string()
+            }
+        });
         // Store invocant span for complex expressions (call chains etc.)
         let invocant_span = invocant_node
             .filter(|n| !matches!(n.kind(), "scalar" | "array" | "hash" | "bareword" | "package"))
             .map(|n| node_to_span(n));
 
-        if let Some(name) = method_name {
+        if let Some(ref name) = method_name {
             self.add_ref(
                 RefKind::MethodCall {
-                    invocant: invocant.unwrap_or_default(),
+                    invocant: invocant.clone().unwrap_or_default(),
                     invocant_span,
                 },
                 node_to_span(node),
-                name,
+                name.clone(),
                 AccessKind::Read,
             );
         }
+
+        // DBIC accessor synthesis: __PACKAGE__->add_columns(...), ->has_many(...), etc.
+        let is_pkg_call = invocant_text.as_deref() == Some("__PACKAGE__")
+            || (invocant_node.map(|n| n.kind()) == Some("package")
+                && invocant_text.as_ref() == self.current_package.as_ref());
+        if is_pkg_call && self.is_dbic_class() {
+            if let Some(ref name) = method_name {
+                self.visit_dbic_class_method(node, name);
+            }
+        }
+
         self.visit_children(node);
+    }
+
+    /// Check if the current package inherits from a DBIx::Class package.
+    fn is_dbic_class(&self) -> bool {
+        if let Some(ref pkg) = self.current_package {
+            if let Some(parents) = self.package_parents.get(pkg) {
+                return parents.iter().any(|p| p.starts_with("DBIx::Class"));
+            }
+        }
+        false
+    }
+
+    /// Synthesize accessor methods from DBIC class method calls.
+    fn visit_dbic_class_method(&mut self, node: Node<'a>, method_name: &str) {
+        match method_name {
+            "add_columns" | "add_column" => {
+                self.visit_dbic_add_columns(node);
+            }
+            "has_many" | "many_to_many" => {
+                self.visit_dbic_relationship(node, true);
+            }
+            "belongs_to" | "has_one" | "might_have" => {
+                self.visit_dbic_relationship(node, false);
+            }
+            _ => {}
+        }
+    }
+
+    /// Synthesize column accessor methods from __PACKAGE__->add_columns(...).
+    fn visit_dbic_add_columns(&mut self, node: Node<'a>) {
+        // Arguments from method_call_expression:
+        //   qw(id name email)
+        //   id => { data_type => 'integer' }, name => { data_type => 'varchar' }
+        let args = match node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return,
+        };
+
+        let mut col_names: Vec<(String, Span)> = Vec::new();
+
+        match args.kind() {
+            "quoted_word_list" => {
+                self.extract_array_attr_names(args, &mut col_names);
+            }
+            "parenthesized_expression" | "list_expression" => {
+                self.extract_dbic_column_names(args, &mut col_names);
+            }
+            _ => {}
+        }
+
+        for (name, sel_span) in &col_names {
+            self.add_symbol(
+                name.clone(),
+                SymKind::Method,
+                node_to_span(node),
+                *sel_span,
+                SymbolDetail::Sub {
+                    params: vec![ParamInfo {
+                        name: "$val".into(),
+                        default: None,
+                        is_slurpy: false,
+                    }],
+                    is_method: true,
+                    return_type: None,
+                    doc: None,
+                },
+            );
+        }
+    }
+
+    /// Extract column names from DBIC add_columns argument list.
+    /// In `id => { ... }, name => { ... }`, the column names are the fat-comma keys.
+    fn extract_dbic_column_names(&self, node: Node<'a>, names: &mut Vec<(String, Span)>) {
+        let mut expect_key = true;
+        for i in 0..node.child_count() {
+            let child = match node.child(i) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if !child.is_named() {
+                if child.kind() == "=>" {
+                    expect_key = false; // next named node is a value
+                }
+                continue;
+            }
+
+            if expect_key {
+                match child.kind() {
+                    "bareword" | "autoquoted_bareword" => {
+                        if let Ok(text) = child.utf8_text(self.source) {
+                            names.push((text.to_string(), node_to_span(child)));
+                        }
+                        expect_key = true; // will flip on =>
+                    }
+                    "string_literal" | "interpolated_string_literal" => {
+                        if let Some(text) = self.extract_string_content(child) {
+                            names.push((text, self.string_content_span(child)));
+                        }
+                        expect_key = true;
+                    }
+                    "quoted_word_list" => {
+                        // qw(id name email) — simple form
+                        self.extract_array_attr_names(child, names);
+                        return;
+                    }
+                    _ => {}
+                }
+            } else {
+                // Skip the value (hash_ref, string, etc.)
+                expect_key = true;
+            }
+        }
+    }
+
+    /// Synthesize relationship accessor from __PACKAGE__->has_many/belongs_to/etc.
+    fn visit_dbic_relationship(&mut self, node: Node<'a>, is_resultset: bool) {
+        // First arg: accessor name, second arg: related class
+        let mut accessor_name: Option<(String, Span)> = None;
+        let mut related_class: Option<String> = None;
+
+        let args = match node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return,
+        };
+
+        match args.kind() {
+            "parenthesized_expression" | "list_expression" => {
+                self.extract_relationship_args(args, &mut accessor_name, &mut related_class);
+            }
+            _ => {}
+        }
+
+        if let Some((name, sel_span)) = accessor_name {
+            let return_type = if is_resultset {
+                Some(InferredType::ClassName("DBIx::Class::ResultSet".to_string()))
+            } else {
+                related_class.map(|c| InferredType::ClassName(c))
+            };
+
+            self.add_symbol(
+                name,
+                SymKind::Method,
+                node_to_span(node),
+                sel_span,
+                SymbolDetail::Sub {
+                    params: vec![],
+                    is_method: true,
+                    return_type,
+                    doc: None,
+                },
+            );
+        }
+    }
+
+    /// Extract accessor name and related class from relationship call arguments.
+    fn extract_relationship_args(&self, node: Node<'a>, accessor: &mut Option<(String, Span)>, related: &mut Option<String>) {
+        let mut arg_idx = 0;
+        for i in 0..node.child_count() {
+            let child = match node.child(i) {
+                Some(c) if c.is_named() => c,
+                _ => continue,
+            };
+            match child.kind() {
+                "string_literal" | "interpolated_string_literal" => {
+                    if let Some(text) = self.extract_string_content(child) {
+                        if arg_idx == 0 {
+                            *accessor = Some((text, self.string_content_span(child)));
+                        } else if arg_idx == 1 {
+                            *related = Some(text);
+                        }
+                        arg_idx += 1;
+                    }
+                }
+                "bareword" | "autoquoted_bareword" => {
+                    if let Ok(text) = child.utf8_text(self.source) {
+                        if arg_idx == 0 {
+                            *accessor = Some((text.to_string(), node_to_span(child)));
+                        }
+                        arg_idx += 1;
+                    }
+                }
+                _ => { arg_idx += 1; }
+            }
+        }
     }
 
     fn visit_hash_element(&mut self, node: Node<'a>) {
@@ -1854,17 +2604,18 @@ impl<'a> Builder<'a> {
 
     /// Extract the function name from a call expression (function_call or ambiguous_function_call).
     fn extract_call_name(&self, node: Node<'a>) -> Option<String> {
-        let name = crate::file_analysis::extract_call_name(node, self.source)?;
-        // For function calls, filter out qualified names ($ref->(), Foo::bar())
+        // Only match actual function calls, not method calls
+        // (method calls are handled by MethodCallBinding)
         match node.kind() {
             "function_call_expression" | "ambiguous_function_call_expression" => {
+                let name = crate::file_analysis::extract_call_name(node, self.source)?;
                 if name.contains(':') || name.starts_with('$') {
                     None
                 } else {
                     Some(name)
                 }
             }
-            _ => Some(name),
+            _ => None,
         }
     }
 
@@ -4104,7 +4855,7 @@ sub transform { }
             package SpecialFactory;
             use parent 'Factory';
         ");
-        let rt = fa.find_method_return_type("SpecialFactory", "create", None);
+        let rt = fa.find_method_return_type("SpecialFactory", "create", None, None);
         assert!(rt.is_some(), "should find return type from parent");
     }
 
@@ -4166,6 +4917,7 @@ sub transform { }
                 s.insert("connect".into(), ExportedSub {
                     def_line: 10, params: vec![], is_method: true,
                     return_type: None, hash_keys: vec![], doc: None,
+                    overloads: vec![],
                 });
                 s
             },
@@ -4182,6 +4934,7 @@ sub transform { }
                 s.insert("prepare".into(), ExportedSub {
                     def_line: 5, params: vec![], is_method: true,
                     return_type: None, hash_keys: vec![], doc: None,
+                    overloads: vec![],
                 });
                 s
             },
@@ -4221,6 +4974,7 @@ sub transform { }
                 s.insert("process".into(), ExportedSub {
                     def_line: 1, params: vec![], is_method: true,
                     return_type: None, hash_keys: vec![], doc: None,
+                    overloads: vec![],
                 });
                 s
             },
@@ -4260,6 +5014,7 @@ sub transform { }
                     return_type: Some(InferredType::HashRef),
                     hash_keys: vec!["status".into(), "body".into()],
                     doc: None,
+                    overloads: vec![],
                 });
                 s
             },
@@ -4271,7 +5026,7 @@ sub transform { }
             use parent 'Fetcher';
         ");
 
-        let rt = fa.find_method_return_type("MyFetcher", "fetch", Some(&idx));
+        let rt = fa.find_method_return_type("MyFetcher", "fetch", Some(&idx), None);
         assert_eq!(rt, Some(InferredType::HashRef));
     }
 
@@ -4351,5 +5106,469 @@ sub run {
 ");
         let ty = fa.inferred_type("$cfg", Point::new(7, 4));
         assert_eq!(ty, Some(&InferredType::HashRef));
+    }
+
+    // ---- Framework accessor synthesis tests ----
+
+    #[test]
+    fn test_moo_has_ro() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has 'name' => (is => 'ro');
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1, "should synthesize one getter");
+        if let SymbolDetail::Sub { ref params, is_method, .. } = methods[0].detail {
+            assert!(is_method);
+            assert!(params.is_empty(), "ro getter has no params");
+        }
+    }
+
+    #[test]
+    fn test_moo_has_rw() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has 'name' => (is => 'rw');
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+            .collect();
+        // rw produces getter (0 params) + setter (1 param)
+        assert_eq!(methods.len(), 2, "should synthesize getter + setter");
+    }
+
+    #[test]
+    fn test_moo_has_isa_type() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has 'count' => (is => 'ro', isa => 'Int');
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "count" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1);
+        if let SymbolDetail::Sub { ref return_type, .. } = methods[0].detail {
+            assert_eq!(return_type.as_ref(), Some(&InferredType::Numeric));
+        }
+    }
+
+    #[test]
+    fn test_moo_has_multiple_qw() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has [qw(foo bar)] => (is => 'ro');
+");
+        let foo: Vec<_> = fa.symbols.iter().filter(|s| s.name == "foo" && s.kind == SymKind::Method).collect();
+        let bar: Vec<_> = fa.symbols.iter().filter(|s| s.name == "bar" && s.kind == SymKind::Method).collect();
+        assert_eq!(foo.len(), 1, "should synthesize foo accessor");
+        assert_eq!(bar.len(), 1, "should synthesize bar accessor");
+    }
+
+    #[test]
+    fn test_moo_has_bare_no_accessor() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has 'internal' => (is => 'bare');
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "internal" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 0, "bare should not synthesize accessor");
+    }
+
+    #[test]
+    fn test_moo_no_accessor_without_is() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has 'internal';
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "internal" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 0, "no `is` should not synthesize accessor");
+    }
+
+    #[test]
+    fn test_moose_has_classname_isa() {
+        let fa = build_fa("
+package Foo;
+use Moose;
+has 'db' => (is => 'ro', isa => 'DBI::db');
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "db" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1);
+        if let SymbolDetail::Sub { ref return_type, .. } = methods[0].detail {
+            assert_eq!(return_type.as_ref(), Some(&InferredType::ClassName("DBI::db".into())));
+        }
+    }
+
+    #[test]
+    fn test_moo_has_instanceof() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has 'logger' => (is => 'ro', isa => \"InstanceOf['Log::Any']\");
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "logger" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1);
+        if let SymbolDetail::Sub { ref return_type, .. } = methods[0].detail {
+            assert_eq!(return_type.as_ref(), Some(&InferredType::ClassName("Log::Any".into())));
+        }
+    }
+
+    #[test]
+    fn test_moo_has_rwp() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has 'status' => (is => 'rwp');
+");
+        let getter: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "status" && s.kind == SymKind::Method)
+            .collect();
+        let writer: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "_set_status" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(getter.len(), 1, "rwp should synthesize getter");
+        assert_eq!(writer.len(), 1, "rwp should synthesize _set_name writer");
+    }
+
+    #[test]
+    fn test_mojo_has_basic() {
+        let fa = build_fa("
+package Foo;
+use Mojo::Base -base;
+has 'name';
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 2, "Mojo::Base synthesizes getter + setter");
+        // Getter: no params, no return type
+        let getter = methods.iter().find(|m| {
+            if let SymbolDetail::Sub { ref params, .. } = m.detail { params.is_empty() } else { false }
+        }).expect("should have getter");
+        if let SymbolDetail::Sub { ref return_type, is_method, .. } = getter.detail {
+            assert!(is_method);
+            assert!(return_type.is_none(), "getter has no return type");
+        }
+        // Setter: 1 param, fluent return
+        let setter = methods.iter().find(|m| {
+            if let SymbolDetail::Sub { ref params, .. } = m.detail { params.len() == 1 } else { false }
+        }).expect("should have setter");
+        if let SymbolDetail::Sub { ref return_type, is_method, .. } = setter.detail {
+            assert!(is_method);
+            assert_eq!(return_type.as_ref(), Some(&InferredType::ClassName("Foo".into())));
+        }
+    }
+
+    #[test]
+    fn test_mojo_base_parent_inheritance() {
+        let fa = build_fa("
+package MyApp;
+use Mojo::Base 'Mojolicious';
+has 'config';
+");
+        // Should register parent
+        assert_eq!(fa.package_parents.get("MyApp").map(|v| v.as_slice()),
+            Some(["Mojolicious".to_string()].as_slice()));
+        // Should synthesize getter + setter accessors
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "config" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 2, "Mojo::Base synthesizes getter + setter");
+    }
+
+    #[test]
+    fn test_mojo_base_strict_no_accessor() {
+        let fa = build_fa("
+package Foo;
+use Mojo::Base -strict;
+has 'name';
+");
+        // -strict means no framework mode, has is just a regular function
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 0, "-strict should not trigger accessor synthesis");
+    }
+
+    #[test]
+    fn test_no_accessor_without_framework() {
+        let fa = build_fa("
+package Foo;
+has 'name' => (is => 'ro');
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 0, "no framework = no accessor synthesis");
+    }
+
+    #[test]
+    fn test_dbic_add_columns() {
+        let fa = build_fa("
+package Schema::Result::User;
+use base 'DBIx::Class::Core';
+__PACKAGE__->add_columns(
+    id    => { data_type => 'integer' },
+    name  => { data_type => 'varchar' },
+    email => { data_type => 'varchar' },
+);
+");
+        let id: Vec<_> = fa.symbols.iter().filter(|s| s.name == "id" && s.kind == SymKind::Method).collect();
+        let name: Vec<_> = fa.symbols.iter().filter(|s| s.name == "name" && s.kind == SymKind::Method).collect();
+        let email: Vec<_> = fa.symbols.iter().filter(|s| s.name == "email" && s.kind == SymKind::Method).collect();
+        assert_eq!(id.len(), 1, "should synthesize id accessor");
+        assert_eq!(name.len(), 1, "should synthesize name accessor");
+        assert_eq!(email.len(), 1, "should synthesize email accessor");
+    }
+
+    #[test]
+    fn test_dbic_has_many() {
+        let fa = build_fa("
+package Schema::Result::Post;
+use base 'DBIx::Class::Core';
+__PACKAGE__->has_many(comments => 'Schema::Result::Comment', 'post_id');
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "comments" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1);
+        if let SymbolDetail::Sub { ref return_type, .. } = methods[0].detail {
+            assert_eq!(return_type.as_ref(), Some(&InferredType::ClassName("DBIx::Class::ResultSet".into())));
+        }
+    }
+
+    #[test]
+    fn test_dbic_belongs_to() {
+        let fa = build_fa("
+package Schema::Result::Comment;
+use base 'DBIx::Class::Core';
+__PACKAGE__->belongs_to(author => 'Schema::Result::User', 'author_id');
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "author" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1);
+        if let SymbolDetail::Sub { ref return_type, .. } = methods[0].detail {
+            assert_eq!(return_type.as_ref(), Some(&InferredType::ClassName("Schema::Result::User".into())));
+        }
+    }
+
+    #[test]
+    fn test_accessor_return_type_propagation() {
+        let src = r#"
+package Moo::Config;
+use Moo;
+has 'host' => (is => 'ro', isa => 'Str');
+sub dsn { my ($self) = @_; return "x"; }
+
+package Moo::Service;
+use Moo;
+has 'config' => (is => 'ro', isa => "InstanceOf['Moo::Config']");
+sub run {
+    my ($self) = @_;
+    my $cfg = $self->config;
+    my $dsn = $cfg->dsn;
+}
+"#;
+        let fa = build_fa(src);
+
+        // Verify the config accessor has the right return type
+        let config_methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "config" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(config_methods.len(), 1, "should have 1 config accessor");
+        assert_eq!(config_methods[0].package.as_deref(), Some("Moo::Service"));
+        if let SymbolDetail::Sub { ref return_type, .. } = config_methods[0].detail {
+            assert_eq!(return_type.as_ref(), Some(&InferredType::ClassName("Moo::Config".into())),
+                "config accessor should return Moo::Config");
+        }
+
+        // Verify method call binding exists (not a function call binding)
+        let cfg_binding = fa.method_call_bindings.iter()
+            .find(|b| b.variable == "$cfg");
+        assert!(cfg_binding.is_some(), "should have method call binding for $cfg");
+        assert!(fa.call_bindings.iter().find(|b| b.variable == "$cfg").is_none(),
+            "$cfg should NOT be a function call binding");
+
+        // Verify $cfg gets Moo::Config type (not Moo::Service)
+        let cfg_type = fa.inferred_type("$cfg", tree_sitter::Point::new(13, 0));
+        assert_eq!(cfg_type, Some(&InferredType::ClassName("Moo::Config".into())),
+            "$cfg should be Moo::Config, not Moo::Service");
+
+        // Verify chained resolution: $dsn = $cfg->dsn → String
+        let dsn_binding = fa.method_call_bindings.iter()
+            .find(|b| b.variable == "$dsn");
+        assert!(dsn_binding.is_some(), "should have method call binding for $dsn");
+    }
+
+    #[test]
+    fn test_mojo_getter_setter_distinct() {
+        let fa = build_fa("
+package Foo;
+use Mojo::Base -base;
+has 'name';
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 2, "should synthesize getter + setter");
+
+        let getter = methods.iter().find(|m| {
+            if let SymbolDetail::Sub { ref params, .. } = m.detail { params.is_empty() } else { false }
+        });
+        let setter = methods.iter().find(|m| {
+            if let SymbolDetail::Sub { ref params, .. } = m.detail { params.len() == 1 } else { false }
+        });
+        assert!(getter.is_some(), "should have a 0-param getter");
+        assert!(setter.is_some(), "should have a 1-param setter");
+
+        // Getter: no return type (inferable from usage)
+        if let SymbolDetail::Sub { ref return_type, .. } = getter.unwrap().detail {
+            assert!(return_type.is_none());
+        }
+        // Setter: fluent return
+        if let SymbolDetail::Sub { ref return_type, .. } = setter.unwrap().detail {
+            assert_eq!(return_type.as_ref(), Some(&InferredType::ClassName("Foo".into())));
+        }
+    }
+
+    #[test]
+    fn test_mojo_fluent_chain_resolves() {
+        let src = "
+package Foo;
+use Mojo::Base -base;
+has 'name';
+has 'age';
+sub greet {
+    my ($self) = @_;
+    my $result = $self->name('Bob')->age;
+    return $result;
+}
+";
+        let fa = build_fa(src);
+        // $self->name('Bob') has args → setter → returns Foo
+        // ->age has no args → getter → returns None (unknown)
+        // The chain should resolve: name('Bob') returns Foo, ->age is valid on Foo
+        let method_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "age" && matches!(r.kind, RefKind::MethodCall { .. }))
+            .collect();
+        assert!(!method_refs.is_empty(), "should have method call ref for 'age'");
+    }
+
+    #[test]
+    fn test_moo_rw_arity_resolution() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has 'name' => (is => 'rw', isa => 'Str');
+");
+        // Moo rw: both getter and setter have same return type (Str)
+        // With arity, both 0 and 1 should return String since both symbols have the same type
+        let rt_getter = fa.find_method_return_type("Foo", "name", None, Some(0));
+        assert_eq!(rt_getter, Some(InferredType::String));
+        let rt_setter = fa.find_method_return_type("Foo", "name", None, Some(1));
+        assert_eq!(rt_setter, Some(InferredType::String));
+        let rt_default = fa.find_method_return_type("Foo", "name", None, None);
+        assert_eq!(rt_default, Some(InferredType::String));
+    }
+
+    #[test]
+    fn test_mojo_arity_resolution() {
+        let fa = build_fa("
+package Bar;
+use Mojo::Base -base;
+has 'title';
+");
+        // Getter (0 args): no return type
+        let rt_getter = fa.find_method_return_type("Bar", "title", None, Some(0));
+        assert!(rt_getter.is_none(), "getter should have no return type");
+        // Setter (1 arg): fluent return (ClassName)
+        let rt_setter = fa.find_method_return_type("Bar", "title", None, Some(1));
+        assert_eq!(rt_setter, Some(InferredType::ClassName("Bar".into())));
+        // Default (None): getter (primary, first symbol)
+        let rt_default = fa.find_method_return_type("Bar", "title", None, None);
+        assert!(rt_default.is_none(), "default should return getter type");
+    }
+
+    #[test]
+    fn test_mojo_default_string_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has name => 'default';
+");
+        let rt = fa.find_method_return_type("App", "name", None, Some(0));
+        assert_eq!(rt, Some(InferredType::String), "string default → String getter");
+    }
+
+    #[test]
+    fn test_mojo_default_arrayref_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has items => sub { [] };
+");
+        let rt = fa.find_method_return_type("App", "items", None, Some(0));
+        assert_eq!(rt, Some(InferredType::ArrayRef), "sub {{ [] }} default → ArrayRef getter");
+    }
+
+    #[test]
+    fn test_mojo_default_hashref_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has config => sub { {} };
+");
+        let rt = fa.find_method_return_type("App", "config", None, Some(0));
+        assert_eq!(rt, Some(InferredType::HashRef), "sub {{{{ }}}} default → HashRef getter");
+    }
+
+    #[test]
+    fn test_mojo_default_constructor_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has ua => sub { Mojo::UserAgent->new };
+");
+        let rt = fa.find_method_return_type("App", "ua", None, Some(0));
+        assert_eq!(rt, Some(InferredType::ClassName("Mojo::UserAgent".into())),
+            "sub {{ Foo->new }} default → ClassName getter");
+    }
+
+    #[test]
+    fn test_mojo_default_number_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has timeout => 30;
+");
+        let rt = fa.find_method_return_type("App", "timeout", None, Some(0));
+        assert_eq!(rt, Some(InferredType::Numeric), "number default → Numeric getter");
+    }
+
+    #[test]
+    fn test_mojo_default_no_value_no_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has 'name';
+");
+        let rt = fa.find_method_return_type("App", "name", None, Some(0));
+        assert!(rt.is_none(), "no default → no getter type");
     }
 }

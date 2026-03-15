@@ -12,14 +12,14 @@ use dashmap::DashMap;
 use rusqlite::{params, Connection};
 
 use crate::file_analysis::{inferred_type_from_tag, inferred_type_to_tag};
-use crate::module_index::{ExportedParam, ExportedSub, ModuleExports};
+use crate::module_index::{ExportedOverload, ExportedParam, ExportedSub, ModuleExports};
 
 const SCHEMA_VERSION: &str = "8";
 
 /// Bumped when extraction logic changes (new fields, better parsing).
 /// Unlike SCHEMA_VERSION, this doesn't drop the table — stale entries
 /// are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 2;
+pub const EXTRACT_VERSION: i64 = 3;
 
 pub fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
@@ -290,6 +290,7 @@ fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
                                     .get("is_slurpy")
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(false),
+                                inferred_type: p.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()),
                             })
                         })
                         .collect()
@@ -307,6 +308,25 @@ fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
             let doc = val.get("doc")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let overloads = val.get("overloads")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|o| {
+                    let ol_params = o.get("params")
+                        .and_then(|p| p.as_array())
+                        .map(|pa| pa.iter().filter_map(|pv| {
+                            Some(ExportedParam {
+                                name: pv.get("name")?.as_str()?.to_string(),
+                                is_slurpy: pv.get("is_slurpy").and_then(|v| v.as_bool()).unwrap_or(false),
+                                inferred_type: pv.get("type").and_then(|v| v.as_str()).map(String::from),
+                            })
+                        }).collect())
+                        .unwrap_or_default();
+                    let ol_rt = o.get("return_type")
+                        .and_then(|v| v.as_str())
+                        .and_then(inferred_type_from_tag);
+                    Some(ExportedOverload { params: ol_params, return_type: ol_rt })
+                }).collect())
+                .unwrap_or_default();
             Some((
                 name,
                 ExportedSub {
@@ -316,6 +336,7 @@ fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
                     return_type,
                     hash_keys,
                     doc,
+                    overloads,
                 },
             ))
         })
@@ -394,6 +415,23 @@ fn serialize_subs_json(subs: &HashMap<String, ExportedSub>) -> String {
         }
         if let Some(ref doc) = sub_info.doc {
             obj.insert("doc".into(), serde_json::Value::String(doc.clone()));
+        }
+        if !sub_info.overloads.is_empty() {
+            let overloads: Vec<serde_json::Value> = sub_info.overloads.iter().map(|ol| {
+                let ol_params: Vec<serde_json::Value> = ol.params.iter().map(|p| {
+                    let mut pobj = serde_json::json!({ "name": p.name, "is_slurpy": p.is_slurpy });
+                    if let Some(ref t) = p.inferred_type {
+                        pobj["type"] = serde_json::Value::String(t.clone());
+                    }
+                    pobj
+                }).collect();
+                let mut ol_obj = serde_json::json!({ "params": ol_params });
+                if let Some(ref rt) = ol.return_type {
+                    ol_obj["return_type"] = serde_json::Value::String(inferred_type_to_tag(rt));
+                }
+                ol_obj
+            }).collect();
+            obj.insert("overloads".into(), overloads.into());
         }
         map.insert(name.clone(), obj.into());
     }
@@ -557,6 +595,7 @@ mod tests {
                 return_type: Some(crate::file_analysis::InferredType::HashRef),
                 hash_keys: vec!["host".into()],
                 doc: None,
+                overloads: vec![],
             },
         );
 
@@ -645,12 +684,13 @@ mod tests {
             ExportedSub {
                 def_line: 5,
                 params: vec![
-                    ExportedParam { name: "$path".into(), is_slurpy: false },
+                    ExportedParam { name: "$path".into(), is_slurpy: false, inferred_type: None },
                 ],
                 is_method: false,
                 return_type: Some(InferredType::HashRef),
                 hash_keys: vec!["host".into(), "port".into()],
                 doc: None,
+                overloads: vec![],
             },
         );
         subs.insert(
@@ -662,17 +702,19 @@ mod tests {
                 return_type: Some(InferredType::ArrayRef),
                 hash_keys: vec![],
                 doc: None,
+                overloads: vec![],
             },
         );
         subs.insert(
             "new_obj".to_string(),
             ExportedSub {
                 def_line: 30,
-                params: vec![ExportedParam { name: "$class".into(), is_slurpy: false }],
+                params: vec![ExportedParam { name: "$class".into(), is_slurpy: false, inferred_type: None }],
                 is_method: true,
                 return_type: Some(InferredType::ClassName("MyObj".into())),
                 hash_keys: vec![],
                 doc: None,
+                overloads: vec![],
             },
         );
 
@@ -709,6 +751,46 @@ mod tests {
         assert_eq!(no.return_type, Some(InferredType::ClassName("MyObj".into())));
 
         let _ = std::fs::remove_file(&pm);
+    }
+
+    #[test]
+    fn test_exported_sub_overloads_roundtrip() {
+        use crate::file_analysis::InferredType;
+
+        let mut subs = HashMap::new();
+        subs.insert(
+            "name".to_string(),
+            ExportedSub {
+                def_line: 5,
+                params: vec![], // getter: no params
+                is_method: true,
+                return_type: None,
+                hash_keys: vec![],
+                doc: None,
+                overloads: vec![ExportedOverload {
+                    params: vec![ExportedParam {
+                        name: "$val".into(),
+                        is_slurpy: false,
+                        inferred_type: None,
+                    }],
+                    return_type: Some(InferredType::ClassName("Foo".into())),
+                }],
+            },
+        );
+
+        let json = serialize_subs_json(&subs);
+        let roundtripped = deserialize_subs_json(&json);
+        let rt = roundtripped.get("name").unwrap();
+        assert_eq!(rt.overloads.len(), 1);
+        assert_eq!(rt.overloads[0].params.len(), 1);
+        assert_eq!(rt.overloads[0].params[0].name, "$val");
+        assert_eq!(
+            rt.overloads[0].return_type,
+            Some(InferredType::ClassName("Foo".into()))
+        );
+        // Primary should be preserved
+        assert!(rt.params.is_empty());
+        assert!(rt.return_type.is_none());
     }
 
     #[test]

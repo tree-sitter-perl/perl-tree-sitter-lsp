@@ -105,6 +105,8 @@ pub struct Symbol {
     pub selection_span: Span,
     /// Scope this symbol is declared in.
     pub scope: ScopeId,
+    /// The package this symbol belongs to (captured at creation time).
+    pub package: Option<String>,
     /// Kind-specific extra data.
     pub detail: SymbolDetail,
 }
@@ -399,6 +401,10 @@ pub struct FileAnalysis {
     /// Return types from imported functions (populated after build from module index).
     pub imported_return_types: HashMap<String, InferredType>,
 
+    /// Functions implicitly imported by OOP frameworks (e.g. `has`, `extends`, `with`).
+    /// Used to suppress "not defined" diagnostics for these known framework keywords.
+    pub framework_imports: HashSet<String>,
+
     // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
     base_type_constraint_count: usize,
     base_symbol_count: usize,
@@ -423,6 +429,7 @@ impl FileAnalysis {
         call_bindings: Vec<CallBinding>,
         package_parents: HashMap<String, Vec<String>>,
         method_call_bindings: Vec<MethodCallBinding>,
+        framework_imports: HashSet<String>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -435,6 +442,7 @@ impl FileAnalysis {
             method_call_bindings,
             package_parents,
             imported_return_types: HashMap::new(),
+            framework_imports,
             base_type_constraint_count: 0,
             base_symbol_count: 0,
             scope_starts: Vec::new(),
@@ -663,6 +671,7 @@ impl FileAnalysis {
                     span: zero_span,
                     selection_span: zero_span,
                     scope: ScopeId(0),
+                    package: None,
                     detail: SymbolDetail::HashKeyDef {
                         owner: owner.clone(),
                         is_dynamic: false,
@@ -695,7 +704,7 @@ impl FileAnalysis {
             );
 
             if let Some(cn) = class_name {
-                if let Some(rt) = self.find_method_return_type(&cn, &binding.method_name, module_index) {
+                if let Some(rt) = self.find_method_return_type(&cn, &binding.method_name, module_index, None) {
                     self.type_constraints.push(TypeConstraint {
                         variable: binding.variable.clone(),
                         scope: binding.scope,
@@ -774,7 +783,8 @@ impl FileAnalysis {
                 if method_text == "new" {
                     return Some(InferredType::ClassName(class_name.to_string()));
                 }
-                self.find_method_return_type(class_name, method_text, module_index)
+                let arg_count = self.count_call_args(node);
+                self.find_method_return_type(class_name, method_text, module_index, Some(arg_count))
             }
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 let func_node = node.child_by_field_name("function")?;
@@ -873,9 +883,38 @@ impl FileAnalysis {
         class_name: &str,
         method_name: &str,
         module_index: Option<&ModuleIndex>,
+        arg_count: Option<usize>,
     ) -> Option<InferredType> {
         match self.resolve_method_in_ancestors(class_name, method_name, module_index) {
             Some(MethodResolution::Local { sym_id, .. }) => {
+                // Collect all matching symbols for arity selection
+                let candidates: Vec<_> = self.symbols_named(method_name).iter()
+                    .filter(|&&sid| {
+                        let s = self.symbol(sid);
+                        matches!(s.kind, SymKind::Sub | SymKind::Method)
+                            && self.symbol_in_class(sid, class_name)
+                    })
+                    .copied()
+                    .collect();
+
+                if candidates.len() <= 1 || arg_count.is_none() {
+                    // Single symbol or no arity info — primary (first match)
+                    if let SymbolDetail::Sub { ref return_type, .. } = self.symbol(sym_id).detail {
+                        return return_type.clone();
+                    }
+                    return None;
+                }
+
+                // Multiple overloads: pick by param count
+                let target = arg_count.unwrap();
+                for sid in &candidates {
+                    if let SymbolDetail::Sub { ref params, ref return_type, .. } = self.symbol(*sid).detail {
+                        if params.len() == target {
+                            return return_type.clone();
+                        }
+                    }
+                }
+                // No exact match — fall back to primary
                 if let SymbolDetail::Sub { ref return_type, .. } = self.symbol(sym_id).detail {
                     return_type.clone()
                 } else {
@@ -884,11 +923,42 @@ impl FileAnalysis {
             }
             Some(MethodResolution::CrossFile { ref class }) => {
                 module_index.and_then(|idx| {
-                    idx.get_exports_cached(class)
-                        .and_then(|e| e.subs.get(method_name)?.return_type.clone())
+                    let exports = idx.get_exports_cached(class)?;
+                    let sub = exports.subs.get(method_name)?;
+
+                    // If no arity info or no overloads, return primary
+                    let target = match arg_count {
+                        Some(n) if !sub.overloads.is_empty() => n,
+                        _ => return sub.return_type.clone(),
+                    };
+
+                    // Check primary params
+                    if sub.params.len() == target {
+                        return sub.return_type.clone();
+                    }
+                    // Check overloads
+                    for overload in &sub.overloads {
+                        if overload.params.len() == target {
+                            return overload.return_type.clone();
+                        }
+                    }
+                    // Fallback to primary
+                    sub.return_type.clone()
                 })
             }
             None => None,
+        }
+    }
+
+    /// Count arguments in a method/function call expression (excluding invocant).
+    pub(crate) fn count_call_args(&self, node: tree_sitter::Node) -> usize {
+        let args = match node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return 0,
+        };
+        match args.kind() {
+            "parenthesized_expression" | "list_expression" => args.named_child_count(),
+            _ => 1, // single argument
         }
     }
 
@@ -931,7 +1001,7 @@ impl FileAnalysis {
         } else {
             class_name.to_string()
         };
-        if let Some(ref rt) = self.find_method_return_type(class_name, method_name, module_index) {
+        if let Some(ref rt) = self.find_method_return_type(class_name, method_name, module_index, None) {
             format!("{} → {}", base, format_inferred_type(rt))
         } else {
             base
@@ -1363,7 +1433,7 @@ impl FileAnalysis {
                                     cn.to_string()
                                 };
                                 let mut text = format!("```perl\n{}\n```\n\n*class {}*", line.trim(), class_label);
-                                if let Some(ref rt) = self.find_method_return_type(cn, &r.target_name, module_index) {
+                                if let Some(ref rt) = self.find_method_return_type(cn, &r.target_name, module_index, None) {
                                     text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
                                 }
                                 return Some(text);
@@ -1755,10 +1825,13 @@ impl FileAnalysis {
     /// Check if a symbol is defined within a class/package.
     pub(crate) fn symbol_in_class(&self, sym_id: SymbolId, class_name: &str) -> bool {
         let sym = self.symbol(sym_id);
-        // Use scope_at to find the innermost scope containing this symbol.
-        // For subs, this finds the Sub scope (which has the correct package
-        // from when it was defined), rather than the enclosing scope the
-        // symbol was recorded in.
+        // Fast path: check the package captured at symbol creation time.
+        // This is authoritative for multi-package files where the scope's
+        // mutable `package` field gets overwritten by later package statements.
+        if let Some(ref pkg) = sym.package {
+            return pkg == class_name;
+        }
+        // Fallback: walk the scope chain for symbols without a package field.
         let start_scope = self.scope_at(sym.span.start).unwrap_or(sym.scope);
         let chain = self.scope_chain(start_scope);
         for scope_id in &chain {
@@ -2025,6 +2098,8 @@ pub struct SignatureInfo {
     pub is_method: bool,
     /// End of the sub body — used to query inferred types for params.
     pub body_end: Point,
+    /// Pre-resolved param types (for cross-file subs where body_end is meaningless).
+    pub param_types: Option<Vec<Option<String>>>,
 }
 
 // ---- Completion query methods ----
@@ -2391,9 +2466,15 @@ impl FileAnalysis {
                     params,
                     is_method,
                     body_end: sub_sym.span.end,
+                    param_types: None, // local — use inferred_type() with body_end
                 })
             }
             ResolvedSub::CrossFile { params: exported_params, is_method: cf_is_method, .. } => {
+                // Collect pre-resolved param types before stripping $self/$class
+                let all_types: Vec<Option<String>> = exported_params.iter()
+                    .map(|p| p.inferred_type.clone())
+                    .collect();
+
                 let mut params: Vec<ParamInfo> = exported_params
                     .iter()
                     .map(|p| ParamInfo {
@@ -2406,11 +2487,15 @@ impl FileAnalysis {
                 let is_method = is_method || cf_is_method
                     || params.first().map_or(false, |p| p.name == "$self" || p.name == "$class");
 
-                // Strip $self/$class from method params
+                // Strip $self/$class from method params (and their types)
+                let mut param_types = all_types;
                 if is_method && !params.is_empty() {
                     let first = &params[0].name;
                     if first == "$self" || first == "$class" {
                         params.remove(0);
+                        if !param_types.is_empty() {
+                            param_types.remove(0);
+                        }
                     }
                 }
 
@@ -2418,7 +2503,8 @@ impl FileAnalysis {
                     name: name.to_string(),
                     params,
                     is_method,
-                    body_end: Point::new(0, 0), // no local body
+                    body_end: Point::new(0, 0),
+                    param_types: Some(param_types),
                 })
             }
         }
@@ -2543,6 +2629,16 @@ impl FileAnalysis {
                 && contains_point(&self.scopes[cb.scope.0 as usize].span, point)
             {
                 return Some(HashKeyOwner::Sub(cb.func_name.clone()));
+            }
+        }
+
+        // Check method call bindings → follow to method's return hash keys
+        for mcb in &self.method_call_bindings {
+            if mcb.variable == var_text
+                && mcb.span.start <= point
+                && contains_point(&self.scopes[mcb.scope.0 as usize].span, point)
+            {
+                return Some(HashKeyOwner::Sub(mcb.method_name.clone()));
             }
         }
 
@@ -2911,6 +3007,7 @@ mod tests {
             vec![],
             HashMap::new(),
             vec![],
+            HashSet::new(),
         )
     }
 
@@ -2989,6 +3086,7 @@ mod tests {
                 span: Span { start: Point::new(0, 0), end: Point::new(2, 1) },
                 selection_span: Span { start: Point::new(0, 4), end: Point::new(0, 14) },
                 scope: ScopeId(0),
+                package: None,
                 detail: SymbolDetail::Sub {
                     params: vec![],
                     is_method: false,
@@ -3003,6 +3101,7 @@ mod tests {
             vec![],
             HashMap::new(),
             vec![],
+            HashSet::new(),
         );
         assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
         assert_eq!(fa.sub_return_type("nonexistent"), None);
@@ -3160,6 +3259,7 @@ mod tests {
             }],
             HashMap::new(),
             vec![],
+            HashSet::new(),
         );
 
         let mut imported = HashMap::new();

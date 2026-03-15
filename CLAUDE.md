@@ -130,6 +130,22 @@ Post-build enrichment propagates imported return types and hash keys into the lo
 - Cross-file: `ModuleExports.parents` stored in SQLite `parents` TEXT column (JSON array) and subprocess JSON output
 - `ModuleIndex.parents_cached(module_name)` returns parent list for cross-file inheritance walking
 
+### Framework accessor synthesis
+
+- `FrameworkMode` enum (`Moo`, `Moose`, `MojoBase`) detected per-package from `use` statements
+- Moo/Moose: `has 'name' => (is => 'ro'/'rw'/'lazy'/'rwp'/'bare')` synthesizes `SymKind::Method` symbols
+- `isa` type constraints mapped to `InferredType`: `Str` → String, `Int`/`Num` → Numeric, `HashRef`/`ArrayRef`/`CodeRef`, `InstanceOf['Foo']` → ClassName, Moose class names
+- Mojo::Base: `has 'name'` produces rw accessor with fluent return type `ClassName(current_package)`; `use Mojo::Base 'Parent'` also feeds `package_parents`
+- DBIC: `__PACKAGE__->add_columns(...)` synthesizes column accessors; `has_many`/`belongs_to`/`has_one`/`might_have` synthesize relationship accessors with typed returns
+- Synthesized methods are standard symbols — completion, hover, goto-def, inheritance all work automatically
+- Cross-file: subprocess runs full builder, so framework accessors appear in `ModuleExports.subs` for cross-file resolution
+
+### Cross-file param types
+
+- `ExportedParam.inferred_type: Option<String>` carries body-inferred param types across file boundaries
+- Subprocess serializes param type as `"type"` field in JSON; deserialized in both subprocess and direct-parse paths
+- `SignatureInfo.param_types` delivers pre-resolved types for cross-file signature help (avoids meaningless `body_end` query)
+
 ## LSP Capabilities
 
 - `textDocument/documentSymbol` — outline of subs, packages, variables, classes (with fields/methods as children)
