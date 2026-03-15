@@ -108,6 +108,21 @@ t.test("completion: $cfg->{} offers hash keys from get_config", function()
   end
 end)
 
+-- ── 4. Goto-def on imported function name in use statement ───────────
+
+t.test("goto-def: 'get_config' in use qw() jumps to TestExporter.pm", function()
+  local N = "goto-def: 'get_config' in use qw() jumps to TestExporter.pm"
+  local line, col = b.find_pos(buf, "use TestExporter qw(get_config")
+  if not t.ok(N, line, "couldn't find use TestExporter line") then return end
+  -- Position cursor on "get_config" inside qw() — col + 20 lands inside the word
+  local loc = lsp.def_location(buf, line, col + 20)
+  if not t.ok(N, loc, "no definition result") then return end
+  if t.ok(N, loc.uri and loc.uri:find("TestExporter.pm", 1, true),
+    "uri should point to TestExporter.pm, got: " .. tostring(loc.uri)) then
+    t.pass(N)
+  end
+end)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()

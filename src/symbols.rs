@@ -4,8 +4,8 @@ use tree_sitter::{Point, Tree};
 
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
-    format_inferred_type, CompletionCandidate, FileAnalysis, FoldKind, InferredType, OutlineSymbol,
-    RefKind, Span, SymKind as FaSymKind, SymbolDetail, VarModifier,
+    contains_point, format_inferred_type, CompletionCandidate, FileAnalysis, FoldKind, InferredType,
+    OutlineSymbol, RefKind, Span, SymKind as FaSymKind, SymbolDetail, VarModifier,
     PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT, PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
 use crate::module_index::ExportedSub;
@@ -85,7 +85,7 @@ pub fn find_definition(
     let point = position_to_point(pos);
 
     // Try local definition first
-    if let Some(span) = analysis.find_definition(point, Some(tree), Some(source.as_bytes())) {
+    if let Some(span) = analysis.find_definition(point, Some(tree), Some(source.as_bytes()), Some(module_index)) {
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
             range: span_to_range(span),
@@ -115,6 +115,17 @@ pub fn find_definition(
                         None => Range::default(),
                     };
 
+                    let pm_location = Location {
+                        uri: module_uri,
+                        range: def_range,
+                    };
+
+                    // If cursor is inside the use statement itself (on the import name),
+                    // jump directly to the .pm definition — no need to also show the use stmt.
+                    if contains_point(&import.span, point) {
+                        return Some(GotoDefinitionResponse::Scalar(pm_location));
+                    }
+
                     return Some(GotoDefinitionResponse::Array(vec![
                         // First: the use statement in this file
                         Location {
@@ -122,10 +133,7 @@ pub fn find_definition(
                             range: span_to_range(import.span),
                         },
                         // Second: the sub definition in the .pm file
-                        Location {
-                            uri: module_uri,
-                            range: def_range,
-                        },
+                        pm_location,
                     ]));
                 }
                 // Fall back to just the use statement
@@ -133,6 +141,44 @@ pub fn find_definition(
                     uri: uri.clone(),
                     range: span_to_range(import.span),
                 }));
+            }
+        }
+
+        // Cross-file package goto-def: resolve module name via module index
+        if matches!(r.kind, RefKind::PackageRef) {
+            if let Some(path) = module_index.module_path_cached(&r.target_name) {
+                if let Ok(module_uri) = Url::from_file_path(&path) {
+                    return Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: module_uri,
+                        range: Range::default(),
+                    }));
+                }
+            }
+        }
+
+        // Cross-file method goto-def: resolve inherited methods through module index
+        if let RefKind::MethodCall { ref invocant, ref invocant_span } = r.kind {
+            use crate::file_analysis::MethodResolution;
+            let class_name = analysis.resolve_method_invocant_public(
+                invocant, invocant_span, r.scope, point, Some(tree), Some(source.as_bytes()), Some(module_index),
+            );
+            if let Some(ref cn) = class_name {
+                if let Some(MethodResolution::CrossFile { ref class }) = analysis.resolve_method_in_ancestors(cn, &r.target_name, Some(module_index)) {
+                    if let Some(exports) = module_index.get_exports_cached(class) {
+                        if let Some(sub_info) = exports.sub_info(&r.target_name) {
+                            if let Ok(module_uri) = Url::from_file_path(&exports.path) {
+                                let def_range = Range {
+                                    start: Position { line: sub_info.def_line, character: 0 },
+                                    end: Position { line: sub_info.def_line, character: 0 },
+                                };
+                                return Some(GotoDefinitionResponse::Scalar(Location {
+                                    uri: module_uri,
+                                    range: def_range,
+                                }));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -230,7 +276,7 @@ pub fn completion_items(
         CursorContext::Method { ref invocant_type, ref invocant_text } => {
             if let Some(ref ty) = invocant_type {
                 if let Some(cn) = ty.class_name() {
-                    analysis.complete_methods_for_class(cn)
+                    analysis.complete_methods_for_class(cn, Some(module_index))
                 } else {
                     // Ref types get deref snippet completions (handled below)
                     Vec::new()
@@ -267,6 +313,7 @@ pub fn completion_items(
                         call_ctx.invocant.as_deref(),
                         point,
                         &call_ctx.used_keys,
+                        Some(module_index),
                     ));
                 }
             }
@@ -276,7 +323,7 @@ pub fn completion_items(
             items.extend(imported_function_completions(analysis, module_index));
 
             // Add completions from unimported modules (with auto-import edits)
-            items.extend(unimported_function_completions(analysis, module_index));
+            items.extend(unimported_function_completions(analysis, module_index, point));
 
             items
         }
@@ -343,7 +390,7 @@ pub fn hover_info(
     let point = position_to_point(pos);
 
     // Try local hover first
-    if let Some(markdown) = analysis.hover_info(point, source, Some(tree)) {
+    if let Some(markdown) = analysis.hover_info(point, source, Some(tree), Some(module_index)) {
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -449,12 +496,13 @@ pub fn signature_help(
     // Step 1: cursor_context finds the enclosing call
     let call_ctx = cursor_context::find_call_context(tree, text.as_bytes(), point)?;
 
-    // Step 2: file_analysis resolves the sub signature (pure table lookup)
+    // Step 2: file_analysis resolves the sub signature (local + cross-file)
     if let Some(sig_info) = analysis.signature_for_call(
         &call_ctx.name,
         call_ctx.is_method,
         call_ctx.invocant.as_deref(),
         point,
+        Some(module_index),
     ) {
         // Build param labels with inferred types
         let param_labels: Vec<String> = sig_info
@@ -499,39 +547,6 @@ pub fn signature_help(
             active_signature: Some(0),
             active_parameter: Some(call_ctx.active_param as u32),
         });
-    }
-
-    // Fallback: imported function
-    if !call_ctx.is_method {
-        if let Some((import, _)) =
-            resolve_imported_function(analysis, &call_ctx.name, module_index)
-        {
-            if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
-                if let Some(sub_info) = exports.sub_info(&call_ctx.name) {
-                    let param_labels: Vec<String> =
-                        sub_info.params.iter().map(|p| p.name.clone()).collect();
-                    let params: Vec<ParameterInformation> = param_labels
-                        .iter()
-                        .map(|label| ParameterInformation {
-                            label: ParameterLabel::Simple(label.clone()),
-                            documentation: None,
-                        })
-                        .collect();
-                    let label =
-                        format!("{}({})", call_ctx.name, param_labels.join(", "));
-                    return Some(SignatureHelp {
-                        signatures: vec![SignatureInformation {
-                            label,
-                            documentation: None,
-                            parameters: Some(params),
-                            active_parameter: Some(call_ctx.active_param as u32),
-                        }],
-                        active_signature: Some(0),
-                        active_parameter: Some(call_ctx.active_param as u32),
-                    });
-                }
-            }
-        }
     }
 
     None
@@ -787,6 +802,7 @@ fn imported_function_completions(
 fn unimported_function_completions(
     analysis: &FileAnalysis,
     module_index: &ModuleIndex,
+    point: Point,
 ) -> Vec<CompletionCandidate> {
     use crate::file_analysis::Span;
     let mut candidates = Vec::new();
@@ -798,7 +814,7 @@ fn unimported_function_completions(
         .map(|i| i.module_name.as_str())
         .collect();
 
-    let insert_pos = find_use_insertion_position(analysis);
+    let insert_pos = find_use_insertion_position(analysis, point);
     let insert_span = Span {
         start: tree_sitter::Point {
             row: insert_pos.line as usize,
@@ -1088,13 +1104,8 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
             continue;
         }
 
-        // Check if the method exists in the class
-        let method_exists = analysis.symbols.iter().any(|s| {
-            matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
-                && s.name == *method_name
-                && analysis.symbol_in_class(s.id, &class_name)
-        });
-        if method_exists {
+        // Check if the method exists in the class (walks inheritance chain)
+        if analysis.resolve_method_in_ancestors(&class_name, method_name, Some(module_index)).is_some() {
             continue;
         }
 
@@ -1116,15 +1127,34 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
 
 // ---- Code actions ----
 
-/// Find the position to insert a new `use` statement.
-/// Returns the start of the line after the last existing `use`.
-fn find_use_insertion_position(analysis: &FileAnalysis) -> Position {
-    if let Some(last_import) = analysis.imports.last() {
+/// Find the position to insert a new `use` statement, scoped to the package at `point`.
+/// Returns the start of the line after the last existing `use` in the same package.
+fn find_use_insertion_position(analysis: &FileAnalysis, point: Point) -> Position {
+    let target_pkg = analysis.package_at(point);
+
+    // Find the last import in the same package
+    let last_in_pkg = analysis.imports.iter().rev().find(|imp| {
+        analysis.package_at(imp.span.start) == target_pkg
+    });
+
+    if let Some(last_import) = last_in_pkg {
         Position {
             line: last_import.span.end.row as u32 + 1,
             character: 0,
         }
     } else {
+        // No imports in this package — find the package statement and insert after it
+        if let Some(pkg_name) = target_pkg {
+            for sym in &analysis.symbols {
+                if matches!(sym.kind, FaSymKind::Package | FaSymKind::Class) && sym.name == pkg_name {
+                    return Position {
+                        line: sym.selection_span.end.row as u32 + 1,
+                        character: 0,
+                    };
+                }
+            }
+        }
+        // Fallback: beginning of file
         Position {
             line: 0,
             character: 0,
@@ -1168,7 +1198,8 @@ pub fn code_actions(
 
         // Case 2: New import — add `use Module qw(func);` statement
         if let Some(modules) = data.get("modules").and_then(|v| v.as_array()) {
-            let insert_pos = find_use_insertion_position(analysis);
+            let diag_point = position_to_point(diag.range.start);
+            let insert_pos = find_use_insertion_position(analysis, diag_point);
             for (i, module_val) in modules.iter().enumerate() {
                 if let Some(module_name) = module_val.as_str() {
                     let new_text = format!("use {} qw({});\n", module_name, func_name);
@@ -1415,6 +1446,7 @@ mod tests {
                 export: vec![],
                 export_ok: vec!["first".into(), "max".into(), "min".into()],
                 subs: std::collections::HashMap::new(),
+                parents: vec![],
             }),
         );
 
@@ -1464,6 +1496,7 @@ mod tests {
                 export: vec![],
                 export_ok: vec!["first".into(), "max".into(), "min".into()],
                 subs: std::collections::HashMap::new(),
+                parents: vec![],
             }),
         );
         idx.insert_cache(
@@ -1473,6 +1506,7 @@ mod tests {
                 export: vec![],
                 export_ok: vec!["blessed".into(), "reftype".into()],
                 subs: std::collections::HashMap::new(),
+                parents: vec![],
             }),
         );
 
