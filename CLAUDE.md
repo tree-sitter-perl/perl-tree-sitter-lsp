@@ -123,7 +123,7 @@ Post-build enrichment propagates imported return types and hash keys into the lo
 ### Inheritance chain resolution
 
 - `FileAnalysis.package_parents: HashMap<String, Vec<String>>` — unified parent map from all inheritance sources
-- Sources: `use parent`, `use base`, `@ISA = (...)`, `class :isa(Parent)` — all feed `package_parents` during builder walk
+- Sources: `use parent`, `use base`, `@ISA = (...)`, `class :isa(Parent)`, `class :does(Role)`, `with 'Role'` (Moo/Moose), `__PACKAGE__->load_components(...)` (DBIC) — all feed `package_parents` during builder walk
 - `resolve_method_in_ancestors()` does DFS parent walk (matching Perl's default MRO), depth limit 20
 - `MethodResolution` enum: `Local { class, sym_id }` for same-file, `CrossFile { class }` for module index lookup
 - `complete_methods_for_class` walks ancestors, deduplicates by name (child methods shadow parent)

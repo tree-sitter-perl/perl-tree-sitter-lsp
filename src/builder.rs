@@ -401,6 +401,13 @@ impl<'a> Builder<'a> {
                 .or_default()
                 .push(p.clone());
         }
+        // Roles via :does(Role) are also parents for method resolution
+        if !roles.is_empty() {
+            self.package_parents
+                .entry(name.clone())
+                .or_default()
+                .extend(roles.iter().cloned());
+        }
 
         self.add_symbol(
             name.clone(),
@@ -1751,6 +1758,14 @@ impl<'a> Builder<'a> {
                         }
                     }
                 }
+                // Moose/Moo `with 'Role'` — register roles as parents for method resolution
+                if name == "with" {
+                    if let Some(pkg) = self.current_package.clone() {
+                        if self.framework_modes.contains_key(&pkg) {
+                            self.visit_extends_call(node, &pkg);
+                        }
+                    }
+                }
             }
         }
         self.visit_children(node);
@@ -1793,6 +1808,57 @@ impl<'a> Builder<'a> {
                 .entry(pkg.to_string())
                 .or_default()
                 .extend(parents);
+        }
+    }
+
+    /// Handle `__PACKAGE__->load_components('+Full::Name', 'Short::Name')`.
+    /// Bare names are prefixed with `DBIx::Class::`, `+` prefix means fully qualified.
+    fn visit_load_components(&mut self, node: Node<'a>) {
+        let pkg = match self.current_package.clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let args = match node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return,
+        };
+        let mut components: Vec<String> = Vec::new();
+        let nodes: Vec<Node> = if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
+            (0..args.child_count()).filter_map(|i| args.child(i)).collect()
+        } else {
+            vec![args]
+        };
+        for child in &nodes {
+            if !child.is_named() { continue; }
+            match child.kind() {
+                "string_literal" | "interpolated_string_literal" => {
+                    if let Some(text) = self.extract_string_content(*child) {
+                        if let Some(stripped) = text.strip_prefix('+') {
+                            components.push(stripped.to_string());
+                        } else {
+                            components.push(format!("DBIx::Class::{}", text));
+                        }
+                    }
+                }
+                "quoted_word_list" => {
+                    let mut names = Vec::new();
+                    self.extract_qw_words(*child, &mut names);
+                    for (name, _) in names {
+                        if let Some(stripped) = name.strip_prefix('+') {
+                            components.push(stripped.to_string());
+                        } else {
+                            components.push(format!("DBIx::Class::{}", name));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !components.is_empty() {
+            self.package_parents
+                .entry(pkg)
+                .or_default()
+                .extend(components);
         }
     }
 
@@ -2255,9 +2321,17 @@ impl<'a> Builder<'a> {
         let is_pkg_call = invocant_text.as_deref() == Some("__PACKAGE__")
             || (invocant_node.map(|n| n.kind()) == Some("package")
                 && invocant_text.as_ref() == self.current_package.as_ref());
-        if is_pkg_call && self.is_dbic_class() {
+        if is_pkg_call {
             if let Some(ref name) = method_name {
-                self.visit_dbic_class_method(node, name);
+                // load_components — register components as parents for method resolution
+                // Works for any class (DBIC, Catalyst, etc.) — components are mixins
+                if name == "load_components" {
+                    self.visit_load_components(node);
+                }
+                // DBIC accessor synthesis
+                if self.is_dbic_class() {
+                    self.visit_dbic_class_method(node, name);
+                }
             }
         }
 
@@ -4796,6 +4870,84 @@ sub transform { }
             class Child :isa(Parent) { }
         ");
         assert_eq!(fa.package_parents.get("Child").unwrap(), &vec!["Parent".to_string()]);
+    }
+
+    #[test]
+    fn test_class_does_populates_package_parents() {
+        let fa = build_fa("
+            class MyClass :does(Printable) :does(Serializable) { }
+        ");
+        let parents = fa.package_parents.get("MyClass").unwrap();
+        assert!(parents.contains(&"Printable".to_string()));
+        assert!(parents.contains(&"Serializable".to_string()));
+    }
+
+    #[test]
+    fn test_class_isa_and_does_combined() {
+        let fa = build_fa("
+            class Child :isa(Parent) :does(Role) { }
+        ");
+        let parents = fa.package_parents.get("Child").unwrap();
+        assert_eq!(parents, &vec!["Parent".to_string(), "Role".to_string()]);
+    }
+
+    #[test]
+    fn test_with_role_populates_package_parents() {
+        let fa = build_fa("
+            package MyApp;
+            use Moo;
+            with 'My::Role::Logging';
+        ");
+        let parents = fa.package_parents.get("MyApp").unwrap();
+        assert!(parents.contains(&"My::Role::Logging".to_string()));
+    }
+
+    #[test]
+    fn test_with_multiple_roles() {
+        let fa = build_fa("
+            package MyApp;
+            use Moose;
+            with 'Role::A', 'Role::B';
+        ");
+        let parents = fa.package_parents.get("MyApp").unwrap();
+        assert!(parents.contains(&"Role::A".to_string()));
+        assert!(parents.contains(&"Role::B".to_string()));
+    }
+
+    #[test]
+    fn test_load_components_bare() {
+        let fa = build_fa("
+            package MySchema::Result::User;
+            use base 'DBIx::Class::Core';
+            __PACKAGE__->load_components('InflateColumn::DateTime', 'TimeStamp');
+        ");
+        let parents = fa.package_parents.get("MySchema::Result::User").unwrap();
+        assert!(parents.contains(&"DBIx::Class::Core".to_string()));
+        assert!(parents.contains(&"DBIx::Class::InflateColumn::DateTime".to_string()));
+        assert!(parents.contains(&"DBIx::Class::TimeStamp".to_string()));
+    }
+
+    #[test]
+    fn test_load_components_plus_prefix() {
+        let fa = build_fa("
+            package MySchema::Result::User;
+            use base 'DBIx::Class::Core';
+            __PACKAGE__->load_components('+My::Custom::Component');
+        ");
+        let parents = fa.package_parents.get("MySchema::Result::User").unwrap();
+        assert!(parents.contains(&"My::Custom::Component".to_string()));
+    }
+
+    #[test]
+    fn test_load_components_qw() {
+        let fa = build_fa("
+            package MySchema::ResultSet::User;
+            use base 'DBIx::Class::Core';
+            __PACKAGE__->load_components(qw(Helper::ResultSet::Shortcut Helper::ResultSet::Me));
+        ");
+        let parents = fa.package_parents.get("MySchema::ResultSet::User").unwrap();
+        assert!(parents.contains(&"DBIx::Class::Helper::ResultSet::Shortcut".to_string()));
+        assert!(parents.contains(&"DBIx::Class::Helper::ResultSet::Me".to_string()));
     }
 
     // ---- Inheritance method resolution tests ----
