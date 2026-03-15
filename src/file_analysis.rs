@@ -105,6 +105,8 @@ pub struct Symbol {
     pub selection_span: Span,
     /// Scope this symbol is declared in.
     pub scope: ScopeId,
+    /// The package this symbol belongs to (captured at creation time).
+    pub package: Option<String>,
     /// Kind-specific extra data.
     pub detail: SymbolDetail,
 }
@@ -399,6 +401,10 @@ pub struct FileAnalysis {
     /// Return types from imported functions (populated after build from module index).
     pub imported_return_types: HashMap<String, InferredType>,
 
+    /// Functions implicitly imported by OOP frameworks (e.g. `has`, `extends`, `with`).
+    /// Used to suppress "not defined" diagnostics for these known framework keywords.
+    pub framework_imports: HashSet<String>,
+
     // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
     base_type_constraint_count: usize,
     base_symbol_count: usize,
@@ -423,6 +429,7 @@ impl FileAnalysis {
         call_bindings: Vec<CallBinding>,
         package_parents: HashMap<String, Vec<String>>,
         method_call_bindings: Vec<MethodCallBinding>,
+        framework_imports: HashSet<String>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -435,6 +442,7 @@ impl FileAnalysis {
             method_call_bindings,
             package_parents,
             imported_return_types: HashMap::new(),
+            framework_imports,
             base_type_constraint_count: 0,
             base_symbol_count: 0,
             scope_starts: Vec::new(),
@@ -663,6 +671,7 @@ impl FileAnalysis {
                     span: zero_span,
                     selection_span: zero_span,
                     scope: ScopeId(0),
+                    package: None,
                     detail: SymbolDetail::HashKeyDef {
                         owner: owner.clone(),
                         is_dynamic: false,
@@ -1755,10 +1764,13 @@ impl FileAnalysis {
     /// Check if a symbol is defined within a class/package.
     pub(crate) fn symbol_in_class(&self, sym_id: SymbolId, class_name: &str) -> bool {
         let sym = self.symbol(sym_id);
-        // Use scope_at to find the innermost scope containing this symbol.
-        // For subs, this finds the Sub scope (which has the correct package
-        // from when it was defined), rather than the enclosing scope the
-        // symbol was recorded in.
+        // Fast path: check the package captured at symbol creation time.
+        // This is authoritative for multi-package files where the scope's
+        // mutable `package` field gets overwritten by later package statements.
+        if let Some(ref pkg) = sym.package {
+            return pkg == class_name;
+        }
+        // Fallback: walk the scope chain for symbols without a package field.
         let start_scope = self.scope_at(sym.span.start).unwrap_or(sym.scope);
         let chain = self.scope_chain(start_scope);
         for scope_id in &chain {
@@ -2025,6 +2037,8 @@ pub struct SignatureInfo {
     pub is_method: bool,
     /// End of the sub body — used to query inferred types for params.
     pub body_end: Point,
+    /// Pre-resolved param types (for cross-file subs where body_end is meaningless).
+    pub param_types: Option<Vec<Option<String>>>,
 }
 
 // ---- Completion query methods ----
@@ -2391,9 +2405,15 @@ impl FileAnalysis {
                     params,
                     is_method,
                     body_end: sub_sym.span.end,
+                    param_types: None, // local — use inferred_type() with body_end
                 })
             }
             ResolvedSub::CrossFile { params: exported_params, is_method: cf_is_method, .. } => {
+                // Collect pre-resolved param types before stripping $self/$class
+                let all_types: Vec<Option<String>> = exported_params.iter()
+                    .map(|p| p.inferred_type.clone())
+                    .collect();
+
                 let mut params: Vec<ParamInfo> = exported_params
                     .iter()
                     .map(|p| ParamInfo {
@@ -2406,11 +2426,15 @@ impl FileAnalysis {
                 let is_method = is_method || cf_is_method
                     || params.first().map_or(false, |p| p.name == "$self" || p.name == "$class");
 
-                // Strip $self/$class from method params
+                // Strip $self/$class from method params (and their types)
+                let mut param_types = all_types;
                 if is_method && !params.is_empty() {
                     let first = &params[0].name;
                     if first == "$self" || first == "$class" {
                         params.remove(0);
+                        if !param_types.is_empty() {
+                            param_types.remove(0);
+                        }
                     }
                 }
 
@@ -2418,7 +2442,8 @@ impl FileAnalysis {
                     name: name.to_string(),
                     params,
                     is_method,
-                    body_end: Point::new(0, 0), // no local body
+                    body_end: Point::new(0, 0),
+                    param_types: Some(param_types),
                 })
             }
         }
@@ -2911,6 +2936,7 @@ mod tests {
             vec![],
             HashMap::new(),
             vec![],
+            HashSet::new(),
         )
     }
 
@@ -2989,6 +3015,7 @@ mod tests {
                 span: Span { start: Point::new(0, 0), end: Point::new(2, 1) },
                 selection_span: Span { start: Point::new(0, 4), end: Point::new(0, 14) },
                 scope: ScopeId(0),
+                package: None,
                 detail: SymbolDetail::Sub {
                     params: vec![],
                     is_method: false,
@@ -3003,6 +3030,7 @@ mod tests {
             vec![],
             HashMap::new(),
             vec![],
+            HashSet::new(),
         );
         assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
         assert_eq!(fa.sub_return_type("nonexistent"), None);
@@ -3160,6 +3188,7 @@ mod tests {
             }],
             HashMap::new(),
             vec![],
+            HashSet::new(),
         );
 
         let mut imported = HashMap::new();

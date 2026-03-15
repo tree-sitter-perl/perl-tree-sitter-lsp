@@ -508,17 +508,25 @@ pub fn signature_help(
         let param_labels: Vec<String> = sig_info
             .params
             .iter()
-            .map(|p| {
+            .enumerate()
+            .map(|(i, p)| {
                 let base = if let Some(ref default) = p.default {
                     format!("{} = {}", p.name, default)
                 } else {
                     p.name.clone()
                 };
-                // Look up inferred type at end of sub body (captures all operator usage)
                 // Skip $self/$class — type is obvious
                 if p.name == "$self" || p.name == "$class" {
                     return base;
                 }
+                // Cross-file: use pre-resolved param types
+                if let Some(ref types) = sig_info.param_types {
+                    if let Some(Some(ref type_tag)) = types.get(i) {
+                        return format!("{}: {}", base, type_tag);
+                    }
+                    return base;
+                }
+                // Local: look up inferred type at end of sub body
                 if let Some(ty) = analysis.inferred_type(&p.name, sig_info.body_end) {
                     format!("{}: {}", base, format_inferred_type(ty))
                 } else {
@@ -986,6 +994,11 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
             continue;
         }
 
+        // Skip functions implicitly imported by OOP frameworks (has, extends, etc.)
+        if analysis.framework_imports.contains(name.as_str()) {
+            continue;
+        }
+
         // Skip if explicitly listed in any import's qw(...)
         let explicitly_imported = analysis
             .imports
@@ -1059,6 +1072,11 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
     // 5e: Unresolved method diagnostics for locally-defined classes
     let universal_methods = [
         "new", "AUTOLOAD", "DESTROY", "can", "isa", "DOES", "VERSION",
+        // DBIC meta-methods (inherited from DBIx::Class::Core)
+        "add_columns", "set_primary_key", "table", "resultset_class",
+        "has_many", "has_one", "belongs_to", "might_have", "many_to_many",
+        // Moose/Moo meta-methods
+        "meta",
     ];
     for r in &analysis.refs {
         let (invocant, _invocant_span) = match &r.kind {

@@ -43,6 +43,8 @@ pub struct ExportedSub {
 pub struct ExportedParam {
     pub name: String,
     pub is_slurpy: bool,
+    /// Inferred type from body usage (e.g. "Numeric", "String"), for cross-file signature help.
+    pub inferred_type: Option<String>,
 }
 
 /// Exports extracted from a .pm file.

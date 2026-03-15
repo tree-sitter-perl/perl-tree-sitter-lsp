@@ -433,6 +433,7 @@ fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<Modul
                         Some(ExportedParam {
                             name: p.get("name")?.as_str()?.to_string(),
                             is_slurpy: p.get("is_slurpy").and_then(|v| v.as_bool()).unwrap_or(false),
+                            inferred_type: p.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()),
                         })
                     }).collect())
                     .unwrap_or_default();
@@ -524,10 +525,17 @@ pub fn subprocess_main(path: &str, module_name: Option<&str>) {
                     if let SymbolDetail::Sub { ref params, is_method, ref doc, .. } = sym.detail {
                         sub_info.insert("is_method".into(), is_method.into());
                         let params_json: Vec<serde_json::Value> = params.iter()
-                            .map(|p| serde_json::json!({
-                                "name": p.name,
-                                "is_slurpy": p.is_slurpy,
-                            }))
+                            .map(|p| {
+                                let mut obj = serde_json::json!({
+                                    "name": p.name,
+                                    "is_slurpy": p.is_slurpy,
+                                });
+                                // Carry inferred param type for cross-file signature help
+                                if let Some(ty) = analysis.inferred_type(&p.name, sym.span.end) {
+                                    obj["type"] = serde_json::Value::String(inferred_type_to_tag(ty));
+                                }
+                                obj
+                            })
                             .collect();
                         sub_info.insert("params".into(), params_json.into());
                         if let Some(ref d) = doc {
@@ -570,10 +578,16 @@ pub fn subprocess_main(path: &str, module_name: Option<&str>) {
             sub_info.insert("is_method".into(), is_method.into());
             if let SymbolDetail::Sub { ref params, ref doc, .. } = sym.detail {
                 let params_json: Vec<serde_json::Value> = params.iter()
-                    .map(|p| serde_json::json!({
-                        "name": p.name,
-                        "is_slurpy": p.is_slurpy,
-                    }))
+                    .map(|p| {
+                        let mut obj = serde_json::json!({
+                            "name": p.name,
+                            "is_slurpy": p.is_slurpy,
+                        });
+                        if let Some(ty) = analysis.inferred_type(&p.name, sym.span.end) {
+                            obj["type"] = serde_json::Value::String(inferred_type_to_tag(ty));
+                        }
+                        obj
+                    })
                     .collect();
                 sub_info.insert("params".into(), params_json.into());
                 if let Some(ref d) = doc {
@@ -668,7 +682,11 @@ pub fn resolve_and_parse(
                     if let SymbolDetail::Sub { params: ref p, is_method: m, doc: ref d, .. } = sym.detail {
                         is_method = m;
                         params = p.iter()
-                            .map(|pi| ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy })
+                            .map(|pi| {
+                                let param_type = analysis.inferred_type(&pi.name, sym.span.end)
+                                    .map(|t| inferred_type_to_tag(t));
+                                ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy, inferred_type: param_type }
+                            })
                             .collect();
                         doc = d.clone();
                     }
@@ -697,7 +715,11 @@ pub fn resolve_and_parse(
             let mut doc = None;
             if let SymbolDetail::Sub { params: ref p, doc: ref d, .. } = sym.detail {
                 params = p.iter()
-                    .map(|pi| ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy })
+                    .map(|pi| {
+                        let param_type = analysis.inferred_type(&pi.name, sym.span.end)
+                            .map(|t| inferred_type_to_tag(t));
+                        ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy, inferred_type: param_type }
+                    })
                     .collect();
                 doc = d.clone();
             }

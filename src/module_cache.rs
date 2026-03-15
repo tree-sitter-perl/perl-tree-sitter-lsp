@@ -19,7 +19,7 @@ const SCHEMA_VERSION: &str = "8";
 /// Bumped when extraction logic changes (new fields, better parsing).
 /// Unlike SCHEMA_VERSION, this doesn't drop the table — stale entries
 /// are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 2;
+pub const EXTRACT_VERSION: i64 = 3;
 
 pub fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
@@ -290,6 +290,7 @@ fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
                                     .get("is_slurpy")
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(false),
+                                inferred_type: p.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()),
                             })
                         })
                         .collect()
@@ -645,7 +646,7 @@ mod tests {
             ExportedSub {
                 def_line: 5,
                 params: vec![
-                    ExportedParam { name: "$path".into(), is_slurpy: false },
+                    ExportedParam { name: "$path".into(), is_slurpy: false, inferred_type: None },
                 ],
                 is_method: false,
                 return_type: Some(InferredType::HashRef),
@@ -668,7 +669,7 @@ mod tests {
             "new_obj".to_string(),
             ExportedSub {
                 def_line: 30,
-                params: vec![ExportedParam { name: "$class".into(), is_slurpy: false }],
+                params: vec![ExportedParam { name: "$class".into(), is_slurpy: false, inferred_type: None }],
                 is_method: true,
                 return_type: Some(InferredType::ClassName("MyObj".into())),
                 hash_keys: vec![],
