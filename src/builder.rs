@@ -1414,6 +1414,38 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Infer the type of a Mojo::Base `has` default value.
+    ///
+    /// Handles: `has name => 'str'`, `has name => 42`, `has name => []`,
+    /// `has name => {}`, `has name => sub { [] }` (looks at sub body's
+    /// last expression), `has name => Foo->new`.
+    fn infer_mojo_default_type(&self, node: Node<'a>) -> Option<InferredType> {
+        match node.kind() {
+            "string_literal" | "interpolated_string_literal" => Some(InferredType::String),
+            "number" => Some(InferredType::Numeric),
+            "anonymous_hash_expression" => Some(InferredType::HashRef),
+            "anonymous_array_expression" => Some(InferredType::ArrayRef),
+            "anonymous_subroutine_expression" => {
+                // sub { ... } — look at the last expression in the block for the return type
+                let body = node.child_by_field_name("body")?;
+                let last_stmt = body.named_child(body.named_child_count().checked_sub(1)?)?;
+                let expr = if last_stmt.kind() == "expression_statement" {
+                    last_stmt.named_child(0)?
+                } else if last_stmt.kind() == "return_expression" {
+                    last_stmt.named_child(0)?
+                } else {
+                    last_stmt
+                };
+                self.infer_mojo_default_type(expr)
+            }
+            "method_call_expression" => {
+                // Foo->new — constructor
+                self.extract_constructor_class(node).map(InferredType::ClassName)
+            }
+            _ => None,
+        }
+    }
+
     /// Infer the type of a return expression's value.
     ///
     /// Handles:
@@ -1775,6 +1807,7 @@ impl<'a> Builder<'a> {
         let mut attr_names: Vec<(String, Span)> = Vec::new();
         let mut is_value: Option<String> = None;
         let mut isa_value: Option<String> = None;
+        let mut mojo_default_node: Option<Node<'a>> = None;
 
         // Get the arguments node
         let args = match node.child_by_field_name("arguments") {
@@ -1818,7 +1851,12 @@ impl<'a> Builder<'a> {
             }
 
             // After first arg: options (Moo/Moose) or default value (Mojo::Base)
-            if mode != FrameworkMode::MojoBase {
+            if mode == FrameworkMode::MojoBase {
+                // Capture default value node for type inference
+                if mojo_default_node.is_none() {
+                    mojo_default_node = Some(*child);
+                }
+            } else {
                 match child.kind() {
                     "list_expression" | "parenthesized_expression" => {
                         let pairs = self.extract_fat_comma_pairs(*child);
@@ -1916,9 +1954,13 @@ impl<'a> Builder<'a> {
                 }
             }
             FrameworkMode::MojoBase => {
+                // Infer getter return type from default value if present
+                let getter_type = mojo_default_node
+                    .and_then(|n| self.infer_mojo_default_type(n));
+
                 // Mojo::Base `has` produces getter + setter (two symbols)
                 for (name, sel_span) in &attr_names {
-                    // Getter: no params, return type inferable from usage
+                    // Getter: no params, return type from default value (or None)
                     self.add_symbol(
                         name.clone(),
                         SymKind::Method,
@@ -1927,7 +1969,7 @@ impl<'a> Builder<'a> {
                         SymbolDetail::Sub {
                             params: vec![],
                             is_method: true,
-                            return_type: None,
+                            return_type: getter_type.clone(),
                             doc: None,
                         },
                     );
@@ -5461,5 +5503,72 @@ has 'title';
         // Default (None): getter (primary, first symbol)
         let rt_default = fa.find_method_return_type("Bar", "title", None, None);
         assert!(rt_default.is_none(), "default should return getter type");
+    }
+
+    #[test]
+    fn test_mojo_default_string_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has name => 'default';
+");
+        let rt = fa.find_method_return_type("App", "name", None, Some(0));
+        assert_eq!(rt, Some(InferredType::String), "string default → String getter");
+    }
+
+    #[test]
+    fn test_mojo_default_arrayref_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has items => sub { [] };
+");
+        let rt = fa.find_method_return_type("App", "items", None, Some(0));
+        assert_eq!(rt, Some(InferredType::ArrayRef), "sub {{ [] }} default → ArrayRef getter");
+    }
+
+    #[test]
+    fn test_mojo_default_hashref_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has config => sub { {} };
+");
+        let rt = fa.find_method_return_type("App", "config", None, Some(0));
+        assert_eq!(rt, Some(InferredType::HashRef), "sub {{{{ }}}} default → HashRef getter");
+    }
+
+    #[test]
+    fn test_mojo_default_constructor_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has ua => sub { Mojo::UserAgent->new };
+");
+        let rt = fa.find_method_return_type("App", "ua", None, Some(0));
+        assert_eq!(rt, Some(InferredType::ClassName("Mojo::UserAgent".into())),
+            "sub {{ Foo->new }} default → ClassName getter");
+    }
+
+    #[test]
+    fn test_mojo_default_number_infers_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has timeout => 30;
+");
+        let rt = fa.find_method_return_type("App", "timeout", None, Some(0));
+        assert_eq!(rt, Some(InferredType::Numeric), "number default → Numeric getter");
+    }
+
+    #[test]
+    fn test_mojo_default_no_value_no_type() {
+        let fa = build_fa("
+package App;
+use Mojo::Base -base;
+has 'name';
+");
+        let rt = fa.find_method_return_type("App", "name", None, Some(0));
+        assert!(rt.is_none(), "no default → no getter type");
     }
 }
