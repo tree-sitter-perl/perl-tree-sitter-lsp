@@ -37,6 +37,16 @@ pub struct ExportedSub {
     pub hash_keys: Vec<String>,
     /// Pre-rendered markdown from POD or comments.
     pub doc: Option<String>,
+    /// Additional calling conventions (e.g. setter overload for rw accessors).
+    /// Empty for normal subs. Primary fields above hold the getter (0-param) variant.
+    pub overloads: Vec<ExportedOverload>,
+}
+
+/// An additional calling convention for the same method name.
+#[derive(Debug, Clone)]
+pub struct ExportedOverload {
+    pub params: Vec<ExportedParam>,
+    pub return_type: Option<InferredType>,
 }
 
 #[derive(Debug, Clone)]
@@ -490,6 +500,7 @@ mod tests {
             return_type: Some(InferredType::HashRef),
             hash_keys: vec![],
             doc: None,
+            overloads: vec![],
         });
         subs.insert("make_obj".to_string(), ExportedSub {
             def_line: 20,
@@ -498,6 +509,7 @@ mod tests {
             return_type: Some(InferredType::ClassName("MyClass".into())),
             hash_keys: vec![],
             doc: None,
+            overloads: vec![],
         });
 
         idx.insert_cache(

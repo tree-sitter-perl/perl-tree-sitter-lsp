@@ -19,7 +19,7 @@ use crate::cpanfile;
 use crate::file_analysis::inferred_type_from_tag;
 use crate::file_analysis::inferred_type_to_tag;
 use crate::module_cache;
-use crate::module_index::{ExportedParam, ExportedSub, ModuleExports, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
+use crate::module_index::{ExportedOverload, ExportedParam, ExportedSub, ModuleExports, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
 
 /// Hard timeout for parsing a single .pm file in a child process.
 #[cfg(not(test))]
@@ -447,7 +447,25 @@ fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<Modul
                 let doc = val.get("doc")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                Some((name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc }))
+                let overloads = val.get("overloads")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|o| {
+                        let ol_params = o.get("params")
+                            .and_then(|p| p.as_array())
+                            .map(|pa| pa.iter().filter_map(|pv| {
+                                let pname = pv.get("name")?.as_str()?.to_string();
+                                let slurpy = pv.get("is_slurpy").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let inferred_type = pv.get("type").and_then(|v| v.as_str()).map(String::from);
+                                Some(ExportedParam { name: pname, is_slurpy: slurpy, inferred_type })
+                            }).collect())
+                            .unwrap_or_default();
+                        let ol_rt = o.get("return_type")
+                            .and_then(|v| v.as_str())
+                            .and_then(inferred_type_from_tag);
+                        Some(ExportedOverload { params: ol_params, return_type: ol_rt })
+                    }).collect())
+                    .unwrap_or_default();
+                Some((name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc, overloads }))
             }).collect()
         })
         .unwrap_or_default();
@@ -516,37 +534,57 @@ pub fn subprocess_main(path: &str, module_name: Option<&str>) {
         }
 
         for name in export.iter().chain(export_ok.iter()) {
-            let mut sub_info = serde_json::Map::new();
+            // Collect all symbols matching this export name (may have overloads)
+            let matching_syms: Vec<_> = analysis.symbols.iter()
+                .filter(|sym| sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method))
+                .collect();
 
-            // Find the sub symbol for definition line + params + doc
-            for sym in &analysis.symbols {
-                if sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                    sub_info.insert("def_line".into(), sym.span.start.row.into());
-                    if let SymbolDetail::Sub { ref params, is_method, ref doc, .. } = sym.detail {
-                        sub_info.insert("is_method".into(), is_method.into());
-                        let params_json: Vec<serde_json::Value> = params.iter()
-                            .map(|p| {
-                                let mut obj = serde_json::json!({
-                                    "name": p.name,
-                                    "is_slurpy": p.is_slurpy,
-                                });
-                                // Carry inferred param type for cross-file signature help
-                                if let Some(ty) = analysis.inferred_type(&p.name, sym.span.end) {
-                                    obj["type"] = serde_json::Value::String(inferred_type_to_tag(ty));
-                                }
-                                obj
-                            })
-                            .collect();
-                        sub_info.insert("params".into(), params_json.into());
-                        if let Some(ref d) = doc {
-                            sub_info.insert("doc".into(), serde_json::Value::String(d.clone()));
+            if matching_syms.is_empty() {
+                // No symbol found — still emit entry for hash keys / return type
+                let mut sub_info = serde_json::Map::new();
+                if let Some(ty) = analysis.sub_return_type(name) {
+                    sub_info.insert("return_type".into(),
+                        serde_json::Value::String(inferred_type_to_tag(ty)));
+                }
+                let owner = crate::file_analysis::HashKeyOwner::Sub(name.clone());
+                let keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                if !keys.is_empty() {
+                    sub_info.insert("hash_keys".into(), serde_json::json!(keys));
+                }
+                if !sub_info.is_empty() {
+                    subs_map.insert(name.clone(), sub_info.into());
+                }
+                continue;
+            }
+
+            // First symbol becomes the primary entry
+            let primary = matching_syms[0];
+            let mut sub_info = serde_json::Map::new();
+            sub_info.insert("def_line".into(), primary.span.start.row.into());
+            if let SymbolDetail::Sub { ref params, is_method, ref doc, .. } = primary.detail {
+                sub_info.insert("is_method".into(), is_method.into());
+                let params_json: Vec<serde_json::Value> = params.iter()
+                    .map(|p| {
+                        let mut obj = serde_json::json!({
+                            "name": p.name,
+                            "is_slurpy": p.is_slurpy,
+                        });
+                        if let Some(ty) = analysis.inferred_type(&p.name, primary.span.end) {
+                            obj["type"] = serde_json::Value::String(inferred_type_to_tag(ty));
                         }
-                    }
-                    break;
+                        obj
+                    })
+                    .collect();
+                sub_info.insert("params".into(), params_json.into());
+                if let Some(ref d) = doc {
+                    sub_info.insert("doc".into(), serde_json::Value::String(d.clone()));
                 }
             }
 
-            // Return type
+            // Return type (uses sub_return_type which picks the first symbol's return type)
             if let Some(ty) = analysis.sub_return_type(name) {
                 sub_info.insert("return_type".into(),
                     serde_json::Value::String(inferred_type_to_tag(ty)));
@@ -562,15 +600,76 @@ pub fn subprocess_main(path: &str, module_name: Option<&str>) {
                 sub_info.insert("hash_keys".into(), serde_json::json!(keys));
             }
 
-            if !sub_info.is_empty() {
-                subs_map.insert(name.clone(), sub_info.into());
+            // Remaining symbols become overloads
+            if matching_syms.len() > 1 {
+                let mut overloads = Vec::new();
+                for sym in &matching_syms[1..] {
+                    let mut ol_params = Vec::new();
+                    if let SymbolDetail::Sub { ref params, .. } = sym.detail {
+                        ol_params = params.iter()
+                            .map(|p| {
+                                let mut obj = serde_json::json!({ "name": p.name, "is_slurpy": p.is_slurpy });
+                                if let Some(ty) = analysis.inferred_type(&p.name, sym.span.end) {
+                                    obj["type"] = serde_json::Value::String(inferred_type_to_tag(ty));
+                                }
+                                obj
+                            })
+                            .collect::<Vec<_>>();
+                    }
+                    let ol_rt = if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
+                        return_type.as_ref().map(|t| serde_json::Value::String(inferred_type_to_tag(t)))
+                    } else { None };
+                    let mut overload = serde_json::json!({ "params": ol_params });
+                    if let Some(rt) = ol_rt {
+                        overload["return_type"] = rt;
+                    }
+                    overloads.push(overload);
+                }
+                sub_info.insert("overloads".into(), serde_json::json!(overloads));
             }
+
+            subs_map.insert(name.clone(), sub_info.into());
         }
+
+        // Names fully handled by the export loop above (including all overloads)
+        let exported_names: std::collections::HashSet<&str> =
+            export.iter().chain(export_ok.iter()).map(|s| s.as_str()).collect();
 
         // Also include all subs not in @EXPORT/@EXPORT_OK — needed for inheritance.
         for sym in &analysis.symbols {
             if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-            if subs_map.contains_key(&sym.name) { continue; }
+            // Skip symbols already fully handled by the export loop
+            if exported_names.contains(sym.name.as_str()) { continue; }
+
+            // Merge duplicate names as overloads (e.g. getter + setter for rw accessors)
+            if let Some(existing) = subs_map.get_mut(&sym.name) {
+                let existing_obj = existing.as_object_mut().unwrap();
+                let overloads = existing_obj
+                    .entry("overloads")
+                    .or_insert_with(|| serde_json::json!([]));
+                let mut ol_params = Vec::new();
+                if let SymbolDetail::Sub { ref params, .. } = sym.detail {
+                    ol_params = params.iter()
+                        .map(|p| {
+                            let mut obj = serde_json::json!({ "name": p.name, "is_slurpy": p.is_slurpy });
+                            if let Some(ty) = analysis.inferred_type(&p.name, sym.span.end) {
+                                obj["type"] = serde_json::Value::String(inferred_type_to_tag(ty));
+                            }
+                            obj
+                        })
+                        .collect::<Vec<_>>();
+                }
+                let ol_rt = if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
+                    return_type.as_ref().map(|t| serde_json::Value::String(inferred_type_to_tag(t)))
+                } else { None };
+                let mut overload = serde_json::json!({ "params": ol_params });
+                if let Some(rt) = ol_rt {
+                    overload["return_type"] = rt;
+                }
+                overloads.as_array_mut().unwrap().push(overload);
+                continue;
+            }
+
             let is_method = matches!(sym.detail, SymbolDetail::Sub { is_method: true, .. })
                 || sym.kind == SymKind::Method;
             let mut sub_info = serde_json::Map::new();
@@ -671,28 +770,30 @@ pub fn resolve_and_parse(
         }
 
         for name in export.iter().chain(export_ok.iter()) {
-            let mut def_line = 0u32;
-            let mut params = Vec::new();
-            let mut is_method = false;
-            let mut doc = None;
+            // Collect all symbols matching this export name (may have overloads)
+            let matching_syms: Vec<_> = analysis.symbols.iter()
+                .filter(|sym| sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method))
+                .collect();
 
-            for sym in &analysis.symbols {
-                if sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                    def_line = sym.span.start.row as u32;
-                    if let SymbolDetail::Sub { params: ref p, is_method: m, doc: ref d, .. } = sym.detail {
-                        is_method = m;
-                        params = p.iter()
-                            .map(|pi| {
-                                let param_type = analysis.inferred_type(&pi.name, sym.span.end)
-                                    .map(|t| inferred_type_to_tag(t));
-                                ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy, inferred_type: param_type }
-                            })
-                            .collect();
-                        doc = d.clone();
-                    }
-                    break;
+            let (def_line, params, is_method, doc) = if let Some(primary) = matching_syms.first() {
+                let mut p = Vec::new();
+                let mut im = false;
+                let mut d = None;
+                if let SymbolDetail::Sub { params: ref pp, is_method: m, doc: ref dd, .. } = primary.detail {
+                    im = m;
+                    p = pp.iter()
+                        .map(|pi| {
+                            let param_type = analysis.inferred_type(&pi.name, primary.span.end)
+                                .map(|t| inferred_type_to_tag(t));
+                            ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy, inferred_type: param_type }
+                        })
+                        .collect();
+                    d = dd.clone();
                 }
-            }
+                (primary.span.start.row as u32, p, im, d)
+            } else {
+                (0u32, Vec::new(), false, None)
+            };
 
             let return_type = analysis.sub_return_type(name).cloned();
             let owner = crate::file_analysis::HashKeyOwner::Sub(name.clone());
@@ -701,13 +802,56 @@ pub fn resolve_and_parse(
                 .map(|s| s.name.clone())
                 .collect();
 
-            subs.insert(name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc });
+            // Remaining symbols become overloads
+            let overloads: Vec<ExportedOverload> = matching_syms.iter().skip(1).map(|sym| {
+                let mut ol_params = Vec::new();
+                if let SymbolDetail::Sub { params: ref p, .. } = sym.detail {
+                    ol_params = p.iter()
+                        .map(|pi| {
+                            let param_type = analysis.inferred_type(&pi.name, sym.span.end)
+                                .map(|t| inferred_type_to_tag(t));
+                            ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy, inferred_type: param_type }
+                        })
+                        .collect();
+                }
+                let ol_rt = if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
+                    return_type.clone()
+                } else { None };
+                ExportedOverload { params: ol_params, return_type: ol_rt }
+            }).collect();
+
+            subs.insert(name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc, overloads });
         }
+
+        // Names fully handled by the export loop above (including all overloads)
+        let exported_names: std::collections::HashSet<&str> =
+            export.iter().chain(export_ok.iter()).map(|s| s.as_str()).collect();
 
         // Also include methods not in @EXPORT/@EXPORT_OK — needed for inheritance.
         for sym in &analysis.symbols {
             if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-            if subs.contains_key(&sym.name) { continue; }
+            // Skip symbols already fully handled by the export loop
+            if exported_names.contains(sym.name.as_str()) { continue; }
+
+            // Merge duplicate names as overloads (e.g. getter + setter for rw accessors)
+            if let Some(existing) = subs.get_mut(&sym.name) {
+                let mut ol_params = Vec::new();
+                if let SymbolDetail::Sub { params: ref p, .. } = sym.detail {
+                    ol_params = p.iter()
+                        .map(|pi| {
+                            let param_type = analysis.inferred_type(&pi.name, sym.span.end)
+                                .map(|t| inferred_type_to_tag(t));
+                            ExportedParam { name: pi.name.clone(), is_slurpy: pi.is_slurpy, inferred_type: param_type }
+                        })
+                        .collect();
+                }
+                let ol_rt = if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
+                    return_type.clone()
+                } else { None };
+                existing.overloads.push(ExportedOverload { params: ol_params, return_type: ol_rt });
+                continue;
+            }
+
             let is_method_flag = matches!(sym.detail, SymbolDetail::Sub { is_method: true, .. })
                 || sym.kind == SymKind::Method;
             let def_line = sym.span.start.row as u32;
@@ -730,7 +874,7 @@ pub fn resolve_and_parse(
                 .map(|s| s.name.clone())
                 .collect();
             subs.insert(sym.name.clone(), ExportedSub {
-                def_line, params, is_method: is_method_flag, return_type, hash_keys, doc,
+                def_line, params, is_method: is_method_flag, return_type, hash_keys, doc, overloads: vec![],
             });
         }
     }

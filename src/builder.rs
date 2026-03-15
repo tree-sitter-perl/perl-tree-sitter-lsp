@@ -1916,8 +1916,22 @@ impl<'a> Builder<'a> {
                 }
             }
             FrameworkMode::MojoBase => {
-                // All Mojo::Base `has` produces rw accessors
+                // Mojo::Base `has` produces getter + setter (two symbols)
                 for (name, sel_span) in &attr_names {
+                    // Getter: no params, return type inferable from usage
+                    self.add_symbol(
+                        name.clone(),
+                        SymKind::Method,
+                        node_to_span(node),
+                        *sel_span,
+                        SymbolDetail::Sub {
+                            params: vec![],
+                            is_method: true,
+                            return_type: None,
+                            doc: None,
+                        },
+                    );
+                    // Setter: fluent, returns $self for chaining
                     self.add_symbol(
                         name.clone(),
                         SymKind::Method,
@@ -1930,7 +1944,8 @@ impl<'a> Builder<'a> {
                                 is_slurpy: false,
                             }],
                             is_method: true,
-                            return_type: return_type.clone(),
+                            return_type: self.current_package.as_ref()
+                                .map(|pkg| InferredType::ClassName(pkg.clone())),
                             doc: None,
                         },
                     );
@@ -4798,7 +4813,7 @@ sub transform { }
             package SpecialFactory;
             use parent 'Factory';
         ");
-        let rt = fa.find_method_return_type("SpecialFactory", "create", None);
+        let rt = fa.find_method_return_type("SpecialFactory", "create", None, None);
         assert!(rt.is_some(), "should find return type from parent");
     }
 
@@ -4860,6 +4875,7 @@ sub transform { }
                 s.insert("connect".into(), ExportedSub {
                     def_line: 10, params: vec![], is_method: true,
                     return_type: None, hash_keys: vec![], doc: None,
+                    overloads: vec![],
                 });
                 s
             },
@@ -4876,6 +4892,7 @@ sub transform { }
                 s.insert("prepare".into(), ExportedSub {
                     def_line: 5, params: vec![], is_method: true,
                     return_type: None, hash_keys: vec![], doc: None,
+                    overloads: vec![],
                 });
                 s
             },
@@ -4915,6 +4932,7 @@ sub transform { }
                 s.insert("process".into(), ExportedSub {
                     def_line: 1, params: vec![], is_method: true,
                     return_type: None, hash_keys: vec![], doc: None,
+                    overloads: vec![],
                 });
                 s
             },
@@ -4954,6 +4972,7 @@ sub transform { }
                     return_type: Some(InferredType::HashRef),
                     hash_keys: vec!["status".into(), "body".into()],
                     doc: None,
+                    overloads: vec![],
                 });
                 s
             },
@@ -4965,7 +4984,7 @@ sub transform { }
             use parent 'Fetcher';
         ");
 
-        let rt = fa.find_method_return_type("MyFetcher", "fetch", Some(&idx));
+        let rt = fa.find_method_return_type("MyFetcher", "fetch", Some(&idx), None);
         assert_eq!(rt, Some(InferredType::HashRef));
     }
 
@@ -5194,10 +5213,21 @@ has 'name';
         let methods: Vec<_> = fa.symbols.iter()
             .filter(|s| s.name == "name" && s.kind == SymKind::Method)
             .collect();
-        assert_eq!(methods.len(), 1);
-        if let SymbolDetail::Sub { ref return_type, is_method, .. } = methods[0].detail {
+        assert_eq!(methods.len(), 2, "Mojo::Base synthesizes getter + setter");
+        // Getter: no params, no return type
+        let getter = methods.iter().find(|m| {
+            if let SymbolDetail::Sub { ref params, .. } = m.detail { params.is_empty() } else { false }
+        }).expect("should have getter");
+        if let SymbolDetail::Sub { ref return_type, is_method, .. } = getter.detail {
             assert!(is_method);
-            // Mojo::Base returns ClassName(current_package) for fluent chaining
+            assert!(return_type.is_none(), "getter has no return type");
+        }
+        // Setter: 1 param, fluent return
+        let setter = methods.iter().find(|m| {
+            if let SymbolDetail::Sub { ref params, .. } = m.detail { params.len() == 1 } else { false }
+        }).expect("should have setter");
+        if let SymbolDetail::Sub { ref return_type, is_method, .. } = setter.detail {
+            assert!(is_method);
             assert_eq!(return_type.as_ref(), Some(&InferredType::ClassName("Foo".into())));
         }
     }
@@ -5212,11 +5242,11 @@ has 'config';
         // Should register parent
         assert_eq!(fa.package_parents.get("MyApp").map(|v| v.as_slice()),
             Some(["Mojolicious".to_string()].as_slice()));
-        // Should synthesize accessor
+        // Should synthesize getter + setter accessors
         let methods: Vec<_> = fa.symbols.iter()
             .filter(|s| s.name == "config" && s.kind == SymKind::Method)
             .collect();
-        assert_eq!(methods.len(), 1);
+        assert_eq!(methods.len(), 2, "Mojo::Base synthesizes getter + setter");
     }
 
     #[test]
@@ -5342,5 +5372,94 @@ sub run {
         let dsn_binding = fa.method_call_bindings.iter()
             .find(|b| b.variable == "$dsn");
         assert!(dsn_binding.is_some(), "should have method call binding for $dsn");
+    }
+
+    #[test]
+    fn test_mojo_getter_setter_distinct() {
+        let fa = build_fa("
+package Foo;
+use Mojo::Base -base;
+has 'name';
+");
+        let methods: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 2, "should synthesize getter + setter");
+
+        let getter = methods.iter().find(|m| {
+            if let SymbolDetail::Sub { ref params, .. } = m.detail { params.is_empty() } else { false }
+        });
+        let setter = methods.iter().find(|m| {
+            if let SymbolDetail::Sub { ref params, .. } = m.detail { params.len() == 1 } else { false }
+        });
+        assert!(getter.is_some(), "should have a 0-param getter");
+        assert!(setter.is_some(), "should have a 1-param setter");
+
+        // Getter: no return type (inferable from usage)
+        if let SymbolDetail::Sub { ref return_type, .. } = getter.unwrap().detail {
+            assert!(return_type.is_none());
+        }
+        // Setter: fluent return
+        if let SymbolDetail::Sub { ref return_type, .. } = setter.unwrap().detail {
+            assert_eq!(return_type.as_ref(), Some(&InferredType::ClassName("Foo".into())));
+        }
+    }
+
+    #[test]
+    fn test_mojo_fluent_chain_resolves() {
+        let src = "
+package Foo;
+use Mojo::Base -base;
+has 'name';
+has 'age';
+sub greet {
+    my ($self) = @_;
+    my $result = $self->name('Bob')->age;
+    return $result;
+}
+";
+        let fa = build_fa(src);
+        // $self->name('Bob') has args → setter → returns Foo
+        // ->age has no args → getter → returns None (unknown)
+        // The chain should resolve: name('Bob') returns Foo, ->age is valid on Foo
+        let method_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "age" && matches!(r.kind, RefKind::MethodCall { .. }))
+            .collect();
+        assert!(!method_refs.is_empty(), "should have method call ref for 'age'");
+    }
+
+    #[test]
+    fn test_moo_rw_arity_resolution() {
+        let fa = build_fa("
+package Foo;
+use Moo;
+has 'name' => (is => 'rw', isa => 'Str');
+");
+        // Moo rw: both getter and setter have same return type (Str)
+        // With arity, both 0 and 1 should return String since both symbols have the same type
+        let rt_getter = fa.find_method_return_type("Foo", "name", None, Some(0));
+        assert_eq!(rt_getter, Some(InferredType::String));
+        let rt_setter = fa.find_method_return_type("Foo", "name", None, Some(1));
+        assert_eq!(rt_setter, Some(InferredType::String));
+        let rt_default = fa.find_method_return_type("Foo", "name", None, None);
+        assert_eq!(rt_default, Some(InferredType::String));
+    }
+
+    #[test]
+    fn test_mojo_arity_resolution() {
+        let fa = build_fa("
+package Bar;
+use Mojo::Base -base;
+has 'title';
+");
+        // Getter (0 args): no return type
+        let rt_getter = fa.find_method_return_type("Bar", "title", None, Some(0));
+        assert!(rt_getter.is_none(), "getter should have no return type");
+        // Setter (1 arg): fluent return (ClassName)
+        let rt_setter = fa.find_method_return_type("Bar", "title", None, Some(1));
+        assert_eq!(rt_setter, Some(InferredType::ClassName("Bar".into())));
+        // Default (None): getter (primary, first symbol)
+        let rt_default = fa.find_method_return_type("Bar", "title", None, None);
+        assert!(rt_default.is_none(), "default should return getter type");
     }
 }

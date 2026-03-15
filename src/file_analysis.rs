@@ -704,7 +704,7 @@ impl FileAnalysis {
             );
 
             if let Some(cn) = class_name {
-                if let Some(rt) = self.find_method_return_type(&cn, &binding.method_name, module_index) {
+                if let Some(rt) = self.find_method_return_type(&cn, &binding.method_name, module_index, None) {
                     self.type_constraints.push(TypeConstraint {
                         variable: binding.variable.clone(),
                         scope: binding.scope,
@@ -783,7 +783,8 @@ impl FileAnalysis {
                 if method_text == "new" {
                     return Some(InferredType::ClassName(class_name.to_string()));
                 }
-                self.find_method_return_type(class_name, method_text, module_index)
+                let arg_count = self.count_call_args(node);
+                self.find_method_return_type(class_name, method_text, module_index, Some(arg_count))
             }
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 let func_node = node.child_by_field_name("function")?;
@@ -882,9 +883,38 @@ impl FileAnalysis {
         class_name: &str,
         method_name: &str,
         module_index: Option<&ModuleIndex>,
+        arg_count: Option<usize>,
     ) -> Option<InferredType> {
         match self.resolve_method_in_ancestors(class_name, method_name, module_index) {
             Some(MethodResolution::Local { sym_id, .. }) => {
+                // Collect all matching symbols for arity selection
+                let candidates: Vec<_> = self.symbols_named(method_name).iter()
+                    .filter(|&&sid| {
+                        let s = self.symbol(sid);
+                        matches!(s.kind, SymKind::Sub | SymKind::Method)
+                            && self.symbol_in_class(sid, class_name)
+                    })
+                    .copied()
+                    .collect();
+
+                if candidates.len() <= 1 || arg_count.is_none() {
+                    // Single symbol or no arity info — primary (first match)
+                    if let SymbolDetail::Sub { ref return_type, .. } = self.symbol(sym_id).detail {
+                        return return_type.clone();
+                    }
+                    return None;
+                }
+
+                // Multiple overloads: pick by param count
+                let target = arg_count.unwrap();
+                for sid in &candidates {
+                    if let SymbolDetail::Sub { ref params, ref return_type, .. } = self.symbol(*sid).detail {
+                        if params.len() == target {
+                            return return_type.clone();
+                        }
+                    }
+                }
+                // No exact match — fall back to primary
                 if let SymbolDetail::Sub { ref return_type, .. } = self.symbol(sym_id).detail {
                     return_type.clone()
                 } else {
@@ -893,11 +923,42 @@ impl FileAnalysis {
             }
             Some(MethodResolution::CrossFile { ref class }) => {
                 module_index.and_then(|idx| {
-                    idx.get_exports_cached(class)
-                        .and_then(|e| e.subs.get(method_name)?.return_type.clone())
+                    let exports = idx.get_exports_cached(class)?;
+                    let sub = exports.subs.get(method_name)?;
+
+                    // If no arity info or no overloads, return primary
+                    let target = match arg_count {
+                        Some(n) if !sub.overloads.is_empty() => n,
+                        _ => return sub.return_type.clone(),
+                    };
+
+                    // Check primary params
+                    if sub.params.len() == target {
+                        return sub.return_type.clone();
+                    }
+                    // Check overloads
+                    for overload in &sub.overloads {
+                        if overload.params.len() == target {
+                            return overload.return_type.clone();
+                        }
+                    }
+                    // Fallback to primary
+                    sub.return_type.clone()
                 })
             }
             None => None,
+        }
+    }
+
+    /// Count arguments in a method/function call expression (excluding invocant).
+    pub(crate) fn count_call_args(&self, node: tree_sitter::Node) -> usize {
+        let args = match node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return 0,
+        };
+        match args.kind() {
+            "parenthesized_expression" | "list_expression" => args.named_child_count(),
+            _ => 1, // single argument
         }
     }
 
@@ -940,7 +1001,7 @@ impl FileAnalysis {
         } else {
             class_name.to_string()
         };
-        if let Some(ref rt) = self.find_method_return_type(class_name, method_name, module_index) {
+        if let Some(ref rt) = self.find_method_return_type(class_name, method_name, module_index, None) {
             format!("{} → {}", base, format_inferred_type(rt))
         } else {
             base
@@ -1372,7 +1433,7 @@ impl FileAnalysis {
                                     cn.to_string()
                                 };
                                 let mut text = format!("```perl\n{}\n```\n\n*class {}*", line.trim(), class_label);
-                                if let Some(ref rt) = self.find_method_return_type(cn, &r.target_name, module_index) {
+                                if let Some(ref rt) = self.find_method_return_type(cn, &r.target_name, module_index, None) {
                                     text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
                                 }
                                 return Some(text);
