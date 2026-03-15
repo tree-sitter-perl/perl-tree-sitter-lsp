@@ -3771,7 +3771,7 @@ my $p = Point->new(x => 3, y => 4);
         }
         ");
         // signature_for_call strips $self when first param is $self
-        let sig = fa.signature_for_call("process", false, None, Point::new(0, 0)).unwrap();
+        let sig = fa.signature_for_call("process", false, None, Point::new(0, 0), None).unwrap();
         assert!(sig.is_method, "should detect method from $self first param");
         assert_eq!(sig.params.len(), 2);
         assert_eq!(sig.params[0].name, "$file");
@@ -3799,7 +3799,7 @@ my $p = Point->new(x => 3, y => 4);
             my ($file, @opts) = @_;
         }
         ");
-        let sig = fa.signature_for_call("process", false, None, Point::new(0, 0)).unwrap();
+        let sig = fa.signature_for_call("process", false, None, Point::new(0, 0), None).unwrap();
         assert!(sig.is_method);
         assert_eq!(sig.params.len(), 2, "should have $file and @opts (stripped $self)");
         assert_eq!(sig.params[0].name, "$file");
@@ -3824,7 +3824,7 @@ my $p = Point->new(x => 3, y => 4);
             my $timeout = shift || 30;
         }
         ");
-        let sig = fa.signature_for_call("handler", false, None, Point::new(0, 0)).unwrap();
+        let sig = fa.signature_for_call("handler", false, None, Point::new(0, 0), None).unwrap();
         assert_eq!(sig.params.len(), 1, "stripped $self");
         assert_eq!(sig.params[0].name, "$timeout");
         assert_eq!(sig.params[0].default, Some("30".into()));
@@ -3838,7 +3838,7 @@ my $p = Point->new(x => 3, y => 4);
             my $verbose = shift // 0;
         }
         ");
-        let sig = fa.signature_for_call("handler", false, None, Point::new(0, 0)).unwrap();
+        let sig = fa.signature_for_call("handler", false, None, Point::new(0, 0), None).unwrap();
         assert_eq!(sig.params.len(), 1, "stripped $self");
         assert_eq!(sig.params[0].name, "$verbose");
         assert_eq!(sig.params[0].default, Some("0".into()));
@@ -3852,7 +3852,7 @@ my $p = Point->new(x => 3, y => 4);
             my $data = $_[1];
         }
         ");
-        let sig = fa.signature_for_call("handler", false, None, Point::new(0, 0)).unwrap();
+        let sig = fa.signature_for_call("handler", false, None, Point::new(0, 0), None).unwrap();
         assert_eq!(sig.params.len(), 1, "stripped $self");
         assert_eq!(sig.params[0].name, "$data");
     }
@@ -3865,7 +3865,7 @@ my $p = Point->new(x => 3, y => 4);
             my ($first, $file, @opts) = @_;
         }
         ");
-        let sig = fa.signature_for_call("process", false, None, Point::new(0, 0)).unwrap();
+        let sig = fa.signature_for_call("process", false, None, Point::new(0, 0), None).unwrap();
         assert_eq!(sig.params.len(), 3);
         assert_eq!(sig.params[0].name, "$first");
         assert_eq!(sig.params[1].name, "$file");

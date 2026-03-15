@@ -1935,6 +1935,18 @@ pub enum MethodResolution {
     CrossFile { class: String },
 }
 
+/// Result of resolving a sub/method call — local symbol or cross-file metadata.
+pub enum ResolvedSub<'a> {
+    /// Found locally in this file's symbols.
+    Local(&'a Symbol),
+    /// Found in a cross-file module via ModuleIndex.
+    CrossFile {
+        params: Vec<crate::module_index::ExportedParam>,
+        is_method: bool,
+        hash_keys: Vec<String>,
+    },
+}
+
 // ---- Completion types ----
 
 /// A completion candidate from FileAnalysis resolution (pure table lookup).
@@ -2194,6 +2206,7 @@ impl FileAnalysis {
         invocant: Option<&str>,
         point: Point,
         used_keys: &HashSet<String>,
+        module_index: Option<&ModuleIndex>,
     ) -> Vec<CompletionCandidate> {
         // For `new` calls on a class, check for :param fields
         if call_name == "new" {
@@ -2216,52 +2229,73 @@ impl FileAnalysis {
             }
         }
 
-        // Find the sub definition
-        let sub_sym = self.find_sub_for_call(call_name, is_method, invocant, point);
-        let sub_sym = match sub_sym {
-            Some(s) => s,
+        // Find the sub definition (local or cross-file)
+        let resolved = match self.find_sub_for_call(call_name, is_method, invocant, point, module_index) {
+            Some(r) => r,
             None => return Vec::new(),
         };
 
-        // Get params
-        let params = match &sub_sym.detail {
-            SymbolDetail::Sub { params, .. } => params,
-            _ => return Vec::new(),
-        };
+        match resolved {
+            ResolvedSub::Local(sub_sym) => {
+                let params = match &sub_sym.detail {
+                    SymbolDetail::Sub { params, .. } => params,
+                    _ => return Vec::new(),
+                };
 
-        // Find slurpy %hash param
-        let slurpy = params
-            .iter()
-            .find(|p| p.is_slurpy && p.name.starts_with('%'));
-        let slurpy_name = match slurpy {
-            Some(p) => {
-                if p.name.starts_with('%') || p.name.starts_with('$') || p.name.starts_with('@') {
-                    &p.name[1..]
-                } else {
-                    &p.name
-                }
+                // Find slurpy %hash param
+                let slurpy = params
+                    .iter()
+                    .find(|p| p.is_slurpy && p.name.starts_with('%'));
+                let slurpy_name = match slurpy {
+                    Some(p) => {
+                        if p.name.starts_with('%') || p.name.starts_with('$') || p.name.starts_with('@') {
+                            &p.name[1..]
+                        } else {
+                            &p.name
+                        }
+                    }
+                    None => return Vec::new(),
+                };
+
+                // Find hash key accesses for this param name within the sub's body scope
+                let body_scope = self.find_body_scope(sub_sym);
+                let keys = match body_scope {
+                    Some(scope_id) => self.hash_keys_in_scope(slurpy_name, scope_id),
+                    None => Vec::new(),
+                };
+
+                keys.into_iter()
+                    .filter(|k| !used_keys.contains(k))
+                    .map(|k| CompletionCandidate {
+                        label: format!("{} =>", k),
+                        kind: SymKind::Variable,
+                        detail: Some(format!("{}(%{})", call_name, slurpy_name)),
+                        insert_text: Some(format!("{} => ", k)),
+                        sort_priority: PRIORITY_LOCAL,
+                        additional_edits: vec![],
+                    })
+                    .collect()
             }
-            None => return Vec::new(),
-        };
+            ResolvedSub::CrossFile { hash_keys, params, .. } => {
+                // Check if any param is slurpy %hash
+                let has_slurpy = params.iter().any(|p| p.is_slurpy && p.name.starts_with('%'));
+                if !has_slurpy || hash_keys.is_empty() {
+                    return Vec::new();
+                }
 
-        // Find hash key accesses for this param name within the sub's body scope
-        let body_scope = self.find_body_scope(sub_sym);
-        let keys = match body_scope {
-            Some(scope_id) => self.hash_keys_in_scope(slurpy_name, scope_id),
-            None => Vec::new(),
-        };
-
-        keys.into_iter()
-            .filter(|k| !used_keys.contains(k))
-            .map(|k| CompletionCandidate {
-                label: format!("{} =>", k),
-                kind: SymKind::Variable,
-                detail: Some(format!("{}(%{})", call_name, slurpy_name)),
-                insert_text: Some(format!("{} => ", k)),
-                sort_priority: PRIORITY_LOCAL,
-                    additional_edits: vec![],
-            })
-            .collect()
+                hash_keys.into_iter()
+                    .filter(|k| !used_keys.contains(k))
+                    .map(|k| CompletionCandidate {
+                        label: format!("{} =>", k),
+                        kind: SymKind::Variable,
+                        detail: Some(format!("{}()", call_name)),
+                        insert_text: Some(format!("{} => ", k)),
+                        sort_priority: PRIORITY_LOCAL,
+                        additional_edits: vec![],
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// Resolve signature info for a call (sub/method name).
@@ -2271,47 +2305,83 @@ impl FileAnalysis {
         is_method: bool,
         invocant: Option<&str>,
         point: Point,
+        module_index: Option<&ModuleIndex>,
     ) -> Option<SignatureInfo> {
-        let sub_sym = self.find_sub_for_call(name, is_method, invocant, point)?;
+        let resolved = self.find_sub_for_call(name, is_method, invocant, point, module_index)?;
 
-        let (params, sym_is_method) = match &sub_sym.detail {
-            SymbolDetail::Sub { params, is_method, .. } => (params.clone(), *is_method),
-            _ => return None,
-        };
+        match resolved {
+            ResolvedSub::Local(sub_sym) => {
+                let (params, sym_is_method) = match &sub_sym.detail {
+                    SymbolDetail::Sub { params, is_method, .. } => (params.clone(), *is_method),
+                    _ => return None,
+                };
 
-        let mut params = params;
-        let is_method = is_method
-            || sym_is_method
-            || params
-                .first()
-                .map_or(false, |p| p.name == "$self" || p.name == "$class");
+                let mut params = params;
+                let is_method = is_method
+                    || sym_is_method
+                    || params
+                        .first()
+                        .map_or(false, |p| p.name == "$self" || p.name == "$class");
 
-        // Strip $self/$class from method params
-        if is_method && !params.is_empty() {
-            let first = &params[0].name;
-            if first == "$self" || first == "$class" {
-                params.remove(0);
+                // Strip $self/$class from method params
+                if is_method && !params.is_empty() {
+                    let first = &params[0].name;
+                    if first == "$self" || first == "$class" {
+                        params.remove(0);
+                    }
+                }
+
+                Some(SignatureInfo {
+                    name: name.to_string(),
+                    params,
+                    is_method,
+                    body_end: sub_sym.span.end,
+                })
+            }
+            ResolvedSub::CrossFile { params: exported_params, is_method: cf_is_method, .. } => {
+                let mut params: Vec<ParamInfo> = exported_params
+                    .iter()
+                    .map(|p| ParamInfo {
+                        name: p.name.clone(),
+                        default: None,
+                        is_slurpy: p.is_slurpy,
+                    })
+                    .collect();
+
+                let is_method = is_method || cf_is_method
+                    || params.first().map_or(false, |p| p.name == "$self" || p.name == "$class");
+
+                // Strip $self/$class from method params
+                if is_method && !params.is_empty() {
+                    let first = &params[0].name;
+                    if first == "$self" || first == "$class" {
+                        params.remove(0);
+                    }
+                }
+
+                Some(SignatureInfo {
+                    name: name.to_string(),
+                    params,
+                    is_method,
+                    body_end: Point::new(0, 0), // no local body
+                })
             }
         }
-
-        Some(SignatureInfo {
-            name: name.to_string(),
-            params,
-            is_method,
-            body_end: sub_sym.span.end,
-        })
     }
 
     // ---- Internal completion helpers ----
 
-    /// Find a sub/method symbol by name, optionally scoped to a class.
-    fn find_sub_for_call(
-        &self,
+    /// Find a sub/method by name, optionally scoped to a class.
+    /// Returns `ResolvedSub::Local` for same-file symbols, or `ResolvedSub::CrossFile`
+    /// for inherited methods and imported functions found via `ModuleIndex`.
+    fn find_sub_for_call<'s>(
+        &'s self,
         name: &str,
         is_method: bool,
         invocant: Option<&str>,
         point: Point,
-    ) -> Option<&Symbol> {
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<ResolvedSub<'s>> {
         // Resolve class name for scoped lookup
         let class_name = if is_method {
             invocant.and_then(|inv| {
@@ -2331,18 +2401,65 @@ impl FileAnalysis {
 
         // Try inheritance-aware class-scoped lookup first
         if let Some(ref cn) = class_name {
-            if let Some(MethodResolution::Local { sym_id, .. }) =
-                self.resolve_method_in_ancestors(cn, name, None)
-            {
-                return Some(self.symbol(sym_id));
+            match self.resolve_method_in_ancestors(cn, name, module_index) {
+                Some(MethodResolution::Local { sym_id, .. }) => {
+                    return Some(ResolvedSub::Local(self.symbol(sym_id)));
+                }
+                Some(MethodResolution::CrossFile { ref class }) => {
+                    if let Some(idx) = module_index {
+                        if let Some(exports) = idx.get_exports_cached(class) {
+                            if let Some(sub_info) = exports.sub_info(name) {
+                                return Some(ResolvedSub::CrossFile {
+                                    params: sub_info.params.clone(),
+                                    is_method: sub_info.is_method,
+                                    hash_keys: sub_info.hash_keys.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                None => {}
             }
         }
 
-        // Fallback: any sub/method with that name
+        // Fallback: any local sub/method with that name
         for &sid in self.symbols_named(name) {
             let sym = self.symbol(sid);
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                return Some(sym);
+                return Some(ResolvedSub::Local(sym));
+            }
+        }
+
+        // Fallback: imported function via ModuleIndex
+        if !is_method {
+            if let Some(idx) = module_index {
+                for import in &self.imports {
+                    if import.imported_symbols.iter().any(|s| s == name) {
+                        if let Some(exports) = idx.get_exports_cached(&import.module_name) {
+                            if let Some(sub_info) = exports.sub_info(name) {
+                                return Some(ResolvedSub::CrossFile {
+                                    params: sub_info.params.clone(),
+                                    is_method: sub_info.is_method,
+                                    hash_keys: sub_info.hash_keys.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                // Also check @EXPORT (bare imports)
+                for import in &self.imports {
+                    if let Some(exports) = idx.get_exports_cached(&import.module_name) {
+                        if exports.export.iter().any(|s| s == name) {
+                            if let Some(sub_info) = exports.sub_info(name) {
+                                return Some(ResolvedSub::CrossFile {
+                                    params: sub_info.params.clone(),
+                                    is_method: sub_info.is_method,
+                                    hash_keys: sub_info.hash_keys.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 

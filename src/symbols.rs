@@ -313,6 +313,7 @@ pub fn completion_items(
                         call_ctx.invocant.as_deref(),
                         point,
                         &call_ctx.used_keys,
+                        Some(module_index),
                     ));
                 }
             }
@@ -322,7 +323,7 @@ pub fn completion_items(
             items.extend(imported_function_completions(analysis, module_index));
 
             // Add completions from unimported modules (with auto-import edits)
-            items.extend(unimported_function_completions(analysis, module_index));
+            items.extend(unimported_function_completions(analysis, module_index, point));
 
             items
         }
@@ -495,12 +496,13 @@ pub fn signature_help(
     // Step 1: cursor_context finds the enclosing call
     let call_ctx = cursor_context::find_call_context(tree, text.as_bytes(), point)?;
 
-    // Step 2: file_analysis resolves the sub signature (pure table lookup)
+    // Step 2: file_analysis resolves the sub signature (local + cross-file)
     if let Some(sig_info) = analysis.signature_for_call(
         &call_ctx.name,
         call_ctx.is_method,
         call_ctx.invocant.as_deref(),
         point,
+        Some(module_index),
     ) {
         // Build param labels with inferred types
         let param_labels: Vec<String> = sig_info
@@ -545,39 +547,6 @@ pub fn signature_help(
             active_signature: Some(0),
             active_parameter: Some(call_ctx.active_param as u32),
         });
-    }
-
-    // Fallback: imported function
-    if !call_ctx.is_method {
-        if let Some((import, _)) =
-            resolve_imported_function(analysis, &call_ctx.name, module_index)
-        {
-            if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
-                if let Some(sub_info) = exports.sub_info(&call_ctx.name) {
-                    let param_labels: Vec<String> =
-                        sub_info.params.iter().map(|p| p.name.clone()).collect();
-                    let params: Vec<ParameterInformation> = param_labels
-                        .iter()
-                        .map(|label| ParameterInformation {
-                            label: ParameterLabel::Simple(label.clone()),
-                            documentation: None,
-                        })
-                        .collect();
-                    let label =
-                        format!("{}({})", call_ctx.name, param_labels.join(", "));
-                    return Some(SignatureHelp {
-                        signatures: vec![SignatureInformation {
-                            label,
-                            documentation: None,
-                            parameters: Some(params),
-                            active_parameter: Some(call_ctx.active_param as u32),
-                        }],
-                        active_signature: Some(0),
-                        active_parameter: Some(call_ctx.active_param as u32),
-                    });
-                }
-            }
-        }
     }
 
     None
@@ -833,6 +802,7 @@ fn imported_function_completions(
 fn unimported_function_completions(
     analysis: &FileAnalysis,
     module_index: &ModuleIndex,
+    point: Point,
 ) -> Vec<CompletionCandidate> {
     use crate::file_analysis::Span;
     let mut candidates = Vec::new();
@@ -844,7 +814,7 @@ fn unimported_function_completions(
         .map(|i| i.module_name.as_str())
         .collect();
 
-    let insert_pos = find_use_insertion_position(analysis);
+    let insert_pos = find_use_insertion_position(analysis, point);
     let insert_span = Span {
         start: tree_sitter::Point {
             row: insert_pos.line as usize,
@@ -1157,15 +1127,34 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
 
 // ---- Code actions ----
 
-/// Find the position to insert a new `use` statement.
-/// Returns the start of the line after the last existing `use`.
-fn find_use_insertion_position(analysis: &FileAnalysis) -> Position {
-    if let Some(last_import) = analysis.imports.last() {
+/// Find the position to insert a new `use` statement, scoped to the package at `point`.
+/// Returns the start of the line after the last existing `use` in the same package.
+fn find_use_insertion_position(analysis: &FileAnalysis, point: Point) -> Position {
+    let target_pkg = analysis.package_at(point);
+
+    // Find the last import in the same package
+    let last_in_pkg = analysis.imports.iter().rev().find(|imp| {
+        analysis.package_at(imp.span.start) == target_pkg
+    });
+
+    if let Some(last_import) = last_in_pkg {
         Position {
             line: last_import.span.end.row as u32 + 1,
             character: 0,
         }
     } else {
+        // No imports in this package — find the package statement and insert after it
+        if let Some(pkg_name) = target_pkg {
+            for sym in &analysis.symbols {
+                if matches!(sym.kind, FaSymKind::Package | FaSymKind::Class) && sym.name == pkg_name {
+                    return Position {
+                        line: sym.selection_span.end.row as u32 + 1,
+                        character: 0,
+                    };
+                }
+            }
+        }
+        // Fallback: beginning of file
         Position {
             line: 0,
             character: 0,
@@ -1209,7 +1198,8 @@ pub fn code_actions(
 
         // Case 2: New import — add `use Module qw(func);` statement
         if let Some(modules) = data.get("modules").and_then(|v| v.as_array()) {
-            let insert_pos = find_use_insertion_position(analysis);
+            let diag_point = position_to_point(diag.range.start);
+            let insert_pos = find_use_insertion_position(analysis, diag_point);
             for (i, module_val) in modules.iter().enumerate() {
                 if let Some(module_name) = module_val.as_str() {
                     let new_text = format!("use {} qw({});\n", module_name, func_name);
