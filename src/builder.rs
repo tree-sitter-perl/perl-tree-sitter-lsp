@@ -20,6 +20,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         return_infos: Vec::new(),
         last_expr_type: std::collections::HashMap::new(),
         call_bindings: Vec::new(),
+        method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
         package_parents: std::collections::HashMap::new(),
         scope_stack: Vec::new(),
@@ -55,6 +56,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         b.imports,
         b.call_bindings,
         b.package_parents,
+        b.method_call_bindings,
     )
 }
 
@@ -81,6 +83,8 @@ struct Builder<'a> {
     last_expr_type: std::collections::HashMap<ScopeId, Option<InferredType>>,
     /// Assignments where RHS is a function call — resolved in return-type post-pass.
     call_bindings: Vec<CallBinding>,
+    /// Assignments where RHS is a method call — resolved in FileAnalysis post-pass.
+    method_call_bindings: Vec<MethodCallBinding>,
     /// Raw POD text blocks collected during the walk (for tail-POD post-pass).
     pod_texts: Vec<String>,
     /// Parent classes for each package (from use parent/base, @ISA, class :isa).
@@ -1294,6 +1298,29 @@ impl<'a> Builder<'a> {
                             scope: self.current_scope(),
                             span: node_to_span(node),
                         });
+                    }
+                } else if right.kind() == "method_call_expression" {
+                    // RHS is a method call — record binding for return-type post-pass
+                    if let Some(method_node) = right.child_by_field_name("method") {
+                        if let Some(invocant_node) = right.child_by_field_name("invocant") {
+                            if let (Ok(method), Ok(inv)) = (
+                                method_node.utf8_text(self.source),
+                                invocant_node.utf8_text(self.source),
+                            ) {
+                                // Skip constructors — already handled by extract_constructor_class
+                                if method != "new" {
+                                    if let Some(vt) = self.get_var_text_from_lhs(left) {
+                                        self.method_call_bindings.push(MethodCallBinding {
+                                            variable: vt,
+                                            invocant_var: inv.to_string(),
+                                            method_name: method.to_string(),
+                                            scope: self.current_scope(),
+                                            span: node_to_span(node),
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // Visit the RHS (may contain refs, calls, etc.)
@@ -4268,5 +4295,61 @@ sub transform { }
         let parents = idx.parents_cached("Child::Mod");
         assert_eq!(parents, vec!["Parent::Mod", "Mixin::Role"]);
         assert!(idx.parents_cached("Unknown::Mod").is_empty());
+    }
+
+    // ---- Method call return type propagation tests ----
+
+    #[test]
+    fn test_method_call_return_type_propagates() {
+        let fa = build_fa("
+package Foo;
+sub new { bless {}, shift }
+sub get_config {
+    return { host => 'localhost', port => 5432 };
+}
+package main;
+my $f = Foo->new();
+my $cfg = $f->get_config();
+$cfg;
+");
+        let ty = fa.inferred_type("$cfg", Point::new(9, 0));
+        assert_eq!(ty, Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_method_call_chain_propagation() {
+        let fa = build_fa("
+package Foo;
+sub new { bless {}, shift }
+sub get_bar { return Bar->new() }
+package Bar;
+sub new { bless {}, shift }
+sub get_name { return { name => 'test' } }
+package main;
+my $f = Foo->new();
+my $bar = $f->get_bar();
+my $name = $bar->get_name();
+$name;
+");
+        let bar_ty = fa.inferred_type("$bar", Point::new(10, 0));
+        assert_eq!(bar_ty, Some(&InferredType::ClassName("Bar".into())));
+        let name_ty = fa.inferred_type("$name", Point::new(11, 0));
+        assert_eq!(name_ty, Some(&InferredType::HashRef));
+    }
+
+    #[test]
+    fn test_self_method_call_return_type() {
+        let fa = build_fa("
+package Foo;
+sub new { bless {}, shift }
+sub get_config { return { host => 1 } }
+sub run {
+    my ($self) = @_;
+    my $cfg = $self->get_config();
+    $cfg;
+}
+");
+        let ty = fa.inferred_type("$cfg", Point::new(7, 4));
+        assert_eq!(ty, Some(&InferredType::HashRef));
     }
 }

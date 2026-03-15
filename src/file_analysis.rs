@@ -315,6 +315,17 @@ pub struct CallBinding {
     pub span: Span,
 }
 
+/// A method call binding: `$var = $invocant->method()`.
+/// Recorded during build, resolved in post-pass via `find_method_return_type`.
+#[derive(Debug, Clone)]
+pub struct MethodCallBinding {
+    pub variable: String,
+    pub invocant_var: String,
+    pub method_name: String,
+    pub scope: ScopeId,
+    pub span: Span,
+}
+
 // ---- Import ----
 
 /// A `use Foo::Bar qw(func1 func2)` statement parsed from the source.
@@ -379,6 +390,7 @@ pub struct FileAnalysis {
     pub fold_ranges: Vec<FoldRange>,
     pub imports: Vec<Import>,
     pub call_bindings: Vec<CallBinding>,
+    pub method_call_bindings: Vec<MethodCallBinding>,
 
     /// Parent classes for each package in this file.
     /// Populated by the builder from use parent/base, @ISA, and class :isa.
@@ -410,6 +422,7 @@ impl FileAnalysis {
         imports: Vec<Import>,
         call_bindings: Vec<CallBinding>,
         package_parents: HashMap<String, Vec<String>>,
+        method_call_bindings: Vec<MethodCallBinding>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -419,6 +432,7 @@ impl FileAnalysis {
             fold_ranges,
             imports,
             call_bindings,
+            method_call_bindings,
             package_parents,
             imported_return_types: HashMap::new(),
             base_type_constraint_count: 0,
@@ -430,6 +444,7 @@ impl FileAnalysis {
             type_constraints_by_var: HashMap::new(),
         };
         fa.build_indices();
+        fa.resolve_method_call_types(None); // local post-pass
         fa.base_type_constraint_count = fa.type_constraints.len();
         fa.base_symbol_count = fa.symbols.len();
         fa
@@ -596,7 +611,7 @@ impl FileAnalysis {
     /// Convenience wrapper: enrich with return types only (no hash keys).
     #[cfg(test)]
     pub fn enrich_imported_types(&mut self, imported_returns: HashMap<String, InferredType>) {
-        self.enrich_imported_types_with_keys(imported_returns, HashMap::new());
+        self.enrich_imported_types_with_keys(imported_returns, HashMap::new(), None);
     }
 
     /// Resolve call bindings for imported functions and inject hash key defs.
@@ -605,6 +620,7 @@ impl FileAnalysis {
         &mut self,
         imported_returns: HashMap<String, InferredType>,
         imported_hash_keys: HashMap<String, Vec<String>>,
+        module_index: Option<&ModuleIndex>,
     ) {
         // Truncate back to baseline so repeated enrichment doesn't accumulate duplicates.
         self.type_constraints.truncate(self.base_type_constraint_count);
@@ -655,7 +671,46 @@ impl FileAnalysis {
             }
         }
 
+        // Cross-file method call return type resolution
+        self.resolve_method_call_types(module_index);
+
         self.rebuild_enrichment_indices();
+    }
+
+    /// Resolve method call bindings to type constraints.
+    /// Called in local post-pass (None) and cross-file enrichment (Some(module_index)).
+    fn resolve_method_call_types(&mut self, module_index: Option<&ModuleIndex>) {
+        let bindings = self.method_call_bindings.clone();
+        for binding in &bindings {
+            // Skip if this variable already has a type at this point
+            if self.inferred_type(&binding.variable, binding.span.start).is_some() {
+                continue;
+            }
+
+            // Resolve invocant to class name
+            let class_name = self.resolve_invocant_class(
+                &binding.invocant_var,
+                binding.scope,
+                binding.span.start,
+            );
+
+            if let Some(cn) = class_name {
+                if let Some(rt) = self.find_method_return_type(&cn, &binding.method_name, module_index) {
+                    self.type_constraints.push(TypeConstraint {
+                        variable: binding.variable.clone(),
+                        scope: binding.scope,
+                        constraint_span: binding.span,
+                        inferred_type: rt,
+                    });
+                    // Incrementally update the index so the NEXT binding can see this constraint
+                    let idx = self.type_constraints.len() - 1;
+                    self.type_constraints_by_var
+                        .entry(binding.variable.clone())
+                        .or_default()
+                        .push(idx);
+                }
+            }
+        }
     }
 
     /// Rebuild indices affected by enrichment (type constraints + symbols).
@@ -2855,6 +2910,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            vec![],
         )
     }
 
@@ -2946,6 +3002,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            vec![],
         );
         assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
         assert_eq!(fa.sub_return_type("nonexistent"), None);
@@ -3102,6 +3159,7 @@ mod tests {
                 span: Span { start: Point::new(2, 0), end: Point::new(2, 30) },
             }],
             HashMap::new(),
+            vec![],
         );
 
         let mut imported = HashMap::new();

@@ -48,7 +48,7 @@ impl Backend {
                 for mut entry in docs.iter_mut() {
                     let uri = entry.key().clone();
                     let (imported_returns, imported_keys) = build_imported_return_types(&entry.analysis, module_index);
-                    entry.analysis.enrich_imported_types_with_keys(imported_returns, imported_keys);
+                    entry.analysis.enrich_imported_types_with_keys(imported_returns, imported_keys, Some(module_index));
                     let diagnostics = symbols::collect_diagnostics(&entry.analysis, module_index);
                     client.publish_diagnostics(uri, diagnostics, None).await;
                 }
@@ -68,7 +68,7 @@ impl Backend {
     fn enrich_analysis(&self, uri: &Url) {
         if let Some(mut doc) = self.documents.get_mut(uri) {
             let (imported_returns, imported_keys) = build_imported_return_types(&doc.analysis, &self.module_index);
-            doc.analysis.enrich_imported_types_with_keys(imported_returns, imported_keys);
+            doc.analysis.enrich_imported_types_with_keys(imported_returns, imported_keys, Some(&self.module_index));
         }
     }
 
