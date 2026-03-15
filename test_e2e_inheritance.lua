@@ -165,6 +165,21 @@ t.test("hover: $worker->process() shows BaseWorker provenance", function()
   end
 end)
 
+-- ── 7. Goto-def on parent class name in use parent ──────────────────
+
+t.test("goto-def: 'BaseWorker' in use parent opens BaseWorker.pm", function()
+  local N = "goto-def: 'BaseWorker' in use parent opens BaseWorker.pm"
+  local line, col = b.find_pos(buf, "use parent 'BaseWorker'")
+  if not t.ok(N, line, "couldn't find 'use parent BaseWorker'") then return end
+  -- Position cursor on "BaseWorker" inside the string (col + 12 = inside the string content)
+  local loc = lsp.def_location(buf, line, col + 12)
+  if not t.ok(N, loc, "no definition result") then return end
+  if t.ok(N, loc.uri and loc.uri:find("BaseWorker.pm", 1, true),
+    "uri should point to BaseWorker.pm, got: " .. tostring(loc.uri)) then
+    t.pass(N)
+  end
+end)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()

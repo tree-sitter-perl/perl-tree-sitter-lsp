@@ -1124,9 +1124,17 @@ impl FileAnalysis {
                                 // can resolve it via ModuleIndex with the correct URI.
                                 return None;
                             }
-                            None => {}
+                            None => {
+                                // If the class has known parents, the method might be
+                                // inherited but the module index hasn't resolved yet.
+                                // Return None so the cross-file block in symbols.rs
+                                // gets a chance, rather than jumping to the package decl.
+                                if self.package_parents.contains_key(cn) {
+                                    return None;
+                                }
+                            }
                         }
-                        // Method not found (e.g. auto-generated "new") → go to class def
+                        // Method not found and no parents — go to class def
                         if let Some(span) = self.find_package_or_class(cn) {
                             return Some(span);
                         }

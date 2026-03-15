@@ -935,14 +935,16 @@ impl<'a> Builder<'a> {
 
                 // Extract parent classes from `use parent` / `use base`
                 if module_name == "parent" || module_name == "base" {
-                    if let Some(ref pkg) = self.current_package {
+                    if let Some(pkg) = self.current_package.clone() {
                         let (parents, _) = self.extract_use_import_list(node);
                         let parents: Vec<String> = parents.into_iter()
                             .filter(|s| !s.starts_with('-')) // skip -norequire etc.
                             .collect();
                         if !parents.is_empty() {
+                            // Emit PackageRef for each parent class (for goto-def on parent names)
+                            self.emit_parent_class_refs(node, &parents);
                             self.package_parents
-                                .entry(pkg.clone())
+                                .entry(pkg)
                                 .or_default()
                                 .extend(parents);
                         }
@@ -951,6 +953,10 @@ impl<'a> Builder<'a> {
 
                 // Extract imported symbols from qw(...) or list
                 let (imported_symbols, qw_close_paren) = self.extract_use_import_list(node);
+                // Emit FunctionCall refs for imported symbol names (for goto-def on import args)
+                if module_name != "parent" && module_name != "base" {
+                    self.emit_import_symbol_refs(node, &imported_symbols);
+                }
                 self.imports.push(Import {
                     module_name: module_name.to_string(),
                     imported_symbols,
@@ -960,6 +966,179 @@ impl<'a> Builder<'a> {
             }
         }
         // Don't recurse — use statements don't contain interesting sub-nodes
+    }
+
+    /// Emit PackageRef refs for parent class names in `use parent`/`use base` statements.
+    /// Walks the use statement's children to find string literals or qw words matching parent names.
+    fn emit_parent_class_refs(&mut self, node: Node<'a>, parents: &[String]) {
+        let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                match child.kind() {
+                    "string_literal" => {
+                        // Single string: 'BaseWorker' — use string_content child for span
+                        if let Some(content) = child.named_child(0) {
+                            if content.kind() == "string_content" {
+                                if let Ok(text) = content.utf8_text(self.source) {
+                                    if parent_set.contains(text) {
+                                        self.add_ref(
+                                            RefKind::PackageRef,
+                                            node_to_span(content),
+                                            text.to_string(),
+                                            AccessKind::Read,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "quoted_word_list" => {
+                        // qw(Foo Bar) — string_content may contain multiple words
+                        for j in 0..child.named_child_count() {
+                            if let Some(sc) = child.named_child(j) {
+                                if sc.kind() == "string_content" {
+                                    if let Ok(text) = sc.utf8_text(self.source) {
+                                        // Each word in the qw list — find its position
+                                        let sc_start = sc.start_position();
+                                        let mut col_offset = 0usize;
+                                        for word in text.split_whitespace() {
+                                            if let Some(pos) = text[col_offset..].find(word) {
+                                                let word_col = col_offset + pos;
+                                                if parent_set.contains(word) {
+                                                    let start = Point::new(sc_start.row, sc_start.column + word_col);
+                                                    let end = Point::new(sc_start.row, sc_start.column + word_col + word.len());
+                                                    self.add_ref(
+                                                        RefKind::PackageRef,
+                                                        Span { start, end },
+                                                        word.to_string(),
+                                                        AccessKind::Read,
+                                                    );
+                                                }
+                                                col_offset = word_col + word.len();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "parenthesized_expression" | "list_expression" => {
+                        // ('Foo', 'Bar') — walk for string_literal children
+                        self.emit_parent_refs_in_list(child, &parent_set);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Helper: emit PackageRef refs for parent names found in a list/paren expression.
+    fn emit_parent_refs_in_list(&mut self, node: Node<'a>, parent_set: &std::collections::HashSet<&str>) {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.kind() == "string_literal" {
+                    if let Some(content) = child.named_child(0) {
+                        if content.kind() == "string_content" {
+                            if let Ok(text) = content.utf8_text(self.source) {
+                                if parent_set.contains(text) {
+                                    self.add_ref(
+                                        RefKind::PackageRef,
+                                        node_to_span(content),
+                                        text.to_string(),
+                                        AccessKind::Read,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit FunctionCall refs for imported symbol names in use statements (for goto-def on import args).
+    /// Handles `use Foo 'bar'`, `use Foo qw(bar baz)`, and `use Foo ('bar', 'baz')`.
+    fn emit_import_symbol_refs(&mut self, node: Node<'a>, symbols: &[String]) {
+        if symbols.is_empty() { return; }
+        let sym_set: std::collections::HashSet<&str> = symbols.iter().map(|s| s.as_str()).collect();
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                match child.kind() {
+                    "string_literal" => {
+                        if let Some(content) = child.named_child(0) {
+                            if content.kind() == "string_content" {
+                                if let Ok(text) = content.utf8_text(self.source) {
+                                    if sym_set.contains(text) {
+                                        self.add_ref(
+                                            RefKind::FunctionCall,
+                                            node_to_span(content),
+                                            text.to_string(),
+                                            AccessKind::Read,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "quoted_word_list" => {
+                        for j in 0..child.named_child_count() {
+                            if let Some(sc) = child.named_child(j) {
+                                if sc.kind() == "string_content" {
+                                    if let Ok(text) = sc.utf8_text(self.source) {
+                                        let sc_start = sc.start_position();
+                                        let mut col_offset = 0usize;
+                                        for word in text.split_whitespace() {
+                                            if let Some(pos) = text[col_offset..].find(word) {
+                                                let word_col = col_offset + pos;
+                                                if sym_set.contains(word) {
+                                                    let start = Point::new(sc_start.row, sc_start.column + word_col);
+                                                    let end = Point::new(sc_start.row, sc_start.column + word_col + word.len());
+                                                    self.add_ref(
+                                                        RefKind::FunctionCall,
+                                                        Span { start, end },
+                                                        word.to_string(),
+                                                        AccessKind::Read,
+                                                    );
+                                                }
+                                                col_offset = word_col + word.len();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "parenthesized_expression" | "list_expression" => {
+                        self.emit_import_refs_in_list(child, &sym_set);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Helper: emit FunctionCall refs for imported names found in a list/paren expression.
+    fn emit_import_refs_in_list(&mut self, node: Node<'a>, sym_set: &std::collections::HashSet<&str>) {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.kind() == "string_literal" {
+                    if let Some(content) = child.named_child(0) {
+                        if content.kind() == "string_content" {
+                            if let Ok(text) = content.utf8_text(self.source) {
+                                if sym_set.contains(text) {
+                                    self.add_ref(
+                                        RefKind::FunctionCall,
+                                        node_to_span(content),
+                                        text.to_string(),
+                                        AccessKind::Read,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Extract the import list from a use statement.
@@ -3776,6 +3955,34 @@ sub transform { }
             use parent qw(Foo Bar);
         ");
         assert_eq!(fa.package_parents.get("Multi").unwrap(), &vec!["Foo".to_string(), "Bar".to_string()]);
+    }
+
+    #[test]
+    fn test_use_parent_emits_package_refs() {
+        let fa = build_fa("
+            package Child;
+            use parent 'Parent';
+        ");
+        let refs: Vec<_> = fa.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::PackageRef) && r.target_name == "Parent")
+            .collect();
+        assert_eq!(refs.len(), 1, "should emit PackageRef for parent class");
+    }
+
+    #[test]
+    fn test_use_parent_qw_emits_package_refs() {
+        let fa = build_fa("
+            package Multi;
+            use parent qw(Foo Bar);
+        ");
+        let foo_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::PackageRef) && r.target_name == "Foo")
+            .collect();
+        let bar_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::PackageRef) && r.target_name == "Bar")
+            .collect();
+        assert_eq!(foo_refs.len(), 1, "should emit PackageRef for Foo");
+        assert_eq!(bar_refs.len(), 1, "should emit PackageRef for Bar");
     }
 
     #[test]

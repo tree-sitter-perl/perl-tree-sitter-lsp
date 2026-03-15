@@ -4,8 +4,8 @@ use tree_sitter::{Point, Tree};
 
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
-    format_inferred_type, CompletionCandidate, FileAnalysis, FoldKind, InferredType, OutlineSymbol,
-    RefKind, Span, SymKind as FaSymKind, SymbolDetail, VarModifier,
+    contains_point, format_inferred_type, CompletionCandidate, FileAnalysis, FoldKind, InferredType,
+    OutlineSymbol, RefKind, Span, SymKind as FaSymKind, SymbolDetail, VarModifier,
     PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT, PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
 use crate::module_index::ExportedSub;
@@ -115,6 +115,17 @@ pub fn find_definition(
                         None => Range::default(),
                     };
 
+                    let pm_location = Location {
+                        uri: module_uri,
+                        range: def_range,
+                    };
+
+                    // If cursor is inside the use statement itself (on the import name),
+                    // jump directly to the .pm definition — no need to also show the use stmt.
+                    if contains_point(&import.span, point) {
+                        return Some(GotoDefinitionResponse::Scalar(pm_location));
+                    }
+
                     return Some(GotoDefinitionResponse::Array(vec![
                         // First: the use statement in this file
                         Location {
@@ -122,10 +133,7 @@ pub fn find_definition(
                             range: span_to_range(import.span),
                         },
                         // Second: the sub definition in the .pm file
-                        Location {
-                            uri: module_uri,
-                            range: def_range,
-                        },
+                        pm_location,
                     ]));
                 }
                 // Fall back to just the use statement
@@ -133,6 +141,18 @@ pub fn find_definition(
                     uri: uri.clone(),
                     range: span_to_range(import.span),
                 }));
+            }
+        }
+
+        // Cross-file package goto-def: resolve module name via module index
+        if matches!(r.kind, RefKind::PackageRef) {
+            if let Some(path) = module_index.module_path_cached(&r.target_name) {
+                if let Ok(module_uri) = Url::from_file_path(&path) {
+                    return Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: module_uri,
+                        range: Range::default(),
+                    }));
+                }
             }
         }
 
