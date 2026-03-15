@@ -2632,6 +2632,16 @@ impl FileAnalysis {
             }
         }
 
+        // Check method call bindings → follow to method's return hash keys
+        for mcb in &self.method_call_bindings {
+            if mcb.variable == var_text
+                && mcb.span.start <= point
+                && contains_point(&self.scopes[mcb.scope.0 as usize].span, point)
+            {
+                return Some(HashKeyOwner::Sub(mcb.method_name.clone()));
+            }
+        }
+
         // Try resolving the variable declaration → Variable owner
         // For $hash{}, try %hash first
         let try_names: Vec<String> = if var_text.starts_with('$') {
