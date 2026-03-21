@@ -284,8 +284,7 @@ impl<'a> Builder<'a> {
                 // Track the type of the last expression in the innermost sub/method scope
                 if let Some(scope) = self.enclosing_sub_scope() {
                     let expr_type = node.named_child(0).and_then(|child| {
-                        Self::infer_literal_type(child)
-                            .or_else(|| self.extract_constructor_class(child).map(InferredType::ClassName))
+                        self.infer_expression_type(child, false)
                     });
                     self.last_expr_type.insert(scope, expr_type);
                 }
@@ -999,7 +998,8 @@ impl<'a> Builder<'a> {
                                     .filter(|s| !s.starts_with('-'))
                                     .collect();
                                 if !parents.is_empty() {
-                                    self.emit_parent_class_refs(node, &parents);
+                                    let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
+                                    self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
                                     self.package_parents
                                         .entry(pkg)
                                         .or_default()
@@ -1019,8 +1019,8 @@ impl<'a> Builder<'a> {
                             .filter(|s| !s.starts_with('-')) // skip -norequire etc.
                             .collect();
                         if !parents.is_empty() {
-                            // Emit PackageRef for each parent class (for goto-def on parent names)
-                            self.emit_parent_class_refs(node, &parents);
+                            let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
+                            self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
                             self.package_parents
                                 .entry(pkg)
                                 .or_default()
@@ -1033,7 +1033,10 @@ impl<'a> Builder<'a> {
                 let (imported_symbols, qw_close_paren) = self.extract_use_import_list(node);
                 // Emit FunctionCall refs for imported symbol names (for goto-def on import args)
                 if module_name != "parent" && module_name != "base" {
-                    self.emit_import_symbol_refs(node, &imported_symbols);
+                    if !imported_symbols.is_empty() {
+                        let sym_set: std::collections::HashSet<&str> = imported_symbols.iter().map(|s| s.as_str()).collect();
+                        self.emit_refs_for_strings(node, &sym_set, RefKind::FunctionCall);
+                    }
                 }
                 self.imports.push(Import {
                     module_name: module_name.to_string(),
@@ -1046,86 +1049,106 @@ impl<'a> Builder<'a> {
         // Don't recurse — use statements don't contain interesting sub-nodes
     }
 
-    /// Emit PackageRef refs for parent class names in `use parent`/`use base` statements.
-    /// Walks the use statement's children to find string literals or qw words matching parent names.
-    fn emit_parent_class_refs(&mut self, node: Node<'a>, parents: &[String]) {
-        let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
+    /// Extract strings from a node's children: qw(), paren lists, bare strings.
+    /// Returns (text, span) pairs where span covers each individual word.
+    /// Also handles the case where the node itself is a string/qw (not just its children).
+    fn extract_string_list(&self, node: Node<'a>) -> Vec<(String, Span)> {
+        // Handle the node itself being a leaf string type
+        match node.kind() {
+            "quoted_word_list" => {
+                let mut results = Vec::new();
+                self.extract_qw_word_spans(node, &mut results);
+                return results;
+            }
+            "string_literal" | "interpolated_string_literal" => {
+                if let Some(text) = self.extract_string_content(node) {
+                    return vec![(text, self.string_content_span(node))];
+                }
+                return vec![];
+            }
+            _ => {}
+        }
+        // Walk children
+        let mut results = Vec::new();
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 match child.kind() {
-                    "string_literal" => {
-                        // Single string: 'BaseWorker' — use string_content child for span
-                        if let Some(content) = child.named_child(0) {
-                            if content.kind() == "string_content" {
-                                if let Ok(text) = content.utf8_text(self.source) {
-                                    if parent_set.contains(text) {
-                                        self.add_ref(
-                                            RefKind::PackageRef,
-                                            node_to_span(content),
-                                            text.to_string(),
-                                            AccessKind::Read,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
                     "quoted_word_list" => {
-                        // qw(Foo Bar) — string_content may contain multiple words
-                        for j in 0..child.named_child_count() {
-                            if let Some(sc) = child.named_child(j) {
-                                if sc.kind() == "string_content" {
-                                    if let Ok(text) = sc.utf8_text(self.source) {
-                                        // Each word in the qw list — find its position
-                                        let sc_start = sc.start_position();
-                                        let mut col_offset = 0usize;
-                                        for word in text.split_whitespace() {
-                                            if let Some(pos) = text[col_offset..].find(word) {
-                                                let word_col = col_offset + pos;
-                                                if parent_set.contains(word) {
-                                                    let start = Point::new(sc_start.row, sc_start.column + word_col);
-                                                    let end = Point::new(sc_start.row, sc_start.column + word_col + word.len());
-                                                    self.add_ref(
-                                                        RefKind::PackageRef,
-                                                        Span { start, end },
-                                                        word.to_string(),
-                                                        AccessKind::Read,
-                                                    );
-                                                }
-                                                col_offset = word_col + word.len();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        self.extract_qw_word_spans(child, &mut results);
+                    }
+                    "string_literal" | "interpolated_string_literal" => {
+                        if let Some(text) = self.extract_string_content(child) {
+                            results.push((text, self.string_content_span(child)));
                         }
                     }
-                    "parenthesized_expression" | "list_expression" => {
-                        // ('Foo', 'Bar') — walk for string_literal children
-                        self.emit_parent_refs_in_list(child, &parent_set);
+                    "parenthesized_expression" | "list_expression"
+                    | "anonymous_array_expression" => {
+                        results.extend(self.extract_string_list(child));
                     }
                     _ => {}
                 }
             }
         }
+        results
     }
 
-    /// Helper: emit PackageRef refs for parent names found in a list/paren expression.
-    fn emit_parent_refs_in_list(&mut self, node: Node<'a>, parent_set: &std::collections::HashSet<&str>) {
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                if child.kind() == "string_literal" {
-                    if let Some(content) = child.named_child(0) {
-                        if content.kind() == "string_content" {
-                            if let Ok(text) = content.utf8_text(self.source) {
-                                if parent_set.contains(text) {
-                                    self.add_ref(
-                                        RefKind::PackageRef,
-                                        node_to_span(content),
-                                        text.to_string(),
-                                        AccessKind::Read,
-                                    );
+    /// Extract strings without spans. Convenience for callers that don't need positions.
+    fn extract_string_names(&self, node: Node<'a>) -> Vec<String> {
+        self.extract_string_list(node).into_iter().map(|(s, _)| s).collect()
+    }
+
+    /// Emit refs for string names found in a node's children.
+    /// Only emits refs for names in `filter` set.
+    fn emit_refs_for_strings(
+        &mut self,
+        node: Node<'a>,
+        filter: &std::collections::HashSet<&str>,
+        ref_kind: RefKind,
+    ) {
+        for (text, span) in self.extract_string_list(node) {
+            if filter.contains(text.as_str()) {
+                self.add_ref(ref_kind.clone(), span, text, AccessKind::Read);
+            }
+        }
+    }
+
+    /// Extract per-word (text, span) pairs from a quoted_word_list node.
+    /// Handles multi-line qw by tracking row/col through whitespace.
+    fn extract_qw_word_spans(&self, qw_node: Node<'a>, results: &mut Vec<(String, Span)>) {
+        for j in 0..qw_node.named_child_count() {
+            if let Some(sc) = qw_node.named_child(j) {
+                if sc.kind() == "string_content" {
+                    if let Ok(text) = sc.utf8_text(self.source) {
+                        let sc_start = sc.start_position();
+                        let bytes = text.as_bytes();
+                        let mut row = sc_start.row;
+                        let mut col = sc_start.column;
+                        let mut i = 0;
+                        while i < bytes.len() {
+                            // Skip whitespace, tracking newlines
+                            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                                if bytes[i] == b'\n' {
+                                    row += 1;
+                                    col = 0;
+                                } else {
+                                    col += 1;
                                 }
+                                i += 1;
+                            }
+                            // Collect word
+                            let word_start = (row, col);
+                            let word_begin = i;
+                            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                                col += 1;
+                                i += 1;
+                            }
+                            if word_begin < i {
+                                let word = &text[word_begin..i];
+                                let span = Span {
+                                    start: Point::new(word_start.0, word_start.1),
+                                    end: Point::new(row, col),
+                                };
+                                results.push((word.to_string(), span));
                             }
                         }
                     }
@@ -1134,167 +1157,28 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Emit FunctionCall refs for imported symbol names in use statements (for goto-def on import args).
-    /// Handles `use Foo 'bar'`, `use Foo qw(bar baz)`, and `use Foo ('bar', 'baz')`.
-    fn emit_import_symbol_refs(&mut self, node: Node<'a>, symbols: &[String]) {
-        if symbols.is_empty() { return; }
-        let sym_set: std::collections::HashSet<&str> = symbols.iter().map(|s| s.as_str()).collect();
+    /// Find the qw close paren position in a use statement (only needed for completion positioning).
+    fn find_qw_close_position(&self, node: Node<'a>) -> Option<Point> {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
-                match child.kind() {
-                    "string_literal" => {
-                        if let Some(content) = child.named_child(0) {
-                            if content.kind() == "string_content" {
-                                if let Ok(text) = content.utf8_text(self.source) {
-                                    if sym_set.contains(text) {
-                                        self.add_ref(
-                                            RefKind::FunctionCall,
-                                            node_to_span(content),
-                                            text.to_string(),
-                                            AccessKind::Read,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "quoted_word_list" => {
-                        for j in 0..child.named_child_count() {
-                            if let Some(sc) = child.named_child(j) {
-                                if sc.kind() == "string_content" {
-                                    if let Ok(text) = sc.utf8_text(self.source) {
-                                        let sc_start = sc.start_position();
-                                        let mut col_offset = 0usize;
-                                        for word in text.split_whitespace() {
-                                            if let Some(pos) = text[col_offset..].find(word) {
-                                                let word_col = col_offset + pos;
-                                                if sym_set.contains(word) {
-                                                    let start = Point::new(sc_start.row, sc_start.column + word_col);
-                                                    let end = Point::new(sc_start.row, sc_start.column + word_col + word.len());
-                                                    self.add_ref(
-                                                        RefKind::FunctionCall,
-                                                        Span { start, end },
-                                                        word.to_string(),
-                                                        AccessKind::Read,
-                                                    );
-                                                }
-                                                col_offset = word_col + word.len();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "parenthesized_expression" | "list_expression" => {
-                        self.emit_import_refs_in_list(child, &sym_set);
-                    }
-                    _ => {}
+                if child.kind() == "quoted_word_list" {
+                    let end = child.end_position();
+                    return Some(Point::new(end.row, end.column.saturating_sub(1)));
                 }
             }
         }
-    }
-
-    /// Helper: emit FunctionCall refs for imported names found in a list/paren expression.
-    fn emit_import_refs_in_list(&mut self, node: Node<'a>, sym_set: &std::collections::HashSet<&str>) {
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                if child.kind() == "string_literal" {
-                    if let Some(content) = child.named_child(0) {
-                        if content.kind() == "string_content" {
-                            if let Ok(text) = content.utf8_text(self.source) {
-                                if sym_set.contains(text) {
-                                    self.add_ref(
-                                        RefKind::FunctionCall,
-                                        node_to_span(content),
-                                        text.to_string(),
-                                        AccessKind::Read,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        None
     }
 
     /// Extract the import list from a use statement.
-    /// Handles `use Foo qw(bar baz)` and `use Foo ('bar', 'baz')`.
     /// Returns (imported_symbols, qw_close_paren_position).
     fn extract_use_import_list(&self, node: Node<'a>) -> (Vec<String>, Option<Point>) {
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                match child.kind() {
-                    "quoted_word_list" => {
-                        // qw(word1 word2 ...) — find the closing delimiter
-                        let mut words = Vec::new();
-                        for j in 0..child.named_child_count() {
-                            if let Some(sc) = child.named_child(j) {
-                                if sc.kind() == "string_content" {
-                                    if let Ok(text) = sc.utf8_text(self.source) {
-                                        for word in text.split_whitespace() {
-                                            if !word.is_empty() {
-                                                words.push(word.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // The closing delimiter is the last byte of the qw node
-                        // e.g. for `qw(foo bar)`, end_position points just past `)`
-                        let end = child.end_position();
-                        let close_pos = Point::new(end.row, end.column.saturating_sub(1));
-                        return (words, Some(close_pos));
-                    }
-                    "parenthesized_expression" | "list_expression" => {
-                        // ('foo', 'bar', ...)
-                        let mut words = Vec::new();
-                        self.collect_string_values(child, &mut words);
-                        if !words.is_empty() {
-                            return (words, None);
-                        }
-                    }
-                    "string_literal" => {
-                        // bare 'Foo' (single string, no parens/qw)
-                        if let Ok(text) = child.utf8_text(self.source) {
-                            let unquoted = text.trim_matches(|c| c == '\'' || c == '"');
-                            if !unquoted.is_empty() {
-                                return (vec![unquoted.to_string()], None);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        let qw_close = self.find_qw_close_position(node);
+        let names = self.extract_string_names(node);
+        if !names.is_empty() {
+            return (names, qw_close);
         }
         (vec![], None)
-    }
-
-    /// Collect string literal values from a list/paren expression.
-    fn collect_string_values(&self, node: Node<'a>, words: &mut Vec<String>) {
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                match child.kind() {
-                    "string_literal" | "interpolated_string_literal" => {
-                        for j in 0..child.named_child_count() {
-                            if let Some(content) = child.named_child(j) {
-                                if content.kind() == "string_content" {
-                                    if let Ok(text) = content.utf8_text(self.source) {
-                                        words.push(text.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "list_expression" | "parenthesized_expression" => {
-                        self.collect_string_values(child, words);
-                    }
-                    _ => {}
-                }
-            }
-        }
     }
 
     fn visit_assignment(&mut self, node: Node<'a>) {
@@ -1308,27 +1192,7 @@ impl<'a> Builder<'a> {
                     let mut parents = Vec::new();
                     for i in 0..node.named_child_count() {
                         if let Some(child) = node.named_child(i) {
-                            match child.kind() {
-                                "list_expression" | "parenthesized_expression" => {
-                                    self.collect_string_values(child, &mut parents);
-                                }
-                                "quoted_word_list" => {
-                                    for j in 0..child.named_child_count() {
-                                        if let Some(sc) = child.named_child(j) {
-                                            if sc.kind() == "string_content" {
-                                                if let Ok(text) = sc.utf8_text(self.source) {
-                                                    for word in text.split_whitespace() {
-                                                        if !word.is_empty() {
-                                                            parents.push(word.to_string());
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
+                            parents.extend(self.extract_string_names(child));
                         }
                     }
                     if !parents.is_empty() {
@@ -1347,13 +1211,8 @@ impl<'a> Builder<'a> {
             }
             if let Some(right) = node.child_by_field_name("right") {
                 // Try constructor class first, then literal types, then expression type
-                let inferred = if let Some(class_name) = self.extract_constructor_class(right) {
-                    Some(InferredType::ClassName(class_name))
-                } else if let Some(t) = Self::infer_literal_type(right) {
-                    Some(t)
-                } else {
-                    self.infer_expression_result_type(right)
-                };
+                let inferred = self.infer_expression_type(right, false)
+                    .or_else(|| self.infer_expression_result_type(right));
                 if let Some(it) = inferred {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
                         self.type_constraints.push(TypeConstraint {
@@ -1411,42 +1270,34 @@ impl<'a> Builder<'a> {
     }
 
     /// Infer a type from a literal RHS node (no CST walk, just node kind check).
-    fn infer_literal_type(node: Node) -> Option<InferredType> {
-        match node.kind() {
-            "anonymous_hash_expression" => Some(InferredType::HashRef),
-            "anonymous_array_expression" => Some(InferredType::ArrayRef),
-            "anonymous_subroutine_expression" => Some(InferredType::CodeRef),
-            "quoted_regexp" => Some(InferredType::Regexp),
-            _ => None,
-        }
-    }
-
-    /// Infer the type of a Mojo::Base `has` default value.
-    ///
-    /// Handles: `has name => 'str'`, `has name => 42`, `has name => []`,
-    /// `has name => {}`, `has name => sub { [] }` (looks at sub body's
-    /// last expression), `has name => Foo->new`.
-    fn infer_mojo_default_type(&self, node: Node<'a>) -> Option<InferredType> {
+    /// Infer type from an expression node: literals, constructors, sub-body last expr.
+    /// When `unwrap_sub_body` is true (Mojo default context), recurses into sub bodies.
+    /// When false (literal/return context), anonymous subs return CodeRef.
+    fn infer_expression_type(&self, node: Node<'a>, unwrap_sub_body: bool) -> Option<InferredType> {
         match node.kind() {
             "string_literal" | "interpolated_string_literal" => Some(InferredType::String),
             "number" => Some(InferredType::Numeric),
             "anonymous_hash_expression" => Some(InferredType::HashRef),
             "anonymous_array_expression" => Some(InferredType::ArrayRef),
+            "quoted_regexp" => Some(InferredType::Regexp),
             "anonymous_subroutine_expression" => {
-                // sub { ... } — look at the last expression in the block for the return type
-                let body = node.child_by_field_name("body")?;
-                let last_stmt = body.named_child(body.named_child_count().checked_sub(1)?)?;
-                let expr = if last_stmt.kind() == "expression_statement" {
-                    last_stmt.named_child(0)?
-                } else if last_stmt.kind() == "return_expression" {
-                    last_stmt.named_child(0)?
+                if unwrap_sub_body {
+                    // Look at the last expression in the block for the return type
+                    let body = node.child_by_field_name("body")?;
+                    let last_stmt = body.named_child(body.named_child_count().checked_sub(1)?)?;
+                    let expr = if last_stmt.kind() == "expression_statement" {
+                        last_stmt.named_child(0)?
+                    } else if last_stmt.kind() == "return_expression" {
+                        last_stmt.named_child(0)?
+                    } else {
+                        last_stmt
+                    };
+                    self.infer_expression_type(expr, true)
                 } else {
-                    last_stmt
-                };
-                self.infer_mojo_default_type(expr)
+                    Some(InferredType::CodeRef)
+                }
             }
             "method_call_expression" => {
-                // Foo->new — constructor
                 self.extract_constructor_class(node).map(InferredType::ClassName)
             }
             _ => None,
@@ -1454,29 +1305,17 @@ impl<'a> Builder<'a> {
     }
 
     /// Infer the type of a return expression's value.
-    ///
-    /// Handles:
-    /// - Bare `return` / `return undef` → None (skip signal)
-    /// - `return { ... }` / `return [ ... ]` / `return sub { }` / `return qr//` → literal type
-    /// - `return Foo->new()` → Object(Foo)
-    /// - `return $self` → lookup variable's type constraint at this point
-    /// - `return $var` → lookup variable's type constraint at this point
     fn infer_return_value_type(&self, return_node: Node<'a>) -> Option<InferredType> {
         let child = match return_node.named_child(0) {
             Some(c) => c,
             None => return None, // bare `return` — skip signal
         };
-        // `return undef` — skip
         if child.kind() == "undef" {
             return None;
         }
-        // Try literal types first
-        if let Some(t) = Self::infer_literal_type(child) {
+        // Try expression type (literals, constructors)
+        if let Some(t) = self.infer_expression_type(child, false) {
             return Some(t);
-        }
-        // Try constructor: return Foo->new()
-        if let Some(class_name) = self.extract_constructor_class(child) {
-            return Some(InferredType::ClassName(class_name));
         }
         // Try expression result type: return $a + $b → Numeric
         if let Some(t) = self.infer_expression_result_type(child) {
@@ -1485,11 +1324,9 @@ impl<'a> Builder<'a> {
         // Try variable lookup: return $self, return $var
         if child.kind() == "scalar" {
             if let Ok(var_text) = child.utf8_text(self.source) {
-                // Look up the variable's type constraint at this point
                 let point = child.start_position();
                 for tc in self.type_constraints.iter().rev() {
                     if tc.variable == var_text && tc.constraint_span.start <= point {
-                        // Check scope containment
                         let scope = &self.scopes[tc.scope.0 as usize];
                         if contains_point(&scope.span, point) {
                             return Some(tc.inferred_type.clone());
@@ -1778,32 +1615,10 @@ impl<'a> Builder<'a> {
             Some(a) => a,
             None => return,
         };
-        let mut parents: Vec<String> = Vec::new();
-        let nodes: Vec<Node> = if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
-            (0..args.child_count()).filter_map(|i| args.child(i)).collect()
-        } else {
-            vec![args]
-        };
-        for child in &nodes {
-            if !child.is_named() { continue; }
-            match child.kind() {
-                "string_literal" | "interpolated_string_literal" => {
-                    if let Some(text) = self.extract_string_content(*child) {
-                        parents.push(text);
-                    }
-                }
-                "quoted_word_list" => {
-                    let mut names = Vec::new();
-                    self.extract_qw_words(*child, &mut names);
-                    for (name, _) in names {
-                        parents.push(name);
-                    }
-                }
-                _ => {}
-            }
-        }
+        let parents = self.extract_string_names(args);
         if !parents.is_empty() {
-            self.emit_parent_class_refs(node, &parents);
+            let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
+            self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
             self.package_parents
                 .entry(pkg.to_string())
                 .or_default()
@@ -1822,38 +1637,15 @@ impl<'a> Builder<'a> {
             Some(a) => a,
             None => return,
         };
-        let mut components: Vec<String> = Vec::new();
-        let nodes: Vec<Node> = if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
-            (0..args.child_count()).filter_map(|i| args.child(i)).collect()
-        } else {
-            vec![args]
-        };
-        for child in &nodes {
-            if !child.is_named() { continue; }
-            match child.kind() {
-                "string_literal" | "interpolated_string_literal" => {
-                    if let Some(text) = self.extract_string_content(*child) {
-                        if let Some(stripped) = text.strip_prefix('+') {
-                            components.push(stripped.to_string());
-                        } else {
-                            components.push(format!("DBIx::Class::{}", text));
-                        }
-                    }
+        let components: Vec<String> = self.extract_string_names(args).into_iter()
+            .map(|name| {
+                if let Some(stripped) = name.strip_prefix('+') {
+                    stripped.to_string()
+                } else {
+                    format!("DBIx::Class::{}", name)
                 }
-                "quoted_word_list" => {
-                    let mut names = Vec::new();
-                    self.extract_qw_words(*child, &mut names);
-                    for (name, _) in names {
-                        if let Some(stripped) = name.strip_prefix('+') {
-                            components.push(stripped.to_string());
-                        } else {
-                            components.push(format!("DBIx::Class::{}", name));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+            })
+            .collect();
         if !components.is_empty() {
             self.package_parents
                 .entry(pkg)
@@ -2022,7 +1814,7 @@ impl<'a> Builder<'a> {
             FrameworkMode::MojoBase => {
                 // Infer getter return type from default value if present
                 let getter_type = mojo_default_node
-                    .and_then(|n| self.infer_mojo_default_type(n));
+                    .and_then(|n| self.infer_expression_type(n, true));
 
                 // Mojo::Base `has` produces getter + setter (two symbols)
                 for (name, sel_span) in &attr_names {
@@ -2120,54 +1912,12 @@ impl<'a> Builder<'a> {
 
     /// Extract attribute names from an array ref expression: [qw(foo bar)] or ['foo', 'bar']
     fn extract_array_attr_names(&self, node: Node<'a>, names: &mut Vec<(String, Span)>) {
-        // Handle the case where the node itself IS a quoted_word_list (e.g. bare qw() as method arg)
+        // Handle bare qw() node directly (e.g. as method arg)
         if node.kind() == "quoted_word_list" {
-            self.extract_qw_words(node, names);
+            self.extract_qw_word_spans(node, names);
             return;
         }
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                match child.kind() {
-                    "quoted_word_list" => {
-                        self.extract_qw_words(child, names);
-                    }
-                    "string_literal" | "interpolated_string_literal" => {
-                        if let Some(text) = self.extract_string_content(child) {
-                            names.push((text, self.string_content_span(child)));
-                        }
-                    }
-                    "list_expression" | "parenthesized_expression" => {
-                        self.extract_array_attr_names(child, names);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    /// Extract individual words from a `quoted_word_list` node (qw(...)).
-    fn extract_qw_words(&self, qw_node: Node<'a>, names: &mut Vec<(String, Span)>) {
-        for j in 0..qw_node.named_child_count() {
-            if let Some(sc) = qw_node.named_child(j) {
-                if sc.kind() == "string_content" {
-                    if let Ok(text) = sc.utf8_text(self.source) {
-                        let sc_start = sc.start_position();
-                        let mut col_offset = 0usize;
-                        for word in text.split_whitespace() {
-                            if let Some(pos) = text[col_offset..].find(word) {
-                                let abs_col = sc_start.column + col_offset + pos;
-                                let span = Span {
-                                    start: Point::new(sc_start.row, abs_col),
-                                    end: Point::new(sc_start.row, abs_col + word.len()),
-                                };
-                                names.push((word.to_string(), span));
-                                col_offset += pos + word.len();
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        names.extend(self.extract_string_list(node));
     }
 
     /// Extract key-value pairs from a fat-comma list expression.
