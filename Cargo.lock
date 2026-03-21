@@ -1048,6 +1048,8 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 [[package]]
 name = "ts-parser-perl"
 version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50af7554968af227827f6504f5bdbcf602dd5ad69c204184799afc4a3058eae8"
 dependencies = [
  "cc",
  "tree-sitter-language",

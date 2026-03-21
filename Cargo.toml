@@ -7,7 +7,7 @@ edition = "2021"
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
 tree-sitter = "0.25"
-ts-parser-perl = { path = "../tree-sitter-perl" }
+ts-parser-perl = "1"
 dashmap = "6"
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
