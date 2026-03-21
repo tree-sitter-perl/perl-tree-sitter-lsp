@@ -123,6 +123,10 @@ t.test("goto-def: 'get_config' in use qw() jumps to TestExporter.pm", function()
   end
 end)
 
+-- ── diagnostics ──────────────────────────────────────────────────────
+
+lsp.assert_no_diagnostics(t, buf)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()

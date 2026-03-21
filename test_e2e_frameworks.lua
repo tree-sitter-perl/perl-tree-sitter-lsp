@@ -216,6 +216,10 @@ t.test("hover: $dynamic_title from $mojo->$get_title() shows String", function()
   end
 end)
 
+-- ── 8. No unexpected diagnostics ─────────────────────────────────────
+
+lsp.assert_no_diagnostics(t, buf)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()

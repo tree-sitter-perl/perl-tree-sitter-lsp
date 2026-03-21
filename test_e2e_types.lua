@@ -201,6 +201,10 @@ t.test("hover: $callback inferred as CodeRef from ->() usage", function()
     "$callback->($rec);", 0, "CodeRef")
 end)
 
+-- ── diagnostics ──────────────────────────────────────────────────────
+
+lsp.assert_no_diagnostics(t, buf)
+
 -- ── done ────────────────────────────────────────────────────────────
 
 t.finish()

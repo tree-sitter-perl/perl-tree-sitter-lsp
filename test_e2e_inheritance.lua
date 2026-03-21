@@ -180,6 +180,10 @@ t.test("goto-def: 'BaseWorker' in use parent opens BaseWorker.pm", function()
   end
 end)
 
+-- ── diagnostics ──────────────────────────────────────────────────────
+
+lsp.assert_no_diagnostics(t, buf)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()
