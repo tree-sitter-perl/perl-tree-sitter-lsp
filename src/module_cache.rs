@@ -19,7 +19,7 @@ const SCHEMA_VERSION: &str = "8";
 /// Bumped when extraction logic changes (new fields, better parsing).
 /// Unlike SCHEMA_VERSION, this doesn't drop the table — stale entries
 /// are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 3;
+pub const EXTRACT_VERSION: i64 = 4;
 
 pub fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {

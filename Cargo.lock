@@ -621,7 +621,7 @@ dependencies = [
  "tokio",
  "tower-lsp",
  "tree-sitter",
- "tree-sitter-perl",
+ "ts-parser-perl",
 ]
 
 [[package]]
@@ -1046,8 +1046,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
-name = "tree-sitter-perl"
-version = "0.0.1"
+name = "ts-parser-perl"
+version = "1.0.0"
 dependencies = [
  "cc",
  "tree-sitter-language",

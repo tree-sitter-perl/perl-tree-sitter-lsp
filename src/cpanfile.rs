@@ -12,7 +12,7 @@ pub fn parse_cpanfile(root_path: &std::path::Path) -> Vec<String> {
 
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_perl::LANGUAGE.into())
+        .set_language(&ts_parser_perl::LANGUAGE.into())
         .expect("failed to set Perl language");
     let tree = match parser.parse(&source, None) {
         Some(t) => t,

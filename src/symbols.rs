@@ -1300,7 +1300,7 @@ mod tests {
     fn parse_analysis(source: &str) -> FileAnalysis {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&tree_sitter_perl::LANGUAGE.into())
+            .set_language(&ts_parser_perl::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         builder::build(&tree, source.as_bytes())

@@ -699,7 +699,7 @@ pub fn subprocess_main(path: &str, module_name: Option<&str>) {
 pub fn create_parser() -> Parser {
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_perl::LANGUAGE.into())
+        .set_language(&ts_parser_perl::LANGUAGE.into())
         .expect("failed to set Perl language");
     parser
 }

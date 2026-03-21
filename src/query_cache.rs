@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 use tree_sitter::Query;
 
 fn perl_language() -> tree_sitter::Language {
-    tree_sitter_perl::LANGUAGE.into()
+    ts_parser_perl::LANGUAGE.into()
 }
 
 /// Query for `requires 'Module::Name'` calls in cpanfiles.
