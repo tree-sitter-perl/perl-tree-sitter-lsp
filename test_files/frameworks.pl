@@ -8,6 +8,12 @@ package MooApp;
 use Moo;
 with 'MyRole::Logging';
 
+=head2 name
+
+The user's display name (read-only).
+
+=cut
+
 has name => (is => 'ro');
 has count => (is => 'rw');
 
