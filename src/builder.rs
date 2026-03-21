@@ -25,6 +25,9 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         package_parents: std::collections::HashMap::new(),
         framework_modes: std::collections::HashMap::new(),
         framework_imports: std::collections::HashSet::new(),
+        constant_strings: std::collections::HashMap::new(),
+        export: Vec::new(),
+        export_ok: Vec::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -60,6 +63,8 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         b.package_parents,
         b.method_call_bindings,
         b.framework_imports,
+        b.export,
+        b.export_ok,
     )
 }
 
@@ -96,6 +101,13 @@ struct Builder<'a> {
     framework_modes: std::collections::HashMap<String, FrameworkMode>,
     /// Functions implicitly imported by OOP frameworks (has, extends, with, etc.)
     framework_imports: std::collections::HashSet<String>,
+    /// Known compile-time string values, accumulated during the walk.
+    /// Keyed by variable/constant name (e.g. "@COMMON", "BASE_CLASS", "$PREFIX").
+    constant_strings: std::collections::HashMap<String, Vec<String>>,
+    /// Exported function names from @EXPORT assignments.
+    export: Vec<String>,
+    /// Exported function names from @EXPORT_OK assignments.
+    export_ok: Vec<String>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -944,9 +956,18 @@ impl<'a> Builder<'a> {
                 self.add_ref(
                     RefKind::Variable,
                     node_to_span(var_node),
-                    var_name,
+                    var_name.clone(),
                     AccessKind::Declaration,
                 );
+
+                // Accumulate loop variable values for constant folding
+                // for my $x (qw(a b c)) → $x => ["a", "b", "c"]
+                if let Some(list_node) = node.child_by_field_name("list") {
+                    let values = self.extract_string_names(list_node);
+                    if !values.is_empty() {
+                        self.constant_strings.insert(var_name, values);
+                    }
+                }
 
                 self.visit_children(node);
                 self.pop_scope();
@@ -1029,6 +1050,11 @@ impl<'a> Builder<'a> {
                     }
                 }
 
+                // Accumulate constant values: use constant NAME => 'val' / qw(a b)
+                if module_name == "constant" {
+                    self.accumulate_use_constant(node);
+                }
+
                 // Extract imported symbols from qw(...) or list
                 let (imported_symbols, qw_close_paren) = self.extract_use_import_list(node);
                 // Emit FunctionCall refs for imported symbol names (for goto-def on import args)
@@ -1049,6 +1075,57 @@ impl<'a> Builder<'a> {
         // Don't recurse — use statements don't contain interesting sub-nodes
     }
 
+    /// Check if we're at package scope (file scope or package block, not inside a sub).
+    #[allow(dead_code)]
+    fn is_package_scope(&self) -> bool {
+        for &scope_id in self.scope_stack.iter().rev() {
+            match &self.scopes[scope_id.0 as usize].kind {
+                ScopeKind::File | ScopeKind::Package { .. } => return true,
+                ScopeKind::Sub { .. } | ScopeKind::Method { .. } => return false,
+                _ => continue, // blocks, for loops at package level are OK
+            }
+        }
+        true // empty stack = file scope
+    }
+
+    /// Accumulate `use constant NAME => value` into constant_strings.
+    fn accumulate_use_constant(&mut self, node: Node<'a>) {
+        // CST: use_statement → module:"constant", list_expression(autoquoted_bareword, value...)
+        // Find the list_expression child that contains the constant definition
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.kind() == "list_expression" {
+                    // First named child should be the constant name (autoquoted_bareword)
+                    let mut name = None;
+                    let mut saw_name = false;
+                    for j in 0..child.child_count() {
+                        if let Some(c) = child.child(j) {
+                            if !c.is_named() { continue; }
+                            if !saw_name {
+                                if c.kind() == "autoquoted_bareword" || c.kind() == "bareword" {
+                                    name = c.utf8_text(self.source).ok().map(|s| s.to_string());
+                                }
+                                saw_name = true;
+                                continue;
+                            }
+                            // Everything after the name is the value — extract strings
+                            if let Some(ref n) = name {
+                                let values = self.extract_string_names(c);
+                                if !values.is_empty() {
+                                    self.constant_strings
+                                        .entry(n.clone())
+                                        .or_default()
+                                        .extend(values);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     /// Extract strings from a node's children: qw(), paren lists, bare strings.
     /// Returns (text, span) pairs where span covers each individual word.
     /// Also handles the case where the node itself is a string/qw (not just its children).
@@ -1063,6 +1140,24 @@ impl<'a> Builder<'a> {
             "string_literal" | "interpolated_string_literal" => {
                 if let Some(text) = self.extract_string_content(node) {
                     return vec![(text, self.string_content_span(node))];
+                }
+                return vec![];
+            }
+            "bareword" | "autoquoted_bareword" => {
+                if let Ok(text) = node.utf8_text(self.source) {
+                    if let Some(values) = self.resolve_constant_strings(text, 0) {
+                        let span = node_to_span(node);
+                        return values.into_iter().map(|v| (v, span)).collect();
+                    }
+                }
+                return vec![];
+            }
+            "array" => {
+                if let Ok(text) = node.utf8_text(self.source) {
+                    if let Some(values) = self.resolve_constant_strings(text, 0) {
+                        let span = node_to_span(node);
+                        return values.into_iter().map(|v| (v, span)).collect();
+                    }
                 }
                 return vec![];
             }
@@ -1084,6 +1179,27 @@ impl<'a> Builder<'a> {
                     "parenthesized_expression" | "list_expression"
                     | "anonymous_array_expression" => {
                         results.extend(self.extract_string_list(child));
+                    }
+                    // Constant/variable resolution: barewords and array variables
+                    "bareword" | "autoquoted_bareword" => {
+                        if let Ok(text) = child.utf8_text(self.source) {
+                            if let Some(values) = self.resolve_constant_strings(text, 0) {
+                                let span = node_to_span(child);
+                                for val in values {
+                                    results.push((val, span));
+                                }
+                            }
+                        }
+                    }
+                    "array" => {
+                        if let Ok(text) = child.utf8_text(self.source) {
+                            if let Some(values) = self.resolve_constant_strings(text, 0) {
+                                let span = node_to_span(child);
+                                for val in values {
+                                    results.push((val, span));
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1170,6 +1286,91 @@ impl<'a> Builder<'a> {
         None
     }
 
+    /// Resolve a name to its known constant string values.
+    /// Recurses through constant references up to max_depth.
+    fn resolve_constant_strings(&self, name: &str, depth: u8) -> Option<Vec<String>> {
+        if depth > 3 { return None; }
+        let values = self.constant_strings.get(name)?;
+        let mut resolved = Vec::new();
+        for val in values {
+            if let Some(expanded) = self.resolve_constant_strings(val, depth + 1) {
+                resolved.extend(expanded);
+            } else {
+                resolved.push(val.clone());
+            }
+        }
+        Some(resolved)
+    }
+
+    /// Try to resolve an interpolated string to concrete value(s).
+    /// Returns empty vec if any interpolated variable is unknown.
+    /// Returns multiple values if a variable resolves to multiple strings (loop var).
+    fn try_fold_interpolated_string(&self, node: Node<'a>) -> Vec<String> {
+        // Find the string_content child
+        let content = match node.named_child(0) {
+            Some(c) if c.kind() == "string_content" => c,
+            _ => return vec![],
+        };
+
+        // Walk the string_content: split into literal text and interpolated variables.
+        // Named children are the scalars; text between/around them is literal.
+        let content_start = content.start_byte();
+        let content_end = content.end_byte();
+        let source_bytes = &self.source[content_start..content_end];
+
+        let mut segments: Vec<Vec<String>> = Vec::new();
+        let mut pos = 0usize; // position within source_bytes
+
+        for i in 0..content.named_child_count() {
+            if let Some(var_node) = content.named_child(i) {
+                if var_node.kind() != "scalar" {
+                    return vec![]; // complex interpolation, bail
+                }
+                // Literal text before this variable
+                let var_start = var_node.start_byte() - content_start;
+                if var_start > pos {
+                    let literal = std::str::from_utf8(&source_bytes[pos..var_start]).unwrap_or("");
+                    if !literal.is_empty() {
+                        segments.push(vec![literal.to_string()]);
+                    }
+                }
+                // Resolve the variable
+                let var_text = match var_node.utf8_text(self.source) {
+                    Ok(t) => t,
+                    Err(_) => return vec![],
+                };
+                match self.resolve_constant_strings(var_text, 0) {
+                    Some(values) if !values.is_empty() => segments.push(values),
+                    _ => return vec![],
+                }
+                pos = var_node.end_byte() - content_start;
+            }
+        }
+        // Literal text after last variable
+        if pos < source_bytes.len() {
+            let literal = std::str::from_utf8(&source_bytes[pos..]).unwrap_or("");
+            if !literal.is_empty() {
+                segments.push(vec![literal.to_string()]);
+            }
+        }
+
+        if segments.is_empty() {
+            return vec![];
+        }
+        // Cartesian product of all segments
+        let mut result = vec![String::new()];
+        for seg in segments {
+            let mut next = Vec::new();
+            for prefix in &result {
+                for val in &seg {
+                    next.push(format!("{}{}", prefix, val));
+                }
+            }
+            result = next;
+        }
+        result
+    }
+
     /// Extract the import list from a use statement.
     /// Returns (imported_symbols, qw_close_paren_position).
     fn extract_use_import_list(&self, node: Node<'a>) -> (Vec<String>, Option<Point>) {
@@ -1198,6 +1399,69 @@ impl<'a> Builder<'a> {
                     if !parents.is_empty() {
                         // @ISA = replaces (not appends)
                         self.package_parents.insert(pkg.clone(), parents);
+                    }
+                }
+            }
+
+            // Accumulate @EXPORT / @EXPORT_OK assignments
+            let var_name = if lhs_text.ends_with("@EXPORT_OK") {
+                Some("@EXPORT_OK")
+            } else if lhs_text.ends_with("@EXPORT") && !lhs_text.ends_with("@EXPORT_OK") {
+                Some("@EXPORT")
+            } else {
+                None
+            };
+            if let Some(export_var) = var_name {
+                let mut names = Vec::new();
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        names.extend(self.extract_string_names(child));
+                    }
+                }
+                if !names.is_empty() {
+                    if export_var == "@EXPORT" {
+                        self.export = names;
+                    } else {
+                        self.export_ok = names;
+                    }
+                }
+            }
+
+            // Accumulate array/scalar assignments as constants
+            {
+                // Strip leading "our " or "my " to get the variable name
+                let var_stripped = if lhs_text.starts_with("our ") {
+                    &lhs_text[4..]
+                } else if lhs_text.starts_with("my ") {
+                    &lhs_text[3..]
+                } else {
+                    lhs_text
+                };
+                if var_stripped.starts_with('@') {
+                    let mut values = Vec::new();
+                    for i in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(i) {
+                            values.extend(self.extract_string_names(child));
+                        }
+                    }
+                    if !values.is_empty() {
+                        self.constant_strings.insert(var_stripped.to_string(), values);
+                    }
+                } else if var_stripped.starts_with('$') {
+                    let var = var_stripped;
+                    if let Some(right) = node.child_by_field_name("right") {
+                        if right.kind() == "interpolated_string_literal" {
+                            // Try interpolated string folding first (has variable refs)
+                            let folded = self.try_fold_interpolated_string(right);
+                            if !folded.is_empty() {
+                                self.constant_strings.insert(var.to_string(), folded);
+                            }
+                        } else if right.kind() == "string_literal" {
+                            // Plain string literal
+                            if let Some(text) = self.extract_string_content(right) {
+                                self.constant_strings.insert(var.to_string(), vec![text]);
+                            }
+                        }
                     }
                 }
             }
@@ -1603,9 +1867,50 @@ impl<'a> Builder<'a> {
                         }
                     }
                 }
+                // push @EXPORT, 'foo', 'bar' / push @EXPORT_OK, 'foo'
+                if name == "push" {
+                    self.visit_push_call(node);
+                }
             }
         }
         self.visit_children(node);
+    }
+
+    /// Handle `push @EXPORT, 'foo', 'bar'` — append to export lists.
+    fn visit_push_call(&mut self, node: Node<'a>) {
+        let args = match node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return,
+        };
+        // First arg should be the array, rest are values
+        let children: Vec<Node> = if args.kind() == "list_expression" {
+            (0..args.child_count()).filter_map(|i| args.child(i)).filter(|c| c.is_named()).collect()
+        } else {
+            return;
+        };
+        if children.is_empty() { return; }
+        let first = children[0];
+        if first.kind() != "array" { return; }
+        let arr_name = match first.utf8_text(self.source) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let is_export = arr_name.ends_with("@EXPORT") && !arr_name.ends_with("@EXPORT_OK");
+        let is_export_ok = arr_name.ends_with("@EXPORT_OK");
+        if !is_export && !is_export_ok { return; }
+
+        // Extract string values from remaining args
+        let mut values = Vec::new();
+        for child in &children[1..] {
+            values.extend(self.extract_string_names(*child));
+        }
+        if !values.is_empty() {
+            if is_export {
+                self.export.extend(values);
+            } else {
+                self.export_ok.extend(values);
+            }
+        }
     }
 
     /// Synthesize accessor methods from `has` calls in Moo/Moose/Mojo::Base classes.
@@ -2056,15 +2361,32 @@ impl<'a> Builder<'a> {
             .map(|n| node_to_span(n));
 
         if let Some(ref name) = method_name {
-            self.add_ref(
-                RefKind::MethodCall {
-                    invocant: invocant.clone().unwrap_or_default(),
-                    invocant_span,
-                },
-                node_to_span(node),
-                name.clone(),
-                AccessKind::Read,
-            );
+            // Dynamic method dispatch: $self->$method() — resolve $method if known
+            if name.starts_with('$') {
+                if let Some(resolved) = self.resolve_constant_strings(name, 0) {
+                    for rname in resolved {
+                        self.add_ref(
+                            RefKind::MethodCall {
+                                invocant: invocant.clone().unwrap_or_default(),
+                                invocant_span,
+                            },
+                            node_to_span(node),
+                            rname,
+                            AccessKind::Read,
+                        );
+                    }
+                }
+            } else {
+                self.add_ref(
+                    RefKind::MethodCall {
+                        invocant: invocant.clone().unwrap_or_default(),
+                        invocant_span,
+                    },
+                    node_to_span(node),
+                    name.clone(),
+                    AccessKind::Read,
+                );
+            }
         }
 
         // DBIC accessor synthesis: __PACKAGE__->add_columns(...), ->has_many(...), etc.
@@ -5472,5 +5794,123 @@ has 'name';
 ");
         let rt = fa.find_method_return_type("App", "name", None, Some(0));
         assert!(rt.is_none(), "no default → no getter type");
+    }
+
+    // ---- Constant folding + export extraction tests ----
+
+    #[test]
+    fn test_builder_extracts_exports_qw() {
+        let fa = build_fa("
+package Foo;
+use Exporter 'import';
+our @EXPORT = qw(delta);
+our @EXPORT_OK = qw(alpha beta gamma);
+");
+        assert_eq!(fa.export, vec!["delta"]);
+        assert_eq!(fa.export_ok, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_builder_extracts_exports_paren() {
+        let fa = build_fa("
+package Bar;
+our @EXPORT_OK = ('foo', 'bar', 'baz');
+");
+        assert_eq!(fa.export_ok, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn test_push_exports() {
+        let fa = build_fa("
+package Foo;
+use Exporter 'import';
+our @EXPORT_OK = qw(foo);
+push @EXPORT_OK, 'bar', 'baz';
+");
+        assert_eq!(fa.export_ok, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn test_use_constant_string() {
+        let fa = build_fa("
+package Foo;
+use constant NAME => 'hello';
+use parent NAME;
+");
+        assert_eq!(fa.package_parents.get("Foo").unwrap(), &vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn test_constant_array_our() {
+        let fa = build_fa("
+our @THINGS = qw(a b);
+our @EXPORT_OK = (@THINGS, 'c');
+");
+        assert_eq!(fa.export_ok, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_constant_array_my() {
+        let fa = build_fa("
+my @THINGS = qw(a b);
+our @EXPORT_OK = (@THINGS, 'c');
+");
+        assert_eq!(fa.export_ok, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_constant_array_in_exports() {
+        let fa = build_fa("
+package Foo;
+use Exporter 'import';
+my @COMMON = qw(alpha beta);
+our @EXPORT_OK = (@COMMON, 'gamma');
+");
+        assert_eq!(fa.export_ok, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_recursive_constant_resolution() {
+        let fa = build_fa("
+package Foo;
+use Exporter 'import';
+use constant BASE => qw(a b);
+use constant ALL => (BASE, 'c');
+our @EXPORT_OK = (ALL);
+");
+        assert_eq!(fa.export_ok, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_loop_variable_constant_folding() {
+        let fa = build_fa("
+package Foo;
+sub test {
+    my $self = shift;
+    for my $attr (qw(name email)) {
+        my $getter = \"get_$attr\";
+        $self->$getter();
+    }
+}
+");
+        let method_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::MethodCall { .. }))
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(method_refs.contains(&"get_name"), "should resolve get_name");
+        assert!(method_refs.contains(&"get_email"), "should resolve get_email");
+    }
+
+    #[test]
+    fn test_dynamic_method_dispatch() {
+        let fa = build_fa("
+package Foo;
+my $method = 'get_name';
+sub test { my $self = shift; $self->$method() }
+");
+        let method_refs: Vec<_> = fa.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "get_name")
+            .collect();
+        assert!(!method_refs.is_empty(), "dynamic method call should resolve to get_name");
     }
 }

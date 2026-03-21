@@ -61,10 +61,8 @@ pub fn cpanfile_requires() -> &'static Query {
 }
 
 /// Query for `@EXPORT = qw(...)` and `@EXPORT_OK = qw(...)` assignments.
-///
-/// Captures the array variable name and the `quoted_word_list` content.
-/// Matches both direct `@EXPORT = qw(...)` and nested inside a list expression
-/// like `@EXPORT = ('foo', qw/bar baz/)` where qw is a child of `list_expression`.
+/// Now only used in tests — export extraction moved to builder.
+#[cfg(test)]
 pub fn exports_qw() -> &'static Query {
     static QUERY: OnceLock<Query> = OnceLock::new();
     QUERY.get_or_init(|| {
@@ -93,10 +91,8 @@ pub fn exports_qw() -> &'static Query {
 }
 
 /// Query for `@EXPORT = ('foo', 'bar')` list assignments.
-///
-/// Captures the array variable and all string_content nodes inside the
-/// list expression. Handles multi-element `('foo', 'bar')` → `list_expression`
-/// and single-element `('foo')` → bare `string_literal` on the right side.
+/// Now only used in tests — export extraction moved to builder.
+#[cfg(test)]
 pub fn exports_paren_list() -> &'static Query {
     static QUERY: OnceLock<Query> = OnceLock::new();
     QUERY.get_or_init(|| {

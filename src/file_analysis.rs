@@ -405,6 +405,11 @@ pub struct FileAnalysis {
     /// Used to suppress "not defined" diagnostics for these known framework keywords.
     pub framework_imports: HashSet<String>,
 
+    /// Exported function names from `@EXPORT = ...` assignments.
+    pub export: Vec<String>,
+    /// Exported function names from `@EXPORT_OK = ...` assignments.
+    pub export_ok: Vec<String>,
+
     // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
     base_type_constraint_count: usize,
     base_symbol_count: usize,
@@ -430,6 +435,8 @@ impl FileAnalysis {
         package_parents: HashMap<String, Vec<String>>,
         method_call_bindings: Vec<MethodCallBinding>,
         framework_imports: HashSet<String>,
+        export: Vec<String>,
+        export_ok: Vec<String>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -443,6 +450,8 @@ impl FileAnalysis {
             package_parents,
             imported_return_types: HashMap::new(),
             framework_imports,
+            export,
+            export_ok,
             base_type_constraint_count: 0,
             base_symbol_count: 0,
             scope_starts: Vec::new(),
@@ -3008,6 +3017,8 @@ mod tests {
             HashMap::new(),
             vec![],
             HashSet::new(),
+            vec![],
+            vec![],
         )
     }
 
@@ -3102,6 +3113,8 @@ mod tests {
             HashMap::new(),
             vec![],
             HashSet::new(),
+            vec![],
+            vec![],
         );
         assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
         assert_eq!(fa.sub_return_type("nonexistent"), None);
@@ -3260,6 +3273,8 @@ mod tests {
             HashMap::new(),
             vec![],
             HashSet::new(),
+            vec![],
+            vec![],
         );
 
         let mut imported = HashMap::new();
