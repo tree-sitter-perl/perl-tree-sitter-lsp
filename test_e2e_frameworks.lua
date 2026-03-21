@@ -188,6 +188,39 @@ t.test("goto-def: $report->to_string() jumps to Printable::to_string", function(
   if t.eq(N, expected, def, "definition line") then t.pass(N) end
 end)
 
+-- ── 7. Dynamic method dispatch via constant folding ──────────────────
+
+t.test("goto-def: $moo->$accessor() resolves to MooApp::name accessor", function()
+  local N = "goto-def: $moo->$accessor() resolves to MooApp::name accessor"
+  local line, col = b.find_pos(buf, "$moo->$accessor();")
+  if not t.ok(N, line, "couldn't find '$moo->$accessor()'") then return end
+  -- Position on $accessor (the method name)
+  local def = lsp.def_line(buf, line, col + 6)
+  if not t.ok(N, def, "no definition result") then return end
+  -- Should jump to the 'has name' line (the accessor definition)
+  local has_line = b.find_line(buf, "has name =>")
+  -- Also accept the 'my $accessor' definition line (variable def)
+  local var_line = b.find_line(buf, "my $accessor = ")
+  if def == has_line or def == var_line then
+    t.pass(N)
+  else
+    t.fail(N, string.format("expected line %s (has) or %s (var), got %s",
+      tostring(has_line), tostring(var_line), tostring(def)))
+  end
+end)
+
+t.test("hover: $moo->$accessor() resolves dynamic method", function()
+  local N = "hover: $moo->$accessor() resolves dynamic method"
+  local line, col = b.find_pos(buf, "$moo->$accessor();")
+  if not t.ok(N, line, "couldn't find '$moo->$accessor()'") then return end
+  local text = lsp.hover_text(buf, line, col + 6)
+  if not t.ok(N, text, "no hover result") then return end
+  if t.ok(N, text:find("name", 1, true),
+    "hover should mention 'name', got: " .. text) then
+    t.pass(N)
+  end
+end)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()

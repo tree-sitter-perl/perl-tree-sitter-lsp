@@ -73,4 +73,15 @@ my $report = Report->new();
 $report->generate();
 $report->to_string();
 
+# ── Dynamic method dispatch via constant folding ──
+
+my $accessor = 'name';
+$moo->$accessor();
+
+# ── Constant-based exports ──
+
+use constant MY_EXPORTS => qw(encode decode);
+my @BASE = qw(connect disconnect);
+our @EXPORT_OK = (MY_EXPORTS, @BASE, 'status');
+
 1;
