@@ -78,6 +78,9 @@ $report->to_string();
 my $accessor = 'name';
 $moo->$accessor();
 
+my $get_title = 'title';
+my $dynamic_title = $mojo->$get_title();
+
 # ── Constant-based exports ──
 
 use constant MY_EXPORTS => qw(encode decode);

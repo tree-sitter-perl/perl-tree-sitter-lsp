@@ -1507,13 +1507,22 @@ impl<'a> Builder<'a> {
                                 // Skip constructors — already handled by extract_constructor_class
                                 if method != "new" {
                                     if let Some(vt) = self.get_var_text_from_lhs(left) {
-                                        self.method_call_bindings.push(MethodCallBinding {
-                                            variable: vt,
-                                            invocant_var: inv.to_string(),
-                                            method_name: method.to_string(),
-                                            scope: self.current_scope(),
-                                            span: node_to_span(node),
-                                        });
+                                        // Resolve dynamic method names via constant folding
+                                        let method_names = if method.starts_with('$') {
+                                            self.resolve_constant_strings(method, 0)
+                                                .unwrap_or_else(|| vec![method.to_string()])
+                                        } else {
+                                            vec![method.to_string()]
+                                        };
+                                        for mname in method_names {
+                                            self.method_call_bindings.push(MethodCallBinding {
+                                                variable: vt.clone(),
+                                                invocant_var: inv.to_string(),
+                                                method_name: mname,
+                                                scope: self.current_scope(),
+                                                span: node_to_span(node),
+                                            });
+                                        }
                                     }
                                 }
                             }

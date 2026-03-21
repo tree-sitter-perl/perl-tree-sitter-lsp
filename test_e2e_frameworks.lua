@@ -221,6 +221,18 @@ t.test("hover: $moo->$accessor() resolves dynamic method", function()
   end
 end)
 
+t.test("hover: $dynamic_title from $mojo->$get_title() shows String", function()
+  local N = "hover: $dynamic_title from $mojo->$get_title() shows String"
+  local line, col = b.find_pos(buf, "$dynamic_title = $mojo->$get_title()")
+  if not t.ok(N, line, "couldn't find dynamic_title line") then return end
+  local text = lsp.hover_text(buf, line, col)
+  if not t.ok(N, text, "no hover result") then return end
+  if t.ok(N, text:find("String", 1, true),
+    "hover should mention 'String' (from Mojo title default), got: " .. text) then
+    t.pass(N)
+  end
+end)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()
