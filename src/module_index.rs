@@ -121,6 +121,8 @@ pub struct ModuleIndex {
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
     stale_modules: Arc<DashMap<String, ()>>,
+    /// Known module names from @INC scan. Name → path. No exports until resolved.
+    available_modules: Arc<DashMap<String, std::path::PathBuf>>,
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
@@ -133,6 +135,7 @@ impl ModuleIndex {
         let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
         let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
+        let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
         let queue = Arc::new(ResolveQueue {
             priority: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
@@ -154,6 +157,7 @@ impl ModuleIndex {
             Arc::clone(&cache),
             Arc::clone(&reverse_index),
             Arc::clone(&stale_modules),
+            Arc::clone(&available_modules),
             Arc::clone(&queue),
             Arc::clone(&resolved),
             Arc::clone(&workspace_root),
@@ -165,6 +169,7 @@ impl ModuleIndex {
             cache,
             reverse_index,
             stale_modules,
+            available_modules,
             queue,
             resolved,
             workspace_root,
@@ -230,6 +235,34 @@ impl ModuleIndex {
         }
     }
 
+    /// Collect module names matching a prefix for completion.
+    /// Returns (name, is_resolved) — resolved modules have export data.
+    pub fn complete_module_names(&self, prefix: &str) -> Vec<(String, bool)> {
+        let prefix_lower = prefix.to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::new();
+
+        // Tier 1: resolved modules (have full export data)
+        for entry in self.cache.iter() {
+            if entry.value().is_some() {
+                let name = entry.key();
+                if name.to_lowercase().starts_with(&prefix_lower) && seen.insert(name.clone()) {
+                    results.push((name.clone(), true));
+                }
+            }
+        }
+
+        // Tier 2: @INC scan (name only, no exports yet)
+        for entry in self.available_modules.iter() {
+            let name = entry.key();
+            if name.to_lowercase().starts_with(&prefix_lower) && seen.insert(name.clone()) {
+                results.push((name.clone(), false));
+            }
+        }
+
+        results
+    }
+
     /// Look up the return type of an imported function. Zero I/O.
     #[cfg(test)]
     pub fn get_return_type_cached(&self, func_name: &str) -> Option<InferredType> {
@@ -268,6 +301,7 @@ impl ModuleIndex {
         let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
         let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
+        let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
         let queue = Arc::new(ResolveQueue {
             priority: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
@@ -295,6 +329,7 @@ impl ModuleIndex {
             cache,
             reverse_index,
             stale_modules,
+            available_modules,
             queue,
             resolved,
             workspace_root,

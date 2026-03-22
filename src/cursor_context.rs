@@ -21,6 +21,15 @@ pub enum CursorContext {
     Method { invocant_type: Option<InferredType>, invocant_text: String },
     /// After `$var->{` or `$hash{` — hash key completion. Type is resolved when available.
     HashKey { owner_type: Option<InferredType>, var_text: String, source_sub: Option<String> },
+    /// On a `use`/`require` line — completing module name or import list.
+    UseStatement {
+        /// Module name typed so far (e.g. "Mojo::Ba" or "" if just "use ")
+        module_prefix: String,
+        /// If true, cursor is inside the import list (qw, parens, or bare string after module)
+        in_import_list: bool,
+        /// The fully typed module name (only set when in_import_list is true)
+        module_name: Option<String>,
+    },
     /// No specific trigger — general completion.
     General,
 }
@@ -59,6 +68,28 @@ pub fn detect_cursor_context(source: &str, point: Point, analysis: Option<&FileA
         line
     };
     let trimmed = before.trim_end();
+
+    // Check for use/require line — module name or import list completion
+    {
+        let line_trimmed = line.trim_start();
+        if line_trimmed.starts_with("use ") || line_trimmed.starts_with("require ") {
+            let keyword = if line_trimmed.starts_with("use ") { "use " } else { "require " };
+            let after_keyword = line_trimmed.strip_prefix(keyword).unwrap_or("");
+            // How much of the line is before the cursor?
+            let leading_ws = line.len() - line.trim_start().len();
+            let cursor_in_line = if point.column > leading_ws + keyword.len() {
+                point.column - leading_ws - keyword.len()
+            } else {
+                0
+            };
+            let before_cursor_in_after = if cursor_in_line <= after_keyword.len() {
+                &after_keyword[..cursor_in_line]
+            } else {
+                after_keyword
+            };
+            return detect_use_context(before_cursor_in_after, keyword == "require ");
+        }
+    }
 
     // Check for hash key completion: $hash{ or $self->{ (including mid-word: $var->{ho)
     {
@@ -146,6 +177,44 @@ fn strip_trailing_identifier(s: &str) -> &str {
 }
 
 /// Extract the invocant token from the text before `->` or `{`.
+/// Detect whether we're completing a module name or an import list on a use/require line.
+/// `text` is the content after "use " / "require ", up to the cursor position.
+fn detect_use_context(text: &str, is_require: bool) -> CursorContext {
+    // Skip special pragmas that don't take module-style arguments
+    if text.starts_with("strict") || text.starts_with("warnings") || text.starts_with("utf8")
+        || text.starts_with("feature") || text.starts_with("constant ")
+        || text.starts_with("lib ") || text.starts_with("v5")
+    {
+        return CursorContext::General;
+    }
+
+    // Find the module name: sequence of word chars and :: up to whitespace/paren/quote/semicolon
+    let module_end = text.find(|c: char| c.is_whitespace() || c == '(' || c == '\'' || c == '"' || c == ';')
+        .unwrap_or(text.len());
+    let module_prefix = &text[..module_end];
+
+    // If there's content after the module name, we're in the import list
+    let rest = text[module_end..].trim_start();
+    if !rest.is_empty() && !module_prefix.is_empty() && !is_require {
+        // Skip use parent/base — those take class names, handled elsewhere
+        if module_prefix == "parent" || module_prefix == "base" {
+            return CursorContext::General;
+        }
+        return CursorContext::UseStatement {
+            module_prefix: String::new(),
+            in_import_list: true,
+            module_name: Some(module_prefix.to_string()),
+        };
+    }
+
+    // Still typing the module name
+    CursorContext::UseStatement {
+        module_prefix: module_prefix.to_string(),
+        in_import_list: false,
+        module_name: None,
+    }
+}
+
 fn extract_invocant_from_prefix(prefix: &str) -> &str {
     let bytes = prefix.as_bytes();
     let end = bytes.len();
@@ -915,5 +984,67 @@ $calc->get_self->get_config->{";
                 invocant_text: "$obj".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_use_context_module_prefix() {
+        let source = "use Mojo::Ba";
+        let ctx = detect_cursor_context(source, Point::new(0, 12), None);
+        assert_eq!(ctx, CursorContext::UseStatement {
+            module_prefix: "Mojo::Ba".to_string(),
+            in_import_list: false,
+            module_name: None,
+        });
+    }
+
+    #[test]
+    fn test_use_context_empty_prefix() {
+        let source = "use ";
+        let ctx = detect_cursor_context(source, Point::new(0, 4), None);
+        assert_eq!(ctx, CursorContext::UseStatement {
+            module_prefix: String::new(),
+            in_import_list: false,
+            module_name: None,
+        });
+    }
+
+    #[test]
+    fn test_use_context_import_list_qw() {
+        let source = "use List::Util qw(ma";
+        let ctx = detect_cursor_context(source, Point::new(0, 20), None);
+        assert_eq!(ctx, CursorContext::UseStatement {
+            module_prefix: String::new(),
+            in_import_list: true,
+            module_name: Some("List::Util".to_string()),
+        });
+    }
+
+    #[test]
+    fn test_use_context_import_list_bare_string() {
+        let source = "use Foo 'ba";
+        let ctx = detect_cursor_context(source, Point::new(0, 11), None);
+        assert_eq!(ctx, CursorContext::UseStatement {
+            module_prefix: String::new(),
+            in_import_list: true,
+            module_name: Some("Foo".to_string()),
+        });
+    }
+
+    #[test]
+    fn test_use_context_skips_pragmas() {
+        let source = "use strict";
+        let ctx = detect_cursor_context(source, Point::new(0, 10), None);
+        assert_eq!(ctx, CursorContext::General);
+    }
+
+    #[test]
+    fn test_require_context_module_prefix() {
+        let source = "require DBI";
+        let ctx = detect_cursor_context(source, Point::new(0, 11), None);
+        assert_eq!(ctx, CursorContext::UseStatement {
+            module_prefix: "DBI".to_string(),
+            in_import_list: false,
+            module_name: None,
+        });
     }
 }

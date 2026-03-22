@@ -36,6 +36,7 @@ pub fn spawn_resolver(
     cache: Arc<DashMap<String, Option<ModuleExports>>>,
     reverse_index: Arc<DashMap<String, Vec<String>>>,
     stale_modules: Arc<DashMap<String, ()>>,
+    available_modules: Arc<DashMap<String, PathBuf>>,
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
@@ -48,6 +49,10 @@ pub fn spawn_resolver(
         .name("module-resolver".into())
         .spawn(move || {
             let inc_paths = discover_inc_paths();
+
+            // Scan @INC for available module names (fast, no parsing — just readdir)
+            scan_inc_module_names(&inc_paths, &available_modules);
+            log::info!("@INC scan: {} modules available", available_modules.len());
 
             // Wait for workspace root from initialize() for per-project cache path.
             let ws_root = wait_for_workspace_root(&workspace_root);
@@ -758,6 +763,37 @@ pub fn discover_inc_paths() -> Vec<PathBuf> {
     }
 }
 
+
+/// Scan @INC directories for .pm files, populating the available_modules map.
+/// Fast — no file reads, just directory traversal + path→module name conversion.
+fn scan_inc_module_names(inc_paths: &[PathBuf], available: &DashMap<String, PathBuf>) {
+    for inc in inc_paths {
+        if inc.is_dir() {
+            scan_dir_recursive(inc, inc, available, 0);
+        }
+    }
+}
+
+fn scan_dir_recursive(base: &std::path::Path, dir: &std::path::Path, available: &DashMap<String, PathBuf>, depth: u32) {
+    if depth > 15 { return; } // prevent symlink loops
+    let entries = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir_recursive(base, &path, available, depth + 1);
+        } else if path.extension().map(|e| e == "pm").unwrap_or(false) {
+            if let Ok(rel) = path.strip_prefix(base) {
+                let module_name = rel.to_string_lossy()
+                    .trim_end_matches(".pm")
+                    .replace(std::path::MAIN_SEPARATOR, "::");
+                available.insert(module_name, path.clone());
+            }
+        }
+    }
+}
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     uri.strip_prefix("file://").map(PathBuf::from)
