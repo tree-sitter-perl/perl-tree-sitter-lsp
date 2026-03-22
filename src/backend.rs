@@ -344,7 +344,27 @@ impl LanguageServer for Backend {
         if items.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(CompletionResponse::Array(items)))
+            // If any item is a loading placeholder (empty insert_text), mark as incomplete
+            // so the editor re-requests on next keystroke after the module resolves.
+            let is_incomplete = items.iter().any(|i| i.insert_text.as_deref() == Some(""));
+            if is_incomplete {
+                // Trigger resolution for the module being loaded
+                for i in &items {
+                    if i.insert_text.as_deref() == Some("") {
+                        if let Some(ref label) = Some(&i.label) {
+                            if let Some(name) = label.strip_prefix("loading ").and_then(|s| s.strip_suffix("...")) {
+                                self.module_index.request_resolve(name);
+                            }
+                        }
+                    }
+                }
+                Ok(Some(CompletionResponse::List(CompletionList {
+                    is_incomplete: true,
+                    items,
+                })))
+            } else {
+                Ok(Some(CompletionResponse::Array(items)))
+            }
         }
     }
 

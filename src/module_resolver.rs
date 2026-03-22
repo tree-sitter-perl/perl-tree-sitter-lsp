@@ -236,6 +236,7 @@ pub fn spawn_test_resolver(
     cache: Arc<DashMap<String, Option<ModuleExports>>>,
     reverse_index: Arc<DashMap<String, Vec<String>>>,
     stale_modules: Arc<DashMap<String, ()>>,
+    available_modules: Arc<DashMap<String, PathBuf>>,
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
@@ -244,6 +245,7 @@ pub fn spawn_test_resolver(
         .name("module-resolver-test".into())
         .spawn(move || {
             let inc_paths = discover_inc_paths();
+            scan_inc_module_names(&inc_paths, &available_modules);
             let ws_root = wait_for_workspace_root(&workspace_root);
 
             let db = module_cache::open_cache_db(ws_root.as_deref());

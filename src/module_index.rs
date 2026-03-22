@@ -320,6 +320,7 @@ impl ModuleIndex {
             Arc::clone(&cache),
             Arc::clone(&reverse_index),
             Arc::clone(&stale_modules),
+            Arc::clone(&available_modules),
             Arc::clone(&queue),
             Arc::clone(&resolved),
             Arc::clone(&workspace_root),
