@@ -301,6 +301,10 @@ t.test("completion detail: $calc->get_self shows return type", function()
   if t.ok(N, found, "no 'get_self' completion with Calculator detail") then t.pass(N) end
 end)
 
+-- ── diagnostics ──────────────────────────────────────────────────────
+
+lsp.assert_no_diagnostics(t, buf)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()

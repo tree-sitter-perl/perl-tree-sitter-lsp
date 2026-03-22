@@ -1,18 +1,12 @@
 # perl-lsp
 
-A Perl LSP server built on tree-sitter-perl and tower-lsp.
+A Perl LSP server built on ts-parser-perl (crates.io) and tower-lsp.
 
 ## Build
 
 ```
 cargo build          # debug
 cargo build --release  # optimized
-```
-
-Requires `tree-sitter-perl` as a sibling directory (`../tree-sitter-perl`).
-If `src/parser.c` is missing from tree-sitter-perl, generate it:
-```
-cd ../tree-sitter-perl && tree-sitter generate
 ```
 
 ## Architecture
@@ -66,7 +60,7 @@ The codebase has four layers. Data flows **down** only. Each layer may only depe
 
 - `tower-lsp 0.20` — LSP framework (uses `#[tower_lsp::async_trait]`)
 - `tree-sitter 0.25` — Parsing
-- `tree-sitter-perl` — Path dep to `../tree-sitter-perl`, exports `LANGUAGE: LanguageFn`
+- `ts-parser-perl` — crates.io, exports `LANGUAGE: LanguageFn`
 - `dashmap 6` — Concurrent document store + module cache
 - `rusqlite 0.32` — SQLite persistence for module index (bundled)
 - `regex 1` — POD→markdown inline formatting conversion

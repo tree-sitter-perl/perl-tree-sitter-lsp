@@ -8,6 +8,12 @@ package MooApp;
 use Moo;
 with 'MyRole::Logging';
 
+=head2 name
+
+The user's display name (read-only).
+
+=cut
+
 has name => (is => 'ro');
 has count => (is => 'rw');
 
@@ -72,5 +78,19 @@ $rs->columns();
 my $report = Report->new();
 $report->generate();
 $report->to_string();
+
+# ── Dynamic method dispatch via constant folding ──
+
+my $accessor = 'name';
+$moo->$accessor();
+
+my $get_title = 'title';
+my $dynamic_title = $mojo->$get_title();
+
+# ── Constant-based exports ──
+
+use constant MY_EXPORTS => qw(encode decode);
+my @BASE = qw(connect disconnect);
+our @EXPORT_OK = (MY_EXPORTS, @BASE, 'status');
 
 1;

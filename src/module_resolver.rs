@@ -626,8 +626,8 @@ pub fn subprocess_main(path: &str, module_name: Option<&str>) {
     };
     let mut parser = create_parser();
 
-    let (export, export_ok, tree) = match extract_exports(&mut parser, &source) {
-        Some(tuple) => tuple,
+    let tree = match parser.parse(&source, None) {
+        Some(t) => t,
         None => {
             println!("{{}}");
             return;
@@ -635,7 +635,9 @@ pub fn subprocess_main(path: &str, module_name: Option<&str>) {
     };
 
     let analysis = crate::builder::build(&tree, source.as_bytes());
-    let (subs, parents) = collect_export_metadata(&analysis, &export, &export_ok, module_name);
+    let export = &analysis.export;
+    let export_ok = &analysis.export_ok;
+    let (subs, parents) = collect_export_metadata(&analysis, export, export_ok, module_name);
 
     // Serialize to JSON for subprocess IPC
     let mut subs_map = serde_json::Map::new();
@@ -697,7 +699,7 @@ pub fn subprocess_main(path: &str, module_name: Option<&str>) {
 pub fn create_parser() -> Parser {
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_perl::LANGUAGE.into())
+        .set_language(&ts_parser_perl::LANGUAGE.into())
         .expect("failed to set Perl language");
     parser
 }
@@ -727,9 +729,11 @@ pub fn resolve_and_parse(
         return None;
     }
     let source = std::fs::read_to_string(&path).ok()?;
-    let (export, export_ok, tree) = extract_exports(parser, &source)?;
+    let tree = parser.parse(&source, None)?;
 
     let analysis = crate::builder::build(&tree, source.as_bytes());
+    let export = analysis.export.clone();
+    let export_ok = analysis.export_ok.clone();
     let (subs, parents) = collect_export_metadata(&analysis, &export, &export_ok, Some(module_name));
 
     Some(ModuleExports { path, export, export_ok, subs, parents })
@@ -754,70 +758,6 @@ pub fn discover_inc_paths() -> Vec<PathBuf> {
     }
 }
 
-// ---- Export extraction ----
-
-fn extract_exports(parser: &mut Parser, source: &str) -> Option<(Vec<String>, Vec<String>, tree_sitter::Tree)> {
-    use tree_sitter::{QueryCursor, StreamingIterator};
-
-    let tree = parser.parse(source, None)?;
-    let root = tree.root_node();
-    let bytes = source.as_bytes();
-
-    let mut export = Vec::new();
-    let mut export_ok = Vec::new();
-
-    // Query 1: @EXPORT = qw(...)
-    let qw_query = crate::query_cache::exports_qw();
-    let qw_var_idx = qw_query.capture_index_for_name("var").unwrap();
-    let qw_words_idx = qw_query.capture_index_for_name("words").unwrap();
-
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(qw_query, root, bytes);
-    while let Some(m) = matches.next() {
-        let mut var_name = "";
-        let mut words = Vec::new();
-        for cap in m.captures {
-            let text = cap.node.utf8_text(bytes).unwrap_or("");
-            if cap.index == qw_var_idx {
-                var_name = text;
-            } else if cap.index == qw_words_idx {
-                words.extend(text.split_whitespace().map(String::from));
-            }
-        }
-        match var_name {
-            "@EXPORT_OK" => export_ok.extend(words),
-            "@EXPORT" => export.extend(words),
-            _ => {}
-        }
-    }
-
-    // Query 2: @EXPORT = ('foo', 'bar')
-    let paren_query = crate::query_cache::exports_paren_list();
-    let paren_var_idx = paren_query.capture_index_for_name("var").unwrap();
-    let paren_word_idx = paren_query.capture_index_for_name("word").unwrap();
-
-    let mut cursor2 = QueryCursor::new();
-    let mut matches2 = cursor2.matches(paren_query, root, bytes);
-    while let Some(m) = matches2.next() {
-        let mut var_name = "";
-        let mut words = Vec::new();
-        for cap in m.captures {
-            let text = cap.node.utf8_text(bytes).unwrap_or("");
-            if cap.index == paren_var_idx {
-                var_name = text;
-            } else if cap.index == paren_word_idx {
-                words.push(text.to_string());
-            }
-        }
-        match var_name {
-            "@EXPORT_OK" => export_ok.extend(words),
-            "@EXPORT" => export.extend(words),
-            _ => {}
-        }
-    }
-
-    Some((export, export_ok, tree))
-}
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     uri.strip_prefix("file://").map(PathBuf::from)
@@ -849,9 +789,10 @@ our @EXPORT = qw(delta);
 1;
 "#;
         let mut parser = create_parser();
-        let (export, export_ok, _tree) = extract_exports(&mut parser, source).unwrap();
-        assert_eq!(export, vec!["delta"]);
-        assert_eq!(export_ok, vec!["alpha", "beta", "gamma"]);
+        let tree = parser.parse(source, None).unwrap();
+        let analysis = crate::builder::build(&tree, source.as_bytes());
+        assert_eq!(analysis.export, vec!["delta"]);
+        assert_eq!(analysis.export_ok, vec!["alpha", "beta", "gamma"]);
     }
 
     #[test]
@@ -862,8 +803,9 @@ our @EXPORT_OK = ('foo', 'bar', 'baz');
 1;
 "#;
         let mut parser = create_parser();
-        let (_, export_ok, _tree) = extract_exports(&mut parser, source).unwrap();
-        assert_eq!(export_ok, vec!["foo", "bar", "baz"]);
+        let tree = parser.parse(source, None).unwrap();
+        let analysis = crate::builder::build(&tree, source.as_bytes());
+        assert_eq!(analysis.export_ok, vec!["foo", "bar", "baz"]);
     }
 
     #[test]

@@ -119,6 +119,31 @@ function M.diagnostics(buf)
   return vim.diagnostic.get(buf)
 end
 
+--- Assert zero diagnostics (or only expected ones). Call after cross-file resolution.
+--- `allowed` is an optional list of message substrings to tolerate.
+function M.assert_no_diagnostics(t, buf, allowed)
+  allowed = allowed or {}
+  local diags = vim.diagnostic.get(buf)
+  local unexpected = {}
+  for _, d in ipairs(diags) do
+    local ok = false
+    for _, pattern in ipairs(allowed) do
+      if d.message:find(pattern, 1, true) then ok = true; break end
+    end
+    if not ok then
+      table.insert(unexpected, string.format("L%d: %s", d.lnum + 1, d.message))
+    end
+  end
+  t.test("no unexpected diagnostics", function()
+    local N = "no unexpected diagnostics"
+    if #unexpected == 0 then
+      t.pass(N)
+    else
+      t.fail(N, table.concat(unexpected, "\n    "))
+    end
+  end)
+end
+
 --- Open a file, wait for LSP to attach. Returns buf or calls vim.cmd("cquit! 1").
 function M.open_and_attach(path)
   local abs = vim.fn.fnamemodify(path, ":p")

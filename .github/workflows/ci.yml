@@ -16,15 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone tree-sitter-perl
-        run: git clone https://github.com/tree-sitter-perl/tree-sitter-perl.git ../tree-sitter-perl
-
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Generate parser
-        run: cargo install tree-sitter-cli && cd ../tree-sitter-perl && tree-sitter generate
 
       - name: Build
         run: cargo build
@@ -38,15 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone tree-sitter-perl
-        run: git clone https://github.com/tree-sitter-perl/tree-sitter-perl.git ../tree-sitter-perl
-
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Generate parser
-        run: cargo install tree-sitter-cli && cd ../tree-sitter-perl && tree-sitter generate
 
       - name: Build release binary
         run: cargo build --release

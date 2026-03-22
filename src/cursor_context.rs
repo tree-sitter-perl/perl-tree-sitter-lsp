@@ -789,7 +789,7 @@ mod tests {
     fn parse(source: &str) -> Tree {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&tree_sitter_perl::LANGUAGE.into())
+            .set_language(&ts_parser_perl::LANGUAGE.into())
             .unwrap();
         parser.parse(source, None).unwrap()
     }

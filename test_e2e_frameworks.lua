@@ -188,6 +188,38 @@ t.test("goto-def: $report->to_string() jumps to Printable::to_string", function(
   if t.eq(N, expected, def, "definition line") then t.pass(N) end
 end)
 
+-- ── 7. Dynamic method dispatch via constant folding ──────────────────
+
+t.test("hover: $moo->$accessor() shows resolved accessor with POD", function()
+  local N = "hover: $moo->$accessor() shows resolved accessor with POD"
+  local line, col = b.find_pos(buf, "$moo->$accessor();")
+  if not t.ok(N, line, "couldn't find '$moo->$accessor()'") then return end
+  -- Cursor on $accessor — should show the resolved 'name' accessor info
+  local text = lsp.hover_text(buf, line, col + 6)
+  if not t.ok(N, text, "no hover result") then return end
+  -- Should show the resolved method's POD, not just the variable
+  if t.ok(N, text:find("display name", 1, true),
+    "hover should show POD 'display name' from resolved accessor, got: " .. text) then
+    t.pass(N)
+  end
+end)
+
+t.test("hover: $dynamic_title from $mojo->$get_title() shows String", function()
+  local N = "hover: $dynamic_title from $mojo->$get_title() shows String"
+  local line, col = b.find_pos(buf, "$dynamic_title = $mojo->$get_title()")
+  if not t.ok(N, line, "couldn't find dynamic_title line") then return end
+  local text = lsp.hover_text(buf, line, col)
+  if not t.ok(N, text, "no hover result") then return end
+  if t.ok(N, text:find("String", 1, true),
+    "hover should mention 'String' (from Mojo title default), got: " .. text) then
+    t.pass(N)
+  end
+end)
+
+-- ── 8. No unexpected diagnostics ─────────────────────────────────────
+
+lsp.assert_no_diagnostics(t, buf)
+
 -- ── done ─────────────────────────────────────────────────────────────
 
 t.finish()

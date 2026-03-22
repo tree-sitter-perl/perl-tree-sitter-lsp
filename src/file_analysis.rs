@@ -405,6 +405,11 @@ pub struct FileAnalysis {
     /// Used to suppress "not defined" diagnostics for these known framework keywords.
     pub framework_imports: HashSet<String>,
 
+    /// Exported function names from `@EXPORT = ...` assignments.
+    pub export: Vec<String>,
+    /// Exported function names from `@EXPORT_OK = ...` assignments.
+    pub export_ok: Vec<String>,
+
     // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
     base_type_constraint_count: usize,
     base_symbol_count: usize,
@@ -430,6 +435,8 @@ impl FileAnalysis {
         package_parents: HashMap<String, Vec<String>>,
         method_call_bindings: Vec<MethodCallBinding>,
         framework_imports: HashSet<String>,
+        export: Vec<String>,
+        export_ok: Vec<String>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -443,6 +450,8 @@ impl FileAnalysis {
             package_parents,
             imported_return_types: HashMap::new(),
             framework_imports,
+            export,
+            export_ok,
             base_type_constraint_count: 0,
             base_symbol_count: 0,
             scope_starts: Vec::new(),
@@ -1401,6 +1410,60 @@ impl FileAnalysis {
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => {
+                    // Check if this variable is also a dynamic method call target
+                    // (e.g. $self->$method() where $method is a known constant)
+                    let method_hover = self.refs.iter()
+                        .find(|mr| matches!(mr.kind, RefKind::MethodCall { .. })
+                            && contains_point(&mr.span, point)
+                            && mr.target_name != r.target_name);
+                    if let Some(mr) = method_hover {
+                        if let RefKind::MethodCall { ref invocant, ref invocant_span, .. } = mr.kind {
+                            let class_name = self.resolve_method_invocant(
+                                invocant, invocant_span, mr.scope, point, tree, Some(source.as_bytes()), module_index,
+                            );
+                            if let Some(ref cn) = class_name {
+                                match self.resolve_method_in_ancestors(cn, &mr.target_name, module_index) {
+                                    Some(MethodResolution::Local { sym_id, class: ref defining_class, .. }) => {
+                                        let sym = self.symbol(sym_id);
+                                        let line = source_line_at(source, sym.selection_span.start.row);
+                                        let class_label = if defining_class != cn {
+                                            format!("{} (from {})", cn, defining_class)
+                                        } else {
+                                            cn.to_string()
+                                        };
+                                        let mut text = format!("```perl\n{}\n```\n\n*class {} — resolved from `{}`*", line.trim(), class_label, r.target_name);
+                                        if let Some(ref rt) = self.find_method_return_type(cn, &mr.target_name, module_index, None) {
+                                            text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+                                        }
+                                        if let SymbolDetail::Sub { ref doc, .. } = sym.detail {
+                                            if let Some(ref d) = doc {
+                                                text.push_str(&format!("\n\n{}", d));
+                                            }
+                                        }
+                                        return Some(text);
+                                    }
+                                    Some(MethodResolution::CrossFile { ref class }) => {
+                                        if let Some(idx) = module_index {
+                                            if let Some(exports) = idx.get_exports_cached(class) {
+                                                if let Some(sub_info) = exports.sub_info(&mr.target_name) {
+                                                    let sig = format_cross_file_signature(&mr.target_name, sub_info);
+                                                    let mut text = format!("```perl\n{}\n```\n\n*class {} — resolved from `{}`*", sig, class, r.target_name);
+                                                    if let Some(ref rt) = sub_info.return_type {
+                                                        text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+                                                    }
+                                                    if let Some(ref doc) = sub_info.doc {
+                                                        text.push_str(&format!("\n\n{}", doc));
+                                                    }
+                                                    return Some(text);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+                    }
                     if let Some(sym_id) = r.resolves_to {
                         let sym = self.symbol(sym_id);
                         return Some(self.format_symbol_hover_at(sym, source, point));
@@ -3008,6 +3071,8 @@ mod tests {
             HashMap::new(),
             vec![],
             HashSet::new(),
+            vec![],
+            vec![],
         )
     }
 
@@ -3102,6 +3167,8 @@ mod tests {
             HashMap::new(),
             vec![],
             HashSet::new(),
+            vec![],
+            vec![],
         );
         assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
         assert_eq!(fa.sub_return_type("nonexistent"), None);
@@ -3260,6 +3327,8 @@ mod tests {
             HashMap::new(),
             vec![],
             HashSet::new(),
+            vec![],
+            vec![],
         );
 
         let mut imported = HashMap::new();

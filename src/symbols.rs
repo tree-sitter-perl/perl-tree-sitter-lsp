@@ -984,6 +984,11 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
             continue;
         }
 
+        // Skip code deref calls like &{$var}()
+        if name.starts_with('&') {
+            continue;
+        }
+
         // Skip Perl builtins
         if is_perl_builtin(name) {
             continue;
@@ -1073,8 +1078,9 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
     let universal_methods = [
         "new", "AUTOLOAD", "DESTROY", "can", "isa", "DOES", "VERSION",
         // DBIC meta-methods (inherited from DBIx::Class::Core)
-        "add_columns", "set_primary_key", "table", "resultset_class",
+        "add_columns", "add_column", "set_primary_key", "table", "resultset_class",
         "has_many", "has_one", "belongs_to", "might_have", "many_to_many",
+        "load_components",
         // Moose/Moo meta-methods
         "meta",
     ];
@@ -1294,7 +1300,7 @@ mod tests {
     fn parse_analysis(source: &str) -> FileAnalysis {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&tree_sitter_perl::LANGUAGE.into())
+            .set_language(&ts_parser_perl::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         builder::build(&tree, source.as_bytes())
