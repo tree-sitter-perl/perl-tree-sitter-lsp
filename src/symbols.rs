@@ -300,6 +300,16 @@ pub fn completion_items(
                 analysis.complete_hash_keys(var_text, point)
             }
         }
+        CursorContext::UseStatement { ref module_prefix, in_import_list, ref module_name } => {
+            if in_import_list {
+                if let Some(ref name) = module_name {
+                    return complete_import_list(name, module_index);
+                }
+            } else {
+                return complete_module_names(module_prefix, module_index);
+            }
+            Vec::new()
+        }
         CursorContext::General => {
             let mut items = Vec::new();
             // Keyval arg completions if inside a call at key position
@@ -340,6 +350,76 @@ pub fn completion_items(
             if !ty.is_object() {
                 items.extend(ref_type_snippet_completions(ty));
             }
+        }
+    }
+
+    items
+}
+
+/// Complete module names on `use` lines from resolved + @INC-scanned modules.
+fn complete_module_names(prefix: &str, module_index: &ModuleIndex) -> Vec<CompletionItem> {
+    let modules = module_index.complete_module_names(prefix);
+    modules.into_iter().map(|(name, is_resolved)| {
+        let (detail, priority) = if is_resolved {
+            (Some("indexed".to_string()), 10u8)
+        } else {
+            (Some("available".to_string()), 50u8)
+        };
+        CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::MODULE),
+            detail,
+            sort_text: Some(format!("{:03}{}", priority, name)),
+            ..Default::default()
+        }
+    }).collect()
+}
+
+/// Complete import list items for `use Module qw(|)`.
+fn complete_import_list(module_name: &str, module_index: &ModuleIndex) -> Vec<CompletionItem> {
+    let exports = match module_index.get_exports_cached(module_name) {
+        Some(e) => e,
+        None => return vec![CompletionItem {
+            label: format!("loading {}...", module_name),
+            kind: Some(CompletionItemKind::TEXT),
+            detail: Some("Module is being indexed".to_string()),
+            insert_text: Some(String::new()),
+            sort_text: Some("999".to_string()),
+            ..Default::default()
+        }],
+    };
+
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for name in &exports.export {
+        if seen.insert(name.clone()) {
+            let detail = exports.sub_info(name)
+                .and_then(|s| s.return_type.as_ref())
+                .map(|rt| format!("@EXPORT → {}", format_inferred_type(rt)))
+                .or(Some("@EXPORT".to_string()));
+            items.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail,
+                sort_text: Some(format!("010{}", name)),
+                ..Default::default()
+            });
+        }
+    }
+
+    for name in &exports.export_ok {
+        if seen.insert(name.clone()) {
+            let detail = exports.sub_info(name)
+                .and_then(|s| s.return_type.as_ref())
+                .map(|rt| format!("→ {}", format_inferred_type(rt)));
+            items.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail,
+                sort_text: Some(format!("020{}", name)),
+                ..Default::default()
+            });
         }
     }
 
