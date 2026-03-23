@@ -187,6 +187,12 @@ impl ModuleIndex {
         self.workspace_root.condvar.notify_one();
     }
 
+    /// Get the workspace root URI if set.
+    pub fn workspace_root(&self) -> Option<String> {
+        self.workspace_root.root.lock().ok()
+            .and_then(|guard| guard.as_ref().and_then(|opt| opt.clone()))
+    }
+
     /// Request background resolution for a module. Non-blocking.
     /// Stale modules (old extract version) are queued with priority.
     pub fn request_resolve(&self, module_name: &str) {

@@ -74,6 +74,27 @@ pub fn extract_symbols(analysis: &FileAnalysis) -> Vec<DocumentSymbol> {
         .collect()
 }
 
+#[allow(deprecated)]
+pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
+    use crate::file_analysis::SymKind as FaSymKind;
+    // Only include significant symbols (subs, methods, packages, classes)
+    match sym.kind {
+        FaSymKind::Sub | FaSymKind::Method | FaSymKind::Package | FaSymKind::Class => {}
+        _ => return None,
+    }
+    Some(SymbolInformation {
+        name: sym.name.clone(),
+        kind: fa_sym_kind_to_lsp(&sym.kind),
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri,
+            range: span_to_range(sym.selection_span),
+        },
+        container_name: sym.package.clone(),
+    })
+}
+
 pub fn find_definition(
     analysis: &FileAnalysis,
     pos: Position,

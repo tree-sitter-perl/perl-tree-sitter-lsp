@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -7,7 +8,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::document::Document;
-use crate::file_analysis::InferredType;
+use crate::file_analysis::{FileAnalysis, InferredType};
 use crate::module_index::ModuleIndex;
 use crate::symbols;
 
@@ -15,6 +16,7 @@ pub struct Backend {
     client: Client,
     documents: Arc<DashMap<Url, Document>>,
     module_index: Arc<ModuleIndex>,
+    workspace_index: Arc<DashMap<PathBuf, FileAnalysis>>,
 }
 
 impl Backend {
@@ -57,11 +59,13 @@ impl Backend {
 
         let module_index = Arc::new(ModuleIndex::new(client.clone(), on_refresh));
         let _ = module_index_holder.set(Arc::clone(&module_index));
+        let workspace_index: Arc<DashMap<PathBuf, FileAnalysis>> = Arc::new(DashMap::new());
 
         Backend {
             module_index,
             client,
             documents,
+            workspace_index,
         }
     }
 
@@ -180,6 +184,11 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: None,
+                    file_operations: None,
+                }),
                 ..ServerCapabilities::default()
             },
             ..Default::default()
@@ -190,6 +199,38 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "perl-lsp initialized")
             .await;
+
+        // Register file watchers for workspace indexing
+        let registrations = vec![Registration {
+            id: "perl-file-watcher".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![
+                    FileSystemWatcher { glob_pattern: GlobPattern::String("**/*.pm".into()), kind: None },
+                    FileSystemWatcher { glob_pattern: GlobPattern::String("**/*.pl".into()), kind: None },
+                    FileSystemWatcher { glob_pattern: GlobPattern::String("**/*.t".into()), kind: None },
+                ],
+            }).unwrap()),
+        }];
+        let _ = self.client.register_capability(registrations).await;
+
+        // Spawn workspace indexing in background
+        let ws_index = Arc::clone(&self.workspace_index);
+        let client = self.client.clone();
+        let root = self.module_index.workspace_root();
+        tokio::task::spawn_blocking(move || {
+            if let Some(root_uri) = root {
+                if let Some(root_path) = root_uri.strip_prefix("file://") {
+                    let root_path = PathBuf::from(root_path);
+                    let count = crate::module_resolver::index_workspace(&root_path, &ws_index);
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(client.log_message(
+                        MessageType::INFO,
+                        format!("Indexed {} workspace files", count),
+                    ));
+                }
+            }
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -559,6 +600,75 @@ impl LanguageServer for Backend {
             Ok(None)
         } else {
             Ok(Some(hints))
+        }
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let query = params.query.to_lowercase();
+        let mut results = Vec::new();
+        let mut seen_paths = std::collections::HashSet::new();
+
+        // Search open documents first (freshest analysis)
+        for entry in self.documents.iter() {
+            let uri = entry.key().clone();
+            if let Ok(path) = uri.to_file_path() {
+                seen_paths.insert(path);
+            }
+            for sym in &entry.value().analysis.symbols {
+                if sym.name.to_lowercase().contains(&query) {
+                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
+                        results.push(info);
+                    }
+                }
+            }
+        }
+
+        // Then workspace index (skip files already covered by open docs)
+        for entry in self.workspace_index.iter() {
+            if seen_paths.contains(entry.key()) { continue; }
+            let uri = Url::from_file_path(entry.key()).unwrap_or_else(|_| {
+                Url::parse(&format!("file://{}", entry.key().display())).unwrap()
+            });
+            for sym in &entry.value().symbols {
+                if sym.name.to_lowercase().contains(&query) {
+                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
+                        results.push(info);
+                    }
+                }
+            }
+        }
+
+        if results.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(results))
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        for change in params.changes {
+            let path = match change.uri.to_file_path() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            match change.typ {
+                FileChangeType::DELETED => {
+                    self.workspace_index.remove(&path);
+                }
+                _ => {
+                    // Re-index the file (created or changed)
+                    if let Ok(source) = std::fs::read_to_string(&path) {
+                        let mut parser = crate::module_resolver::create_parser();
+                        if let Some(tree) = parser.parse(&source, None) {
+                            let analysis = crate::builder::build(&tree, source.as_bytes());
+                            self.workspace_index.insert(path, analysis);
+                        }
+                    }
+                }
+            }
         }
     }
 }

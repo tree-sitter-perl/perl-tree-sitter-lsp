@@ -531,6 +531,58 @@ pub fn discover_inc_paths() -> Vec<PathBuf> {
 }
 
 
+/// Index all Perl files in a workspace directory using Rayon for parallelism.
+/// Returns the number of successfully indexed files.
+pub fn index_workspace(
+    root: &std::path::Path,
+    index: &DashMap<PathBuf, crate::file_analysis::FileAnalysis>,
+) -> usize {
+    use ignore::types::TypesBuilder;
+    use ignore::WalkBuilder;
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut types_builder = TypesBuilder::new();
+    types_builder.add("perl", "*.pm").unwrap();
+    types_builder.add("perl", "*.pl").unwrap();
+    types_builder.add("perl", "*.t").unwrap();
+    types_builder.select("perl");
+    let types = types_builder.build().unwrap();
+
+    let files: Vec<PathBuf> = WalkBuilder::new(root)
+        .types(types)
+        .build()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter(|e| e.metadata().map(|m| m.len() < 1_000_000).unwrap_or(false))
+        .map(|e| e.into_path())
+        .collect();
+
+    let count = AtomicUsize::new(0);
+
+    files.par_iter().for_each(|path| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let source = std::fs::read_to_string(path).ok()?;
+            let mut parser = create_parser();
+            let tree = parser.parse(&source, None)?;
+            Some(crate::builder::build(&tree, source.as_bytes()))
+        }));
+
+        match result {
+            Ok(Some(analysis)) => {
+                index.insert(path.clone(), analysis);
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(None) => { /* parse failed, skip */ }
+            Err(_) => {
+                log::warn!("Panic while indexing {:?}, skipping", path);
+            }
+        }
+    });
+
+    count.load(Ordering::Relaxed)
+}
+
 /// Scan @INC directories for .pm files, populating the available_modules map.
 /// Fast — no file reads, just directory traversal + path→module name conversion.
 fn scan_inc_module_names(inc_paths: &[PathBuf], available: &DashMap<String, PathBuf>) {
