@@ -111,8 +111,11 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
 
     let rename_fn: fn(&file_analysis::FileAnalysis, &str, &str) -> Vec<(file_analysis::Span, String)> = match &rename_kind {
         file_analysis::RenameKind::Variable | file_analysis::RenameKind::HashKey(_) => {
-            // Single-file rename
-            if let Some(edits) = analysis_ref.rename_at(point, new_name) {
+            // Single-file rename — parse tree for hash key owner resolution
+            let source = std::fs::read_to_string(&file_path).expect("cannot read file");
+            let mut parser = module_resolver::create_parser();
+            let tree = parser.parse(&source, None).expect("parse failed");
+            if let Some(edits) = analysis_ref.rename_at(point, new_name, Some(&tree), Some(source.as_bytes())) {
                 let json_edits: Vec<_> = edits.into_iter()
                     .map(|(span, text)| span_to_json(span, text))
                     .collect();

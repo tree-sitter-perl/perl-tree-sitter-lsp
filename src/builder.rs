@@ -4491,7 +4491,7 @@ $calc->get_self->get_config->{host};
     fn test_rename_variable() {
         let src = "my $x = 1;\nprint $x;";
         let fa = build_fa(src);
-        let edits = fa.rename_at(Point::new(0, 4), "y");
+        let edits = fa.rename_at(Point::new(0, 4), "y", None, None);
         assert!(edits.is_some(), "should produce rename edits");
         let edits = edits.unwrap();
         assert!(edits.len() >= 2, "should rename at least declaration + usage");

@@ -225,7 +225,7 @@ pub fn rename(
     tree: Option<&tree_sitter::Tree>,
     source: Option<&str>,
 ) -> Option<WorkspaceEdit> {
-    let edits = analysis.rename_at_with_tree(
+    let edits = analysis.rename_at(
         position_to_point(pos), new_name, tree, source.map(|s| s.as_bytes()),
     )?;
 

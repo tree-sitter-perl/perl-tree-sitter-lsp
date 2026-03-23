@@ -333,6 +333,27 @@ t.test("rename: $pi → $tau updates all occurrences", function()
   if t.ok(N, found_new, "new name $tau should appear after rename") then t.pass(N) end
 end)
 
+t.test("rename: host → hostname from deref access site", function()
+  local N = "rename: host → hostname from deref access site"
+  -- Cursor on "host" in $db_config->{host} — the access side has a HashKeyAccess ref
+  local line, col = b.find_pos(buf, "$db_config->{host}")
+  if not t.ok(N, line, "couldn't find '$db_config->{host}'") then return end
+
+  -- Position on "host" inside the braces (col + 13)
+  local edit = lsp.rename(buf, line, col + 13, "hostname")
+  if not t.ok(N, edit, "rename returned no edit") then return end
+  if not t.ok(N, edit.changes, "rename has no changes") then return end
+
+  local total = 0
+  for _, edits in pairs(edit.changes) do
+    total = total + #edits
+  end
+  -- Should find: hash key def (host =>) + access ($db_config->{host}) + chained access
+  if t.ok(N, total >= 2, string.format("should have ≥2 edits (def + access), got %d", total)) then
+    t.pass(N)
+  end
+end)
+
 -- ── diagnostics ──────────────────────────────────────────────────────
 
 lsp.assert_no_diagnostics(t, buf)

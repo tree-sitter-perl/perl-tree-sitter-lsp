@@ -1583,11 +1583,7 @@ impl FileAnalysis {
     }
 
     /// Rename: return all spans + new text for renaming the symbol at cursor.
-    pub fn rename_at(&self, point: Point, new_name: &str) -> Option<Vec<(Span, String)>> {
-        self.rename_at_with_tree(point, new_name, None, None)
-    }
-
-    pub fn rename_at_with_tree(&self, point: Point, new_name: &str, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Option<Vec<(Span, String)>> {
+    pub fn rename_at(&self, point: Point, new_name: &str, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Option<Vec<(Span, String)>> {
         let refs = self.find_references(point, tree, source_bytes);
         if refs.is_empty() {
             return None;
