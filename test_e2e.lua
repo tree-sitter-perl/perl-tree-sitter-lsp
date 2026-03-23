@@ -301,6 +301,38 @@ t.test("completion detail: $calc->get_self shows return type", function()
   if t.ok(N, found, "no 'get_self' completion with Calculator detail") then t.pass(N) end
 end)
 
+-- ── rename ───────────────────────────────────────────────────────────
+
+t.test("rename: $pi → $tau updates all occurrences", function()
+  local N = "rename: $pi → $tau updates all occurrences"
+  local line, col = b.find_pos(buf, "my $pi = 3.14159")
+  if not t.ok(N, line, "couldn't find '$pi' declaration") then return end
+
+  -- Perform the rename
+  local edit = lsp.rename(buf, line, col + 3, "tau")
+  if not t.ok(N, edit, "rename returned no edit") then return end
+
+  -- Apply + verify
+  lsp.apply_workspace_edit(edit)
+  b.invalidate()
+  local lines = b.get_lines(buf)
+  local found_old = false
+  local found_new = false
+  for _, l in ipairs(lines) do
+    if l:find("$pi", 1, true) and not l:find("$pid", 1, true) then found_old = true end
+    if l:find("$tau", 1, true) then found_new = true end
+  end
+
+  -- Undo to restore original content
+  vim.cmd("silent undo")
+  b.invalidate()
+  -- Wait for the LSP to re-parse after undo
+  vim.wait(500)
+
+  if not t.ok(N, not found_old, "old name $pi still found after rename") then return end
+  if t.ok(N, found_new, "new name $tau should appear after rename") then t.pass(N) end
+end)
+
 -- ── diagnostics ──────────────────────────────────────────────────────
 
 lsp.assert_no_diagnostics(t, buf)
