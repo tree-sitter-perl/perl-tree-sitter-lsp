@@ -399,10 +399,6 @@ impl ModuleIndex {
     }
 }
 
-/// Entry point for `--parse-exports <path>` subprocess mode.
-pub fn subprocess_main(path: &str, module_name: Option<&str>) {
-    module_resolver::subprocess_main(path, module_name);
-}
 
 #[cfg(test)]
 mod tests {

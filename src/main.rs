@@ -16,16 +16,6 @@ use tower_lsp::{LspService, Server};
 
 #[tokio::main]
 async fn main() {
-    // Subprocess mode: parse a .pm file and print exports as JSON.
-    // Used by the module resolver with a hard timeout to protect against
-    // infinite loops in the tree-sitter external scanner.
-    let args: Vec<String> = std::env::args().collect();
-    if (args.len() == 3 || args.len() == 4) && args[1] == "--parse-exports" {
-        let module_name = args.get(3).map(|s| s.as_str());
-        module_index::subprocess_main(&args[2], module_name);
-        return;
-    }
-
     env_logger::init();
 
     let stdin = tokio::io::stdin();

@@ -1,7 +1,7 @@
 //! Module resolver: background thread that resolves Perl modules from `@INC`.
 //!
-//! Discovers `@INC` paths, locates `.pm` files, extracts `@EXPORT`/`@EXPORT_OK`,
-//! and handles subprocess isolation for safe parsing (tree-sitter hangs → SIGKILL).
+//! Discovers `@INC` paths, locates `.pm` files, parses them in-process with
+//! tree-sitter-perl, and extracts export metadata for the module index.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,15 +15,9 @@ use tower_lsp::Client;
 use tree_sitter::Parser;
 
 use crate::cpanfile;
-#[cfg(not(test))]
-use crate::file_analysis::inferred_type_from_tag;
 use crate::file_analysis::inferred_type_to_tag;
 use crate::module_cache;
 use crate::module_index::{ExportedOverload, ExportedParam, ExportedSub, ModuleExports, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
-
-/// Hard timeout for parsing a single .pm file in a child process.
-#[cfg(not(test))]
-const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Callback invoked after each module is resolved. Used to trigger diagnostic refresh.
 pub type OnResolved = Box<dyn Fn() + Send + Sync>;
@@ -340,162 +334,13 @@ fn rebuild_reverse_index(
 
 // ---- Module parsing ----
 
-/// In production: subprocess isolation with hard timeout (SIGKILL on hang).
-/// In tests: direct parsing (the test binary doesn't handle --parse-exports).
-#[cfg(not(test))]
-fn parse_module(inc_paths: &[PathBuf], module_name: &str) -> Option<ModuleExports> {
-    parse_in_subprocess(inc_paths, module_name)
-}
-
-#[cfg(test)]
+/// Parse a module file directly in-process.
+/// tree-sitter-perl is stable — no subprocess isolation needed.
 fn parse_module(inc_paths: &[PathBuf], module_name: &str) -> Option<ModuleExports> {
     let mut parser = create_parser();
     resolve_and_parse(inc_paths, module_name, &mut parser)
 }
 
-#[cfg(not(test))]
-fn parse_in_subprocess(inc_paths: &[PathBuf], module_name: &str) -> Option<ModuleExports> {
-    let path = resolve_module_path(inc_paths, module_name)?;
-    let metadata = std::fs::metadata(&path).ok()?;
-    let file_size = metadata.len();
-    if file_size > 1_000_000 {
-        log::warn!(
-            "Skipping '{}' — file too large ({} bytes): {:?}",
-            module_name,
-            file_size,
-            path
-        );
-        return None;
-    }
-    log::info!(
-        "Subprocess parse '{}' ({} bytes): {:?}",
-        module_name,
-        file_size,
-        path
-    );
-
-    let exe = std::env::current_exe().ok()?;
-    let mut child = std::process::Command::new(exe)
-        .arg("--parse-exports")
-        .arg(&path)
-        .arg(module_name)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let stdout = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name(format!("read-{}", module_name))
-        .spawn(move || {
-            let result = std::io::read_to_string(stdout);
-            let _ = tx.send(result);
-        })
-        .ok()?;
-
-    let output = match rx.recv_timeout(PARSE_TIMEOUT) {
-        Ok(Ok(s)) => s,
-        _ => {
-            let _ = child.kill();
-            let _ = child.wait();
-            log::warn!("Timed out parsing module '{}'", module_name);
-            return None;
-        }
-    };
-    let _ = child.wait();
-
-    let json: serde_json::Value = serde_json::from_str(&output).ok()?;
-    let export: Vec<String> = json
-        .get("export")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let export_ok: Vec<String> = json
-        .get("export_ok")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Parse subs metadata from JSON
-    let subs: HashMap<String, ExportedSub> = json
-        .get("subs")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter().filter_map(|(name, val)| {
-                let def_line = val.get("def_line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let is_method = val.get("is_method").and_then(|v| v.as_bool()).unwrap_or(false);
-                let params = val.get("params")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|p| {
-                        Some(ExportedParam {
-                            name: p.get("name")?.as_str()?.to_string(),
-                            is_slurpy: p.get("is_slurpy").and_then(|v| v.as_bool()).unwrap_or(false),
-                            inferred_type: p.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        })
-                    }).collect())
-                    .unwrap_or_default();
-                let return_type = val.get("return_type")
-                    .and_then(|v| v.as_str())
-                    .and_then(inferred_type_from_tag);
-                let hash_keys = val.get("hash_keys")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                let doc = val.get("doc")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let overloads = val.get("overloads")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|o| {
-                        let ol_params = o.get("params")
-                            .and_then(|p| p.as_array())
-                            .map(|pa| pa.iter().filter_map(|pv| {
-                                let pname = pv.get("name")?.as_str()?.to_string();
-                                let slurpy = pv.get("is_slurpy").and_then(|v| v.as_bool()).unwrap_or(false);
-                                let inferred_type = pv.get("type").and_then(|v| v.as_str()).map(String::from);
-                                Some(ExportedParam { name: pname, is_slurpy: slurpy, inferred_type })
-                            }).collect())
-                            .unwrap_or_default();
-                        let ol_rt = o.get("return_type")
-                            .and_then(|v| v.as_str())
-                            .and_then(inferred_type_from_tag);
-                        Some(ExportedOverload { params: ol_params, return_type: ol_rt })
-                    }).collect())
-                    .unwrap_or_default();
-                Some((name.clone(), ExportedSub { def_line, params, is_method, return_type, hash_keys, doc, overloads }))
-            }).collect()
-        })
-        .unwrap_or_default();
-
-    // Extract parents from subprocess JSON
-    let parents: Vec<String> = json
-        .get("parents")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Some(ModuleExports {
-        path,
-        export,
-        export_ok,
-        subs,
-        parents,
-    })
-}
 
 /// Collect export metadata from a FileAnalysis for a set of export names.
 /// Returns (subs, parents) ready for serialization or direct use.
@@ -622,86 +467,6 @@ fn collect_export_metadata(
     (subs, parents)
 }
 
-/// Entry point for `--parse-exports <path> [module_name]` subprocess mode.
-pub fn subprocess_main(path: &str, module_name: Option<&str>) {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => {
-            println!("{{}}");
-            return;
-        }
-    };
-    let mut parser = create_parser();
-
-    let tree = match parser.parse(&source, None) {
-        Some(t) => t,
-        None => {
-            println!("{{}}");
-            return;
-        }
-    };
-
-    let analysis = crate::builder::build(&tree, source.as_bytes());
-    let export = &analysis.export;
-    let export_ok = &analysis.export_ok;
-    let (subs, parents) = collect_export_metadata(&analysis, export, export_ok, module_name);
-
-    // Serialize to JSON for subprocess IPC
-    let mut subs_map = serde_json::Map::new();
-    for (name, sub) in &subs {
-        let mut sub_info = serde_json::Map::new();
-        sub_info.insert("def_line".into(), sub.def_line.into());
-        sub_info.insert("is_method".into(), sub.is_method.into());
-        let params_json: Vec<serde_json::Value> = sub.params.iter()
-            .map(|p| {
-                let mut obj = serde_json::json!({ "name": p.name, "is_slurpy": p.is_slurpy });
-                if let Some(ref ty) = p.inferred_type {
-                    obj["type"] = serde_json::Value::String(ty.clone());
-                }
-                obj
-            })
-            .collect();
-        sub_info.insert("params".into(), params_json.into());
-        if let Some(ref d) = sub.doc {
-            sub_info.insert("doc".into(), serde_json::Value::String(d.clone()));
-        }
-        if let Some(ref ty) = sub.return_type {
-            sub_info.insert("return_type".into(),
-                serde_json::Value::String(inferred_type_to_tag(ty)));
-        }
-        if !sub.hash_keys.is_empty() {
-            sub_info.insert("hash_keys".into(), serde_json::json!(sub.hash_keys));
-        }
-        if !sub.overloads.is_empty() {
-            let overloads: Vec<serde_json::Value> = sub.overloads.iter().map(|ol| {
-                let ol_params: Vec<serde_json::Value> = ol.params.iter()
-                    .map(|p| {
-                        let mut obj = serde_json::json!({ "name": p.name, "is_slurpy": p.is_slurpy });
-                        if let Some(ref ty) = p.inferred_type {
-                            obj["type"] = serde_json::Value::String(ty.clone());
-                        }
-                        obj
-                    })
-                    .collect();
-                let mut overload = serde_json::json!({ "params": ol_params });
-                if let Some(ref rt) = ol.return_type {
-                    overload["return_type"] = serde_json::Value::String(inferred_type_to_tag(rt));
-                }
-                overload
-            }).collect();
-            sub_info.insert("overloads".into(), serde_json::json!(overloads));
-        }
-        subs_map.insert(name.clone(), sub_info.into());
-    }
-
-    let json = serde_json::json!({
-        "export": export,
-        "export_ok": export_ok,
-        "subs": subs_map,
-        "parents": parents,
-    });
-    println!("{}", json);
-}
 
 pub fn create_parser() -> Parser {
     let mut parser = Parser::new();
