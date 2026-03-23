@@ -418,9 +418,9 @@ impl LanguageServer for Backend {
             | Some(crate::file_analysis::RenameKind::Package(ref name))
             | Some(crate::file_analysis::RenameKind::HashKey(ref name)) => {
                 let rename_fn: fn(&FileAnalysis, &str, &str) -> Vec<(crate::file_analysis::Span, String)> = match &rename_kind {
-                    Some(crate::file_analysis::RenameKind::Function(_)) => FileAnalysis::rename_function,
+                    Some(crate::file_analysis::RenameKind::Function(_)) => FileAnalysis::rename_sub,
                     Some(crate::file_analysis::RenameKind::Package(_)) => FileAnalysis::rename_package,
-                    Some(crate::file_analysis::RenameKind::Method(_)) => FileAnalysis::rename_method,
+                    Some(crate::file_analysis::RenameKind::Method(_)) => FileAnalysis::rename_sub,
                     Some(crate::file_analysis::RenameKind::HashKey(_)) => {
                         // Hash keys: single-file for now
                         return Ok(symbols::rename(&doc.analysis, pos, uri, new_name));

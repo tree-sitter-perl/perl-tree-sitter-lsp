@@ -1640,24 +1640,9 @@ impl FileAnalysis {
         None
     }
 
-    /// Find all occurrences of a function name (def + refs) for cross-file rename.
-    pub fn rename_function(&self, old_name: &str, new_name: &str) -> Vec<(Span, String)> {
-        let mut edits = Vec::new();
-        for sym in &self.symbols {
-            if sym.name == old_name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                edits.push((sym.selection_span, new_name.to_string()));
-            }
-        }
-        for r in &self.refs {
-            if r.target_name == old_name && matches!(r.kind, RefKind::FunctionCall) {
-                edits.push((r.span, new_name.to_string()));
-            }
-        }
-        edits
-    }
-
-    /// Find all occurrences of a method name (def + call refs) for cross-file rename.
-    pub fn rename_method(&self, old_name: &str, new_name: &str) -> Vec<(Span, String)> {
+    /// Find all occurrences of a sub name (def + ALL call refs) for cross-file rename.
+    /// Searches both FunctionCall and MethodCall refs because Perl subs can be called either way.
+    pub fn rename_sub(&self, old_name: &str, new_name: &str) -> Vec<(Span, String)> {
         let mut edits = Vec::new();
         for sym in &self.symbols {
             if sym.name == old_name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
@@ -1666,8 +1651,14 @@ impl FileAnalysis {
         }
         for r in &self.refs {
             if r.target_name == old_name {
-                if let RefKind::MethodCall { method_name_span, .. } = &r.kind {
-                    edits.push((*method_name_span, new_name.to_string()));
+                match &r.kind {
+                    RefKind::FunctionCall => {
+                        edits.push((r.span, new_name.to_string()));
+                    }
+                    RefKind::MethodCall { method_name_span, .. } => {
+                        edits.push((*method_name_span, new_name.to_string()));
+                    }
+                    _ => {}
                 }
             }
         }

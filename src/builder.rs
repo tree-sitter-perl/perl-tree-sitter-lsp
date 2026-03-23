@@ -4484,6 +4484,26 @@ $calc->get_self->get_config->{host};
     }
 
     #[test]
+    fn test_rename_sub_finds_both_function_and_method_calls() {
+        let fa = build_fa("
+package Foo;
+sub emit { }
+sub test {
+    my $self = shift;
+    emit('event');
+    $self->emit('done');
+}
+");
+        let edits = fa.rename_sub("emit", "fire");
+        // Should find: 1 symbol def + 1 FunctionCall + 1 MethodCall = 3 edits
+        assert!(edits.len() >= 3,
+            "rename_sub should find def + function call + method call, got {} edits", edits.len());
+        for (_, text) in &edits {
+            assert_eq!(text, "fire");
+        }
+    }
+
+    #[test]
     fn test_find_def_bareword_class() {
         let src = "package Point;\nsub new { bless {}, shift }\npackage main;\nPoint->new();";
         let fa = build_fa(src);
