@@ -615,7 +615,6 @@ dependencies = [
  "dashmap 6.1.0",
  "env_logger",
  "log",
- "regex",
  "rusqlite",
  "serde_json",
  "tokio",
