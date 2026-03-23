@@ -180,6 +180,31 @@ t.test("goto-def: 'BaseWorker' in use parent opens BaseWorker.pm", function()
   end
 end)
 
+-- ── 8. Cross-file rename ─────────────────────────────────────────────
+
+t.test("rename: process → execute produces edits in both files", function()
+  local N = "rename: process → execute produces edits in both files"
+  local line, col = b.find_pos(buf, "$worker->process()")
+  if not t.ok(N, line, "couldn't find '$worker->process()'") then return end
+
+  -- Request rename but DON'T apply — just check the edit structure
+  local edit = lsp.rename(buf, line, col + 10, "execute")
+  if not t.ok(N, edit, "rename returned no edit") then return end
+  if not t.ok(N, edit.changes, "rename has no changes") then return end
+
+  -- Should have edits in at least the current file
+  local has_local = false
+  local has_cross_file = false
+  for uri, _ in pairs(edit.changes) do
+    if uri:find("inheritance.pl", 1, true) then has_local = true end
+    if uri:find("BaseWorker.pm", 1, true) then has_cross_file = true end
+  end
+
+  local ok = t.ok(N, has_local, "should have edits in inheritance.pl")
+  ok = t.ok(N, has_cross_file, "should have edits in BaseWorker.pm (cross-file)") and ok
+  if ok then t.pass(N) end
+end)
+
 -- ── diagnostics ──────────────────────────────────────────────────────
 
 lsp.assert_no_diagnostics(t, buf)

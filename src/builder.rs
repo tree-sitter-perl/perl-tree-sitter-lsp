@@ -2166,6 +2166,23 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+
+        // Synthesize HashKeyDef entries so Foo->new(name => ...) connects to the attribute.
+        if let Some(ref _pkg) = self.current_package {
+            let owner = HashKeyOwner::Sub("new".to_string());
+            for (name, sel_span) in &attr_names {
+                self.add_symbol(
+                    name.clone(),
+                    SymKind::HashKeyDef,
+                    node_to_span(node),
+                    *sel_span,
+                    SymbolDetail::HashKeyDef {
+                        owner: owner.clone(),
+                        is_dynamic: false,
+                    },
+                );
+            }
+        }
     }
 
     /// Extract arguments from `use Mojo::Base ...` including barewords like -strict, -base.
@@ -2349,9 +2366,12 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_method_call(&mut self, node: Node<'a>) {
-        let method_name = node.child_by_field_name("method")
+        let method_node = node.child_by_field_name("method");
+        let method_name = method_node
             .and_then(|n| n.utf8_text(self.source).ok())
             .map(|s| s.to_string());
+        let method_name_span = method_node.map(|n| node_to_span(n))
+            .unwrap_or_else(|| node_to_span(node));
         let invocant_node = node.child_by_field_name("invocant");
         let invocant_text = invocant_node
             .and_then(|n| n.utf8_text(self.source).ok())
@@ -2378,6 +2398,7 @@ impl<'a> Builder<'a> {
                             RefKind::MethodCall {
                                 invocant: invocant.clone().unwrap_or_default(),
                                 invocant_span,
+                                method_name_span,
                             },
                             node_to_span(node),
                             rname,
@@ -2390,6 +2411,7 @@ impl<'a> Builder<'a> {
                     RefKind::MethodCall {
                         invocant: invocant.clone().unwrap_or_default(),
                         invocant_span,
+                        method_name_span,
                     },
                     node_to_span(node),
                     name.clone(),
@@ -4469,12 +4491,53 @@ $calc->get_self->get_config->{host};
     fn test_rename_variable() {
         let src = "my $x = 1;\nprint $x;";
         let fa = build_fa(src);
-        let edits = fa.rename_at(Point::new(0, 4), "y");
+        let edits = fa.rename_at(Point::new(0, 4), "y", None, None);
         assert!(edits.is_some(), "should produce rename edits");
         let edits = edits.unwrap();
         assert!(edits.len() >= 2, "should rename at least declaration + usage");
         for (_, new_text) in &edits {
             assert_eq!(new_text, "y", "all edits should use new name");
+        }
+    }
+
+    #[test]
+    fn test_rename_sub_finds_both_function_and_method_calls() {
+        let fa = build_fa("
+package Foo;
+sub emit { }
+sub test {
+    my $self = shift;
+    emit('event');
+    $self->emit('done');
+}
+");
+        let edits = fa.rename_sub("emit", "fire");
+        // Should find: 1 symbol def + 1 FunctionCall + 1 MethodCall = 3 edits
+        assert!(edits.len() >= 3,
+            "rename_sub should find def + function call + method call, got {} edits", edits.len());
+        for (_, text) in &edits {
+            assert_eq!(text, "fire");
+        }
+    }
+
+    #[test]
+    fn test_moo_has_creates_constructor_hash_key_def() {
+        let fa = build_fa("
+package MyApp;
+use Moo;
+has username => (is => 'ro');
+has password => (is => 'rw');
+");
+        // Should have HashKeyDef symbols owned by "new" for each has attribute
+        let key_defs: Vec<_> = fa.symbols.iter()
+            .filter(|s| matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
+            .collect();
+        let names: Vec<&str> = key_defs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"username"), "should have HashKeyDef for username, got: {:?}", names);
+        assert!(names.contains(&"password"), "should have HashKeyDef for password, got: {:?}", names);
+        // Verify owner is "new"
+        if let SymbolDetail::HashKeyDef { ref owner, .. } = key_defs[0].detail {
+            assert_eq!(owner, &HashKeyOwner::Sub("new".to_string()));
         }
     }
 

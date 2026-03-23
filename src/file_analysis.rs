@@ -193,6 +193,16 @@ pub struct Ref {
     pub resolves_to: Option<SymbolId>,
 }
 
+/// What kind of entity is being renamed — determines single-file vs cross-file scope.
+#[derive(Debug)]
+pub enum RenameKind {
+    Variable,
+    Function(String),
+    Package(String),
+    Method(String),
+    HashKey(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum RefKind {
@@ -202,6 +212,8 @@ pub enum RefKind {
         invocant: String,
         /// Span of the invocant node (for complex expressions needing tree resolution).
         invocant_span: Option<Span>,
+        /// Span of just the method name (for rename — r.span covers the whole expression).
+        method_name_span: Span,
     },
     PackageRef,
     HashKeyAccess {
@@ -1571,8 +1583,8 @@ impl FileAnalysis {
     }
 
     /// Rename: return all spans + new text for renaming the symbol at cursor.
-    pub fn rename_at(&self, point: Point, new_name: &str) -> Option<Vec<(Span, String)>> {
-        let refs = self.find_references(point, None, None);
+    pub fn rename_at(&self, point: Point, new_name: &str, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Option<Vec<(Span, String)>> {
+        let refs = self.find_references(point, tree, source_bytes);
         if refs.is_empty() {
             return None;
         }
@@ -1605,6 +1617,70 @@ impl FileAnalysis {
         Some(edits)
     }
 
+    /// Determine what kind of rename is appropriate for the cursor position.
+    pub fn rename_kind_at(&self, point: Point) -> Option<RenameKind> {
+        if let Some(r) = self.ref_at(point) {
+            return Some(match &r.kind {
+                RefKind::Variable | RefKind::ContainerAccess => RenameKind::Variable,
+                RefKind::FunctionCall => RenameKind::Function(r.target_name.clone()),
+                RefKind::MethodCall { .. } => RenameKind::Method(r.target_name.clone()),
+                RefKind::PackageRef => RenameKind::Package(r.target_name.clone()),
+                RefKind::HashKeyAccess { .. } => RenameKind::HashKey(r.target_name.clone()),
+            });
+        }
+        if let Some(sym) = self.symbol_at(point) {
+            return match sym.kind {
+                SymKind::Variable | SymKind::Field => Some(RenameKind::Variable),
+                SymKind::Sub => Some(RenameKind::Function(sym.name.clone())),
+                SymKind::Method => Some(RenameKind::Method(sym.name.clone())),
+                SymKind::Package | SymKind::Class => Some(RenameKind::Package(sym.name.clone())),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// Find all occurrences of a sub name (def + ALL call refs) for cross-file rename.
+    /// Searches both FunctionCall and MethodCall refs because Perl subs can be called either way.
+    pub fn rename_sub(&self, old_name: &str, new_name: &str) -> Vec<(Span, String)> {
+        let mut edits = Vec::new();
+        for sym in &self.symbols {
+            if sym.name == old_name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                edits.push((sym.selection_span, new_name.to_string()));
+            }
+        }
+        for r in &self.refs {
+            if r.target_name == old_name {
+                match &r.kind {
+                    RefKind::FunctionCall => {
+                        edits.push((r.span, new_name.to_string()));
+                    }
+                    RefKind::MethodCall { method_name_span, .. } => {
+                        edits.push((*method_name_span, new_name.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        edits
+    }
+
+    /// Find all occurrences of a package name (def + refs + use statements) for cross-file rename.
+    pub fn rename_package(&self, old_name: &str, new_name: &str) -> Vec<(Span, String)> {
+        let mut edits = Vec::new();
+        for sym in &self.symbols {
+            if sym.name == old_name && matches!(sym.kind, SymKind::Package | SymKind::Class | SymKind::Module) {
+                edits.push((sym.selection_span, new_name.to_string()));
+            }
+        }
+        for r in &self.refs {
+            if r.target_name == old_name && matches!(r.kind, RefKind::PackageRef) {
+                edits.push((r.span, new_name.to_string()));
+            }
+        }
+        edits
+    }
+
     // ---- Internal resolution helpers ----
 
     /// Find the target symbol for the thing at cursor. Returns (SymbolId, include_decl_in_refs).
@@ -1628,7 +1704,7 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::MethodCall { ref invocant, ref invocant_span } => {
+                RefKind::MethodCall { ref invocant, ref invocant_span, .. } => {
                     let class_name = self.resolve_method_invocant(
                         invocant, invocant_span, r.scope, point, tree, source_bytes, module_index,
                     );

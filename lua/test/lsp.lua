@@ -114,6 +114,18 @@ function M.signature_label(buf, line, col)
   return result.signatures[1].label
 end
 
+--- Execute a rename at (line, col) with new_name. Returns the WorkspaceEdit or nil.
+function M.rename(buf, line, col, new_name)
+  local params = M.pos_params(buf, line, col)
+  params.newName = new_name
+  return M.request(buf, "textDocument/rename", params)
+end
+
+--- Apply a WorkspaceEdit to the current buffer.
+function M.apply_workspace_edit(edit)
+  vim.lsp.util.apply_workspace_edit(edit, "utf-16")
+end
+
 --- Get diagnostics for the buffer.
 function M.diagnostics(buf)
   return vim.diagnostic.get(buf)

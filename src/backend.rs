@@ -1,13 +1,15 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
+use tower_lsp::lsp_types::{notification, request};
 use tower_lsp::{Client, LanguageServer};
 
 use crate::document::Document;
-use crate::file_analysis::InferredType;
+use crate::file_analysis::{FileAnalysis, InferredType};
 use crate::module_index::ModuleIndex;
 use crate::symbols;
 
@@ -15,6 +17,7 @@ pub struct Backend {
     client: Client,
     documents: Arc<DashMap<Url, Document>>,
     module_index: Arc<ModuleIndex>,
+    workspace_index: Arc<DashMap<PathBuf, FileAnalysis>>,
 }
 
 impl Backend {
@@ -57,11 +60,13 @@ impl Backend {
 
         let module_index = Arc::new(ModuleIndex::new(client.clone(), on_refresh));
         let _ = module_index_holder.set(Arc::clone(&module_index));
+        let workspace_index: Arc<DashMap<PathBuf, FileAnalysis>> = Arc::new(DashMap::new());
 
         Backend {
             module_index,
             client,
             documents,
+            workspace_index,
         }
     }
 
@@ -142,7 +147,12 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
-                rename_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
+                linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
                         "$".to_string(),
@@ -180,6 +190,11 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: None,
+                    file_operations: None,
+                }),
                 ..ServerCapabilities::default()
             },
             ..Default::default()
@@ -190,6 +205,66 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "perl-lsp initialized")
             .await;
+
+        // Register file watchers for workspace indexing
+        let registrations = vec![Registration {
+            id: "perl-file-watcher".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![
+                    FileSystemWatcher { glob_pattern: GlobPattern::String("**/*.pm".into()), kind: None },
+                    FileSystemWatcher { glob_pattern: GlobPattern::String("**/*.pl".into()), kind: None },
+                    FileSystemWatcher { glob_pattern: GlobPattern::String("**/*.t".into()), kind: None },
+                ],
+            }).unwrap()),
+        }];
+        let _ = self.client.register_capability(registrations).await;
+
+        // Spawn workspace indexing in background with progress reporting
+        let ws_index = Arc::clone(&self.workspace_index);
+        let client = self.client.clone();
+        let root = self.module_index.workspace_root();
+        tokio::task::spawn_blocking(move || {
+            if let Some(root_uri) = root {
+                if let Some(root_path) = root_uri.strip_prefix("file://") {
+                    let root_path = PathBuf::from(root_path);
+                    let rt = tokio::runtime::Handle::current();
+                    let token = NumberOrString::String("perl-lsp/workspace-index".to_string());
+
+                    // Start progress
+                    let _ = rt.block_on(client.send_request::<request::WorkDoneProgressCreate>(
+                        WorkDoneProgressCreateParams { token: token.clone() },
+                    ));
+                    rt.block_on(client.send_notification::<notification::Progress>(
+                        ProgressParams {
+                            token: token.clone(),
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                                WorkDoneProgressBegin {
+                                    title: "Indexing workspace".into(),
+                                    cancellable: Some(false),
+                                    message: Some("Scanning files...".into()),
+                                    percentage: Some(0),
+                                },
+                            )),
+                        },
+                    ));
+
+                    let count = crate::module_resolver::index_workspace(&root_path, &ws_index);
+
+                    // End progress
+                    rt.block_on(client.send_notification::<notification::Progress>(
+                        ProgressParams {
+                            token,
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                WorkDoneProgressEnd {
+                                    message: Some(format!("Indexed {} files", count)),
+                                },
+                            )),
+                        },
+                    ));
+                }
+            }
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -297,6 +372,30 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let doc = match self.documents.get(&params.text_document.uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let point = symbols::position_to_point(params.position);
+        if let Some(sym) = doc.analysis.symbol_at(point) {
+            return Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+                range: symbols::span_to_range(sym.selection_span),
+                placeholder: sym.name.clone(),
+            }));
+        }
+        if let Some(r) = doc.analysis.ref_at(point) {
+            return Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+                range: symbols::span_to_range(r.span),
+                placeholder: r.target_name.clone(),
+            }));
+        }
+        Ok(None)
+    }
+
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
@@ -305,7 +404,73 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        Ok(symbols::rename(&doc.analysis, pos, uri, new_name))
+
+        let point = symbols::position_to_point(pos);
+        let rename_kind = doc.analysis.rename_kind_at(point);
+
+        match rename_kind {
+            Some(crate::file_analysis::RenameKind::Variable) => {
+                // Single-file only — lexical scope doesn't cross files
+                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
+            }
+            Some(crate::file_analysis::RenameKind::Function(ref name))
+            | Some(crate::file_analysis::RenameKind::Method(ref name))
+            | Some(crate::file_analysis::RenameKind::Package(ref name))
+            | Some(crate::file_analysis::RenameKind::HashKey(ref name)) => {
+                let rename_fn: fn(&FileAnalysis, &str, &str) -> Vec<(crate::file_analysis::Span, String)> = match &rename_kind {
+                    Some(crate::file_analysis::RenameKind::Function(_)) => FileAnalysis::rename_sub,
+                    Some(crate::file_analysis::RenameKind::Package(_)) => FileAnalysis::rename_package,
+                    Some(crate::file_analysis::RenameKind::Method(_)) => FileAnalysis::rename_sub,
+                    Some(crate::file_analysis::RenameKind::HashKey(_)) => {
+                        // Hash keys: single-file for now
+                        return Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)));
+                    }
+                    _ => unreachable!(),
+                };
+
+                let mut all_changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+                let mut collect = |uri: Url, analysis: &FileAnalysis| {
+                    let edits = rename_fn(analysis, name, new_name);
+                    if !edits.is_empty() {
+                        all_changes.entry(uri).or_default().extend(
+                            edits.into_iter().map(|(span, text)| TextEdit {
+                                range: symbols::span_to_range(span),
+                                new_text: text,
+                            })
+                        );
+                    }
+                };
+
+                // Search open documents
+                let mut seen_paths = std::collections::HashSet::new();
+                for entry in self.documents.iter() {
+                    if let Ok(path) = entry.key().to_file_path() {
+                        seen_paths.insert(path);
+                    }
+                    collect(entry.key().clone(), &entry.value().analysis);
+                }
+
+                // Search workspace index
+                for entry in self.workspace_index.iter() {
+                    if seen_paths.contains(entry.key()) { continue; }
+                    let ws_uri = Url::from_file_path(entry.key()).unwrap_or_else(|_| {
+                        Url::parse(&format!("file://{}", entry.key().display())).unwrap()
+                    });
+                    collect(ws_uri, entry.value());
+                }
+
+                if all_changes.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(WorkspaceEdit {
+                        changes: Some(all_changes),
+                        ..Default::default()
+                    }))
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -560,5 +725,161 @@ impl LanguageServer for Backend {
         } else {
             Ok(Some(hints))
         }
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let query = params.query.to_lowercase();
+        let mut results = Vec::new();
+        let mut seen_paths = std::collections::HashSet::new();
+
+        // Search open documents first (freshest analysis)
+        for entry in self.documents.iter() {
+            let uri = entry.key().clone();
+            if let Ok(path) = uri.to_file_path() {
+                seen_paths.insert(path);
+            }
+            for sym in &entry.value().analysis.symbols {
+                if sym.name.to_lowercase().contains(&query) {
+                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
+                        results.push(info);
+                    }
+                }
+            }
+        }
+
+        // Then workspace index (skip files already covered by open docs)
+        for entry in self.workspace_index.iter() {
+            if seen_paths.contains(entry.key()) { continue; }
+            let uri = Url::from_file_path(entry.key()).unwrap_or_else(|_| {
+                Url::parse(&format!("file://{}", entry.key().display())).unwrap()
+            });
+            for sym in &entry.value().symbols {
+                if sym.name.to_lowercase().contains(&query) {
+                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
+                        results.push(info);
+                    }
+                }
+            }
+        }
+
+        if results.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(results))
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let ws_index = Arc::clone(&self.workspace_index);
+        tokio::task::spawn_blocking(move || {
+            for change in params.changes {
+                let path = match change.uri.to_file_path() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                match change.typ {
+                    FileChangeType::DELETED => {
+                        ws_index.remove(&path);
+                    }
+                    _ => {
+                        // Re-index the file (created or changed)
+                        if let Ok(source) = std::fs::read_to_string(&path) {
+                            let mut parser = crate::module_resolver::create_parser();
+                            if let Some(tree) = parser.parse(&source, None) {
+                                let analysis = crate::builder::build(&tree, source.as_bytes());
+                                ws_index.insert(path, analysis);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document.uri;
+        let doc = match self.documents.get(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        // Extract lines for the range
+        let start_line = params.range.start.line as usize;
+        let end_line = params.range.end.line as usize;
+        let lines: Vec<&str> = doc.text.lines().collect();
+        if start_line >= lines.len() { return Ok(None); }
+        let end = (end_line + 1).min(lines.len());
+        let range_text: String = lines[start_line..end].join("\n") + "\n";
+
+        // Shell out to perltidy on the range
+        let result = tokio::process::Command::new("perltidy")
+            .arg("--standard-output")
+            .arg("--standard-error-output")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        let mut child = match result {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(range_text.as_bytes()).await;
+            drop(stdin);
+        }
+
+        let output = match child.wait_with_output().await {
+            Ok(o) if o.status.success() => o,
+            _ => return Ok(None),
+        };
+
+        let formatted = String::from_utf8_lossy(&output.stdout).to_string();
+        if formatted == range_text {
+            return Ok(None);
+        }
+
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position { line: start_line as u32, character: 0 },
+                end: Position { line: end as u32, character: 0 },
+            },
+            new_text: formatted,
+        }]))
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> Result<Option<LinkedEditingRanges>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let doc = match self.documents.get(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        let point = symbols::position_to_point(pos);
+        let refs = doc.analysis.find_references(point, None, None);
+        if refs.len() < 2 {
+            return Ok(None);
+        }
+
+        let ranges: Vec<Range> = refs.into_iter()
+            .map(|span| symbols::span_to_range(span))
+            .collect();
+
+        Ok(Some(LinkedEditingRanges {
+            ranges,
+            word_pattern: None,
+        }))
     }
 }

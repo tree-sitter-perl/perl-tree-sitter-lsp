@@ -20,11 +20,11 @@ fn point_to_position(p: Point) -> Position {
     }
 }
 
-fn position_to_point(pos: Position) -> Point {
+pub fn position_to_point(pos: Position) -> Point {
     Point::new(pos.line as usize, pos.character as usize)
 }
 
-fn span_to_range(span: Span) -> Range {
+pub fn span_to_range(span: Span) -> Range {
     Range {
         start: point_to_position(span.start),
         end: point_to_position(span.end),
@@ -72,6 +72,27 @@ pub fn extract_symbols(analysis: &FileAnalysis) -> Vec<DocumentSymbol> {
         .iter()
         .map(outline_to_document_symbol)
         .collect()
+}
+
+#[allow(deprecated)]
+pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
+    use crate::file_analysis::SymKind as FaSymKind;
+    // Only include significant symbols (subs, methods, packages, classes)
+    match sym.kind {
+        FaSymKind::Sub | FaSymKind::Method | FaSymKind::Package | FaSymKind::Class => {}
+        _ => return None,
+    }
+    Some(SymbolInformation {
+        name: sym.name.clone(),
+        kind: fa_sym_kind_to_lsp(&sym.kind),
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri,
+            range: span_to_range(sym.selection_span),
+        },
+        container_name: sym.package.clone(),
+    })
 }
 
 pub fn find_definition(
@@ -157,7 +178,7 @@ pub fn find_definition(
         }
 
         // Cross-file method goto-def: resolve inherited methods through module index
-        if let RefKind::MethodCall { ref invocant, ref invocant_span } = r.kind {
+        if let RefKind::MethodCall { ref invocant, ref invocant_span, .. } = r.kind {
             use crate::file_analysis::MethodResolution;
             let class_name = analysis.resolve_method_invocant_public(
                 invocant, invocant_span, r.scope, point, Some(tree), Some(source.as_bytes()), Some(module_index),
@@ -201,8 +222,12 @@ pub fn rename(
     pos: Position,
     uri: &Url,
     new_name: &str,
+    tree: Option<&tree_sitter::Tree>,
+    source: Option<&str>,
 ) -> Option<WorkspaceEdit> {
-    let edits = analysis.rename_at(position_to_point(pos), new_name)?;
+    let edits = analysis.rename_at(
+        position_to_point(pos), new_name, tree, source.map(|s| s.as_bytes()),
+    )?;
 
     let text_edits: Vec<TextEdit> = edits
         .into_iter()
@@ -1166,7 +1191,7 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
     ];
     for r in &analysis.refs {
         let (invocant, _invocant_span) = match &r.kind {
-            RefKind::MethodCall { invocant, invocant_span } => (invocant, invocant_span),
+            RefKind::MethodCall { invocant, invocant_span, .. } => (invocant, invocant_span),
             _ => continue,
         };
         let method_name = &r.target_name;

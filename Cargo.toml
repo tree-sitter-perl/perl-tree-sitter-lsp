@@ -12,5 +12,7 @@ ts-parser-pod = "1"
 dashmap = "6"
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+rayon = "1"
+ignore = "0.4"
 log = "0.4"
 env_logger = "0.11"

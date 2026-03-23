@@ -216,7 +216,30 @@ t.test("hover: $dynamic_title from $mojo->$get_title() shows String", function()
   end
 end)
 
--- ── 8. No unexpected diagnostics ─────────────────────────────────────
+-- ── 8. Moo constructor arg rename ────────────────────────────────────
+
+t.test("rename: 'name' constructor arg produces edits at has + call site", function()
+  local N = "rename: 'name' constructor arg produces edits at has + call site"
+  -- Cursor on "name" in MooApp->new(name => 'alice', ...)
+  local line, col = b.find_pos(buf, "MooApp->new(name =>")
+  if not t.ok(N, line, "couldn't find constructor call") then return end
+
+  -- Position on "name" key — col + 12 puts us on 'name' after 'MooApp->new('
+  local edit = lsp.rename(buf, line, col + 12, "display_name")
+  if not t.ok(N, edit, "rename returned no edit") then return end
+  if not t.ok(N, edit.changes, "rename has no changes") then return end
+
+  local total = 0
+  for _, edits in pairs(edit.changes) do
+    total = total + #edits
+  end
+  -- Should find at least: constructor arg (name =>) + has name definition = 2
+  if t.ok(N, total >= 2, string.format("should have ≥2 edits (has def + constructor arg), got %d", total)) then
+    t.pass(N)
+  end
+end)
+
+-- ── 9. No unexpected diagnostics ─────────────────────────────────────
 
 lsp.assert_no_diagnostics(t, buf)
 
