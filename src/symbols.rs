@@ -20,11 +20,11 @@ fn point_to_position(p: Point) -> Position {
     }
 }
 
-fn position_to_point(pos: Position) -> Point {
+pub fn position_to_point(pos: Position) -> Point {
     Point::new(pos.line as usize, pos.character as usize)
 }
 
-fn span_to_range(span: Span) -> Range {
+pub fn span_to_range(span: Span) -> Range {
     Range {
         start: point_to_position(span.start),
         end: point_to_position(span.end),

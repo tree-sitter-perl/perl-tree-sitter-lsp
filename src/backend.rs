@@ -147,7 +147,12 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
-                rename_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
+                linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
                         "$".to_string(),
@@ -367,6 +372,30 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let doc = match self.documents.get(&params.text_document.uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let point = symbols::position_to_point(params.position);
+        if let Some(sym) = doc.analysis.symbol_at(point) {
+            return Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+                range: symbols::span_to_range(sym.selection_span),
+                placeholder: sym.name.clone(),
+            }));
+        }
+        if let Some(r) = doc.analysis.ref_at(point) {
+            return Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+                range: symbols::span_to_range(r.span),
+                placeholder: r.target_name.clone(),
+            }));
+        }
+        Ok(None)
+    }
+
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
@@ -375,7 +404,73 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        Ok(symbols::rename(&doc.analysis, pos, uri, new_name))
+
+        let point = symbols::position_to_point(pos);
+        let rename_kind = doc.analysis.rename_kind_at(point);
+
+        match rename_kind {
+            Some(crate::file_analysis::RenameKind::Variable) => {
+                // Single-file only — lexical scope doesn't cross files
+                Ok(symbols::rename(&doc.analysis, pos, uri, new_name))
+            }
+            Some(crate::file_analysis::RenameKind::Function(ref name))
+            | Some(crate::file_analysis::RenameKind::Method(ref name))
+            | Some(crate::file_analysis::RenameKind::Package(ref name))
+            | Some(crate::file_analysis::RenameKind::HashKey(ref name)) => {
+                let rename_fn: fn(&FileAnalysis, &str, &str) -> Vec<(crate::file_analysis::Span, String)> = match &rename_kind {
+                    Some(crate::file_analysis::RenameKind::Function(_)) => FileAnalysis::rename_function,
+                    Some(crate::file_analysis::RenameKind::Package(_)) => FileAnalysis::rename_package,
+                    Some(crate::file_analysis::RenameKind::Method(_)) => FileAnalysis::rename_method,
+                    Some(crate::file_analysis::RenameKind::HashKey(_)) => {
+                        // Hash keys: single-file for now
+                        return Ok(symbols::rename(&doc.analysis, pos, uri, new_name));
+                    }
+                    _ => unreachable!(),
+                };
+
+                let mut all_changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+                let mut collect = |uri: Url, analysis: &FileAnalysis| {
+                    let edits = rename_fn(analysis, name, new_name);
+                    if !edits.is_empty() {
+                        all_changes.entry(uri).or_default().extend(
+                            edits.into_iter().map(|(span, text)| TextEdit {
+                                range: symbols::span_to_range(span),
+                                new_text: text,
+                            })
+                        );
+                    }
+                };
+
+                // Search open documents
+                let mut seen_paths = std::collections::HashSet::new();
+                for entry in self.documents.iter() {
+                    if let Ok(path) = entry.key().to_file_path() {
+                        seen_paths.insert(path);
+                    }
+                    collect(entry.key().clone(), &entry.value().analysis);
+                }
+
+                // Search workspace index
+                for entry in self.workspace_index.iter() {
+                    if seen_paths.contains(entry.key()) { continue; }
+                    let ws_uri = Url::from_file_path(entry.key()).unwrap_or_else(|_| {
+                        Url::parse(&format!("file://{}", entry.key().display())).unwrap()
+                    });
+                    collect(ws_uri, entry.value());
+                }
+
+                if all_changes.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(WorkspaceEdit {
+                        changes: Some(all_changes),
+                        ..Default::default()
+                    }))
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -702,5 +797,89 @@ impl LanguageServer for Backend {
                 }
             }
         });
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document.uri;
+        let doc = match self.documents.get(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        // Extract lines for the range
+        let start_line = params.range.start.line as usize;
+        let end_line = params.range.end.line as usize;
+        let lines: Vec<&str> = doc.text.lines().collect();
+        if start_line >= lines.len() { return Ok(None); }
+        let end = (end_line + 1).min(lines.len());
+        let range_text: String = lines[start_line..end].join("\n") + "\n";
+
+        // Shell out to perltidy on the range
+        let result = tokio::process::Command::new("perltidy")
+            .arg("--standard-output")
+            .arg("--standard-error-output")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        let mut child = match result {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(range_text.as_bytes()).await;
+            drop(stdin);
+        }
+
+        let output = match child.wait_with_output().await {
+            Ok(o) if o.status.success() => o,
+            _ => return Ok(None),
+        };
+
+        let formatted = String::from_utf8_lossy(&output.stdout).to_string();
+        if formatted == range_text {
+            return Ok(None);
+        }
+
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position { line: start_line as u32, character: 0 },
+                end: Position { line: end as u32, character: 0 },
+            },
+            new_text: formatted,
+        }]))
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> Result<Option<LinkedEditingRanges>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let doc = match self.documents.get(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        let point = symbols::position_to_point(pos);
+        let refs = doc.analysis.find_references(point, None, None);
+        if refs.len() < 2 {
+            return Ok(None);
+        }
+
+        let ranges: Vec<Range> = refs.into_iter()
+            .map(|span| symbols::span_to_range(span))
+            .collect();
+
+        Ok(Some(LinkedEditingRanges {
+            ranges,
+            word_pattern: None,
+        }))
     }
 }

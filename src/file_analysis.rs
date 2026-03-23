@@ -193,6 +193,16 @@ pub struct Ref {
     pub resolves_to: Option<SymbolId>,
 }
 
+/// What kind of entity is being renamed — determines single-file vs cross-file scope.
+#[derive(Debug)]
+pub enum RenameKind {
+    Variable,
+    Function(String),
+    Package(String),
+    Method(String),
+    HashKey(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum RefKind {
@@ -1603,6 +1613,77 @@ impl FileAnalysis {
         };
 
         Some(edits)
+    }
+
+    /// Determine what kind of rename is appropriate for the cursor position.
+    pub fn rename_kind_at(&self, point: Point) -> Option<RenameKind> {
+        if let Some(r) = self.ref_at(point) {
+            return Some(match &r.kind {
+                RefKind::Variable | RefKind::ContainerAccess => RenameKind::Variable,
+                RefKind::FunctionCall => RenameKind::Function(r.target_name.clone()),
+                RefKind::MethodCall { .. } => RenameKind::Method(r.target_name.clone()),
+                RefKind::PackageRef => RenameKind::Package(r.target_name.clone()),
+                RefKind::HashKeyAccess { .. } => RenameKind::HashKey(r.target_name.clone()),
+            });
+        }
+        if let Some(sym) = self.symbol_at(point) {
+            return match sym.kind {
+                SymKind::Variable | SymKind::Field => Some(RenameKind::Variable),
+                SymKind::Sub => Some(RenameKind::Function(sym.name.clone())),
+                SymKind::Method => Some(RenameKind::Method(sym.name.clone())),
+                SymKind::Package | SymKind::Class => Some(RenameKind::Package(sym.name.clone())),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// Find all occurrences of a function name (def + refs) for cross-file rename.
+    pub fn rename_function(&self, old_name: &str, new_name: &str) -> Vec<(Span, String)> {
+        let mut edits = Vec::new();
+        for sym in &self.symbols {
+            if sym.name == old_name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                edits.push((sym.selection_span, new_name.to_string()));
+            }
+        }
+        for r in &self.refs {
+            if r.target_name == old_name && matches!(r.kind, RefKind::FunctionCall) {
+                edits.push((r.span, new_name.to_string()));
+            }
+        }
+        edits
+    }
+
+    /// Find all occurrences of a method name (def + call refs) for cross-file rename.
+    pub fn rename_method(&self, old_name: &str, new_name: &str) -> Vec<(Span, String)> {
+        let mut edits = Vec::new();
+        for sym in &self.symbols {
+            if sym.name == old_name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                edits.push((sym.selection_span, new_name.to_string()));
+            }
+        }
+        for r in &self.refs {
+            if r.target_name == old_name && matches!(r.kind, RefKind::MethodCall { .. }) {
+                edits.push((r.span, new_name.to_string()));
+            }
+        }
+        edits
+    }
+
+    /// Find all occurrences of a package name (def + refs + use statements) for cross-file rename.
+    pub fn rename_package(&self, old_name: &str, new_name: &str) -> Vec<(Span, String)> {
+        let mut edits = Vec::new();
+        for sym in &self.symbols {
+            if sym.name == old_name && matches!(sym.kind, SymKind::Package | SymKind::Class | SymKind::Module) {
+                edits.push((sym.selection_span, new_name.to_string()));
+            }
+        }
+        for r in &self.refs {
+            if r.target_name == old_name && matches!(r.kind, RefKind::PackageRef) {
+                edits.push((r.span, new_name.to_string()));
+            }
+        }
+        edits
     }
 
     // ---- Internal resolution helpers ----
