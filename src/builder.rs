@@ -2952,14 +2952,13 @@ impl<'a> Builder<'a> {
                 "pod" => {
                     let text = &source_str[node.byte_range()];
                     // Try to extract just the section for this sub (=head2 or =item)
-                    if let Some(section) = crate::pod::extract_head2_section(sub_name, text) {
-                        let md = crate::pod::pod_to_markdown(&section);
+                    // extract_head2_section/extract_item_section return rendered markdown
+                    if let Some(md) = crate::pod::extract_head2_section(sub_name, text) {
                         if !md.is_empty() {
                             return Some(md);
                         }
                     }
-                    if let Some(section) = crate::pod::extract_item_section(sub_name, text) {
-                        let md = crate::pod::pod_to_markdown(&section);
+                    if let Some(md) = crate::pod::extract_item_section(sub_name, text) {
                         if !md.is_empty() {
                             return Some(md);
                         }
@@ -3007,15 +3006,13 @@ impl<'a> Builder<'a> {
                 }
                 // Search pod texts for =head2 matching this sub name, fall back to =item
                 for pod_text in &self.pod_texts {
-                    if let Some(section) = crate::pod::extract_head2_section(&sym.name, pod_text) {
-                        let md = crate::pod::pod_to_markdown(&section);
+                    if let Some(md) = crate::pod::extract_head2_section(&sym.name, pod_text) {
                         if !md.is_empty() {
                             *doc = Some(md);
                             break;
                         }
                     }
-                    if let Some(section) = crate::pod::extract_item_section(&sym.name, pod_text) {
-                        let md = crate::pod::pod_to_markdown(&section);
+                    if let Some(md) = crate::pod::extract_item_section(&sym.name, pod_text) {
                         if !md.is_empty() {
                             *doc = Some(md);
                             break;

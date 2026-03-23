@@ -615,13 +615,13 @@ dependencies = [
  "dashmap 6.1.0",
  "env_logger",
  "log",
- "regex",
  "rusqlite",
  "serde_json",
  "tokio",
  "tower-lsp",
  "tree-sitter",
  "ts-parser-perl",
+ "ts-parser-pod",
 ]
 
 [[package]]
@@ -1050,6 +1050,16 @@ name = "ts-parser-perl"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50af7554968af227827f6504f5bdbcf602dd5ad69c204184799afc4a3058eae8"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "ts-parser-pod"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11335bcc848a5c17669f0b865f47cfdec1866c316791005f8396ec8bebce4a4c"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -48,7 +48,7 @@ The codebase has four layers. Data flows **down** only. Each layer may only depe
 - `src/document.rs` — Document store with tree-sitter parsing
 - `src/file_analysis.rs` — Data model: scopes, symbols, refs, imports, type inference, priority constants
 - `src/builder.rs` — Single-pass CST → FileAnalysis builder (the ONLY tree-sitter consumer)
-- `src/pod.rs` — POD→markdown converter (pure string processing, no tree-sitter)
+- `src/pod.rs` — POD→markdown converter (tree-sitter-pod AST walk, handles nested formatting/lists/data regions)
 - `src/cursor_context.rs` — Cursor position analysis: completion/signature/selection context
 - `src/symbols.rs` — LSP adapter layer (converts FileAnalysis types to LSP types)
 - `src/module_index.rs` — Cross-file: public API, reverse index (`func → modules`), concurrent cache
@@ -63,7 +63,7 @@ The codebase has four layers. Data flows **down** only. Each layer may only depe
 - `ts-parser-perl` — crates.io, exports `LANGUAGE: LanguageFn`
 - `dashmap 6` — Concurrent document store + module cache
 - `rusqlite 0.32` — SQLite persistence for module index (bundled)
-- `regex 1` — POD→markdown inline formatting conversion
+- `ts-parser-pod` — crates.io, POD→AST for documentation rendering
 
 ## tree-sitter-perl Node Types
 
