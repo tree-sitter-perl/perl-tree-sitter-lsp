@@ -5,6 +5,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
+use tower_lsp::lsp_types::{notification, request};
 use tower_lsp::{Client, LanguageServer};
 
 use crate::document::Document;
@@ -214,7 +215,7 @@ impl LanguageServer for Backend {
         }];
         let _ = self.client.register_capability(registrations).await;
 
-        // Spawn workspace indexing in background
+        // Spawn workspace indexing in background with progress reporting
         let ws_index = Arc::clone(&self.workspace_index);
         let client = self.client.clone();
         let root = self.module_index.workspace_root();
@@ -222,11 +223,39 @@ impl LanguageServer for Backend {
             if let Some(root_uri) = root {
                 if let Some(root_path) = root_uri.strip_prefix("file://") {
                     let root_path = PathBuf::from(root_path);
-                    let count = crate::module_resolver::index_workspace(&root_path, &ws_index);
                     let rt = tokio::runtime::Handle::current();
-                    rt.block_on(client.log_message(
-                        MessageType::INFO,
-                        format!("Indexed {} workspace files", count),
+                    let token = NumberOrString::String("perl-lsp/workspace-index".to_string());
+
+                    // Start progress
+                    let _ = rt.block_on(client.send_request::<request::WorkDoneProgressCreate>(
+                        WorkDoneProgressCreateParams { token: token.clone() },
+                    ));
+                    rt.block_on(client.send_notification::<notification::Progress>(
+                        ProgressParams {
+                            token: token.clone(),
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                                WorkDoneProgressBegin {
+                                    title: "Indexing workspace".into(),
+                                    cancellable: Some(false),
+                                    message: Some("Scanning files...".into()),
+                                    percentage: Some(0),
+                                },
+                            )),
+                        },
+                    ));
+
+                    let count = crate::module_resolver::index_workspace(&root_path, &ws_index);
+
+                    // End progress
+                    rt.block_on(client.send_notification::<notification::Progress>(
+                        ProgressParams {
+                            token,
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                WorkDoneProgressEnd {
+                                    message: Some(format!("Indexed {} files", count)),
+                                },
+                            )),
+                        },
                     ));
                 }
             }
@@ -649,26 +678,29 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        for change in params.changes {
-            let path = match change.uri.to_file_path() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            match change.typ {
-                FileChangeType::DELETED => {
-                    self.workspace_index.remove(&path);
-                }
-                _ => {
-                    // Re-index the file (created or changed)
-                    if let Ok(source) = std::fs::read_to_string(&path) {
-                        let mut parser = crate::module_resolver::create_parser();
-                        if let Some(tree) = parser.parse(&source, None) {
-                            let analysis = crate::builder::build(&tree, source.as_bytes());
-                            self.workspace_index.insert(path, analysis);
+        let ws_index = Arc::clone(&self.workspace_index);
+        tokio::task::spawn_blocking(move || {
+            for change in params.changes {
+                let path = match change.uri.to_file_path() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                match change.typ {
+                    FileChangeType::DELETED => {
+                        ws_index.remove(&path);
+                    }
+                    _ => {
+                        // Re-index the file (created or changed)
+                        if let Ok(source) = std::fs::read_to_string(&path) {
+                            let mut parser = crate::module_resolver::create_parser();
+                            if let Some(tree) = parser.parse(&source, None) {
+                                let analysis = crate::builder::build(&tree, source.as_bytes());
+                                ws_index.insert(path, analysis);
+                            }
                         }
                     }
                 }
             }
-        }
+        });
     }
 }
