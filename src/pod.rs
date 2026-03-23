@@ -107,11 +107,35 @@ fn parse_pod(pod_text: &str) -> Option<tree_sitter::Tree> {
 // ---- Rendering ----
 
 fn render_children(node: Node, source: &[u8], out: &mut String) {
-    for i in 0..node.named_child_count() {
+    let count = node.named_child_count();
+    let mut i = 0;
+    while i < count {
         if let Some(child) = node.named_child(i) {
+            // Merge consecutive verbatim paragraphs into one code block
+            if child.kind() == "verbatim_paragraph" {
+                out.push_str("```perl\n");
+                render_verbatim_content(child, source, out);
+                i += 1;
+                while i < count {
+                    if let Some(next) = node.named_child(i) {
+                        if next.kind() == "verbatim_paragraph" {
+                            out.push('\n');
+                            render_verbatim_content(next, source, out);
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                out.push_str("```\n\n");
+                continue;
+            }
             render_node(child, source, out);
             if out.len() > 2000 { return; }
         }
+        i += 1;
     }
 }
 
@@ -151,6 +175,9 @@ fn render_command(node: Node, source: &[u8], out: &mut String) {
                 out.push_str("- ");
             } else if rendered.starts_with("* ") {
                 out.push_str(&format!("- {}\n", &rendered[2..]));
+            } else if let Some(rest) = strip_ordered_prefix(&rendered) {
+                // Ordered list: =item 1. text → 1. text
+                out.push_str(&format!("{}\n", rest));
             } else {
                 out.push_str(&format!("- **{}**\n", rendered));
             }
@@ -173,8 +200,13 @@ fn render_plain(node: Node, source: &[u8], out: &mut String) {
 }
 
 fn render_verbatim(node: Node, source: &[u8], out: &mut String) {
-    out.push_str("```\n");
-    // Get the verbatim content, stripping one level of indent (4 spaces or tab)
+    out.push_str("```perl\n");
+    render_verbatim_content(node, source, out);
+    out.push_str("```\n\n");
+}
+
+/// Render verbatim paragraph content, stripping one level of indent.
+fn render_verbatim_content(node: Node, source: &[u8], out: &mut String) {
     if let Ok(text) = node.utf8_text(source) {
         for line in text.lines() {
             if line.starts_with("    ") {
@@ -187,7 +219,6 @@ fn render_verbatim(node: Node, source: &[u8], out: &mut String) {
             out.push('\n');
         }
     }
-    out.push_str("```\n\n");
 }
 
 fn render_begin(node: Node, source: &[u8], out: &mut String) {
@@ -288,11 +319,25 @@ fn render_interior_sequence(node: Node, source: &[u8]) -> String {
         "I" => format!("*{}*", content),
         "F" => format!("`{}`", content),
         "L" => {
-            // L<text|url> → text, L<Module::Name> → Module::Name
             if let Some(idx) = content.find('|') {
-                content[..idx].to_string()
+                let text = &content[..idx];
+                let url = &content[idx + 1..];
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    format!("[{}]({})", text, url)
+                } else {
+                    // L<text|Module> or L<text|Module/section> — just show text
+                    text.to_string()
+                }
+            } else if content.contains("://") {
+                // Bare URL: L<http://example.com>
+                format!("[{}]({})", content, content)
+            } else if content.contains('/') {
+                // L<Module/section> → Module (section)
+                let parts: Vec<&str> = content.splitn(2, '/').collect();
+                format!("{} ({})", parts[0], parts[1].trim_matches('"'))
             } else {
-                content
+                // L<Module::Name> → link to metacpan
+                format!("[{}](https://metacpan.org/pod/{})", content, content)
             }
         }
         "X" => String::new(), // index entry — invisible
@@ -327,6 +372,19 @@ fn get_content_text(node: &Node, source: &[u8]) -> String {
         }
     }
     String::new()
+}
+
+/// Check if text starts with an ordered list prefix like "1." or "2. ".
+/// Returns the full "N. rest" string for markdown rendering.
+fn strip_ordered_prefix(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let dot_pos = trimmed.find('.')?;
+    let prefix = &trimmed[..dot_pos];
+    if prefix.chars().all(|c| c.is_ascii_digit()) && !prefix.is_empty() {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
 }
 
 /// Extract method name from an =item content string.
@@ -391,7 +449,21 @@ mod tests {
     fn test_link() {
         let pod = "=head2 test\n\nSee L<Foo::Bar>\n\n=cut\n";
         let md = pod_to_markdown(pod);
-        assert!(md.contains("Foo::Bar"), "got: {}", md);
+        assert!(md.contains("[Foo::Bar](https://metacpan.org/pod/Foo::Bar)"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_link_with_text() {
+        let pod = "=head2 test\n\nSee L<the docs|http://example.com>\n\n=cut\n";
+        let md = pod_to_markdown(pod);
+        assert!(md.contains("[the docs](http://example.com)"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_link_section() {
+        let pod = "=head2 test\n\nSee L<Module/method>\n\n=cut\n";
+        let md = pod_to_markdown(pod);
+        assert!(md.contains("Module (method)"), "got: {}", md);
     }
 
     #[test]
@@ -405,7 +477,7 @@ mod tests {
     fn test_verbatim_block() {
         let pod = "=head2 example\n\nSome text:\n\n    my $x = 1;\n    my $y = 2;\n\nMore text.\n\n=cut\n";
         let md = pod_to_markdown(pod);
-        assert!(md.contains("```\nmy $x = 1;\nmy $y = 2;\n```"), "got: {}", md);
+        assert!(md.contains("```perl\nmy $x = 1;\nmy $y = 2;\n```"), "got: {}", md);
     }
 
     #[test]
@@ -547,6 +619,26 @@ mod tests {
         let pod = "=head2 test\n\naZ<>b\n\n=cut\n";
         let md = pod_to_markdown(pod);
         assert!(md.contains("ab"), "Z<> should produce nothing, got: {}", md);
+    }
+
+    #[test]
+    fn test_ordered_list() {
+        let pod = "=over\n\n=item 1. First\n\n=item 2. Second\n\n=back\n\n=cut\n";
+        let md = pod_to_markdown(pod);
+        assert!(md.contains("1. First"), "got: {}", md);
+        assert!(md.contains("2. Second"), "got: {}", md);
+        assert!(!md.contains("- **1."), "should not bold-wrap ordered items, got: {}", md);
+    }
+
+    #[test]
+    fn test_consecutive_verbatim_merged() {
+        let pod = "=head2 test\n\n    block one\n    line two\n\n    block two\n    line three\n\n=cut\n";
+        let md = pod_to_markdown(pod);
+        // Should be one code block, not two
+        let fence_count = md.matches("```").count();
+        assert_eq!(fence_count, 2, "should have exactly one code block (2 fences), got: {}", md);
+        assert!(md.contains("block one"), "got: {}", md);
+        assert!(md.contains("block two"), "got: {}", md);
     }
 
     #[test]
