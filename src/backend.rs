@@ -411,7 +411,7 @@ impl LanguageServer for Backend {
         match rename_kind {
             Some(crate::file_analysis::RenameKind::Variable) => {
                 // Single-file only — lexical scope doesn't cross files
-                Ok(symbols::rename(&doc.analysis, pos, uri, new_name))
+                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
             }
             Some(crate::file_analysis::RenameKind::Function(ref name))
             | Some(crate::file_analysis::RenameKind::Method(ref name))
@@ -423,7 +423,7 @@ impl LanguageServer for Backend {
                     Some(crate::file_analysis::RenameKind::Method(_)) => FileAnalysis::rename_sub,
                     Some(crate::file_analysis::RenameKind::HashKey(_)) => {
                         // Hash keys: single-file for now
-                        return Ok(symbols::rename(&doc.analysis, pos, uri, new_name));
+                        return Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)));
                     }
                     _ => unreachable!(),
                 };

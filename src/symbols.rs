@@ -222,8 +222,12 @@ pub fn rename(
     pos: Position,
     uri: &Url,
     new_name: &str,
+    tree: Option<&tree_sitter::Tree>,
+    source: Option<&str>,
 ) -> Option<WorkspaceEdit> {
-    let edits = analysis.rename_at(position_to_point(pos), new_name)?;
+    let edits = analysis.rename_at_with_tree(
+        position_to_point(pos), new_name, tree, source.map(|s| s.as_bytes()),
+    )?;
 
     let text_edits: Vec<TextEdit> = edits
         .into_iter()

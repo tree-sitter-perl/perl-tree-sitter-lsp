@@ -2166,6 +2166,23 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+
+        // Synthesize HashKeyDef entries so Foo->new(name => ...) connects to the attribute.
+        if let Some(ref _pkg) = self.current_package {
+            let owner = HashKeyOwner::Sub("new".to_string());
+            for (name, sel_span) in &attr_names {
+                self.add_symbol(
+                    name.clone(),
+                    SymKind::HashKeyDef,
+                    node_to_span(node),
+                    *sel_span,
+                    SymbolDetail::HashKeyDef {
+                        owner: owner.clone(),
+                        is_dynamic: false,
+                    },
+                );
+            }
+        }
     }
 
     /// Extract arguments from `use Mojo::Base ...` including barewords like -strict, -base.
@@ -4500,6 +4517,27 @@ sub test {
             "rename_sub should find def + function call + method call, got {} edits", edits.len());
         for (_, text) in &edits {
             assert_eq!(text, "fire");
+        }
+    }
+
+    #[test]
+    fn test_moo_has_creates_constructor_hash_key_def() {
+        let fa = build_fa("
+package MyApp;
+use Moo;
+has username => (is => 'ro');
+has password => (is => 'rw');
+");
+        // Should have HashKeyDef symbols owned by "new" for each has attribute
+        let key_defs: Vec<_> = fa.symbols.iter()
+            .filter(|s| matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
+            .collect();
+        let names: Vec<&str> = key_defs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"username"), "should have HashKeyDef for username, got: {:?}", names);
+        assert!(names.contains(&"password"), "should have HashKeyDef for password, got: {:?}", names);
+        // Verify owner is "new"
+        if let SymbolDetail::HashKeyDef { ref owner, .. } = key_defs[0].detail {
+            assert_eq!(owner, &HashKeyOwner::Sub("new".to_string()));
         }
     }
 
