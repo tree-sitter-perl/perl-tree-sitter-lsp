@@ -295,6 +295,9 @@ fn render_interior_sequence(node: Node, source: &[u8]) -> String {
                 content
             }
         }
+        "X" => String::new(), // index entry — invisible
+        "Z" => String::new(), // zero-width — invisible
+        "S" => content.replace(' ', "\u{00a0}"), // non-breaking spaces
         "E" => match content.as_str() {
             "lt" => "<".to_string(),
             "gt" => ">".to_string(),
@@ -522,6 +525,28 @@ mod tests {
         let pod = "=for html <img src=\"logo.png\">\n\n=cut\n";
         let md = pod_to_markdown(pod);
         assert!(md.contains("```html"), "should have fenced block, got: {}", md);
+    }
+
+    #[test]
+    fn test_deep_nested_formatting() {
+        let pod = "=head2 test\n\nB<I<C<foo>>>\n\n=cut\n";
+        let md = pod_to_markdown(pod);
+        assert!(md.contains("***`foo`***"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_x_index_invisible() {
+        let pod = "=head2 test\n\nSee X<index>this\n\n=cut\n";
+        let md = pod_to_markdown(pod);
+        assert!(md.contains("See this"), "X<> should be invisible, got: {}", md);
+        assert!(!md.contains("index"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_z_zero_width() {
+        let pod = "=head2 test\n\naZ<>b\n\n=cut\n";
+        let md = pod_to_markdown(pod);
+        assert!(md.contains("ab"), "Z<> should produce nothing, got: {}", md);
     }
 
     #[test]
