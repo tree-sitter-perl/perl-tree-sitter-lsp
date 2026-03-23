@@ -2349,9 +2349,12 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_method_call(&mut self, node: Node<'a>) {
-        let method_name = node.child_by_field_name("method")
+        let method_node = node.child_by_field_name("method");
+        let method_name = method_node
             .and_then(|n| n.utf8_text(self.source).ok())
             .map(|s| s.to_string());
+        let method_name_span = method_node.map(|n| node_to_span(n))
+            .unwrap_or_else(|| node_to_span(node));
         let invocant_node = node.child_by_field_name("invocant");
         let invocant_text = invocant_node
             .and_then(|n| n.utf8_text(self.source).ok())
@@ -2378,6 +2381,7 @@ impl<'a> Builder<'a> {
                             RefKind::MethodCall {
                                 invocant: invocant.clone().unwrap_or_default(),
                                 invocant_span,
+                                method_name_span,
                             },
                             node_to_span(node),
                             rname,
@@ -2390,6 +2394,7 @@ impl<'a> Builder<'a> {
                     RefKind::MethodCall {
                         invocant: invocant.clone().unwrap_or_default(),
                         invocant_span,
+                        method_name_span,
                     },
                     node_to_span(node),
                     name.clone(),

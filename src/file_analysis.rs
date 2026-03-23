@@ -212,6 +212,8 @@ pub enum RefKind {
         invocant: String,
         /// Span of the invocant node (for complex expressions needing tree resolution).
         invocant_span: Option<Span>,
+        /// Span of just the method name (for rename — r.span covers the whole expression).
+        method_name_span: Span,
     },
     PackageRef,
     HashKeyAccess {
@@ -1663,8 +1665,10 @@ impl FileAnalysis {
             }
         }
         for r in &self.refs {
-            if r.target_name == old_name && matches!(r.kind, RefKind::MethodCall { .. }) {
-                edits.push((r.span, new_name.to_string()));
+            if r.target_name == old_name {
+                if let RefKind::MethodCall { method_name_span, .. } = &r.kind {
+                    edits.push((*method_name_span, new_name.to_string()));
+                }
             }
         }
         edits
@@ -1709,7 +1713,7 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::MethodCall { ref invocant, ref invocant_span } => {
+                RefKind::MethodCall { ref invocant, ref invocant_span, .. } => {
                     let class_name = self.resolve_method_invocant(
                         invocant, invocant_span, r.scope, point, tree, source_bytes, module_index,
                     );
