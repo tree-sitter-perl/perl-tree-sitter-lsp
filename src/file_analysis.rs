@@ -369,27 +369,41 @@ pub struct OutlineSymbol {
 
 // ---- Semantic tokens ----
 
+// Token type/modifier indices — must match the order in semantic_token_types/modifiers().
+// Some are forward-declared for future phases.
+pub const TOK_VARIABLE: u32 = 0;
+pub const TOK_PARAMETER: u32 = 1;
+pub const TOK_FUNCTION: u32 = 2;
+pub const TOK_METHOD: u32 = 3;
+pub const TOK_MACRO: u32 = 4;
+pub const TOK_PROPERTY: u32 = 5;
+pub const TOK_NAMESPACE: u32 = 6;
+#[allow(dead_code)] pub const TOK_REGEXP: u32 = 7;
+#[allow(dead_code)] pub const TOK_ENUM_MEMBER: u32 = 8;
+pub const TOK_KEYWORD: u32 = 9;
+
+pub const MOD_DECLARATION: u32 = 0;
+pub const MOD_READONLY: u32 = 1;
+pub const MOD_MODIFICATION: u32 = 2;
+pub const MOD_DEFAULT_LIBRARY: u32 = 3;
+#[allow(dead_code)] pub const MOD_DEPRECATED: u32 = 4;
+#[allow(dead_code)] pub const MOD_STATIC: u32 = 5;
+pub const MOD_SCALAR: u32 = 6;
+pub const MOD_ARRAY: u32 = 7;
+pub const MOD_HASH: u32 = 8;
+
 #[derive(Debug, Clone)]
-pub struct SemanticVarToken {
+pub struct PerlSemanticToken {
     pub span: Span,
-    pub var_type: VarModifier,
-    pub is_declaration: bool,
-    pub is_modification: bool,
-    pub is_readonly: bool,
+    pub token_type: u32,
+    pub modifiers: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VarModifier {
-    Scalar,
-    Array,
-    Hash,
-}
-
-fn sigil_to_var_modifier(sigil: char) -> VarModifier {
+fn sigil_modifier(sigil: char) -> u32 {
     match sigil {
-        '@' => VarModifier::Array,
-        '%' => VarModifier::Hash,
-        _ => VarModifier::Scalar,
+        '@' => 1 << MOD_ARRAY,
+        '%' => 1 << MOD_HASH,
+        _ => 1 << MOD_SCALAR,
     }
 }
 
@@ -2116,54 +2130,126 @@ impl FileAnalysis {
     // ---- Semantic tokens ----
 
     /// Collect semantic tokens for all variable references and declarations.
-    pub fn semantic_tokens(&self) -> Vec<SemanticVarToken> {
-        let mut tokens: Vec<SemanticVarToken> = Vec::new();
+    pub fn semantic_tokens(&self) -> Vec<PerlSemanticToken> {
+        let mut tokens: Vec<PerlSemanticToken> = Vec::new();
 
-        // Variable declarations (from symbols)
+        // ---- Variable/parameter/self declarations from symbols ----
         for sym in &self.symbols {
-            if !matches!(sym.kind, SymKind::Variable | SymKind::Field) {
-                continue;
+            match sym.kind {
+                SymKind::Variable | SymKind::Field => {
+                    let is_self = sym.name == "$self" || sym.name == "$class";
+                    let (sigil, is_readonly, is_param) = match &sym.detail {
+                        SymbolDetail::Variable { sigil, decl_kind } => {
+                            let readonly = matches!(decl_kind, DeclKind::Field);
+                            let is_param = matches!(decl_kind, DeclKind::Param | DeclKind::ForVar);
+                            (*sigil, readonly, is_param)
+                        }
+                        SymbolDetail::Field { sigil, attributes } => {
+                            let readonly = !attributes.iter().any(|a| a == "writer" || a == "mutator" || a == "accessor");
+                            (*sigil, readonly, true)
+                        }
+                        _ => continue,
+                    };
+                    let token_type = if is_self { TOK_KEYWORD } else if is_param { TOK_PARAMETER } else { TOK_VARIABLE };
+                    // Don't add sigil modifier for $self/$class — it would override the keyword color
+                    let mut mods = if is_self { 0 } else { sigil_modifier(sigil) };
+                    mods |= 1 << MOD_DECLARATION;
+                    if is_readonly { mods |= 1 << MOD_READONLY; }
+                    tokens.push(PerlSemanticToken { span: sym.selection_span, token_type, modifiers: mods });
+                }
+                SymKind::Package | SymKind::Class => {
+                    tokens.push(PerlSemanticToken {
+                        span: sym.selection_span,
+                        token_type: TOK_NAMESPACE,
+                        modifiers: 1 << MOD_DECLARATION,
+                    });
+                }
+                SymKind::Module => {
+                    tokens.push(PerlSemanticToken {
+                        span: sym.selection_span,
+                        token_type: TOK_NAMESPACE,
+                        modifiers: 0,
+                    });
+                }
+                SymKind::Sub => {
+                    tokens.push(PerlSemanticToken {
+                        span: sym.selection_span,
+                        token_type: TOK_FUNCTION,
+                        modifiers: 1 << MOD_DECLARATION,
+                    });
+                }
+                SymKind::Method => {
+                    tokens.push(PerlSemanticToken {
+                        span: sym.selection_span,
+                        token_type: TOK_METHOD,
+                        modifiers: 1 << MOD_DECLARATION,
+                    });
+                }
+                _ => {}
             }
-            let (sigil, is_readonly) = match &sym.detail {
-                SymbolDetail::Variable { sigil, decl_kind } => {
-                    let readonly = matches!(decl_kind, DeclKind::Field);
-                    (*sigil, readonly)
-                }
-                SymbolDetail::Field { sigil, attributes } => {
-                    let readonly = !attributes.iter().any(|a| a == "writer" || a == "mutator" || a == "accessor");
-                    (*sigil, readonly)
-                }
-                _ => continue,
-            };
-            tokens.push(SemanticVarToken {
-                span: sym.selection_span,
-                var_type: sigil_to_var_modifier(sigil),
-                is_declaration: true,
-                is_modification: false,
-                is_readonly,
-            });
         }
 
-        // Variable references (from refs)
+        // ---- Refs: variables, functions, methods, properties, namespaces ----
+        let imported_names: std::collections::HashSet<&str> = self.imports.iter()
+            .flat_map(|imp| imp.imported_symbols.iter().map(|s| s.as_str()))
+            .collect();
+
         for r in &self.refs {
-            let sigil = match &r.kind {
-                RefKind::Variable => r.target_name.chars().next().unwrap_or('$'),
-                RefKind::ContainerAccess => {
-                    // Container access sigil is the displayed sigil, not the underlying
-                    r.target_name.chars().next().unwrap_or('$')
+            // Skip declaration refs — the symbol loop already emits tokens for declarations
+            if matches!(r.access, AccessKind::Declaration) {
+                continue;
+            }
+            match &r.kind {
+                RefKind::Variable | RefKind::ContainerAccess => {
+                    let sigil = r.target_name.chars().next().unwrap_or('$');
+                    let is_self = r.target_name == "$self" || r.target_name == "$class";
+                    let token_type = if is_self { TOK_KEYWORD } else { TOK_VARIABLE };
+                    // Don't add sigil modifier for $self/$class — it would override the keyword color
+                    let mut mods = if is_self { 0 } else { sigil_modifier(sigil) };
+                    if matches!(r.access, AccessKind::Write) { mods |= 1 << MOD_MODIFICATION; }
+                    tokens.push(PerlSemanticToken { span: r.span, token_type, modifiers: mods });
                 }
-                _ => continue,
-            };
-            tokens.push(SemanticVarToken {
-                span: r.span,
-                var_type: sigil_to_var_modifier(sigil),
-                is_declaration: false,
-                is_modification: matches!(r.access, AccessKind::Write),
-                is_readonly: false,
-            });
+                RefKind::FunctionCall => {
+                    // Framework DSL keywords → macro, otherwise function
+                    let token_type = if self.framework_imports.contains(r.target_name.as_str()) {
+                        TOK_MACRO
+                    } else {
+                        TOK_FUNCTION
+                    };
+                    let mut mods = 0;
+                    if imported_names.contains(r.target_name.as_str()) {
+                        mods |= 1 << MOD_DEFAULT_LIBRARY;
+                    }
+                    tokens.push(PerlSemanticToken { span: r.span, token_type, modifiers: mods });
+                }
+                RefKind::MethodCall { method_name_span, .. } => {
+                    // Use method_name_span for precise highlighting of just the method name
+                    let mods = 0; // TODO: readonly for ro accessors, static for class methods
+                    tokens.push(PerlSemanticToken { span: *method_name_span, token_type: TOK_METHOD, modifiers: mods });
+                }
+                RefKind::PackageRef => {
+                    tokens.push(PerlSemanticToken { span: r.span, token_type: TOK_NAMESPACE, modifiers: 0 });
+                }
+                RefKind::HashKeyAccess { .. } => {
+                    tokens.push(PerlSemanticToken { span: r.span, token_type: TOK_PROPERTY, modifiers: 0 });
+                }
+            }
+        }
+
+        // ---- HashKeyDef symbols → property tokens ----
+        for sym in &self.symbols {
+            if matches!(sym.kind, SymKind::HashKeyDef) {
+                tokens.push(PerlSemanticToken {
+                    span: sym.selection_span,
+                    token_type: TOK_PROPERTY,
+                    modifiers: 1 << MOD_DECLARATION,
+                });
+            }
         }
 
         tokens.sort_by_key(|t| (t.span.start.row, t.span.start.column));
+        // Dedup by position — if two tokens start at the same (row, col), keep the first
+        tokens.dedup_by(|b, a| a.span.start.row == b.span.start.row && a.span.start.column == b.span.start.column);
         tokens
     }
 }
