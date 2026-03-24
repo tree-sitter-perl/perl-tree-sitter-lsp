@@ -213,6 +213,9 @@ vim.api.nvim_create_autocmd("LspAttach", {
 -- Semantic token highlight groups for perl-lsp
 -- Loud and distinct for QA — you should see every token type clearly.
 
+-- Boost semantic token priority so LSP tokens always win over base syntax
+vim.highlight.priorities.semantic_tokens = 200
+
 -- Token types — each gets a unique, bright, unmistakable color
 vim.api.nvim_set_hl(0, "@lsp.type.variable.perl", { fg = "#61afef" })         -- blue — scalars/arrays/hashes
 vim.api.nvim_set_hl(0, "@lsp.type.parameter.perl", { fg = "#ff9e64", bold = true }) -- orange bold — sub params
