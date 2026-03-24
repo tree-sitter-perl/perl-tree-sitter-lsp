@@ -1075,6 +1075,7 @@ fn is_perl_builtin(name: &str) -> bool {
     PERL_BUILTINS.binary_search(&name).is_ok()
 }
 
+
 pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 

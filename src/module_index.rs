@@ -299,6 +299,31 @@ impl ModuleIndex {
         }
     }
 
+    /// Create a minimal ModuleIndex for CLI mode (no resolver thread, no @INC scan).
+    /// Provides empty search results — useful for standalone diagnostics.
+    pub fn new_for_cli() -> Self {
+        ModuleIndex {
+            cache: Arc::new(DashMap::new()),
+            reverse_index: Arc::new(DashMap::new()),
+            stale_modules: Arc::new(DashMap::new()),
+            available_modules: Arc::new(DashMap::new()),
+            queue: Arc::new(ResolveQueue {
+                priority: Mutex::new(Vec::new()),
+                pending: Mutex::new(Vec::new()),
+                condvar: Condvar::new(),
+            }),
+            resolved: Arc::new(ResolveNotify {
+                mu: Mutex::new(()),
+                cv: Condvar::new(),
+            }),
+            workspace_root: Arc::new(WorkspaceRootChannel {
+                root: Mutex::new(None),
+                condvar: Condvar::new(),
+            }),
+            refresh_diagnostics: Arc::new(|| {}),
+        }
+    }
+
     // ---- Test-only methods ----
 
     /// Create a ModuleIndex for testing — no Client, no progress reporting.
@@ -344,8 +369,12 @@ impl ModuleIndex {
         }
     }
 
-    /// Insert a module directly into the cache (for testing).
-    #[cfg(test)]
+    /// Direct access to the raw cache DashMap (for CLI warm_cache integration).
+    pub fn cache_raw(&self) -> &DashMap<String, Option<ModuleExports>> {
+        &self.cache
+    }
+
+    /// Insert a module directly into the cache (for CLI and testing).
     pub fn insert_cache(&self, module_name: &str, exports: Option<ModuleExports>) {
         // Update reverse index.
         if let Some(ref e) = exports {
