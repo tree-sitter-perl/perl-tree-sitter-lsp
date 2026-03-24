@@ -82,7 +82,8 @@ fn print_usage() {
     eprintln!("  perl-lsp                                              Start LSP server (stdio)");
     eprintln!();
     eprintln!("ANALYSIS:");
-    eprintln!("  perl-lsp --check [<root>] [--format json|human]        Batch diagnostics (CI)");
+    eprintln!("  perl-lsp --check [<root>] [--severity error|warning]    Batch diagnostics (CI)");
+    eprintln!("                           [--format json|human]");
     eprintln!("  perl-lsp --outline <file>                              Document symbol outline");
     eprintln!("  perl-lsp --hover <file> <line> <col>                   Type info and docs");
     eprintln!("  perl-lsp --type-at <file> <line> <col>                 Single type query");
@@ -134,8 +135,21 @@ fn index_workspace(root: &str) -> dashmap::DashMap<std::path::PathBuf, file_anal
 }
 
 fn is_json_format(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--format" || a == "json")
-        && args.windows(2).any(|w| w[0] == "--format" && w[1] == "json")
+    args.windows(2).any(|w| w[0] == "--format" && w[1] == "json")
+}
+
+fn get_arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
+}
+
+fn severity_rank(s: &str) -> u8 {
+    match s {
+        "error" => 0,
+        "warning" => 1,
+        "info" => 2,
+        "hint" => 3,
+        _ => 1,
+    }
 }
 
 fn span_to_json(span: file_analysis::Span, text: String) -> serde_json::Value {
@@ -148,35 +162,40 @@ fn span_to_json(span: file_analysis::Span, text: String) -> serde_json::Value {
 
 // ---- CLI Commands ----
 
-/// --check [<root>] [--format json|human] — Batch diagnostics
+/// --check [<root>] [--format json|human] [--severity error|warning|info|hint] — Batch diagnostics
 fn cli_check(args: &[String]) {
     let root = args.iter()
-        .find(|a| !a.starts_with("--"))
+        .find(|a| !a.starts_with("--") && !["json", "human", "error", "warning", "info", "hint"].contains(&a.as_str()))
         .map(|s| s.as_str())
         .unwrap_or(".");
     let json_mode = is_json_format(args);
+    let min_severity = get_arg_value(args, "--severity").unwrap_or("warning");
+    let min_rank = severity_rank(min_severity);
 
     let ws = index_workspace(root);
 
-    // For CLI check, we run per-file diagnostics without cross-file module resolution.
-    // We use collect_diagnostics_no_index which skips cross-file checks.
     let mut all_diagnostics = Vec::new();
 
     for entry in ws.iter() {
         let file = entry.key().display().to_string();
         let diags = symbols::collect_diagnostics_standalone(entry.value());
         for d in diags {
+            let sev = match d.severity {
+                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::ERROR => "error",
+                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::WARNING => "warning",
+                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION => "info",
+                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::HINT => "hint",
+                _ => "warning",
+            };
+            // Filter by minimum severity
+            if severity_rank(sev) > min_rank {
+                continue;
+            }
             all_diagnostics.push(serde_json::json!({
                 "file": file,
                 "line": d.range.start.line,
                 "col": d.range.start.character,
-                "severity": match d.severity {
-                    Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::ERROR => "error",
-                    Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::WARNING => "warning",
-                    Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION => "info",
-                    Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::HINT => "hint",
-                    _ => "warning",
-                },
+                "severity": sev,
                 "code": d.code.map(|c| match c {
                     tower_lsp::lsp_types::NumberOrString::String(s) => s,
                     tower_lsp::lsp_types::NumberOrString::Number(n) => n.to_string(),
