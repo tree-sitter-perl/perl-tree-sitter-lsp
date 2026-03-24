@@ -174,11 +174,47 @@ fn cli_check(args: &[String]) {
 
     let ws = index_workspace(root);
 
+    // Resolve imported modules so diagnostics can suppress known imports.
+    // Collect all unique module names from workspace imports, resolve via @INC.
+    let module_index = module_index::ModuleIndex::new_for_cli();
+    {
+        let mut inc_paths = module_resolver::discover_inc_paths();
+        // Also search workspace lib/ directory (common Perl project layout)
+        let root_path = std::path::Path::new(root).canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(root));
+        let lib_dir = root_path.join("lib");
+        if lib_dir.is_dir() {
+            inc_paths.insert(0, lib_dir);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for entry in ws.iter() {
+            for imp in &entry.value().imports {
+                seen.insert(imp.module_name.clone());
+            }
+            // Also resolve parent classes
+            for parents in entry.value().package_parents.values() {
+                for p in parents {
+                    seen.insert(p.clone());
+                }
+            }
+        }
+        let mut parser = module_resolver::create_parser();
+        let total = seen.len();
+        let mut resolved = 0usize;
+        for name in &seen {
+            if let Some(exports) = module_resolver::resolve_and_parse(&inc_paths, name, &mut parser) {
+                module_index.insert_cache(name, Some(exports));
+                resolved += 1;
+            }
+        }
+        eprintln!("Resolved {}/{} modules from @INC", resolved, total);
+    }
+
     let mut all_diagnostics = Vec::new();
 
     for entry in ws.iter() {
         let file = entry.key().display().to_string();
-        let diags = symbols::collect_diagnostics_standalone(entry.value());
+        let diags = symbols::collect_diagnostics(entry.value(), &module_index);
         for d in diags {
             let sev = match d.severity {
                 Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::ERROR => "error",

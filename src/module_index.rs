@@ -369,8 +369,7 @@ impl ModuleIndex {
         }
     }
 
-    /// Insert a module directly into the cache (for testing).
-    #[cfg(test)]
+    /// Insert a module directly into the cache (for CLI and testing).
     pub fn insert_cache(&self, module_name: &str, exports: Option<ModuleExports>) {
         // Update reverse index.
         if let Some(ref e) = exports {
