@@ -2137,16 +2137,16 @@ impl FileAnalysis {
         for sym in &self.symbols {
             match sym.kind {
                 SymKind::Variable | SymKind::Field => {
-                    let (sigil, is_readonly, is_param, is_self) = match &sym.detail {
+                    let is_self = sym.name == "$self" || sym.name == "$class";
+                    let (sigil, is_readonly, is_param) = match &sym.detail {
                         SymbolDetail::Variable { sigil, decl_kind } => {
                             let readonly = matches!(decl_kind, DeclKind::Field);
                             let is_param = matches!(decl_kind, DeclKind::Param | DeclKind::ForVar);
-                            let is_self = (sym.name == "$self" || sym.name == "$class") && is_param;
-                            (*sigil, readonly, is_param, is_self)
+                            (*sigil, readonly, is_param)
                         }
                         SymbolDetail::Field { sigil, attributes } => {
                             let readonly = !attributes.iter().any(|a| a == "writer" || a == "mutator" || a == "accessor");
-                            (*sigil, readonly, true, false)
+                            (*sigil, readonly, true)
                         }
                         _ => continue,
                     };
