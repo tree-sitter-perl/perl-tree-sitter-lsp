@@ -2151,7 +2151,9 @@ impl FileAnalysis {
                         _ => continue,
                     };
                     let token_type = if is_self { TOK_KEYWORD } else if is_param { TOK_PARAMETER } else { TOK_VARIABLE };
-                    let mut mods = sigil_modifier(sigil) | (1 << MOD_DECLARATION);
+                    // Don't add sigil modifier for $self/$class — it would override the keyword color
+                    let mut mods = if is_self { 0 } else { sigil_modifier(sigil) };
+                    mods |= 1 << MOD_DECLARATION;
                     if is_readonly { mods |= 1 << MOD_READONLY; }
                     tokens.push(PerlSemanticToken { span: sym.selection_span, token_type, modifiers: mods });
                 }
@@ -2202,7 +2204,8 @@ impl FileAnalysis {
                     let sigil = r.target_name.chars().next().unwrap_or('$');
                     let is_self = r.target_name == "$self" || r.target_name == "$class";
                     let token_type = if is_self { TOK_KEYWORD } else { TOK_VARIABLE };
-                    let mut mods = sigil_modifier(sigil);
+                    // Don't add sigil modifier for $self/$class — it would override the keyword color
+                    let mut mods = if is_self { 0 } else { sigil_modifier(sigil) };
                     if matches!(r.access, AccessKind::Write) { mods |= 1 << MOD_MODIFICATION; }
                     tokens.push(PerlSemanticToken { span: r.span, token_type, modifiers: mods });
                 }
