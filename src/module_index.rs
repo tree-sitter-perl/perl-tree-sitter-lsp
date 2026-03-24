@@ -369,6 +369,11 @@ impl ModuleIndex {
         }
     }
 
+    /// Direct access to the raw cache DashMap (for CLI warm_cache integration).
+    pub fn cache_raw(&self) -> &DashMap<String, Option<ModuleExports>> {
+        &self.cache
+    }
+
     /// Insert a module directly into the cache (for CLI and testing).
     pub fn insert_cache(&self, module_name: &str, exports: Option<ModuleExports>) {
         // Update reverse index.
