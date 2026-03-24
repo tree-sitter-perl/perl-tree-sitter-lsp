@@ -389,6 +389,75 @@ Publish with `vsce package && vsce publish`. Requires a marketplace publisher ac
 
 You own the plugin. Update it to point to the binary from GitHub Releases. The extension implements `language_server_command()` in Rust WASM to download the appropriate platform binary.
 
+### 3h. Claude Code plugin
+
+Claude Code has a plugin marketplace with LSP support. Two JSON files in a repo:
+
+Create repo `tree-sitter-perl/perl-lsp-claude-code` (or subdirectory `editors/claude-code/`):
+
+**`.claude-plugin/plugin.json`:**
+```json
+{
+  "name": "perl-lsp",
+  "description": "Perl language intelligence — type inference, cross-file resolution, framework support (Moo/Moose/Mojo/DBIC), semantic diagnostics",
+  "version": "0.1.0",
+  "author": { "name": "tree-sitter-perl" },
+  "homepage": "https://github.com/tree-sitter-perl/perl-tree-sitter-lsp",
+  "repository": "https://github.com/tree-sitter-perl/perl-tree-sitter-lsp",
+  "lspServers": {
+    "perl": {
+      "command": "perl-lsp",
+      "args": [],
+      "extensionToLanguage": {
+        ".pl": "perl",
+        ".pm": "perl",
+        ".t": "perl"
+      }
+    }
+  }
+}
+```
+
+**`.lsp.json`:**
+```json
+{
+  "perl": {
+    "command": "perl-lsp",
+    "args": [],
+    "extensionToLanguage": { ".pl": "perl", ".pm": "perl", ".t": "perl" }
+  }
+}
+```
+
+Users install with:
+```bash
+cargo install perl-lsp             # get the binary
+# then in Claude Code:
+/plugin install perl-lsp            # enable the plugin
+```
+
+Claude Code will start perl-lsp automatically when opening Perl files and use:
+- Diagnostics for edit-diagnose-fix loops (catches typos in method names, unresolved imports)
+- Goto-def and references for understanding code before modifying it
+- Hover for type info and POD docs
+- Workspace symbols for navigating large codebases
+
+This is high-value for Claude Code's Perl comprehension — semantic understanding instead of pattern-matching on source text.
+
+### 3i. AI agent compatibility (Cursor, Windsurf, Continue, Cline, Aider)
+
+The VS Code extension (3f) automatically covers **five AI coding tools**:
+
+| Tool | How they get perl-lsp | What they use |
+|------|----------------------|---------------|
+| **Cursor** | VS Code extension (Cursor is a fork) | All 17 LSP features + AI uses diagnostics as context |
+| **Windsurf** | VS Code extension (also a fork) | All LSP features |
+| **Continue** | VS Code extension (inherits via host editor) | Diagnostics via `@problems` context, symbols |
+| **Cline** | VS Code extension (inherits via host editor) | Diagnostics for agentic edit-diagnose-fix loops |
+| **Aider** | `--lint-cmd "perl-lsp --check ."` config | Diagnostics via CLI (already built) |
+
+No extra work needed for Cursor/Windsurf/Continue/Cline — the VS Code extension is sufficient. For Aider, users configure `--lint-cmd` to point at our `--check` CLI mode.
+
 ---
 
 ## Phase 4: Project polish for release
@@ -436,7 +505,9 @@ Add MIT LICENSE file to the repo root if not already present.
 | **7** | Helix PR | Helix users |
 | **8** | Emacs lsp-mode PR | Emacs users |
 | **9** | Homebrew tap | macOS/Linux users |
-| **10** | VS Code extension | VS Code users (biggest audience) |
+| **10** | VS Code extension | VS Code + Cursor + Windsurf + Continue + Cline users |
 | **11** | Zed extension update | Zed users |
+| **12** | Claude Code plugin | Claude Code users |
+| **13** | Aider docs | Aider users (just docs — `--check` CLI already works) |
 
-Steps 1-4 are the critical path. Steps 5-11 are all independent and can be done in any order / in parallel.
+Steps 1-4 are the critical path. Steps 5-13 are all independent and can be done in parallel. Step 10 (VS Code extension) has the highest reach — it covers 5 AI coding tools in one shot.
