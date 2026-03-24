@@ -2169,6 +2169,20 @@ impl FileAnalysis {
                         modifiers: 0,
                     });
                 }
+                SymKind::Sub => {
+                    tokens.push(PerlSemanticToken {
+                        span: sym.selection_span,
+                        token_type: TOK_FUNCTION,
+                        modifiers: 1 << MOD_DECLARATION,
+                    });
+                }
+                SymKind::Method => {
+                    tokens.push(PerlSemanticToken {
+                        span: sym.selection_span,
+                        token_type: TOK_METHOD,
+                        modifiers: 1 << MOD_DECLARATION,
+                    });
+                }
                 _ => {}
             }
         }
@@ -2179,6 +2193,10 @@ impl FileAnalysis {
             .collect();
 
         for r in &self.refs {
+            // Skip declaration refs — the symbol loop already emits tokens for declarations
+            if matches!(r.access, AccessKind::Declaration) {
+                continue;
+            }
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => {
                     let sigil = r.target_name.chars().next().unwrap_or('$');
@@ -2227,6 +2245,8 @@ impl FileAnalysis {
         }
 
         tokens.sort_by_key(|t| (t.span.start.row, t.span.start.column));
+        // Dedup by position — if two tokens start at the same (row, col), keep the first
+        tokens.dedup_by(|b, a| a.span.start.row == b.span.start.row && a.span.start.column == b.span.start.column);
         tokens
     }
 }
