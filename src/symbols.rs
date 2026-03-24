@@ -1075,6 +1075,16 @@ fn is_perl_builtin(name: &str) -> bool {
     PERL_BUILTINS.binary_search(&name).is_ok()
 }
 
+/// Collect diagnostics without cross-file module resolution (for CLI --check).
+/// Only reports issues detectable from the single file's analysis.
+pub fn collect_diagnostics_standalone(analysis: &FileAnalysis) -> Vec<Diagnostic> {
+    // Create a minimal empty module index
+    // This means cross-file checks (unresolved imports) will fire, but that's
+    // actually useful for CI — it catches typos in function names.
+    let module_index = ModuleIndex::new_for_cli();
+    collect_diagnostics(analysis, &module_index)
+}
+
 pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
