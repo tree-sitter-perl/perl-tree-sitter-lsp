@@ -211,20 +211,28 @@ vim.api.nvim_create_autocmd("LspAttach", {
 })
 
 -- Semantic token highlight groups for perl-lsp
--- Token types
-vim.api.nvim_set_hl(0, "@lsp.type.macro.perl", { link = "Keyword" })      -- has, with, extends
-vim.api.nvim_set_hl(0, "@lsp.type.property.perl", { link = "Identifier" }) -- hash keys
-vim.api.nvim_set_hl(0, "@lsp.type.namespace.perl", { link = "Type" })     -- Foo::Bar
-vim.api.nvim_set_hl(0, "@lsp.type.parameter.perl", { link = "Special" })  -- sub params
-vim.api.nvim_set_hl(0, "@lsp.type.keyword.perl", { link = "Constant" })   -- $self/$class
-vim.api.nvim_set_hl(0, "@lsp.type.enumMember.perl", { link = "Constant" })-- constants
-vim.api.nvim_set_hl(0, "@lsp.type.regexp.perl", { link = "String" })      -- regex
--- Custom modifiers
-vim.api.nvim_set_hl(0, "@lsp.mod.scalar.perl", { fg = "#61afef" })  -- blue
-vim.api.nvim_set_hl(0, "@lsp.mod.array.perl", { fg = "#c678dd" })  -- purple
-vim.api.nvim_set_hl(0, "@lsp.mod.hash.perl", { fg = "#e5c07b" })   -- gold
-vim.api.nvim_set_hl(0, "@lsp.mod.modification.perl", { fg = "#e06c75" })  -- red for writes
-vim.api.nvim_set_hl(0, "@lsp.mod.declaration.perl", { bold = true })
+-- Loud and distinct for QA — you should see every token type clearly.
+
+-- Token types — each gets a unique, bright, unmistakable color
+vim.api.nvim_set_hl(0, "@lsp.type.variable.perl", { fg = "#61afef" })         -- blue — scalars/arrays/hashes
+vim.api.nvim_set_hl(0, "@lsp.type.parameter.perl", { fg = "#ff9e64", bold = true }) -- orange bold — sub params
+vim.api.nvim_set_hl(0, "@lsp.type.function.perl", { fg = "#7aa2f7" })         -- bright blue — function calls
+vim.api.nvim_set_hl(0, "@lsp.type.method.perl", { fg = "#7dcfff" })           -- cyan — method calls
+vim.api.nvim_set_hl(0, "@lsp.type.macro.perl", { fg = "#bb9af7", bold = true }) -- purple bold — has/with/extends
+vim.api.nvim_set_hl(0, "@lsp.type.property.perl", { fg = "#73daca" })         -- teal — hash keys
+vim.api.nvim_set_hl(0, "@lsp.type.namespace.perl", { fg = "#e0af68", bold = true }) -- gold bold — Foo::Bar
+vim.api.nvim_set_hl(0, "@lsp.type.keyword.perl", { fg = "#ff007c", bold = true })  -- hot pink bold — $self/$class
+vim.api.nvim_set_hl(0, "@lsp.type.enumMember.perl", { fg = "#ff9e64", italic = true }) -- orange italic — constants
+vim.api.nvim_set_hl(0, "@lsp.type.regexp.perl", { fg = "#9ece6a" })           -- green — regex
+
+-- Modifiers — layer on top of type colors
+vim.api.nvim_set_hl(0, "@lsp.mod.declaration.perl", { bold = true, underline = true })
+vim.api.nvim_set_hl(0, "@lsp.mod.modification.perl", { fg = "#f7768e" })  -- red for writes
 vim.api.nvim_set_hl(0, "@lsp.mod.readonly.perl", { italic = true })
-vim.api.nvim_set_hl(0, "@lsp.mod.deprecated.perl", { strikethrough = true })
 vim.api.nvim_set_hl(0, "@lsp.mod.defaultLibrary.perl", { italic = true })
+vim.api.nvim_set_hl(0, "@lsp.mod.deprecated.perl", { strikethrough = true })
+
+-- Sigil overrides (these take priority over type colors for variables)
+vim.api.nvim_set_hl(0, "@lsp.mod.scalar.perl", { fg = "#61afef" })  -- blue
+vim.api.nvim_set_hl(0, "@lsp.mod.array.perl", { fg = "#c678dd" })   -- purple
+vim.api.nvim_set_hl(0, "@lsp.mod.hash.perl", { fg = "#e5c07b" })    -- gold
