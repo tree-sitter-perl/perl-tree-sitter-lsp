@@ -221,7 +221,9 @@ vim.api.nvim_set_hl(0, "@lsp.type.method.perl", { fg = "#7dcfff" })           --
 vim.api.nvim_set_hl(0, "@lsp.type.macro.perl", { fg = "#bb9af7", bold = true }) -- purple bold — has/with/extends
 vim.api.nvim_set_hl(0, "@lsp.type.property.perl", { fg = "#73daca" })         -- teal — hash keys
 vim.api.nvim_set_hl(0, "@lsp.type.namespace.perl", { fg = "#e0af68", bold = true }) -- gold bold — Foo::Bar
-vim.api.nvim_set_hl(0, "@lsp.type.keyword.perl", { fg = "#ff007c", bold = true })  -- hot pink bold — $self/$class
+-- $self/$class: force hot pink even when base syntax tries to override (e.g. inside `my()`)
+vim.api.nvim_set_hl(0, "@lsp.type.keyword.perl", { fg = "#ff007c", bold = true })
+vim.api.nvim_set_hl(0, "@lsp.typemod.keyword.declaration.perl", { fg = "#ff007c", bold = true, underline = true })
 vim.api.nvim_set_hl(0, "@lsp.type.enumMember.perl", { fg = "#ff9e64", italic = true }) -- orange italic — constants
 vim.api.nvim_set_hl(0, "@lsp.type.regexp.perl", { fg = "#9ece6a" })           -- green — regex
 
