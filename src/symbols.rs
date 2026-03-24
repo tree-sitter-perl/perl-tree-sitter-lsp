@@ -5,7 +5,7 @@ use tree_sitter::{Point, Tree};
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
     contains_point, format_inferred_type, CompletionCandidate, FileAnalysis, FoldKind, InferredType,
-    OutlineSymbol, RefKind, Span, SymKind as FaSymKind, SymbolDetail, VarModifier,
+    OutlineSymbol, RefKind, Span, SymKind as FaSymKind, SymbolDetail,
     PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT, PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
 use crate::module_index::ExportedSub;
@@ -667,28 +667,34 @@ pub fn signature_help(
 
 // ---- Semantic tokens ----
 
-// Legend indices — must match the order in SEMANTIC_TOKEN_TYPES / SEMANTIC_TOKEN_MODIFIERS
-pub const TOKEN_TYPE_VARIABLE: u32 = 0;
-
-pub const TOKEN_MOD_DECLARATION: u32 = 0; // bit 0
-pub const TOKEN_MOD_READONLY: u32 = 1;    // bit 1
-pub const TOKEN_MOD_MODIFICATION: u32 = 2; // bit 2
-pub const TOKEN_MOD_SCALAR: u32 = 3;       // bit 3
-pub const TOKEN_MOD_ARRAY: u32 = 4;        // bit 4
-pub const TOKEN_MOD_HASH: u32 = 5;         // bit 5
+// Token type/modifier indices are defined in file_analysis.rs (TOK_*, MOD_*).
 
 pub fn semantic_token_types() -> Vec<SemanticTokenType> {
-    vec![SemanticTokenType::VARIABLE]
+    vec![
+        SemanticTokenType::VARIABLE,       // 0: variables
+        SemanticTokenType::PARAMETER,      // 1: sub parameters
+        SemanticTokenType::FUNCTION,       // 2: function calls
+        SemanticTokenType::METHOD,         // 3: method calls
+        SemanticTokenType::MACRO,          // 4: framework DSL keywords
+        SemanticTokenType::PROPERTY,       // 5: hash keys
+        SemanticTokenType::NAMESPACE,      // 6: package/class names
+        SemanticTokenType::REGEXP,         // 7: regex literals
+        SemanticTokenType::ENUM_MEMBER,    // 8: constants
+        SemanticTokenType::KEYWORD,        // 9: $self/$class
+    ]
 }
 
 pub fn semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
     vec![
-        SemanticTokenModifier::DECLARATION,
-        SemanticTokenModifier::READONLY,
-        SemanticTokenModifier::MODIFICATION,
-        SemanticTokenModifier::new("scalar"),
-        SemanticTokenModifier::new("array"),
-        SemanticTokenModifier::new("hash"),
+        SemanticTokenModifier::DECLARATION,      // 0
+        SemanticTokenModifier::READONLY,         // 1
+        SemanticTokenModifier::MODIFICATION,     // 2
+        SemanticTokenModifier::DEFAULT_LIBRARY,  // 3
+        SemanticTokenModifier::DEPRECATED,       // 4
+        SemanticTokenModifier::STATIC,           // 5
+        SemanticTokenModifier::new("scalar"),    // 6
+        SemanticTokenModifier::new("array"),     // 7
+        SemanticTokenModifier::new("hash"),      // 8
     ]
 }
 
@@ -757,50 +763,34 @@ pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
 }
 
 pub fn semantic_tokens(analysis: &FileAnalysis) -> Vec<SemanticToken> {
-    let var_tokens = analysis.semantic_tokens();
+    let tokens = analysis.semantic_tokens();
 
     let mut result = Vec::new();
     let mut prev_line: u32 = 0;
     let mut prev_start: u32 = 0;
 
-    for vt in &var_tokens {
-        let line = vt.span.start.row as u32;
-        let start = vt.span.start.column as u32;
-        let length = if vt.span.start.row == vt.span.end.row {
-            vt.span.end.column as u32 - start
+    for t in &tokens {
+        let line = t.span.start.row as u32;
+        let start = t.span.start.column as u32;
+        let length = if t.span.start.row == t.span.end.row {
+            (t.span.end.column as u32).saturating_sub(start).max(1)
         } else {
-            1 // multi-line token, shouldn't happen for variables
+            1
         };
 
         let delta_line = line - prev_line;
         let delta_start = if delta_line == 0 {
-            start - prev_start
+            start.saturating_sub(prev_start)
         } else {
             start
         };
-
-        let mut modifiers: u32 = 0;
-        if vt.is_declaration {
-            modifiers |= 1 << TOKEN_MOD_DECLARATION;
-        }
-        if vt.is_readonly {
-            modifiers |= 1 << TOKEN_MOD_READONLY;
-        }
-        if vt.is_modification {
-            modifiers |= 1 << TOKEN_MOD_MODIFICATION;
-        }
-        match vt.var_type {
-            VarModifier::Scalar => modifiers |= 1 << TOKEN_MOD_SCALAR,
-            VarModifier::Array => modifiers |= 1 << TOKEN_MOD_ARRAY,
-            VarModifier::Hash => modifiers |= 1 << TOKEN_MOD_HASH,
-        }
 
         result.push(SemanticToken {
             delta_line,
             delta_start,
             length,
-            token_type: TOKEN_TYPE_VARIABLE,
-            token_modifiers_bitset: modifiers,
+            token_type: t.token_type,
+            token_modifiers_bitset: t.modifiers,
         });
 
         prev_line = line;
