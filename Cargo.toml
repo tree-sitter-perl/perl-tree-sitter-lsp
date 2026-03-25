@@ -2,6 +2,16 @@
 name = "perl-lsp"
 version = "0.1.0"
 edition = "2021"
+authors = ["tree-sitter-perl contributors"]
+license = "Artistic-2.0"
+description = "A Perl LSP server built on tree-sitter-perl and tower-lsp"
+repository = "https://github.com/tree-sitter-perl/perl-tree-sitter-lsp"
+keywords = ["perl", "lsp", "tree-sitter", "language-server"]
+categories = ["development-tools", "text-editors"]
+
+[[bin]]
+name = "perl-lsp"
+path = "src/main.rs"
 
 [dependencies]
 tower-lsp = "0.20"

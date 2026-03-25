@@ -167,7 +167,7 @@ name = "perl-lsp"
 version = "0.1.0"
 edition = "2021"
 authors = ["tree-sitter-perl contributors"]
-license = "MIT"
+license = "Artistic-2.0"
 description = "A Perl LSP server built on tree-sitter-perl and tower-lsp"
 repository = "https://github.com/tree-sitter-perl/perl-tree-sitter-lsp"
 keywords = ["perl", "lsp", "tree-sitter", "language-server"]
@@ -226,7 +226,7 @@ name: perl-lsp
 description: Perl language server built on tree-sitter-perl
 homepage: https://github.com/tree-sitter-perl/perl-tree-sitter-lsp
 licenses:
-  - MIT
+  - Artistic-2.0
 languages:
   - Perl
 categories:
@@ -289,7 +289,7 @@ class PerlLsp < Formula
   homepage "https://github.com/tree-sitter-perl/perl-tree-sitter-lsp"
   url "https://github.com/tree-sitter-perl/perl-tree-sitter-lsp/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "TO_BE_FILLED"
-  license "MIT"
+  license "Artistic-2.0"
 
   depends_on "rust" => :build
   depends_on "node" => :build  # for tree-sitter generate
@@ -488,7 +488,7 @@ fn main() {
 
 ### LICENSE file
 
-Add MIT LICENSE file to the repo root if not already present.
+Add Artistic License 2.0 file to the repo root. Consistent with tree-sitter-perl and the broader Perl ecosystem (same license as Perl itself).
 
 ---
 
