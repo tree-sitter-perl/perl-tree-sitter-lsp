@@ -1,195 +1,187 @@
 # perl-lsp
 
-A Language Server Protocol (LSP) implementation for Perl, built on [tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl) for fast, incremental, error-tolerant parsing.
+A Perl language server with deep semantic intelligence. Built on [tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl) and tower-lsp.
 
-## Motivation
-
-Perl has no good LSP. The existing options (Perl::LanguageServer, PLS) are slow, incomplete, and struggle with Perl's dynamic nature. This project takes a different approach: use tree-sitter for parsing and a hand-built scope graph for name resolution — rather than trying to bolt IDE features onto the Perl interpreter.
-
-## Building
-
-### Prerequisites
-
-- Rust toolchain (install via [rustup](https://rustup.rs/))
-- [tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl) cloned as a sibling directory
-
-### Setup
+## Install
 
 ```bash
-# Clone tree-sitter-perl next to this repo (if not already)
-git clone https://github.com/tree-sitter-perl/tree-sitter-perl ../tree-sitter-perl
-
-# Generate the parser (requires tree-sitter CLI)
-cargo install tree-sitter-cli
-cd ../tree-sitter-perl && tree-sitter generate && cd -
-
-# Build
-cargo build --release
+cargo install perl-lsp
 ```
-
-The binary is at `target/release/perl-lsp`.
 
 ## Editor Setup
 
 ### Neovim (0.11+)
 
-Add to your Neovim config (e.g. `~/.config/nvim/init.lua`):
-
 ```lua
 vim.lsp.config["perl-lsp"] = {
-  cmd = { "/absolute/path/to/perl-lsp" },
+  cmd = { "perl-lsp" },
   filetypes = { "perl" },
-  root_markers = { ".git", "Makefile", "cpanfile", "Makefile.PL", "Build.PL" },
+  root_markers = { "cpanfile", "Makefile.PL", "Build.PL", ".git" },
 }
 vim.lsp.enable("perl-lsp")
 ```
 
-Or test with the included throwaway config:
+### Neovim (0.10 or earlier)
+
+```lua
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "perl",
+  callback = function()
+    vim.lsp.start({
+      name = "perl-lsp",
+      cmd = { "perl-lsp" },
+      root_dir = vim.fs.root(0, { "cpanfile", "Makefile.PL", "Build.PL", ".git" }),
+    })
+  end,
+})
+```
+
+### Helix
+
+Add to `~/.config/helix/languages.toml`:
+
+```toml
+[language-server.perl-lsp]
+command = "perl-lsp"
+
+[[language]]
+name = "perl"
+language-servers = ["perl-lsp"]
+```
+
+### Emacs (eglot)
+
+```elisp
+(add-to-list 'eglot-server-programs '(perl-mode . ("perl-lsp")))
+```
+
+### Semantic Token Colors (Neovim)
+
+perl-lsp emits rich semantic tokens. Add these to your config for the best experience:
+
+```lua
+vim.api.nvim_set_hl(0, "@lsp.type.macro.perl", { link = "Keyword" })      -- has, with, extends
+vim.api.nvim_set_hl(0, "@lsp.type.property.perl", { link = "Identifier" }) -- hash keys
+vim.api.nvim_set_hl(0, "@lsp.type.namespace.perl", { link = "Type" })     -- Foo::Bar
+vim.api.nvim_set_hl(0, "@lsp.type.parameter.perl", { link = "Special" })  -- sub params
+vim.api.nvim_set_hl(0, "@lsp.type.keyword.perl", { link = "Constant" })   -- $self/$class
+vim.api.nvim_set_hl(0, "@lsp.mod.scalar.perl", { fg = "#61afef" })        -- $ blue
+vim.api.nvim_set_hl(0, "@lsp.mod.array.perl", { fg = "#c678dd" })         -- @ purple
+vim.api.nvim_set_hl(0, "@lsp.mod.hash.perl", { fg = "#e5c07b" })          -- % gold
+vim.api.nvim_set_hl(0, "@lsp.mod.modification.perl", { fg = "#e06c75" })  -- writes in red
+vim.api.nvim_set_hl(0, "@lsp.mod.declaration.perl", { bold = true })
+vim.api.nvim_set_hl(0, "@lsp.mod.readonly.perl", { italic = true })
+vim.api.nvim_set_hl(0, "@lsp.mod.defaultLibrary.perl", { italic = true }) -- imported functions
+```
+
+## Features
+
+### Type Inference
+
+No annotations needed. perl-lsp infers types from how your code uses values:
+
+- `Foo->new()` → `$obj` is `ClassName(Foo)`
+- `$obj->{key}` → `$obj` is HashRef
+- `$x + 1` → `$x` is Numeric
+- Method chains propagate: `$self->get_config()->{host}` resolves through return types
+- Cross-file: return types and parameter types flow across module boundaries
+
+### Framework Intelligence
+
+| Framework | What perl-lsp understands |
+|-----------|--------------------------|
+| **Moo/Moose** | `has` accessor synthesis with `is`/`isa` type mapping, getter/setter arity, `extends`/`with` for inheritance and roles |
+| **Mojo::Base** | Accessor synthesis with default value type inference, fluent setter chaining, parent class detection |
+| **DBIC** | `add_columns` column accessors, `has_many`/`belongs_to`/`has_one` relationship accessors, `load_components` mixin resolution |
+| **Perl 5.38 `class`** | `field` with `:param`/`:reader`/`:writer`, `:isa(Parent)`, `:does(Role)`, implicit `$self` |
+
+Framework DSL keywords (`has`, `with`, `extends`, `around`, etc.) are recognized and won't trigger unresolved-function diagnostics.
+
+### Constant Folding + Dynamic Dispatch
+
+```perl
+my $method = "get_$field";
+$self->$method();          # goto-def works — resolves through the constant
+```
+
+perl-lsp folds `use constant`, package-scope variables, string interpolation, and loop variables. Dynamic method calls via `$self->$var()` resolve to their targets.
+
+### Cross-File Intelligence
+
+- Module resolution from `@INC` + cpanfile dependencies
+- Inheritance chain walking (DFS, roles, mixins, `load_components`)
+- Return type and parameter type propagation across files
+- Cross-file rename: 289 edits across 56 files in Mojolicious in <1 second
+- SQLite cache for instant repeat resolution
+- Workspace indexing via Rayon: 274-file Mojolicious in 204ms
+
+### LSP Capabilities
+
+| Capability | Highlights |
+|-----------|-----------|
+| **Completion** | Variables, methods (type-inferred), hash keys, auto-import, module names on `use` lines, import lists in `qw()` |
+| **Go-to-definition** | Scope-aware variables, cross-file methods via inheritance, hash keys through expression chains |
+| **Find references** | Scope-aware variables, cross-file functions/methods/packages |
+| **Rename** | Variables (scope-aware), functions/methods/packages (cross-file via workspace index) |
+| **Hover** | Types, POD docs (tree-sitter-pod AST), signatures, class provenance |
+| **Signature help** | Parameter names with inferred types, cross-file parameter types |
+| **Semantic tokens** | 10 types (variable, parameter, `$self`, function, method, macro, property, namespace, regexp, constant), 9 modifiers |
+| **Inlay hints** | Variable type annotations, sub return types |
+| **Diagnostics** | Unresolved function/method warnings with framework awareness |
+| **Code actions** | Auto-import for unresolved functions |
+| **Workspace symbol** | Search across all indexed project files |
+| **Document symbols** | Nested outline with packages, subs, classes, fields |
+| **Formatting** | perltidy (full document + range) |
+| **Highlights** | Read/write distinction |
+| **Selection range** | Tree-sitter node hierarchy |
+| **Folding** | Blocks, subs, classes, POD |
+| **Linked editing** | Simultaneous editing of references in scope |
+
+### POD Documentation
+
+POD is rendered via tree-sitter-pod — proper AST walk, not regex. Handles nested lists, `=begin`/`=end` data regions, multi-angle-bracket formatting (`C<<<  $hash->{key}  >>>`), bold-italic nesting, `L<>` links to metacpan, and `=item`-based method documentation.
+
+## CLI Tools
+
+perl-lsp doubles as a command-line analysis toolkit:
 
 ```bash
-nvim -u test_nvim_init.lua test_files/sample.pl
+# Batch diagnostics (CI-ready — resolves imports, uses SQLite cache)
+perl-lsp --check [<root>] [--severity error|warning] [--format json|human]
+
+# Code exploration
+perl-lsp --outline <file>
+perl-lsp --hover <file> <line> <col>
+perl-lsp --type-at <file> <line> <col>
+perl-lsp --definition <root> <file> <line> <col>
+perl-lsp --references <root> <file> <line> <col>
+
+# Refactoring
+perl-lsp --rename <root> <file> <line> <col> <new_name>
+perl-lsp --workspace-symbol <root> <query>
 ```
 
-### VS Code
-
-1. Install the **[Generic LSP Client](https://marketplace.visualstudio.com/items?itemName=nicolo-ribaudo.vscode-glsp-client)** extension (or any generic LSP extension).
-
-2. Add to your VS Code settings (`.vscode/settings.json`):
-
-```json
-{
-  "glspClient.serverConfigs": [
-    {
-      "id": "perl-lsp",
-      "name": "Perl LSP",
-      "command": "${workspaceFolder}/target/release/perl-lsp",
-      "languages": ["perl"]
-    }
-  ]
-}
-```
-
-## LSP Features
-
-### Single-file
-
-- **documentSymbol** — outline of subs, packages, variables, classes (with fields/methods as children)
-- **definition** — go-to-def for variables (scope-aware), subs, methods (type-inferred), packages/classes, hash keys; works through expression chains (`$obj->get_foo()->bar()`)
-- **references** — scope-aware for variables, file-wide for functions/packages/hash keys; resolves through expression chains
-- **hover** — shows declaration line, inferred types, return types, class-aware for methods
-- **rename** — scope-aware for variables, file-wide for functions/packages/hash keys
-- **completion** — scope-aware variables (cross-sigil forms), subs, methods (type-inferred with return type detail), packages, hash keys (class-aware), deref snippets (`[$0]`/`{$0}`/`($0)` for ArrayRef/HashRef/CodeRef)
-- **signatureHelp** — parameter info with inferred types for subs/methods (signature syntax + legacy `@_` pattern), triggers on `(` and `,`
-- **inlayHints** — type annotations for variables (Object/HashRef/ArrayRef/CodeRef) and sub return types
-- **documentHighlight** — highlight all occurrences with read/write distinction
-- **selectionRange** — expand/shrink selection via tree-sitter node hierarchy
-- **foldingRange** — blocks, subs, classes, pod sections
-- **formatting** — shells out to perltidy (respects .perltidyrc)
-- **semanticTokens/full** — variable tokens with modifiers: scalar/array/hash, declaration, modification
-- **codeAction** — auto-import: adds `use Module qw(func);` for unresolved functions
-- **Diagnostics** — unresolved function/method warnings (skips builtins, local subs, imported functions; method diagnostics check locally-defined classes)
-
-### Cross-file
-
-- **Module resolution** — resolves `@EXPORT` / `@EXPORT_OK` from imported modules via `@INC`
-- **cpanfile pre-scan** — indexes project dependencies at startup with progress reporting
-- **Auto-import completions** — suggests exported functions from cached modules with `additionalTextEdits`
-- **Diagnostics** — warns on unresolved function calls (skips builtins, local subs, imported functions); auto-import code actions for functions found in cached modules
-- **SQLite cache** — per-project persistent cache, survives restarts, validates against `@INC` changes
-
-## Architecture
-
-```
-src/
-├── main.rs              Entry point, stdio transport, --parse-exports subprocess mode
-├── backend.rs           LanguageServer trait impl (tower-lsp), request routing
-├── document.rs          Document store with tree-sitter parsing
-├── file_analysis.rs     Data model: scopes, symbols, refs, imports, type inference engine
-├── builder.rs           Single-pass CST → FileAnalysis builder
-├── cursor_context.rs    Cursor position analysis: completion/signature/selection context
-├── symbols.rs           LSP adapter: converts FileAnalysis types to LSP types
-├── module_index.rs      Cross-file: public API, reverse index, concurrent cache
-├── module_resolver.rs   Background resolver thread, subprocess isolation, export extraction
-├── module_cache.rs      SQLite persistence, schema migrations, mtime validation
-└── cpanfile.rs          cpanfile parsing via tree-sitter queries
-```
-
-### Key dependencies
-
-| Crate | Purpose |
-|---|---|
-| `tower-lsp 0.20` | LSP framework (`#[tower_lsp::async_trait]`) |
-| `tree-sitter 0.25` | Incremental parsing |
-| `tree-sitter-perl` | Perl grammar (path dep to `../tree-sitter-perl`) |
-| `dashmap 6` | Concurrent document store + module cache |
-| `rusqlite 0.32` | SQLite persistence for module index (bundled) |
-
-### How module resolution works
-
-1. When a file is opened/edited, `use` statements trigger background module resolution
-2. A dedicated `std::thread` (not tokio) does all filesystem I/O — never blocks the async runtime
-3. Modules are located via `@INC`, exports extracted by tree-sitter parsing in isolated subprocesses
-4. Results stored in `Arc<DashMap>` (async handlers read) + SQLite (persists across restarts)
-5. A reverse index (`function → modules`) enables O(1) exporter lookup for diagnostics and completions
-6. At startup, `cpanfile` is parsed with tree-sitter queries to pre-resolve project dependencies
-7. After module resolution, diagnostics are refreshed for all open files (no stale false positives)
-
-## Debugging
-
-The LSP server uses `env_logger`. Debug mode is opt-in via `PERL_LSP_DEBUG`:
+`--check` resolves modules from `@INC`, uses the per-project SQLite cache, and exits with code 1 if issues are found. Integrate into CI with:
 
 ```bash
-# Normal usage — no logging
-nvim --clean -u test_nvim_init.lua test_files/sample.pl
-
-# Debug mode — full logging to /tmp/perl-lsp.log
-PERL_LSP_DEBUG=1 nvim --clean -u test_nvim_init.lua test_files/sample.pl
+perl-lsp --check . --severity warning
 ```
 
-Then tail the log: `tail -f /tmp/perl-lsp.log`
+## Building from Source
 
-| Level | What |
-|---|---|
-| `info` | Module resolution: queued, resolved, export counts; cpanfile parsing |
-| `warn` | Slow parses (>100ms), subprocess timeouts, skipped files |
-| `debug` | Every `did_change` dumps document text to `/tmp/perl-lsp-last-update.pl` |
+```bash
+git clone https://github.com/tree-sitter-perl/perl-tree-sitter-lsp
+cd perl-tree-sitter-lsp
+cargo build --release
+```
 
-### Reproducing parser hangs
+## Testing
 
-tree-sitter-perl's external scanner can occasionally enter an infinite loop. Module resolution runs in isolated child processes with a 5-second timeout — the child is SIGKILL'd and the module skipped. The main LSP process stays alive.
+```bash
+cargo test                                    # 317 unit tests
+cargo build --release && ./run_e2e.sh         # 93 e2e tests (requires nvim)
+```
 
-The file `/tmp/perl-lsp-last-update.pl` contains the last document text sent to the parser, useful for reproducing hangs.
+## License
 
-## Roadmap
-
-### Done
-- Single-file: all core LSP features (definition, references, hover, rename, completion, signature help, highlights, selection range, folding, formatting, semantic tokens)
-- Scope-aware variable resolution (my, our, state, signatures, for-loops, class fields)
-- Core Perl `class` support (5.38+): class extraction, field/method symbols, type-inferred method resolution
-- Hash key intelligence: go-to-def, refs, rename, hover, completion (class-aware via bless patterns)
-- Type inference: constructor tracking, builtin return types, expression chain resolution (`$obj->get_foo()->bar()`)
-- Inlay hints: variable type annotations and sub return types
-- Enhanced completion: method return types in detail, deref snippets for typed references
-- Enhanced signature help: inferred parameter types
-- Cross-file module resolution with background resolver thread
-- cpanfile pre-scan with tree-sitter queries and progress reporting
-- Auto-import completions and code actions
-- SQLite persistence with per-project cache segregation
-
-### Next
-- Phase-aware cpanfile filtering (test deps only in `t/` files) — [design doc](docs/cpanfile-indexing-plan.md)
-- Framework submodule whitelist (`Mojo::*`, `Moose::*` patterns)
-- OOP framework stubs (Moo, Moose, Class::Accessor) — declarative DSL → class shape mapping
-- Bulk `@INC` scan for go-to-def into any installed module
-- Subprocess batching: parse multiple modules per child process to reduce spawn overhead for bulk scans
-
-### Future
-- Workspace-wide references and rename
-- Method resolution across inheritance hierarchies (`@ISA` / C3)
-
-## References
-
-- [tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl)
-- [tower-lsp](https://github.com/ebkalderon/tower-lsp)
-- [tree-sitter](https://tree-sitter.github.io/tree-sitter/)
-- [Scope Graphs: A Theory of Name Resolution](https://pl.ewi.tudelft.nl/research/projects/scope-graphs/) — influenced our approach to name resolution
+Artistic License 2.0 — same as Perl itself.
