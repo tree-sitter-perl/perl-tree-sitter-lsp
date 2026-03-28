@@ -1,0 +1,59 @@
+{
+  "name": "perl-lsp",
+  "displayName": "Perl (perl-lsp)",
+  "description": "Perl language support powered by tree-sitter-perl — type inference, cross-file navigation, framework intelligence",
+  "version": "0.2.0",
+  "publisher": "tree-sitter-perl",
+  "license": "Artistic-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tree-sitter-perl/perl-tree-sitter-lsp"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters"
+  ],
+  "keywords": [
+    "perl",
+    "lsp",
+    "tree-sitter",
+    "moo",
+    "moose",
+    "mojolicious",
+    "dbic"
+  ],
+  "activationEvents": [
+    "onLanguage:perl"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Perl LSP",
+      "properties": {
+        "perl-lsp.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to perl-lsp binary. Leave empty to use bundled or auto-downloaded binary."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "@vscode/vsce": "^3.0.0"
+  }
+}
