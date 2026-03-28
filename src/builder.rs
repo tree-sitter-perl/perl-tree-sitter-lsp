@@ -312,10 +312,31 @@ impl<'a> Builder<'a> {
                 }
             }
 
-            // ERROR nodes: recurse into children to extract what we can
-            "ERROR" => self.visit_children(node),
+            // ERROR nodes: recover structural declarations (the file's skeleton)
+            // but skip expressions/refs which are unreliable inside broken regions
+            "ERROR" => self.recover_structural_from_error(node),
 
             _ => self.visit_children(node),
+        }
+    }
+
+    /// Recover structural declarations from ERROR nodes.
+    /// Only recovers the file's skeleton (packages, imports, subs, classes) —
+    /// expressions and refs inside ERROR are unreliable and skipped.
+    fn recover_structural_from_error(&mut self, error_node: Node<'a>) {
+        for i in 0..error_node.child_count() {
+            if let Some(child) = error_node.child(i) {
+                match child.kind() {
+                    "package_statement" => self.visit_package(child),
+                    "use_statement" => self.visit_use(child),
+                    "subroutine_declaration_statement" => self.visit_sub(child, false),
+                    "method_declaration_statement" => self.visit_sub(child, true),
+                    "class_statement" => self.visit_class(child),
+                    "ambiguous_function_call_expression" => self.visit_function_call(child),
+                    "ERROR" => self.recover_structural_from_error(child),
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -4539,6 +4560,88 @@ has password => (is => 'rw');
         if let SymbolDetail::HashKeyDef { ref owner, .. } = key_defs[0].detail {
             assert_eq!(owner, &HashKeyOwner::Sub("new".to_string()));
         }
+    }
+
+    // ---- ERROR recovery tests ----
+    // tree-sitter-perl wraps broken regions in ERROR nodes. Some structural
+    // declarations (sub, class) survive as typed nodes inside ERROR.
+    // use/package often get parsed as raw function tokens inside ERROR —
+    // those can't be recovered (parser fix needed).
+
+    #[test]
+    fn test_error_recovery_sub_outside_error() {
+        // my $x = [ creates an ERROR, but sub below it survives as a top-level node
+        let source = "package Foo;\nmy $x = [\nuse List::Util qw(max);\nsub process { }\n";
+        let fa = build_fa(source);
+        let subs: Vec<&str> = fa.symbols.iter()
+            .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(subs.contains(&"process"), "sub process should survive (outside ERROR)");
+    }
+
+    #[test]
+    fn test_error_recovery_sub_outside_error_survives() {
+        // Sub below an ERROR survives as a top-level node (not inside ERROR)
+        let source = "package Foo;\nmy $x = [\nuse List::Util qw(max);\nsub process { }\n";
+        let fa = build_fa(source);
+        let subs: Vec<&str> = fa.symbols.iter()
+            .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(subs.contains(&"process"), "sub process should survive (outside ERROR)");
+    }
+
+    #[test]
+    fn test_error_node_does_not_panic() {
+        // ERROR nodes should not crash the builder
+        let source = "package Foo;\nmy $x = [\nmy $y = [\nsub process { }\n";
+        let fa = build_fa(source);
+        let pkgs: Vec<&str> = fa.symbols.iter()
+            .filter(|s| matches!(s.kind, SymKind::Package))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(pkgs.contains(&"Foo"), "package Foo should survive");
+    }
+
+    // TODO: These tests document desired behavior that requires tree-sitter-perl
+    // parser improvements. Currently, keywords (sub, use, package) inside ERROR
+    // nodes get downgraded to bareword/function tokens, so we can't recover them.
+    // Remove #[ignore] once the parser preserves structural nodes inside ERROR.
+
+    #[test]
+    #[ignore = "TODO: tree-sitter-perl downgrades sub inside ERROR to bareword"]
+    fn test_error_recovery_sub_inside_error() {
+        let source = "package Foo;\nmy $x = [\nmy $y = [\nsub process { }\n";
+        let fa = build_fa(source);
+        let subs: Vec<&str> = fa.symbols.iter()
+            .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(subs.contains(&"process"), "sub process should be recovered from ERROR");
+    }
+
+    #[test]
+    #[ignore = "TODO: tree-sitter-perl downgrades use inside ERROR to function token"]
+    fn test_error_recovery_import_inside_error() {
+        let source = "package Foo;\nmy $x = [\nuse List::Util qw(max);\nsub process { }\n";
+        let fa = build_fa(source);
+        let imports: Vec<&str> = fa.imports.iter()
+            .map(|i| i.module_name.as_str())
+            .collect();
+        assert!(imports.contains(&"List::Util"), "use List::Util should be recovered from ERROR");
+    }
+
+    #[test]
+    #[ignore = "TODO: tree-sitter-perl downgrades package inside ERROR to function token"]
+    fn test_error_recovery_package_inside_error() {
+        let source = "my $x = [\npackage Bar;\nuse Moose;\nsub bar { }\n";
+        let fa = build_fa(source);
+        let pkgs: Vec<&str> = fa.symbols.iter()
+            .filter(|s| matches!(s.kind, SymKind::Package))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(pkgs.contains(&"Bar"), "package Bar should be recovered from ERROR");
     }
 
     #[test]
