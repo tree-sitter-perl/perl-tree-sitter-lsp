@@ -109,11 +109,27 @@ perl-lsp folds `use constant`, package-scope variables, string interpolation, an
 ### Cross-File Intelligence
 
 - Module resolution from `@INC` + cpanfile dependencies
+- **Auto-discovers `lib/` and `local/lib/perl5/`** relative to workspace root — no `PERL5LIB` needed for standard project layouts (cpm, carton, plain `lib/`)
 - Inheritance chain walking (DFS, roles, mixins, `load_components`)
 - Return type and parameter type propagation across files
 - Cross-file rename: 289 edits across 56 files in Mojolicious in <1 second
 - SQLite cache for instant repeat resolution
 - Workspace indexing via Rayon: 274-file Mojolicious in 204ms
+
+### Module Discovery
+
+perl-lsp finds your modules automatically:
+
+1. **`lib/`** and **`local/lib/perl5/`** in your project root (auto-discovered)
+2. **`@INC`** from your Perl installation (via `perl -e 'print join "\n", @INC'`)
+3. **`PERL5LIB`** if set in your environment
+4. **cpanfile** dependencies pre-resolved at startup
+
+For non-standard layouts, set `PERL5LIB` before launching your editor:
+
+```bash
+PERL5LIB=./my-libs/perl5 nvim lib/MyApp.pm
+```
 
 ### LSP Capabilities
 

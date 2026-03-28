@@ -42,14 +42,21 @@ pub fn spawn_resolver(
     std::thread::Builder::new()
         .name("module-resolver".into())
         .spawn(move || {
-            let inc_paths = discover_inc_paths();
+            let mut inc_paths = discover_inc_paths();
+
+            // Wait for workspace root from initialize() for per-project cache path.
+            let ws_root = wait_for_workspace_root(&workspace_root);
+
+            // Auto-discover project-local lib paths (lib/, local/lib/perl5/).
+            if let Some(ref root_uri) = ws_root {
+                if let Some(root_path) = uri_to_path(root_uri) {
+                    add_project_lib_paths(&mut inc_paths, &root_path);
+                }
+            }
 
             // Scan @INC for available module names (fast, no parsing — just readdir)
             scan_inc_module_names(&inc_paths, &available_modules);
             log::info!("@INC scan: {} modules available", available_modules.len());
-
-            // Wait for workspace root from initialize() for per-project cache path.
-            let ws_root = wait_for_workspace_root(&workspace_root);
 
             // Warm the in-memory cache from SQLite.
             let db = module_cache::open_cache_db(ws_root.as_deref());
@@ -238,9 +245,16 @@ pub fn spawn_test_resolver(
     std::thread::Builder::new()
         .name("module-resolver-test".into())
         .spawn(move || {
-            let inc_paths = discover_inc_paths();
-            scan_inc_module_names(&inc_paths, &available_modules);
+            let mut inc_paths = discover_inc_paths();
             let ws_root = wait_for_workspace_root(&workspace_root);
+
+            if let Some(ref root_uri) = ws_root {
+                if let Some(root_path) = uri_to_path(root_uri) {
+                    add_project_lib_paths(&mut inc_paths, &root_path);
+                }
+            }
+
+            scan_inc_module_names(&inc_paths, &available_modules);
 
             let db = module_cache::open_cache_db(ws_root.as_deref());
             if let Some(ref conn) = db {
@@ -527,6 +541,18 @@ pub fn discover_inc_paths() -> Vec<PathBuf> {
             .filter(|p| p.is_dir())
             .collect(),
         _ => vec![],
+    }
+}
+
+/// Add project-local lib paths (lib/, local/lib/perl5/) to the front of @INC.
+/// Called by the resolver thread, test resolver, and CLI tools.
+pub fn add_project_lib_paths(inc_paths: &mut Vec<PathBuf>, workspace_root: &std::path::Path) {
+    for local_lib in &["lib", "local/lib/perl5"] {
+        let p = workspace_root.join(local_lib);
+        if p.is_dir() {
+            log::info!("Auto-discovered project lib: {:?}", p);
+            inc_paths.insert(0, p);
+        }
     }
 }
 
