@@ -1248,35 +1248,40 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
 // ---- Code actions ----
 
 /// Find the position to insert a new `use` statement, scoped to the package at `point`.
-/// Returns the start of the line after the last existing `use` in the same package.
+/// Uses line-range approach: finds which package range the cursor is in,
+/// then inserts after the last `use` in that range.
 fn find_use_insertion_position(analysis: &FileAnalysis, point: Point) -> Position {
-    let target_pkg = analysis.package_at(point);
+    // Collect package declaration lines (sorted)
+    let mut pkg_lines: Vec<usize> = analysis.symbols.iter()
+        .filter(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class))
+        .map(|s| s.selection_span.start.row)
+        .collect();
+    pkg_lines.sort();
 
-    // Find the last import in the same package
-    let last_in_pkg = analysis.imports.iter().rev().find(|imp| {
-        analysis.package_at(imp.span.start) == target_pkg
+    // Find the package range containing `point`
+    let pkg_start = pkg_lines.iter().rev()
+        .find(|&&line| line <= point.row)
+        .copied()
+        .unwrap_or(0);
+    let pkg_end = pkg_lines.iter()
+        .find(|&&line| line > point.row)
+        .copied()
+        .unwrap_or(usize::MAX);
+
+    // Find the last import within this package's line range
+    let last_import = analysis.imports.iter().rev().find(|imp| {
+        imp.span.start.row >= pkg_start && imp.span.start.row < pkg_end
     });
 
-    if let Some(last_import) = last_in_pkg {
+    if let Some(imp) = last_import {
         Position {
-            line: last_import.span.end.row as u32 + 1,
+            line: imp.span.end.row as u32 + 1,
             character: 0,
         }
     } else {
-        // No imports in this package — find the package statement and insert after it
-        if let Some(pkg_name) = target_pkg {
-            for sym in &analysis.symbols {
-                if matches!(sym.kind, FaSymKind::Package | FaSymKind::Class) && sym.name == pkg_name {
-                    return Position {
-                        line: sym.selection_span.end.row as u32 + 1,
-                        character: 0,
-                    };
-                }
-            }
-        }
-        // Fallback: beginning of file
+        // No imports in this package range — insert after the package statement
         Position {
-            line: 0,
+            line: pkg_start as u32 + 1,
             character: 0,
         }
     }
