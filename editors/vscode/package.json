@@ -2,7 +2,7 @@
   "name": "perl-lsp",
   "displayName": "Perl (perl-lsp)",
   "description": "Perl language support powered by tree-sitter-perl — type inference, cross-file navigation, framework intelligence",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "publisher": "tree-sitter-perl",
   "license": "Artistic-2.0",
   "repository": {
