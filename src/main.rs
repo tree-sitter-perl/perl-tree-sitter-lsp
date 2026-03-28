@@ -183,11 +183,7 @@ fn cli_check(args: &[String]) {
         let root_uri = format!("file://{}", root_path.display());
 
         let mut inc_paths = module_resolver::discover_inc_paths();
-        // Also search workspace lib/ directory (common Perl project layout)
-        let lib_dir = root_path.join("lib");
-        if lib_dir.is_dir() {
-            inc_paths.insert(0, lib_dir);
-        }
+        module_resolver::add_project_lib_paths(&mut inc_paths, &root_path);
 
         // Open (or create) the per-project SQLite cache
         let db = module_cache::open_cache_db(Some(&root_uri));
