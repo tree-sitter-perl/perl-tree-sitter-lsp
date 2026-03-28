@@ -918,6 +918,14 @@ fn unimported_function_completions(
         .collect();
 
     let insert_pos = find_use_insertion_position(analysis, point);
+
+    // Sanity check: use statement must be BEFORE the usage site.
+    // If the insertion position is after the cursor, the parser got confused
+    // about package boundaries — skip auto-import to avoid inserting in the wrong place.
+    if insert_pos.line as usize > point.row {
+        return candidates;
+    }
+
     let insert_span = Span {
         start: tree_sitter::Point {
             row: insert_pos.line as usize,
@@ -1325,6 +1333,10 @@ pub fn code_actions(
         if let Some(modules) = data.get("modules").and_then(|v| v.as_array()) {
             let diag_point = position_to_point(diag.range.start);
             let insert_pos = find_use_insertion_position(analysis, diag_point);
+            // Sanity: use must go before the usage site
+            if insert_pos.line > diag.range.start.line {
+                continue;
+            }
             for (i, module_val) in modules.iter().enumerate() {
                 if let Some(module_name) = module_val.as_str() {
                     let new_text = format!("use {} qw({});\n", module_name, func_name);
