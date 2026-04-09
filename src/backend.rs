@@ -505,6 +505,7 @@ impl LanguageServer for Backend {
             &doc.text,
             pos,
             &self.module_index,
+            Some(doc.stable_outline.package_lines()),
         );
         if items.is_empty() {
             Ok(None)

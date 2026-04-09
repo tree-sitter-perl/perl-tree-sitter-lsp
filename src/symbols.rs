@@ -289,6 +289,7 @@ pub fn completion_items(
     source: &str,
     pos: Position,
     module_index: &ModuleIndex,
+    stable_packages: Option<&[(String, usize)]>,
 ) -> Vec<CompletionItem> {
     let point = position_to_point(pos);
 
@@ -358,7 +359,7 @@ pub fn completion_items(
             items.extend(imported_function_completions(analysis, module_index));
 
             // Add completions from unimported modules (with auto-import edits)
-            items.extend(unimported_function_completions(analysis, module_index, point));
+            items.extend(unimported_function_completions(analysis, module_index, point, stable_packages));
 
             items
         }
@@ -906,6 +907,7 @@ fn unimported_function_completions(
     analysis: &FileAnalysis,
     module_index: &ModuleIndex,
     point: Point,
+    stable_packages: Option<&[(String, usize)]>,
 ) -> Vec<CompletionCandidate> {
     use crate::file_analysis::Span;
     let mut candidates = Vec::new();
@@ -917,7 +919,7 @@ fn unimported_function_completions(
         .map(|i| i.module_name.as_str())
         .collect();
 
-    let insert_pos = find_use_insertion_position(analysis, point);
+    let insert_pos = find_use_insertion_position(analysis, point, stable_packages);
 
     // Sanity check: use statement must be BEFORE the usage site.
     // If the insertion position is after the cursor, the parser got confused
@@ -1258,12 +1260,30 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
 /// Find the position to insert a new `use` statement, scoped to the package at `point`.
 /// Uses line-range approach: finds which package range the cursor is in,
 /// then inserts after the last `use` in that range.
-fn find_use_insertion_position(analysis: &FileAnalysis, point: Point) -> Position {
-    // Collect package declaration lines (sorted)
+/// `stable_packages` provides fallback package lines from the stable outline
+/// when the current parse lost packages due to error recovery.
+fn find_use_insertion_position(
+    analysis: &FileAnalysis,
+    point: Point,
+    stable_packages: Option<&[(String, usize)]>,
+) -> Position {
+    // Collect package declaration lines from current parse
     let mut pkg_lines: Vec<usize> = analysis.symbols.iter()
         .filter(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class))
         .map(|s| s.selection_span.start.row)
         .collect();
+
+    // If the stable outline has MORE packages than the current parse,
+    // merge them in — the parse lost some due to error recovery.
+    if let Some(stable) = stable_packages {
+        if stable.len() > pkg_lines.len() {
+            for (_, line) in stable {
+                if !pkg_lines.contains(line) {
+                    pkg_lines.push(*line);
+                }
+            }
+        }
+    }
     pkg_lines.sort();
 
     // Find the package range containing `point`
@@ -1332,7 +1352,7 @@ pub fn code_actions(
         // Case 2: New import — add `use Module qw(func);` statement
         if let Some(modules) = data.get("modules").and_then(|v| v.as_array()) {
             let diag_point = position_to_point(diag.range.start);
-            let insert_pos = find_use_insertion_position(analysis, diag_point);
+            let insert_pos = find_use_insertion_position(analysis, diag_point, None);
             // Sanity: use must go before the usage site
             if insert_pos.line > diag.range.start.line {
                 continue;
@@ -1594,6 +1614,7 @@ mod tests {
             source,
             Position { line: 3, character: 3 },
             &idx,
+            None,
         );
 
         // Should find "first" from List::Util
@@ -1654,6 +1675,7 @@ mod tests {
             source,
             Position { line: 1, character: 3 },
             &idx,
+            None,
         );
 
         // "first" should appear via imported_function_completions (auto-add to qw),
