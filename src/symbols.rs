@@ -919,13 +919,25 @@ fn unimported_function_completions(
         .map(|i| i.module_name.as_str())
         .collect();
 
-    let insert_pos = find_use_insertion_position(analysis, point, stable_packages);
+    let mut insert_pos = find_use_insertion_position(analysis, point, stable_packages);
 
-    // Sanity check: use statement must be BEFORE the usage site.
-    // If the insertion position is after the cursor, the parser got confused
-    // about package boundaries — skip auto-import to avoid inserting in the wrong place.
+    // If the computed position is after the cursor, fall back to inserting
+    // after the nearest import or package statement ABOVE the cursor.
     if insert_pos.line as usize > point.row {
-        return candidates;
+        // Find the last import above the cursor
+        let last_import_above = analysis.imports.iter().rev()
+            .find(|imp| imp.span.start.row < point.row);
+        if let Some(imp) = last_import_above {
+            insert_pos = Position { line: imp.span.end.row as u32 + 1, character: 0 };
+        } else {
+            // Find the last package statement above the cursor
+            let last_pkg_above = analysis.symbols.iter().rev()
+                .find(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class) && s.selection_span.start.row < point.row);
+            if let Some(pkg) = last_pkg_above {
+                insert_pos = Position { line: pkg.selection_span.start.row as u32 + 1, character: 0 };
+            }
+            // else: keep original position (top of file)
+        }
     }
 
     let insert_span = Span {
@@ -1352,10 +1364,20 @@ pub fn code_actions(
         // Case 2: New import — add `use Module qw(func);` statement
         if let Some(modules) = data.get("modules").and_then(|v| v.as_array()) {
             let diag_point = position_to_point(diag.range.start);
-            let insert_pos = find_use_insertion_position(analysis, diag_point, None);
-            // Sanity: use must go before the usage site
+            let mut insert_pos = find_use_insertion_position(analysis, diag_point, None);
+            // If position is after the diagnostic, fall back to nearest import/package above
             if insert_pos.line > diag.range.start.line {
-                continue;
+                let last_import_above = analysis.imports.iter().rev()
+                    .find(|imp| imp.span.start.row < diag_point.row);
+                if let Some(imp) = last_import_above {
+                    insert_pos = Position { line: imp.span.end.row as u32 + 1, character: 0 };
+                } else {
+                    let last_pkg_above = analysis.symbols.iter().rev()
+                        .find(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class) && s.selection_span.start.row < diag_point.row);
+                    if let Some(pkg) = last_pkg_above {
+                        insert_pos = Position { line: pkg.selection_span.start.row as u32 + 1, character: 0 };
+                    }
+                }
             }
             for (i, module_val) in modules.iter().enumerate() {
                 if let Some(module_name) = module_val.as_str() {
