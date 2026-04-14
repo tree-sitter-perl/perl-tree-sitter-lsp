@@ -264,6 +264,20 @@ pub fn detect_cursor_context_tree(
                 // Check if cursor is after -> (in the method position)
                 if let Some(invocant_node) = current.child_by_field_name("invocant") {
                     if invocant_node.end_position() < point {
+                        // stub_expression means the parser absorbed "()" from a function
+                        // call like `get_config()->`. The real invocant is the parent
+                        // ambiguous_function_call_expression (i.e. the full `get_config()` call).
+                        if invocant_node.kind() == "stub_expression" {
+                            if let Some(parent) = current.parent() {
+                                if parent.kind() == "ambiguous_function_call_expression"
+                                    || parent.kind() == "function_call_expression"
+                                {
+                                    let invocant_text = parent.utf8_text(source).unwrap_or("").to_string();
+                                    let invocant_type = resolve_node_type(parent, source, analysis, point);
+                                    return Some(CursorContext::Method { invocant_type, invocant_text });
+                                }
+                            }
+                        }
                         let invocant_text = invocant_node.utf8_text(source).unwrap_or("").to_string();
                         let invocant_type = resolve_node_type(invocant_node, source, analysis, point);
                         return Some(CursorContext::Method { invocant_type, invocant_text });
@@ -967,15 +981,20 @@ $calc->get_self->get_config->{";
     }
 
     #[test]
-    fn test_tree_context_simple_var_returns_none() {
-        // $obj-> with nothing after: tree-sitter splits $obj and -> into separate nodes,
-        // so tree-based detection returns None. Text-based fallback handles it.
+    fn test_tree_context_simple_var_method() {
+        // $obj-> with nothing after: tree-based detection resolves the type
         let source = "my $obj = Foo->new();\n$obj->";
         let (tree, fa) = build_fa(source);
         let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), Point::new(1, 6), &fa);
-        assert_eq!(ctx, None);
+        assert_eq!(
+            ctx,
+            Some(CursorContext::Method {
+                invocant_type: Some(InferredType::ClassName("Foo".to_string())),
+                invocant_text: "$obj".to_string(),
+            })
+        );
 
-        // Text-based fallback with analysis resolves the type
+        // Text-based fallback also resolves the type
         let ctx = detect_cursor_context(source, Point::new(1, 6), Some(&fa));
         assert_eq!(
             ctx,

@@ -289,6 +289,7 @@ pub fn completion_items(
     source: &str,
     pos: Position,
     module_index: &ModuleIndex,
+    stable_packages: Option<&[(String, usize)]>,
 ) -> Vec<CompletionItem> {
     let point = position_to_point(pos);
 
@@ -358,7 +359,7 @@ pub fn completion_items(
             items.extend(imported_function_completions(analysis, module_index));
 
             // Add completions from unimported modules (with auto-import edits)
-            items.extend(unimported_function_completions(analysis, module_index, point));
+            items.extend(unimported_function_completions(analysis, module_index, point, stable_packages));
 
             items
         }
@@ -906,6 +907,7 @@ fn unimported_function_completions(
     analysis: &FileAnalysis,
     module_index: &ModuleIndex,
     point: Point,
+    stable_packages: Option<&[(String, usize)]>,
 ) -> Vec<CompletionCandidate> {
     use crate::file_analysis::Span;
     let mut candidates = Vec::new();
@@ -917,7 +919,27 @@ fn unimported_function_completions(
         .map(|i| i.module_name.as_str())
         .collect();
 
-    let insert_pos = find_use_insertion_position(analysis, point);
+    let mut insert_pos = find_use_insertion_position(analysis, point, stable_packages);
+
+    // If the computed position is after the cursor, fall back to inserting
+    // after the nearest import or package statement ABOVE the cursor.
+    if insert_pos.line as usize > point.row {
+        // Find the last import above the cursor
+        let last_import_above = analysis.imports.iter().rev()
+            .find(|imp| imp.span.start.row < point.row);
+        if let Some(imp) = last_import_above {
+            insert_pos = Position { line: imp.span.end.row as u32 + 1, character: 0 };
+        } else {
+            // Find the last package statement above the cursor
+            let last_pkg_above = analysis.symbols.iter().rev()
+                .find(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class) && s.selection_span.start.row < point.row);
+            if let Some(pkg) = last_pkg_above {
+                insert_pos = Position { line: pkg.selection_span.start.row as u32 + 1, character: 0 };
+            }
+            // else: keep original position (top of file)
+        }
+    }
+
     let insert_span = Span {
         start: tree_sitter::Point {
             row: insert_pos.line as usize,
@@ -1250,12 +1272,30 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
 /// Find the position to insert a new `use` statement, scoped to the package at `point`.
 /// Uses line-range approach: finds which package range the cursor is in,
 /// then inserts after the last `use` in that range.
-fn find_use_insertion_position(analysis: &FileAnalysis, point: Point) -> Position {
-    // Collect package declaration lines (sorted)
+/// `stable_packages` provides fallback package lines from the stable outline
+/// when the current parse lost packages due to error recovery.
+fn find_use_insertion_position(
+    analysis: &FileAnalysis,
+    point: Point,
+    stable_packages: Option<&[(String, usize)]>,
+) -> Position {
+    // Collect package declaration lines from current parse
     let mut pkg_lines: Vec<usize> = analysis.symbols.iter()
         .filter(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class))
         .map(|s| s.selection_span.start.row)
         .collect();
+
+    // If the stable outline has MORE packages than the current parse,
+    // merge them in — the parse lost some due to error recovery.
+    if let Some(stable) = stable_packages {
+        if stable.len() > pkg_lines.len() {
+            for (_, line) in stable {
+                if !pkg_lines.contains(line) {
+                    pkg_lines.push(*line);
+                }
+            }
+        }
+    }
     pkg_lines.sort();
 
     // Find the package range containing `point`
@@ -1324,7 +1364,21 @@ pub fn code_actions(
         // Case 2: New import — add `use Module qw(func);` statement
         if let Some(modules) = data.get("modules").and_then(|v| v.as_array()) {
             let diag_point = position_to_point(diag.range.start);
-            let insert_pos = find_use_insertion_position(analysis, diag_point);
+            let mut insert_pos = find_use_insertion_position(analysis, diag_point, None);
+            // If position is after the diagnostic, fall back to nearest import/package above
+            if insert_pos.line > diag.range.start.line {
+                let last_import_above = analysis.imports.iter().rev()
+                    .find(|imp| imp.span.start.row < diag_point.row);
+                if let Some(imp) = last_import_above {
+                    insert_pos = Position { line: imp.span.end.row as u32 + 1, character: 0 };
+                } else {
+                    let last_pkg_above = analysis.symbols.iter().rev()
+                        .find(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class) && s.selection_span.start.row < diag_point.row);
+                    if let Some(pkg) = last_pkg_above {
+                        insert_pos = Position { line: pkg.selection_span.start.row as u32 + 1, character: 0 };
+                    }
+                }
+            }
             for (i, module_val) in modules.iter().enumerate() {
                 if let Some(module_name) = module_val.as_str() {
                     let new_text = format!("use {} qw({});\n", module_name, func_name);
@@ -1582,6 +1636,7 @@ mod tests {
             source,
             Position { line: 3, character: 3 },
             &idx,
+            None,
         );
 
         // Should find "first" from List::Util
@@ -1642,6 +1697,7 @@ mod tests {
             source,
             Position { line: 1, character: 3 },
             &idx,
+            None,
         );
 
         // "first" should appear via imported_function_completions (auto-add to qw),
