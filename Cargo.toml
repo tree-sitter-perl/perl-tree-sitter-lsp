@@ -17,7 +17,7 @@ path = "src/main.rs"
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
 tree-sitter = "0.25"
-ts-parser-perl = "1"
+ts-parser-perl = "1.0.1"
 ts-parser-pod = "1"
 dashmap = "6"
 serde_json = "1"

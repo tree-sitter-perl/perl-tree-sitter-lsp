@@ -4604,13 +4604,7 @@ has password => (is => 'rw');
         assert!(pkgs.contains(&"Foo"), "package Foo should survive");
     }
 
-    // TODO: These tests document desired behavior that requires tree-sitter-perl
-    // parser improvements. Currently, keywords (sub, use, package) inside ERROR
-    // nodes get downgraded to bareword/function tokens, so we can't recover them.
-    // Remove #[ignore] once the parser preserves structural nodes inside ERROR.
-
     #[test]
-    #[ignore = "TODO: tree-sitter-perl downgrades sub inside ERROR to bareword"]
     fn test_error_recovery_sub_inside_error() {
         let source = "package Foo;\nmy $x = [\nmy $y = [\nsub process { }\n";
         let fa = build_fa(source);
@@ -4622,7 +4616,6 @@ has password => (is => 'rw');
     }
 
     #[test]
-    #[ignore = "TODO: tree-sitter-perl downgrades use inside ERROR to function token"]
     fn test_error_recovery_import_inside_error() {
         let source = "package Foo;\nmy $x = [\nuse List::Util qw(max);\nsub process { }\n";
         let fa = build_fa(source);
@@ -4633,7 +4626,6 @@ has password => (is => 'rw');
     }
 
     #[test]
-    #[ignore = "TODO: tree-sitter-perl downgrades package inside ERROR to function token"]
     fn test_error_recovery_package_inside_error() {
         let source = "my $x = [\npackage Bar;\nuse Moose;\nsub bar { }\n";
         let fa = build_fa(source);

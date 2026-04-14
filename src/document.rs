@@ -251,7 +251,6 @@ mod incremental_pkg_test {
     use super::*;
 
     #[test]
-    #[ignore]
     fn test_incremental_preserves_packages() {
         let original = std::fs::read_to_string("test_files/frameworks.pl").unwrap();
         let mut doc = Document::new(original.clone()).unwrap();
