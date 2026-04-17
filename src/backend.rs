@@ -462,14 +462,17 @@ impl LanguageServer for Backend {
                 let owner = owner_from_ref.or(owner_from_sym);
 
                 match owner {
-                    Some(HashKeyOwner::Sub(sub_name)) => {
+                    Some(HashKeyOwner::Sub { package, name: sub_name }) => {
                         drop(doc);
                         let results = crate::resolve::refs_to(
                             &self.files,
                             Some(&self.module_index),
                             &crate::resolve::TargetRef {
                                 name,
-                                kind: crate::resolve::TargetKind::HashKeyOfSub(sub_name),
+                                kind: crate::resolve::TargetKind::HashKeyOfSub {
+                                    package,
+                                    name: sub_name,
+                                },
                             },
                             crate::resolve::RoleMask::VISIBLE,
                         );

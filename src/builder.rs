@@ -2320,7 +2320,10 @@ impl<'a> Builder<'a> {
 
         // Synthesize HashKeyDef entries so Foo->new(name => ...) connects to the attribute.
         if let Some(ref _pkg) = self.current_package {
-            let owner = HashKeyOwner::Sub("new".to_string());
+            let owner = HashKeyOwner::Sub {
+                package: self.current_package.clone(),
+                name: "new".to_string(),
+            };
             for (name, sel_span) in &attr_names {
                 self.add_symbol(
                     name.clone(),
@@ -3042,14 +3045,20 @@ impl<'a> Builder<'a> {
             // Check if this is inside a return expression of a sub
             if ancestor.kind() == "return_expression" {
                 if let Some(name) = self.enclosing_sub_name() {
-                    return Some(HashKeyOwner::Sub(name));
+                    return Some(HashKeyOwner::Sub {
+                        package: self.current_package.clone(),
+                        name,
+                    });
                 }
             }
             // Check if this is the last expression in a sub body (implicit return)
             if ancestor.kind() == "expression_statement" {
                 if self.is_last_statement_in_sub(ancestor) {
                     if let Some(name) = self.enclosing_sub_name() {
-                        return Some(HashKeyOwner::Sub(name));
+                        return Some(HashKeyOwner::Sub {
+                            package: self.current_package.clone(),
+                            name,
+                        });
                     }
                 }
             }
@@ -3357,10 +3366,21 @@ impl<'a> Builder<'a> {
             .map(|b| (b.variable.as_str(), b.func_name.as_str()))
             .collect();
 
+        // Per-sub package lookup (sub name → defining package). Needed so the
+        // HashKeyOwner::Sub emitted here carries the same package as the
+        // HashKeyDef the builder synthesized inside that sub.
+        let sub_package: std::collections::HashMap<&str, Option<String>> = self.symbols.iter()
+            .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .map(|s| (s.name.as_str(), s.package.clone()))
+            .collect();
+
         for r in &mut self.refs {
             if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
                 if let Some(func_name) = binding_map.get(var_text.as_str()) {
-                    *owner = Some(HashKeyOwner::Sub(func_name.to_string()));
+                    *owner = Some(HashKeyOwner::Sub {
+                        package: sub_package.get(*func_name).cloned().unwrap_or(None),
+                        name: func_name.to_string(),
+                    });
                 }
             }
         }
@@ -4443,8 +4463,8 @@ $calc->get_self->get_config->{host};
             .collect();
         assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
         if let SymbolDetail::HashKeyDef { ref owner, .. } = host_defs[0].detail {
-            assert_eq!(*owner, HashKeyOwner::Sub("get_config".to_string()),
-                "implicit return hash key should have Sub(get_config) owner, got {:?}", owner);
+            assert_eq!(*owner, HashKeyOwner::Sub { package: None, name: "get_config".to_string() },
+                "implicit return hash key should have Sub get_config owner, got {:?}", owner);
         }
 
         // Go-to-def from $cfg->{host} should reach the hash key in the implicit return
@@ -4503,8 +4523,8 @@ get_foo()->bar();
             .collect();
         assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
         if let SymbolDetail::HashKeyDef { ref owner, .. } = host_defs[0].detail {
-            assert_eq!(*owner, HashKeyOwner::Sub("get_config".to_string()),
-                "host def should have Sub(get_config) owner, got {:?}", owner);
+            assert_eq!(*owner, HashKeyOwner::Sub { package: None, name: "get_config".to_string() },
+                "host def should have Sub get_config owner, got {:?}", owner);
         }
 
         // Verify HashKeyAccess ref for $cfg->{host} has Sub owner
@@ -4513,8 +4533,8 @@ get_foo()->bar();
             .collect();
         assert!(!host_refs.is_empty(), "should find HashKeyAccess for 'host'");
         if let RefKind::HashKeyAccess { ref owner, .. } = host_refs[0].kind {
-            assert_eq!(*owner, Some(HashKeyOwner::Sub("get_config".to_string())),
-                "host ref should have Sub(get_config) owner, got {:?}", owner);
+            assert_eq!(*owner, Some(HashKeyOwner::Sub { package: None, name: "get_config".to_string() }),
+                "host ref should have Sub get_config owner, got {:?}", owner);
         }
 
         // Verify go-to-references from the def finds the usage
@@ -4686,9 +4706,15 @@ has password => (is => 'rw');
         let names: Vec<&str> = key_defs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"username"), "should have HashKeyDef for username, got: {:?}", names);
         assert!(names.contains(&"password"), "should have HashKeyDef for password, got: {:?}", names);
-        // Verify owner is "new"
+        // Verify owner is Sub { package: "MyApp", name: "new" }
         if let SymbolDetail::HashKeyDef { ref owner, .. } = key_defs[0].detail {
-            assert_eq!(owner, &HashKeyOwner::Sub("new".to_string()));
+            assert_eq!(
+                owner,
+                &HashKeyOwner::Sub {
+                    package: Some("MyApp".to_string()),
+                    name: "new".to_string(),
+                }
+            );
         }
     }
 

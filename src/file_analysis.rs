@@ -346,9 +346,14 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
 pub enum HashKeyOwner {
     Class(String),
     Variable { name: String, def_scope: ScopeId },
-    /// Hash keys from a sub's return value: `sub get_config { return { host => 1 } }`
-    Sub(String),
+    /// Hash keys from a sub's return value: `sub get_config { return { host => 1 } }`.
+    /// `package` is the enclosing Perl package at the sub's declaration site
+    /// (or `None` for top-level script subs where no `package` statement is
+    /// in scope). Without this, two different packages each defining
+    /// `sub get_config { ... host ... }` would collide at query time.
+    Sub { package: Option<String>, name: String },
 }
+
 
 // ---- Call binding ----
 
@@ -789,8 +794,12 @@ impl FileAnalysis {
         self.imported_return_types = imported_returns;
 
         // Inject synthetic HashKeyDef symbols for imported functions' hash keys.
+        // Imported subs have no local package — package=None mirrors the
+        // HashKeyAccess fixup's default for imported bindings, so the pair
+        // match each other without bleeding into other workspace files'
+        // locally-packaged `sub get_config` hash keys.
         for (func_name, keys) in &imported_hash_keys {
-            let owner = HashKeyOwner::Sub(func_name.clone());
+            let owner = HashKeyOwner::Sub { package: None, name: func_name.clone() };
             for key_name in keys {
                 let id = SymbolId(self.symbols.len() as u32);
                 // Use a zero-size span at file start for synthetic symbols
@@ -971,10 +980,24 @@ impl FileAnalysis {
         };
 
         if let Some(name) = sub_name {
-            // Check Sub owner has defs; fall through to class if not
-            let sub_owner = HashKeyOwner::Sub(name);
-            if !self.hash_key_defs_for_owner(&sub_owner).is_empty() {
-                return Some(sub_owner);
+            // Try each package the sub might belong to. In practice, the sub
+            // is either defined locally (package comes from its Symbol) or
+            // imported (package = None, matching the enrichment synthetic def).
+            let mut candidate_owners: Vec<HashKeyOwner> = Vec::new();
+            for sym in &self.symbols {
+                if (sym.kind == SymKind::Sub || sym.kind == SymKind::Method) && sym.name == name {
+                    candidate_owners.push(HashKeyOwner::Sub {
+                        package: sym.package.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            // Fallback: None-package owner (matches imported synthetic defs).
+            candidate_owners.push(HashKeyOwner::Sub { package: None, name: name.clone() });
+            for sub_owner in candidate_owners {
+                if !self.hash_key_defs_for_owner(&sub_owner).is_empty() {
+                    return Some(sub_owner);
+                }
             }
         }
 
@@ -2566,7 +2589,7 @@ impl FileAnalysis {
             let detail = match owner {
                 HashKeyOwner::Class(name) => format!("{}->{{{}}}", name, def.name),
                 HashKeyOwner::Variable { name, .. } => format!("{}{{{}}}", name, def.name),
-                HashKeyOwner::Sub(name) => format!("{}()->{{{}}}", name, def.name),
+                HashKeyOwner::Sub { name, .. } => format!("{}()->{{{}}}", name, def.name),
             };
 
             candidates.push(CompletionCandidate {
@@ -2596,8 +2619,30 @@ impl FileAnalysis {
     }
 
     /// Complete hash keys for a sub's return value (from expression type resolution).
+    ///
+    /// Tries the caller's enclosing package first (local subs), then falls
+    /// back to an unpackaged owner (imported subs whose synthetic HashKeyDef
+    /// was added during enrichment with `package: None`).
     pub fn complete_hash_keys_for_sub(&self, sub_name: &str, _point: Point) -> Vec<CompletionCandidate> {
-        self.complete_hash_keys_for_owner(&HashKeyOwner::Sub(sub_name.to_string()))
+        // Try each candidate owner variant until one has defs.
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let push_unique = |cands: Vec<CompletionCandidate>, out: &mut Vec<CompletionCandidate>, seen: &mut HashSet<String>| {
+            for c in cands {
+                if seen.insert(c.label.clone()) {
+                    out.push(c);
+                }
+            }
+        };
+        for sym in &self.symbols {
+            if (sym.kind == SymKind::Sub || sym.kind == SymKind::Method) && sym.name == sub_name {
+                let owner = HashKeyOwner::Sub { package: sym.package.clone(), name: sub_name.to_string() };
+                push_unique(self.complete_hash_keys_for_owner(&owner), &mut out, &mut seen);
+            }
+        }
+        let imported_owner = HashKeyOwner::Sub { package: None, name: sub_name.to_string() };
+        push_unique(self.complete_hash_keys_for_owner(&imported_owner), &mut out, &mut seen);
+        out
     }
 
     /// General completion: all variables (all sigils) + subs + packages.
@@ -2939,7 +2984,8 @@ impl FileAnalysis {
                 && cb.span.start <= point
                 && contains_point(&self.scopes[cb.scope.0 as usize].span, point)
             {
-                return Some(HashKeyOwner::Sub(cb.func_name.clone()));
+                let package = self.sub_defining_package(&cb.func_name);
+                return Some(HashKeyOwner::Sub { package, name: cb.func_name.clone() });
             }
         }
 
@@ -2949,7 +2995,8 @@ impl FileAnalysis {
                 && mcb.span.start <= point
                 && contains_point(&self.scopes[mcb.scope.0 as usize].span, point)
             {
-                return Some(HashKeyOwner::Sub(mcb.method_name.clone()));
+                let package = self.sub_defining_package(&mcb.method_name);
+                return Some(HashKeyOwner::Sub { package, name: mcb.method_name.clone() });
             }
         }
 
@@ -2984,11 +3031,24 @@ impl FileAnalysis {
                             return Some(owner.clone());
                         }
                     }
-                    HashKeyOwner::Class(_) | HashKeyOwner::Sub(_) => {}
+                    HashKeyOwner::Class(_) | HashKeyOwner::Sub { .. } => {}
                 }
             }
         }
 
+        None
+    }
+
+    /// Look up the defining package of a sub/method by name. Returns None when
+    /// the sub is not found locally (imported, or absent). Used to package-
+    /// qualify `HashKeyOwner::Sub` so distinct same-name subs in different
+    /// packages don't collide at query time.
+    fn sub_defining_package(&self, name: &str) -> Option<String> {
+        for sym in &self.symbols {
+            if (sym.kind == SymKind::Sub || sym.kind == SymKind::Method) && sym.name == name {
+                return sym.package.clone();
+            }
+        }
         None
     }
 
@@ -3577,15 +3637,15 @@ mod tests {
             my $h = $cfg->{host};
         "#);
 
-        // Find the HashKeyDef "host" owned by Sub("get_config").
+        // Find the HashKeyDef "host" owned by Sub { name: "get_config", .. }.
         let def = fa.symbols.iter().find(|s| {
             s.name == "host"
                 && s.kind == SymKind::HashKeyDef
                 && matches!(&s.detail, SymbolDetail::HashKeyDef {
-                    owner: HashKeyOwner::Sub(n), ..
-                } if n == "get_config")
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
         });
-        assert!(def.is_some(), "HashKeyDef 'host' owned by Sub('get_config') should exist");
+        assert!(def.is_some(), "HashKeyDef 'host' owned by Sub get_config should exist");
         let def_id = def.unwrap().id;
 
         // The `$cfg->{host}` access should be indexed under this symbol.
@@ -3616,8 +3676,8 @@ mod tests {
             s.name == "host"
                 && s.kind == SymKind::HashKeyDef
                 && matches!(&s.detail, SymbolDetail::HashKeyDef {
-                    owner: HashKeyOwner::Sub(n), ..
-                } if n == "get_config")
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
         }).expect("host HashKeyDef");
 
         // Cursor on the def — convention is that find_references returns the

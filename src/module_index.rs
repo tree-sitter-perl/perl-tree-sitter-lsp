@@ -53,9 +53,14 @@ impl CachedModule {
         let primary = syms.next()?;
         let overloads: Vec<&Symbol> = syms.collect();
 
+        // Keys are owned by `Sub { package: primary.package, name }` — the
+        // sub's hash keys live under the same package as the sub itself.
         let hash_keys: Vec<String> = self
             .analysis
-            .hash_key_defs_for_owner(&HashKeyOwner::Sub(name.to_string()))
+            .hash_key_defs_for_owner(&HashKeyOwner::Sub {
+                package: primary.package.clone(),
+                name: name.to_string(),
+            })
             .iter()
             .map(|s| s.name.clone())
             .collect();
