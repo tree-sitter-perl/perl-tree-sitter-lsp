@@ -187,12 +187,14 @@ fn cli_check(args: &[String]) {
 
         // Open (or create) the per-project SQLite cache
         let db = module_cache::open_cache_db(Some(&root_uri));
+        let mut stale_set: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(ref conn) = db {
             let _ = module_cache::validate_inc_paths(conn, &inc_paths);
-            let (warmed, _stale) = module_cache::warm_cache(conn, &module_index.cache_raw());
+            let (warmed, stale) = module_cache::warm_cache(conn, &module_index.cache_raw());
             if warmed > 0 {
                 eprintln!("Cache: {} modules loaded from disk", warmed);
             }
+            stale_set = stale.into_iter().collect();
         }
 
         // Collect all unique module names needed
@@ -208,12 +210,12 @@ fn cli_check(args: &[String]) {
             }
         }
 
-        // Resolve modules not already in cache
+        // Resolve modules not already in cache (or stale from version bump)
         let mut parser = module_resolver::create_parser();
         let mut resolved = 0usize;
         let mut already_cached = 0usize;
         for name in &needed {
-            if module_index.cache_raw().contains_key(name.as_str()) {
+            if module_index.cache_raw().contains_key(name.as_str()) && !stale_set.contains(name) {
                 already_cached += 1;
                 continue;
             }

@@ -1448,6 +1448,18 @@ impl<'a> Builder<'a> {
                 }
             }
 
+            // Glob assignment inside sub import: *{"$caller::name"} = \&name
+            // Detect custom import() that exports via typeglob manipulation.
+            if left.kind() == "glob" {
+                if self.enclosing_sub_name().as_deref() == Some("import") {
+                    for name in self.extract_glob_export_names(left, node) {
+                        if !self.export.contains(&name) {
+                            self.export.push(name);
+                        }
+                    }
+                }
+            }
+
             // Accumulate array/scalar assignments as constants
             {
                 // Strip leading "our " or "my " to get the variable name
@@ -1940,6 +1952,124 @@ impl<'a> Builder<'a> {
             } else {
                 self.export_ok.extend(values);
             }
+        }
+    }
+
+    /// Extract exported function name(s) from a glob assignment in `sub import`.
+    /// Handles: `*{"${caller}::np"} = \&np`, `*{"$caller\::$imported"} = \&p`,
+    /// `*{$caller . '::confess'} = \&confess`, and loop patterns.
+    /// Returns one or more caller-visible names (from the glob string after "::"),
+    /// falling back to the RHS \&name if the glob name is dynamic.
+    fn extract_glob_export_names(&self, glob_node: Node<'a>, assign_node: Node<'a>) -> Vec<String> {
+        // Try to extract from glob's interpolated string: the name after "::"
+        // AST: glob > varname > block > expression_statement > interpolated_string_literal > string_content
+        let names = self.extract_names_from_glob(glob_node);
+        if !names.is_empty() {
+            return names;
+        }
+
+        // Fallback: extract function name from RHS \&name
+        // AST: refgen_expression > function > varname
+        if let Some(right) = assign_node.child_by_field_name("right") {
+            return self.extract_names_from_refgen(right);
+        }
+        vec![]
+    }
+
+    /// Walk the glob's interpolated string AST to find the exported name(s) after "::".
+    fn extract_names_from_glob(&self, glob_node: Node<'a>) -> Vec<String> {
+        // glob > varname > block > expression_statement > interpolated_string_literal
+        let content = (|| {
+            let varname = glob_node.named_child(0)?;
+            let block = varname.named_child(0)?;
+            let expr_stmt = block.named_child(0)?;
+            let interp = expr_stmt.named_child(0)?;
+            if interp.kind() != "interpolated_string_literal" { return None; }
+            let c = interp.named_child(0)?;
+            if c.kind() == "string_content" { Some(c) } else { None }
+        })();
+        let content = match content {
+            Some(c) => c,
+            None => return vec![],
+        };
+
+        // Walk string_content: find the last "::" in literal segments,
+        // then the part after it is the exported name (literal or variable).
+        let content_bytes = &self.source[content.start_byte()..content.end_byte()];
+        let content_text = match std::str::from_utf8(content_bytes) {
+            Ok(t) => t,
+            Err(_) => return vec![],
+        };
+
+        // Find position of last "::" in the raw content
+        let colons_pos = match content_text.rfind("::") {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let after_colons = colons_pos + 2;
+
+        // Check if there's a named child (scalar variable) that starts after the "::"
+        let last_idx = match content.named_child_count().checked_sub(1) {
+            Some(i) => i,
+            None => return vec![],
+        };
+        let last_child = match content.named_child(last_idx) {
+            Some(c) => c,
+            None => return vec![],
+        };
+        if last_child.kind() == "scalar" && last_child.start_byte() >= content.start_byte() + after_colons {
+            // The name is a variable like $imported or $name — resolve via constant folding.
+            // Use scalar > varname to get the canonical name (without ${} braces).
+            if let Some(varname_node) = last_child.named_child(0) {
+                let bare_name = varname_node.utf8_text(self.source).unwrap_or("");
+                let lookup_key = format!("${}", bare_name);
+                if let Some(values) = self.resolve_constant_strings(&lookup_key, 0) {
+                    return values;
+                }
+            }
+            return vec![];
+        }
+
+        // The name is literal text after "::"
+        let suffix = &content_text[after_colons..];
+        if !suffix.is_empty() && !suffix.starts_with('$') {
+            return vec![suffix.to_string()];
+        }
+
+        vec![]
+    }
+
+    /// Extract bare function name(s) from a `\&name` or `\&$var` refgen expression.
+    fn extract_names_from_refgen(&self, refgen: Node<'a>) -> Vec<String> {
+        if refgen.kind() != "refgen_expression" {
+            return vec![];
+        }
+        let func = match refgen.named_child(0) {
+            Some(f) if f.kind() == "function" => f,
+            _ => return vec![],
+        };
+        // function > varname, possibly containing a scalar child (for \&$name)
+        let varname = match func.named_child(0) {
+            Some(v) => v,
+            None => return vec![],
+        };
+        if let Some(scalar) = varname.named_child(0) {
+            if scalar.kind() == "scalar" {
+                // \&$name — resolve variable via scalar > varname (canonical, no ${} braces)
+                if let Some(scalar_varname) = scalar.named_child(0) {
+                    let bare_name = scalar_varname.utf8_text(self.source).unwrap_or("");
+                    let lookup_key = format!("${}", bare_name);
+                    if let Some(values) = self.resolve_constant_strings(&lookup_key, 0) {
+                        return values;
+                    }
+                }
+                return vec![];
+            }
+        }
+        // Bare name like \&np — varname text is the function name
+        match varname.utf8_text(self.source) {
+            Ok(name) => vec![name.to_string()],
+            Err(_) => vec![],
         }
     }
 
@@ -6043,6 +6173,93 @@ use constant ALL => (BASE, 'c');
 our @EXPORT_OK = (ALL);
 ");
         assert_eq!(fa.export_ok, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_glob_export_literal_name() {
+        // Data::Printer pattern: *{"${caller}::np"} = \&np
+        let fa = build_fa(r#"
+package Data::Printer;
+sub np { }
+sub p { }
+sub import {
+    my $class = shift;
+    my $caller = caller;
+    { no strict 'refs';
+        *{"${caller}::p"} = \&p;
+        *{"${caller}::np"} = \&np;
+    }
+}
+"#);
+        assert!(fa.export.contains(&"p".to_string()), "should detect p export: {:?}", fa.export);
+        assert!(fa.export.contains(&"np".to_string()), "should detect np export: {:?}", fa.export);
+    }
+
+    #[test]
+    fn test_glob_export_variable_name() {
+        // Aliased export: my $imported = 'p'; *{"$caller\::$imported"} = \&p
+        let fa = build_fa(r#"
+package Data::Printer;
+sub p { }
+sub import {
+    my $class = shift;
+    my $caller = caller;
+    my $imported = 'dump_it';
+    { no strict 'refs';
+        *{"$caller\::$imported"} = \&p;
+    }
+}
+"#);
+        assert!(fa.export.contains(&"dump_it".to_string()), "should resolve aliased export: {:?}", fa.export);
+    }
+
+    #[test]
+    fn test_glob_export_loop_pattern() {
+        // Try::Tiny pattern: loop over qw list
+        let fa = build_fa(r#"
+package Try::Tiny;
+sub try { }
+sub catch { }
+sub finally { }
+sub import {
+    my $class = shift;
+    my $caller = caller;
+    for my $name (qw(try catch finally)) {
+        no strict 'refs';
+        *{"${caller}::${name}"} = \&$name;
+    }
+}
+"#);
+        assert!(fa.export.contains(&"try".to_string()), "should detect try: {:?}", fa.export);
+        assert!(fa.export.contains(&"catch".to_string()), "should detect catch: {:?}", fa.export);
+        assert!(fa.export.contains(&"finally".to_string()), "should detect finally: {:?}", fa.export);
+    }
+
+    #[test]
+    fn test_glob_export_fallback_to_rhs() {
+        // When glob name is fully dynamic, fall back to \&name on RHS
+        let fa = build_fa(r#"
+package Foo;
+sub bar { }
+sub import {
+    my $caller = caller;
+    *{$caller . '::bar'} = \&bar;
+}
+"#);
+        assert!(fa.export.contains(&"bar".to_string()), "should fall back to RHS name: {:?}", fa.export);
+    }
+
+    #[test]
+    fn test_glob_export_only_inside_import() {
+        // Glob assigns outside sub import should NOT populate exports
+        let fa = build_fa(r#"
+package Foo;
+sub setup {
+    my $caller = caller;
+    *{"${caller}::thing"} = \&thing;
+}
+"#);
+        assert!(fa.export.is_empty(), "should not export from non-import sub: {:?}", fa.export);
     }
 
     #[test]

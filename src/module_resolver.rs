@@ -64,9 +64,14 @@ pub fn spawn_resolver(
                 let _ = module_cache::validate_inc_paths(conn, &inc_paths);
                 let (n, stale_names) = module_cache::warm_cache(conn, &cache);
                 log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
-                // Populate stale_modules set for priority re-resolution.
-                for name in stale_names {
-                    stale_modules.insert(name, ());
+                // Queue stale modules for priority re-resolution.
+                for name in &stale_names {
+                    stale_modules.insert(name.clone(), ());
+                }
+                if !stale_names.is_empty() {
+                    let mut pq = queue.priority.lock().unwrap();
+                    pq.extend(stale_names);
+                    queue.condvar.notify_one();
                 }
                 // Build reverse index from warmed cache.
                 rebuild_reverse_index(&cache, &reverse_index);
@@ -518,9 +523,23 @@ pub fn resolve_and_parse(
     let tree = parser.parse(&source, None)?;
 
     let analysis = crate::builder::build(&tree, source.as_bytes());
-    let export = analysis.export.clone();
-    let export_ok = analysis.export_ok.clone();
+    let mut export = analysis.export.clone();
+    let mut export_ok = analysis.export_ok.clone();
     let (subs, parents) = collect_export_metadata(&analysis, &export, &export_ok, Some(module_name));
+
+    // If this module has no exports but inherits via @ISA (e.g. DDP → Data::Printer),
+    // try to inherit exports from the first parent that has a sub import.
+    if export.is_empty() && export_ok.is_empty() && !parents.is_empty() {
+        for parent in &parents {
+            if let Some(parent_exports) = resolve_and_parse(inc_paths, parent, parser) {
+                if !parent_exports.export.is_empty() || !parent_exports.export_ok.is_empty() {
+                    export = parent_exports.export;
+                    export_ok = parent_exports.export_ok;
+                    break;
+                }
+            }
+        }
+    }
 
     Some(ModuleExports { path, export, export_ok, subs, parents })
 }

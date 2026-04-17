@@ -1122,11 +1122,22 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
             continue;
         }
 
-        // Skip if explicitly listed in any import's qw(...)
-        let explicitly_imported = analysis
-            .imports
-            .iter()
-            .any(|imp| imp.imported_symbols.iter().any(|s| s == name));
+        // Skip if explicitly listed in any import's qw(...),
+        // or auto-imported via @EXPORT on a bare `use Foo;` (no qw list).
+        let explicitly_imported = analysis.imports.iter().any(|imp| {
+            if imp.imported_symbols.iter().any(|s| s == name) {
+                return true;
+            }
+            // Bare `use Foo;` — check if function is in @EXPORT (auto-imported)
+            if imp.imported_symbols.is_empty() {
+                if let Some(exports) = module_index.get_exports_cached(&imp.module_name) {
+                    if exports.export.iter().any(|s| s == name) {
+                        return true;
+                    }
+                }
+            }
+            false
+        });
         if explicitly_imported {
             continue;
         }
