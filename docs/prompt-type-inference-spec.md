@@ -32,6 +32,7 @@ Landed behaviors:
 - Qualified calls (`Foo::bar()`) and chained delegation (`sub chain { return get_config() }`) both propagate return types + hash-key ownership.
 - Dynamic method dispatch (`$obj->$m()` where `$m = 'get_config'`) resolves via `resolve_constant_strings` and flows into `MethodCallBinding`.
 - The HashKey owner fixup runs over **both** `call_bindings` and `method_call_bindings`, and both paths walk the delegation chain to the sub that owns the HashKeyDefs.
+- **Consumer-side cross-file resolution.** `use Lib qw(get_config); my $c = get_config(); $c->{host}` — the builder can't resolve the owner at build time (imported), but `enrich_imported_types_with_keys` retries the owner fixup against `imported_hash_keys` and then `rebuild_enrichment_indices` re-runs the phase-5 linker against the newly-injected synthetic HashKeyDefs. `refs_by_target` stays correct across the enrichment boundary.
 
 What's in tests (`file_analysis::tests::test_phase5_*`):
 
@@ -42,6 +43,7 @@ What's in tests (`file_analysis::tests::test_phase5_*`):
 - `_hash_key_owner_flows_through_intermediate_sub`
 - `_dynamic_method_call_via_constant_folding`
 - `_demo_file_shape_resolves_all_access_sites`
+- `_consumer_side_cross_file_resolves_via_enrichment`
 
 ---
 
@@ -541,8 +543,8 @@ precedent set by the phase-5 tests.
 - **Full structural typing.** We're not inventing a row-polymorphic
   record calculus. The goal is to cover the 90% of Perl idioms with
   cheap heuristics and fail gracefully otherwise.
-- **Cross-file list-element inference.** Map/grep over an array whose
-  contents come from another file's return requires the phase-5
-  follow-up (enrichment rebuild of refs_by_target). Defer.
 - **Runtime-dependent types** (e.g. values loaded from config files).
   Static-only.
+- **Dynamic import shapes.** `$module->import()` at runtime with a
+  computed symbol list is out of scope; we only track what's declarable
+  at the source level.
