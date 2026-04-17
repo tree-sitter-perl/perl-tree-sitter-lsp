@@ -15,9 +15,8 @@ use tower_lsp::Client;
 use tree_sitter::Parser;
 
 use crate::cpanfile;
-use crate::file_analysis::inferred_type_to_tag;
 use crate::module_cache;
-use crate::module_index::{ExportedOverload, ExportedParam, ExportedSub, ModuleExports, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
+use crate::module_index::{CachedModule, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
 
 /// Callback invoked after each module is resolved. Used to trigger diagnostic refresh.
 pub type OnResolved = Box<dyn Fn() + Send + Sync>;
@@ -27,7 +26,7 @@ pub type OnResolved = Box<dyn Fn() + Send + Sync>;
 /// The `on_resolved` callback fires after each module is inserted into the cache,
 /// allowing the backend to re-publish diagnostics.
 pub fn spawn_resolver(
-    cache: Arc<DashMap<String, Option<ModuleExports>>>,
+    cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     reverse_index: Arc<DashMap<String, Vec<String>>>,
     stale_modules: Arc<DashMap<String, ()>>,
     available_modules: Arc<DashMap<String, PathBuf>>,
@@ -144,11 +143,11 @@ pub fn spawn_resolver(
 
                     let result = parse_module(&inc_paths, &module_name);
                     match &result {
-                        Some(e) => log::info!(
+                        Some(m) => log::info!(
                             "Resolved '{}': {} export, {} export_ok",
                             module_name,
-                            e.export.len(),
-                            e.export_ok.len()
+                            m.analysis.export.len(),
+                            m.analysis.export_ok.len()
                         ),
                         None => log::info!("No exports found for '{}'", module_name),
                     }
@@ -239,7 +238,7 @@ fn drain_next_batch(queue: &ResolveQueue) -> Vec<String> {
 /// Simplified resolver for tests — no Client, no progress, no cpanfile.
 #[cfg(test)]
 pub fn spawn_test_resolver(
-    cache: Arc<DashMap<String, Option<ModuleExports>>>,
+    cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     reverse_index: Arc<DashMap<String, Vec<String>>>,
     stale_modules: Arc<DashMap<String, ()>>,
     available_modules: Arc<DashMap<String, PathBuf>>,
@@ -318,13 +317,13 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
 
 /// Insert a resolved module into the cache and update the reverse index.
 fn insert_into_cache(
-    cache: &DashMap<String, Option<ModuleExports>>,
+    cache: &DashMap<String, Option<Arc<CachedModule>>>,
     reverse_index: &DashMap<String, Vec<String>>,
     module_name: &str,
-    result: Option<ModuleExports>,
+    result: Option<Arc<CachedModule>>,
 ) {
-    if let Some(ref exports) = result {
-        for func in exports.export.iter().chain(exports.export_ok.iter()) {
+    if let Some(ref cached) = result {
+        for func in cached.analysis.export.iter().chain(cached.analysis.export_ok.iter()) {
             reverse_index
                 .entry(func.clone())
                 .or_default()
@@ -336,12 +335,12 @@ fn insert_into_cache(
 
 /// Rebuild reverse index from existing cache (e.g. after warming from SQLite).
 fn rebuild_reverse_index(
-    cache: &DashMap<String, Option<ModuleExports>>,
+    cache: &DashMap<String, Option<Arc<CachedModule>>>,
     reverse_index: &DashMap<String, Vec<String>>,
 ) {
     for entry in cache.iter() {
-        if let Some(ref exports) = *entry.value() {
-            for func in exports.export.iter().chain(exports.export_ok.iter()) {
+        if let Some(ref cached) = *entry.value() {
+            for func in cached.analysis.export.iter().chain(cached.analysis.export_ok.iter()) {
                 reverse_index
                     .entry(func.clone())
                     .or_default()
@@ -355,137 +354,10 @@ fn rebuild_reverse_index(
 
 /// Parse a module file directly in-process.
 /// tree-sitter-perl is stable — no subprocess isolation needed.
-fn parse_module(inc_paths: &[PathBuf], module_name: &str) -> Option<ModuleExports> {
+fn parse_module(inc_paths: &[PathBuf], module_name: &str) -> Option<Arc<CachedModule>> {
     let mut parser = create_parser();
     resolve_and_parse(inc_paths, module_name, &mut parser)
 }
-
-
-/// Collect export metadata from a FileAnalysis for a set of export names.
-/// Returns (subs, parents) ready for serialization or direct use.
-fn collect_export_metadata(
-    analysis: &crate::file_analysis::FileAnalysis,
-    export: &[String],
-    export_ok: &[String],
-    module_name: Option<&str>,
-) -> (HashMap<String, ExportedSub>, Vec<String>) {
-    use crate::file_analysis::{SymKind, SymbolDetail, HashKeyOwner};
-
-    // Extract parents for the primary package
-    let mut parents: Vec<String> = Vec::new();
-    if let Some(pkg_name) = module_name {
-        if let Some(pkg_parents) = analysis.package_parents.get(pkg_name) {
-            parents = pkg_parents.clone();
-        }
-    }
-    if parents.is_empty() && analysis.package_parents.len() == 1 {
-        if let Some((_pkg, pkg_parents)) = analysis.package_parents.iter().next() {
-            parents = pkg_parents.clone();
-        }
-    }
-
-    let mut subs = HashMap::new();
-
-    // Helper closure: build ExportedParam list from symbol params
-    let build_params = |sym: &crate::file_analysis::Symbol| -> Vec<ExportedParam> {
-        if let SymbolDetail::Sub { ref params, .. } = sym.detail {
-            params.iter()
-                .map(|p| {
-                    let param_type = analysis.inferred_type(&p.name, sym.span.end)
-                        .map(|t| inferred_type_to_tag(t));
-                    ExportedParam { name: p.name.clone(), is_slurpy: p.is_slurpy, inferred_type: param_type }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
-    };
-
-    // Helper closure: build ExportedOverload from a symbol
-    let build_overload = |sym: &crate::file_analysis::Symbol| -> ExportedOverload {
-        let params = build_params(sym);
-        let return_type = if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
-            return_type.clone()
-        } else {
-            None
-        };
-        ExportedOverload { params, return_type }
-    };
-
-    // First loop: exported names
-    for name in export.iter().chain(export_ok.iter()) {
-        let matching_syms: Vec<_> = analysis.symbols.iter()
-            .filter(|sym| sym.name == *name && matches!(sym.kind, SymKind::Sub | SymKind::Method))
-            .collect();
-
-        let (def_line, params, is_method, doc) = if let Some(primary) = matching_syms.first() {
-            let is_method = matches!(primary.detail, SymbolDetail::Sub { is_method: true, .. })
-                || primary.kind == SymKind::Method;
-            let doc = if let SymbolDetail::Sub { ref doc, .. } = primary.detail {
-                doc.clone()
-            } else {
-                None
-            };
-            (primary.span.start.row as u32, build_params(primary), is_method, doc)
-        } else {
-            (0u32, Vec::new(), false, None)
-        };
-
-        let return_type = analysis.sub_return_type(name).cloned();
-        let owner = HashKeyOwner::Sub(name.clone());
-        let hash_keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
-            .iter().map(|s| s.name.clone()).collect();
-
-        let overloads: Vec<ExportedOverload> = matching_syms.iter().skip(1)
-            .map(|sym| build_overload(sym))
-            .collect();
-
-        subs.insert(name.clone(), ExportedSub {
-            def_line, params, is_method, return_type, hash_keys, doc, overloads,
-        });
-    }
-
-    // Names fully handled by the export loop above
-    let exported_names: std::collections::HashSet<&str> =
-        export.iter().chain(export_ok.iter()).map(|s| s.as_str()).collect();
-
-    // Second loop: non-exported subs (needed for inheritance)
-    for sym in &analysis.symbols {
-        if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-        if exported_names.contains(sym.name.as_str()) { continue; }
-
-        // Merge duplicate names as overloads (e.g. getter + setter for rw accessors)
-        if let Some(existing) = subs.get_mut(&sym.name) {
-            existing.overloads.push(build_overload(sym));
-            continue;
-        }
-
-        let is_method = matches!(sym.detail, SymbolDetail::Sub { is_method: true, .. })
-            || sym.kind == SymKind::Method;
-        let doc = if let SymbolDetail::Sub { ref doc, .. } = sym.detail {
-            doc.clone()
-        } else {
-            None
-        };
-        let return_type = analysis.sub_return_type(&sym.name).cloned();
-        let owner = HashKeyOwner::Sub(sym.name.clone());
-        let hash_keys: Vec<String> = analysis.hash_key_defs_for_owner(&owner)
-            .iter().map(|s| s.name.clone()).collect();
-
-        subs.insert(sym.name.clone(), ExportedSub {
-            def_line: sym.span.start.row as u32,
-            params: build_params(sym),
-            is_method,
-            return_type,
-            hash_keys,
-            doc,
-            overloads: vec![],
-        });
-    }
-
-    (subs, parents)
-}
-
 
 pub fn create_parser() -> Parser {
     let mut parser = Parser::new();
@@ -513,7 +385,7 @@ pub fn resolve_and_parse(
     inc_paths: &[PathBuf],
     module_name: &str,
     parser: &mut Parser,
-) -> Option<ModuleExports> {
+) -> Option<Arc<CachedModule>> {
     let path = resolve_module_path(inc_paths, module_name)?;
     let metadata = std::fs::metadata(&path).ok()?;
     if metadata.len() > 1_000_000 {
@@ -522,26 +394,27 @@ pub fn resolve_and_parse(
     let source = std::fs::read_to_string(&path).ok()?;
     let tree = parser.parse(&source, None)?;
 
-    let analysis = crate::builder::build(&tree, source.as_bytes());
-    let mut export = analysis.export.clone();
-    let mut export_ok = analysis.export_ok.clone();
-    let (subs, parents) = collect_export_metadata(&analysis, &export, &export_ok, Some(module_name));
+    let mut analysis = crate::builder::build(&tree, source.as_bytes());
 
     // If this module has no exports but inherits via @ISA (e.g. DDP → Data::Printer),
-    // try to inherit exports from the first parent that has a sub import.
-    if export.is_empty() && export_ok.is_empty() && !parents.is_empty() {
+    // fall back to the first parent's exports. This only patches `export`/`export_ok`;
+    // the parent's own cached analysis is still the source of truth for its symbols.
+    if analysis.export.is_empty() && analysis.export_ok.is_empty() {
+        let parents = crate::module_index::primary_package_parents(&analysis, module_name);
         for parent in &parents {
-            if let Some(parent_exports) = resolve_and_parse(inc_paths, parent, parser) {
-                if !parent_exports.export.is_empty() || !parent_exports.export_ok.is_empty() {
-                    export = parent_exports.export;
-                    export_ok = parent_exports.export_ok;
+            if let Some(parent_cached) = resolve_and_parse(inc_paths, parent, parser) {
+                if !parent_cached.analysis.export.is_empty()
+                    || !parent_cached.analysis.export_ok.is_empty()
+                {
+                    analysis.export = parent_cached.analysis.export.clone();
+                    analysis.export_ok = parent_cached.analysis.export_ok.clone();
                     break;
                 }
             }
         }
     }
 
-    Some(ModuleExports { path, export, export_ok, subs, parents })
+    Some(Arc::new(CachedModule::new(path, Arc::new(analysis))))
 }
 
 // ---- @INC discovery ----

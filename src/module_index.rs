@@ -2,88 +2,158 @@
 //!
 //! Wraps a concurrent cache (`DashMap`) backed by a background resolver thread.
 //! Async LSP handlers only read from the cache (zero I/O). The resolver thread
-//! handles @INC discovery, subprocess parsing, SQLite persistence, and cpanfile
+//! handles @INC discovery, in-process parsing, SQLite persistence, and cpanfile
 //! pre-scanning.
 //!
+//! As of unification phase 2, the cache stores full `FileAnalysis` (not a lossy
+//! `ModuleExports` summary). This means cross-file refs, type constraints, call
+//! bindings, and framework context all survive the module boundary.
+//!
 //! See also:
-//! - `module_resolver.rs` — resolver thread, subprocess isolation, export extraction
-//! - `module_cache.rs` — SQLite persistence
+//! - `module_resolver.rs` — resolver thread, in-process parsing
+//! - `module_cache.rs` — SQLite persistence (schema v9, bincode+zstd blobs)
 //! - `cpanfile.rs` — cpanfile parsing
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
 use dashmap::DashMap;
 use tower_lsp::Client;
 
-use crate::file_analysis::InferredType;
+use crate::file_analysis::{FileAnalysis, HashKeyOwner, InferredType, ParamInfo, SymKind, Symbol, SymbolDetail};
 use crate::module_resolver;
 
 // ---- Public types ----
 
-/// Metadata for an exported function, extracted during module analysis.
-#[derive(Debug, Clone)]
-pub struct ExportedSub {
-    /// Line number of the `sub foo {` definition (0-indexed).
-    pub def_line: u32,
-    /// Parameter names with metadata.
-    pub params: Vec<ExportedParam>,
-    /// Whether this is a method (has $self/$class first param).
-    pub is_method: bool,
-    /// Inferred return type, if known.
-    pub return_type: Option<InferredType>,
-    /// Hash key names from return value, if returns HashRef.
-    pub hash_keys: Vec<String>,
-    /// Pre-rendered markdown from POD or comments.
-    pub doc: Option<String>,
-    /// Additional calling conventions (e.g. setter overload for rw accessors).
-    /// Empty for normal subs. Primary fields above hold the getter (0-param) variant.
-    pub overloads: Vec<ExportedOverload>,
-}
-
-/// An additional calling convention for the same method name.
-#[derive(Debug, Clone)]
-pub struct ExportedOverload {
-    pub params: Vec<ExportedParam>,
-    pub return_type: Option<InferredType>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ExportedParam {
-    pub name: String,
-    pub is_slurpy: bool,
-    /// Inferred type from body usage (e.g. "Numeric", "String"), for cross-file signature help.
-    pub inferred_type: Option<String>,
-}
-
-/// Exports extracted from a .pm file.
-#[derive(Debug, Clone)]
-pub struct ModuleExports {
-    /// Filesystem path to the .pm file.
+/// A module in the cache — its filesystem path plus the full FileAnalysis of
+/// its source. Shared by reference-count so async handlers don't deep-copy.
+#[derive(Debug)]
+pub struct CachedModule {
     pub path: PathBuf,
-    /// @EXPORT — auto-imported on bare `use Foo;`.
-    pub export: Vec<String>,
-    /// @EXPORT_OK — available on request via `use Foo qw(...)`.
-    pub export_ok: Vec<String>,
-    /// Per-function metadata for exported subs.
-    pub subs: HashMap<String, ExportedSub>,
-    /// Parent classes for the primary package.
-    pub parents: Vec<String>,
+    pub analysis: Arc<FileAnalysis>,
 }
 
-impl ModuleExports {
-    /// Look up metadata for an exported function.
-    pub fn sub_info(&self, name: &str) -> Option<&ExportedSub> {
-        self.subs.get(name)
+impl CachedModule {
+    pub fn new(path: PathBuf, analysis: Arc<FileAnalysis>) -> Self {
+        CachedModule { path, analysis }
     }
 
-    /// Convenience: return type for a function (used by test code).
-    #[cfg(test)]
-    pub fn return_type(&self, name: &str) -> Option<&InferredType> {
-        self.subs.get(name).and_then(|s| s.return_type.as_ref())
+    /// Look up metadata for a sub/method in this module.
+    ///
+    /// Unlike the old `ExportedSub`, this returns a lightweight view into the
+    /// full `FileAnalysis`. Works for any declared sub — exported or not —
+    /// because we now store the whole analysis, not just a pre-extracted summary.
+    pub fn sub_info(&self, name: &str) -> Option<SubInfo<'_>> {
+        // Prefer the first matching Sub/Method symbol. Builder may emit several
+        // when rw accessors exist (getter + setter); overloads are collected as
+        // additional symbols with the same name.
+        let mut syms = self.analysis.symbols.iter().filter(|s| {
+            s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Method)
+        });
+        let primary = syms.next()?;
+        let overloads: Vec<&Symbol> = syms.collect();
+
+        let hash_keys: Vec<String> = self
+            .analysis
+            .hash_key_defs_for_owner(&HashKeyOwner::Sub(name.to_string()))
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+
+        Some(SubInfo {
+            analysis: &self.analysis,
+            primary,
+            overloads,
+            hash_keys,
+        })
     }
 
+    /// True if any sub/method with this name is declared in this module.
+    pub fn has_sub(&self, name: &str) -> bool {
+        self.analysis.symbols.iter().any(|s| {
+            s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Method)
+        })
+    }
+}
+
+/// A view into a module's metadata for a named sub/method.
+///
+/// Composed of a primary symbol plus any additional symbols with the same
+/// name (for rw accessor setter overloads).
+pub struct SubInfo<'a> {
+    analysis: &'a FileAnalysis,
+    primary: &'a Symbol,
+    overloads: Vec<&'a Symbol>,
+    hash_keys: Vec<String>,
+}
+
+impl<'a> SubInfo<'a> {
+    pub fn def_line(&self) -> u32 {
+        self.primary.span.start.row as u32
+    }
+
+    pub fn params(&self) -> &'a [ParamInfo] {
+        match &self.primary.detail {
+            SymbolDetail::Sub { params, .. } => params,
+            _ => &[],
+        }
+    }
+
+    pub fn is_method(&self) -> bool {
+        if self.primary.kind == SymKind::Method {
+            return true;
+        }
+        matches!(
+            self.primary.detail,
+            SymbolDetail::Sub { is_method: true, .. }
+        )
+    }
+
+    pub fn return_type(&self) -> Option<&'a InferredType> {
+        match &self.primary.detail {
+            SymbolDetail::Sub { return_type, .. } => return_type.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn doc(&self) -> Option<&'a str> {
+        match &self.primary.detail {
+            SymbolDetail::Sub { doc, .. } => doc.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn hash_keys(&self) -> &[String] {
+        &self.hash_keys
+    }
+
+    /// Arity list covering the primary and overloads, in declaration order.
+    pub fn param_counts(&self) -> Vec<usize> {
+        std::iter::once(self.primary)
+            .chain(self.overloads.iter().copied())
+            .map(|s| match &s.detail {
+                SymbolDetail::Sub { params, .. } => params.len(),
+                _ => 0,
+            })
+            .collect()
+    }
+
+    /// Return type for an overload with the given arity, if any matches.
+    pub fn return_type_for_arity(&self, arity: usize) -> Option<&'a InferredType> {
+        for sym in std::iter::once(self.primary).chain(self.overloads.iter().copied()) {
+            if let SymbolDetail::Sub { params, return_type, .. } = &sym.detail {
+                if params.len() == arity {
+                    return return_type.as_ref();
+                }
+            }
+        }
+        None
+    }
+
+    /// Inferred type for a param by name (if the analysis resolved one).
+    pub fn param_inferred_type(&self, param_name: &str) -> Option<&'a InferredType> {
+        self.analysis.inferred_type(param_name, self.primary.span.end)
+    }
 }
 
 // ---- Internal sync primitives (pub(crate) for resolver thread) ----
@@ -112,10 +182,10 @@ pub(crate) struct WorkspaceRootChannel {
 /// Concurrent module cache with background resolution.
 ///
 /// Async LSP handlers read from `cache` (zero I/O). The background resolver
-/// thread populates the cache by parsing `.pm` files in isolated child processes.
+/// thread populates the cache by parsing `.pm` files in-process.
 #[allow(dead_code)]
 pub struct ModuleIndex {
-    cache: Arc<DashMap<String, Option<ModuleExports>>>,
+    cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     /// Reverse index: function name → list of module names that export it.
     reverse_index: Arc<DashMap<String, Vec<String>>>,
     /// Modules loaded from cache with an old extract_version.
@@ -132,7 +202,7 @@ pub struct ModuleIndex {
 
 impl ModuleIndex {
     pub fn new(client: Client, on_diagnostics_refresh: impl Fn() + Send + Sync + 'static) -> Self {
-        let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
+        let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
         let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
@@ -212,8 +282,8 @@ impl ModuleIndex {
         self.queue.condvar.notify_one();
     }
 
-    /// Return cached exports only — never does I/O.
-    pub fn get_exports_cached(&self, module_name: &str) -> Option<ModuleExports> {
+    /// Return the cached CachedModule for a module name. Never does I/O.
+    pub fn get_cached(&self, module_name: &str) -> Option<Arc<CachedModule>> {
         self.cache.get(module_name).and_then(|entry| entry.clone())
     }
 
@@ -221,34 +291,35 @@ impl ModuleIndex {
     pub fn module_path_cached(&self, module_name: &str) -> Option<PathBuf> {
         self.cache
             .get(module_name)
-            .and_then(|entry| entry.as_ref().map(|e| e.path.clone()))
+            .and_then(|entry| entry.as_ref().map(|m| m.path.clone()))
     }
 
-    /// Return cached parent classes for a module.
+    /// Return cached parent classes for a module's primary package.
     pub fn parents_cached(&self, module_name: &str) -> Vec<String> {
-        self.cache
-            .get(module_name)
-            .and_then(|entry| entry.as_ref().map(|e| e.parents.clone()))
-            .unwrap_or_default()
+        let cached = match self.get_cached(module_name) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        primary_package_parents(&cached.analysis, module_name)
     }
 
-    /// Iterate all cached module exports. Callback receives (module_name, exports).
-    pub fn for_each_cached<F: FnMut(&str, &ModuleExports)>(&self, mut f: F) {
+    /// Iterate all cached modules. Callback receives (module_name, CachedModule).
+    pub fn for_each_cached<F: FnMut(&str, &Arc<CachedModule>)>(&self, mut f: F) {
         for entry in self.cache.iter() {
-            if let Some(ref exports) = *entry.value() {
-                f(entry.key(), exports);
+            if let Some(ref cached) = *entry.value() {
+                f(entry.key(), cached);
             }
         }
     }
 
     /// Collect module names matching a prefix for completion.
-    /// Returns (name, is_resolved) — resolved modules have export data.
+    /// Returns (name, is_resolved) — resolved modules have full analysis.
     pub fn complete_module_names(&self, prefix: &str) -> Vec<(String, bool)> {
         let prefix_lower = prefix.to_lowercase();
         let mut seen = std::collections::HashSet::new();
         let mut results = Vec::new();
 
-        // Tier 1: resolved modules (have full export data)
+        // Tier 1: resolved modules (have full analysis)
         for entry in self.cache.iter() {
             if entry.value().is_some() {
                 let name = entry.key();
@@ -258,7 +329,7 @@ impl ModuleIndex {
             }
         }
 
-        // Tier 2: @INC scan (name only, no exports yet)
+        // Tier 2: @INC scan (name only, no analysis yet)
         for entry in self.available_modules.iter() {
             let name = entry.key();
             if name.to_lowercase().starts_with(&prefix_lower) && seen.insert(name.clone()) {
@@ -274,11 +345,9 @@ impl ModuleIndex {
     pub fn get_return_type_cached(&self, func_name: &str) -> Option<InferredType> {
         let modules = self.reverse_index.get(func_name)?;
         for module_name in modules.value() {
-            if let Some(entry) = self.cache.get(module_name) {
-                if let Some(ref exports) = *entry {
-                    if let Some(ty) = exports.return_type(func_name) {
-                        return Some(ty.clone());
-                    }
+            if let Some(cached) = self.get_cached(module_name) {
+                if let Some(ty) = cached.analysis.sub_return_type_local(func_name) {
+                    return Some(ty.clone());
                 }
             }
         }
@@ -300,7 +369,6 @@ impl ModuleIndex {
     }
 
     /// Create a minimal ModuleIndex for CLI mode (no resolver thread, no @INC scan).
-    /// Provides empty search results — useful for standalone diagnostics.
     pub fn new_for_cli() -> Self {
         ModuleIndex {
             cache: Arc::new(DashMap::new()),
@@ -326,10 +394,9 @@ impl ModuleIndex {
 
     // ---- Test-only methods ----
 
-    /// Create a ModuleIndex for testing — no Client, no progress reporting.
     #[cfg(test)]
     pub fn new_for_test() -> Self {
-        let cache: Arc<DashMap<String, Option<ModuleExports>>> = Arc::new(DashMap::new());
+        let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
         let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
@@ -370,22 +437,22 @@ impl ModuleIndex {
     }
 
     /// Direct access to the raw cache DashMap (for CLI warm_cache integration).
-    pub fn cache_raw(&self) -> &DashMap<String, Option<ModuleExports>> {
+    pub fn cache_raw(&self) -> &DashMap<String, Option<Arc<CachedModule>>> {
         &self.cache
     }
 
     /// Insert a module directly into the cache (for CLI and testing).
-    pub fn insert_cache(&self, module_name: &str, exports: Option<ModuleExports>) {
+    pub fn insert_cache(&self, module_name: &str, cached: Option<Arc<CachedModule>>) {
         // Update reverse index.
-        if let Some(ref e) = exports {
-            for func in e.export.iter().chain(e.export_ok.iter()) {
+        if let Some(ref m) = cached {
+            for func in m.analysis.export.iter().chain(m.analysis.export_ok.iter()) {
                 self.reverse_index
                     .entry(func.clone())
                     .or_default()
                     .push(module_name.to_string());
             }
         }
-        self.cache.insert(module_name.to_string(), exports);
+        self.cache.insert(module_name.to_string(), cached);
     }
 
     /// Block until `module_name` appears in the cache, or timeout.
@@ -409,9 +476,9 @@ impl ModuleIndex {
         }
     }
 
-    /// Get exports synchronously. WARNING: Does blocking I/O. Only for tests.
+    /// Get cached module synchronously. WARNING: Does blocking I/O. Only for tests.
     #[cfg(test)]
-    pub fn get_exports(&self, module_name: &str) -> Option<ModuleExports> {
+    pub fn get_cached_blocking(&self, module_name: &str) -> Option<Arc<CachedModule>> {
         if let Some(entry) = self.cache.get(module_name) {
             return entry.clone();
         }
@@ -434,10 +501,39 @@ impl ModuleIndex {
     }
 }
 
+// ---- Module-level helpers ----
+
+/// Return the parents of the primary package of a module, preferring the
+/// package with the same name as `module_name` and falling back to the
+/// single-package case if only one package exists in the file.
+pub fn primary_package_parents(analysis: &FileAnalysis, module_name: &str) -> Vec<String> {
+    if let Some(parents) = analysis.package_parents.get(module_name) {
+        return parents.clone();
+    }
+    if analysis.package_parents.len() == 1 {
+        if let Some((_pkg, parents)) = analysis.package_parents.iter().next() {
+            return parents.clone();
+        }
+    }
+    Vec::new()
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_source_to_cached(source: &str, module_name: &str) -> Arc<CachedModule> {
+        use tree_sitter::Parser;
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let analysis = crate::builder::build(&tree, source.as_bytes());
+        Arc::new(CachedModule::new(
+            PathBuf::from(format!("/fake/{}.pm", module_name.replace("::", "/"))),
+            Arc::new(analysis),
+        ))
+    }
 
     #[test]
     fn test_resolve_module_list_util() {
@@ -456,20 +552,20 @@ mod tests {
         if idx.inc_paths().is_empty() {
             return;
         }
-        let exports = idx.get_exports("List::Util");
-        assert!(exports.is_some(), "Should parse List::Util exports");
-        let exports = exports.unwrap();
+        let cached = idx.get_cached_blocking("List::Util");
+        assert!(cached.is_some(), "Should parse List::Util");
+        let cached = cached.unwrap();
         assert!(
-            exports.export_ok.contains(&"first".to_string()),
+            cached.analysis.export_ok.contains(&"first".to_string()),
             "List::Util should export_ok 'first', got: {:?}",
-            exports.export_ok
+            cached.analysis.export_ok
         );
         assert!(
-            exports.export_ok.contains(&"any".to_string()),
+            cached.analysis.export_ok.contains(&"any".to_string()),
             "List::Util should export_ok 'any'"
         );
         assert!(
-            exports.export_ok.contains(&"min".to_string()),
+            cached.analysis.export_ok.contains(&"min".to_string()),
             "List::Util should export_ok 'min'"
         );
     }
@@ -492,14 +588,14 @@ mod tests {
             idx.wait_resolved("Carp", std::time::Duration::from_secs(10)),
             "Carp should be resolved via thread"
         );
-        let exports = idx.get_exports_cached("Carp").unwrap();
+        let cached = idx.get_cached("Carp").unwrap();
         assert!(
-            exports.export.contains(&"carp".to_string()),
+            cached.analysis.export.contains(&"carp".to_string()),
             "Carp should export 'carp', got: {:?}",
-            exports.export
+            cached.analysis.export
         );
         assert!(
-            exports.export.contains(&"croak".to_string()),
+            cached.analysis.export.contains(&"croak".to_string()),
             "Carp should export 'croak'"
         );
     }
@@ -507,26 +603,12 @@ mod tests {
     #[test]
     fn test_find_exporters() {
         let idx = ModuleIndex::new_for_test();
-        idx.insert_cache(
-            "Foo::Bar",
-            Some(ModuleExports {
-                path: PathBuf::from("/fake/Foo/Bar.pm"),
-                export: vec!["alpha".into()],
-                export_ok: vec!["beta".into()],
-                subs: HashMap::new(),
-                parents: vec![],
-            }),
-        );
-        idx.insert_cache(
-            "Baz::Qux",
-            Some(ModuleExports {
-                path: PathBuf::from("/fake/Baz/Qux.pm"),
-                export: vec![],
-                export_ok: vec!["beta".into(), "gamma".into()],
-                subs: HashMap::new(),
-                parents: vec![],
-            }),
-        );
+
+        let foobar_src = "package Foo::Bar;\nour @EXPORT = qw(alpha);\nour @EXPORT_OK = qw(beta);\nsub alpha {}\nsub beta {}\n1;";
+        idx.insert_cache("Foo::Bar", Some(parse_source_to_cached(foobar_src, "Foo::Bar")));
+
+        let bazqux_src = "package Baz::Qux;\nour @EXPORT_OK = qw(beta gamma);\nsub beta {}\nsub gamma {}\n1;";
+        idx.insert_cache("Baz::Qux", Some(parse_source_to_cached(bazqux_src, "Baz::Qux")));
 
         assert_eq!(idx.find_exporters("alpha"), vec!["Foo::Bar"]);
         assert_eq!(idx.find_exporters("beta"), vec!["Baz::Qux", "Foo::Bar"]);
@@ -536,18 +618,9 @@ mod tests {
     #[test]
     fn test_find_exporters_uses_reverse_index() {
         let idx = ModuleIndex::new_for_test();
-        idx.insert_cache(
-            "My::Mod",
-            Some(ModuleExports {
-                path: PathBuf::from("/fake/My/Mod.pm"),
-                export: vec!["foo".into()],
-                export_ok: vec!["bar".into()],
-                subs: HashMap::new(),
-                parents: vec![],
-            }),
-        );
+        let src = "package My::Mod;\nour @EXPORT = qw(foo);\nour @EXPORT_OK = qw(bar);\nsub foo {}\nsub bar {}\n1;";
+        idx.insert_cache("My::Mod", Some(parse_source_to_cached(src, "My::Mod")));
 
-        // Verify reverse index was populated.
         assert!(idx.reverse_index.contains_key("foo"));
         assert!(idx.reverse_index.contains_key("bar"));
         assert_eq!(idx.find_exporters("foo"), vec!["My::Mod"]);
@@ -559,36 +632,23 @@ mod tests {
         use crate::file_analysis::InferredType;
 
         let idx = ModuleIndex::new_for_test();
-        let mut subs = HashMap::new();
-        subs.insert("get_config".to_string(), ExportedSub {
-            def_line: 10,
-            params: vec![],
-            is_method: false,
-            return_type: Some(InferredType::HashRef),
-            hash_keys: vec![],
-            doc: None,
-            overloads: vec![],
-        });
-        subs.insert("make_obj".to_string(), ExportedSub {
-            def_line: 20,
-            params: vec![],
-            is_method: false,
-            return_type: Some(InferredType::ClassName("MyClass".into())),
-            hash_keys: vec![],
-            doc: None,
-            overloads: vec![],
-        });
 
-        idx.insert_cache(
-            "Config::DB",
-            Some(ModuleExports {
-                path: PathBuf::from("/fake/Config/DB.pm"),
-                export: vec![],
-                export_ok: vec!["get_config".into(), "make_obj".into()],
-                subs,
-                parents: vec![],
-            }),
-        );
+        // Source with two exported subs with clear return types.
+        let src = r#"
+package Config::DB;
+our @EXPORT_OK = qw(get_config make_obj);
+
+sub get_config {
+    return { host => 'localhost', port => 5432 };
+}
+
+sub make_obj {
+    return MyClass->new;
+}
+
+1;
+"#;
+        idx.insert_cache("Config::DB", Some(parse_source_to_cached(src, "Config::DB")));
 
         assert_eq!(
             idx.get_return_type_cached("get_config"),

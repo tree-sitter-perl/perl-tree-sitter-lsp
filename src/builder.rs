@@ -5416,48 +5416,46 @@ sub transform { }
 
     // ---- Cross-file inheritance tests ----
 
+    /// Build a CachedModule from a synthesized Perl source listing the given subs
+    /// (each as an `sub name { $self }` method) plus optional parent packages.
+    fn fake_cached_for_class(
+        package_name: &str,
+        path: &std::path::Path,
+        subs: &[&str],
+        parents: &[&str],
+    ) -> std::sync::Arc<crate::module_index::CachedModule> {
+        let mut source = format!("package {};\n", package_name);
+        if !parents.is_empty() {
+            source.push_str(&format!("use parent '{}';\n", parents.join("', '")));
+        }
+        for sub in subs {
+            source.push_str(&format!("sub {} {{ my $self = shift; }}\n", sub));
+        }
+        source.push_str("1;\n");
+        let fa = build_fa(&source);
+        std::sync::Arc::new(crate::module_index::CachedModule::new(
+            path.to_path_buf(),
+            std::sync::Arc::new(fa),
+        ))
+    }
+
     #[test]
     fn test_cross_file_inherited_method_completion() {
-        use std::collections::HashMap;
         use std::path::PathBuf;
-        use crate::module_index::{ModuleIndex, ModuleExports, ExportedSub};
+        use crate::module_index::ModuleIndex;
 
         let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
 
         // Grandparent: DBI has `connect`
-        idx.insert_cache("DBI", Some(ModuleExports {
-            path: PathBuf::from("/fake/DBI.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: {
-                let mut s = HashMap::new();
-                s.insert("connect".into(), ExportedSub {
-                    def_line: 10, params: vec![], is_method: true,
-                    return_type: None, hash_keys: vec![], doc: None,
-                    overloads: vec![],
-                });
-                s
-            },
-            parents: vec![],
-        }));
+        idx.insert_cache("DBI", Some(fake_cached_for_class(
+            "DBI", &PathBuf::from("/fake/DBI.pm"), &["connect"], &[],
+        )));
 
         // Parent: DBI::db inherits from DBI, has `prepare`
-        idx.insert_cache("DBI::db", Some(ModuleExports {
-            path: PathBuf::from("/fake/DBI/db.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: {
-                let mut s = HashMap::new();
-                s.insert("prepare".into(), ExportedSub {
-                    def_line: 5, params: vec![], is_method: true,
-                    return_type: None, hash_keys: vec![], doc: None,
-                    overloads: vec![],
-                });
-                s
-            },
-            parents: vec!["DBI".into()],
-        }));
+        idx.insert_cache("DBI::db", Some(fake_cached_for_class(
+            "DBI::db", &PathBuf::from("/fake/DBI/db.pm"), &["prepare"], &["DBI"],
+        )));
 
         // Local code inherits from DBI::db
         let fa = build_fa("
@@ -5475,29 +5473,16 @@ sub transform { }
 
     #[test]
     fn test_cross_file_method_override() {
-        use std::collections::HashMap;
         use std::path::PathBuf;
-        use crate::module_index::{ModuleIndex, ModuleExports, ExportedSub};
+        use crate::module_index::ModuleIndex;
 
         let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
 
         // Parent has `process`
-        idx.insert_cache("Base::Worker", Some(ModuleExports {
-            path: PathBuf::from("/fake/Base/Worker.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: {
-                let mut s = HashMap::new();
-                s.insert("process".into(), ExportedSub {
-                    def_line: 1, params: vec![], is_method: true,
-                    return_type: None, hash_keys: vec![], doc: None,
-                    overloads: vec![],
-                });
-                s
-            },
-            parents: vec![],
-        }));
+        idx.insert_cache("Base::Worker", Some(fake_cached_for_class(
+            "Base::Worker", &PathBuf::from("/fake/Base/Worker.pm"), &["process"], &[],
+        )));
 
         // Local child overrides `process`
         let fa = build_fa("
@@ -5513,31 +5498,29 @@ sub transform { }
 
     #[test]
     fn test_cross_file_return_type_through_inheritance() {
-        use std::collections::HashMap;
         use std::path::PathBuf;
         use crate::file_analysis::InferredType;
-        use crate::module_index::{ModuleIndex, ModuleExports, ExportedSub};
+        use crate::module_index::ModuleIndex;
 
         let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
 
-        idx.insert_cache("Fetcher", Some(ModuleExports {
-            path: PathBuf::from("/fake/Fetcher.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: {
-                let mut s = HashMap::new();
-                s.insert("fetch".into(), ExportedSub {
-                    def_line: 1, params: vec![], is_method: true,
-                    return_type: Some(InferredType::HashRef),
-                    hash_keys: vec!["status".into(), "body".into()],
-                    doc: None,
-                    overloads: vec![],
-                });
-                s
-            },
-            parents: vec![],
-        }));
+        // Parent module whose `fetch` returns a hashref with known keys.
+        let source = r#"
+package Fetcher;
+sub fetch {
+    my $self = shift;
+    return { status => 1, body => 'ok' };
+}
+1;
+"#;
+        let fa_parent = build_fa(source);
+        idx.insert_cache("Fetcher", Some(std::sync::Arc::new(
+            crate::module_index::CachedModule::new(
+                PathBuf::from("/fake/Fetcher.pm"),
+                std::sync::Arc::new(fa_parent),
+            ),
+        )));
 
         let fa = build_fa("
             package MyFetcher;
@@ -5550,20 +5533,16 @@ sub transform { }
 
     #[test]
     fn test_parents_cached() {
-        use std::collections::HashMap;
         use std::path::PathBuf;
-        use crate::module_index::{ModuleIndex, ModuleExports};
+        use crate::module_index::ModuleIndex;
 
         let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
 
-        idx.insert_cache("Child::Mod", Some(ModuleExports {
-            path: PathBuf::from("/fake/Child/Mod.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: HashMap::new(),
-            parents: vec!["Parent::Mod".into(), "Mixin::Role".into()],
-        }));
+        idx.insert_cache("Child::Mod", Some(fake_cached_for_class(
+            "Child::Mod", &PathBuf::from("/fake/Child/Mod.pm"),
+            &[], &["Parent::Mod", "Mixin::Role"],
+        )));
 
         let parents = idx.parents_cached("Child::Mod");
         assert_eq!(parents, vec!["Parent::Mod", "Mixin::Role"]);

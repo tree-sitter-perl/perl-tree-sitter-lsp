@@ -93,16 +93,34 @@ fn build_imported_return_types(
     analysis: &crate::file_analysis::FileAnalysis,
     module_index: &ModuleIndex,
 ) -> (HashMap<String, InferredType>, HashMap<String, Vec<String>>) {
+    use crate::file_analysis::{SymKind, SymbolDetail};
+
     let mut type_map = HashMap::new();
     let mut keys_map = HashMap::new();
     for import in &analysis.imports {
-        if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
-            for (name, sub_info) in &exports.subs {
-                if let Some(ref ty) = sub_info.return_type {
-                    type_map.insert(name.clone(), ty.clone());
+        let cached = match module_index.get_cached(&import.module_name) {
+            Some(c) => c,
+            None => continue,
+        };
+        for sym in &cached.analysis.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                continue;
+            }
+            // Limit to exported names for parity with prior ExportedSub behavior.
+            if !cached.analysis.export.iter().any(|n| n == &sym.name)
+                && !cached.analysis.export_ok.iter().any(|n| n == &sym.name)
+            {
+                continue;
+            }
+            if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
+                if let Some(ref ty) = return_type {
+                    type_map.insert(sym.name.clone(), ty.clone());
                 }
-                if !sub_info.hash_keys.is_empty() {
-                    keys_map.insert(name.clone(), sub_info.hash_keys.clone());
+            }
+            if let Some(sub_info) = cached.sub_info(&sym.name) {
+                let hk = sub_info.hash_keys();
+                if !hk.is_empty() {
+                    keys_map.insert(sym.name.clone(), hk.to_vec());
                 }
             }
         }

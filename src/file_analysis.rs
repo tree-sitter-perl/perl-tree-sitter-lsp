@@ -443,7 +443,7 @@ fn sigil_modifier(sigil: char) -> u32 {
 
 // ---- FileAnalysis ----
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FileAnalysis {
     // Core tables
     pub scopes: Vec<Scope>,
@@ -1013,27 +1013,19 @@ impl FileAnalysis {
             }
             Some(MethodResolution::CrossFile { ref class }) => {
                 module_index.and_then(|idx| {
-                    let exports = idx.get_exports_cached(class)?;
-                    let sub = exports.subs.get(method_name)?;
+                    let cached = idx.get_cached(class)?;
+                    let sub = cached.sub_info(method_name)?;
 
-                    // If no arity info or no overloads, return primary
+                    // If no arity info or no overloads, return primary.
+                    let counts = sub.param_counts();
+                    let has_overloads = counts.len() > 1;
                     let target = match arg_count {
-                        Some(n) if !sub.overloads.is_empty() => n,
-                        _ => return sub.return_type.clone(),
+                        Some(n) if has_overloads => n,
+                        _ => return sub.return_type().cloned(),
                     };
 
-                    // Check primary params
-                    if sub.params.len() == target {
-                        return sub.return_type.clone();
-                    }
-                    // Check overloads
-                    for overload in &sub.overloads {
-                        if overload.params.len() == target {
-                            return overload.return_type.clone();
-                        }
-                    }
-                    // Fallback to primary
-                    sub.return_type.clone()
+                    sub.return_type_for_arity(target).cloned()
+                        .or_else(|| sub.return_type().cloned())
                 })
             }
             None => None,
@@ -1173,22 +1165,28 @@ impl FileAnalysis {
         // Walk cross-file parents
         if let Some(idx) = module_index {
             // Methods from the cross-file module itself
-            if let Some(exports) = idx.get_exports_cached(class_name) {
-                for (name, sub_info) in &exports.subs {
-                    if !seen_names.contains(name) {
-                        seen_names.insert(name.clone());
-                        let kind = if sub_info.is_method { SymKind::Method } else { SymKind::Sub };
-                        let defining = if class_name != original_class { Some(class_name) } else { None };
-                        let detail = self.method_detail(original_class, name, defining, module_index);
-                        candidates.push(CompletionCandidate {
-                            label: name.clone(),
-                            kind,
-                            detail: Some(detail),
-                            insert_text: None,
-                            sort_priority: PRIORITY_LOCAL,
-                            additional_edits: vec![],
-                        });
+            if let Some(cached) = idx.get_cached(class_name) {
+                for sym in &cached.analysis.symbols {
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                        continue;
                     }
+                    if seen_names.contains(&sym.name) {
+                        continue;
+                    }
+                    seen_names.insert(sym.name.clone());
+                    let is_method = sym.kind == SymKind::Method
+                        || matches!(sym.detail, SymbolDetail::Sub { is_method: true, .. });
+                    let kind = if is_method { SymKind::Method } else { SymKind::Sub };
+                    let defining = if class_name != original_class { Some(class_name) } else { None };
+                    let detail = self.method_detail(original_class, &sym.name, defining, module_index);
+                    candidates.push(CompletionCandidate {
+                        label: sym.name.clone(),
+                        kind,
+                        detail: Some(detail),
+                        insert_text: None,
+                        sort_priority: PRIORITY_LOCAL,
+                        additional_edits: vec![],
+                    });
                 }
             }
 
@@ -1525,14 +1523,14 @@ impl FileAnalysis {
                                     }
                                     Some(MethodResolution::CrossFile { ref class }) => {
                                         if let Some(idx) = module_index {
-                                            if let Some(exports) = idx.get_exports_cached(class) {
-                                                if let Some(sub_info) = exports.sub_info(&mr.target_name) {
-                                                    let sig = format_cross_file_signature(&mr.target_name, sub_info);
+                                            if let Some(cached) = idx.get_cached(class) {
+                                                if let Some(sub_info) = cached.sub_info(&mr.target_name) {
+                                                    let sig = format_cross_file_signature(&mr.target_name, &sub_info);
                                                     let mut text = format!("```perl\n{}\n```\n\n*class {} — resolved from `{}`*", sig, class, r.target_name);
-                                                    if let Some(ref rt) = sub_info.return_type {
+                                                    if let Some(rt) = sub_info.return_type() {
                                                         text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
                                                     }
-                                                    if let Some(ref doc) = sub_info.doc {
+                                                    if let Some(doc) = sub_info.doc() {
                                                         text.push_str(&format!("\n\n{}", doc));
                                                     }
                                                     return Some(text);
@@ -1584,19 +1582,19 @@ impl FileAnalysis {
                             }
                             Some(MethodResolution::CrossFile { ref class }) => {
                                 if let Some(idx) = module_index {
-                                    if let Some(exports) = idx.get_exports_cached(class) {
-                                        if let Some(sub_info) = exports.sub_info(&r.target_name) {
+                                    if let Some(cached) = idx.get_cached(class) {
+                                        if let Some(sub_info) = cached.sub_info(&r.target_name) {
                                             let class_label = if class != cn {
                                                 format!("{} (from {})", cn, class)
                                             } else {
                                                 cn.to_string()
                                             };
-                                            let sig = format_cross_file_signature(&r.target_name, sub_info);
+                                            let sig = format_cross_file_signature(&r.target_name, &sub_info);
                                             let mut text = format!("```perl\n{}\n```\n\n*class {}*", sig, class_label);
-                                            if let Some(ref rt) = sub_info.return_type {
+                                            if let Some(rt) = sub_info.return_type() {
                                                 text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
                                             }
-                                            if let Some(ref doc) = sub_info.doc {
+                                            if let Some(doc) = sub_info.doc() {
                                                 text.push_str(&format!("\n\n{}", doc));
                                             }
                                             return Some(text);
@@ -1970,8 +1968,8 @@ impl FileAnalysis {
 
         // Check cross-file parents via ModuleIndex
         if let Some(idx) = module_index {
-            if let Some(exports) = idx.get_exports_cached(class_name) {
-                if exports.subs.contains_key(method_name) {
+            if let Some(cached) = idx.get_cached(class_name) {
+                if cached.has_sub(method_name) {
                     return Some(MethodResolution::CrossFile {
                         class: class_name.to_string(),
                     });
@@ -2012,8 +2010,8 @@ impl FileAnalysis {
         if depth > 20 {
             return None;
         }
-        if let Some(exports) = module_index.get_exports_cached(class_name) {
-            if exports.subs.contains_key(method_name) {
+        if let Some(cached) = module_index.get_cached(class_name) {
+            if cached.has_sub(method_name) {
                 return Some(MethodResolution::CrossFile {
                     class: class_name.to_string(),
                 });
@@ -2349,7 +2347,9 @@ pub enum ResolvedSub<'a> {
     Local(&'a Symbol),
     /// Found in a cross-file module via ModuleIndex.
     CrossFile {
-        params: Vec<crate::module_index::ExportedParam>,
+        params: Vec<ParamInfo>,
+        /// Inferred type per param (parallel to `params`); `None` if unknown.
+        param_types: Vec<Option<InferredType>>,
         is_method: bool,
         hash_keys: Vec<String>,
     },
@@ -2749,26 +2749,22 @@ impl FileAnalysis {
                     param_types: None, // local — use inferred_type() with body_end
                 })
             }
-            ResolvedSub::CrossFile { params: exported_params, is_method: cf_is_method, .. } => {
-                // Collect pre-resolved param types before stripping $self/$class
-                let all_types: Vec<Option<String>> = exported_params.iter()
-                    .map(|p| p.inferred_type.clone())
-                    .collect();
-
-                let mut params: Vec<ParamInfo> = exported_params
-                    .iter()
-                    .map(|p| ParamInfo {
-                        name: p.name.clone(),
-                        default: None,
-                        is_slurpy: p.is_slurpy,
-                    })
+            ResolvedSub::CrossFile {
+                params: cross_params,
+                param_types: cross_param_types,
+                is_method: cf_is_method,
+                ..
+            } => {
+                let mut params: Vec<ParamInfo> = cross_params;
+                let mut param_types: Vec<Option<String>> = cross_param_types
+                    .into_iter()
+                    .map(|t| t.as_ref().map(inferred_type_to_tag))
                     .collect();
 
                 let is_method = is_method || cf_is_method
                     || params.first().map_or(false, |p| p.name == "$self" || p.name == "$class");
 
-                // Strip $self/$class from method params (and their types)
-                let mut param_types = all_types;
+                // Strip $self/$class from method params (and their types).
                 if is_method && !params.is_empty() {
                     let first = &params[0].name;
                     if first == "$self" || first == "$class" {
@@ -2828,13 +2824,9 @@ impl FileAnalysis {
                 }
                 Some(MethodResolution::CrossFile { ref class }) => {
                     if let Some(idx) = module_index {
-                        if let Some(exports) = idx.get_exports_cached(class) {
-                            if let Some(sub_info) = exports.sub_info(name) {
-                                return Some(ResolvedSub::CrossFile {
-                                    params: sub_info.params.clone(),
-                                    is_method: sub_info.is_method,
-                                    hash_keys: sub_info.hash_keys.clone(),
-                                });
+                        if let Some(cached) = idx.get_cached(class) {
+                            if let Some(sub_info) = cached.sub_info(name) {
+                                return Some(cross_file_resolved(&sub_info));
                             }
                         }
                     }
@@ -2856,27 +2848,19 @@ impl FileAnalysis {
             if let Some(idx) = module_index {
                 for import in &self.imports {
                     if import.imported_symbols.iter().any(|s| s == name) {
-                        if let Some(exports) = idx.get_exports_cached(&import.module_name) {
-                            if let Some(sub_info) = exports.sub_info(name) {
-                                return Some(ResolvedSub::CrossFile {
-                                    params: sub_info.params.clone(),
-                                    is_method: sub_info.is_method,
-                                    hash_keys: sub_info.hash_keys.clone(),
-                                });
+                        if let Some(cached) = idx.get_cached(&import.module_name) {
+                            if let Some(sub_info) = cached.sub_info(name) {
+                                return Some(cross_file_resolved(&sub_info));
                             }
                         }
                     }
                 }
                 // Also check @EXPORT (bare imports)
                 for import in &self.imports {
-                    if let Some(exports) = idx.get_exports_cached(&import.module_name) {
-                        if exports.export.iter().any(|s| s == name) {
-                            if let Some(sub_info) = exports.sub_info(name) {
-                                return Some(ResolvedSub::CrossFile {
-                                    params: sub_info.params.clone(),
-                                    is_method: sub_info.is_method,
-                                    hash_keys: sub_info.hash_keys.clone(),
-                                });
+                    if let Some(cached) = idx.get_cached(&import.module_name) {
+                        if cached.analysis.export.iter().any(|s| s == name) {
+                            if let Some(sub_info) = cached.sub_info(name) {
+                                return Some(cross_file_resolved(&sub_info));
                             }
                         }
                     }
@@ -3211,7 +3195,9 @@ pub(crate) fn builtin_first_arg_type(name: &str) -> Option<InferredType> {
     }
 }
 
-/// Serialize an InferredType to a simple string tag for JSON IPC and SQLite storage.
+/// Serialize an InferredType to a simple string tag.
+/// Used by signature help's `param_types` field, which piggy-backs on the
+/// pre-unification string representation for backwards-compatible JSON output.
 pub fn inferred_type_to_tag(ty: &InferredType) -> String {
     match ty {
         InferredType::ClassName(name) => format!("Object:{}", name),
@@ -3225,29 +3211,29 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
     }
 }
 
-/// Deserialize a string tag back to an InferredType.
-pub fn inferred_type_from_tag(tag: &str) -> Option<InferredType> {
-    if let Some(class_name) = tag.strip_prefix("Object:") {
-        return Some(InferredType::ClassName(class_name.to_string()));
-    }
-    match tag {
-        "HashRef" => Some(InferredType::HashRef),
-        "ArrayRef" => Some(InferredType::ArrayRef),
-        "CodeRef" => Some(InferredType::CodeRef),
-        "Regexp" => Some(InferredType::Regexp),
-        "Numeric" => Some(InferredType::Numeric),
-        "String" => Some(InferredType::String),
-        _ => None,
+/// Format a cross-file method signature from a SubInfo view.
+fn format_cross_file_signature(method_name: &str, sub_info: &crate::module_index::SubInfo<'_>) -> String {
+    let params = sub_info.params();
+    if params.is_empty() {
+        format!("sub {}()", method_name)
+    } else {
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        format!("sub {}({})", method_name, names.join(", "))
     }
 }
 
-/// Format a cross-file method signature from ExportedSub metadata.
-fn format_cross_file_signature(method_name: &str, sub_info: &crate::module_index::ExportedSub) -> String {
-    if sub_info.params.is_empty() {
-        format!("sub {}()", method_name)
-    } else {
-        let params: Vec<&str> = sub_info.params.iter().map(|p| p.name.as_str()).collect();
-        format!("sub {}({})", method_name, params.join(", "))
+/// Build a `ResolvedSub::CrossFile` from a SubInfo view, snapshotting owned data.
+fn cross_file_resolved(sub_info: &crate::module_index::SubInfo<'_>) -> ResolvedSub<'static> {
+    let params: Vec<ParamInfo> = sub_info.params().to_vec();
+    let param_types: Vec<Option<InferredType>> = params
+        .iter()
+        .map(|p| sub_info.param_inferred_type(&p.name).cloned())
+        .collect();
+    ResolvedSub::CrossFile {
+        params,
+        param_types,
+        is_method: sub_info.is_method(),
+        hash_keys: sub_info.hash_keys().to_vec(),
     }
 }
 
@@ -3464,43 +3450,6 @@ mod tests {
         assert_eq!(InferredType::Regexp.class_name(), None);
         assert_eq!(InferredType::Numeric.class_name(), None);
         assert_eq!(InferredType::String.class_name(), None);
-    }
-
-    // ---- InferredType serialization roundtrip tests ----
-
-    #[test]
-    fn test_inferred_type_tag_roundtrip() {
-        let cases = vec![
-            InferredType::ClassName("Foo::Bar".into()),
-            InferredType::FirstParam { package: "Baz".into() },
-            InferredType::HashRef,
-            InferredType::ArrayRef,
-            InferredType::CodeRef,
-            InferredType::Regexp,
-            InferredType::Numeric,
-            InferredType::String,
-        ];
-        for ty in &cases {
-            let tag = inferred_type_to_tag(ty);
-            let restored = inferred_type_from_tag(&tag);
-            assert!(restored.is_some(), "Failed to deserialize tag: {}", tag);
-            // Note: FirstParam serializes as Object:X and deserializes as ClassName(X)
-            // This is intentional — cross-file we treat both as object types.
-            match ty {
-                InferredType::FirstParam { package } => {
-                    assert_eq!(restored.unwrap(), InferredType::ClassName(package.clone()));
-                }
-                _ => {
-                    assert_eq!(&restored.unwrap(), ty, "Roundtrip failed for tag: {}", tag);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_inferred_type_from_tag_unknown() {
-        assert_eq!(inferred_type_from_tag("UnknownTag"), None);
-        assert_eq!(inferred_type_from_tag(""), None);
     }
 
     // ---- sub_return_type fallback tests ----

@@ -1,25 +1,29 @@
-//! SQLite persistence for the module cache.
+//! SQLite persistence for the module cache (schema v9).
 //!
-//! Stores resolved module exports to disk so they survive LSP restarts.
-//! Validates entries against mtime + file size to detect stale data.
-//! Invalidates the entire cache when `@INC` changes.
+//! Stores a full `Option<FileAnalysis>` per module, serialized via bincode
+//! and compressed with zstd. Validates entries against mtime + file size to
+//! detect stale data. Invalidates the entire cache when `@INC` changes.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use dashmap::DashMap;
 use rusqlite::{params, Connection};
 
-use crate::file_analysis::{inferred_type_from_tag, inferred_type_to_tag};
-use crate::module_index::{ExportedOverload, ExportedParam, ExportedSub, ModuleExports};
+use crate::file_analysis::FileAnalysis;
+use crate::module_index::CachedModule;
 
-const SCHEMA_VERSION: &str = "8";
+const SCHEMA_VERSION: &str = "9";
 
-/// Bumped when extraction logic changes (new fields, better parsing).
-/// Unlike SCHEMA_VERSION, this doesn't drop the table — stale entries
-/// are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 5;
+/// Bumped when the builder's analysis output changes shape in a way that
+/// invalidates cached blobs. Unlike `SCHEMA_VERSION`, this does not drop
+/// the table — stale entries are re-resolved lazily with priority.
+pub const EXTRACT_VERSION: i64 = 1;
+
+/// zstd compression level for the `analysis` blob. Lower numbers are faster;
+/// 3 is zstd's default and gives a solid space/speed tradeoff.
+const ZSTD_LEVEL: i32 = 3;
 
 pub fn cache_base_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
@@ -89,16 +93,13 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             value TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS modules (
-            module_name  TEXT PRIMARY KEY,
-            path         TEXT NOT NULL,
-            mtime_secs   INTEGER NOT NULL,
-            file_size    INTEGER NOT NULL,
-            export       TEXT NOT NULL,
-            export_ok    TEXT NOT NULL,
-            source       TEXT NOT NULL DEFAULT 'import',
-            subs         TEXT NOT NULL DEFAULT '{}',
-            parents      TEXT NOT NULL DEFAULT '[]',
-            extract_version INTEGER NOT NULL DEFAULT 0
+            module_name      TEXT PRIMARY KEY,
+            path             TEXT NOT NULL,
+            mtime_secs       INTEGER NOT NULL,
+            file_size        INTEGER NOT NULL,
+            source           TEXT NOT NULL DEFAULT 'import',
+            analysis         BLOB,
+            extract_version  INTEGER NOT NULL DEFAULT 0
         );",
     )?;
 
@@ -116,16 +117,13 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             conn.execute_batch("DROP TABLE IF EXISTS modules;")?;
             conn.execute_batch(
                 "CREATE TABLE modules (
-                    module_name  TEXT PRIMARY KEY,
-                    path         TEXT NOT NULL,
-                    mtime_secs   INTEGER NOT NULL,
-                    file_size    INTEGER NOT NULL,
-                    export       TEXT NOT NULL,
-                    export_ok    TEXT NOT NULL,
-                    source       TEXT NOT NULL DEFAULT 'import',
-                    subs         TEXT NOT NULL DEFAULT '{}',
-                    parents      TEXT NOT NULL DEFAULT '[]',
-                    extract_version INTEGER NOT NULL DEFAULT 0
+                    module_name      TEXT PRIMARY KEY,
+                    path             TEXT NOT NULL,
+                    mtime_secs       INTEGER NOT NULL,
+                    file_size        INTEGER NOT NULL,
+                    source           TEXT NOT NULL DEFAULT 'import',
+                    analysis         BLOB,
+                    extract_version  INTEGER NOT NULL DEFAULT 0
                 );",
             )?;
             conn.execute(
@@ -187,12 +185,26 @@ fn mtime_as_secs(path: &std::path::Path) -> Option<(i64, i64)> {
     Some((secs, size))
 }
 
+/// Serialize FileAnalysis via bincode then compress with zstd.
+fn encode_analysis(fa: &FileAnalysis) -> Option<Vec<u8>> {
+    let bin = bincode::serialize(fa).ok()?;
+    zstd::encode_all(bin.as_slice(), ZSTD_LEVEL).ok()
+}
+
+/// Decompress + deserialize an analysis blob.
+fn decode_analysis(blob: &[u8]) -> Option<FileAnalysis> {
+    let bin = zstd::decode_all(blob).ok()?;
+    let mut fa: FileAnalysis = bincode::deserialize(&bin).ok()?;
+    fa.after_deserialize();
+    Some(fa)
+}
+
 pub fn warm_cache(
     conn: &Connection,
-    cache: &DashMap<String, Option<ModuleExports>>,
+    cache: &DashMap<String, Option<Arc<CachedModule>>>,
 ) -> (usize, Vec<String>) {
     let mut stmt = match conn.prepare(
-        "SELECT module_name, path, mtime_secs, file_size, export, export_ok, subs, extract_version, parents FROM modules",
+        "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version FROM modules",
     ) {
         Ok(s) => s,
         Err(_) => return (0, Vec::new()),
@@ -204,11 +216,8 @@ pub fn warm_cache(
             row.get::<_, String>(1)?,
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, i64>(7)?,
-            row.get::<_, String>(8)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, i64>(5)?,
         ))
     }) {
         Ok(r) => r,
@@ -218,9 +227,9 @@ pub fn warm_cache(
     let mut count = 0usize;
     let mut stale_names = Vec::new();
     for row in rows.flatten() {
-        let (module_name, path_str, cached_mtime, cached_size, export_json, export_ok_json, subs_json, row_extract_version, parents_json) = row;
+        let (module_name, path_str, cached_mtime, cached_size, analysis_blob, row_extract_version) = row;
 
-        // Negative sentinel
+        // Negative sentinel: empty path + NULL blob.
         if path_str.is_empty() {
             cache.insert(module_name, None);
             count += 1;
@@ -229,7 +238,7 @@ pub fn warm_cache(
 
         let path = PathBuf::from(&path_str);
 
-        // Validate mtime — skip entries where the file changed on disk
+        // Validate mtime — skip entries where the file changed on disk.
         if let Some((disk_mtime, disk_size)) = mtime_as_secs(&path) {
             if disk_mtime != cached_mtime || disk_size != cached_size {
                 continue;
@@ -238,205 +247,60 @@ pub fn warm_cache(
             continue; // file deleted
         }
 
-        let export: Vec<String> = serde_json::from_str(&export_json).unwrap_or_default();
-        let export_ok: Vec<String> = serde_json::from_str(&export_ok_json).unwrap_or_default();
-
-        // Deserialize subs: JSON map of name → { def_line, params, is_method, return_type, hash_keys }
-        let subs = deserialize_subs_json(&subs_json);
-        let parents: Vec<String> = serde_json::from_str(&parents_json).unwrap_or_default();
-
-        // Check if this entry was produced by an older extraction version
+        // Check extract version — stale entries are still loaded but queued for re-resolve.
         if row_extract_version < EXTRACT_VERSION {
             stale_names.push(module_name.clone());
         }
 
-        if export.is_empty() && export_ok.is_empty() {
-            cache.insert(module_name, None);
-        } else {
-            cache.insert(
-                module_name,
-                Some(ModuleExports {
-                    path,
-                    export,
-                    export_ok,
-                    subs,
-                    parents,
-                }),
-            );
+        match analysis_blob {
+            Some(blob) if !blob.is_empty() => {
+                match decode_analysis(&blob) {
+                    Some(fa) => {
+                        cache.insert(
+                            module_name,
+                            Some(Arc::new(CachedModule::new(path, Arc::new(fa)))),
+                        );
+                        count += 1;
+                    }
+                    None => {
+                        log::warn!("Failed to decode cached analysis for '{}', skipping", module_name);
+                    }
+                }
+            }
+            _ => {
+                // Blob missing / empty — treat as negative sentinel.
+                cache.insert(module_name, None);
+                count += 1;
+            }
         }
-        count += 1;
     }
 
     (count, stale_names)
 }
 
-fn deserialize_subs_json(json_str: &str) -> HashMap<String, ExportedSub> {
-    let obj: HashMap<String, serde_json::Value> = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return HashMap::new(),
-    };
-    obj.into_iter()
-        .filter_map(|(name, val)| {
-            let def_line = val.get("def_line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let is_method = val.get("is_method").and_then(|v| v.as_bool()).unwrap_or(false);
-            let params = val
-                .get("params")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|p| {
-                            Some(ExportedParam {
-                                name: p.get("name")?.as_str()?.to_string(),
-                                is_slurpy: p
-                                    .get("is_slurpy")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false),
-                                inferred_type: p.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let return_type = val
-                .get("return_type")
-                .and_then(|v| v.as_str())
-                .and_then(inferred_type_from_tag);
-            let hash_keys = val
-                .get("hash_keys")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let doc = val.get("doc")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let overloads = val.get("overloads")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|o| {
-                    let ol_params = o.get("params")
-                        .and_then(|p| p.as_array())
-                        .map(|pa| pa.iter().filter_map(|pv| {
-                            Some(ExportedParam {
-                                name: pv.get("name")?.as_str()?.to_string(),
-                                is_slurpy: pv.get("is_slurpy").and_then(|v| v.as_bool()).unwrap_or(false),
-                                inferred_type: pv.get("type").and_then(|v| v.as_str()).map(String::from),
-                            })
-                        }).collect())
-                        .unwrap_or_default();
-                    let ol_rt = o.get("return_type")
-                        .and_then(|v| v.as_str())
-                        .and_then(inferred_type_from_tag);
-                    Some(ExportedOverload { params: ol_params, return_type: ol_rt })
-                }).collect())
-                .unwrap_or_default();
-            Some((
-                name,
-                ExportedSub {
-                    def_line,
-                    params,
-                    is_method,
-                    return_type,
-                    hash_keys,
-                    doc,
-                    overloads,
-                },
-            ))
-        })
-        .collect()
-}
-
 pub fn save_to_db(
     conn: &Connection,
     module_name: &str,
-    result: &Option<ModuleExports>,
+    result: &Option<Arc<CachedModule>>,
     source: &str,
 ) {
-    let (path_str, mtime, size, export_json, export_ok_json, subs_json, parents_json) = match result {
-        Some(exports) => {
-            let (mtime, size) = mtime_as_secs(&exports.path).unwrap_or((0, 0));
-            let ej = serde_json::to_string(&exports.export).unwrap_or_default();
-            let eoj = serde_json::to_string(&exports.export_ok).unwrap_or_default();
-            let sj = serialize_subs_json(&exports.subs);
-            let pj = serde_json::to_string(&exports.parents).unwrap_or_else(|_| "[]".to_string());
-            (
-                exports.path.to_string_lossy().to_string(),
-                mtime,
-                size,
-                ej,
-                eoj,
-                sj,
-                pj,
-            )
+    let (path_str, mtime, size, analysis_blob) = match result {
+        Some(cached) => {
+            let (mtime, size) = mtime_as_secs(&cached.path).unwrap_or((0, 0));
+            let blob = encode_analysis(&cached.analysis);
+            (cached.path.to_string_lossy().to_string(), mtime, size, blob)
         }
-        None => (
-            String::new(),
-            0i64,
-            0i64,
-            "[]".to_string(),
-            "[]".to_string(),
-            "{}".to_string(),
-            "[]".to_string(),
-        ),
+        None => (String::new(), 0i64, 0i64, None),
     };
 
     let r = conn.execute(
-        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, source, subs, parents, extract_version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![module_name, path_str, mtime, size, export_json, export_ok_json, source, subs_json, parents_json, EXTRACT_VERSION],
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, source, analysis, extract_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![module_name, path_str, mtime, size, source, analysis_blob, EXTRACT_VERSION],
     );
     if let Err(e) = r {
         log::warn!("Failed to save module cache for '{}': {}", module_name, e);
     }
-}
-
-fn serialize_subs_json(subs: &HashMap<String, ExportedSub>) -> String {
-    let mut map = serde_json::Map::new();
-    for (name, sub_info) in subs {
-        let mut obj = serde_json::Map::new();
-        obj.insert("def_line".into(), sub_info.def_line.into());
-        obj.insert("is_method".into(), sub_info.is_method.into());
-        let params: Vec<serde_json::Value> = sub_info
-            .params
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "name": p.name,
-                    "is_slurpy": p.is_slurpy,
-                })
-            })
-            .collect();
-        obj.insert("params".into(), params.into());
-        if let Some(ref rt) = sub_info.return_type {
-            obj.insert(
-                "return_type".into(),
-                serde_json::Value::String(inferred_type_to_tag(rt)),
-            );
-        }
-        if !sub_info.hash_keys.is_empty() {
-            obj.insert("hash_keys".into(), serde_json::json!(sub_info.hash_keys));
-        }
-        if let Some(ref doc) = sub_info.doc {
-            obj.insert("doc".into(), serde_json::Value::String(doc.clone()));
-        }
-        if !sub_info.overloads.is_empty() {
-            let overloads: Vec<serde_json::Value> = sub_info.overloads.iter().map(|ol| {
-                let ol_params: Vec<serde_json::Value> = ol.params.iter().map(|p| {
-                    let mut pobj = serde_json::json!({ "name": p.name, "is_slurpy": p.is_slurpy });
-                    if let Some(ref t) = p.inferred_type {
-                        pobj["type"] = serde_json::Value::String(t.clone());
-                    }
-                    pobj
-                }).collect();
-                let mut ol_obj = serde_json::json!({ "params": ol_params });
-                if let Some(ref rt) = ol.return_type {
-                    ol_obj["return_type"] = serde_json::Value::String(inferred_type_to_tag(rt));
-                }
-                ol_obj
-            }).collect();
-            obj.insert("overloads".into(), overloads.into());
-        }
-        map.insert(name.clone(), obj.into());
-    }
-    serde_json::Value::Object(map).to_string()
 }
 
 #[cfg(test)]
@@ -450,33 +314,35 @@ mod tests {
         conn
     }
 
+    fn parse_source_to_cached(source: &str, path: &std::path::Path) -> Arc<CachedModule> {
+        use tree_sitter::Parser;
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let fa = crate::builder::build(&tree, source.as_bytes());
+        Arc::new(CachedModule::new(path.to_path_buf(), Arc::new(fa)))
+    }
+
     #[test]
     fn test_db_save_and_load_roundtrip() {
         let conn = test_db();
-
         let dir = std::env::temp_dir();
-        let pm = dir.join("TestModule.pm");
-        std::fs::write(&pm, "package TestModule; 1;").unwrap();
+        let pm = dir.join("TestModule_roundtrip.pm");
+        std::fs::write(&pm, "package TestModule;\nour @EXPORT = qw(foo bar);\nour @EXPORT_OK = qw(baz);\nsub foo { 1 }\nsub bar { 2 }\nsub baz { 3 }\n1;\n").unwrap();
 
-        let exports = Some(ModuleExports {
-            path: pm.clone(),
-            export: vec!["foo".into(), "bar".into()],
-            export_ok: vec!["baz".into()],
-            subs: HashMap::new(),
-            parents: vec![],
-        });
-        save_to_db(&conn, "TestModule", &exports, "import");
+        let source = std::fs::read_to_string(&pm).unwrap();
+        let cached = Some(parse_source_to_cached(&source, &pm));
+        save_to_db(&conn, "TestModule", &cached, "import");
 
-        let cache = DashMap::new();
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
         let (n, stale) = warm_cache(&conn, &cache);
         assert_eq!(n, 1);
         assert!(stale.is_empty());
 
         let loaded = cache.get("TestModule").unwrap();
         let loaded = loaded.as_ref().unwrap();
-        assert_eq!(loaded.export, vec!["foo", "bar"]);
-        assert_eq!(loaded.export_ok, vec!["baz"]);
-        assert_eq!(loaded.path, pm);
+        assert_eq!(loaded.analysis.export, vec!["foo", "bar"]);
+        assert_eq!(loaded.analysis.export_ok, vec!["baz"]);
 
         let _ = std::fs::remove_file(&pm);
     }
@@ -486,7 +352,7 @@ mod tests {
         let conn = test_db();
         save_to_db(&conn, "Nonexistent::Module", &None, "import");
 
-        let cache = DashMap::new();
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
         let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 1);
 
@@ -499,22 +365,17 @@ mod tests {
         let conn = test_db();
 
         let dir = std::env::temp_dir();
-        let pm = dir.join("StaleModule.pm");
-        std::fs::write(&pm, "v1").unwrap();
+        let pm = dir.join("StaleModule_v9.pm");
+        std::fs::write(&pm, "package StaleModule;\nour @EXPORT_OK = qw(old);\nsub old {}\n1;\n").unwrap();
 
-        let exports = Some(ModuleExports {
-            path: pm.clone(),
-            export: vec!["old".into()],
-            export_ok: vec![],
-            subs: HashMap::new(),
-            parents: vec![],
-        });
-        save_to_db(&conn, "StaleModule", &exports, "import");
+        let source = std::fs::read_to_string(&pm).unwrap();
+        let cached = Some(parse_source_to_cached(&source, &pm));
+        save_to_db(&conn, "StaleModule", &cached, "import");
 
         std::thread::sleep(std::time::Duration::from_secs(1));
-        std::fs::write(&pm, "v2 with more content").unwrap();
+        std::fs::write(&pm, "package StaleModule;\nour @EXPORT_OK = qw(v2 with more content);\n1;\n").unwrap();
 
-        let cache = DashMap::new();
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
         let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 0, "stale entry should not be loaded");
         assert!(!cache.contains_key("StaleModule"));
@@ -535,7 +396,7 @@ mod tests {
         save_to_db(&conn, "Foo", &None, "import");
 
         validate_inc_paths(&conn, &paths2).unwrap();
-        let cache = DashMap::new();
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
         let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 0, "cache should be empty after @INC change");
     }
@@ -552,105 +413,30 @@ mod tests {
         save_to_db(&conn, "OldModule", &None, "import");
 
         init_schema(&conn).unwrap();
-        let cache = DashMap::new();
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
         let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 0, "old data should be gone after migration");
-    }
-
-    #[test]
-    fn test_db_migration_old_to_v5_supports_subs() {
-        // Simulate an old database (different schema version)
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('schema_version', '4');
-             CREATE TABLE modules (
-                 module_name TEXT PRIMARY KEY,
-                 path        TEXT NOT NULL,
-                 mtime_secs  INTEGER NOT NULL,
-                 file_size   INTEGER NOT NULL,
-                 export      TEXT NOT NULL,
-                 export_ok   TEXT NOT NULL,
-                 source      TEXT NOT NULL DEFAULT 'import',
-                 return_types TEXT NOT NULL DEFAULT '{}',
-                 hash_keys    TEXT NOT NULL DEFAULT '{}'
-             );",
-        )
-        .unwrap();
-
-        // Run migration
-        init_schema(&conn).unwrap();
-
-        // Now save with subs — should not fail
-        let dir = std::env::temp_dir();
-        let pm = dir.join("MigratedModule.pm");
-        std::fs::write(&pm, "package MigratedModule; 1;").unwrap();
-
-        let mut subs = HashMap::new();
-        subs.insert(
-            "get_data".to_string(),
-            ExportedSub {
-                def_line: 10,
-                params: vec![],
-                is_method: false,
-                return_type: Some(crate::file_analysis::InferredType::HashRef),
-                hash_keys: vec!["host".into()],
-                doc: None,
-                overloads: vec![],
-            },
-        );
-
-        let exports = Some(ModuleExports {
-            path: pm.clone(),
-            export: vec!["get_data".into()],
-            export_ok: vec![],
-            subs,
-            parents: vec![],
-        });
-        save_to_db(&conn, "MigratedModule", &exports, "import");
-
-        // Verify it round-trips
-        let cache = DashMap::new();
-        let (n, _) = warm_cache(&conn, &cache);
-        assert_eq!(n, 1);
-        let loaded = cache.get("MigratedModule").unwrap();
-        let loaded = loaded.as_ref().unwrap();
-        let sub_info = loaded.subs.get("get_data").expect("should have get_data sub");
-        assert_eq!(sub_info.def_line, 10);
-        assert_eq!(
-            sub_info.return_type,
-            Some(crate::file_analysis::InferredType::HashRef),
-            "return_type should survive migration + roundtrip"
-        );
-        assert_eq!(sub_info.hash_keys, vec!["host"]);
-
-        let _ = std::fs::remove_file(&pm);
     }
 
     #[test]
     fn test_db_source_column() {
         let conn = test_db();
         let dir = std::env::temp_dir();
-        let pm = dir.join("SourceTest.pm");
-        std::fs::write(&pm, "package SourceTest; 1;").unwrap();
+        let pm = dir.join("SourceTest_v9.pm");
+        std::fs::write(&pm, "package SourceTest;\nour @EXPORT_OK = qw(foo);\nsub foo {}\n1;\n").unwrap();
 
-        let exports = Some(ModuleExports {
-            path: pm.clone(),
-            export: vec!["foo".into()],
-            export_ok: vec![],
-            subs: HashMap::new(),
-            parents: vec![],
-        });
-        save_to_db(&conn, "SourceTest", &exports, "cpanfile");
+        let source = std::fs::read_to_string(&pm).unwrap();
+        let cached = Some(parse_source_to_cached(&source, &pm));
+        save_to_db(&conn, "SourceTest", &cached, "cpanfile");
 
-        let source: String = conn
+        let source_val: String = conn
             .query_row(
                 "SELECT source FROM modules WHERE module_name = 'SourceTest'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(source, "cpanfile");
+        assert_eq!(source_val, "cpanfile");
 
         let _ = std::fs::remove_file(&pm);
     }
@@ -670,200 +456,32 @@ mod tests {
     }
 
     #[test]
-    fn test_db_subs_roundtrip() {
-        use crate::file_analysis::InferredType;
-
+    fn test_full_file_analysis_survives_roundtrip() {
+        // Verify that FileAnalysis fields lost in the old ModuleExports representation
+        // (refs, type_constraints, call_bindings, full package_parents) now survive.
         let conn = test_db();
-
         let dir = std::env::temp_dir();
-        let pm = dir.join("SubsTest.pm");
-        std::fs::write(&pm, "package SubsTest; 1;").unwrap();
+        let pm = dir.join("Fidelity_v9.pm");
+        std::fs::write(
+            &pm,
+            "package Fidelity;\nuse parent 'Base';\nour @EXPORT_OK = qw(make);\nsub make { return { host => 1, port => 2 } }\n1;\n",
+        )
+        .unwrap();
 
-        let mut subs = HashMap::new();
-        subs.insert(
-            "get_config".to_string(),
-            ExportedSub {
-                def_line: 5,
-                params: vec![
-                    ExportedParam { name: "$path".into(), is_slurpy: false, inferred_type: None },
-                ],
-                is_method: false,
-                return_type: Some(InferredType::HashRef),
-                hash_keys: vec!["host".into(), "port".into()],
-                doc: None,
-                overloads: vec![],
-            },
-        );
-        subs.insert(
-            "make_items".to_string(),
-            ExportedSub {
-                def_line: 20,
-                params: vec![],
-                is_method: false,
-                return_type: Some(InferredType::ArrayRef),
-                hash_keys: vec![],
-                doc: None,
-                overloads: vec![],
-            },
-        );
-        subs.insert(
-            "new_obj".to_string(),
-            ExportedSub {
-                def_line: 30,
-                params: vec![ExportedParam { name: "$class".into(), is_slurpy: false, inferred_type: None }],
-                is_method: true,
-                return_type: Some(InferredType::ClassName("MyObj".into())),
-                hash_keys: vec![],
-                doc: None,
-                overloads: vec![],
-            },
-        );
+        let source = std::fs::read_to_string(&pm).unwrap();
+        let cached = parse_source_to_cached(&source, &pm);
+        let original_refs_count = cached.analysis.refs.len();
+        let original_package_parents = cached.analysis.package_parents.clone();
+        save_to_db(&conn, "Fidelity", &Some(Arc::clone(&cached)), "import");
 
-        let exports = Some(ModuleExports {
-            path: pm.clone(),
-            export: vec!["get_config".into()],
-            export_ok: vec!["make_items".into(), "new_obj".into()],
-            subs,
-            parents: vec![],
-        });
-        save_to_db(&conn, "SubsTest", &exports, "import");
-
-        let cache = DashMap::new();
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
         let (n, _) = warm_cache(&conn, &cache);
         assert_eq!(n, 1);
 
-        let loaded = cache.get("SubsTest").unwrap();
+        let loaded = cache.get("Fidelity").unwrap();
         let loaded = loaded.as_ref().unwrap();
-
-        let gc = loaded.subs.get("get_config").expect("get_config");
-        assert_eq!(gc.def_line, 5);
-        assert_eq!(gc.params.len(), 1);
-        assert_eq!(gc.params[0].name, "$path");
-        assert_eq!(gc.return_type, Some(InferredType::HashRef));
-        assert_eq!(gc.hash_keys, vec!["host", "port"]);
-
-        let mi = loaded.subs.get("make_items").expect("make_items");
-        assert_eq!(mi.def_line, 20);
-        assert_eq!(mi.return_type, Some(InferredType::ArrayRef));
-
-        let no = loaded.subs.get("new_obj").expect("new_obj");
-        assert_eq!(no.def_line, 30);
-        assert!(no.is_method);
-        assert_eq!(no.return_type, Some(InferredType::ClassName("MyObj".into())));
-
-        let _ = std::fs::remove_file(&pm);
-    }
-
-    #[test]
-    fn test_exported_sub_overloads_roundtrip() {
-        use crate::file_analysis::InferredType;
-
-        let mut subs = HashMap::new();
-        subs.insert(
-            "name".to_string(),
-            ExportedSub {
-                def_line: 5,
-                params: vec![], // getter: no params
-                is_method: true,
-                return_type: None,
-                hash_keys: vec![],
-                doc: None,
-                overloads: vec![ExportedOverload {
-                    params: vec![ExportedParam {
-                        name: "$val".into(),
-                        is_slurpy: false,
-                        inferred_type: None,
-                    }],
-                    return_type: Some(InferredType::ClassName("Foo".into())),
-                }],
-            },
-        );
-
-        let json = serialize_subs_json(&subs);
-        let roundtripped = deserialize_subs_json(&json);
-        let rt = roundtripped.get("name").unwrap();
-        assert_eq!(rt.overloads.len(), 1);
-        assert_eq!(rt.overloads[0].params.len(), 1);
-        assert_eq!(rt.overloads[0].params[0].name, "$val");
-        assert_eq!(
-            rt.overloads[0].return_type,
-            Some(InferredType::ClassName("Foo".into()))
-        );
-        // Primary should be preserved
-        assert!(rt.params.is_empty());
-        assert!(rt.return_type.is_none());
-    }
-
-    #[test]
-    fn test_warm_reports_stale_entries() {
-        let conn = test_db();
-        let dir = std::env::temp_dir();
-        let pm = dir.join("StaleExtract.pm");
-        std::fs::write(&pm, "package StaleExtract; 1;").unwrap();
-
-        let (mtime, size) = mtime_as_secs(&pm).unwrap();
-
-        // Save with old extract version (0, below EXTRACT_VERSION)
-        conn.execute(
-            "INSERT INTO modules (module_name, path, mtime_secs, file_size, export, export_ok, subs, extract_version)
-             VALUES ('StaleExtract', ?1, ?2, ?3, '[\"foo\"]', '[]', '{}', 0)",
-            params![pm.to_string_lossy(), mtime, size],
-        ).unwrap();
-
-        let cache = DashMap::new();
-        let (loaded, stale) = warm_cache(&conn, &cache);
-        assert_eq!(loaded, 1, "stale entry should still be loaded");
-        assert!(cache.contains_key("StaleExtract"), "stale entry should be in cache");
-        assert_eq!(stale, vec!["StaleExtract"], "should report as stale");
-
-        let _ = std::fs::remove_file(&pm);
-    }
-
-    #[test]
-    fn test_warm_fresh_not_stale() {
-        let conn = test_db();
-        let dir = std::env::temp_dir();
-        let pm = dir.join("FreshExtract.pm");
-        std::fs::write(&pm, "package FreshExtract; 1;").unwrap();
-
-        let exports = Some(ModuleExports {
-            path: pm.clone(),
-            export: vec!["foo".into()],
-            export_ok: vec![],
-            subs: HashMap::new(),
-            parents: vec![],
-        });
-        save_to_db(&conn, "FreshExtract", &exports, "import");
-
-        let cache = DashMap::new();
-        let (loaded, stale) = warm_cache(&conn, &cache);
-        assert_eq!(loaded, 1);
-        assert!(stale.is_empty(), "current-version entry should not be stale");
-
-        let _ = std::fs::remove_file(&pm);
-    }
-
-    #[test]
-    fn test_save_writes_extract_version() {
-        let conn = test_db();
-        let dir = std::env::temp_dir();
-        let pm = dir.join("VersionedSave.pm");
-        std::fs::write(&pm, "package VersionedSave; 1;").unwrap();
-
-        let exports = Some(ModuleExports {
-            path: pm.clone(),
-            export: vec!["foo".into()],
-            export_ok: vec![],
-            subs: HashMap::new(),
-            parents: vec![],
-        });
-        save_to_db(&conn, "VersionedSave", &exports, "import");
-
-        let ver: i64 = conn.query_row(
-            "SELECT extract_version FROM modules WHERE module_name = 'VersionedSave'",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(ver, EXTRACT_VERSION);
+        assert_eq!(loaded.analysis.refs.len(), original_refs_count, "refs survive roundtrip");
+        assert_eq!(loaded.analysis.package_parents, original_package_parents, "package_parents survive");
 
         let _ = std::fs::remove_file(&pm);
     }

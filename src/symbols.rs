@@ -8,8 +8,8 @@ use crate::file_analysis::{
     OutlineSymbol, RefKind, Span, SymKind as FaSymKind, SymbolDetail,
     PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT, PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
-use crate::module_index::ExportedSub;
-use crate::module_index::ModuleIndex;
+use crate::module_index::{CachedModule, ModuleIndex, SubInfo};
+use std::sync::Arc;
 
 // ---- Coordinate conversion ----
 
@@ -122,12 +122,10 @@ pub fn find_definition(
                 // Jump to the module's use statement in the current file
                 // (or the .pm file if we can resolve it)
                 if let Ok(module_uri) = Url::from_file_path(&module_path) {
-                    // Try to get the actual definition line from the module index
+                    // Try to get the actual definition line from the module index.
                     let def_line = module_index
-                        .get_exports_cached(&import.module_name)
-                        .as_ref()
-                        .and_then(|e| e.sub_info(&r.target_name))
-                        .map(|s| s.def_line);
+                        .get_cached(&import.module_name)
+                        .and_then(|cached| cached.sub_info(&r.target_name).map(|s| s.def_line()));
                     let def_range = match def_line {
                         Some(line) => Range {
                             start: Position { line, character: 0 },
@@ -185,12 +183,13 @@ pub fn find_definition(
             );
             if let Some(ref cn) = class_name {
                 if let Some(MethodResolution::CrossFile { ref class }) = analysis.resolve_method_in_ancestors(cn, &r.target_name, Some(module_index)) {
-                    if let Some(exports) = module_index.get_exports_cached(class) {
-                        if let Some(sub_info) = exports.sub_info(&r.target_name) {
-                            if let Ok(module_uri) = Url::from_file_path(&exports.path) {
+                    if let Some(cached) = module_index.get_cached(class) {
+                        if let Some(sub_info) = cached.sub_info(&r.target_name) {
+                            if let Ok(module_uri) = Url::from_file_path(&cached.path) {
+                                let line = sub_info.def_line();
                                 let def_range = Range {
-                                    start: Position { line: sub_info.def_line, character: 0 },
-                                    end: Position { line: sub_info.def_line, character: 0 },
+                                    start: Position { line, character: 0 },
+                                    end: Position { line, character: 0 },
                                 };
                                 return Some(GotoDefinitionResponse::Scalar(Location {
                                     uri: module_uri,
@@ -403,8 +402,8 @@ fn complete_module_names(prefix: &str, module_index: &ModuleIndex) -> Vec<Comple
 
 /// Complete import list items for `use Module qw(|)`.
 fn complete_import_list(module_name: &str, module_index: &ModuleIndex) -> Vec<CompletionItem> {
-    let exports = match module_index.get_exports_cached(module_name) {
-        Some(e) => e,
+    let cached: Arc<CachedModule> = match module_index.get_cached(module_name) {
+        Some(c) => c,
         None => return vec![CompletionItem {
             label: format!("loading {}...", module_name),
             kind: Some(CompletionItemKind::TEXT),
@@ -418,11 +417,11 @@ fn complete_import_list(module_name: &str, module_index: &ModuleIndex) -> Vec<Co
     let mut items = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    for name in &exports.export {
+    for name in &cached.analysis.export {
         if seen.insert(name.clone()) {
-            let detail = exports.sub_info(name)
-                .and_then(|s| s.return_type.as_ref())
-                .map(|rt| format!("@EXPORT → {}", format_inferred_type(rt)))
+            let detail = cached.sub_info(name)
+                .and_then(|s| s.return_type().cloned())
+                .map(|rt| format!("@EXPORT → {}", format_inferred_type(&rt)))
                 .or(Some("@EXPORT".to_string()));
             items.push(CompletionItem {
                 label: name.clone(),
@@ -434,11 +433,11 @@ fn complete_import_list(module_name: &str, module_index: &ModuleIndex) -> Vec<Co
         }
     }
 
-    for name in &exports.export_ok {
+    for name in &cached.analysis.export_ok {
         if seen.insert(name.clone()) {
-            let detail = exports.sub_info(name)
-                .and_then(|s| s.return_type.as_ref())
-                .map(|rt| format!("→ {}", format_inferred_type(rt)));
+            let detail = cached.sub_info(name)
+                .and_then(|s| s.return_type().cloned())
+                .map(|rt| format!("→ {}", format_inferred_type(&rt)));
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::FUNCTION),
@@ -514,13 +513,13 @@ pub fn hover_info(
             {
                 let mut parts = Vec::new();
 
-                // Show signature if available
-                if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
-                    if let Some(sub_info) = exports.sub_info(&r.target_name) {
-                        let sig = format_imported_signature(&r.target_name, sub_info);
+                // Show signature if available.
+                if let Some(cached) = module_index.get_cached(&import.module_name) {
+                    if let Some(sub_info) = cached.sub_info(&r.target_name) {
+                        let sig = format_imported_signature(&r.target_name, &sub_info);
                         parts.push(format!("```perl\n{}\n```", sig));
-                        if let Some(ref doc) = sub_info.doc {
-                            parts.push(doc.clone());
+                        if let Some(doc) = sub_info.doc() {
+                            parts.push(doc.to_string());
                         }
                     }
                 }
@@ -816,7 +815,7 @@ fn imported_function_completions(
     let mut seen = std::collections::HashSet::new();
 
     for import in &analysis.imports {
-        let exports = module_index.get_exports_cached(&import.module_name);
+        let cached: Option<Arc<CachedModule>> = module_index.get_cached(&import.module_name);
 
         // 1. Always offer explicitly imported symbols (from the qw list)
         for name in &import.imported_symbols {
@@ -826,7 +825,7 @@ fn imported_function_completions(
             if !analysis.symbols_named(name).is_empty() {
                 continue;
             }
-            let detail = completion_detail_for_import(name, exports.as_ref(), &import.module_name);
+            let detail = completion_detail_for_import(name, cached.as_deref(), &import.module_name);
             candidates.push(CompletionCandidate {
                 label: name.clone(),
                 kind: FaSymKind::Sub,
@@ -838,15 +837,16 @@ fn imported_function_completions(
         }
 
         // 2. Offer additional @EXPORT_OK functions (not yet imported) if we can resolve the module
-        if let Some(ref exports) = exports {
+        if let Some(ref cached) = cached {
+            let fa = &cached.analysis;
             let all_exported: Vec<&String> = if import.imported_symbols.is_empty() {
                 // Bare `use Foo;` — offer @EXPORT
-                exports.export.iter().collect()
+                fa.export.iter().collect()
             } else {
                 // `use Foo qw(bar)` — offer remaining @EXPORT + @EXPORT_OK
                 let mut all = Vec::new();
-                all.extend(exports.export.iter());
-                all.extend(exports.export_ok.iter());
+                all.extend(fa.export.iter());
+                all.extend(fa.export_ok.iter());
                 all
             };
 
@@ -859,9 +859,9 @@ fn imported_function_completions(
                     continue;
                 }
 
-                let rt_prefix = exports.sub_info(name)
-                    .and_then(|s| s.return_type.as_ref())
-                    .map(|rt| format!("→ {} ", format_inferred_type(rt)))
+                let rt_prefix = cached.sub_info(name)
+                    .and_then(|s| s.return_type().cloned())
+                    .map(|rt| format!("→ {} ", format_inferred_type(&rt)))
                     .unwrap_or_default();
 
                 let (detail, priority, additional_edits) =
@@ -951,12 +951,13 @@ fn unimported_function_completions(
         },
     };
 
-    module_index.for_each_cached(|module_name, exports| {
+    module_index.for_each_cached(|module_name, cached| {
         if imported_modules.contains(module_name) {
             return;
         }
 
-        let all_exported = exports.export.iter().chain(exports.export_ok.iter());
+        let fa = &cached.analysis;
+        let all_exported = fa.export.iter().chain(fa.export_ok.iter());
         for name in all_exported {
             // Skip functions already defined locally
             if !analysis.symbols_named(name).is_empty() {
@@ -990,12 +991,12 @@ fn resolve_imported_function<'a>(
     module_index: &ModuleIndex,
 ) -> Option<(&'a crate::file_analysis::Import, std::path::PathBuf)> {
     for import in &analysis.imports {
-        if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
+        if let Some(cached) = module_index.get_cached(&import.module_name) {
             let explicitly_imported = import.imported_symbols.iter().any(|s| s == func_name);
-            let in_export_lists = exports.export.iter().any(|s| s == func_name)
-                || exports.export_ok.iter().any(|s| s == func_name);
+            let in_export_lists = cached.analysis.export.iter().any(|s| s == func_name)
+                || cached.analysis.export_ok.iter().any(|s| s == func_name);
             if explicitly_imported || in_export_lists {
-                return Some((import, exports.path.clone()));
+                return Some((import, cached.path.clone()));
             }
         } else if import.imported_symbols.iter().any(|s| s == func_name) {
             // Module not cached yet but explicitly listed in qw() — trust the import.
@@ -1009,12 +1010,12 @@ fn resolve_imported_function<'a>(
 
 fn completion_detail_for_import(
     name: &str,
-    exports: Option<&crate::module_index::ModuleExports>,
+    cached: Option<&CachedModule>,
     module_name: &str,
 ) -> String {
-    if let Some(exports) = exports {
-        if let Some(sub_info) = exports.sub_info(name) {
-            if let Some(ref rt) = sub_info.return_type {
+    if let Some(cached) = cached {
+        if let Some(sub_info) = cached.sub_info(name) {
+            if let Some(rt) = sub_info.return_type() {
                 return format!("→ {} ({})", format_inferred_type(rt), module_name);
             }
         }
@@ -1022,15 +1023,15 @@ fn completion_detail_for_import(
     format!("imported from {}", module_name)
 }
 
-fn format_imported_signature(name: &str, sub_info: &ExportedSub) -> String {
+fn format_imported_signature(name: &str, sub_info: &SubInfo<'_>) -> String {
     let params_str = sub_info
-        .params
+        .params()
         .iter()
         .map(|p| p.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     let mut sig = format!("sub {}({})", name, params_str);
-    if let Some(ref rt) = sub_info.return_type {
+    if let Some(rt) = sub_info.return_type() {
         sig.push_str(&format!(" → {}", format_inferred_type(rt)));
     }
     sig
@@ -1130,8 +1131,8 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
             }
             // Bare `use Foo;` — check if function is in @EXPORT (auto-imported)
             if imp.imported_symbols.is_empty() {
-                if let Some(exports) = module_index.get_exports_cached(&imp.module_name) {
-                    if exports.export.iter().any(|s| s == name) {
+                if let Some(cached) = module_index.get_cached(&imp.module_name) {
+                    if cached.analysis.export.iter().any(|s| s == name) {
                         return true;
                     }
                 }
@@ -1472,6 +1473,30 @@ mod tests {
         builder::build(&tree, source.as_bytes())
     }
 
+    /// Build a CachedModule by parsing a synthesized Perl source listing the given exports.
+    /// Used by tests to seed ModuleIndex with known export lists without real @INC files.
+    fn fake_cached(
+        path: &str,
+        exports: &[&str],
+        exports_ok: &[&str],
+    ) -> std::sync::Arc<crate::module_index::CachedModule> {
+        let mut source = String::from("package Fake;\n");
+        if !exports.is_empty() {
+            source.push_str(&format!("our @EXPORT = qw({});\n", exports.join(" ")));
+        }
+        if !exports_ok.is_empty() {
+            source.push_str(&format!("our @EXPORT_OK = qw({});\n", exports_ok.join(" ")));
+        }
+        for n in exports.iter().chain(exports_ok.iter()) {
+            source.push_str(&format!("sub {} {{}}\n", n));
+        }
+        source.push_str("1;\n");
+        std::sync::Arc::new(crate::module_index::CachedModule::new(
+            std::path::PathBuf::from(path),
+            std::sync::Arc::new(parse_analysis(&source)),
+        ))
+    }
+
     #[test]
     fn test_builtins_sorted() {
         for window in PERL_BUILTINS.windows(2) {
@@ -1631,13 +1656,7 @@ mod tests {
         // Insert directly into cache for testing
         idx.insert_cache(
             "List::Util",
-            Some(crate::module_index::ModuleExports {
-                path: std::path::PathBuf::from("/usr/lib/perl5/List/Util.pm"),
-                export: vec![],
-                export_ok: vec!["first".into(), "max".into(), "min".into()],
-                subs: std::collections::HashMap::new(),
-                parents: vec![],
-            }),
+            Some(fake_cached("/usr/lib/perl5/List/Util.pm", &[], &["first", "max", "min"])),
         );
 
         let tree = crate::document::Document::new(source.to_string()).unwrap().tree;
@@ -1682,23 +1701,11 @@ mod tests {
         idx.set_workspace_root(None);
         idx.insert_cache(
             "List::Util",
-            Some(crate::module_index::ModuleExports {
-                path: std::path::PathBuf::from("/usr/lib/perl5/List/Util.pm"),
-                export: vec![],
-                export_ok: vec!["first".into(), "max".into(), "min".into()],
-                subs: std::collections::HashMap::new(),
-                parents: vec![],
-            }),
+            Some(fake_cached("/usr/lib/perl5/List/Util.pm", &[], &["first", "max", "min"])),
         );
         idx.insert_cache(
             "Scalar::Util",
-            Some(crate::module_index::ModuleExports {
-                path: std::path::PathBuf::from("/usr/lib/perl5/Scalar/Util.pm"),
-                export: vec![],
-                export_ok: vec!["blessed".into(), "reftype".into()],
-                subs: std::collections::HashMap::new(),
-                parents: vec![],
-            }),
+            Some(fake_cached("/usr/lib/perl5/Scalar/Util.pm", &[], &["blessed", "reftype"])),
         );
 
         let tree = crate::document::Document::new(source.to_string()).unwrap().tree;

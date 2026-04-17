@@ -219,11 +219,11 @@ fn cli_check(args: &[String]) {
                 already_cached += 1;
                 continue;
             }
-            if let Some(exports) = module_resolver::resolve_and_parse(&inc_paths, name, &mut parser) {
+            if let Some(cached) = module_resolver::resolve_and_parse(&inc_paths, name, &mut parser) {
                 if let Some(ref conn) = db {
-                    module_cache::save_to_db(conn, name, &Some(exports.clone()), "cli-check");
+                    module_cache::save_to_db(conn, name, &Some(std::sync::Arc::clone(&cached)), "cli-check");
                 }
-                module_index.insert_cache(name, Some(exports));
+                module_index.insert_cache(name, Some(cached));
                 resolved += 1;
             }
         }
