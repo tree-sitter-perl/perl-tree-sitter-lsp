@@ -2999,18 +2999,31 @@ impl<'a> Builder<'a> {
         //
         // We used to reject names containing `:` (qualified calls like
         // `Pkg::Sub::foo()`), which silently dropped those from
-        // `call_bindings` — so hash-key-owner propagation never fired for
-        // any fully-qualified invocation. The fixup downstream strips the
-        // package prefix before looking the sub up in `return_types`, so the
-        // qualifier is fine to pass through here.
+        // `call_bindings`. The fixup downstream strips the package prefix
+        // before looking the sub up in `return_types`, so qualifiers are
+        // fine to pass through here.
+        //
+        // Dynamic calls like `my $fn = 'get_config'; $fn->()` — the parser
+        // yields a function_call_expression with function="$fn". Mirror the
+        // method-call path: try constant folding to recover the concrete
+        // sub name; fall through to None when the variable isn't a known
+        // compile-time constant.
         match node.kind() {
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 let name = crate::file_analysis::extract_call_name(node, self.source)?;
-                if name.starts_with('$') {
-                    None
-                } else {
-                    Some(name)
+                if let Some(stripped) = name.strip_prefix('&') {
+                    // `&$fn()` syntax — same deal.
+                    if stripped.starts_with('$') {
+                        return self.resolve_constant_strings(stripped, 0)
+                            .and_then(|names| names.into_iter().next());
+                    }
+                    return Some(stripped.to_string());
                 }
+                if name.starts_with('$') {
+                    return self.resolve_constant_strings(&name, 0)
+                        .and_then(|names| names.into_iter().next());
+                }
+                Some(name)
             }
             _ => None,
         }
@@ -3485,6 +3498,14 @@ impl<'a> Builder<'a> {
             })
             .collect();
 
+        // Method-call bindings: `my $c = $obj->method()` (including dynamic
+        // `$obj->$m()` where $m was constant-folded during method_call_binding
+        // emission). Same ownership logic as function calls — point $c's
+        // hash-key accesses at the HashKeyDefs inside `method`.
+        let method_binding_map: std::collections::HashMap<&str, String> = self.method_call_bindings.iter()
+            .map(|mcb| (mcb.variable.as_str(), mcb.method_name.clone()))
+            .collect();
+
         for r in &mut self.refs {
             if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
                 if let Some(func_name) = binding_map.get(var_text.as_str()) {
@@ -3497,6 +3518,19 @@ impl<'a> Builder<'a> {
                         package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
                         name: resolved,
                     });
+                } else if let Some(method_name) = method_binding_map.get(var_text.as_str()) {
+                    // Method call — does the method itself own hash keys?
+                    let resolved = walk_return_delegation_chain(
+                        method_name,
+                        &self.sub_return_delegations,
+                        &subs_with_own_keys,
+                    );
+                    if subs_with_own_keys.contains(&resolved) {
+                        *owner = Some(HashKeyOwner::Sub {
+                            package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
+                            name: resolved,
+                        });
+                    }
                 }
             }
         }

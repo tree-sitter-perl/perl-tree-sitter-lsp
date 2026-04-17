@@ -3625,6 +3625,38 @@ mod tests {
         crate::builder::build(&tree, source.as_bytes())
     }
 
+    /// Dynamic method dispatch: `my $m = 'get_config'; __PACKAGE__->$m()`.
+    /// Constant folding recovers the method name "get_config" from the
+    /// string assignment, so the MethodCallBinding fires and $c picks up
+    /// the return type. The access $c->{host} then links to the HashKeyDef.
+    /// This path already worked for method-call types in the old builder;
+    /// the phase 5 tests pin it so we don't regress when we refactor the
+    /// fixup.
+    #[test]
+    fn test_phase5_dynamic_method_call_via_constant_folding() {
+        let fa = build_fa_from_source(r#"
+            package Demo::dyn;
+            sub get_config { return { host => 'localhost', port => 5432 } }
+            my $method = 'get_config';
+            my $c = __PACKAGE__->$method();
+            my $h = $c->{host};
+        "#);
+
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
+        }).expect("HashKeyDef host owned by get_config");
+
+        let indexed = fa.refs_to_symbol(def.id);
+        assert!(
+            !indexed.is_empty(),
+            "dynamic method call via $method='get_config' should link $c->{{host}} back to the def",
+        );
+    }
+
     /// End-to-end demo shape: mirrors `test_files/phase5_demo.pl` so a
     /// regression in the demo surfaces here first. Three access sites all
     /// flow through the qualified `Demo::phase5::get_config()` binding.
