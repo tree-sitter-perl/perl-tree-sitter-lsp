@@ -4,6 +4,7 @@ mod cpanfile;
 mod cursor_context;
 mod document;
 mod file_analysis;
+mod file_store;
 mod module_cache;
 mod module_index;
 mod module_resolver;
@@ -125,13 +126,13 @@ fn parse_point(line_str: &str, col_str: &str) -> tree_sitter::Point {
     tree_sitter::Point::new(line, col)
 }
 
-fn index_workspace(root: &str) -> dashmap::DashMap<std::path::PathBuf, file_analysis::FileAnalysis> {
+fn index_workspace(root: &str) -> file_store::FileStore {
     use std::path::{Path, PathBuf};
     let root_path = Path::new(root).canonicalize().unwrap_or_else(|_| PathBuf::from(root));
-    let ws = dashmap::DashMap::new();
-    let count = module_resolver::index_workspace(&root_path, &ws);
+    let store = file_store::FileStore::new();
+    let count = module_resolver::index_workspace(&root_path, &store);
     eprintln!("Indexed {} files", count);
-    ws
+    store
 }
 
 fn is_json_format(args: &[String]) -> bool {
@@ -199,7 +200,7 @@ fn cli_check(args: &[String]) {
 
         // Collect all unique module names needed
         let mut needed = std::collections::HashSet::new();
-        for entry in ws.iter() {
+        for entry in ws.workspace_raw().iter() {
             for imp in &entry.value().imports {
                 needed.insert(imp.module_name.clone());
             }
@@ -232,7 +233,7 @@ fn cli_check(args: &[String]) {
 
     let mut all_diagnostics = Vec::new();
 
-    for entry in ws.iter() {
+    for entry in ws.workspace_raw().iter() {
         let file = entry.key().display().to_string();
         let diags = symbols::collect_diagnostics(entry.value(), &module_index);
         for d in diags {
@@ -274,7 +275,7 @@ fn cli_check(args: &[String]) {
             eprintln!("{}:{}:{}: {}[{}] {}", file, line, col, severity, code, msg);
         }
         let total = all_diagnostics.len();
-        let files = ws.len();
+        let files = ws.workspace_len();
         eprintln!("{} diagnostics in {} files", total, files);
     }
 
@@ -375,7 +376,7 @@ fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
     if let Some(r) = analysis.ref_at(point) {
         match &r.kind {
             file_analysis::RefKind::FunctionCall | file_analysis::RefKind::MethodCall { .. } => {
-                for entry in ws.iter() {
+                for entry in ws.workspace_raw().iter() {
                     for sym in &entry.value().symbols {
                         if sym.name == r.target_name
                             && matches!(sym.kind, file_analysis::SymKind::Sub | file_analysis::SymKind::Method)
@@ -389,7 +390,7 @@ fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
                 }
             }
             file_analysis::RefKind::PackageRef => {
-                for entry in ws.iter() {
+                for entry in ws.workspace_raw().iter() {
                     for sym in &entry.value().symbols {
                         if sym.name == r.target_name
                             && matches!(sym.kind, file_analysis::SymKind::Package | file_analysis::SymKind::Class)
@@ -440,7 +441,7 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
 
         if is_sub || matches!(r.kind, file_analysis::RefKind::PackageRef) {
             let ws = index_workspace(root);
-            for entry in ws.iter() {
+            for entry in ws.workspace_raw().iter() {
                 if *entry.key() == file_path { continue; }
                 let edits = if is_sub {
                     entry.value().rename_sub(target, target)
@@ -472,11 +473,11 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
     let ws = index_workspace(root);
 
     // Ensure target file is in the workspace index
-    if !ws.contains_key(&file_path) {
+    if ws.get_workspace(&file_path).is_none() {
         let (_source, _tree, analysis) = parse_file(file);
-        ws.insert(file_path.clone(), analysis);
+        ws.insert_workspace(file_path.clone(), analysis);
     }
-    let analysis_ref = ws.get(&file_path).unwrap();
+    let analysis_ref = ws.get_workspace(&file_path).unwrap();
 
     let rename_kind = match analysis_ref.rename_kind_at(point) {
         Some(k) => k,
@@ -507,7 +508,7 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
                 file_analysis::RenameKind::Function(n) | file_analysis::RenameKind::Method(n) => n.clone(),
                 _ => unreachable!(),
             };
-            for entry in ws.iter() {
+            for entry in ws.workspace_raw().iter() {
                 let edits = entry.value().rename_sub(&name, new_name);
                 if !edits.is_empty() {
                     let json_edits: Vec<_> = edits.into_iter()
@@ -522,7 +523,7 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
                 file_analysis::RenameKind::Package(n) => n.clone(),
                 _ => unreachable!(),
             };
-            for entry in ws.iter() {
+            for entry in ws.workspace_raw().iter() {
                 let edits = entry.value().rename_package(&name, new_name);
                 if !edits.is_empty() {
                     let json_edits: Vec<_> = edits.into_iter()
@@ -546,7 +547,7 @@ fn cli_workspace_symbol(root: &str, query: &str) {
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
 
-    for entry in ws.iter() {
+    for entry in ws.workspace_raw().iter() {
         for sym in &entry.value().symbols {
             if sym.name.to_lowercase().contains(&query_lower) {
                 results.push(serde_json::json!({

@@ -450,10 +450,11 @@ pub fn add_project_lib_paths(inc_paths: &mut Vec<PathBuf>, workspace_root: &std:
 
 
 /// Index all Perl files in a workspace directory using Rayon for parallelism.
-/// Returns the number of successfully indexed files.
+/// Populates the workspace role of the shared `FileStore`. Returns the number
+/// of successfully indexed files.
 pub fn index_workspace(
     root: &std::path::Path,
-    index: &DashMap<PathBuf, crate::file_analysis::FileAnalysis>,
+    files: &crate::file_store::FileStore,
 ) -> usize {
     use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
@@ -467,7 +468,7 @@ pub fn index_workspace(
     types_builder.select("perl");
     let types = types_builder.build().unwrap();
 
-    let files: Vec<PathBuf> = WalkBuilder::new(root)
+    let paths: Vec<PathBuf> = WalkBuilder::new(root)
         .types(types)
         .build()
         .filter_map(|e| e.ok())
@@ -478,7 +479,7 @@ pub fn index_workspace(
 
     let count = AtomicUsize::new(0);
 
-    files.par_iter().for_each(|path| {
+    paths.par_iter().for_each(|path| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let source = std::fs::read_to_string(path).ok()?;
             let mut parser = create_parser();
@@ -488,7 +489,7 @@ pub fn index_workspace(
 
         match result {
             Ok(Some(analysis)) => {
-                index.insert(path.clone(), analysis);
+                files.insert_workspace(path.clone(), analysis);
                 count.fetch_add(1, Ordering::Relaxed);
             }
             Ok(None) => { /* parse failed, skip */ }
