@@ -823,6 +823,56 @@ impl FileAnalysis {
             }
         }
 
+        // Phase 5 follow-up: the builder's HashKeyAccess owner fixup only runs
+        // for bindings where the func's return type is known at build time.
+        // Imported funcs aren't in that map; their return types come in via
+        // `imported_returns` here. Retry the fixup now so the consumer-side
+        // `$cfg = Lib::get_config(); $cfg->{host}` access gets its owner set
+        // to Sub{None, "get_config"}, matching the synthetic HashKeyDef we
+        // just injected. Without this, cross-file hash-key references
+        // would silently miss every consumer access.
+        let imported_keyed_subs: std::collections::HashSet<String> = imported_hash_keys
+            .keys()
+            .cloned()
+            .collect();
+        let binding_by_var: std::collections::HashMap<String, String> = self.call_bindings.iter()
+            .filter_map(|b| {
+                let bare = b.func_name.rsplit("::").next().unwrap_or(&b.func_name).to_string();
+                if imported_keyed_subs.contains(&bare) {
+                    Some((b.variable.clone(), bare))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !binding_by_var.is_empty() {
+            for r in &mut self.refs {
+                if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
+                    if owner.is_some() && !matches!(owner, Some(HashKeyOwner::Variable { .. })) {
+                        // Already linked to a real owner by the builder — don't overwrite.
+                        continue;
+                    }
+                    if let Some(func_name) = binding_by_var.get(var_text.as_str()) {
+                        // Only set if the specific key is actually in the
+                        // imported hash_keys for this func — avoids linking
+                        // unrelated `$cfg->{random}` to the imported def.
+                        if let Some(keys) = imported_hash_keys.get(func_name) {
+                            if keys.iter().any(|k| k == &r.target_name) {
+                                *owner = Some(HashKeyOwner::Sub {
+                                    package: None,
+                                    name: func_name.clone(),
+                                });
+                                // Clear resolves_to so the index linker in
+                                // rebuild_enrichment_indices picks it up
+                                // against the newly-injected synthetic def.
+                                r.resolves_to = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Cross-file method call return type resolution
         self.resolve_method_call_types(module_index);
 
@@ -865,7 +915,14 @@ impl FileAnalysis {
         }
     }
 
-    /// Rebuild indices affected by enrichment (type constraints + symbols).
+    /// Rebuild indices affected by enrichment (type constraints + symbols +
+    /// the phase-5 refs_by_target + HashKeyAccess linkage).
+    ///
+    /// Enrichment injects synthetic HashKeyDef symbols for imported subs and
+    /// clears `resolves_to` on HashKeyAccess refs that now have a matching
+    /// owner. This method re-runs the same `(target_name, owner)` linker that
+    /// `build_indices` uses, so `refs_by_target` stays accurate after a
+    /// cross-file hash-key binding resolves.
     fn rebuild_enrichment_indices(&mut self) {
         self.type_constraints_by_var.clear();
         for (i, tc) in self.type_constraints.iter().enumerate() {
@@ -886,6 +943,45 @@ impl FileAnalysis {
                 .entry(sym.scope)
                 .or_default()
                 .push(sym.id);
+        }
+
+        // Re-link HashKeyAccess refs to (possibly newly-injected) HashKeyDef
+        // symbols, mirroring build_indices's phase-5 logic.
+        let hashkey_defs: HashMap<(String, HashKeyOwner), SymbolId> = self.symbols.iter()
+            .filter_map(|sym| {
+                if let SymbolDetail::HashKeyDef { owner, .. } = &sym.detail {
+                    Some(((sym.name.clone(), owner.clone()), sym.id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut hashkey_resolutions: Vec<(usize, SymbolId)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            if r.resolves_to.is_some() {
+                continue;
+            }
+            if let RefKind::HashKeyAccess { owner: Some(owner), .. } = &r.kind {
+                if let Some(&sid) = hashkey_defs.get(&(r.target_name.clone(), owner.clone())) {
+                    hashkey_resolutions.push((i, sid));
+                }
+            }
+        }
+        for (idx, sid) in hashkey_resolutions {
+            self.refs[idx].resolves_to = Some(sid);
+        }
+
+        // Refresh refs_by_name + refs_by_target against the current refs.
+        self.refs_by_name.clear();
+        self.refs_by_target.clear();
+        for (i, r) in self.refs.iter().enumerate() {
+            self.refs_by_name
+                .entry(r.target_name.clone())
+                .or_default()
+                .push(i);
+            if let Some(sym_id) = r.resolves_to {
+                self.refs_by_target.entry(sym_id).or_default().push(i);
+            }
         }
     }
 
@@ -3654,6 +3750,55 @@ mod tests {
         assert!(
             !indexed.is_empty(),
             "dynamic method call via $method='get_config' should link $c->{{host}} back to the def",
+        );
+    }
+
+    /// Cross-file consumer-side resolution (the phase-5 follow-up).
+    /// Consumer has `my $c = Imported::get_config(); $c->{host}`. At build
+    /// time we don't know get_config returns HashRef. Enrichment injects
+    /// synthetic HashKeyDefs and now ALSO retries the HashKeyAccess owner
+    /// fixup + rebuilds refs_by_target. Result: the access links to the
+    /// synthetic def, so rename / references / refs_by_target all work.
+    #[test]
+    fn test_phase5_consumer_side_cross_file_resolves_via_enrichment() {
+        let mut fa = build_fa_from_source(r#"
+            use TestExporter qw(get_config);
+            my $c = get_config();
+            my $h = $c->{host};
+        "#);
+
+        // Sanity: before enrichment the access has no link (there's no
+        // local HashKeyDef for "host" and no local get_config sub).
+        let hka_before = fa.refs.iter().find(|r| {
+            matches!(r.kind, RefKind::HashKeyAccess { .. }) && r.target_name == "host"
+        }).expect("HashKeyAccess host");
+        assert!(hka_before.resolves_to.is_none(),
+            "pre-enrichment, access should not be resolved");
+
+        // Simulate what the Backend's enrich_analysis does after the
+        // module index resolves TestExporter::get_config returning HashRef
+        // with keys { host, port, name }.
+        let mut imported_returns = HashMap::new();
+        imported_returns.insert("get_config".to_string(), InferredType::HashRef);
+        let mut imported_hash_keys = HashMap::new();
+        imported_hash_keys.insert("get_config".to_string(),
+            vec!["host".to_string(), "port".to_string(), "name".to_string()]);
+        fa.enrich_imported_types_with_keys(imported_returns, imported_hash_keys, None);
+
+        // The synthetic HashKeyDef `host` owned by Sub{None, "get_config"}
+        // must now have the access indexed under it.
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { package: None, name }, ..
+                } if name == "get_config")
+        }).expect("synthetic HashKeyDef host");
+
+        let indexed = fa.refs_to_symbol(def.id);
+        assert!(
+            !indexed.is_empty(),
+            "consumer-side $c->{{host}} access should link to synthetic HashKeyDef after enrichment, got empty refs_by_target entry",
         );
     }
 
