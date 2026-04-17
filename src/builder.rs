@@ -23,6 +23,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
         package_parents: std::collections::HashMap::new(),
+        sub_return_delegations: std::collections::HashMap::new(),
         framework_modes: std::collections::HashMap::new(),
         framework_imports: std::collections::HashSet::new(),
         constant_strings: std::collections::HashMap::new(),
@@ -76,6 +77,51 @@ struct ReturnInfo {
     inferred_type: Option<InferredType>,
 }
 
+/// If `return_node` is `return CALL`, where CALL is a simple named function
+/// call or method call, return the bare called name. Otherwise None. Used to
+/// collect hash-key ownership delegation chains for post-pass resolution.
+fn extract_delegated_call_name<'a>(return_node: Node<'a>, source: &'a [u8]) -> Option<String> {
+    // The `return X` node has the expression as its first named child.
+    let expr = return_node.named_child(0)?;
+    let call_name = match expr.kind() {
+        "function_call_expression" | "ambiguous_function_call_expression" => {
+            expr.child_by_field_name("function")?.utf8_text(source).ok()?
+        }
+        "method_call_expression" => {
+            expr.child_by_field_name("method")?.utf8_text(source).ok()?
+        }
+        _ => return None,
+    };
+    // Strip package prefix — delegation is stored by bare sub name to match
+    // the return_types lookup convention.
+    Some(call_name.rsplit("::").next().unwrap_or(call_name).to_string())
+}
+
+/// Walk the delegation chain starting at `start` until we find a sub that
+/// actually owns HashKeyDefs, or run out of links. Cycle-safe via a visited
+/// set; caps at a small depth since delegation chains in real code are short.
+fn walk_return_delegation_chain(
+    start: &str,
+    delegations: &std::collections::HashMap<String, String>,
+    subs_with_own_keys: &std::collections::HashSet<String>,
+) -> String {
+    let mut current = start.to_string();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..10 {
+        if subs_with_own_keys.contains(&current) {
+            return current;
+        }
+        if !seen.insert(current.clone()) {
+            return current; // cycle guard
+        }
+        match delegations.get(&current) {
+            Some(next) => current = next.clone(),
+            None => return current,
+        }
+    }
+    current
+}
+
 struct Builder<'a> {
     source: &'a [u8],
 
@@ -97,6 +143,11 @@ struct Builder<'a> {
     pod_texts: Vec<String>,
     /// Parent classes for each package (from use parent/base, @ISA, class :isa).
     package_parents: std::collections::HashMap<String, Vec<String>>,
+    /// sub_name → delegated sub name, for bodies that are `return other()` or
+    /// a bare trailing call. Used to propagate hash-key ownership through
+    /// intermediate subs so `sub chain { return get_config() }` doesn't
+    /// orphan `$cfg = chain(); $cfg->{host}`.
+    sub_return_delegations: std::collections::HashMap<String, String>,
     /// Framework mode per package (Moo, Moose, MojoBase) for accessor synthesis.
     framework_modes: std::collections::HashMap<String, FrameworkMode>,
     /// Functions implicitly imported by OOP frameworks (has, extends, with, etc.)
@@ -286,6 +337,14 @@ impl<'a> Builder<'a> {
                         scope,
                         inferred_type: ret_type,
                     });
+                    // If the return body is `return other()` (a direct call),
+                    // record the delegation so hash-key ownership can walk
+                    // through the intermediate.
+                    if let Some(sub_name) = self.enclosing_sub_name() {
+                        if let Some(delegated) = extract_delegated_call_name(node, self.source) {
+                            self.sub_return_delegations.insert(sub_name, delegated);
+                        }
+                    }
                 }
                 self.visit_children(node);
             }
@@ -1448,6 +1507,18 @@ impl<'a> Builder<'a> {
                 }
             }
 
+            // Glob assignment inside sub import: *{"$caller::name"} = \&name
+            // Detect custom import() that exports via typeglob manipulation.
+            if left.kind() == "glob" {
+                if self.enclosing_sub_name().as_deref() == Some("import") {
+                    for name in self.extract_glob_export_names(left, node) {
+                        if !self.export.contains(&name) {
+                            self.export.push(name);
+                        }
+                    }
+                }
+            }
+
             // Accumulate array/scalar assignments as constants
             {
                 // Strip leading "our " or "my " to get the variable name
@@ -1943,6 +2014,124 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Extract exported function name(s) from a glob assignment in `sub import`.
+    /// Handles: `*{"${caller}::np"} = \&np`, `*{"$caller\::$imported"} = \&p`,
+    /// `*{$caller . '::confess'} = \&confess`, and loop patterns.
+    /// Returns one or more caller-visible names (from the glob string after "::"),
+    /// falling back to the RHS \&name if the glob name is dynamic.
+    fn extract_glob_export_names(&self, glob_node: Node<'a>, assign_node: Node<'a>) -> Vec<String> {
+        // Try to extract from glob's interpolated string: the name after "::"
+        // AST: glob > varname > block > expression_statement > interpolated_string_literal > string_content
+        let names = self.extract_names_from_glob(glob_node);
+        if !names.is_empty() {
+            return names;
+        }
+
+        // Fallback: extract function name from RHS \&name
+        // AST: refgen_expression > function > varname
+        if let Some(right) = assign_node.child_by_field_name("right") {
+            return self.extract_names_from_refgen(right);
+        }
+        vec![]
+    }
+
+    /// Walk the glob's interpolated string AST to find the exported name(s) after "::".
+    fn extract_names_from_glob(&self, glob_node: Node<'a>) -> Vec<String> {
+        // glob > varname > block > expression_statement > interpolated_string_literal
+        let content = (|| {
+            let varname = glob_node.named_child(0)?;
+            let block = varname.named_child(0)?;
+            let expr_stmt = block.named_child(0)?;
+            let interp = expr_stmt.named_child(0)?;
+            if interp.kind() != "interpolated_string_literal" { return None; }
+            let c = interp.named_child(0)?;
+            if c.kind() == "string_content" { Some(c) } else { None }
+        })();
+        let content = match content {
+            Some(c) => c,
+            None => return vec![],
+        };
+
+        // Walk string_content: find the last "::" in literal segments,
+        // then the part after it is the exported name (literal or variable).
+        let content_bytes = &self.source[content.start_byte()..content.end_byte()];
+        let content_text = match std::str::from_utf8(content_bytes) {
+            Ok(t) => t,
+            Err(_) => return vec![],
+        };
+
+        // Find position of last "::" in the raw content
+        let colons_pos = match content_text.rfind("::") {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let after_colons = colons_pos + 2;
+
+        // Check if there's a named child (scalar variable) that starts after the "::"
+        let last_idx = match content.named_child_count().checked_sub(1) {
+            Some(i) => i,
+            None => return vec![],
+        };
+        let last_child = match content.named_child(last_idx) {
+            Some(c) => c,
+            None => return vec![],
+        };
+        if last_child.kind() == "scalar" && last_child.start_byte() >= content.start_byte() + after_colons {
+            // The name is a variable like $imported or $name — resolve via constant folding.
+            // Use scalar > varname to get the canonical name (without ${} braces).
+            if let Some(varname_node) = last_child.named_child(0) {
+                let bare_name = varname_node.utf8_text(self.source).unwrap_or("");
+                let lookup_key = format!("${}", bare_name);
+                if let Some(values) = self.resolve_constant_strings(&lookup_key, 0) {
+                    return values;
+                }
+            }
+            return vec![];
+        }
+
+        // The name is literal text after "::"
+        let suffix = &content_text[after_colons..];
+        if !suffix.is_empty() && !suffix.starts_with('$') {
+            return vec![suffix.to_string()];
+        }
+
+        vec![]
+    }
+
+    /// Extract bare function name(s) from a `\&name` or `\&$var` refgen expression.
+    fn extract_names_from_refgen(&self, refgen: Node<'a>) -> Vec<String> {
+        if refgen.kind() != "refgen_expression" {
+            return vec![];
+        }
+        let func = match refgen.named_child(0) {
+            Some(f) if f.kind() == "function" => f,
+            _ => return vec![],
+        };
+        // function > varname, possibly containing a scalar child (for \&$name)
+        let varname = match func.named_child(0) {
+            Some(v) => v,
+            None => return vec![],
+        };
+        if let Some(scalar) = varname.named_child(0) {
+            if scalar.kind() == "scalar" {
+                // \&$name — resolve variable via scalar > varname (canonical, no ${} braces)
+                if let Some(scalar_varname) = scalar.named_child(0) {
+                    let bare_name = scalar_varname.utf8_text(self.source).unwrap_or("");
+                    let lookup_key = format!("${}", bare_name);
+                    if let Some(values) = self.resolve_constant_strings(&lookup_key, 0) {
+                        return values;
+                    }
+                }
+                return vec![];
+            }
+        }
+        // Bare name like \&np — varname text is the function name
+        match varname.utf8_text(self.source) {
+            Ok(name) => vec![name.to_string()],
+            Err(_) => vec![],
+        }
+    }
+
     /// Synthesize accessor methods from `has` calls in Moo/Moose/Mojo::Base classes.
     /// Handle Moose/Moo `extends 'Parent::Class', ...` — register parent classes.
     fn visit_extends_call(&mut self, node: Node<'a>, pkg: &str) {
@@ -2190,7 +2379,10 @@ impl<'a> Builder<'a> {
 
         // Synthesize HashKeyDef entries so Foo->new(name => ...) connects to the attribute.
         if let Some(ref _pkg) = self.current_package {
-            let owner = HashKeyOwner::Sub("new".to_string());
+            let owner = HashKeyOwner::Sub {
+                package: self.current_package.clone(),
+                name: "new".to_string(),
+            };
             for (name, sel_span) in &attr_names {
                 self.add_symbol(
                     name.clone(),
@@ -2803,15 +2995,35 @@ impl<'a> Builder<'a> {
     /// Extract the function name from a call expression (function_call or ambiguous_function_call).
     fn extract_call_name(&self, node: Node<'a>) -> Option<String> {
         // Only match actual function calls, not method calls
-        // (method calls are handled by MethodCallBinding)
+        // (method calls are handled by MethodCallBinding).
+        //
+        // We used to reject names containing `:` (qualified calls like
+        // `Pkg::Sub::foo()`), which silently dropped those from
+        // `call_bindings`. The fixup downstream strips the package prefix
+        // before looking the sub up in `return_types`, so qualifiers are
+        // fine to pass through here.
+        //
+        // Dynamic calls like `my $fn = 'get_config'; $fn->()` — the parser
+        // yields a function_call_expression with function="$fn". Mirror the
+        // method-call path: try constant folding to recover the concrete
+        // sub name; fall through to None when the variable isn't a known
+        // compile-time constant.
         match node.kind() {
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 let name = crate::file_analysis::extract_call_name(node, self.source)?;
-                if name.contains(':') || name.starts_with('$') {
-                    None
-                } else {
-                    Some(name)
+                if let Some(stripped) = name.strip_prefix('&') {
+                    // `&$fn()` syntax — same deal.
+                    if stripped.starts_with('$') {
+                        return self.resolve_constant_strings(stripped, 0)
+                            .and_then(|names| names.into_iter().next());
+                    }
+                    return Some(stripped.to_string());
                 }
+                if name.starts_with('$') {
+                    return self.resolve_constant_strings(&name, 0)
+                        .and_then(|names| names.into_iter().next());
+                }
+                Some(name)
             }
             _ => None,
         }
@@ -2912,14 +3124,20 @@ impl<'a> Builder<'a> {
             // Check if this is inside a return expression of a sub
             if ancestor.kind() == "return_expression" {
                 if let Some(name) = self.enclosing_sub_name() {
-                    return Some(HashKeyOwner::Sub(name));
+                    return Some(HashKeyOwner::Sub {
+                        package: self.current_package.clone(),
+                        name,
+                    });
                 }
             }
             // Check if this is the last expression in a sub body (implicit return)
             if ancestor.kind() == "expression_statement" {
                 if self.is_last_statement_in_sub(ancestor) {
                     if let Some(name) = self.enclosing_sub_name() {
-                        return Some(HashKeyOwner::Sub(name));
+                        return Some(HashKeyOwner::Sub {
+                            package: self.current_package.clone(),
+                            name,
+                        });
                     }
                 }
             }
@@ -3187,6 +3405,29 @@ impl<'a> Builder<'a> {
             }
         }
 
+        // Propagate return types through delegation chains. If sub X's body
+        // is `return Y()` (recorded in sub_return_delegations) and Y has a
+        // known return type, X inherits it. Iterate until no changes — chains
+        // converge in at most `delegations.len()` passes.
+        let mut changed = true;
+        let mut iters = 0;
+        while changed && iters < 20 {
+            changed = false;
+            iters += 1;
+            let pairs: Vec<(String, String)> = self.sub_return_delegations.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (delegator, delegate) in pairs {
+                if return_types.contains_key(&delegator) {
+                    continue;
+                }
+                if let Some(t) = return_types.get(&delegate).cloned() {
+                    return_types.insert(delegator, t);
+                    changed = true;
+                }
+            }
+        }
+
         // Set return_type on matching Sub/Method symbols
         for sym in &mut self.symbols {
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
@@ -3220,17 +3461,76 @@ impl<'a> Builder<'a> {
         self.type_constraints.extend(new_constraints);
 
         // Fixup: update HashKeyAccess owners for variables bound to sub calls
-        // that return HashRef. This runs after call binding propagation so the
-        // type constraints are available.
-        let binding_map: std::collections::HashMap<&str, &str> = self.call_bindings.iter()
-            .filter(|b| return_types.get(&b.func_name).map_or(false, |t| *t == InferredType::HashRef))
-            .map(|b| (b.variable.as_str(), b.func_name.as_str()))
+        // that return HashRef. Two normalizations beyond the naive name match:
+        //   1. Call names may be qualified (`Pkg::foo`) — strip the package
+        //      prefix since return_types and the symbol table key on the
+        //      bare name.
+        //   2. The bound func may itself just `return other()` — walk the
+        //      delegation chain to the sub that actually declares the hash
+        //      literal. Otherwise `sub chain { return get_config() }` leaves
+        //      `$cfg = chain(); $cfg->{host}` with an owner that has no
+        //      matching HashKeyDefs.
+        let bare = |s: &str| -> String { s.rsplit("::").next().unwrap_or(s).to_string() };
+
+        let binding_map: std::collections::HashMap<&str, String> = self.call_bindings.iter()
+            .filter(|b| {
+                let name = bare(&b.func_name);
+                return_types.get(&name).map_or(false, |t| *t == InferredType::HashRef)
+            })
+            .map(|b| (b.variable.as_str(), bare(&b.func_name)))
+            .collect();
+
+        let sub_package: std::collections::HashMap<&str, Option<String>> = self.symbols.iter()
+            .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .map(|s| (s.name.as_str(), s.package.clone()))
+            .collect();
+
+        // Which subs have at least one HashKeyDef they actually own?
+        let subs_with_own_keys: std::collections::HashSet<String> = self.symbols.iter()
+            .filter_map(|s| {
+                if let SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } = &s.detail {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Method-call bindings: `my $c = $obj->method()` (including dynamic
+        // `$obj->$m()` where $m was constant-folded during method_call_binding
+        // emission). Same ownership logic as function calls — point $c's
+        // hash-key accesses at the HashKeyDefs inside `method`.
+        let method_binding_map: std::collections::HashMap<&str, String> = self.method_call_bindings.iter()
+            .map(|mcb| (mcb.variable.as_str(), mcb.method_name.clone()))
             .collect();
 
         for r in &mut self.refs {
             if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
                 if let Some(func_name) = binding_map.get(var_text.as_str()) {
-                    *owner = Some(HashKeyOwner::Sub(func_name.to_string()));
+                    let resolved = walk_return_delegation_chain(
+                        func_name,
+                        &self.sub_return_delegations,
+                        &subs_with_own_keys,
+                    );
+                    *owner = Some(HashKeyOwner::Sub {
+                        package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
+                        name: resolved,
+                    });
+                } else if let Some(method_name) = method_binding_map.get(var_text.as_str()) {
+                    // Method call — does the method itself own hash keys?
+                    let resolved = walk_return_delegation_chain(
+                        method_name,
+                        &self.sub_return_delegations,
+                        &subs_with_own_keys,
+                    );
+                    if subs_with_own_keys.contains(&resolved) {
+                        *owner = Some(HashKeyOwner::Sub {
+                            package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
+                            name: resolved,
+                        });
+                    }
                 }
             }
         }
@@ -4313,8 +4613,8 @@ $calc->get_self->get_config->{host};
             .collect();
         assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
         if let SymbolDetail::HashKeyDef { ref owner, .. } = host_defs[0].detail {
-            assert_eq!(*owner, HashKeyOwner::Sub("get_config".to_string()),
-                "implicit return hash key should have Sub(get_config) owner, got {:?}", owner);
+            assert_eq!(*owner, HashKeyOwner::Sub { package: None, name: "get_config".to_string() },
+                "implicit return hash key should have Sub get_config owner, got {:?}", owner);
         }
 
         // Go-to-def from $cfg->{host} should reach the hash key in the implicit return
@@ -4373,8 +4673,8 @@ get_foo()->bar();
             .collect();
         assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
         if let SymbolDetail::HashKeyDef { ref owner, .. } = host_defs[0].detail {
-            assert_eq!(*owner, HashKeyOwner::Sub("get_config".to_string()),
-                "host def should have Sub(get_config) owner, got {:?}", owner);
+            assert_eq!(*owner, HashKeyOwner::Sub { package: None, name: "get_config".to_string() },
+                "host def should have Sub get_config owner, got {:?}", owner);
         }
 
         // Verify HashKeyAccess ref for $cfg->{host} has Sub owner
@@ -4383,8 +4683,8 @@ get_foo()->bar();
             .collect();
         assert!(!host_refs.is_empty(), "should find HashKeyAccess for 'host'");
         if let RefKind::HashKeyAccess { ref owner, .. } = host_refs[0].kind {
-            assert_eq!(*owner, Some(HashKeyOwner::Sub("get_config".to_string())),
-                "host ref should have Sub(get_config) owner, got {:?}", owner);
+            assert_eq!(*owner, Some(HashKeyOwner::Sub { package: None, name: "get_config".to_string() }),
+                "host ref should have Sub get_config owner, got {:?}", owner);
         }
 
         // Verify go-to-references from the def finds the usage
@@ -4556,9 +4856,15 @@ has password => (is => 'rw');
         let names: Vec<&str> = key_defs.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"username"), "should have HashKeyDef for username, got: {:?}", names);
         assert!(names.contains(&"password"), "should have HashKeyDef for password, got: {:?}", names);
-        // Verify owner is "new"
+        // Verify owner is Sub { package: "MyApp", name: "new" }
         if let SymbolDetail::HashKeyDef { ref owner, .. } = key_defs[0].detail {
-            assert_eq!(owner, &HashKeyOwner::Sub("new".to_string()));
+            assert_eq!(
+                owner,
+                &HashKeyOwner::Sub {
+                    package: Some("MyApp".to_string()),
+                    name: "new".to_string(),
+                }
+            );
         }
     }
 
@@ -5286,48 +5592,46 @@ sub transform { }
 
     // ---- Cross-file inheritance tests ----
 
+    /// Build a CachedModule from a synthesized Perl source listing the given subs
+    /// (each as an `sub name { $self }` method) plus optional parent packages.
+    fn fake_cached_for_class(
+        package_name: &str,
+        path: &std::path::Path,
+        subs: &[&str],
+        parents: &[&str],
+    ) -> std::sync::Arc<crate::module_index::CachedModule> {
+        let mut source = format!("package {};\n", package_name);
+        if !parents.is_empty() {
+            source.push_str(&format!("use parent '{}';\n", parents.join("', '")));
+        }
+        for sub in subs {
+            source.push_str(&format!("sub {} {{ my $self = shift; }}\n", sub));
+        }
+        source.push_str("1;\n");
+        let fa = build_fa(&source);
+        std::sync::Arc::new(crate::module_index::CachedModule::new(
+            path.to_path_buf(),
+            std::sync::Arc::new(fa),
+        ))
+    }
+
     #[test]
     fn test_cross_file_inherited_method_completion() {
-        use std::collections::HashMap;
         use std::path::PathBuf;
-        use crate::module_index::{ModuleIndex, ModuleExports, ExportedSub};
+        use crate::module_index::ModuleIndex;
 
         let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
 
         // Grandparent: DBI has `connect`
-        idx.insert_cache("DBI", Some(ModuleExports {
-            path: PathBuf::from("/fake/DBI.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: {
-                let mut s = HashMap::new();
-                s.insert("connect".into(), ExportedSub {
-                    def_line: 10, params: vec![], is_method: true,
-                    return_type: None, hash_keys: vec![], doc: None,
-                    overloads: vec![],
-                });
-                s
-            },
-            parents: vec![],
-        }));
+        idx.insert_cache("DBI", Some(fake_cached_for_class(
+            "DBI", &PathBuf::from("/fake/DBI.pm"), &["connect"], &[],
+        )));
 
         // Parent: DBI::db inherits from DBI, has `prepare`
-        idx.insert_cache("DBI::db", Some(ModuleExports {
-            path: PathBuf::from("/fake/DBI/db.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: {
-                let mut s = HashMap::new();
-                s.insert("prepare".into(), ExportedSub {
-                    def_line: 5, params: vec![], is_method: true,
-                    return_type: None, hash_keys: vec![], doc: None,
-                    overloads: vec![],
-                });
-                s
-            },
-            parents: vec!["DBI".into()],
-        }));
+        idx.insert_cache("DBI::db", Some(fake_cached_for_class(
+            "DBI::db", &PathBuf::from("/fake/DBI/db.pm"), &["prepare"], &["DBI"],
+        )));
 
         // Local code inherits from DBI::db
         let fa = build_fa("
@@ -5345,29 +5649,16 @@ sub transform { }
 
     #[test]
     fn test_cross_file_method_override() {
-        use std::collections::HashMap;
         use std::path::PathBuf;
-        use crate::module_index::{ModuleIndex, ModuleExports, ExportedSub};
+        use crate::module_index::ModuleIndex;
 
         let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
 
         // Parent has `process`
-        idx.insert_cache("Base::Worker", Some(ModuleExports {
-            path: PathBuf::from("/fake/Base/Worker.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: {
-                let mut s = HashMap::new();
-                s.insert("process".into(), ExportedSub {
-                    def_line: 1, params: vec![], is_method: true,
-                    return_type: None, hash_keys: vec![], doc: None,
-                    overloads: vec![],
-                });
-                s
-            },
-            parents: vec![],
-        }));
+        idx.insert_cache("Base::Worker", Some(fake_cached_for_class(
+            "Base::Worker", &PathBuf::from("/fake/Base/Worker.pm"), &["process"], &[],
+        )));
 
         // Local child overrides `process`
         let fa = build_fa("
@@ -5383,31 +5674,29 @@ sub transform { }
 
     #[test]
     fn test_cross_file_return_type_through_inheritance() {
-        use std::collections::HashMap;
         use std::path::PathBuf;
         use crate::file_analysis::InferredType;
-        use crate::module_index::{ModuleIndex, ModuleExports, ExportedSub};
+        use crate::module_index::ModuleIndex;
 
         let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
 
-        idx.insert_cache("Fetcher", Some(ModuleExports {
-            path: PathBuf::from("/fake/Fetcher.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: {
-                let mut s = HashMap::new();
-                s.insert("fetch".into(), ExportedSub {
-                    def_line: 1, params: vec![], is_method: true,
-                    return_type: Some(InferredType::HashRef),
-                    hash_keys: vec!["status".into(), "body".into()],
-                    doc: None,
-                    overloads: vec![],
-                });
-                s
-            },
-            parents: vec![],
-        }));
+        // Parent module whose `fetch` returns a hashref with known keys.
+        let source = r#"
+package Fetcher;
+sub fetch {
+    my $self = shift;
+    return { status => 1, body => 'ok' };
+}
+1;
+"#;
+        let fa_parent = build_fa(source);
+        idx.insert_cache("Fetcher", Some(std::sync::Arc::new(
+            crate::module_index::CachedModule::new(
+                PathBuf::from("/fake/Fetcher.pm"),
+                std::sync::Arc::new(fa_parent),
+            ),
+        )));
 
         let fa = build_fa("
             package MyFetcher;
@@ -5420,20 +5709,16 @@ sub transform { }
 
     #[test]
     fn test_parents_cached() {
-        use std::collections::HashMap;
         use std::path::PathBuf;
-        use crate::module_index::{ModuleIndex, ModuleExports};
+        use crate::module_index::ModuleIndex;
 
         let idx = ModuleIndex::new_for_test();
         idx.set_workspace_root(None);
 
-        idx.insert_cache("Child::Mod", Some(ModuleExports {
-            path: PathBuf::from("/fake/Child/Mod.pm"),
-            export: vec![],
-            export_ok: vec![],
-            subs: HashMap::new(),
-            parents: vec!["Parent::Mod".into(), "Mixin::Role".into()],
-        }));
+        idx.insert_cache("Child::Mod", Some(fake_cached_for_class(
+            "Child::Mod", &PathBuf::from("/fake/Child/Mod.pm"),
+            &[], &["Parent::Mod", "Mixin::Role"],
+        )));
 
         let parents = idx.parents_cached("Child::Mod");
         assert_eq!(parents, vec!["Parent::Mod", "Mixin::Role"]);
@@ -6043,6 +6328,93 @@ use constant ALL => (BASE, 'c');
 our @EXPORT_OK = (ALL);
 ");
         assert_eq!(fa.export_ok, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_glob_export_literal_name() {
+        // Data::Printer pattern: *{"${caller}::np"} = \&np
+        let fa = build_fa(r#"
+package Data::Printer;
+sub np { }
+sub p { }
+sub import {
+    my $class = shift;
+    my $caller = caller;
+    { no strict 'refs';
+        *{"${caller}::p"} = \&p;
+        *{"${caller}::np"} = \&np;
+    }
+}
+"#);
+        assert!(fa.export.contains(&"p".to_string()), "should detect p export: {:?}", fa.export);
+        assert!(fa.export.contains(&"np".to_string()), "should detect np export: {:?}", fa.export);
+    }
+
+    #[test]
+    fn test_glob_export_variable_name() {
+        // Aliased export: my $imported = 'p'; *{"$caller\::$imported"} = \&p
+        let fa = build_fa(r#"
+package Data::Printer;
+sub p { }
+sub import {
+    my $class = shift;
+    my $caller = caller;
+    my $imported = 'dump_it';
+    { no strict 'refs';
+        *{"$caller\::$imported"} = \&p;
+    }
+}
+"#);
+        assert!(fa.export.contains(&"dump_it".to_string()), "should resolve aliased export: {:?}", fa.export);
+    }
+
+    #[test]
+    fn test_glob_export_loop_pattern() {
+        // Try::Tiny pattern: loop over qw list
+        let fa = build_fa(r#"
+package Try::Tiny;
+sub try { }
+sub catch { }
+sub finally { }
+sub import {
+    my $class = shift;
+    my $caller = caller;
+    for my $name (qw(try catch finally)) {
+        no strict 'refs';
+        *{"${caller}::${name}"} = \&$name;
+    }
+}
+"#);
+        assert!(fa.export.contains(&"try".to_string()), "should detect try: {:?}", fa.export);
+        assert!(fa.export.contains(&"catch".to_string()), "should detect catch: {:?}", fa.export);
+        assert!(fa.export.contains(&"finally".to_string()), "should detect finally: {:?}", fa.export);
+    }
+
+    #[test]
+    fn test_glob_export_fallback_to_rhs() {
+        // When glob name is fully dynamic, fall back to \&name on RHS
+        let fa = build_fa(r#"
+package Foo;
+sub bar { }
+sub import {
+    my $caller = caller;
+    *{$caller . '::bar'} = \&bar;
+}
+"#);
+        assert!(fa.export.contains(&"bar".to_string()), "should fall back to RHS name: {:?}", fa.export);
+    }
+
+    #[test]
+    fn test_glob_export_only_inside_import() {
+        // Glob assigns outside sub import should NOT populate exports
+        let fa = build_fa(r#"
+package Foo;
+sub setup {
+    my $caller = caller;
+    *{"${caller}::thing"} = \&thing;
+}
+"#);
+        assert!(fa.export.is_empty(), "should not export from non-import sub: {:?}", fa.export);
     }
 
     #[test]

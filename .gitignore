@@ -2,3 +2,5 @@
 /.nvim-test
 editors/vscode/node_modules/
 editors/vscode/out/
+
+.claude/

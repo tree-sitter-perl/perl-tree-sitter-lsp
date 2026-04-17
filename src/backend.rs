@@ -2,35 +2,32 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::lsp_types::{notification, request};
 use tower_lsp::{Client, LanguageServer};
 
-use crate::document::Document;
 use crate::file_analysis::{FileAnalysis, InferredType};
+use crate::file_store::{FileKey, FileStore};
 use crate::module_index::ModuleIndex;
 use crate::symbols;
 
 pub struct Backend {
     client: Client,
-    documents: Arc<DashMap<Url, Document>>,
+    files: Arc<FileStore>,
     module_index: Arc<ModuleIndex>,
-    workspace_index: Arc<DashMap<PathBuf, FileAnalysis>>,
 }
 
 impl Backend {
     pub fn new(client: Client) -> Self {
-        let documents: Arc<DashMap<Url, Document>> = Arc::new(DashMap::new());
+        let files: Arc<FileStore> = Arc::new(FileStore::new());
 
         // We need Arc<ModuleIndex> so the refresh callback can access it.
-        // Use a two-phase init: create with a placeholder, then wrap in Arc.
+        // Two-phase init: create ModuleIndex whose refresh callback references
+        // a later-set Arc<ModuleIndex>, then wire up the Arc.
         let refresh_client = client.clone();
-        let refresh_docs = Arc::clone(&documents);
+        let refresh_files = Arc::clone(&files);
 
-        // We'll set the module_index into this Arc after creation.
-        // The refresh callback captures Arcs to docs and module_index.
         let module_index_holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>> =
             Arc::new(std::sync::OnceLock::new());
         let holder_clone = Arc::clone(&module_index_holder);
@@ -40,46 +37,58 @@ impl Backend {
         let tokio_handle = tokio::runtime::Handle::current();
         let on_refresh = move || {
             let client = refresh_client.clone();
-            let docs = Arc::clone(&refresh_docs);
+            let files = Arc::clone(&refresh_files);
             let holder = Arc::clone(&holder_clone);
-            // Spawn onto the tokio runtime — can't block the resolver thread.
             tokio_handle.spawn(async move {
                 let module_index = match holder.get() {
                     Some(idx) => idx,
                     None => return,
                 };
-                for mut entry in docs.iter_mut() {
-                    let uri = entry.key().clone();
-                    let (imported_returns, imported_keys) = build_imported_return_types(&entry.analysis, module_index);
-                    entry.analysis.enrich_imported_types_with_keys(imported_returns, imported_keys, Some(module_index));
-                    let diagnostics = symbols::collect_diagnostics(&entry.analysis, module_index);
-                    client.publish_diagnostics(uri, diagnostics, None).await;
+                // Collect (uri, diagnostics) first without holding the store lock
+                // across the await — publishing is async and could deadlock.
+                let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
+                files.for_each_open_mut(|uri, doc| {
+                    let (imported_returns, imported_keys) =
+                        build_imported_return_types(&doc.analysis, module_index);
+                    doc.analysis.enrich_imported_types_with_keys(
+                        imported_returns,
+                        imported_keys,
+                        Some(module_index),
+                    );
+                    let diagnostics = symbols::collect_diagnostics(&doc.analysis, module_index);
+                    pending.push((uri.clone(), diagnostics));
+                });
+                for (uri, diags) in pending {
+                    client.publish_diagnostics(uri, diags, None).await;
                 }
             });
         };
 
         let module_index = Arc::new(ModuleIndex::new(client.clone(), on_refresh));
         let _ = module_index_holder.set(Arc::clone(&module_index));
-        let workspace_index: Arc<DashMap<PathBuf, FileAnalysis>> = Arc::new(DashMap::new());
 
         Backend {
             module_index,
             client,
-            documents,
-            workspace_index,
+            files,
         }
     }
 
     fn enrich_analysis(&self, uri: &Url) {
-        if let Some(mut doc) = self.documents.get_mut(uri) {
-            let (imported_returns, imported_keys) = build_imported_return_types(&doc.analysis, &self.module_index);
-            doc.analysis.enrich_imported_types_with_keys(imported_returns, imported_keys, Some(&self.module_index));
+        if let Some(mut doc) = self.files.get_open_mut(uri) {
+            let (imported_returns, imported_keys) =
+                build_imported_return_types(&doc.analysis, &self.module_index);
+            doc.analysis.enrich_imported_types_with_keys(
+                imported_returns,
+                imported_keys,
+                Some(&self.module_index),
+            );
         }
     }
 
     async fn publish_diagnostics(&self, uri: &Url) {
         self.enrich_analysis(uri);
-        let diagnostics = match self.documents.get(uri) {
+        let diagnostics = match self.files.get_open(uri) {
             Some(doc) => symbols::collect_diagnostics(&doc.analysis, &self.module_index),
             None => vec![],
         };
@@ -89,20 +98,63 @@ impl Backend {
     }
 }
 
+/// Convert a resolve::RefLocation list into the LSP Location list expected by
+/// the `references` response, stable-sorted and deduplicated by (uri, span).
+fn refs_to_locations(results: Vec<crate::resolve::RefLocation>) -> Option<Vec<Location>> {
+    let mut locations: Vec<Location> = results
+        .into_iter()
+        .filter_map(|r| {
+            let uri = r.to_url()?;
+            Some(Location {
+                uri,
+                range: symbols::span_to_range(r.span),
+            })
+        })
+        .collect();
+    if locations.is_empty() {
+        return None;
+    }
+    locations.sort_by(|a, b| {
+        a.uri.as_str().cmp(b.uri.as_str())
+            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
+            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+    });
+    locations.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
+    Some(locations)
+}
+
 fn build_imported_return_types(
     analysis: &crate::file_analysis::FileAnalysis,
     module_index: &ModuleIndex,
 ) -> (HashMap<String, InferredType>, HashMap<String, Vec<String>>) {
+    use crate::file_analysis::{SymKind, SymbolDetail};
+
     let mut type_map = HashMap::new();
     let mut keys_map = HashMap::new();
     for import in &analysis.imports {
-        if let Some(exports) = module_index.get_exports_cached(&import.module_name) {
-            for (name, sub_info) in &exports.subs {
-                if let Some(ref ty) = sub_info.return_type {
-                    type_map.insert(name.clone(), ty.clone());
+        let cached = match module_index.get_cached(&import.module_name) {
+            Some(c) => c,
+            None => continue,
+        };
+        for sym in &cached.analysis.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                continue;
+            }
+            // Limit to exported names for parity with prior ExportedSub behavior.
+            if !cached.analysis.export.iter().any(|n| n == &sym.name)
+                && !cached.analysis.export_ok.iter().any(|n| n == &sym.name)
+            {
+                continue;
+            }
+            if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
+                if let Some(ref ty) = return_type {
+                    type_map.insert(sym.name.clone(), ty.clone());
                 }
-                if !sub_info.hash_keys.is_empty() {
-                    keys_map.insert(name.clone(), sub_info.hash_keys.clone());
+            }
+            if let Some(sub_info) = cached.sub_info(&sym.name) {
+                let hk = sub_info.hash_keys();
+                if !hk.is_empty() {
+                    keys_map.insert(sym.name.clone(), hk.to_vec());
                 }
             }
         }
@@ -221,7 +273,7 @@ impl LanguageServer for Backend {
         let _ = self.client.register_capability(registrations).await;
 
         // Spawn workspace indexing in background with progress reporting
-        let ws_index = Arc::clone(&self.workspace_index);
+        let files = Arc::clone(&self.files);
         let client = self.client.clone();
         let root = self.module_index.workspace_root();
         tokio::task::spawn_blocking(move || {
@@ -249,7 +301,7 @@ impl LanguageServer for Backend {
                         },
                     ));
 
-                    let count = crate::module_resolver::index_workspace(&root_path, &ws_index);
+                    let count = crate::module_resolver::index_workspace(&root_path, &files);
 
                     // End progress
                     rt.block_on(client.send_notification::<notification::Progress>(
@@ -274,18 +326,19 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
-        if let Some(doc) = Document::new(text) {
-            // Enqueue imports for background resolution (non-blocking).
-            for imp in &doc.analysis.imports {
-                self.module_index.request_resolve(&imp.module_name);
-            }
-            // Enqueue parent classes for resolution (inheritance chain).
-            for parents in doc.analysis.package_parents.values() {
-                for parent in parents {
-                    self.module_index.request_resolve(parent);
+        if self.files.open(uri.clone(), text) {
+            if let Some(doc) = self.files.get_open(&uri) {
+                // Enqueue imports for background resolution (non-blocking).
+                for imp in &doc.analysis.imports {
+                    self.module_index.request_resolve(&imp.module_name);
+                }
+                // Enqueue parent classes for resolution (inheritance chain).
+                for parents in doc.analysis.package_parents.values() {
+                    for parent in parents {
+                        self.module_index.request_resolve(parent);
+                    }
                 }
             }
-            self.documents.insert(uri.clone(), doc);
         }
         self.publish_diagnostics(&uri).await;
     }
@@ -293,7 +346,7 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         if let Some(change) = params.content_changes.into_iter().next() {
-            if let Some(mut doc) = self.documents.get_mut(&uri) {
+            if let Some(mut doc) = self.files.get_open_mut(&uri) {
                 doc.update(change.text);
                 // Resolve any new imports that appeared during editing.
                 for imp in &doc.analysis.imports {
@@ -313,7 +366,7 @@ impl LanguageServer for Backend {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         if let Some(text) = params.text {
             let uri = params.text_document.uri;
-            if let Some(mut doc) = self.documents.get_mut(&uri) {
+            if let Some(mut doc) = self.files.get_open_mut(&uri) {
                 doc.update(text);
             }
             self.publish_diagnostics(&uri).await;
@@ -321,7 +374,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.documents.remove(&params.text_document.uri);
+        self.files.close(&params.text_document.uri);
     }
 
     async fn document_symbol(
@@ -329,7 +382,7 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = &params.text_document.uri;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -343,7 +396,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -360,23 +413,119 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let refs = symbols::find_references(&doc.analysis, pos, uri, &doc.tree, &doc.text);
-        if refs.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(refs))
-        }
+
+        // Derive a cross-file target from the rename-kind machinery. If the
+        // target is inherently local (variables), fall back to single-file
+        // references — no cross-file walk to do.
+        use crate::file_analysis::RenameKind;
+        use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
+
+        let point = symbols::position_to_point(pos);
+        let target = match doc.analysis.rename_kind_at(point) {
+            Some(RenameKind::Function(name)) => TargetRef {
+                name,
+                kind: TargetKind::Sub,
+            },
+            Some(RenameKind::Method(name)) => TargetRef {
+                name,
+                kind: TargetKind::Method,
+            },
+            Some(RenameKind::Package(name)) => TargetRef {
+                name,
+                kind: TargetKind::Package,
+            },
+            Some(RenameKind::HashKey(name)) => {
+                // Phase 5: if the cursor is on a HashKeyDef or a HashKeyAccess
+                // whose owner was resolved at build time, do a cross-file walk
+                // keyed on (key name, owner). If we can't determine the owner,
+                // fall back to single-file.
+                use crate::file_analysis::{HashKeyOwner, RefKind, SymbolDetail};
+                let cursor_point = symbols::position_to_point(pos);
+                let owner_from_ref = doc.analysis.ref_at(cursor_point).and_then(|r| {
+                    if let RefKind::HashKeyAccess { owner: Some(o), .. } = &r.kind {
+                        Some(o.clone())
+                    } else {
+                        None
+                    }
+                });
+                let owner_from_sym = doc.analysis.symbol_at(cursor_point).and_then(|s| {
+                    if let SymbolDetail::HashKeyDef { owner, .. } = &s.detail {
+                        Some(owner.clone())
+                    } else {
+                        None
+                    }
+                });
+                let owner = owner_from_ref.or(owner_from_sym);
+
+                match owner {
+                    Some(HashKeyOwner::Sub { package, name: sub_name }) => {
+                        drop(doc);
+                        let results = crate::resolve::refs_to(
+                            &self.files,
+                            Some(&self.module_index),
+                            &crate::resolve::TargetRef {
+                                name,
+                                kind: crate::resolve::TargetKind::HashKeyOfSub {
+                                    package,
+                                    name: sub_name,
+                                },
+                            },
+                            crate::resolve::RoleMask::VISIBLE,
+                        );
+                        return Ok(refs_to_locations(results));
+                    }
+                    Some(HashKeyOwner::Class(class_name)) => {
+                        drop(doc);
+                        let results = crate::resolve::refs_to(
+                            &self.files,
+                            Some(&self.module_index),
+                            &crate::resolve::TargetRef {
+                                name,
+                                kind: crate::resolve::TargetKind::HashKeyOfClass(class_name),
+                            },
+                            crate::resolve::RoleMask::VISIBLE,
+                        );
+                        return Ok(refs_to_locations(results));
+                    }
+                    _ => {
+                        // Fall back to single-file (e.g. keys owned by a lexical
+                        // variable — scope-local by definition).
+                        let refs = symbols::find_references(
+                            &doc.analysis, pos, uri, &doc.tree, &doc.text,
+                        );
+                        return Ok(if refs.is_empty() { None } else { Some(refs) });
+                    }
+                }
+            }
+            Some(RenameKind::Variable) | None => {
+                // Variables are lexical — single-file only.
+                let refs = symbols::find_references(
+                    &doc.analysis, pos, uri, &doc.tree, &doc.text,
+                );
+                return Ok(if refs.is_empty() { None } else { Some(refs) });
+            }
+        };
+
+        // Cross-file walk: workspace + open + deps.
+        drop(doc); // release the DashMap read lock before the resolve walk
+        let results = refs_to(
+            &self.files,
+            Some(&self.module_index),
+            &target,
+            RoleMask::VISIBLE,
+        );
+        Ok(refs_to_locations(results))
     }
 
     async fn prepare_rename(
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
-        let doc = match self.documents.get(&params.text_document.uri) {
+        let doc = match self.files.get_open(&params.text_document.uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -400,7 +549,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let new_name = &params.new_name;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -442,23 +591,16 @@ impl LanguageServer for Backend {
                     }
                 };
 
-                // Search open documents
-                let mut seen_paths = std::collections::HashSet::new();
-                for entry in self.documents.iter() {
-                    if let Ok(path) = entry.key().to_file_path() {
-                        seen_paths.insert(path);
-                    }
-                    collect(entry.key().clone(), &entry.value().analysis);
-                }
-
-                // Search workspace index
-                for entry in self.workspace_index.iter() {
-                    if seen_paths.contains(entry.key()) { continue; }
-                    let ws_uri = Url::from_file_path(entry.key()).unwrap_or_else(|_| {
-                        Url::parse(&format!("file://{}", entry.key().display())).unwrap()
-                    });
-                    collect(ws_uri, entry.value());
-                }
+                // Iterate all file-backed analyses (open + workspace, deduped).
+                self.files.for_each_analysis(|key, analysis| {
+                    let entry_uri = match key {
+                        FileKey::Url(u) => u,
+                        FileKey::Path(p) => Url::from_file_path(&p).unwrap_or_else(|_| {
+                            Url::parse(&format!("file://{}", p.display())).unwrap()
+                        }),
+                    };
+                    collect(entry_uri, analysis);
+                });
 
                 if all_changes.is_empty() {
                     Ok(None)
@@ -476,7 +618,7 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -495,7 +637,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -540,7 +682,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SignatureHelp>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -553,7 +695,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<DocumentHighlight>>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -570,7 +712,7 @@ impl LanguageServer for Backend {
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
         let uri = &params.text_document.uri;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -587,7 +729,7 @@ impl LanguageServer for Backend {
         params: FoldingRangeParams,
     ) -> Result<Option<Vec<FoldingRange>>> {
         let uri = &params.text_document.uri;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -604,7 +746,7 @@ impl LanguageServer for Backend {
         params: DocumentFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
         let uri = &params.text_document.uri;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -686,7 +828,7 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -703,7 +845,7 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = &params.text_document.uri;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -716,7 +858,7 @@ impl LanguageServer for Backend {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -734,37 +876,22 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
         let mut results = Vec::new();
-        let mut seen_paths = std::collections::HashSet::new();
 
-        // Search open documents first (freshest analysis)
-        for entry in self.documents.iter() {
-            let uri = entry.key().clone();
-            if let Ok(path) = uri.to_file_path() {
-                seen_paths.insert(path);
-            }
-            for sym in &entry.value().analysis.symbols {
+        self.files.for_each_analysis(|key, analysis| {
+            let uri = match key {
+                FileKey::Url(u) => u,
+                FileKey::Path(p) => Url::from_file_path(&p).unwrap_or_else(|_| {
+                    Url::parse(&format!("file://{}", p.display())).unwrap()
+                }),
+            };
+            for sym in &analysis.symbols {
                 if sym.name.to_lowercase().contains(&query) {
                     if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
                         results.push(info);
                     }
                 }
             }
-        }
-
-        // Then workspace index (skip files already covered by open docs)
-        for entry in self.workspace_index.iter() {
-            if seen_paths.contains(entry.key()) { continue; }
-            let uri = Url::from_file_path(entry.key()).unwrap_or_else(|_| {
-                Url::parse(&format!("file://{}", entry.key().display())).unwrap()
-            });
-            for sym in &entry.value().symbols {
-                if sym.name.to_lowercase().contains(&query) {
-                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
-                        results.push(info);
-                    }
-                }
-            }
-        }
+        });
 
         if results.is_empty() {
             Ok(None)
@@ -774,7 +901,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let ws_index = Arc::clone(&self.workspace_index);
+        let files = Arc::clone(&self.files);
         tokio::task::spawn_blocking(move || {
             for change in params.changes {
                 let path = match change.uri.to_file_path() {
@@ -783,7 +910,7 @@ impl LanguageServer for Backend {
                 };
                 match change.typ {
                     FileChangeType::DELETED => {
-                        ws_index.remove(&path);
+                        files.remove_workspace(&path);
                     }
                     _ => {
                         // Re-index the file (created or changed)
@@ -791,7 +918,7 @@ impl LanguageServer for Backend {
                             let mut parser = crate::module_resolver::create_parser();
                             if let Some(tree) = parser.parse(&source, None) {
                                 let analysis = crate::builder::build(&tree, source.as_bytes());
-                                ws_index.insert(path, analysis);
+                                files.insert_workspace(path, analysis);
                             }
                         }
                     }
@@ -805,7 +932,7 @@ impl LanguageServer for Backend {
         params: DocumentRangeFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
         let uri = &params.text_document.uri;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
@@ -863,7 +990,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<LinkedEditingRanges>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let doc = match self.documents.get(uri) {
+        let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };

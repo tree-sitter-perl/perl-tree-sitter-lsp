@@ -6,15 +6,48 @@
 //! Designed to compose into a project index: `HashMap<PathBuf, FileAnalysis>`.
 
 use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
 use tree_sitter::Point;
 
 use crate::module_index::ModuleIndex;
 
+// ---- Serde proxy for tree_sitter::Point ----
+
+/// Remote-derive proxy for `tree_sitter::Point`, which doesn't implement serde.
+/// Fields mirror `Point` exactly — use `#[serde(with = "PointDef")]` on Point fields.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Point")]
+pub(crate) struct PointDef {
+    pub row: usize,
+    pub column: usize,
+}
+
+/// Helper module for `Option<Point>` serialization via the remote-derived proxy.
+pub(crate) mod point_opt_serde {
+    use super::PointDef;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tree_sitter::Point;
+
+    pub fn serialize<S: Serializer>(val: &Option<Point>, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct W<'a>(#[serde(with = "PointDef")] &'a Point);
+        val.as_ref().map(W).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Point>, D::Error> {
+        #[derive(Deserialize)]
+        struct W(#[serde(with = "PointDef")] Point);
+        Option::<W>::deserialize(d).map(|o| o.map(|W(p)| p))
+    }
+}
+
 // ---- Shared types (formerly in analysis.rs) ----
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Span {
+    #[serde(with = "PointDef")]
     pub start: Point,
+    #[serde(with = "PointDef")]
     pub end: Point,
 }
 
@@ -40,14 +73,14 @@ pub(crate) fn node_to_span(node: tree_sitter::Node) -> Span {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoldRange {
     pub start_line: usize,
     pub end_line: usize,
     pub kind: FoldKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum FoldKind {
     Region,
@@ -56,15 +89,15 @@ pub enum FoldKind {
 
 // ---- IDs ----
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ScopeId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SymbolId(pub u32);
 
 // ---- Scope ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scope {
     pub id: ScopeId,
     pub parent: Option<ScopeId>,
@@ -76,7 +109,7 @@ pub struct Scope {
     pub package: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum ScopeKind {
     File,
@@ -96,7 +129,7 @@ pub enum ScopeKind {
 
 // ---- Symbol ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub id: SymbolId,
     pub name: String,
@@ -111,7 +144,7 @@ pub struct Symbol {
     pub detail: SymbolDetail,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymKind {
     Variable,
     Sub,
@@ -123,7 +156,7 @@ pub enum SymKind {
     HashKeyDef,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum SymbolDetail {
     Variable {
@@ -155,7 +188,7 @@ pub enum SymbolDetail {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeclKind {
     My,
     Our,
@@ -165,14 +198,14 @@ pub enum DeclKind {
     ForVar,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamInfo {
     pub name: String,
     pub default: Option<String>,
     pub is_slurpy: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct FieldDetail {
     pub name: String,
@@ -182,7 +215,7 @@ pub struct FieldDetail {
 
 // ---- Ref ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ref {
     pub kind: RefKind,
     pub span: Span,
@@ -203,7 +236,7 @@ pub enum RenameKind {
     HashKey(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum RefKind {
     Variable,
@@ -224,7 +257,7 @@ pub enum RefKind {
     ContainerAccess,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessKind {
     Read,
     Write,
@@ -233,7 +266,7 @@ pub enum AccessKind {
 
 // ---- Type constraints ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeConstraint {
     pub variable: String,
     pub scope: ScopeId,
@@ -241,7 +274,7 @@ pub struct TypeConstraint {
     pub inferred_type: InferredType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InferredType {
     /// `$p = Point->new(...)` — variable is an instance of ClassName.
     ClassName(String),
@@ -309,19 +342,24 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
 
 // ---- Hash key owner (for scope graph) ----
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HashKeyOwner {
     Class(String),
     Variable { name: String, def_scope: ScopeId },
-    /// Hash keys from a sub's return value: `sub get_config { return { host => 1 } }`
-    Sub(String),
+    /// Hash keys from a sub's return value: `sub get_config { return { host => 1 } }`.
+    /// `package` is the enclosing Perl package at the sub's declaration site
+    /// (or `None` for top-level script subs where no `package` statement is
+    /// in scope). Without this, two different packages each defining
+    /// `sub get_config { ... host ... }` would collide at query time.
+    Sub { package: Option<String>, name: String },
 }
+
 
 // ---- Call binding ----
 
 /// A variable assigned from a function call: `my $cfg = get_config()`.
 /// Stored in FileAnalysis so query-time resolution can follow the chain.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallBinding {
     pub variable: String,
     pub func_name: String,
@@ -331,7 +369,7 @@ pub struct CallBinding {
 
 /// A method call binding: `$var = $invocant->method()`.
 /// Recorded during build, resolved in post-pass via `find_method_return_type`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MethodCallBinding {
     pub variable: String,
     pub invocant_var: String,
@@ -343,7 +381,7 @@ pub struct MethodCallBinding {
 // ---- Import ----
 
 /// A `use Foo::Bar qw(func1 func2)` statement parsed from the source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Import {
     /// Module name, e.g. "List::Util".
     pub module_name: String,
@@ -353,6 +391,7 @@ pub struct Import {
     pub span: Span,
     /// Position of the closing delimiter of the `qw()` list (the `)` character).
     /// Used to insert new imports into an existing qw list.
+    #[serde(with = "point_opt_serde")]
     pub qw_close_paren: Option<Point>,
 }
 
@@ -409,6 +448,7 @@ fn sigil_modifier(sigil: char) -> u32 {
 
 // ---- FileAnalysis ----
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FileAnalysis {
     // Core tables
     pub scopes: Vec<Scope>,
@@ -437,15 +477,26 @@ pub struct FileAnalysis {
     pub export_ok: Vec<String>,
 
     // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
+    #[serde(default)]
     base_type_constraint_count: usize,
+    #[serde(default)]
     base_symbol_count: usize,
 
-    // Indices (built in post-pass)
+    // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
+    #[serde(skip, default)]
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
+    #[serde(skip, default)]
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
+    #[serde(skip, default)]
     symbols_by_scope: HashMap<ScopeId, Vec<SymbolId>>,
+    #[serde(skip, default)]
     refs_by_name: HashMap<String, Vec<usize>>,
+    #[serde(skip, default)]
     type_constraints_by_var: HashMap<String, Vec<usize>>,
+    /// Refs indexed by the SymbolId they resolve to (phase 5).
+    /// Every query for "refs to symbol X" collapses to an O(1) lookup here.
+    #[serde(skip, default)]
+    refs_by_target: HashMap<SymbolId, Vec<usize>>,
 }
 
 impl FileAnalysis {
@@ -485,12 +536,27 @@ impl FileAnalysis {
             symbols_by_scope: HashMap::new(),
             refs_by_name: HashMap::new(),
             type_constraints_by_var: HashMap::new(),
+            refs_by_target: HashMap::new(),
         };
         fa.build_indices();
         fa.resolve_method_call_types(None); // local post-pass
         fa.base_type_constraint_count = fa.type_constraints.len();
         fa.base_symbol_count = fa.symbols.len();
         fa
+    }
+
+    /// Rebuild all derived indices after deserialization.
+    /// Idempotent: safe to call on a freshly deserialized `FileAnalysis` whose
+    /// index fields were zeroed by `#[serde(skip, default)]`.
+    pub fn after_deserialize(&mut self) {
+        // Clear first in case this is called on a populated FileAnalysis.
+        self.scope_starts.clear();
+        self.symbols_by_name.clear();
+        self.symbols_by_scope.clear();
+        self.refs_by_name.clear();
+        self.type_constraints_by_var.clear();
+        self.refs_by_target.clear();
+        self.build_indices();
     }
 
     fn build_indices(&mut self) {
@@ -516,12 +582,44 @@ impl FileAnalysis {
                 .push(sym.id);
         }
 
-        // Refs by target name
+        // Phase 5: link HashKeyAccess refs to their HashKeyDef symbols whenever
+        // the owner is already resolved (the builder's pre-pass handled type
+        // constraints + variable identity + call-binding fixups). With this
+        // link, `refs_to_symbol(def_id)` returns all accesses in O(1), which
+        // is what references, rename, and highlights consume.
+        let hashkey_defs: HashMap<(&str, &HashKeyOwner), SymbolId> = self.symbols.iter()
+            .filter_map(|sym| {
+                if let SymbolDetail::HashKeyDef { owner, .. } = &sym.detail {
+                    Some(((sym.name.as_str(), owner), sym.id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut hashkey_resolutions: Vec<(usize, SymbolId)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            if r.resolves_to.is_some() {
+                continue;
+            }
+            if let RefKind::HashKeyAccess { owner: Some(owner), .. } = &r.kind {
+                if let Some(&sid) = hashkey_defs.get(&(r.target_name.as_str(), owner)) {
+                    hashkey_resolutions.push((i, sid));
+                }
+            }
+        }
+        for (idx, sid) in hashkey_resolutions {
+            self.refs[idx].resolves_to = Some(sid);
+        }
+
+        // Refs by target name, and refs by resolved target SymbolId (phase 5).
         for (i, r) in self.refs.iter().enumerate() {
             self.refs_by_name
                 .entry(r.target_name.clone())
                 .or_default()
                 .push(i);
+            if let Some(sym_id) = r.resolves_to {
+                self.refs_by_target.entry(sym_id).or_default().push(i);
+            }
         }
 
         // Type constraints by variable name
@@ -531,6 +629,12 @@ impl FileAnalysis {
                 .or_default()
                 .push(i);
         }
+    }
+
+    /// All refs that resolve to this symbol — O(1) lookup via the index.
+    /// Callers typically combine this with a kind filter.
+    pub fn refs_to_symbol(&self, sym_id: SymbolId) -> &[usize] {
+        self.refs_by_target.get(&sym_id).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     // ---- Query methods ----
@@ -690,8 +794,12 @@ impl FileAnalysis {
         self.imported_return_types = imported_returns;
 
         // Inject synthetic HashKeyDef symbols for imported functions' hash keys.
+        // Imported subs have no local package — package=None mirrors the
+        // HashKeyAccess fixup's default for imported bindings, so the pair
+        // match each other without bleeding into other workspace files'
+        // locally-packaged `sub get_config` hash keys.
         for (func_name, keys) in &imported_hash_keys {
-            let owner = HashKeyOwner::Sub(func_name.clone());
+            let owner = HashKeyOwner::Sub { package: None, name: func_name.clone() };
             for key_name in keys {
                 let id = SymbolId(self.symbols.len() as u32);
                 // Use a zero-size span at file start for synthetic symbols
@@ -712,6 +820,56 @@ impl FileAnalysis {
                         is_dynamic: false,
                     },
                 });
+            }
+        }
+
+        // Phase 5 follow-up: the builder's HashKeyAccess owner fixup only runs
+        // for bindings where the func's return type is known at build time.
+        // Imported funcs aren't in that map; their return types come in via
+        // `imported_returns` here. Retry the fixup now so the consumer-side
+        // `$cfg = Lib::get_config(); $cfg->{host}` access gets its owner set
+        // to Sub{None, "get_config"}, matching the synthetic HashKeyDef we
+        // just injected. Without this, cross-file hash-key references
+        // would silently miss every consumer access.
+        let imported_keyed_subs: std::collections::HashSet<String> = imported_hash_keys
+            .keys()
+            .cloned()
+            .collect();
+        let binding_by_var: std::collections::HashMap<String, String> = self.call_bindings.iter()
+            .filter_map(|b| {
+                let bare = b.func_name.rsplit("::").next().unwrap_or(&b.func_name).to_string();
+                if imported_keyed_subs.contains(&bare) {
+                    Some((b.variable.clone(), bare))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !binding_by_var.is_empty() {
+            for r in &mut self.refs {
+                if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
+                    if owner.is_some() && !matches!(owner, Some(HashKeyOwner::Variable { .. })) {
+                        // Already linked to a real owner by the builder — don't overwrite.
+                        continue;
+                    }
+                    if let Some(func_name) = binding_by_var.get(var_text.as_str()) {
+                        // Only set if the specific key is actually in the
+                        // imported hash_keys for this func — avoids linking
+                        // unrelated `$cfg->{random}` to the imported def.
+                        if let Some(keys) = imported_hash_keys.get(func_name) {
+                            if keys.iter().any(|k| k == &r.target_name) {
+                                *owner = Some(HashKeyOwner::Sub {
+                                    package: None,
+                                    name: func_name.clone(),
+                                });
+                                // Clear resolves_to so the index linker in
+                                // rebuild_enrichment_indices picks it up
+                                // against the newly-injected synthetic def.
+                                r.resolves_to = None;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -757,7 +915,14 @@ impl FileAnalysis {
         }
     }
 
-    /// Rebuild indices affected by enrichment (type constraints + symbols).
+    /// Rebuild indices affected by enrichment (type constraints + symbols +
+    /// the phase-5 refs_by_target + HashKeyAccess linkage).
+    ///
+    /// Enrichment injects synthetic HashKeyDef symbols for imported subs and
+    /// clears `resolves_to` on HashKeyAccess refs that now have a matching
+    /// owner. This method re-runs the same `(target_name, owner)` linker that
+    /// `build_indices` uses, so `refs_by_target` stays accurate after a
+    /// cross-file hash-key binding resolves.
     fn rebuild_enrichment_indices(&mut self) {
         self.type_constraints_by_var.clear();
         for (i, tc) in self.type_constraints.iter().enumerate() {
@@ -778,6 +943,45 @@ impl FileAnalysis {
                 .entry(sym.scope)
                 .or_default()
                 .push(sym.id);
+        }
+
+        // Re-link HashKeyAccess refs to (possibly newly-injected) HashKeyDef
+        // symbols, mirroring build_indices's phase-5 logic.
+        let hashkey_defs: HashMap<(String, HashKeyOwner), SymbolId> = self.symbols.iter()
+            .filter_map(|sym| {
+                if let SymbolDetail::HashKeyDef { owner, .. } = &sym.detail {
+                    Some(((sym.name.clone(), owner.clone()), sym.id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut hashkey_resolutions: Vec<(usize, SymbolId)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            if r.resolves_to.is_some() {
+                continue;
+            }
+            if let RefKind::HashKeyAccess { owner: Some(owner), .. } = &r.kind {
+                if let Some(&sid) = hashkey_defs.get(&(r.target_name.clone(), owner.clone())) {
+                    hashkey_resolutions.push((i, sid));
+                }
+            }
+        }
+        for (idx, sid) in hashkey_resolutions {
+            self.refs[idx].resolves_to = Some(sid);
+        }
+
+        // Refresh refs_by_name + refs_by_target against the current refs.
+        self.refs_by_name.clear();
+        self.refs_by_target.clear();
+        for (i, r) in self.refs.iter().enumerate() {
+            self.refs_by_name
+                .entry(r.target_name.clone())
+                .or_default()
+                .push(i);
+            if let Some(sym_id) = r.resolves_to {
+                self.refs_by_target.entry(sym_id).or_default().push(i);
+            }
         }
     }
 
@@ -872,10 +1076,24 @@ impl FileAnalysis {
         };
 
         if let Some(name) = sub_name {
-            // Check Sub owner has defs; fall through to class if not
-            let sub_owner = HashKeyOwner::Sub(name);
-            if !self.hash_key_defs_for_owner(&sub_owner).is_empty() {
-                return Some(sub_owner);
+            // Try each package the sub might belong to. In practice, the sub
+            // is either defined locally (package comes from its Symbol) or
+            // imported (package = None, matching the enrichment synthetic def).
+            let mut candidate_owners: Vec<HashKeyOwner> = Vec::new();
+            for sym in &self.symbols {
+                if (sym.kind == SymKind::Sub || sym.kind == SymKind::Method) && sym.name == name {
+                    candidate_owners.push(HashKeyOwner::Sub {
+                        package: sym.package.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            // Fallback: None-package owner (matches imported synthetic defs).
+            candidate_owners.push(HashKeyOwner::Sub { package: None, name: name.clone() });
+            for sub_owner in candidate_owners {
+                if !self.hash_key_defs_for_owner(&sub_owner).is_empty() {
+                    return Some(sub_owner);
+                }
             }
         }
 
@@ -958,27 +1176,19 @@ impl FileAnalysis {
             }
             Some(MethodResolution::CrossFile { ref class }) => {
                 module_index.and_then(|idx| {
-                    let exports = idx.get_exports_cached(class)?;
-                    let sub = exports.subs.get(method_name)?;
+                    let cached = idx.get_cached(class)?;
+                    let sub = cached.sub_info(method_name)?;
 
-                    // If no arity info or no overloads, return primary
+                    // If no arity info or no overloads, return primary.
+                    let counts = sub.param_counts();
+                    let has_overloads = counts.len() > 1;
                     let target = match arg_count {
-                        Some(n) if !sub.overloads.is_empty() => n,
-                        _ => return sub.return_type.clone(),
+                        Some(n) if has_overloads => n,
+                        _ => return sub.return_type().cloned(),
                     };
 
-                    // Check primary params
-                    if sub.params.len() == target {
-                        return sub.return_type.clone();
-                    }
-                    // Check overloads
-                    for overload in &sub.overloads {
-                        if overload.params.len() == target {
-                            return overload.return_type.clone();
-                        }
-                    }
-                    // Fallback to primary
-                    sub.return_type.clone()
+                    sub.return_type_for_arity(target).cloned()
+                        .or_else(|| sub.return_type().cloned())
                 })
             }
             None => None,
@@ -1118,22 +1328,28 @@ impl FileAnalysis {
         // Walk cross-file parents
         if let Some(idx) = module_index {
             // Methods from the cross-file module itself
-            if let Some(exports) = idx.get_exports_cached(class_name) {
-                for (name, sub_info) in &exports.subs {
-                    if !seen_names.contains(name) {
-                        seen_names.insert(name.clone());
-                        let kind = if sub_info.is_method { SymKind::Method } else { SymKind::Sub };
-                        let defining = if class_name != original_class { Some(class_name) } else { None };
-                        let detail = self.method_detail(original_class, name, defining, module_index);
-                        candidates.push(CompletionCandidate {
-                            label: name.clone(),
-                            kind,
-                            detail: Some(detail),
-                            insert_text: None,
-                            sort_priority: PRIORITY_LOCAL,
-                            additional_edits: vec![],
-                        });
+            if let Some(cached) = idx.get_cached(class_name) {
+                for sym in &cached.analysis.symbols {
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                        continue;
                     }
+                    if seen_names.contains(&sym.name) {
+                        continue;
+                    }
+                    seen_names.insert(sym.name.clone());
+                    let is_method = sym.kind == SymKind::Method
+                        || matches!(sym.detail, SymbolDetail::Sub { is_method: true, .. });
+                    let kind = if is_method { SymKind::Method } else { SymKind::Sub };
+                    let defining = if class_name != original_class { Some(class_name) } else { None };
+                    let detail = self.method_detail(original_class, &sym.name, defining, module_index);
+                    candidates.push(CompletionCandidate {
+                        label: sym.name.clone(),
+                        kind,
+                        detail: Some(detail),
+                        insert_text: None,
+                        sort_priority: PRIORITY_LOCAL,
+                        additional_edits: vec![],
+                    });
                 }
             }
 
@@ -1380,14 +1596,17 @@ impl FileAnalysis {
             results.push((sym.selection_span, AccessKind::Declaration));
         }
 
-        // Collect all refs that resolve to this symbol
-        for r in &self.refs {
-            if r.resolves_to == Some(target_id) {
-                results.push((r.span, r.access));
-            }
+        // Phase 5: O(1) lookup for every ref resolved to this symbol.
+        // This covers variables, HashKeyAccess refs whose owner was resolved at
+        // build time, and any future kinds that set resolves_to.
+        for &idx in self.refs_to_symbol(target_id) {
+            let r = &self.refs[idx];
+            results.push((r.span, r.access));
         }
 
         // For subs/methods/packages/classes, also find refs by name
+        // (these kinds don't populate resolves_to during build and are matched
+        // by textual name across the refs table).
         if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
             for r in &self.refs {
                 if r.target_name == sym.name && r.resolves_to.is_none() {
@@ -1470,14 +1689,14 @@ impl FileAnalysis {
                                     }
                                     Some(MethodResolution::CrossFile { ref class }) => {
                                         if let Some(idx) = module_index {
-                                            if let Some(exports) = idx.get_exports_cached(class) {
-                                                if let Some(sub_info) = exports.sub_info(&mr.target_name) {
-                                                    let sig = format_cross_file_signature(&mr.target_name, sub_info);
+                                            if let Some(cached) = idx.get_cached(class) {
+                                                if let Some(sub_info) = cached.sub_info(&mr.target_name) {
+                                                    let sig = format_cross_file_signature(&mr.target_name, &sub_info);
                                                     let mut text = format!("```perl\n{}\n```\n\n*class {} — resolved from `{}`*", sig, class, r.target_name);
-                                                    if let Some(ref rt) = sub_info.return_type {
+                                                    if let Some(rt) = sub_info.return_type() {
                                                         text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
                                                     }
-                                                    if let Some(ref doc) = sub_info.doc {
+                                                    if let Some(doc) = sub_info.doc() {
                                                         text.push_str(&format!("\n\n{}", doc));
                                                     }
                                                     return Some(text);
@@ -1529,19 +1748,19 @@ impl FileAnalysis {
                             }
                             Some(MethodResolution::CrossFile { ref class }) => {
                                 if let Some(idx) = module_index {
-                                    if let Some(exports) = idx.get_exports_cached(class) {
-                                        if let Some(sub_info) = exports.sub_info(&r.target_name) {
+                                    if let Some(cached) = idx.get_cached(class) {
+                                        if let Some(sub_info) = cached.sub_info(&r.target_name) {
                                             let class_label = if class != cn {
                                                 format!("{} (from {})", cn, class)
                                             } else {
                                                 cn.to_string()
                                             };
-                                            let sig = format_cross_file_signature(&r.target_name, sub_info);
+                                            let sig = format_cross_file_signature(&r.target_name, &sub_info);
                                             let mut text = format!("```perl\n{}\n```\n\n*class {}*", sig, class_label);
-                                            if let Some(ref rt) = sub_info.return_type {
+                                            if let Some(rt) = sub_info.return_type() {
                                                 text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
                                             }
-                                            if let Some(ref doc) = sub_info.doc {
+                                            if let Some(doc) = sub_info.doc() {
                                                 text.push_str(&format!("\n\n{}", doc));
                                             }
                                             return Some(text);
@@ -1915,8 +2134,8 @@ impl FileAnalysis {
 
         // Check cross-file parents via ModuleIndex
         if let Some(idx) = module_index {
-            if let Some(exports) = idx.get_exports_cached(class_name) {
-                if exports.subs.contains_key(method_name) {
+            if let Some(cached) = idx.get_cached(class_name) {
+                if cached.has_sub(method_name) {
                     return Some(MethodResolution::CrossFile {
                         class: class_name.to_string(),
                     });
@@ -1957,8 +2176,8 @@ impl FileAnalysis {
         if depth > 20 {
             return None;
         }
-        if let Some(exports) = module_index.get_exports_cached(class_name) {
-            if exports.subs.contains_key(method_name) {
+        if let Some(cached) = module_index.get_cached(class_name) {
+            if cached.has_sub(method_name) {
                 return Some(MethodResolution::CrossFile {
                     class: class_name.to_string(),
                 });
@@ -2294,7 +2513,9 @@ pub enum ResolvedSub<'a> {
     Local(&'a Symbol),
     /// Found in a cross-file module via ModuleIndex.
     CrossFile {
-        params: Vec<crate::module_index::ExportedParam>,
+        params: Vec<ParamInfo>,
+        /// Inferred type per param (parallel to `params`); `None` if unknown.
+        param_types: Vec<Option<InferredType>>,
         is_method: bool,
         hash_keys: Vec<String>,
     },
@@ -2464,7 +2685,7 @@ impl FileAnalysis {
             let detail = match owner {
                 HashKeyOwner::Class(name) => format!("{}->{{{}}}", name, def.name),
                 HashKeyOwner::Variable { name, .. } => format!("{}{{{}}}", name, def.name),
-                HashKeyOwner::Sub(name) => format!("{}()->{{{}}}", name, def.name),
+                HashKeyOwner::Sub { name, .. } => format!("{}()->{{{}}}", name, def.name),
             };
 
             candidates.push(CompletionCandidate {
@@ -2494,8 +2715,30 @@ impl FileAnalysis {
     }
 
     /// Complete hash keys for a sub's return value (from expression type resolution).
+    ///
+    /// Tries the caller's enclosing package first (local subs), then falls
+    /// back to an unpackaged owner (imported subs whose synthetic HashKeyDef
+    /// was added during enrichment with `package: None`).
     pub fn complete_hash_keys_for_sub(&self, sub_name: &str, _point: Point) -> Vec<CompletionCandidate> {
-        self.complete_hash_keys_for_owner(&HashKeyOwner::Sub(sub_name.to_string()))
+        // Try each candidate owner variant until one has defs.
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let push_unique = |cands: Vec<CompletionCandidate>, out: &mut Vec<CompletionCandidate>, seen: &mut HashSet<String>| {
+            for c in cands {
+                if seen.insert(c.label.clone()) {
+                    out.push(c);
+                }
+            }
+        };
+        for sym in &self.symbols {
+            if (sym.kind == SymKind::Sub || sym.kind == SymKind::Method) && sym.name == sub_name {
+                let owner = HashKeyOwner::Sub { package: sym.package.clone(), name: sub_name.to_string() };
+                push_unique(self.complete_hash_keys_for_owner(&owner), &mut out, &mut seen);
+            }
+        }
+        let imported_owner = HashKeyOwner::Sub { package: None, name: sub_name.to_string() };
+        push_unique(self.complete_hash_keys_for_owner(&imported_owner), &mut out, &mut seen);
+        out
     }
 
     /// General completion: all variables (all sigils) + subs + packages.
@@ -2694,26 +2937,22 @@ impl FileAnalysis {
                     param_types: None, // local — use inferred_type() with body_end
                 })
             }
-            ResolvedSub::CrossFile { params: exported_params, is_method: cf_is_method, .. } => {
-                // Collect pre-resolved param types before stripping $self/$class
-                let all_types: Vec<Option<String>> = exported_params.iter()
-                    .map(|p| p.inferred_type.clone())
-                    .collect();
-
-                let mut params: Vec<ParamInfo> = exported_params
-                    .iter()
-                    .map(|p| ParamInfo {
-                        name: p.name.clone(),
-                        default: None,
-                        is_slurpy: p.is_slurpy,
-                    })
+            ResolvedSub::CrossFile {
+                params: cross_params,
+                param_types: cross_param_types,
+                is_method: cf_is_method,
+                ..
+            } => {
+                let mut params: Vec<ParamInfo> = cross_params;
+                let mut param_types: Vec<Option<String>> = cross_param_types
+                    .into_iter()
+                    .map(|t| t.as_ref().map(inferred_type_to_tag))
                     .collect();
 
                 let is_method = is_method || cf_is_method
                     || params.first().map_or(false, |p| p.name == "$self" || p.name == "$class");
 
-                // Strip $self/$class from method params (and their types)
-                let mut param_types = all_types;
+                // Strip $self/$class from method params (and their types).
                 if is_method && !params.is_empty() {
                     let first = &params[0].name;
                     if first == "$self" || first == "$class" {
@@ -2773,13 +3012,9 @@ impl FileAnalysis {
                 }
                 Some(MethodResolution::CrossFile { ref class }) => {
                     if let Some(idx) = module_index {
-                        if let Some(exports) = idx.get_exports_cached(class) {
-                            if let Some(sub_info) = exports.sub_info(name) {
-                                return Some(ResolvedSub::CrossFile {
-                                    params: sub_info.params.clone(),
-                                    is_method: sub_info.is_method,
-                                    hash_keys: sub_info.hash_keys.clone(),
-                                });
+                        if let Some(cached) = idx.get_cached(class) {
+                            if let Some(sub_info) = cached.sub_info(name) {
+                                return Some(cross_file_resolved(&sub_info));
                             }
                         }
                     }
@@ -2801,27 +3036,19 @@ impl FileAnalysis {
             if let Some(idx) = module_index {
                 for import in &self.imports {
                     if import.imported_symbols.iter().any(|s| s == name) {
-                        if let Some(exports) = idx.get_exports_cached(&import.module_name) {
-                            if let Some(sub_info) = exports.sub_info(name) {
-                                return Some(ResolvedSub::CrossFile {
-                                    params: sub_info.params.clone(),
-                                    is_method: sub_info.is_method,
-                                    hash_keys: sub_info.hash_keys.clone(),
-                                });
+                        if let Some(cached) = idx.get_cached(&import.module_name) {
+                            if let Some(sub_info) = cached.sub_info(name) {
+                                return Some(cross_file_resolved(&sub_info));
                             }
                         }
                     }
                 }
                 // Also check @EXPORT (bare imports)
                 for import in &self.imports {
-                    if let Some(exports) = idx.get_exports_cached(&import.module_name) {
-                        if exports.export.iter().any(|s| s == name) {
-                            if let Some(sub_info) = exports.sub_info(name) {
-                                return Some(ResolvedSub::CrossFile {
-                                    params: sub_info.params.clone(),
-                                    is_method: sub_info.is_method,
-                                    hash_keys: sub_info.hash_keys.clone(),
-                                });
+                    if let Some(cached) = idx.get_cached(&import.module_name) {
+                        if cached.analysis.export.iter().any(|s| s == name) {
+                            if let Some(sub_info) = cached.sub_info(name) {
+                                return Some(cross_file_resolved(&sub_info));
                             }
                         }
                     }
@@ -2853,7 +3080,8 @@ impl FileAnalysis {
                 && cb.span.start <= point
                 && contains_point(&self.scopes[cb.scope.0 as usize].span, point)
             {
-                return Some(HashKeyOwner::Sub(cb.func_name.clone()));
+                let package = self.sub_defining_package(&cb.func_name);
+                return Some(HashKeyOwner::Sub { package, name: cb.func_name.clone() });
             }
         }
 
@@ -2863,7 +3091,8 @@ impl FileAnalysis {
                 && mcb.span.start <= point
                 && contains_point(&self.scopes[mcb.scope.0 as usize].span, point)
             {
-                return Some(HashKeyOwner::Sub(mcb.method_name.clone()));
+                let package = self.sub_defining_package(&mcb.method_name);
+                return Some(HashKeyOwner::Sub { package, name: mcb.method_name.clone() });
             }
         }
 
@@ -2898,11 +3127,24 @@ impl FileAnalysis {
                             return Some(owner.clone());
                         }
                     }
-                    HashKeyOwner::Class(_) | HashKeyOwner::Sub(_) => {}
+                    HashKeyOwner::Class(_) | HashKeyOwner::Sub { .. } => {}
                 }
             }
         }
 
+        None
+    }
+
+    /// Look up the defining package of a sub/method by name. Returns None when
+    /// the sub is not found locally (imported, or absent). Used to package-
+    /// qualify `HashKeyOwner::Sub` so distinct same-name subs in different
+    /// packages don't collide at query time.
+    fn sub_defining_package(&self, name: &str) -> Option<String> {
+        for sym in &self.symbols {
+            if (sym.kind == SymKind::Sub || sym.kind == SymKind::Method) && sym.name == name {
+                return sym.package.clone();
+            }
+        }
         None
     }
 
@@ -3156,7 +3398,9 @@ pub(crate) fn builtin_first_arg_type(name: &str) -> Option<InferredType> {
     }
 }
 
-/// Serialize an InferredType to a simple string tag for JSON IPC and SQLite storage.
+/// Serialize an InferredType to a simple string tag.
+/// Used by signature help's `param_types` field, which piggy-backs on the
+/// pre-unification string representation for backwards-compatible JSON output.
 pub fn inferred_type_to_tag(ty: &InferredType) -> String {
     match ty {
         InferredType::ClassName(name) => format!("Object:{}", name),
@@ -3170,29 +3414,29 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
     }
 }
 
-/// Deserialize a string tag back to an InferredType.
-pub fn inferred_type_from_tag(tag: &str) -> Option<InferredType> {
-    if let Some(class_name) = tag.strip_prefix("Object:") {
-        return Some(InferredType::ClassName(class_name.to_string()));
-    }
-    match tag {
-        "HashRef" => Some(InferredType::HashRef),
-        "ArrayRef" => Some(InferredType::ArrayRef),
-        "CodeRef" => Some(InferredType::CodeRef),
-        "Regexp" => Some(InferredType::Regexp),
-        "Numeric" => Some(InferredType::Numeric),
-        "String" => Some(InferredType::String),
-        _ => None,
+/// Format a cross-file method signature from a SubInfo view.
+fn format_cross_file_signature(method_name: &str, sub_info: &crate::module_index::SubInfo<'_>) -> String {
+    let params = sub_info.params();
+    if params.is_empty() {
+        format!("sub {}()", method_name)
+    } else {
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        format!("sub {}({})", method_name, names.join(", "))
     }
 }
 
-/// Format a cross-file method signature from ExportedSub metadata.
-fn format_cross_file_signature(method_name: &str, sub_info: &crate::module_index::ExportedSub) -> String {
-    if sub_info.params.is_empty() {
-        format!("sub {}()", method_name)
-    } else {
-        let params: Vec<&str> = sub_info.params.iter().map(|p| p.name.as_str()).collect();
-        format!("sub {}({})", method_name, params.join(", "))
+/// Build a `ResolvedSub::CrossFile` from a SubInfo view, snapshotting owned data.
+fn cross_file_resolved(sub_info: &crate::module_index::SubInfo<'_>) -> ResolvedSub<'static> {
+    let params: Vec<ParamInfo> = sub_info.params().to_vec();
+    let param_types: Vec<Option<InferredType>> = params
+        .iter()
+        .map(|p| sub_info.param_inferred_type(&p.name).cloned())
+        .collect();
+    ResolvedSub::CrossFile {
+        params,
+        param_types,
+        is_method: sub_info.is_method(),
+        hash_keys: sub_info.hash_keys().to_vec(),
     }
 }
 
@@ -3411,43 +3655,6 @@ mod tests {
         assert_eq!(InferredType::String.class_name(), None);
     }
 
-    // ---- InferredType serialization roundtrip tests ----
-
-    #[test]
-    fn test_inferred_type_tag_roundtrip() {
-        let cases = vec![
-            InferredType::ClassName("Foo::Bar".into()),
-            InferredType::FirstParam { package: "Baz".into() },
-            InferredType::HashRef,
-            InferredType::ArrayRef,
-            InferredType::CodeRef,
-            InferredType::Regexp,
-            InferredType::Numeric,
-            InferredType::String,
-        ];
-        for ty in &cases {
-            let tag = inferred_type_to_tag(ty);
-            let restored = inferred_type_from_tag(&tag);
-            assert!(restored.is_some(), "Failed to deserialize tag: {}", tag);
-            // Note: FirstParam serializes as Object:X and deserializes as ClassName(X)
-            // This is intentional — cross-file we treat both as object types.
-            match ty {
-                InferredType::FirstParam { package } => {
-                    assert_eq!(restored.unwrap(), InferredType::ClassName(package.clone()));
-                }
-                _ => {
-                    assert_eq!(&restored.unwrap(), ty, "Roundtrip failed for tag: {}", tag);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_inferred_type_from_tag_unknown() {
-        assert_eq!(inferred_type_from_tag("UnknownTag"), None);
-        assert_eq!(inferred_type_from_tag(""), None);
-    }
-
     // ---- sub_return_type fallback tests ----
 
     #[test]
@@ -3502,6 +3709,299 @@ mod tests {
             fa.inferred_type("$cfg", Point::new(3, 0)),
             Some(&InferredType::HashRef),
             "Enrichment should propagate imported return type to call binding variable"
+        );
+    }
+
+    // ---- Phase 5: refs_by_target index + eager HashKeyAccess resolution ----
+
+    fn build_fa_from_source(source: &str) -> FileAnalysis {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        crate::builder::build(&tree, source.as_bytes())
+    }
+
+    /// Dynamic method dispatch: `my $m = 'get_config'; __PACKAGE__->$m()`.
+    /// Constant folding recovers the method name "get_config" from the
+    /// string assignment, so the MethodCallBinding fires and $c picks up
+    /// the return type. The access $c->{host} then links to the HashKeyDef.
+    /// This path already worked for method-call types in the old builder;
+    /// the phase 5 tests pin it so we don't regress when we refactor the
+    /// fixup.
+    #[test]
+    fn test_phase5_dynamic_method_call_via_constant_folding() {
+        let fa = build_fa_from_source(r#"
+            package Demo::dyn;
+            sub get_config { return { host => 'localhost', port => 5432 } }
+            my $method = 'get_config';
+            my $c = __PACKAGE__->$method();
+            my $h = $c->{host};
+        "#);
+
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
+        }).expect("HashKeyDef host owned by get_config");
+
+        let indexed = fa.refs_to_symbol(def.id);
+        assert!(
+            !indexed.is_empty(),
+            "dynamic method call via $method='get_config' should link $c->{{host}} back to the def",
+        );
+    }
+
+    /// Cross-file consumer-side resolution (the phase-5 follow-up).
+    /// Consumer has `my $c = Imported::get_config(); $c->{host}`. At build
+    /// time we don't know get_config returns HashRef. Enrichment injects
+    /// synthetic HashKeyDefs and now ALSO retries the HashKeyAccess owner
+    /// fixup + rebuilds refs_by_target. Result: the access links to the
+    /// synthetic def, so rename / references / refs_by_target all work.
+    #[test]
+    fn test_phase5_consumer_side_cross_file_resolves_via_enrichment() {
+        let mut fa = build_fa_from_source(r#"
+            use TestExporter qw(get_config);
+            my $c = get_config();
+            my $h = $c->{host};
+        "#);
+
+        // Sanity: before enrichment the access has no link (there's no
+        // local HashKeyDef for "host" and no local get_config sub).
+        let hka_before = fa.refs.iter().find(|r| {
+            matches!(r.kind, RefKind::HashKeyAccess { .. }) && r.target_name == "host"
+        }).expect("HashKeyAccess host");
+        assert!(hka_before.resolves_to.is_none(),
+            "pre-enrichment, access should not be resolved");
+
+        // Simulate what the Backend's enrich_analysis does after the
+        // module index resolves TestExporter::get_config returning HashRef
+        // with keys { host, port, name }.
+        let mut imported_returns = HashMap::new();
+        imported_returns.insert("get_config".to_string(), InferredType::HashRef);
+        let mut imported_hash_keys = HashMap::new();
+        imported_hash_keys.insert("get_config".to_string(),
+            vec!["host".to_string(), "port".to_string(), "name".to_string()]);
+        fa.enrich_imported_types_with_keys(imported_returns, imported_hash_keys, None);
+
+        // The synthetic HashKeyDef `host` owned by Sub{None, "get_config"}
+        // must now have the access indexed under it.
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { package: None, name }, ..
+                } if name == "get_config")
+        }).expect("synthetic HashKeyDef host");
+
+        let indexed = fa.refs_to_symbol(def.id);
+        assert!(
+            !indexed.is_empty(),
+            "consumer-side $c->{{host}} access should link to synthetic HashKeyDef after enrichment, got empty refs_by_target entry",
+        );
+    }
+
+    /// End-to-end demo shape: mirrors `test_files/phase5_demo.pl` so a
+    /// regression in the demo surfaces here first. Three access sites all
+    /// flow through the qualified `Demo::phase5::get_config()` binding.
+    #[test]
+    fn test_phase5_demo_file_shape_resolves_all_access_sites() {
+        let fa = build_fa_from_source(r#"
+            package Demo::phase5;
+            sub get_config {
+                return { host => 'localhost', port => 5432, name => 'mydb' };
+            }
+            my $c = Demo::phase5::get_config();
+            my $h1 = $c->{host};
+            my $h2 = $c->{host};
+            my $p  = $c->{port};
+        "#);
+
+        let def_host = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { package: Some(p), name }, ..
+                } if p == "Demo::phase5" && name == "get_config")
+        }).expect("Demo::phase5::get_config's HashKeyDef `host`");
+
+        let indexed = fa.refs_to_symbol(def_host.id);
+        // Two $c->{host} accesses — both should resolve to the same def.
+        assert_eq!(
+            indexed.len(),
+            2,
+            "expected 2 $c->{{host}} accesses to link via refs_by_target, got {} (indexes: {:?})",
+            indexed.len(),
+            indexed,
+        );
+
+        // The port access must NOT be under host's target.
+        let def_port = fa.symbols.iter().find(|s| {
+            s.name == "port"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
+        }).expect("HashKeyDef port");
+        let port_refs = fa.refs_to_symbol(def_port.id);
+        assert_eq!(port_refs.len(), 1, "expected exactly one $c->{{port}} access");
+    }
+
+    /// Qualified call: `Demo::phase5::get_config()` should link $c->{host}
+    /// to the HashKeyDef emitted inside `sub get_config` in the same package.
+    /// Previously broken: the binding fixup looked up `return_types` by the
+    /// qualified func_name ("Demo::phase5::get_config"), missed, and left
+    /// $c->{host} with owner=None. Now the fixup strips the package prefix.
+    #[test]
+    fn test_phase5_qualified_sub_call_links_hash_key_access() {
+        let fa = build_fa_from_source(r#"
+            package Demo::phase5;
+            sub get_config { return { host => 'localhost', port => 5432 } }
+            my $c = Demo::phase5::get_config();
+            my $h = $c->{host};
+        "#);
+
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { package: Some(p), name }, ..
+                } if p == "Demo::phase5" && name == "get_config")
+        }).expect("HashKeyDef host owned by Sub{Some(Demo::phase5), get_config}");
+
+        let indexed = fa.refs_to_symbol(def.id);
+        assert!(
+            !indexed.is_empty(),
+            "qualified call `Demo::phase5::get_config()` should link $c->{{host}} to the def via refs_by_target",
+        );
+    }
+
+    /// Chain through an intermediate sub: `sub chain { return get_config() }`
+    /// with `$c = chain(); $c->{host}`. The hash key ownership must flow
+    /// through chain to get_config, where the actual HashKeyDefs live.
+    /// Previously broken: $c's owner was Sub{_, "chain"}, which has no
+    /// HashKeyDefs, so refs_by_target matched nothing.
+    #[test]
+    fn test_phase5_hash_key_owner_flows_through_intermediate_sub() {
+        let fa = build_fa_from_source(r#"
+            package Demo::phase5;
+            sub get_config { return { host => 'localhost', port => 5432 } }
+            sub chain_helper { return get_config() }
+            my $c = chain_helper();
+            my $h = $c->{host};
+        "#);
+
+        // The HashKeyDef for `host` lives under get_config, not chain_helper.
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
+        }).expect("host HashKeyDef owned by get_config");
+
+        // The access $c->{host} must link to this def, even though $c was
+        // bound to chain_helper() (the intermediate sub with no keys).
+        let indexed = fa.refs_to_symbol(def.id);
+        assert!(
+            !indexed.is_empty(),
+            "chain_helper → get_config delegation should flow $c->{{host}} to get_config's HashKeyDef",
+        );
+    }
+
+    /// Previously broken: references on a hash key owned by a sub's return
+    /// value didn't flow through refs_by_target because resolves_to was never
+    /// set on HashKeyAccess refs. Phase 5 links HashKeyAccess.resolves_to to
+    /// the matching HashKeyDef at build time via (target_name, owner) lookup.
+    #[test]
+    fn test_phase5_hash_key_access_links_to_def_symbol() {
+        let fa = build_fa_from_source(r#"
+            sub get_config { return { host => 'localhost', port => 5432 } }
+            my $cfg = get_config();
+            my $h = $cfg->{host};
+        "#);
+
+        // Find the HashKeyDef "host" owned by Sub { name: "get_config", .. }.
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
+        });
+        assert!(def.is_some(), "HashKeyDef 'host' owned by Sub get_config should exist");
+        let def_id = def.unwrap().id;
+
+        // The `$cfg->{host}` access should be indexed under this symbol.
+        let indexed = fa.refs_to_symbol(def_id);
+        assert!(
+            !indexed.is_empty(),
+            "refs_by_target should index $cfg->{{host}} access under the HashKeyDef, got empty"
+        );
+        let access = &fa.refs[indexed[0]];
+        assert!(matches!(access.kind, RefKind::HashKeyAccess { .. }));
+        assert_eq!(access.target_name, "host");
+    }
+
+    /// Previously broken: find_references on the HashKeyDef required a tree
+    /// argument to match accesses (the HashKeyAccess.owner was resolved lazily
+    /// in the query via `resolve_hash_owner_from_tree`). Phase 5 links the ref
+    /// to the def at build time, so the query returns the access even when
+    /// the caller passes no tree.
+    #[test]
+    fn test_phase5_find_references_on_hash_key_def_without_tree() {
+        let fa = build_fa_from_source(r#"
+            sub get_config { return { host => 1, port => 2 } }
+            my $cfg = get_config();
+            my $h = $cfg->{host};
+            my $p = $cfg->{port};
+        "#);
+        let def_host = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
+        }).expect("host HashKeyDef");
+
+        // Cursor on the def — convention is that find_references returns the
+        // *usages*, not the def itself. Previously this returned 0 without a
+        // tree; phase 5 returns the access sites via refs_by_target.
+        let point = def_host.selection_span.start;
+        let refs = fa.find_references(point, None, None);
+        assert!(
+            !refs.is_empty(),
+            "expected at least one access for 'host' via refs_by_target (no tree), got empty",
+        );
+        // Sanity: the access should point at `$cfg->{host}`.
+        assert!(
+            refs.iter().any(|s| s.start.row == 3),
+            "expected to find the access on row 3 ($cfg->{{host}}), got {:?}",
+            refs,
+        );
+    }
+
+    /// Previously broken: refs_by_target was absent. Even variable refs
+    /// relied on a linear scan of `refs` per query. Phase 5 exposes an
+    /// O(1) lookup for any resolved ref.
+    #[test]
+    fn test_phase5_refs_by_target_index_populated_for_variables() {
+        let fa = build_fa_from_source(r#"
+            my $x = 1;
+            $x = 2;
+            my $y = $x + 1;
+        "#);
+        // Find the variable symbol $x.
+        let x_sym = fa.symbols.iter().find(|s| s.name == "$x" && s.kind == SymKind::Variable)
+            .expect("$x variable symbol");
+        let indexed = fa.refs_to_symbol(x_sym.id);
+        // Two usages after decl: `$x = 2` (write) and `$x + 1` (read).
+        assert!(
+            indexed.len() >= 2,
+            "expected >= 2 refs to $x via refs_by_target, got {}: {:?}",
+            indexed.len(),
+            indexed,
         );
     }
 }
