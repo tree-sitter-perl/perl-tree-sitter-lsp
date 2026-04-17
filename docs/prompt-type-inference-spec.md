@@ -340,9 +340,187 @@ the framework-synthesis pattern from the unification spec.
 
 ---
 
+## Part 5 — Dependent-type patterns
+
+The earlier parts handle "static types about values." This part covers
+**types parameterised by values** — the chunk of the HoTT conversation
+that actually transfers to a Perl static analyzer. Three patterns, all
+built on existing `InferredType` + emission rules. No new type theory,
+no univalence, no paths.
+
+### 5a — Value-indexed returns (Pi types)
+
+`get_config('host')` returns `String`; `get_config('port')` returns
+`Int`. The return type is a function of the **literal value** of the
+argument.
+
+**Data shape.** Extend `ExportedSub`-style metadata already carried on
+`Symbol`:
+
+```rust
+// On SymbolDetail::Sub:
+keyed_returns: Option<HashMap<String, InferredType>>,
+```
+
+Set at build time when the builder sees a sub whose body is a dispatch
+on the first arg:
+
+```perl
+sub get_config {
+    my ($key) = @_;
+    return { host => 'localhost', port => 5432 }->{$key};
+}
+```
+
+The anon-hash literal we already harvest gives us `host → String`,
+`port → Numeric`. Under Pi-type semantics, calling `get_config('host')`
+with a literal first-arg yields `String`.
+
+**Emission rule.** During `visit_sub`, detect the `{ ... }->{$param}`
+shape (or `my %table = (...); return $table{$param}`). If every RHS is
+a typed literal, record `keyed_returns` on the sub's Symbol.
+
+**Consumer side.** `infer_expression_type` on a call where the first
+arg is a literal string looks `keyed_returns[lit]` first; falls back to
+the plain `return_type` otherwise. Wires into the existing
+`CallBinding` fixup without new structures.
+
+**Practical payoff.** `get_config('host')->` completes with `String`
+methods. `$cfg = get_config('port'); $cfg + 1` doesn't trip "numeric on
+non-numeric" diagnostics.
+
+### 5b — Sum types + tag-discriminated narrowing
+
+```perl
+sub fetch {
+    return { ok => 1, data => $x } if $ok;
+    return { ok => 0, error => $msg };
+}
+my $r = fetch();
+if ($r->{ok}) {
+    $r->{data};   # narrowed to the "ok" branch's shape
+} else {
+    $r->{error};  # narrowed to the "err" branch's shape
+}
+```
+
+**Data shape.** Extend `InferredType`:
+
+```rust
+InferredType::Union(Vec<Arc<InferredType>>),
+```
+
+and a minor addition to `TypeConstraint` so narrowing produces a
+scope-limited override:
+
+```rust
+pub struct TypeConstraint {
+    pub variable: String,
+    pub scope: ScopeId,
+    pub constraint_span: Span,
+    pub inferred_type: InferredType,
+    /// Only applies inside this span (if-body / unless-body). Absent →
+    /// applies from constraint_span onward within `scope`.
+    pub narrowing_scope: Option<Span>,
+}
+```
+
+**Emission rule — construction side.** `resolve_return_types` already
+collects all return branches. When multiple branches produce distinct
+literal hash shapes, emit `InferredType::Union([Shape1, Shape2, ...])`
+instead of collapsing to a single HashRef.
+
+**Emission rule — narrowing side.** Walk `if` / `unless` conditions:
+
+| Condition pattern | Effect in the then-body |
+|---|---|
+| `if ($v)` / `if (defined $v)` | Narrow `$v` to non-undef members of its Union. |
+| `if ($v->{tag} eq 'literal')` | Narrow `$v` to Union members whose `tag` shape matches `literal`. |
+| `if (ref $v eq 'ARRAY')` | Narrow `$v` to `ArrayRef`. |
+| `if (blessed $v)` | Narrow away non-object members. |
+
+Each narrowing emits a `TypeConstraint` with `narrowing_scope` set to
+the if-body span. `inferred_type(var, point)` picks the narrowed
+constraint when point is inside the body, falls back to the outer
+constraint otherwise.
+
+**Practical payoff.** Accessing `$r->{data}` inside the truthy branch
+completes only with `data`-branch keys, not the err-branch's `error`.
+Diagnostics flag `$r->{error}` in the ok-branch as "key not in this
+variant."
+
+### 5c — Parametric types (ResultSet[R], indexed string collections)
+
+`$schema->resultset('Users')` returns a `ResultSet<Users>` where
+`Users` is the DBIC Result class. The valid keys for
+`$rs->search({ KEY => ... })` depend on `Users`.
+
+**Data shape.** Extend `InferredType`:
+
+```rust
+InferredType::Parametric {
+    base: String,        // "ResultSet"
+    type_arg: String,    // "MyApp::Schema::Result::Users"
+},
+```
+
+**Emission rules.**
+
+- `$schema->resultset('Users')` (literal first arg) → the binding site
+  records `InferredType::Parametric { base: "ResultSet", type_arg: canonicalized_class }`.
+- `$rs->search(...)` / `$rs->search_rs(...)` / `$rs->find(...)`: return
+  type is the same `Parametric` — the parameter threads through.
+
+**Consumer side — context-sensitive completion.** When
+`cursor_context.rs` detects cursor in a hash-key position inside
+`search-family method arg[0]` on a receiver of type
+`InferredType::Parametric { base: "ResultSet", type_arg }`:
+
+- Look up the HashKeyDefs (+ synthesized column accessors) in
+  `Package(type_arg)`. Offer them as completions.
+- Emit an `unresolved-dbic-column` diagnostic when a literal key in the
+  call doesn't exist on the Result class.
+
+**Relationship prefetch** (`->search({...}, { join => 'posts' })`):
+expand the valid key set with `posts.col` entries from the joined Result
+class's HashKeyDefs. Phase-2 complexity — same framework.
+
+**Practical payoff.** DBIC column completion inside `->search`,
+goto-def on `name` in `->search({ name => ... })` jumps to the
+`add_columns` site, rename safety, unknown-column diagnostics.
+
+### What to skip
+
+- **Univalence.** "Equivalent types ARE equal" is beautiful but
+  engineering-useless here. We already collapse equivalent
+  representations ad-hoc (framework synthesis across Moo/Moose/Mojo::Base
+  producing the same accessor shape); no need for a formal mechanism.
+- **Path induction / identity types as first-class values.** Rename
+  is "transport along equality" in HoTT terms; we do it procedurally
+  via `refs_by_target` and that's the right level.
+- **Higher inductive types.** Perl has no user-visible quotient
+  structures to model.
+- **Full dependent inference.** Undecidable. The three patterns above
+  are the sweet spot — they cover the common idioms (value-indexed
+  lookups, sum-type results, parametric collections) with bounded
+  analysis cost.
+
+### Interplay with landed phase-5 work
+
+All three patterns compose with the current model:
+
+- Value-indexed returns (5a) piggy-back on existing `HashKeyDef` harvesting + `CallBinding` fixup. The `keyed_returns` table is read by a small extension in `resolve_return_types`.
+- Sum types (5b) add a new `InferredType` variant + narrowing-scoped `TypeConstraint`. `inferred_type(var, point)` already picks the closest constraint; the narrowing field is a refinement of that lookup.
+- Parametric types (5c) add a new `InferredType` variant + a new cursor-context variant. Everything else (HashKeyDef lookup, column completion) reuses the existing pipeline.
+
+No new graph. No parallel data model. Same univalence-style collapse
+the unification refactor applied to FrameworkEntity.
+
+---
+
 ## Implementation ordering
 
-These four parts are mostly independent and can land separately.
+All parts are mostly independent and can land separately.
 
 | Part | Build cost | User-visible win | Prerequisite |
 |---|---|---|---|
@@ -350,6 +528,9 @@ These four parts are mostly independent and can land separately.
 | 2 — Hash key unions | medium; owner enum extension + linker change | completion + references on merged hashes | none |
 | 3 — Method loops | medium-large; new collection pass | diagnostics + invocant narrowing | const-folding infra (already there) |
 | 4 — map/grep/reduce invariants | medium; block-walk pass | @-array key inference, list-element types | none |
+| 5a — Value-indexed returns | small; new `keyed_returns` on SymbolDetail::Sub | context-sensitive return types for dispatch subs | none |
+| 5b — Sum types + narrowing | medium; Union variant + narrowing_scope on TypeConstraint | tag-discriminated narrowing; diagnostics on wrong-variant access | none |
+| 5c — Parametric types (DBIC) | large; new `Parametric` variant + cursor-context wiring | DBIC column completion inside search/update/find; rename on columns | 1, 2 ideally |
 
 Land each behind a pin-the-fix test pair (one showing the previously-
 broken behavior, one showing the now-correct one). This matches the
