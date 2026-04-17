@@ -1,31 +1,26 @@
 #!/usr/bin/perl
 # ============================================================================
-# Phase 5 demo — behaviors that previously didn't work cleanly.
+# Phase 5 demo — what genuinely works, honestly pitched.
 #
-# Open this file in a perl-lsp-attached editor and try the cursor positions
-# called out below with `gr` (references) and `gd` (goto-def). The key names
-# here (host/port/name) are the same the unit tests use, to keep this file
-# trivial to eyeball.
+# Uses a unique sub name (`phase5_demo_config`) so the cross-file walk isn't
+# polluted by other test_files/ that happen to also define `sub get_config`
+# with a `host` key. The broader "owner by name" scoping is a phase 1
+# limitation (Namespace widening) — phase 5 doesn't claim to fix it.
 #
-# What's new in phase 5:
-#   1. References on a hash key defined inside a sub's return value now
-#      find every access site via an O(1) index, no tree argument required.
-#   2. `Backend::references` walks cross-file for hash keys too — previously
-#      it fell back to single-file because owner resolution required a tree.
-#
-# Before phase 5 this was: "goto-def works, but references is empty or only
-# finds the def itself." Now: def + every matching access.
+# Try each spot with `gr` (references). IDE convention: cursor on a decl
+# returns the USES, not the decl itself.
 # ============================================================================
 
 use strict;
 use warnings;
 
-# ── Source of truth: a sub that returns a hashref with three known keys ──
+# ── Source of truth ──
 
-sub get_config {
-    # ▸ Put cursor on `host` below and hit `gr`.
-    #   Expected: two results — this def, plus the `$cfg->{host}` access on
-    #   the line marked (A). Previously this returned [] without a tree.
+sub phase5_demo_config {
+    # ▸ Cursor on `host` in the return hash below, hit `gr`.
+    #   Expected: every `$c->{host}` site where `$c` was bound directly to
+    #   phase5_demo_config() — i.e. (A1), (A2), (A3) below.
+    #   Previously: returned [] without a tree argument.
     return {
         host => 'localhost',
         port => 5432,
@@ -33,34 +28,37 @@ sub get_config {
     };
 }
 
-# ── Local consumer of get_config ──
+my $c = phase5_demo_config();
 
-my $cfg = get_config();
+my $h1 = $c->{host};   # (A1)
+my $h2 = $c->{host};   # (A2) — a second access of the same key
+my $p  = $c->{port};   # (B)  — different key, used to eyeball that the
+                       #         references list contains only `host` hits
+                       #         and not `port`.
 
-my $h = $cfg->{host};   # (A) access site for `host`
-my $p = $cfg->{port};   # (B) access site for `port`
-my $n = $cfg->{name};   # (C) access site for `name`
+# A copy of the same binding gets the same owner — owner is keyed on the
+# sub name, not on the variable identity.
+my $also = phase5_demo_config();
+my $h3   = $also->{host};  # (A3)
 
-# ▸ Put cursor on `host` at (A) and hit `gr`.
-#   Expected: this access + the def inside get_config().
-#   Previously: required tree-walking the invocant; worked in the open-editor
-#   case but not when querying a closed workspace file.
+# ▸ Cursor on `host` at (A1), (A2), or (A3) and hit `gr`.
+#   Expected: all three access sites + the decl inside phase5_demo_config().
+#   The `include_decl` flag is true here because the cursor is on a ref, not
+#   on the symbol itself.
 
-# ▸ Put cursor on `host` at (A) and hit `gd`.
-#   Expected: jumps to the `host =>` inside the return hash. (Unchanged; this
-#   already worked — listed here so you can eyeball symmetry with `gr`.)
+# ── Known limitation that phase 5 does NOT fix ──
+#
+# The following reassignment breaks the chain because the builder's owner
+# propagation is direct-only: `$chained`'s owner becomes Sub("chain_helper"),
+# not Sub("phase5_demo_config"). So `$chained->{host}` is NOT included in
+# references for the key above. Fixing this is a type-propagation-through-
+# returns enhancement (a later phase); calling it out here so the demo
+# doesn't mislead.
 
-# ── A second consumer through an intermediary — tests the "find accesses
-# across callers" flow when more than one path exists to the key. ──
+sub chain_helper { return phase5_demo_config(); }
+my $chained = chain_helper();
+my $x = $chained->{host};  # (LIMITATION) — won't show up; owner mismatch.
 
-sub load_config { return get_config(); }
-
-my $alt = load_config();
-my $alt_host = $alt->{host};  # (D) another access to `host`
-
-# ▸ Cursor on `host` inside the def — references should now include (A) and
-#   (D) and any others, all without needing the caller's tree.
-
-print "$h $p $n $alt_host\n";
+print "$h1 $h2 $h3 $p $x\n";
 
 1;
