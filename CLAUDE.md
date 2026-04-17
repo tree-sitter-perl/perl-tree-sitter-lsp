@@ -34,8 +34,11 @@ Unification refactor status: phases 2, 3, 4, 5 landed.
 - **Phase 3** — unified `FileStore` collapses `documents` + `workspace_index` (src/file_store.rs). Dedup: opening a workspace file promotes it to `Open`; closing demotes back.
 - **Phase 4** — `resolve.rs` + `RoleMask`; cross-file references now search workspace + deps (previously single-file).
 - **Phase 5** — `refs_by_target: HashMap<SymbolId, Vec<RefId>>` index + eager HashKeyAccess linkage to HashKeyDef at build time. `find_references` no longer requires a tree to match hash-key accesses; `Backend::references` now walks cross-file for hash keys too. Pin-the-fix tests in `file_analysis::tests::test_phase5_*` and `resolve::tests::test_refs_to_*`.
+- **Phase 5 follow-ups** — `HashKeyOwner::Sub` is package-qualified (no more cross-file name collisions); qualified calls (`Pkg::foo()`) produce `call_bindings`; delegation chains (`sub chain { return other() }`) propagate return types + hash-key ownership; dynamic method dispatch (`$obj->$m()` where `$m='name'`) resolves via constant folding through `MethodCallBinding`.
 
 Phases 1 (Namespace) and 6–7 still pending; see `docs/prompt-unification-spec.md`.
+
+Type inference + invariant derivation: `docs/prompt-type-inference-spec.md` captures what's landed and the next four modeling directions (invocant mutations, hash-key unions, method-loop dispatch analysis, map/grep/reduce invariants).
 
 **Rules:**
 
