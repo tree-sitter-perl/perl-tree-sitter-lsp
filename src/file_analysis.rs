@@ -6,15 +6,48 @@
 //! Designed to compose into a project index: `HashMap<PathBuf, FileAnalysis>`.
 
 use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
 use tree_sitter::Point;
 
 use crate::module_index::ModuleIndex;
 
+// ---- Serde proxy for tree_sitter::Point ----
+
+/// Remote-derive proxy for `tree_sitter::Point`, which doesn't implement serde.
+/// Fields mirror `Point` exactly — use `#[serde(with = "PointDef")]` on Point fields.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Point")]
+pub(crate) struct PointDef {
+    pub row: usize,
+    pub column: usize,
+}
+
+/// Helper module for `Option<Point>` serialization via the remote-derived proxy.
+pub(crate) mod point_opt_serde {
+    use super::PointDef;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tree_sitter::Point;
+
+    pub fn serialize<S: Serializer>(val: &Option<Point>, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct W<'a>(#[serde(with = "PointDef")] &'a Point);
+        val.as_ref().map(W).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Point>, D::Error> {
+        #[derive(Deserialize)]
+        struct W(#[serde(with = "PointDef")] Point);
+        Option::<W>::deserialize(d).map(|o| o.map(|W(p)| p))
+    }
+}
+
 // ---- Shared types (formerly in analysis.rs) ----
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Span {
+    #[serde(with = "PointDef")]
     pub start: Point,
+    #[serde(with = "PointDef")]
     pub end: Point,
 }
 
@@ -40,14 +73,14 @@ pub(crate) fn node_to_span(node: tree_sitter::Node) -> Span {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoldRange {
     pub start_line: usize,
     pub end_line: usize,
     pub kind: FoldKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum FoldKind {
     Region,
@@ -56,15 +89,15 @@ pub enum FoldKind {
 
 // ---- IDs ----
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ScopeId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SymbolId(pub u32);
 
 // ---- Scope ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scope {
     pub id: ScopeId,
     pub parent: Option<ScopeId>,
@@ -76,7 +109,7 @@ pub struct Scope {
     pub package: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum ScopeKind {
     File,
@@ -96,7 +129,7 @@ pub enum ScopeKind {
 
 // ---- Symbol ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub id: SymbolId,
     pub name: String,
@@ -111,7 +144,7 @@ pub struct Symbol {
     pub detail: SymbolDetail,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymKind {
     Variable,
     Sub,
@@ -123,7 +156,7 @@ pub enum SymKind {
     HashKeyDef,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum SymbolDetail {
     Variable {
@@ -155,7 +188,7 @@ pub enum SymbolDetail {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeclKind {
     My,
     Our,
@@ -165,14 +198,14 @@ pub enum DeclKind {
     ForVar,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamInfo {
     pub name: String,
     pub default: Option<String>,
     pub is_slurpy: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct FieldDetail {
     pub name: String,
@@ -182,7 +215,7 @@ pub struct FieldDetail {
 
 // ---- Ref ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ref {
     pub kind: RefKind,
     pub span: Span,
@@ -203,7 +236,7 @@ pub enum RenameKind {
     HashKey(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum RefKind {
     Variable,
@@ -224,7 +257,7 @@ pub enum RefKind {
     ContainerAccess,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessKind {
     Read,
     Write,
@@ -233,7 +266,7 @@ pub enum AccessKind {
 
 // ---- Type constraints ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeConstraint {
     pub variable: String,
     pub scope: ScopeId,
@@ -241,7 +274,7 @@ pub struct TypeConstraint {
     pub inferred_type: InferredType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InferredType {
     /// `$p = Point->new(...)` — variable is an instance of ClassName.
     ClassName(String),
@@ -309,7 +342,7 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
 
 // ---- Hash key owner (for scope graph) ----
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HashKeyOwner {
     Class(String),
     Variable { name: String, def_scope: ScopeId },
@@ -321,7 +354,7 @@ pub enum HashKeyOwner {
 
 /// A variable assigned from a function call: `my $cfg = get_config()`.
 /// Stored in FileAnalysis so query-time resolution can follow the chain.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallBinding {
     pub variable: String,
     pub func_name: String,
@@ -331,7 +364,7 @@ pub struct CallBinding {
 
 /// A method call binding: `$var = $invocant->method()`.
 /// Recorded during build, resolved in post-pass via `find_method_return_type`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MethodCallBinding {
     pub variable: String,
     pub invocant_var: String,
@@ -343,7 +376,7 @@ pub struct MethodCallBinding {
 // ---- Import ----
 
 /// A `use Foo::Bar qw(func1 func2)` statement parsed from the source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Import {
     /// Module name, e.g. "List::Util".
     pub module_name: String,
@@ -353,6 +386,7 @@ pub struct Import {
     pub span: Span,
     /// Position of the closing delimiter of the `qw()` list (the `)` character).
     /// Used to insert new imports into an existing qw list.
+    #[serde(with = "point_opt_serde")]
     pub qw_close_paren: Option<Point>,
 }
 
@@ -409,6 +443,7 @@ fn sigil_modifier(sigil: char) -> u32 {
 
 // ---- FileAnalysis ----
 
+#[derive(Serialize, Deserialize)]
 pub struct FileAnalysis {
     // Core tables
     pub scopes: Vec<Scope>,
@@ -437,14 +472,21 @@ pub struct FileAnalysis {
     pub export_ok: Vec<String>,
 
     // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
+    #[serde(default)]
     base_type_constraint_count: usize,
+    #[serde(default)]
     base_symbol_count: usize,
 
-    // Indices (built in post-pass)
+    // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
+    #[serde(skip, default)]
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
+    #[serde(skip, default)]
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
+    #[serde(skip, default)]
     symbols_by_scope: HashMap<ScopeId, Vec<SymbolId>>,
+    #[serde(skip, default)]
     refs_by_name: HashMap<String, Vec<usize>>,
+    #[serde(skip, default)]
     type_constraints_by_var: HashMap<String, Vec<usize>>,
 }
 
@@ -491,6 +533,19 @@ impl FileAnalysis {
         fa.base_type_constraint_count = fa.type_constraints.len();
         fa.base_symbol_count = fa.symbols.len();
         fa
+    }
+
+    /// Rebuild all derived indices after deserialization.
+    /// Idempotent: safe to call on a freshly deserialized `FileAnalysis` whose
+    /// index fields were zeroed by `#[serde(skip, default)]`.
+    pub fn after_deserialize(&mut self) {
+        // Clear first in case this is called on a populated FileAnalysis.
+        self.scope_starts.clear();
+        self.symbols_by_name.clear();
+        self.symbols_by_scope.clear();
+        self.refs_by_name.clear();
+        self.type_constraints_by_var.clear();
+        self.build_indices();
     }
 
     fn build_indices(&mut self) {
