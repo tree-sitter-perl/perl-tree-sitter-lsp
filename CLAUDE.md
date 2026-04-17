@@ -18,14 +18,18 @@ The codebase has four layers. Data flows **down** only. Each layer may only depe
 ```
   LSP adapter      symbols.rs, backend.rs       → LSP protocol types
   ─────────────────────────────────────────────────────────────────
-  Cross-file       module_index.rs,             → ModuleExports, ExportedSub
-                   module_resolver.rs,
-                   module_cache.rs
+  Cross-file       module_index.rs,             → CachedModule (path + Arc<FileAnalysis>)
+                   module_resolver.rs,            plus SubInfo<'_> view helpers.
+                   module_cache.rs                No lossy per-module summary type.
   ─────────────────────────────────────────────────────────────────
   Builder          builder.rs                   → produces FileAnalysis
   ─────────────────────────────────────────────────────────────────
   Data model       file_analysis.rs             → FileAnalysis, Symbol, Ref, types
+                                                  (serde-derived graph, serializable
+                                                  via bincode for SQLite storage)
 ```
+
+Unification refactor status: phase 2 landed (full FileAnalysis stored for deps, no more ModuleExports fidelity cliff). Phases 3–7 in progress; see `docs/prompt-unification-spec.md`.
 
 **Rules:**
 
@@ -79,6 +83,7 @@ The codebase has four layers. Data flows **down** only. Each layer may only depe
 - `dashmap 6` — Concurrent document store + module cache
 - `rusqlite 0.32` — SQLite persistence for module index (bundled)
 - `ts-parser-pod` — crates.io, POD→AST for documentation rendering
+- `serde 1` (derive) + `bincode 1` + `zstd 0.13` — FileAnalysis serialization for the module cache blob
 
 ## tree-sitter-perl Node Types
 
@@ -105,16 +110,16 @@ E2e tests use Neovim headless mode. They exercise the full LSP protocol over std
 
 ## Cross-file Module Resolution
 
-- `ModuleIndex` uses a dedicated `std::thread` for filesystem I/O (never blocks tokio)
-- `Arc<DashMap>` shared between resolver thread and async LSP handlers
-- Reverse index: `DashMap<func_name, Vec<module_name>>` for O(1) exporter lookup
-- Export extraction runs in-process (no subprocess isolation — tree-sitter-perl grammar is stable)
-- Subprocess runs the full builder on each module, then queries `FileAnalysis` for per-export metadata
-- `ModuleExports` stores `subs: HashMap<String, ExportedSub>` — unified per-export metadata (def_line, params, is_method, return_type, hash_keys, doc) — and `parents: Vec<String>` for inheritance chain
-- cpanfile parsed with tree-sitter queries at startup, deps pre-resolved with progress reporting
-- SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`), schema v8 with `subs` JSON + `parents` JSON columns
-- Async handlers only use `_cached` methods — zero I/O
-- After resolution, diagnostics are refreshed for all open files (clears stale false positives)
+- `ModuleIndex` uses a dedicated `std::thread` for filesystem I/O (never blocks tokio).
+- `Arc<DashMap>` shared between resolver thread and async LSP handlers.
+- Cache value is `Option<Arc<CachedModule>>` — `CachedModule { path: PathBuf, analysis: Arc<FileAnalysis> }`. **Full FileAnalysis survives the module boundary** — refs, type_constraints, call_bindings, method_call_bindings, imports, framework_imports, complete package_parents.
+- `SubInfo<'_>` view on `CachedModule` gives callers the old `ExportedSub`-style accessors (`def_line`, `params`, `is_method`, `return_type`, `doc`, `hash_keys`) without a separate summary type.
+- Reverse index: `DashMap<func_name, Vec<module_name>>` for O(1) exporter lookup.
+- Export extraction runs in-process (no subprocess isolation — tree-sitter-perl grammar is stable).
+- cpanfile parsed with tree-sitter queries at startup, deps pre-resolved with progress reporting.
+- SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`), **schema v9** with a single `analysis BLOB` column containing `zstd(bincode(FileAnalysis))`. `EXTRACT_VERSION` still bumps on builder changes to trigger priority re-resolution without dropping the table.
+- Async handlers only use `_cached` methods — zero I/O.
+- After resolution, diagnostics are refreshed for all open files (clears stale false positives).
 
 ### Cross-file type enrichment
 
@@ -126,8 +131,8 @@ Post-build enrichment propagates imported return types and hash keys into the lo
 - `rebuild_enrichment_indices()` rebuilds `type_constraints_by_var`, `symbols_by_name`, and `symbols_by_scope` after enrichment
 - Backend wiring: `Arc<ModuleIndex>` on `Backend`, refresh callback uses `OnceLock<Arc<ModuleIndex>>` for deferred init (resolver thread has no tokio context, spawns async work via captured `Handle`)
 - `enrich_analysis()` called from `publish_diagnostics()` and from the refresh callback (which re-enriches all open documents when a module resolves)
-- `InferredType` serialized as simple string tags (`"HashRef"`, `"Object:Foo"`, etc.) for JSON IPC and SQLite TEXT storage — no serde derives
-- `EXTRACT_VERSION` tracks extraction logic version; stale entries loaded from cache but re-resolved with priority
+- `InferredType` is serde-derived; signature help still emits string tags (`"HashRef"`, `"Object:Foo"`, ...) via `inferred_type_to_tag` for its `param_types` LSP JSON field. All SQLite storage now uses bincode, not tags.
+- `EXTRACT_VERSION` tracks builder output version; stale entries loaded from cache but re-resolved with priority
 
 ### Inheritance chain resolution
 
