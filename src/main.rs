@@ -10,6 +10,7 @@ mod module_index;
 mod module_resolver;
 mod pod;
 mod query_cache;
+mod resolve;
 mod symbols;
 
 use backend::Backend;

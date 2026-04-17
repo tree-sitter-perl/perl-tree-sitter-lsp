@@ -392,11 +392,76 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let refs = symbols::find_references(&doc.analysis, pos, uri, &doc.tree, &doc.text);
-        if refs.is_empty() {
+
+        // Derive a cross-file target from the rename-kind machinery. If the
+        // target is inherently local (variables), fall back to single-file
+        // references — no cross-file walk to do.
+        use crate::file_analysis::RenameKind;
+        use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
+
+        let point = symbols::position_to_point(pos);
+        let target = match doc.analysis.rename_kind_at(point) {
+            Some(RenameKind::Function(name)) => TargetRef {
+                name,
+                kind: TargetKind::Sub,
+            },
+            Some(RenameKind::Method(name)) => TargetRef {
+                name,
+                kind: TargetKind::Method,
+            },
+            Some(RenameKind::Package(name)) => TargetRef {
+                name,
+                kind: TargetKind::Package,
+            },
+            Some(RenameKind::HashKey(_)) => {
+                // Hash-key cross-file resolution depends on the owner (the
+                // current Ref model resolves owners lazily via tree walk).
+                // Phase 5's eager ref target resolution will make this tractable;
+                // until then, fall back to single-file references.
+                let refs = symbols::find_references(
+                    &doc.analysis, pos, uri, &doc.tree, &doc.text,
+                );
+                return Ok(if refs.is_empty() { None } else { Some(refs) });
+            }
+            Some(RenameKind::Variable) | None => {
+                // Variables are lexical — single-file only.
+                let refs = symbols::find_references(
+                    &doc.analysis, pos, uri, &doc.tree, &doc.text,
+                );
+                return Ok(if refs.is_empty() { None } else { Some(refs) });
+            }
+        };
+
+        // Cross-file walk: workspace + open + deps.
+        drop(doc); // release the DashMap read lock before the resolve walk
+        let results = refs_to(
+            &self.files,
+            Some(&self.module_index),
+            &target,
+            RoleMask::VISIBLE,
+        );
+
+        let mut locations: Vec<Location> = results
+            .into_iter()
+            .filter_map(|r| {
+                let uri = r.to_url()?;
+                Some(Location {
+                    uri,
+                    range: symbols::span_to_range(r.span),
+                })
+            })
+            .collect();
+
+        if locations.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(refs))
+            // Stable order for the client.
+            locations.sort_by(|a, b| {
+                a.uri.as_str().cmp(b.uri.as_str())
+                    .then_with(|| a.range.start.line.cmp(&b.range.start.line))
+                    .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+            });
+            Ok(Some(locations))
         }
     }
 

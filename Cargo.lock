@@ -711,6 +711,7 @@ name = "perl-lsp"
 version = "0.2.4"
 dependencies = [
  "bincode",
+ "bitflags 2.11.1",
  "dashmap 6.1.0",
  "env_logger",
  "ignore",
