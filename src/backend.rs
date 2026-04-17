@@ -98,6 +98,31 @@ impl Backend {
     }
 }
 
+/// Convert a resolve::RefLocation list into the LSP Location list expected by
+/// the `references` response, stable-sorted and deduplicated by (uri, span).
+fn refs_to_locations(results: Vec<crate::resolve::RefLocation>) -> Option<Vec<Location>> {
+    let mut locations: Vec<Location> = results
+        .into_iter()
+        .filter_map(|r| {
+            let uri = r.to_url()?;
+            Some(Location {
+                uri,
+                range: symbols::span_to_range(r.span),
+            })
+        })
+        .collect();
+    if locations.is_empty() {
+        return None;
+    }
+    locations.sort_by(|a, b| {
+        a.uri.as_str().cmp(b.uri.as_str())
+            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
+            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+    });
+    locations.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
+    Some(locations)
+}
+
 fn build_imported_return_types(
     analysis: &crate::file_analysis::FileAnalysis,
     module_index: &ModuleIndex,
@@ -413,15 +438,65 @@ impl LanguageServer for Backend {
                 name,
                 kind: TargetKind::Package,
             },
-            Some(RenameKind::HashKey(_)) => {
-                // Hash-key cross-file resolution depends on the owner (the
-                // current Ref model resolves owners lazily via tree walk).
-                // Phase 5's eager ref target resolution will make this tractable;
-                // until then, fall back to single-file references.
-                let refs = symbols::find_references(
-                    &doc.analysis, pos, uri, &doc.tree, &doc.text,
-                );
-                return Ok(if refs.is_empty() { None } else { Some(refs) });
+            Some(RenameKind::HashKey(name)) => {
+                // Phase 5: if the cursor is on a HashKeyDef or a HashKeyAccess
+                // whose owner was resolved at build time, do a cross-file walk
+                // keyed on (key name, owner). If we can't determine the owner,
+                // fall back to single-file.
+                use crate::file_analysis::{HashKeyOwner, RefKind, SymbolDetail};
+                let cursor_point = symbols::position_to_point(pos);
+                let owner_from_ref = doc.analysis.ref_at(cursor_point).and_then(|r| {
+                    if let RefKind::HashKeyAccess { owner: Some(o), .. } = &r.kind {
+                        Some(o.clone())
+                    } else {
+                        None
+                    }
+                });
+                let owner_from_sym = doc.analysis.symbol_at(cursor_point).and_then(|s| {
+                    if let SymbolDetail::HashKeyDef { owner, .. } = &s.detail {
+                        Some(owner.clone())
+                    } else {
+                        None
+                    }
+                });
+                let owner = owner_from_ref.or(owner_from_sym);
+
+                match owner {
+                    Some(HashKeyOwner::Sub(sub_name)) => {
+                        drop(doc);
+                        let results = crate::resolve::refs_to(
+                            &self.files,
+                            Some(&self.module_index),
+                            &crate::resolve::TargetRef {
+                                name,
+                                kind: crate::resolve::TargetKind::HashKeyOfSub(sub_name),
+                            },
+                            crate::resolve::RoleMask::VISIBLE,
+                        );
+                        return Ok(refs_to_locations(results));
+                    }
+                    Some(HashKeyOwner::Class(class_name)) => {
+                        drop(doc);
+                        let results = crate::resolve::refs_to(
+                            &self.files,
+                            Some(&self.module_index),
+                            &crate::resolve::TargetRef {
+                                name,
+                                kind: crate::resolve::TargetKind::HashKeyOfClass(class_name),
+                            },
+                            crate::resolve::RoleMask::VISIBLE,
+                        );
+                        return Ok(refs_to_locations(results));
+                    }
+                    _ => {
+                        // Fall back to single-file (e.g. keys owned by a lexical
+                        // variable — scope-local by definition).
+                        let refs = symbols::find_references(
+                            &doc.analysis, pos, uri, &doc.tree, &doc.text,
+                        );
+                        return Ok(if refs.is_empty() { None } else { Some(refs) });
+                    }
+                }
             }
             Some(RenameKind::Variable) | None => {
                 // Variables are lexical — single-file only.
@@ -440,29 +515,7 @@ impl LanguageServer for Backend {
             &target,
             RoleMask::VISIBLE,
         );
-
-        let mut locations: Vec<Location> = results
-            .into_iter()
-            .filter_map(|r| {
-                let uri = r.to_url()?;
-                Some(Location {
-                    uri,
-                    range: symbols::span_to_range(r.span),
-                })
-            })
-            .collect();
-
-        if locations.is_empty() {
-            Ok(None)
-        } else {
-            // Stable order for the client.
-            locations.sort_by(|a, b| {
-                a.uri.as_str().cmp(b.uri.as_str())
-                    .then_with(|| a.range.start.line.cmp(&b.range.start.line))
-                    .then_with(|| a.range.start.character.cmp(&b.range.start.character))
-            });
-            Ok(Some(locations))
-        }
+        Ok(refs_to_locations(results))
     }
 
     async fn prepare_rename(

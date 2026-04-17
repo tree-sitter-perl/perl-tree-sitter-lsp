@@ -285,6 +285,73 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// Phase 5: hash key references are emitted with owner resolved at build
+    /// time when the binding is local. refs_to then matches both the def and
+    /// the access in the same file via the HashKeyOfSub target.
+    ///
+    /// Cross-file HashKeyAccess owners are currently resolved through the
+    /// enrichment path (which injects synthetic HashKeyDefs in the consumer
+    /// file); this test covers the same-file case that lands purely via phase
+    /// 5 build-time linking. A follow-up (enrichment rebuild of
+    /// refs_by_target) will close the cross-file consumer-access case.
+    #[test]
+    fn test_refs_to_finds_hash_key_def_and_access_same_file() {
+        let store = FileStore::new();
+        let path = PathBuf::from("/tmp/resolve_hash_same.pm");
+
+        let fa = parse(
+            "package Lib;\nsub get_config { return { host => 1, port => 2 } }\nmy $cfg = get_config();\nmy $h = $cfg->{host};\n1;\n",
+        );
+        store.insert_workspace(path.clone(), fa);
+
+        let results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "host".to_string(),
+                kind: TargetKind::HashKeyOfSub("get_config".to_string()),
+            },
+            RoleMask::EDITABLE,
+        );
+
+        // Expect at least the HashKeyDef decl AND the HashKeyAccess (both in
+        // the same file). Previously, the access required a tree argument to
+        // resolve its owner — now it's linked at build time.
+        let has_decl = results.iter().any(|r| r.access == AccessKind::Declaration);
+        let has_access = results.iter().any(|r| r.access == AccessKind::Read);
+        assert!(has_decl, "expected HashKeyDef decl, got {:?}", results);
+        assert!(has_access, "expected HashKeyAccess, got {:?}", results);
+    }
+
+    /// Cross-file: the HashKeyDef is discoverable in a different file even
+    /// when the consumer's access site hasn't been enriched yet. This is a
+    /// partial cross-file fix — consumer-side access resolution still needs
+    /// enrichment to run in the consumer's FileAnalysis.
+    #[test]
+    fn test_refs_to_finds_cross_file_hash_key_def() {
+        let store = FileStore::new();
+        let path_lib = PathBuf::from("/tmp/resolve_hash_cross_lib.pm");
+
+        let fa_lib = parse(
+            "package Lib;\nsub get_config { return { host => 1, port => 2 } }\n1;\n",
+        );
+        store.insert_workspace(path_lib.clone(), fa_lib);
+
+        let results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "host".to_string(),
+                kind: TargetKind::HashKeyOfSub("get_config".to_string()),
+            },
+            RoleMask::EDITABLE,
+        );
+        assert!(
+            results.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &path_lib)),
+            "expected HashKeyDef match in Lib, got {:?}", results,
+        );
+    }
+
     #[test]
     fn test_refs_to_role_mask_excludes_workspace() {
         let store = FileStore::new();

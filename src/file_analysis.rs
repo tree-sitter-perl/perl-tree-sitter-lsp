@@ -488,6 +488,10 @@ pub struct FileAnalysis {
     refs_by_name: HashMap<String, Vec<usize>>,
     #[serde(skip, default)]
     type_constraints_by_var: HashMap<String, Vec<usize>>,
+    /// Refs indexed by the SymbolId they resolve to (phase 5).
+    /// Every query for "refs to symbol X" collapses to an O(1) lookup here.
+    #[serde(skip, default)]
+    refs_by_target: HashMap<SymbolId, Vec<usize>>,
 }
 
 impl FileAnalysis {
@@ -527,6 +531,7 @@ impl FileAnalysis {
             symbols_by_scope: HashMap::new(),
             refs_by_name: HashMap::new(),
             type_constraints_by_var: HashMap::new(),
+            refs_by_target: HashMap::new(),
         };
         fa.build_indices();
         fa.resolve_method_call_types(None); // local post-pass
@@ -545,6 +550,7 @@ impl FileAnalysis {
         self.symbols_by_scope.clear();
         self.refs_by_name.clear();
         self.type_constraints_by_var.clear();
+        self.refs_by_target.clear();
         self.build_indices();
     }
 
@@ -571,12 +577,44 @@ impl FileAnalysis {
                 .push(sym.id);
         }
 
-        // Refs by target name
+        // Phase 5: link HashKeyAccess refs to their HashKeyDef symbols whenever
+        // the owner is already resolved (the builder's pre-pass handled type
+        // constraints + variable identity + call-binding fixups). With this
+        // link, `refs_to_symbol(def_id)` returns all accesses in O(1), which
+        // is what references, rename, and highlights consume.
+        let hashkey_defs: HashMap<(&str, &HashKeyOwner), SymbolId> = self.symbols.iter()
+            .filter_map(|sym| {
+                if let SymbolDetail::HashKeyDef { owner, .. } = &sym.detail {
+                    Some(((sym.name.as_str(), owner), sym.id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut hashkey_resolutions: Vec<(usize, SymbolId)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            if r.resolves_to.is_some() {
+                continue;
+            }
+            if let RefKind::HashKeyAccess { owner: Some(owner), .. } = &r.kind {
+                if let Some(&sid) = hashkey_defs.get(&(r.target_name.as_str(), owner)) {
+                    hashkey_resolutions.push((i, sid));
+                }
+            }
+        }
+        for (idx, sid) in hashkey_resolutions {
+            self.refs[idx].resolves_to = Some(sid);
+        }
+
+        // Refs by target name, and refs by resolved target SymbolId (phase 5).
         for (i, r) in self.refs.iter().enumerate() {
             self.refs_by_name
                 .entry(r.target_name.clone())
                 .or_default()
                 .push(i);
+            if let Some(sym_id) = r.resolves_to {
+                self.refs_by_target.entry(sym_id).or_default().push(i);
+            }
         }
 
         // Type constraints by variable name
@@ -586,6 +624,12 @@ impl FileAnalysis {
                 .or_default()
                 .push(i);
         }
+    }
+
+    /// All refs that resolve to this symbol — O(1) lookup via the index.
+    /// Callers typically combine this with a kind filter.
+    pub fn refs_to_symbol(&self, sym_id: SymbolId) -> &[usize] {
+        self.refs_by_target.get(&sym_id).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     // ---- Query methods ----
@@ -1433,14 +1477,17 @@ impl FileAnalysis {
             results.push((sym.selection_span, AccessKind::Declaration));
         }
 
-        // Collect all refs that resolve to this symbol
-        for r in &self.refs {
-            if r.resolves_to == Some(target_id) {
-                results.push((r.span, r.access));
-            }
+        // Phase 5: O(1) lookup for every ref resolved to this symbol.
+        // This covers variables, HashKeyAccess refs whose owner was resolved at
+        // build time, and any future kinds that set resolves_to.
+        for &idx in self.refs_to_symbol(target_id) {
+            let r = &self.refs[idx];
+            results.push((r.span, r.access));
         }
 
         // For subs/methods/packages/classes, also find refs by name
+        // (these kinds don't populate resolves_to during build and are matched
+        // by textual name across the refs table).
         if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
             for r in &self.refs {
                 if r.target_name == sym.name && r.resolves_to.is_none() {
@@ -3506,6 +3553,110 @@ mod tests {
             fa.inferred_type("$cfg", Point::new(3, 0)),
             Some(&InferredType::HashRef),
             "Enrichment should propagate imported return type to call binding variable"
+        );
+    }
+
+    // ---- Phase 5: refs_by_target index + eager HashKeyAccess resolution ----
+
+    fn build_fa_from_source(source: &str) -> FileAnalysis {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        crate::builder::build(&tree, source.as_bytes())
+    }
+
+    /// Previously broken: references on a hash key owned by a sub's return
+    /// value didn't flow through refs_by_target because resolves_to was never
+    /// set on HashKeyAccess refs. Phase 5 links HashKeyAccess.resolves_to to
+    /// the matching HashKeyDef at build time via (target_name, owner) lookup.
+    #[test]
+    fn test_phase5_hash_key_access_links_to_def_symbol() {
+        let fa = build_fa_from_source(r#"
+            sub get_config { return { host => 'localhost', port => 5432 } }
+            my $cfg = get_config();
+            my $h = $cfg->{host};
+        "#);
+
+        // Find the HashKeyDef "host" owned by Sub("get_config").
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub(n), ..
+                } if n == "get_config")
+        });
+        assert!(def.is_some(), "HashKeyDef 'host' owned by Sub('get_config') should exist");
+        let def_id = def.unwrap().id;
+
+        // The `$cfg->{host}` access should be indexed under this symbol.
+        let indexed = fa.refs_to_symbol(def_id);
+        assert!(
+            !indexed.is_empty(),
+            "refs_by_target should index $cfg->{{host}} access under the HashKeyDef, got empty"
+        );
+        let access = &fa.refs[indexed[0]];
+        assert!(matches!(access.kind, RefKind::HashKeyAccess { .. }));
+        assert_eq!(access.target_name, "host");
+    }
+
+    /// Previously broken: find_references on the HashKeyDef required a tree
+    /// argument to match accesses (the HashKeyAccess.owner was resolved lazily
+    /// in the query via `resolve_hash_owner_from_tree`). Phase 5 links the ref
+    /// to the def at build time, so the query returns the access even when
+    /// the caller passes no tree.
+    #[test]
+    fn test_phase5_find_references_on_hash_key_def_without_tree() {
+        let fa = build_fa_from_source(r#"
+            sub get_config { return { host => 1, port => 2 } }
+            my $cfg = get_config();
+            my $h = $cfg->{host};
+            my $p = $cfg->{port};
+        "#);
+        let def_host = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub(n), ..
+                } if n == "get_config")
+        }).expect("host HashKeyDef");
+
+        // Cursor on the def — convention is that find_references returns the
+        // *usages*, not the def itself. Previously this returned 0 without a
+        // tree; phase 5 returns the access sites via refs_by_target.
+        let point = def_host.selection_span.start;
+        let refs = fa.find_references(point, None, None);
+        assert!(
+            !refs.is_empty(),
+            "expected at least one access for 'host' via refs_by_target (no tree), got empty",
+        );
+        // Sanity: the access should point at `$cfg->{host}`.
+        assert!(
+            refs.iter().any(|s| s.start.row == 3),
+            "expected to find the access on row 3 ($cfg->{{host}}), got {:?}",
+            refs,
+        );
+    }
+
+    /// Previously broken: refs_by_target was absent. Even variable refs
+    /// relied on a linear scan of `refs` per query. Phase 5 exposes an
+    /// O(1) lookup for any resolved ref.
+    #[test]
+    fn test_phase5_refs_by_target_index_populated_for_variables() {
+        let fa = build_fa_from_source(r#"
+            my $x = 1;
+            $x = 2;
+            my $y = $x + 1;
+        "#);
+        // Find the variable symbol $x.
+        let x_sym = fa.symbols.iter().find(|s| s.name == "$x" && s.kind == SymKind::Variable)
+            .expect("$x variable symbol");
+        let indexed = fa.refs_to_symbol(x_sym.id);
+        // Two usages after decl: `$x = 2` (write) and `$x + 1` (read).
+        assert!(
+            indexed.len() >= 2,
+            "expected >= 2 refs to $x via refs_by_target, got {}: {:?}",
+            indexed.len(),
+            indexed,
         );
     }
 }
