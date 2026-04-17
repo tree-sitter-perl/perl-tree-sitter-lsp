@@ -29,7 +29,12 @@ The codebase has four layers. Data flows **down** only. Each layer may only depe
                                                   via bincode for SQLite storage)
 ```
 
-Unification refactor status: phase 2 landed (full FileAnalysis stored for deps, no more ModuleExports fidelity cliff). Phases 3–7 in progress; see `docs/prompt-unification-spec.md`.
+Unification refactor status: phases 2, 3, 4 landed.
+- **Phase 2** — full FileAnalysis stored for deps (no more ModuleExports fidelity cliff).
+- **Phase 3** — unified `FileStore` collapses `documents` + `workspace_index` (src/file_store.rs). Dedup: opening a workspace file promotes it to `Open`; closing demotes back.
+- **Phase 4** — `resolve.rs` + `RoleMask`; cross-file references now search workspace + deps (previously single-file).
+
+Phases 1 (Namespace) and 5–7 still pending; see `docs/prompt-unification-spec.md`.
 
 **Rules:**
 
@@ -63,16 +68,18 @@ Unification refactor status: phase 2 landed (full FileAnalysis stored for deps, 
 ### File map
 
 - `src/main.rs` — Entry point, stdio transport, CLI modes (`--rename`, `--workspace-symbol`, `--version`)
-- `src/backend.rs` — `LanguageServer` trait implementation (tower-lsp), request routing, workspace indexing
-- `src/document.rs` — Document store with tree-sitter parsing
-- `src/file_analysis.rs` — Data model: scopes, symbols, refs, imports, type inference, priority constants
+- `src/backend.rs` — `LanguageServer` trait implementation (tower-lsp), request routing. Open + workspace files live in the shared `FileStore`.
+- `src/document.rs` — `Document` (tree + text + analysis + stable_outline) for open files
+- `src/file_store.rs` — Unified store for open + workspace FileAnalyses (role-tagged, dedup'd by path)
+- `src/file_analysis.rs` — Data model: scopes, symbols, refs, imports, type inference, priority constants. Serde-derived.
 - `src/builder.rs` — Single-pass CST → FileAnalysis builder (the ONLY tree-sitter consumer)
 - `src/pod.rs` — POD→markdown converter (tree-sitter-pod AST walk, handles nested formatting/lists/data regions)
 - `src/cursor_context.rs` — Cursor position analysis: completion/signature/selection context
 - `src/symbols.rs` — LSP adapter layer (converts FileAnalysis types to LSP types)
-- `src/module_index.rs` — Cross-file: public API, reverse index (`func → modules`), concurrent cache
-- `src/module_resolver.rs` — Background resolver thread, in-process parsing, workspace indexing (Rayon)
-- `src/module_cache.rs` — SQLite persistence, schema migrations, mtime validation
+- `src/resolve.rs` — Cross-file `refs_to` + `RoleMask` (OPEN, WORKSPACE, DEPENDENCY, BUILTIN). Every cross-file query routes through here.
+- `src/module_index.rs` — Cross-file dep API, `CachedModule`, `SubInfo`, reverse index (`func → modules`), concurrent cache
+- `src/module_resolver.rs` — Background resolver thread, in-process parsing, workspace indexing (Rayon) into FileStore
+- `src/module_cache.rs` — SQLite persistence (schema v9, bincode+zstd of FileAnalysis), mtime validation
 - `src/cpanfile.rs` — cpanfile parsing via tree-sitter queries
 
 ## Key Dependencies
