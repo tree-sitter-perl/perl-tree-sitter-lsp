@@ -3625,6 +3625,114 @@ mod tests {
         crate::builder::build(&tree, source.as_bytes())
     }
 
+    /// End-to-end demo shape: mirrors `test_files/phase5_demo.pl` so a
+    /// regression in the demo surfaces here first. Three access sites all
+    /// flow through the qualified `Demo::phase5::get_config()` binding.
+    #[test]
+    fn test_phase5_demo_file_shape_resolves_all_access_sites() {
+        let fa = build_fa_from_source(r#"
+            package Demo::phase5;
+            sub get_config {
+                return { host => 'localhost', port => 5432, name => 'mydb' };
+            }
+            my $c = Demo::phase5::get_config();
+            my $h1 = $c->{host};
+            my $h2 = $c->{host};
+            my $p  = $c->{port};
+        "#);
+
+        let def_host = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { package: Some(p), name }, ..
+                } if p == "Demo::phase5" && name == "get_config")
+        }).expect("Demo::phase5::get_config's HashKeyDef `host`");
+
+        let indexed = fa.refs_to_symbol(def_host.id);
+        // Two $c->{host} accesses — both should resolve to the same def.
+        assert_eq!(
+            indexed.len(),
+            2,
+            "expected 2 $c->{{host}} accesses to link via refs_by_target, got {} (indexes: {:?})",
+            indexed.len(),
+            indexed,
+        );
+
+        // The port access must NOT be under host's target.
+        let def_port = fa.symbols.iter().find(|s| {
+            s.name == "port"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
+        }).expect("HashKeyDef port");
+        let port_refs = fa.refs_to_symbol(def_port.id);
+        assert_eq!(port_refs.len(), 1, "expected exactly one $c->{{port}} access");
+    }
+
+    /// Qualified call: `Demo::phase5::get_config()` should link $c->{host}
+    /// to the HashKeyDef emitted inside `sub get_config` in the same package.
+    /// Previously broken: the binding fixup looked up `return_types` by the
+    /// qualified func_name ("Demo::phase5::get_config"), missed, and left
+    /// $c->{host} with owner=None. Now the fixup strips the package prefix.
+    #[test]
+    fn test_phase5_qualified_sub_call_links_hash_key_access() {
+        let fa = build_fa_from_source(r#"
+            package Demo::phase5;
+            sub get_config { return { host => 'localhost', port => 5432 } }
+            my $c = Demo::phase5::get_config();
+            my $h = $c->{host};
+        "#);
+
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { package: Some(p), name }, ..
+                } if p == "Demo::phase5" && name == "get_config")
+        }).expect("HashKeyDef host owned by Sub{Some(Demo::phase5), get_config}");
+
+        let indexed = fa.refs_to_symbol(def.id);
+        assert!(
+            !indexed.is_empty(),
+            "qualified call `Demo::phase5::get_config()` should link $c->{{host}} to the def via refs_by_target",
+        );
+    }
+
+    /// Chain through an intermediate sub: `sub chain { return get_config() }`
+    /// with `$c = chain(); $c->{host}`. The hash key ownership must flow
+    /// through chain to get_config, where the actual HashKeyDefs live.
+    /// Previously broken: $c's owner was Sub{_, "chain"}, which has no
+    /// HashKeyDefs, so refs_by_target matched nothing.
+    #[test]
+    fn test_phase5_hash_key_owner_flows_through_intermediate_sub() {
+        let fa = build_fa_from_source(r#"
+            package Demo::phase5;
+            sub get_config { return { host => 'localhost', port => 5432 } }
+            sub chain_helper { return get_config() }
+            my $c = chain_helper();
+            my $h = $c->{host};
+        "#);
+
+        // The HashKeyDef for `host` lives under get_config, not chain_helper.
+        let def = fa.symbols.iter().find(|s| {
+            s.name == "host"
+                && s.kind == SymKind::HashKeyDef
+                && matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == "get_config")
+        }).expect("host HashKeyDef owned by get_config");
+
+        // The access $c->{host} must link to this def, even though $c was
+        // bound to chain_helper() (the intermediate sub with no keys).
+        let indexed = fa.refs_to_symbol(def.id);
+        assert!(
+            !indexed.is_empty(),
+            "chain_helper → get_config delegation should flow $c->{{host}} to get_config's HashKeyDef",
+        );
+    }
+
     /// Previously broken: references on a hash key owned by a sub's return
     /// value didn't flow through refs_by_target because resolves_to was never
     /// set on HashKeyAccess refs. Phase 5 links HashKeyAccess.resolves_to to

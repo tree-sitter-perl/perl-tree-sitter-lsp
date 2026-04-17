@@ -23,6 +23,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
         package_parents: std::collections::HashMap::new(),
+        sub_return_delegations: std::collections::HashMap::new(),
         framework_modes: std::collections::HashMap::new(),
         framework_imports: std::collections::HashSet::new(),
         constant_strings: std::collections::HashMap::new(),
@@ -76,6 +77,51 @@ struct ReturnInfo {
     inferred_type: Option<InferredType>,
 }
 
+/// If `return_node` is `return CALL`, where CALL is a simple named function
+/// call or method call, return the bare called name. Otherwise None. Used to
+/// collect hash-key ownership delegation chains for post-pass resolution.
+fn extract_delegated_call_name<'a>(return_node: Node<'a>, source: &'a [u8]) -> Option<String> {
+    // The `return X` node has the expression as its first named child.
+    let expr = return_node.named_child(0)?;
+    let call_name = match expr.kind() {
+        "function_call_expression" | "ambiguous_function_call_expression" => {
+            expr.child_by_field_name("function")?.utf8_text(source).ok()?
+        }
+        "method_call_expression" => {
+            expr.child_by_field_name("method")?.utf8_text(source).ok()?
+        }
+        _ => return None,
+    };
+    // Strip package prefix — delegation is stored by bare sub name to match
+    // the return_types lookup convention.
+    Some(call_name.rsplit("::").next().unwrap_or(call_name).to_string())
+}
+
+/// Walk the delegation chain starting at `start` until we find a sub that
+/// actually owns HashKeyDefs, or run out of links. Cycle-safe via a visited
+/// set; caps at a small depth since delegation chains in real code are short.
+fn walk_return_delegation_chain(
+    start: &str,
+    delegations: &std::collections::HashMap<String, String>,
+    subs_with_own_keys: &std::collections::HashSet<String>,
+) -> String {
+    let mut current = start.to_string();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..10 {
+        if subs_with_own_keys.contains(&current) {
+            return current;
+        }
+        if !seen.insert(current.clone()) {
+            return current; // cycle guard
+        }
+        match delegations.get(&current) {
+            Some(next) => current = next.clone(),
+            None => return current,
+        }
+    }
+    current
+}
+
 struct Builder<'a> {
     source: &'a [u8],
 
@@ -97,6 +143,11 @@ struct Builder<'a> {
     pod_texts: Vec<String>,
     /// Parent classes for each package (from use parent/base, @ISA, class :isa).
     package_parents: std::collections::HashMap<String, Vec<String>>,
+    /// sub_name → delegated sub name, for bodies that are `return other()` or
+    /// a bare trailing call. Used to propagate hash-key ownership through
+    /// intermediate subs so `sub chain { return get_config() }` doesn't
+    /// orphan `$cfg = chain(); $cfg->{host}`.
+    sub_return_delegations: std::collections::HashMap<String, String>,
     /// Framework mode per package (Moo, Moose, MojoBase) for accessor synthesis.
     framework_modes: std::collections::HashMap<String, FrameworkMode>,
     /// Functions implicitly imported by OOP frameworks (has, extends, with, etc.)
@@ -286,6 +337,14 @@ impl<'a> Builder<'a> {
                         scope,
                         inferred_type: ret_type,
                     });
+                    // If the return body is `return other()` (a direct call),
+                    // record the delegation so hash-key ownership can walk
+                    // through the intermediate.
+                    if let Some(sub_name) = self.enclosing_sub_name() {
+                        if let Some(delegated) = extract_delegated_call_name(node, self.source) {
+                            self.sub_return_delegations.insert(sub_name, delegated);
+                        }
+                    }
                 }
                 self.visit_children(node);
             }
@@ -2936,11 +2995,18 @@ impl<'a> Builder<'a> {
     /// Extract the function name from a call expression (function_call or ambiguous_function_call).
     fn extract_call_name(&self, node: Node<'a>) -> Option<String> {
         // Only match actual function calls, not method calls
-        // (method calls are handled by MethodCallBinding)
+        // (method calls are handled by MethodCallBinding).
+        //
+        // We used to reject names containing `:` (qualified calls like
+        // `Pkg::Sub::foo()`), which silently dropped those from
+        // `call_bindings` — so hash-key-owner propagation never fired for
+        // any fully-qualified invocation. The fixup downstream strips the
+        // package prefix before looking the sub up in `return_types`, so the
+        // qualifier is fine to pass through here.
         match node.kind() {
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 let name = crate::file_analysis::extract_call_name(node, self.source)?;
-                if name.contains(':') || name.starts_with('$') {
+                if name.starts_with('$') {
                     None
                 } else {
                     Some(name)
@@ -3326,6 +3392,29 @@ impl<'a> Builder<'a> {
             }
         }
 
+        // Propagate return types through delegation chains. If sub X's body
+        // is `return Y()` (recorded in sub_return_delegations) and Y has a
+        // known return type, X inherits it. Iterate until no changes — chains
+        // converge in at most `delegations.len()` passes.
+        let mut changed = true;
+        let mut iters = 0;
+        while changed && iters < 20 {
+            changed = false;
+            iters += 1;
+            let pairs: Vec<(String, String)> = self.sub_return_delegations.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (delegator, delegate) in pairs {
+                if return_types.contains_key(&delegator) {
+                    continue;
+                }
+                if let Some(t) = return_types.get(&delegate).cloned() {
+                    return_types.insert(delegator, t);
+                    changed = true;
+                }
+            }
+        }
+
         // Set return_type on matching Sub/Method symbols
         for sym in &mut self.symbols {
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
@@ -3359,27 +3448,54 @@ impl<'a> Builder<'a> {
         self.type_constraints.extend(new_constraints);
 
         // Fixup: update HashKeyAccess owners for variables bound to sub calls
-        // that return HashRef. This runs after call binding propagation so the
-        // type constraints are available.
-        let binding_map: std::collections::HashMap<&str, &str> = self.call_bindings.iter()
-            .filter(|b| return_types.get(&b.func_name).map_or(false, |t| *t == InferredType::HashRef))
-            .map(|b| (b.variable.as_str(), b.func_name.as_str()))
+        // that return HashRef. Two normalizations beyond the naive name match:
+        //   1. Call names may be qualified (`Pkg::foo`) — strip the package
+        //      prefix since return_types and the symbol table key on the
+        //      bare name.
+        //   2. The bound func may itself just `return other()` — walk the
+        //      delegation chain to the sub that actually declares the hash
+        //      literal. Otherwise `sub chain { return get_config() }` leaves
+        //      `$cfg = chain(); $cfg->{host}` with an owner that has no
+        //      matching HashKeyDefs.
+        let bare = |s: &str| -> String { s.rsplit("::").next().unwrap_or(s).to_string() };
+
+        let binding_map: std::collections::HashMap<&str, String> = self.call_bindings.iter()
+            .filter(|b| {
+                let name = bare(&b.func_name);
+                return_types.get(&name).map_or(false, |t| *t == InferredType::HashRef)
+            })
+            .map(|b| (b.variable.as_str(), bare(&b.func_name)))
             .collect();
 
-        // Per-sub package lookup (sub name → defining package). Needed so the
-        // HashKeyOwner::Sub emitted here carries the same package as the
-        // HashKeyDef the builder synthesized inside that sub.
         let sub_package: std::collections::HashMap<&str, Option<String>> = self.symbols.iter()
             .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
             .map(|s| (s.name.as_str(), s.package.clone()))
             .collect();
 
+        // Which subs have at least one HashKeyDef they actually own?
+        let subs_with_own_keys: std::collections::HashSet<String> = self.symbols.iter()
+            .filter_map(|s| {
+                if let SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } = &s.detail {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         for r in &mut self.refs {
             if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
                 if let Some(func_name) = binding_map.get(var_text.as_str()) {
+                    let resolved = walk_return_delegation_chain(
+                        func_name,
+                        &self.sub_return_delegations,
+                        &subs_with_own_keys,
+                    );
                     *owner = Some(HashKeyOwner::Sub {
-                        package: sub_package.get(*func_name).cloned().unwrap_or(None),
-                        name: func_name.to_string(),
+                        package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
+                        name: resolved,
                     });
                 }
             }
