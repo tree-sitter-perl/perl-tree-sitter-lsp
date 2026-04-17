@@ -1,5 +1,9 @@
 # Mojolicious Deep Intelligence + Builder Plugin Architecture
 
+> **Status: blocked on unification phase 1.** See `docs/prompt-unification-spec.md`.
+>
+> **Superseded sections.** The data model in this document (Part E's `FrameworkEntity`, the per-feature Rust structs in Part A like `MojoRoute`/`MojoTask`/`MojoEvent`, and Part C's `framework_entities: Vec<FrameworkEntity>` field) is **replaced** by the unified Symbol/Ref/Namespace model. Mojo features do not introduce parallel data structures; they are **emission rules** that create Symbols and Refs in framework-specific Namespaces. The Pattern Catalog (Part A's Perl code + "What we provide" lists) and detection logic remain valid. The data-model replacement is in the **Emission Rules Catalog** section below (which supersedes Parts C, D, and E).
+
 ## Part A: Mojo-Specific Intelligence — Complete Pattern Catalog
 
 ### 1. Route → Controller#Action Resolution
@@ -89,26 +93,7 @@ get '/users' => {controller => 'users', action => 'list'};
 - Lite app: `main` by default, or the current package
 - Fallback: strip `::Controller::*` from known controller packages
 
-**Data structures:**
-
-```rust
-struct MojoRoute {
-    /// Span of the route target (string literal or hash pair values)
-    span: Span,
-    /// Span of just the action name within the string (for precise goto-def)
-    action_span: Span,
-    /// Resolved controller class (e.g. "MyApp::Controller::Users")
-    controller_class: String,
-    /// Action method name (e.g. "list")
-    action: String,
-    /// HTTP method (get, post, any, etc.) — for display
-    http_method: Option<String>,
-    /// Route path pattern (e.g. "/users/:id") — for display/hover
-    path_pattern: Option<String>,
-    /// Route name if ->name('...') was chained
-    name: Option<String>,
-}
-```
+**Data emitted:** see the **Emission Rules Catalog** section at the end of this doc. Routes do not introduce a new data type; they emit Refs pointing at existing Controller/Method Symbols.
 
 ### 2. Route Naming + url_for Resolution
 
@@ -267,20 +252,7 @@ add_task(process_order => 'MyApp::Task::ProcessOrder');
 ```
 Resolve the class, find its `run` method, extract params from there.
 
-**Data structure:**
-
-```rust
-struct MojoTask {
-    name: String,
-    name_span: Span,          // span of the task name string
-    def_span: Span,           // span of the full add_task call
-    /// Params from the sub body, EXCLUDING $job (first param)
-    params: Vec<ParamInfo>,
-    return_type: Option<InferredType>,
-    /// If task is a class name, the resolved class
-    task_class: Option<String>,
-}
-```
+**Data emitted:** see the **Emission Rules Catalog** section. Tasks are Symbols in the `MojoApp` Namespace with `SymKind::MojoTask`; `enqueue('name')` string literals become Refs pointing at them.
 
 ### 5. Stash Intelligence
 
@@ -606,32 +578,7 @@ Per-event handler signatures (hardcoded):
 - `->emit_safe(string, ...)` — same as `emit` with exception catching.
 - `->unsubscribe(string)` — event unregistration.
 
-**Data structure:**
-
-```rust
-struct MojoEvent {
-    name: String,
-    name_span: Span,
-    kind: MojoEventKind,  // On, Once, Emit, EmitSafe, Unsubscribe
-    /// Invocant class (if known) — for scoping events to the right class
-    invocant_class: Option<String>,
-    /// Handler params (for on/once registrations with inline sub)
-    handler_params: Vec<ParamInfo>,
-}
-
-enum MojoEventKind {
-    On,
-    Once,
-    Emit,
-    EmitSafe,
-    Unsubscribe,
-}
-```
-
-On FileAnalysis:
-```rust
-pub mojo_events: Vec<MojoEvent>,
-```
+**Data emitted:** see the **Emission Rules Catalog**. Event names are Symbols in the emitting class's Namespace with `SymKind::MojoEvent`; `on('name')` / `emit('name')` / `once('name')` / `unsubscribe('name')` strings become Refs with distinguishing `RefKind::MojoEventOn` / `MojoEventEmit` / `MojoEventOnce` / `MojoEventUnsubscribe`. The first `emit('name')` synthesizes the Symbol; subsequent references are Refs to it.
 
 **Cross-class event resolution:**
 When we see `$ua->on('start')` and we know `$ua` is `Mojo::UserAgent`, we offer UA-specific events. When class is unknown, fall back to showing all accumulated user-defined events + the base `Mojo::EventEmitter` events. The existing type inference system tells us the invocant's class — same machinery used for method completion.
@@ -785,21 +732,16 @@ Steps 1 and 2 are pure refactors. Step 3 is new feature code.
 
 Detection leverages existing `package_parents` — just check if the parent chain includes the Mojo base classes.
 
-### FileAnalysis fields
+### FileAnalysis changes
 
-Two new fields on FileAnalysis:
+**No new top-level vector on `FileAnalysis`.** Mojo features are expressed as Symbols and Refs in framework-specific Namespaces (see `docs/prompt-unification-spec.md` phase 1 for the Namespace enum). Two small flags on `FileAnalysis`:
 
 ```rust
-/// Unified registry for all framework-specific named entities.
-/// See Part E for the full data model design.
-pub framework_entities: Vec<FrameworkEntity>,
-
-/// App-level metadata (detected during post-build pass)
+/// Which Mojo-app namespace this file participates in.
+/// Used during emission to route Symbols into the right Namespace.
 pub mojo_app_namespace: Option<String>,
 pub is_mojo_lite: bool,
 ```
-
-One vec. One field. All Mojo routes, helpers, tasks, events, hooks, stash keys, plugins — and all future DBIC columns-in-search, relationships-in-join, and any other framework's string-referenced entities — go here.
 
 ### Post-build pass flow
 
@@ -807,42 +749,28 @@ One vec. One field. All Mojo routes, helpers, tasks, events, hooks, stash keys, 
 pub fn analyze_mojo_patterns(fa: &mut FileAnalysis, tree: &Tree, source: &[u8]) {
     let app_ns = detect_app_namespace(fa);
     let is_lite = detect_lite_mode(fa);
-    if app_ns.is_none() && !is_lite {
-        if !is_controller(fa) && !is_plugin(fa) {
-            return;
-        }
+    if app_ns.is_none() && !is_lite && !is_controller(fa) && !is_plugin(fa) {
+        return;
     }
 
     fa.mojo_app_namespace = app_ns.clone();
     fa.is_mojo_lite = is_lite;
 
-    // Each extractor pushes FrameworkEntity entries
-    extract_routes(fa, tree, source, app_ns.as_deref(), is_lite);
-    extract_helpers(fa, tree, source, is_lite);
-    extract_tasks(fa, tree, source);
-    extract_hooks(fa, tree, source, is_lite);
-    extract_events(fa, tree, source);
-    extract_plugins(fa, tree, source, is_lite);
-    extract_stash_keys(fa, tree, source);
-
-    // Synthesize helper symbols (helpers are ALSO methods on controller classes)
-    for entity in &fa.framework_entities {
-        if matches!(entity.kind, EntityKind::MojoHelper) {
-            synthesize_helper_symbol(fa, entity, app_ns.as_deref());
-        }
-    }
-
-    // Add route goto-def refs
-    for entity in &fa.framework_entities {
-        if matches!(entity.kind, EntityKind::MojoRoute { .. }) {
-            synthesize_route_refs(fa, entity);
-        }
-    }
-
-    // Add task/event name refs for enqueue/emit call sites
-    synthesize_string_refs(fa, tree, source);
+    // Emission rules — each appends Symbols and/or Refs to fa.symbols/fa.refs
+    // with the appropriate home_namespace and target resolution.
+    emit_helpers(fa, tree, source, &app_ns, is_lite);
+    emit_routes(fa, tree, source, &app_ns);          // PackageRef + MethodCall refs from route strings
+    emit_route_names(fa, tree, source, &app_ns);     // MojoRouteName symbols, Refs at url_for sites
+    emit_tasks(fa, tree, source, &app_ns);           // MojoTask symbols, Refs at enqueue sites
+    emit_hooks(fa, tree, source);                    // Refs against pre-seeded BuiltIn hook symbols
+    emit_events(fa, tree, source);                   // MojoEvent symbols + Refs across on/emit/once/unsubscribe
+    emit_plugins(fa, tree, source, &app_ns);         // MojoPluginRef + namespace_parents edge
+    emit_stash_keys(fa, tree, source);               // HashKeyDef/HashKeyAccess in MojoAction namespace
+    emit_under_chain_edges(fa, tree, source);        // namespace_parents edges between MojoAction namespaces
 }
 ```
+
+Each `emit_*` function is a pure emission rule: inspect the tree for a specific construct, append to `fa.symbols` / `fa.refs` with the correct `home_namespace` / `target`. No shared mutable "framework entity" bag. LSP queries never look up Mojo features through a special path — `resolve_symbol` / `refs_to` / `ref_at` already cover them.
 
 ### Route string parsing
 
@@ -878,296 +806,165 @@ fn capitalize_controller(s: &str) -> String {
 
 When cursor is inside `enqueue('send_email', [|])`:
 
-1. Identify the task name from the first arg
-2. Look up `FrameworkEntity` with `EntityKind::MojoTask` by name
-3. The entity's params (already stripped of `$job`) map to array positions
-4. Return `SignatureHelp` with the param at the cursor's array index highlighted
+1. `cursor_context.rs` identifies the cursor as "inside arrayref arg of an `enqueue`-family call."
+2. Resolve the task name from arg[0] via `resolve_symbol(task_name, from_ns, VISIBLE)` filtered to `SymKind::MojoTask`.
+3. The Symbol's `params` (already stripped of `$job`) map to array positions.
+4. Return `SignatureHelp` with the param at the cursor's array index highlighted.
 
-```rust
-fn task_signature_for_enqueue(
-    task_name: &str,
-    array_index: usize,
-    fa: &FileAnalysis,
-) -> Option<SignatureHelp> {
-    let task = fa.entities_by_kind(|k| matches!(k, EntityKind::MojoTask))
-        .find(|e| e.name == task_name)?;
-    if task.params.is_empty() { return None; }
-
-    let params_str = task.params.iter()
-        .map(|p| p.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    Some(SignatureHelp {
-        signatures: vec![SignatureInformation {
-            label: format!("enqueue('{}', [{}])", task_name, params_str),
-            parameters: Some(task.params.iter().map(|p| {
-                ParameterInformation {
-                    label: ParameterLabel::Simple(p.name.clone()),
-                    documentation: None,
-                }
-            }).collect()),
-            active_parameter: Some(array_index as u32),
-            documentation: None,
-        }],
-        active_signature: Some(0),
-        active_parameter: None,
-    })
-}
-```
+No Mojo-specific plumbing — the task Symbol carries all the info already, and `resolve_symbol` is the same one every other query uses.
 
 ---
 
-## Part D: Cross-File Intelligence
+## Part D: Cross-File
 
-### Phase 1: Single-file
+After unification phase 2 lands, cross-file is not a Mojo concern at the data-model level. Every file (open, workspace, dep) stores a full `FileAnalysis` in the shared `FileStore`. Mojo Symbols and Refs emitted in one file are automatically visible to queries from another:
 
-Everything in the same file. The post-build pass pushes `FrameworkEntity` entries into `fa.framework_entities`. Completion/goto-def queries filter by `EntityKind`.
+- Route in app file → goto-def jumps to controller method in another file.
+- Helper defined in app → completion in controller files via `namespace_parents` walk.
+- Task defined in app → completion/goto-def from any file.
+- Plugin loaded in host → plugin's helpers appear in host's controllers through the `MojoApp ← MojoPlugin` edge added at emission time.
 
-### Phase 2: Cross-file (requires workspace indexing)
+Plugin chain resolution traverses `namespace_parents` normally; transitive loads walk edges with an existing recursion cap of 3.
 
-- Route in app file → goto-def jumps to controller method in another file
-- Helper defined in app → completion in controller files
-- Task defined in app → completion/goto-def in any file
-- DBIC columns in one file → search/join completion in another
+---
 
-With workspace indexing, we merge entities from all files into a global registry:
+## Part E: Emission Rules Catalog
 
-```rust
-// On ModuleIndex or WorkspaceContext:
-pub global_entities: Arc<DashMap<EntityKindDiscriminant, Vec<FrameworkEntity>>>,
-```
+This section replaces the earlier `FrameworkEntity` data model. **Core rule:** every Mojo concept is a **Symbol** (definition) + **Refs** (references) in an appropriate **Namespace**. No parallel vector, no per-framework fields on `FileAnalysis`, no bespoke query methods.
 
-Each file's `framework_entities` are merged when the workspace index updates. The completion layer queries global entities when local ones don't match.
+### Namespaces used
 
-This is framework-agnostic: Mojo helpers, DBIC columns, and any future framework entities all flow through the same global registry. No per-framework wiring needed.
+From unification phase 1:
 
-### Phase 3: Plugin chain resolution
+- `Package(String)` — ordinary Perl package.
+- `MojoApp(String)` — the Mojo app scope.
+- `MojoPlugin(String)` — plugin-local scope.
+- `MojoController(String)` — controller class; parent edge to its `MojoApp`.
+- `MojoAction { controller, action }` — action scope; parent edges to its `MojoController` plus any `under()` bridge actions.
+- `LiteApp(PathBuf)` — Lite app's namespace (the file itself).
+- `BuiltIn` — pre-seeded framework symbols (hook names, built-in event names per class).
+
+### New SymKind variants
+
+- `MojoHelper` — helper registered via `$app->helper(name => sub { ... })`. A parallel `Method` Symbol is also emitted so `$c->name` completes as a method.
+- `MojoTask` — Minion task.
+- `MojoRouteName` — named route (`->name('show_user')`).
+- `MojoEvent` — event emittable by a class.
+- `MojoHook` — pre-seeded hook name.
+- `MojoStashKey` — (may be unified with existing `HashKeyDef`).
+
+### New RefKind variants (roles)
+
+- `MojoRouteTarget { controller_span, action_span }` — a `->to('ctrl#act')` string literal. The builder emits **two separate refs** from one string, one per sub-span — existing narrowest-span-wins logic in `ref_at()` disambiguates at cursor time.
+- `MojoRouteName` — `url_for('name')` / `redirect_to('name')` string.
+- `MojoTaskEnqueue` — task name string in `enqueue('name', ...)`.
+- `MojoEventOn` / `MojoEventEmit` / `MojoEventOnce` / `MojoEventUnsubscribe` — event name strings in respective call contexts.
+- `MojoHookName` — hook name string in `hook('name' => ...)`.
+- `MojoStashAccess` — (may be unified with existing `HashKeyAccess`).
+- `MojoPluginRef` — plugin name string in `$app->plugin('Name')`.
+
+### Per-feature emission
+
+| Feature | Symbols emitted | Namespace | Refs at call sites |
+|---------|-----------------|-----------|--------------------|
+| Helper in `startup` | `Symbol { kind: MojoHelper }` + parallel `Symbol { kind: Method }` | `MojoApp(app)` | `$c->name` → ordinary `MethodCall` Ref, resolved via `namespace_parents` (controller → app) |
+| Helper in plugin `register` | Same Symbols | `MojoPlugin(plugin)` | Plugin-load emits edge `MojoApp(host) ← MojoPlugin(plugin)`; host controllers see helper automatically |
+| Route `->to('users#list')` | None (Controller+Method already exist) | — | **Two Refs from one string**: `PackageRef` on `users` sub-span → existing `Package(MyApp::Controller::Users)`; `MethodCall` on `list` sub-span → existing `list` method Symbol |
+| Route `->to(controller=>'x', action=>'y')` | None | — | Same two Refs, sourced from fat-comma values |
+| Route `->to('ctrl#')` | None | — | `PackageRef` + `MethodCall` against implicit `index` |
+| Inline route `->to(cb => sub {})` | None | — | None (handler is the inline sub itself) |
+| Route name `->name('show_user')` | `Symbol { kind: MojoRouteName }` | `MojoApp(app)` | `url_for('show_user')` etc. → `Ref { kind: MojoRouteName }` |
+| Minion task (inline sub) | `Symbol { kind: MojoTask, params: from sub minus $job }` | `MojoApp(app)` | `enqueue('name', [...])` → `Ref { kind: MojoTaskEnqueue }` |
+| Minion task (class ref) `add_task(n => 'Class')` | `Symbol { kind: MojoTask, target_class: "Class" }` | `MojoApp(app)` | Same; hover/goto-def follows `target_class` to its `run` method |
+| Hook `$app->hook('name' => ...)` | None — hook names are pre-seeded `BuiltIn` Symbols | `BuiltIn` | `Ref { kind: MojoHookName, target: pre-seeded Symbol }` |
+| Stash set in action body | `HashKeyDef` Symbol (or `MojoStashKey`) | `MojoAction(ctrl, act)` | `$c->stash('k')` / `$c->stash->{k}` → `HashKeyAccess` Ref via `namespace_parents` walk |
+| Stash via route default `->to('c#a', k => v)` | Same Symbol | `MojoAction(c, a)` | Same |
+| Stash via render `->render(k => v)` | Same Symbol | Enclosing `MojoAction` | Same |
+| Plugin load `$app->plugin('Auth')` | None (plugin's Package Symbol already exists) | — | `Ref { kind: MojoPluginRef }`. **Side effect:** add `MojoApp(host) ← MojoPlugin("Mojolicious::Plugin::Auth")` to `namespace_parents` |
+| Event first `emit('x')` site | `Symbol { kind: MojoEvent, home_namespace: Package(emitter) }` | `Package(emitter)` | The emit site itself becomes the def span; subsequent emits are Refs to it |
+| Event `on('x', ...)` | None | — | `Ref { kind: MojoEventOn }` — UNRESOLVED sentinel until an emit appears, resolved via enrichment |
+| `once('x', ...)` / `unsubscribe('x')` | None | — | `MojoEventOnce` / `MojoEventUnsubscribe` Ref |
+| Built-in events (UserAgent `start`, Transaction `finish`, etc.) | Pre-seeded Symbols per class | `BuiltIn` | Same Ref kinds, target pre-seeded Symbol; handler params populated from static table |
+| Lite route `get '/p' => sub {}` | Anonymous handler Symbol | `LiteApp(file)` | — |
+| Lite named route `get ... => 'name'` | Additional `MojoRouteName` Symbol | `LiteApp(file)` | Same as full-app named routes |
+| Lite DSL keywords (`get`, `post`, `under`, `app`, `helper`, `hook`, `plugin`, `group`, `websocket`) | Pre-seeded framework-import Symbols | `BuiltIn` | Ordinary `FunctionCall` Refs |
+
+### Pre-seeded Symbol tables
+
+Two small static tables bootstrap at FileStore initialization:
+
+- **Hook names + handler signatures.** `before_dispatch($c)`, `after_dispatch($c)`, `around_dispatch($next, $c)`, `before_routes($c)`, `around_action($next, $c, $action, $last)`, `after_static($c)`, `before_server_start($server, $app)`, `after_build_tx($tx, $app)`. Loaded once as Symbols in `Namespace::BuiltIn`.
+- **Event names per class.** `Mojo::UserAgent` → `[start, prepare]`; `Mojo::Transaction` → `[finish, connection, upgrade, request]`; `Mojo::Transaction::WebSocket` → `[text, binary, json, message, drain, finish, frame, resume]`; `Mojo::IOLoop` → `[finish, reset]`; `Mojolicious::Controller` (WS context) → `[message, json, text, binary, drain, finish, frame, resume]`.
+
+Refs from user code resolve to these pre-seeded Symbols via ordinary `resolve_symbol` — no special lookup path.
+
+### Under-chain edges
 
 ```perl
-$app->plugin('Authentication', { ... });
-# → resolve Mojolicious::Plugin::Authentication
-# → find register() method
-# → find helper() calls → add to global entity registry
+my $auth = $r->under('/')->to('auth#check');
+$auth->get('/dashboard')->to('dashboard#index');
 ```
 
-Transitive: plugin loads other plugins. Cap recursion at depth 3.
+`emit_under_chain_edges` tracks each route-chain's accumulated under-actions and adds `namespace_parents` edges so stash inheritance follows the dispatch order:
 
----
-
-## Part E: Unified Framework Entity Data Model
-
-### The problem with per-framework fields
-
-The naive approach adds fields per feature per framework:
-```rust
-// DON'T DO THIS — doesn't scale
-pub mojo_routes: Vec<MojoRoute>,
-pub mojo_helpers: Vec<MojoHelper>,
-pub mojo_tasks: Vec<MojoTask>,
-pub dbic_columns: HashMap<String, Vec<DBICColumn>>,
-pub dbic_relationships: HashMap<String, Vec<DBICRel>>,
-// ... Catalyst, Dancer, etc.
+```
+MojoAction("MyApp::Controller::Dashboard", "index")
+    ← parent: MojoAction("MyApp::Controller::Auth", "check")
+    ← parent: MojoController("MyApp::Controller::Dashboard")
+    ← parent: MojoApp("MyApp")
 ```
 
-Every new framework feature = new field on FileAnalysis. This is a combinatorial explosion.
+Multi-level chains (under → under → leaf) compose edges the same way.
 
-### Two categories of framework intelligence
+### DBIC retroactive alignment
 
-**Category 1: Synthesized symbols** — things that become methods/functions. Already handled by `Symbol` with `SymKind::Method`. No new data model:
-- Moo/Moose accessors (done)
-- DBIC column/relationship accessors (done)
-- Mojo helpers (synthesized in post-build pass)
+DBIC framework synthesis adopts the same pattern:
 
-**Category 2: String registries** — named things referenced by string in specific call contexts. NOT symbols — runtime registrations looked up by string:
-- `->to('users#list')` → route target
-- `url_for('show_user')` → route name
-- `enqueue('send_email')` → task name
-- `->on('message')` → event name
-- `->search({ name| => })` → DBIC column in search context
-- `->join('posts|')` → DBIC relationship in join context
+- `add_columns('name', ...)` emits the existing `SymKind::Method` accessor **and** a `HashKeyDef` Symbol in `Package(result_class)` so `$rs->search({ name => ... })` resolves via ordinary `HashKeyAccess`.
+- `has_many` / `belongs_to` / `has_one` / `might_have` emit the accessor Method Symbol with `target_class` so chained lookups (`$row->posts->search(...)`) thread through the foreign class's ResultSet scope.
+- `__PACKAGE__->table('users')` emits a small Symbol (kind TBD: `DBICTable` or just `Method`) for hover + rename support.
 
-### The unified model
+No `DBICColumn` / `DBICRelationship` enum variants needed. Same pipeline as Mojo.
 
-```rust
-/// A framework-specific named entity — lives in a string namespace,
-/// needs completion, goto-def, and hover when referenced by string.
-///
-/// NOT the same as Symbol (which represents code declarations).
-/// These are runtime registrations that connect strings to code.
-#[derive(Debug, Clone)]
-pub struct FrameworkEntity {
-    pub name: String,
-    pub kind: EntityKind,
-    pub def_span: Span,
-    pub name_span: Span,
-    /// Scoping class — which result class owns this column,
-    /// which app namespace owns this route, which class emits this event.
-    pub scope_class: Option<String>,
-    /// Target for goto-def: the class this entity points to.
-    pub target_class: Option<String>,
-    /// Target for goto-def: the method this entity points to.
-    pub target_method: Option<String>,
-    /// Params (for signature help — task args, event handler params).
-    pub params: Vec<ParamInfo>,
-    pub return_type: Option<InferredType>,
-    pub doc: Option<String>,
-}
+### LSP features fall out for free
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum EntityKind {
-    // ── Mojo ──
-    /// Route target: 'controller#action' in ->to()
-    MojoRoute { http_method: Option<String>, path: Option<String> },
-    /// Named route: ->name('show_user')
-    MojoRouteName,
-    /// Minion task: add_task('name' => ...)
-    MojoTask,
-    /// EventEmitter: on/emit/once/unsubscribe
-    MojoEvent { op: EventOp },
-    /// Hook: hook('before_dispatch' => ...)
-    MojoHook,
-    /// Stash key: $c->stash(key => val)
-    MojoStashKey,
-    /// Plugin: $app->plugin('Name')
-    MojoPlugin,
-    /// Helper: $app->helper('name' => sub { ... })
-    /// (also synthesized as a Symbol for method completion)
-    MojoHelper,
+Every feature below uses `resolve_symbol` / `refs_to` / `ref_at` — no per-kind wiring:
 
-    // ── DBIC ──
-    /// Column: __PACKAGE__->add_columns('name', { ... })
-    /// (accessor already synthesized as Symbol — this is for search/update/select context)
-    DBICColumn { data_type: Option<String>, is_nullable: bool },
-    /// Relationship: has_many, belongs_to, etc.
-    /// (accessor already synthesized as Symbol — this is for join/prefetch context)
-    DBICRelationship { rel_type: String, foreign_class: Option<String> },
-    /// Table name: __PACKAGE__->table('users')
-    DBICTable,
-
-    // ── Future frameworks ──
-    // CatalystAction { path: String },
-    // DancerRoute { http_method: String, path: String },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum EventOp { On, Once, Emit, EmitSafe, Unsubscribe }
-```
-
-### Query methods on FileAnalysis
-
-```rust
-impl FileAnalysis {
-    /// All entities matching a kind filter.
-    pub fn entities_by_kind(&self, filter: impl Fn(&EntityKind) -> bool) -> impl Iterator<Item = &FrameworkEntity> {
-        self.framework_entities.iter().filter(move |e| filter(&e.kind))
-    }
-
-    /// Mojo routes.
-    pub fn mojo_routes(&self) -> impl Iterator<Item = &FrameworkEntity> {
-        self.entities_by_kind(|k| matches!(k, EntityKind::MojoRoute { .. }))
-    }
-
-    /// Mojo tasks.
-    pub fn mojo_tasks(&self) -> impl Iterator<Item = &FrameworkEntity> {
-        self.entities_by_kind(|k| matches!(k, EntityKind::MojoTask))
-    }
-
-    /// Mojo route names.
-    pub fn mojo_route_names(&self) -> impl Iterator<Item = &FrameworkEntity> {
-        self.entities_by_kind(|k| matches!(k, EntityKind::MojoRouteName))
-    }
-
-    /// Mojo events for a specific class (or all if class is None).
-    pub fn mojo_events_for_class(&self, class: Option<&str>) -> impl Iterator<Item = &FrameworkEntity> + '_ {
-        self.framework_entities.iter().filter(move |e|
-            matches!(e.kind, EntityKind::MojoEvent { .. })
-            && (class.is_none() || e.scope_class.as_deref() == class))
-    }
-
-    /// DBIC columns for a result class — for search/update/select context completion.
-    pub fn dbic_columns_for_class(&self, class: &str) -> impl Iterator<Item = &FrameworkEntity> + '_ {
-        self.framework_entities.iter().filter(move |e|
-            matches!(e.kind, EntityKind::DBICColumn { .. })
-            && e.scope_class.as_deref() == Some(class))
-    }
-
-    /// DBIC relationships for a result class — for join/prefetch context completion.
-    pub fn dbic_relationships_for_class(&self, class: &str) -> impl Iterator<Item = &FrameworkEntity> + '_ {
-        self.framework_entities.iter().filter(move |e|
-            matches!(e.kind, EntityKind::DBICRelationship { .. })
-            && e.scope_class.as_deref() == Some(class))
-    }
-
-    /// Entity by name + kind (for goto-def lookups).
-    pub fn entity_by_name(&self, name: &str, filter: impl Fn(&EntityKind) -> bool) -> Option<&FrameworkEntity> {
-        self.framework_entities.iter().find(|e| e.name == name && filter(&e.kind))
-    }
-}
-```
-
-### DBIC retroactive entity production
-
-The existing DBIC builder code already synthesizes `SymKind::Method` symbols for column and relationship accessors. We add entity production alongside — same data, different namespace:
-
-```rust
-// In builder_dbic.rs, when processing add_columns:
-for column_name in columns {
-    // Existing: synthesize accessor Symbol (for $row->column_name)
-    builder.add_symbol(column_name.clone(), SymKind::Method, ...);
-
-    // New: register FrameworkEntity (for ->search({ column_name| => }))
-    builder.framework_entities.push(FrameworkEntity {
-        name: column_name.clone(),
-        kind: EntityKind::DBICColumn { data_type: dtype.clone(), is_nullable },
-        scope_class: Some(current_class.clone()),
-        ...
-    });
-}
-
-// Same for relationships:
-builder.framework_entities.push(FrameworkEntity {
-    name: rel_name.clone(),
-    kind: EntityKind::DBICRelationship {
-        rel_type: "has_many".into(),
-        foreign_class: Some(foreign_class.clone()),
-    },
-    scope_class: Some(current_class.clone()),
-    target_class: Some(foreign_class.clone()),
-    ...
-});
-```
-
-This means DBIC search/join/prefetch completion comes "free" once the entity registry is in place — the data is already captured.
-
-### Serialization for cross-file + cache
-
-`FrameworkEntity` is simple enough for JSON serialization (all fields are String/Option/Vec of simple types). For SQLite cache and subprocess IPC, serialize as a JSON array alongside the existing `subs` JSON. For workspace indexing, entities travel with `FileAnalysis`.
+- **Goto-def on route string `'users#list'`** — `ref_at(cursor)` returns either the `PackageRef` or `MethodCall` Ref (narrowest span wins); navigate to ordinary Controller/Method Symbol.
+- **Goto-def on helper `$c->current_user`** — ordinary `MethodCall` Ref, resolved via `namespace_parents` walk from controller → `MojoApp`.
+- **Completion inside `enqueue('|')`** — `cursor_context.rs` returns `InsideMojoTaskString`; completion calls `resolve_symbol(prefix, MojoApp(app), VISIBLE)` filtered to `SymKind::MojoTask`.
+- **Completion inside `->stash('|')`** — returns `InsideMojoStashKey(ctrl, action)`; completion walks `namespace_parents` from `MojoAction(ctrl, action)`.
+- **References on a helper** — `refs_to(helper_sym, VISIBLE)`; works across plugin + host + every controller.
+- **Rename across plugin and host** — `refs_to(helper_sym, EDITABLE)`.
+- **Hover on `hook('before_dispatch')`** — resolves to the pre-seeded built-in Symbol with its signature.
+- **Diagnostics on `enqueue('nonexistent')`** — unified diagnostic rule: `resolve_symbol` empty in a Closed chain (endpoint app) → warn. In a plugin (Open chain), suppressed.
 
 ### REPL compatibility
 
-The completion engine is purely functional: `FileAnalysis` + cursor context → completions. A REPL accumulates code, parses it, builds `FileAnalysis` (including `framework_entities`), and queries the same engine. `add_task` in the REPL session populates entities; `enqueue` completion queries them. No architecture changes needed — the REPL is just a different frontend feeding the same engine.
+The query engine is purely functional: `FileStore` + `FileAnalysis` + cursor context → results. A REPL parses accumulated code into a `FileAnalysis`, inserts into `FileStore` (role: Open, or a new `REPL` role), and queries the same `resolve_symbol` / `refs_to` pipeline. No REPL-specific data model.
 
 ---
 
 ## Implementation ordering
 
+> **Blocked on unification spec phases 1 (Namespace), 2 (kill ModuleExports), 3 (FileStore), 4 (resolve), 5 (eager Ref target).** See `docs/prompt-unification-spec.md`. Once those land, Mojo implementation is almost entirely emission rules with no new data structures.
+
 | Phase | Work | Depends on |
 |-------|------|-----------|
-| **0** | Builder decomposition (extract framework + DBIC to sub-modules) | Nothing |
-| **1a** | `builder_mojo.rs` — app/controller/plugin/lite detection | Phase 0 |
-| **1b** | Helper synthesis (single-file) | Phase 1a |
-| **1c** | Route parsing + refs (single-file, both full app and Lite) | Phase 1a |
-| **1d** | Task registry + enqueue arg signature help | Phase 1a |
-| **1e** | Hook name completion + signatures | Phase 1a |
-| **1f** | Route naming + url_for/redirect_to completion | Phase 1c |
-| **1g** | EventEmitter intelligence (on/emit/once — built-in + user-defined) | Phase 1a |
-| **1h** | Stash key intelligence | Phase 1a |
-| **1i** | Plugin class resolution | Phase 1a |
-| **1j** | Lite DSL detection + framework_imports expansion | Phase 1a |
-| **1k** | Cursor context: string-position completion in ->to(), enqueue(), hook(), url_for(), on(), emit() | Phase 1b-g |
-| **2** | Cross-file: global registries from workspace index | Workspace indexing |
-| **3** | Plugin chain resolution (transitive helper discovery) | Phase 2 |
+| **0** | Builder decomposition: `builder.rs` core + `builder_framework.rs` (Moo/Moose/Mojo::Base) + `builder_dbic.rs` (DBIC) + `builder_mojo.rs` (Mojo). Pure refactor, no behavior change. | Unification phases 1, 5 |
+| **1a** | `builder_mojo.rs` — app/controller/plugin/Lite detection (writes `mojo_app_namespace`, `is_mojo_lite`) | Phase 0 |
+| **1b** | Helper emission: `MojoHelper` Symbols + parallel `Method` Symbols; plugin-load edges | Phase 1a |
+| **1c** | Route emission: two Refs from one string at `->to()` sites, resolving to existing Controller/Method Symbols | Phase 1a |
+| **1d** | Task emission + `enqueue` arg signature help via `cursor_context.rs` | Phase 1a |
+| **1e** | Hook pre-seeded Symbols + `MojoHookName` Refs | Phase 1a |
+| **1f** | Route name emission + `url_for` / `redirect_to` Refs | Phase 1c |
+| **1g** | Event emission: `MojoEvent` Symbols + `MojoEventOn/Emit/Once/Unsubscribe` Refs; pre-seeded built-in events | Phase 1a |
+| **1h** | Stash key emission in `MojoAction` namespaces; under-chain parent edges | Phase 1a |
+| **1i** | Plugin Refs + `MojoApp ← MojoPlugin` namespace parent edges | Phase 1a |
+| **1j** | Lite DSL detection + `BuiltIn` pre-seeded import Symbols | Phase 1a |
+| **1k** | `cursor_context.rs` variants: `InsideMojoRouteString`, `InsideMojoTaskString`, `InsideMojoHookString`, `InsideMojoRouteName`, `InsideMojoEventString`, `InsideMojoStashKey` | Phase 1b–g |
+| **2** | Cross-file already works via unified `FileStore`; this phase exists only to add regression coverage | Phases 1b–k |
+| **3** | Plugin-chain transitive resolution — `namespace_parents` walk handles it; add recursion cap | Phase 2 |
 
 ---
 
@@ -1175,19 +972,38 @@ The completion engine is purely functional: `FileAnalysis` + cursor context → 
 
 | File | Change |
 |------|--------|
-| `src/builder.rs` | Extract framework + DBIC code. Add post-build plugin call. `pub(crate)` visibility. |
-| `src/builder_framework.rs` | **New.** Moo/Moose/Mojo::Base accessor synthesis, framework detection. |
-| `src/builder_dbic.rs` | **New.** DBIC column/relationship synthesis. |
-| `src/builder_mojo.rs` | **New.** All Mojo intelligence: routes, helpers, tasks, hooks, stash, plugins, Lite DSL. |
-| `src/file_analysis.rs` | Add Mojo fields. Mojo-aware completion/goto-def query methods. |
-| `src/cursor_context.rs` | Detect string-position contexts in ->to(), enqueue(), hook(), url_for(), redirect_to(), on(), once(), emit(), unsubscribe(). |
-| `src/symbols.rs` | Route/task/hook/route-name string completion. Helper integration in method completion. Mojo diagnostic suppression for Lite keywords. |
+| `src/builder.rs` | Extract framework + DBIC code; call post-build plugins after the main walk. `pub(crate)` visibility for shared helpers. |
+| `src/builder_framework.rs` | **New.** Moo/Moose/Mojo::Base accessor synthesis + framework detection. Emits Method Symbols + HashKeyDef Symbols into the right Namespaces. |
+| `src/builder_dbic.rs` | **New.** DBIC column/relationship synthesis. Emits Method Symbols + HashKeyDef Symbols in `Package(result_class)`. |
+| `src/builder_mojo.rs` | **New.** Mojo emission rules: routes, helpers, tasks, hooks, stash, plugins, events, Lite DSL, under-chain edges. |
+| `src/file_analysis.rs` | Add `mojo_app_namespace: Option<String>` and `is_mojo_lite: bool` flags. New `SymKind` variants. New `RefKind` variants (or role extension). Pre-seeded BuiltIn Symbol tables. |
+| `src/namespace.rs` | `MojoApp`, `MojoPlugin`, `MojoController`, `MojoAction`, `LiteApp` variants on the `Namespace` enum (from unification phase 1). |
+| `src/cursor_context.rs` | String-position contexts: `InsideMojoRouteString`, `InsideMojoTaskString`, `InsideMojoHookString`, `InsideMojoRouteName`, `InsideMojoEventString`, `InsideMojoStashKey`. |
+| `src/symbols.rs` | Cursor-context routing to `resolve_symbol` with appropriate `SymKind` filter. No bespoke Mojo lookup paths. |
+| `src/resolve.rs` | No Mojo-specific code (already handles Symbol/Ref + Namespace walk). |
 
 ---
 
 ## Tests
 
-All tests use `fa.framework_entities` with kind-based filtering via the convenience methods.
+> **Note on test assertions.** The test snippets below describe the **intent** of each feature (what should work from a user's perspective). They were originally written against `fa.framework_entities` with `EntityKind` filters; under the unified model they must be rewritten to assert against Symbols + Refs + Namespaces. A typical translation:
+>
+> ```rust
+> // OLD (pre-unification):
+> let routes: Vec<_> = fa.mojo_routes().collect();
+> assert_eq!(routes[0].target_class.as_deref(), Some("MyApp::Controller::Users"));
+>
+> // NEW:
+> let ref_at_users = fa.ref_at_text("'users#list'", sub_span: "users").unwrap();
+> let sym = fa.symbol(ref_at_users.target).unwrap();
+> assert_eq!(sym.qualified_name(), "MyApp::Controller::Users");
+> // ...or, for the action:
+> let ref_at_list = fa.ref_at_text("'users#list'", sub_span: "list").unwrap();
+> let sym = fa.symbol(ref_at_list.target).unwrap();
+> assert_eq!(sym.qualified_name(), "MyApp::Controller::Users::list");
+> ```
+>
+> The assertions below are retained as-is for intent; translate when implementing.
 
 ### Route resolution
 ```rust
