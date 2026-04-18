@@ -51,6 +51,11 @@ pub struct CallContext {
     pub at_key_position: bool,
     /// Keys already typed at the call site (barewords/strings before `=>`).
     pub used_keys: HashSet<String>,
+    /// The first argument as a constant string when it folds to a literal.
+    /// Used by string-dispatch signature help (`$x->emit('ready', CURSOR)`
+    /// looks this up against HashKeyDefs to surface handler params). `None`
+    /// when the first arg is a variable/expression.
+    pub first_arg_string: Option<String>,
 }
 
 // ---- Cursor context detection (text-only, no tree) ----
@@ -406,6 +411,8 @@ pub fn find_call_context(tree: &Tree, source: &[u8], point: Point) -> Option<Cal
         None => HashSet::new(),
     };
 
+    let first_arg_string = args_node.and_then(|args| first_arg_as_string(args, source));
+
     Some(CallContext {
         name,
         is_method,
@@ -413,7 +420,28 @@ pub fn find_call_context(tree: &Tree, source: &[u8], point: Point) -> Option<Cal
         active_param,
         at_key_position,
         used_keys,
+        first_arg_string,
     })
+}
+
+/// If the first argument of a call is a string literal or bareword, return
+/// its content. Used for string-dispatch signature help.
+fn first_arg_as_string(args: Node, source: &[u8]) -> Option<String> {
+    let first = if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
+        args.named_child(0)?
+    } else {
+        args
+    };
+    let text = first.utf8_text(source).ok()?;
+    match first.kind() {
+        "string_literal" | "interpolated_string_literal" => Some(
+            text.trim_start_matches(['\'', '"'])
+                .trim_end_matches(['\'', '"'])
+                .to_string(),
+        ),
+        "bareword" => Some(text.to_string()),
+        _ => None,
+    }
 }
 
 /// Find call context at cursor — walks up from cursor to find enclosing call.

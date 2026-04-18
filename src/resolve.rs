@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use tower_lsp::lsp_types::Url;
 
-use crate::file_analysis::{AccessKind, FileAnalysis, RefKind, Span, SymKind};
+use crate::file_analysis::{AccessKind, FileAnalysis, HandlerOwner, RefKind, Span, SymKind, SymbolDetail};
 use crate::file_store::{FileKey, FileStore};
 use crate::module_index::ModuleIndex;
 
@@ -53,6 +53,14 @@ pub enum TargetKind {
     HashKeyOfSub { package: Option<String>, name: String },
     /// A hash key owned by a class (Moo `has` slots, DBIC columns on a Result class).
     HashKeyOfClass(String),
+    /// A `Handler` symbol registered on a class (Mojo events, Dancer
+    /// routes, etc.). Both the definition (`Handler` symbol) and call
+    /// sites (`DispatchCall` refs) match; stacked registrations all
+    /// surface separately so features can enumerate every handler.
+    Handler {
+        owner: HandlerOwner,
+        name: String,
+    },
 }
 
 /// A located reference in some file.
@@ -182,6 +190,12 @@ fn collect_from_analysis(
                 &sym.detail,
                 SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(n), .. } if n == wanted
             ),
+            TargetKind::Handler { owner, name: hname } => {
+                sym.name == *hname && matches!(
+                    &sym.detail,
+                    SymbolDetail::Handler { owner: o, .. } if o == owner
+                )
+            }
         };
         if matches_kind {
             out.push(RefLocation {
@@ -213,6 +227,11 @@ fn collect_from_analysis(
             ),
             (TargetKind::HashKeyOfClass(wanted), RefKind::HashKeyAccess { owner, .. }) => {
                 matches!(owner, Some(HashKeyOwner::Class(n)) if n == wanted)
+            }
+            (TargetKind::Handler { owner, name: hname },
+             RefKind::DispatchCall { owner: ref_owner, .. }) => {
+                r.target_name == *hname
+                    && matches!(ref_owner, Some(o) if o == owner)
             }
             _ => false,
         };

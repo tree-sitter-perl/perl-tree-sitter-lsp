@@ -4,9 +4,10 @@ use tree_sitter::{Point, Tree};
 
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
-    contains_point, format_inferred_type, CompletionCandidate, FileAnalysis, FoldKind, InferredType,
-    OutlineSymbol, RefKind, Span, SymKind as FaSymKind, SymbolDetail,
-    PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT, PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
+    contains_point, format_inferred_type, CompletionCandidate, FileAnalysis, FoldKind,
+    HandlerOwner, HashKeyOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
+    SymKind as FaSymKind, SymbolDetail, PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT,
+    PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
 use crate::module_index::{CachedModule, ModuleIndex, SubInfo};
 use std::sync::Arc;
@@ -42,6 +43,10 @@ fn fa_sym_kind_to_lsp(kind: &FaSymKind) -> SymbolKind {
         FaSymKind::Class => SymbolKind::CLASS,
         FaSymKind::Module => SymbolKind::MODULE,
         FaSymKind::HashKeyDef => SymbolKind::KEY,
+        // Handler is string-dispatched (not a real Perl method); EVENT
+        // is the closest LSP kind — it's a named thing you react to
+        // by firing, like keyboard/IO events in other languages.
+        FaSymKind::Handler => SymbolKind::EVENT,
     }
 }
 
@@ -254,6 +259,7 @@ fn fa_completion_kind(kind: &FaSymKind) -> CompletionItemKind {
         FaSymKind::Class => CompletionItemKind::CLASS,
         FaSymKind::Module => CompletionItemKind::MODULE,
         FaSymKind::HashKeyDef => CompletionItemKind::PROPERTY,
+        FaSymKind::Handler => CompletionItemKind::EVENT,
     }
 }
 
@@ -296,7 +302,50 @@ pub fn completion_items(
     let ctx = cursor_context::detect_cursor_context_tree(tree, source.as_bytes(), point, analysis)
         .unwrap_or_else(|| cursor_context::detect_cursor_context(source, point, Some(analysis)));
 
-    let mut candidates: Vec<CompletionCandidate> = match ctx {
+    // Mid-string completion for plugin-emitted MethodCallRefs. When the
+    // cursor sits inside the span of a MethodCallRef emitted by a plugin
+    // (e.g. `->to('Users#lis|')` in mojo-routes), offer methods on the
+    // target class — prefix-filtered by whatever's been typed since the
+    // `#` (or the whole prefix if none). This generalizes: any plugin
+    // that drops a MethodCallRef at a string span gets scoped method
+    // completion for free. Runs first so it preempts the generic paths.
+    if let Some(refs) = refs_at_point_matching(analysis, point, |r|
+        matches!(r.kind, RefKind::MethodCall { .. })
+    ) {
+        for r in &refs {
+            if let RefKind::MethodCall { invocant, .. } = &r.kind {
+                let early = mid_string_methodref_completions(
+                    analysis, module_index, invocant, source, point, r.span,
+                );
+                if !early.is_empty() {
+                    return early;
+                }
+            }
+        }
+    }
+
+    // Dispatch-target completions are orthogonal to the context match:
+    // a user typing inside `$obj->emit(^)` is simultaneously after a `->`
+    // (tree detects `Method`) and inside call args (general path would
+    // apply too). Pull the call context out once and prepend handler
+    // completions whenever we're at arg-0 of a dispatcher method.
+    // Routing through the Handler/DispatchCall abstraction keeps this
+    // consistent with hover + sig help — one source of truth for "what
+    // handlers live on this class".
+    let mut candidates: Vec<CompletionCandidate> = Vec::new();
+    if let Some(call_ctx) = cursor_context::find_call_context(tree, source.as_bytes(), point) {
+        if call_ctx.is_method && call_ctx.active_param == 0 {
+            candidates.extend(dispatch_target_completions(
+                analysis,
+                module_index,
+                call_ctx.invocant.as_deref(),
+                &call_ctx.name,
+                point,
+            ));
+        }
+    }
+
+    candidates.extend::<Vec<CompletionCandidate>>(match ctx {
         CursorContext::Variable { sigil } => analysis.complete_variables(point, sigil),
         CursorContext::Method { ref invocant_type, ref invocant_text } => {
             if let Some(ref ty) = invocant_type {
@@ -337,7 +386,10 @@ pub fn completion_items(
         }
         CursorContext::General => {
             let mut items = Vec::new();
-            // Keyval arg completions if inside a call at key position
+            // Keyval arg completions if inside a call at key position.
+            // (Dispatch-target completions are handled above the match
+            // regardless of context, so they apply whether tree detection
+            // decides we're in Method, General, or anything else.)
             if let Some(call_ctx) =
                 cursor_context::find_call_context(tree, source.as_bytes(), point)
             {
@@ -362,7 +414,7 @@ pub fn completion_items(
 
             items
         }
-    };
+    });
 
     let mut items: Vec<CompletionItem> = candidates
         .drain(..)
@@ -589,6 +641,291 @@ pub fn folding_ranges(analysis: &FileAnalysis) -> Vec<FoldingRange> {
 
 // ---- Signature help ----
 
+/// Completions for the first arg of a string-dispatched method call.
+/// Walks every Handler symbol (local + cross-file via module index),
+/// filters by (owner class matches receiver, dispatcher matches method
+/// name), and returns each as a CompletionItem. Stacked registrations
+/// dedup on name; the completion shows the param shape in detail so
+/// you know what args the handler will get.
+fn dispatch_target_completions(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    invocant: Option<&str>,
+    method_name: &str,
+    point: Point,
+) -> Vec<CompletionCandidate> {
+    let class = match resolve_invocant_class(analysis, invocant, point) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    // Accumulate (handler_name → display_params + provenance) so stacked
+    // registrations across files appear once in the completion list.
+    let mut acc: std::collections::BTreeMap<String, (Vec<String>, String)> =
+        std::collections::BTreeMap::new();
+
+    let mut consider = |sym: &crate::file_analysis::Symbol, file_tag: &str| {
+        let SymbolDetail::Handler { owner, dispatchers, params } = &sym.detail else { return };
+        let HandlerOwner::Class(n) = owner;
+        if n != &class { return; }
+        if !dispatchers.is_empty() && !dispatchers.iter().any(|d| d == method_name) {
+            return;
+        }
+        let display: Vec<String> = params
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| !(*i == 0 && matches!(p.name.as_str(),
+                "$self" | "$self_in" | "$emitter")))
+            .map(|(_, p)| p.name.clone())
+            .collect();
+        acc.entry(sym.name.clone()).or_insert((display, file_tag.to_string()));
+    };
+
+    for sym in &analysis.symbols {
+        consider(sym, "this file");
+    }
+    module_index.for_each_cached(|module_name, cached| {
+        for sym in &cached.analysis.symbols {
+            consider(sym, module_name);
+        }
+    });
+
+    acc.into_iter().map(|(name, (params, provenance))| {
+        let detail = if params.is_empty() {
+            format!("handler on {}  ({})", class, provenance)
+        } else {
+            format!("handler on {} ({})  — {}", class, params.join(", "), provenance)
+        };
+        CompletionCandidate {
+            label: name.clone(),
+            // Handler kind flows to CompletionItemKind::EVENT via
+            // `fa_completion_kind` — consistent with outline and hover.
+            kind: FaSymKind::Handler,
+            detail: Some(detail),
+            // The string arg users type needs quotes — insert them so
+            // `$self->emit(^)` → `$self->emit('connect')` in one keystroke.
+            insert_text: Some(format!("'{}'", name)),
+            // Top of the list: handlers are the canonical completion in
+            // this position when a dispatcher is declared for them.
+            sort_priority: 0,
+            additional_edits: Vec::new(),
+        }
+    }).collect()
+}
+
+/// Collect refs whose span contains `point` and match a predicate.
+/// Small generic helper — used by mid-string completion to find the
+/// (typically unique) MethodCallRef at the cursor.
+fn refs_at_point_matching<'a>(
+    analysis: &'a FileAnalysis,
+    point: Point,
+    pred: impl Fn(&crate::file_analysis::Ref) -> bool,
+) -> Option<Vec<&'a crate::file_analysis::Ref>> {
+    let out: Vec<&crate::file_analysis::Ref> = analysis.refs.iter()
+        .filter(|r| span_contains_point(&r.span, point) && pred(r))
+        .collect();
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn span_contains_point(span: &crate::file_analysis::Span, p: Point) -> bool {
+    let a = (span.start.row, span.start.column);
+    let b = (span.end.row, span.end.column);
+    let pp = (p.row, p.column);
+    a <= pp && pp <= b
+}
+
+/// Mid-string completion for a cursor inside a plugin-emitted
+/// `MethodCallRef`. Offers methods on the invocant class (walking
+/// inheritance + workspace), prefix-filtered by whatever the user has
+/// typed since the start of the ref's span.
+///
+/// The core is deliberately ignorant of plugin-specific string formats
+/// (no `#` splitting, no `::` splitting — that's Mojo-routes syntax
+/// bleeding in). It's the plugin's job to emit a tight span that
+/// covers only the method-name portion of its string; the core just
+/// slices `source[ref.span.start..cursor]` and uses that as the prefix.
+/// If a plugin wants fuzzier matching behavior it can widen its spans;
+/// the semantics stay plugin-controlled.
+fn mid_string_methodref_completions(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    invocant_class: &str,
+    source: &str,
+    point: Point,
+    ref_span: crate::file_analysis::Span,
+) -> Vec<CompletionItem> {
+    // Pull the typed prefix out of the live source text — not from the
+    // parser, because during active editing the two diverge.
+    let lines: Vec<&str> = source.lines().collect();
+    if ref_span.start.row >= lines.len() || point.row >= lines.len() {
+        return Vec::new();
+    }
+    let typed = if ref_span.start.row == point.row {
+        let line = lines[point.row];
+        let start = ref_span.start.column.min(line.len());
+        let end = point.column.min(line.len());
+        &line[start..end]
+    } else {
+        // Multi-line ref spans: conservative — only use the current line.
+        let line = lines[point.row];
+        &line[..point.column.min(line.len())]
+    };
+
+    let candidates = analysis.complete_methods_for_class(invocant_class, Some(module_index));
+    candidates
+        .into_iter()
+        .filter(|c| typed.is_empty() || c.label.starts_with(typed))
+        .map(|c| {
+            let mut item = candidate_to_completion_item(c);
+            item.sort_text = Some(format!("000{}", item.label));
+            item
+        })
+        .collect()
+}
+
+/// Find the enclosing method_call_expression at `point` and return any
+/// `DispatchCall` ref whose span sits inside that call's argument list.
+/// Returns `(handler_name, owner_class, dispatcher)` — all three are
+/// already plugin-resolved, so the caller inherits const-folding and
+/// receiver-type inference without re-deriving them.
+fn dispatch_info_for_enclosing_call(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    _source: &[u8],
+    point: Point,
+) -> Option<(String, String, String)> {
+    // Walk up from the cursor until we hit the enclosing method call.
+    let mut node = tree.root_node().descendant_for_point_range(point, point)?;
+    let call = loop {
+        if node.kind() == "method_call_expression" {
+            break node;
+        }
+        node = node.parent()?;
+    };
+    let call_start = crate::file_analysis::Span {
+        start: call.start_position(),
+        end: call.end_position(),
+    };
+
+    // First DispatchCall ref whose span is contained by this call.
+    for r in &analysis.refs {
+        let RefKind::DispatchCall { dispatcher, owner } = &r.kind else { continue };
+        if !span_contains_span(&call_start, &r.span) { continue; }
+        let Some(HandlerOwner::Class(class)) = owner.clone() else { continue };
+        return Some((r.target_name.clone(), class, dispatcher.clone()));
+    }
+    None
+}
+
+fn span_contains_span(outer: &crate::file_analysis::Span, inner: &crate::file_analysis::Span) -> bool {
+    let o_start = (outer.start.row, outer.start.column);
+    let o_end   = (outer.end.row,   outer.end.column);
+    let i_start = (inner.start.row, inner.start.column);
+    let i_end   = (inner.end.row,   inner.end.column);
+    o_start <= i_start && i_end <= o_end
+}
+
+/// Build sig help for a known (class, dispatcher, handler_name) — the
+/// ref-driven path feeds this directly; the text path derives the same
+/// tuple and calls in too. One place to format stacked handler sigs.
+fn string_dispatch_signature_for(
+    analysis: &FileAnalysis,
+    class: &str,
+    dispatcher: &str,
+    handler_name: &str,
+    active_param: usize,
+) -> Option<SignatureHelp> {
+    let mut signatures: Vec<SignatureInformation> = Vec::new();
+    for sym in &analysis.symbols {
+        if sym.name != handler_name { continue; }
+        let SymbolDetail::Handler { owner, dispatchers, params } = &sym.detail else { continue };
+        let HandlerOwner::Class(n) = owner;
+        if n != class { continue; }
+        let dispatcher_ok = dispatchers.is_empty()
+            || dispatchers.iter().any(|d| d == dispatcher);
+        if !dispatcher_ok || params.is_empty() { continue; }
+
+        let display: Vec<&ParamInfo> = params
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| !(*i == 0 && matches!(p.name.as_str(),
+                "$self" | "$self_in" | "$emitter")))
+            .map(|(_, p)| p)
+            .collect();
+        let labels: Vec<String> = display.iter()
+            .map(|p| match &p.default {
+                Some(d) => format!("{} = {}", p.name, d),
+                None => p.name.clone(),
+            })
+            .collect();
+        let parameters: Vec<ParameterInformation> = labels.iter()
+            .map(|l| ParameterInformation {
+                label: ParameterLabel::Simple(l.clone()),
+                documentation: None,
+            })
+            .collect();
+        signatures.push(SignatureInformation {
+            label: format!("{}('{}', {})", dispatcher, handler_name, labels.join(", ")),
+            documentation: Some(Documentation::String(format!(
+                "{} handler on `{}`, registered at line {}",
+                handler_name, class, sym.selection_span.start.row + 1,
+            ))),
+            parameters: Some(parameters),
+            active_parameter: None,
+        });
+    }
+    if signatures.is_empty() { return None; }
+    Some(SignatureHelp {
+        signatures,
+        active_signature: Some(0),
+        active_parameter: Some(active_param.saturating_sub(1) as u32),
+    })
+}
+
+/// Resolve the class of an invocant expression at a given cursor point.
+///   * `$self` / `__PACKAGE__`  → enclosing package at that position
+///   * bare `Pkg::Name`         → the literal class
+///   * `$var`                   → looked up via `analysis.inferred_type`
+/// Returns `None` when the expression doesn't resolve to a known class.
+fn resolve_invocant_class(
+    analysis: &FileAnalysis,
+    invocant: Option<&str>,
+    point: Point,
+) -> Option<String> {
+    let text = invocant?;
+    if text == "$self" || text == "__PACKAGE__" {
+        return analysis.package_at(point).map(|s| s.to_string());
+    }
+    if let Some(stripped) = text.strip_prefix('$') {
+        let var_name = format!("${}", stripped);
+        if let Some(ty) = analysis.inferred_type(&var_name, point) {
+            if let crate::file_analysis::InferredType::ClassName(n) = ty {
+                return Some(n.clone());
+            }
+        }
+        return None;
+    }
+    if text.starts_with('@') || text.starts_with('%') {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+/// Text-driven entry point: resolve invocant → class, then delegate to
+/// `string_dispatch_signature_for`. Used for mid-editing states where
+/// no DispatchCall ref exists yet.
+fn string_dispatch_signature(
+    analysis: &FileAnalysis,
+    invocant: Option<&str>,
+    dispatcher: &str,
+    handler_name: &str,
+    active_param: usize,
+    point: Point,
+) -> Option<SignatureHelp> {
+    let class = resolve_invocant_class(analysis, invocant, point)?;
+    string_dispatch_signature_for(analysis, &class, dispatcher, handler_name, active_param)
+}
+
 pub fn signature_help(
     analysis: &FileAnalysis,
     tree: &Tree,
@@ -600,6 +937,52 @@ pub fn signature_help(
 
     // Step 1: cursor_context finds the enclosing call
     let call_ctx = cursor_context::find_call_context(tree, text.as_bytes(), point)?;
+
+    // Step 1a: string-dispatch specialization. `$x->emit('ready', CURSOR)`
+    // is a method call whose string arg routes to a registered handler;
+    // when handler_params are on record for that (class, event_name) pair,
+    // surface them instead of the emit() method's own generic signature.
+    // Stacked defs (multiple `->on('ready', sub {...})` wire-ups) each
+    // contribute one `SignatureInformation` so users see every handler
+    // shape they might be dispatching to.
+    if call_ctx.is_method && call_ctx.active_param >= 1 {
+        // Primary path: find the DispatchCall ref the plugin already
+        // emitted for this call site. Its `target_name`, `owner`, and
+        // `dispatcher` were all computed with the builder's full
+        // knowledge — including const-folding `$dynamic` back to
+        // `'connect'` — so sig help inherits folding for free and
+        // can't drift from what hover shows.
+        if let Some((handler_name, owner_class, dispatcher)) =
+            dispatch_info_for_enclosing_call(analysis, tree, text.as_bytes(), point)
+        {
+            if let Some(sig) = string_dispatch_signature_for(
+                analysis,
+                &owner_class,
+                &dispatcher,
+                &handler_name,
+                call_ctx.active_param,
+            ) {
+                return Some(sig);
+            }
+        }
+
+        // Fallback: no DispatchCall ref at this call site (e.g. no plugin
+        // declared the method as a dispatcher). Try the text-level
+        // first-arg string; this covers mid-editing states where a ref
+        // hasn't been emitted yet.
+        if let Some(ref name) = call_ctx.first_arg_string {
+            if let Some(sig) = string_dispatch_signature(
+                analysis,
+                call_ctx.invocant.as_deref(),
+                &call_ctx.name,
+                name,
+                call_ctx.active_param,
+                point,
+            ) {
+                return Some(sig);
+            }
+        }
+    }
 
     // Step 2: file_analysis resolves the sub signature (local + cross-file)
     if let Some(sig_info) = analysis.signature_for_call(
@@ -1771,5 +2154,467 @@ mod tests {
                 assert_eq!(a.is_preferred, Some(false));
             }
         }
+    }
+
+    // ---- String-dispatch signature help (mojo-events plugin path) ----
+
+    /// `$self->emit('ready', CURSOR)` should surface the `->on('ready', sub
+    /// ($self, $msg) {})` handler's params as sig help. The dispatch string
+    /// is arg 0; handler params are offset by 1 so active_parameter lines
+    /// up with the user's cursor.
+    #[test]
+    fn sig_help_returns_handler_params_for_emit() {
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub register {
+    my $self = shift;
+    $self->on('ready', sub {
+        my ($self_in, $msg, $when) = @_;
+        warn $msg;
+    });
+}
+
+sub fire {
+    my $self = shift;
+    $self->emit('ready', 'hi', )
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        // Cursor just after `'hi', ` on the emit line — active_param=2 means
+        // we're in the 2nd handler slot (after event name + first handler arg).
+        let pos = {
+            let (line_idx, line) = src.lines().enumerate()
+                .find(|(_, l)| l.contains("->emit('ready'"))
+                .unwrap();
+            let col = line.find(", )").unwrap() + 2;
+            Position { line: line_idx as u32, character: col as u32 }
+        };
+
+        let sig = signature_help(&analysis, &tree, src, pos, &idx)
+            .expect("sig help should surface handler sig");
+        assert_eq!(sig.signatures.len(), 1, "one registered handler");
+
+        let s = &sig.signatures[0];
+        // Label mirrors the actual call the user is writing — `emit('ready',
+        // $msg, $when)` — not a fake method-call shape.
+        assert!(s.label.starts_with("emit('ready'"),
+            "label should show the call shape starting with emit('ready'): {}", s.label);
+        // Documentation carries the class + line provenance.
+        if let Some(Documentation::String(ref d)) = s.documentation {
+            assert!(d.contains("My::Emitter"),
+                "doc should name the owning class: {}", d);
+        } else {
+            panic!("expected Documentation::String, got {:?}", s.documentation);
+        }
+        // $self_in stripped as implicit → remaining params $msg, $when.
+        let params = s.parameters.as_ref().expect("has params");
+        assert_eq!(params.len(), 2, "drops implicit $self_in");
+        assert!(matches!(&params[0].label, ParameterLabel::Simple(s) if s == "$msg"));
+        assert!(matches!(&params[1].label, ParameterLabel::Simple(s) if s == "$when"));
+    }
+
+    /// Multiple `->on('ready', sub {...})` wire-ups stack — each becomes a
+    /// separate SignatureInformation entry, so users see every handler
+    /// shape they might be dispatching to.
+    #[test]
+    fn sig_help_stacks_multiple_handler_defs() {
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub new {
+    my $self = bless {}, shift;
+    $self->on('tick', sub {
+        my ($self_in, $count) = @_;
+    });
+    $self->on('tick', sub {
+        my ($self_in, $count, $unit) = @_;
+    });
+    $self;
+}
+
+sub go {
+    my $self = shift;
+    $self->emit('tick', )
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        let pos = {
+            let line_idx = src.lines().enumerate()
+                .find(|(_, l)| l.contains("->emit('tick'"))
+                .map(|(i, _)| i).unwrap();
+            let line = src.lines().nth(line_idx).unwrap();
+            let col = line.find(", )").unwrap() + 2;
+            Position { line: line_idx as u32, character: col as u32 }
+        };
+
+        let sig = signature_help(&analysis, &tree, src, pos, &idx)
+            .expect("sig help should fire");
+        assert_eq!(sig.signatures.len(), 2,
+            "stacked handlers: one signature per ->on call");
+
+        let labels: Vec<&str> = sig.signatures.iter()
+            .map(|s| s.label.as_str()).collect();
+        assert!(labels.iter().all(|l| l.starts_with("emit('tick'")),
+            "every signature uses emit('tick', ...) call shape: {:?}", labels);
+    }
+
+    /// Baseline before the user started typing: cursor in the empty
+    /// second-arg slot `$self->emit('connect', CURSOR );`. Sig help
+    /// should offer handler params from the moment the comma is typed.
+    #[test]
+    fn sig_help_fires_in_empty_second_slot() {
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my $self = shift;
+    $self->on('connect', sub {
+        my ($self_in, $sock, $remote_ip) = @_;
+    });
+}
+
+sub fire {
+    my $self = shift;
+    $self->emit('connect', );
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("->emit('connect'"))
+            .unwrap();
+        let col = line.find(", )").unwrap() + 2; // just after `, `
+        let pos = Position {
+            line: line_idx as u32,
+            character: col as u32,
+        };
+
+        let sig = signature_help(&analysis, &tree, src, pos, &idx)
+            .expect("empty arg slot after comma should offer handler sig");
+        let s = &sig.signatures[0];
+        assert!(s.label.starts_with("emit('connect'"),
+            "baseline: label identifies emit handler call: {}", s.label);
+    }
+
+    /// Flow gap fix: `my $dynamic = 'connect'; $self->emit($dynamic, ...)`
+    /// — hover already worked (DispatchCall.target_name is const-folded
+    /// by the plugin) but sig help used to miss because it parsed the
+    /// first arg from text ($dynamic → not a literal). Now sig help
+    /// routes through the DispatchCall ref too, so const folding
+    /// composes uniformly and this class of gap can't reopen.
+    #[test]
+    fn sig_help_follows_const_folding_like_hover_does() {
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my $self = shift;
+    $self->on('connect', sub {
+        my ($self_in, $sock, $remote_ip) = @_;
+    });
+}
+
+sub fire {
+    my $self = shift;
+    my $dynamic = 'connect';
+    $self->emit($dynamic, 'hi', );
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("->emit($dynamic"))
+            .unwrap();
+        let col = line.find(", )").unwrap() + 2;
+        let pos = Position {
+            line: line_idx as u32,
+            character: col as u32,
+        };
+
+        let sig = signature_help(&analysis, &tree, src, pos, &idx)
+            .expect("sig help must follow const folding like hover does");
+        let s = &sig.signatures[0];
+        assert!(s.label.starts_with("emit('connect'"),
+            "const-folded: $dynamic → 'connect' → emit('connect', ...) label; got: {}", s.label);
+        let params = s.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2, "$sock, $remote_ip (implicit $self_in dropped)");
+    }
+
+    /// Regression: cursor inside the SECOND literal-string arg of a
+    /// dispatch call — matches the user's screenshot where
+    /// `$self->emit('connect', 'soc' )` had the cursor mid-'soc'. The
+    /// string-dispatch sig should still fire (first arg is 'connect',
+    /// handler is registered, active_param is 1).
+    #[test]
+    fn sig_help_fires_from_inside_second_string_arg() {
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my $self = shift;
+    $self->on('connect', sub {
+        my ($self_in, $sock, $remote_ip) = @_;
+    });
+}
+
+sub fire {
+    my $self = shift;
+    $self->emit('connect', 'soc' );
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("->emit('connect', 'soc'"))
+            .unwrap();
+        // Cursor at column index pointing into the middle of `'soc'`.
+        let col = line.find("'soc'").unwrap() + 2; // between 's' and 'o'
+        let pos = Position {
+            line: line_idx as u32,
+            character: col as u32,
+        };
+
+        let sig = signature_help(&analysis, &tree, src, pos, &idx)
+            .expect("cursor in 2nd string arg should still surface handler sig");
+        let s = &sig.signatures[0];
+        assert!(s.label.starts_with("emit('connect'"),
+            "label should still be the emit(handler) form: {}", s.label);
+        let params = s.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2, "handler params ($sock, $remote_ip)");
+    }
+
+    /// Completion at the first arg of a dispatch call should list every
+    /// registered Handler on the receiver's class — top priority, quoted
+    /// insert, handler params in detail. Same abstraction as hover +
+    /// sig help, so new plugins don't have to wire this up separately.
+    #[test]
+    fn completion_offers_handler_names_at_dispatch_arg0() {
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my $self = shift;
+    $self->on('connect', sub { my ($s, $sock, $ip) = @_; });
+    $self->on('disconnect', sub { my ($s) = @_; });
+}
+
+sub fire {
+    my $self = shift;
+    $self->emit();
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        // Cursor inside the empty `()` of `$self->emit()`.
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("->emit()"))
+            .unwrap();
+        let col = line.find("emit(").unwrap() + "emit(".len();
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+
+        // Every registered handler shows up as a top-priority suggestion.
+        let connect = items.iter().find(|i| i.label == "connect")
+            .expect("connect handler should be offered at emit arg-0");
+        let disconnect = items.iter().find(|i| i.label == "disconnect")
+            .expect("disconnect handler should be offered at emit arg-0");
+
+        assert_eq!(connect.kind, Some(CompletionItemKind::EVENT),
+            "handler completion kind is EVENT (matches outline)");
+        assert_eq!(connect.insert_text.as_deref(), Some("'connect'"),
+            "insert should include quotes so the user doesn't type them");
+        assert!(connect.detail.as_deref().unwrap_or("").contains("My::Emitter"),
+            "detail should name the owning class: {:?}", connect.detail);
+        assert!(connect.detail.as_deref().unwrap_or("").contains("$sock"),
+            "detail should expose handler params: {:?}", connect.detail);
+
+        // Sort text puts handlers ahead of other general completions.
+        assert!(connect.sort_text.as_deref().unwrap_or("zzz").starts_with("00"),
+            "handler sort should be first: {:?}", connect.sort_text);
+        assert!(disconnect.sort_text.as_deref().unwrap_or("zzz").starts_with("00"));
+    }
+
+    /// Mid-string completion for route targets. Cursor inside
+    /// `->to('Users#lis|')` offers methods on Users, prefix-filtered
+    /// by `lis`. Generic for ANY plugin that emits MethodCallRef at
+    /// a string span (routes today, Catalyst forwards, etc.).
+    #[test]
+    fn completion_mid_string_route_target_scoped_to_invocant() {
+        // Same-file Users package so the test is self-contained. Real
+        // use would have Users in a separate file via workspace index;
+        // the lookup path is the same (complete_methods_for_class
+        // walks inheritance + module index).
+        let src = r#"
+package Users;
+sub list {}
+sub login {}
+sub logout {}
+sub delete_user {}
+
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#lis');
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        // Cursor just after 'lis' in 'Users#lis' — active editing state.
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("Users#lis")).unwrap();
+        let col = line.find("Users#lis").unwrap() + "Users#lis".len();
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        // Prefix-filtered: only `list` starts with `lis`; `login`,
+        // `logout`, `delete_user` don't.
+        assert!(labels.contains(&"list"),
+            "list must be offered for prefix `lis`: {:?}", labels);
+        assert!(!labels.contains(&"login"),
+            "login does NOT start with `lis` — must be filtered out: {:?}", labels);
+        assert!(!labels.contains(&"logout"),
+            "logout does NOT start with `lis` — must be filtered out: {:?}", labels);
+        assert!(!labels.contains(&"delete_user"),
+            "delete_user is unrelated — must not appear: {:?}", labels);
+
+        // Top-priority sort — the mid-string completion path is the
+        // only sensible one at this cursor position.
+        let list = items.iter().find(|i| i.label == "list").unwrap();
+        assert!(list.sort_text.as_deref().unwrap_or("zzz").starts_with("000"),
+            "mid-string method completion should be top-priority: {:?}",
+            list.sort_text);
+    }
+
+    /// Mid-string completion for routes before `#` is typed — cursor at
+    /// `->to('Us|')`. The invocant portion isn't complete yet, so the
+    /// plugin won't have emitted a MethodCallRef. Graceful fallthrough
+    /// to general completion (or nothing) is the expected behavior.
+    #[test]
+    fn completion_mid_string_before_hash_falls_through() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Us');
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("'Us'")).unwrap();
+        let col = line.find("'Us'").unwrap() + "'Us".len();
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        // Doesn't assert what IS offered — just that it doesn't panic
+        // and doesn't return complete nonsense. This is the honest
+        // edge-case: without a `#` yet, no plugin-emitted ref exists.
+        let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+        let _ = items;
+    }
+
+    /// Completion skips when the method isn't a declared dispatcher, even
+    /// if handlers exist on the class. (Empty dispatchers == "any" by
+    /// convention, but mojo-events declares ["emit"] specifically.)
+    #[test]
+    fn completion_skips_non_dispatcher_method() {
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my $self = shift;
+    $self->on('connect', sub { my ($s) = @_; });
+}
+
+sub other {
+    my $self = shift;
+    $self->unrelated_method();
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("->unrelated_method()"))
+            .unwrap();
+        let col = line.find("method(").unwrap() + "method(".len();
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+        assert!(!items.iter().any(|i| i.label == "connect"),
+            "non-dispatcher method must not surface handler completions");
+    }
+
+    /// No handler params means no specialized sig help — fall through to
+    /// the regular method-signature path (or return None if ->emit isn't
+    /// locally defined, as in this test).
+    #[test]
+    fn sig_help_returns_none_when_no_handler_registered() {
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub fire {
+    my $self = shift;
+    $self->emit('never_registered', )
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        let pos = {
+            let line_idx = src.lines().enumerate()
+                .find(|(_, l)| l.contains("never_registered"))
+                .map(|(i, _)| i).unwrap();
+            let line = src.lines().nth(line_idx).unwrap();
+            let col = line.find(", )").unwrap() + 2;
+            Position { line: line_idx as u32, character: col as u32 }
+        };
+
+        let sig = signature_help(&analysis, &tree, src, pos, &idx);
+        assert!(sig.is_none(),
+            "no handler_params → no string-dispatch sig; also no local ->emit def");
     }
 }

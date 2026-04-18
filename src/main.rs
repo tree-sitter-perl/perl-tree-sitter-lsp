@@ -8,6 +8,7 @@ mod file_store;
 mod module_cache;
 mod module_index;
 mod module_resolver;
+mod plugin;
 mod pod;
 mod query_cache;
 mod resolve;
@@ -294,7 +295,7 @@ fn cli_outline(file: &str) {
         match sym.kind {
             file_analysis::SymKind::Sub | file_analysis::SymKind::Method
             | file_analysis::SymKind::Package | file_analysis::SymKind::Class
-            | file_analysis::SymKind::Variable => {}
+            | file_analysis::SymKind::Variable | file_analysis::SymKind::Handler => {}
             _ => continue,
         }
         let mut entry = serde_json::json!({
@@ -317,6 +318,11 @@ fn cli_outline(file: &str) {
             if is_method {
                 entry["is_method"] = serde_json::json!(true);
             }
+        }
+        if let file_analysis::SymbolDetail::Handler { ref params, ref dispatchers, .. } = sym.detail {
+            let param_names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            entry["params"] = serde_json::json!(param_names);
+            entry["dispatchers"] = serde_json::json!(dispatchers);
         }
         results.push(entry);
     }
@@ -493,7 +499,9 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
     let mut all_edits: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
     match &rename_kind {
-        file_analysis::RenameKind::Variable | file_analysis::RenameKind::HashKey(_) => {
+        file_analysis::RenameKind::Variable
+        | file_analysis::RenameKind::HashKey(_)
+        | file_analysis::RenameKind::Handler { .. } => {
             let source = std::fs::read_to_string(&file_path).expect("cannot read file");
             let mut parser = module_resolver::create_parser();
             let tree = parser.parse(&source, None).expect("parse failed");

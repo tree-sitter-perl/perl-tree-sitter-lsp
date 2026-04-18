@@ -127,6 +127,38 @@ pub enum ScopeKind {
     ForLoop { var: String },
 }
 
+// ---- Namespace ----
+
+/// Origin tag for symbols and refs. Phase 1 of the namespace-widening work:
+/// every entity gets a `Namespace` that records whether it's native Perl or
+/// was produced by a framework rule (built-in or plugin). Downstream features
+/// (completion bucketing, diagnostic suppression, plugin-aware rename) read
+/// this tag instead of reconstructing provenance from names and positions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Namespace {
+    /// Native Perl: subs, variables, packages, classes, hash keys extracted
+    /// directly from the CST by the builder.
+    Language,
+    /// Produced by a framework plugin. `id` is the plugin identifier
+    /// (e.g. `"mojo-base"`, `"moo"`, `"dbic-columns"`), allowing per-plugin
+    /// filtering, rename coordination, and diagnostic attribution.
+    Framework { id: String },
+}
+
+impl Default for Namespace {
+    fn default() -> Self { Self::Language }
+}
+
+impl Namespace {
+    pub fn framework(id: impl Into<String>) -> Self {
+        Self::Framework { id: id.into() }
+    }
+
+    pub fn is_framework(&self) -> bool {
+        matches!(self, Self::Framework { .. })
+    }
+}
+
 // ---- Symbol ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +174,10 @@ pub struct Symbol {
     pub package: Option<String>,
     /// Kind-specific extra data.
     pub detail: SymbolDetail,
+    /// Provenance tag. Defaults to `Language` for builder-native symbols;
+    /// framework plugins stamp their plugin id.
+    #[serde(default)]
+    pub namespace: Namespace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +190,13 @@ pub enum SymKind {
     Module,
     Field,
     HashKeyDef,
+    /// Named handler registered on a class via string-dispatch (e.g. Mojo
+    /// events, Dancer routes, Catalyst actions). Not a Perl method — it
+    /// can't be called as `$self->name()`. It's dispatched through named
+    /// methods (`->emit`, `->get`, `->forward`) whose first string arg
+    /// selects which Handler to run. Multiple Handlers with the same
+    /// `(owner, name)` stack, they don't override.
+    Handler,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +226,18 @@ pub enum SymbolDetail {
     HashKeyDef {
         owner: HashKeyOwner,
         is_dynamic: bool,
+    },
+    /// String-dispatched handler detail. `owner` ties the handler to a
+    /// class (so two classes can each register a handler named "ready"
+    /// without collision). `dispatchers` is the set of method names that
+    /// select this handler by string — e.g. `["emit", "subscribe"]` for
+    /// Mojo events, `["forward"]` for Catalyst actions. `params` is the
+    /// handler's sub signature, consumed by signature help at call
+    /// sites and by hover to describe the handler shape.
+    Handler {
+        owner: HandlerOwner,
+        dispatchers: Vec<String>,
+        params: Vec<ParamInfo>,
     },
     /// Package, Module, or other kinds needing no extra data.
     None,
@@ -234,6 +289,9 @@ pub enum RenameKind {
     Package(String),
     Method(String),
     HashKey(String),
+    /// Rename a `Handler` by (owner, name) — touches the handler symbol's
+    /// name + every `DispatchCall` ref targeting it.
+    Handler { owner: HandlerOwner, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +313,17 @@ pub enum RefKind {
     },
     /// The container variable in `$hash{key}`, `@arr[0]`, etc.
     ContainerAccess,
+    /// Call site that dispatches to a `Handler` symbol by string name,
+    /// e.g. `$emitter->emit('ready', ...)`. `dispatcher` is the method
+    /// name chosen on the receiver (`"emit"`, `"subscribe"`, etc.).
+    /// `owner` is resolved at build time when the receiver type is
+    /// known; otherwise left `None` and re-linked by enrichment later.
+    /// `target_name` on the enclosing `Ref` is the handler name
+    /// (the string literal first-arg).
+    DispatchCall {
+        dispatcher: String,
+        owner: Option<HandlerOwner>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +407,19 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
         }
     }
     object
+}
+
+// ---- Handler owner ----
+
+/// Owner of a `Handler` symbol. Distinct from `HashKeyOwner` because
+/// hash keys and dispatch handlers are different concepts even though
+/// both happen to be keyed by a name under a class. Keeping them split
+/// prevents overload creep — each stays free to evolve on its own axis.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HandlerOwner {
+    /// Handler is registered on a specific class (typical for Mojo
+    /// events, Moose roles, DBIC relationships, etc.).
+    Class(String),
 }
 
 // ---- Hash key owner (for scope graph) ----
@@ -611,6 +693,39 @@ impl FileAnalysis {
             self.refs[idx].resolves_to = Some(sid);
         }
 
+        // Link DispatchCall refs → Handler symbols by (owner, name). A
+        // DispatchCall whose owner couldn't be resolved at build time (e.g.
+        // `$obj->emit('x')` where `$obj` type isn't known yet) stays
+        // unlinked here and may be re-resolved by enrichment when the
+        // cross-file receiver type becomes known.
+        //
+        // Unlike hash keys, multiple Handlers with the same (owner, name)
+        // legitimately coexist (stacked registrations) — we link the ref
+        // to the *first* def found so `resolves_to` has a single target,
+        // and rely on `refs_to_symbol` walking all stacked defs separately
+        // for features like references/rename.
+        let handler_defs: HashMap<(&str, &HandlerOwner), SymbolId> = self.symbols.iter()
+            .filter_map(|sym| {
+                if let SymbolDetail::Handler { owner, .. } = &sym.detail {
+                    Some(((sym.name.as_str(), owner), sym.id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut handler_resolutions: Vec<(usize, SymbolId)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            if r.resolves_to.is_some() { continue; }
+            if let RefKind::DispatchCall { owner: Some(owner), .. } = &r.kind {
+                if let Some(&sid) = handler_defs.get(&(r.target_name.as_str(), owner)) {
+                    handler_resolutions.push((i, sid));
+                }
+            }
+        }
+        for (idx, sid) in handler_resolutions {
+            self.refs[idx].resolves_to = Some(sid);
+        }
+
         // Refs by target name, and refs by resolved target SymbolId (phase 5).
         for (i, r) in self.refs.iter().enumerate() {
             self.refs_by_name
@@ -818,7 +933,9 @@ impl FileAnalysis {
                     detail: SymbolDetail::HashKeyDef {
                         owner: owner.clone(),
                         is_dynamic: false,
+
                     },
+                    namespace: Namespace::Language,
                 });
             }
         }
@@ -1545,6 +1662,22 @@ impl FileAnalysis {
                     return self.resolve_variable(&r.target_name, point)
                         .map(|sym| sym.selection_span);
                 }
+                RefKind::DispatchCall { owner: Some(owner), .. } => {
+                    // Go-to-def on a dispatch call site lands at the
+                    // first stacked Handler for this (owner, name).
+                    // Features that want all registrations walk
+                    // `refs_to_symbol` or use `refs_to` with
+                    // `TargetKind::Handler`.
+                    for sym in &self.symbols {
+                        if sym.name != r.target_name { continue; }
+                        if let SymbolDetail::Handler { owner: o, .. } = &sym.detail {
+                            if o == owner {
+                                return Some(sym.selection_span);
+                            }
+                        }
+                    }
+                }
+                RefKind::DispatchCall { owner: None, .. } => {}
             }
         }
 
@@ -1804,11 +1937,26 @@ impl FileAnalysis {
                         }
                     }
                 }
+                RefKind::DispatchCall { dispatcher, owner } => {
+                    if let Some(ref owner) = owner {
+                        return Some(self.format_handler_hover(
+                            &r.target_name,
+                            owner,
+                            Some(dispatcher),
+                            module_index,
+                        ));
+                    }
+                }
             }
         }
 
         // Check symbols
         if let Some(sym) = self.symbol_at(point) {
+            // Handler symbols get a specialized multi-registration hover
+            // (stacked defs, dispatcher list, param shapes).
+            if let SymbolDetail::Handler { owner, .. } = &sym.detail {
+                return Some(self.format_handler_hover(&sym.name, owner, None, module_index));
+            }
             return Some(self.format_symbol_hover(sym, source));
         }
 
@@ -1859,6 +2007,13 @@ impl FileAnalysis {
                 RefKind::MethodCall { .. } => RenameKind::Method(r.target_name.clone()),
                 RefKind::PackageRef => RenameKind::Package(r.target_name.clone()),
                 RefKind::HashKeyAccess { .. } => RenameKind::HashKey(r.target_name.clone()),
+                RefKind::DispatchCall { owner: Some(owner), .. } => {
+                    RenameKind::Handler { owner: owner.clone(), name: r.target_name.clone() }
+                }
+                // Unresolved DispatchCall — owner couldn't be determined
+                // at build time, so rename can't safely scope. Fall through
+                // to the symbol-at check below which returns None.
+                RefKind::DispatchCall { owner: None, .. } => return None,
             });
         }
         if let Some(sym) = self.symbol_at(point) {
@@ -1867,6 +2022,11 @@ impl FileAnalysis {
                 SymKind::Sub => Some(RenameKind::Function(sym.name.clone())),
                 SymKind::Method => Some(RenameKind::Method(sym.name.clone())),
                 SymKind::Package | SymKind::Class => Some(RenameKind::Package(sym.name.clone())),
+                SymKind::Handler => {
+                    if let SymbolDetail::Handler { owner, .. } = &sym.detail {
+                        Some(RenameKind::Handler { owner: owner.clone(), name: sym.name.clone() })
+                    } else { None }
+                }
                 _ => None,
             };
         }
@@ -1981,6 +2141,17 @@ impl FileAnalysis {
                         }
                     }
                 }
+                RefKind::DispatchCall { owner: Some(owner), .. } => {
+                    for sym in &self.symbols {
+                        if sym.name != r.target_name { continue; }
+                        if let SymbolDetail::Handler { owner: o, .. } = &sym.detail {
+                            if o == owner {
+                                return Some((sym.id, true));
+                            }
+                        }
+                    }
+                }
+                RefKind::DispatchCall { owner: None, .. } => {}
             }
         }
 
@@ -2165,6 +2336,139 @@ impl FileAnalysis {
         None
     }
 
+    /// Hover text for a `Handler` symbol or `DispatchCall` ref. Shows
+    /// every stacked registration with its param shape, lists the
+    /// dispatcher methods that route to it, and names the owning class.
+    /// Walks the module index too so consumer-file hovers cross-file
+    /// back to the producer's registrations — critical for the common
+    /// case where events are defined in a lib and emitted from scripts.
+    fn format_handler_hover(
+        &self,
+        name: &str,
+        owner: &HandlerOwner,
+        active_dispatcher: Option<&str>,
+        module_index: Option<&ModuleIndex>,
+    ) -> String {
+        let class = match owner {
+            HandlerOwner::Class(n) => n.as_str(),
+        };
+
+        // Gather stacked registrations from this file first, then any
+        // additional ones in the workspace/dependency cache. Each entry
+        // is `(line_number, display_params)` rather than a `&Symbol`
+        // reference so cross-file handlers (owned by other
+        // FileAnalyses) flow through the same formatting path.
+        let mut registrations: Vec<(usize, Vec<String>)> = self.symbols.iter()
+            .filter(|s| s.name == name)
+            .filter_map(|s| match &s.detail {
+                SymbolDetail::Handler { owner: o, params, .. } if o == owner => {
+                    Some((s.selection_span.start.row + 1, display_handler_params(params)))
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Cross-file walk: every cached module in the workspace gets
+        // scanned for Handler symbols with the same (owner, name).
+        if let Some(idx) = module_index {
+            idx.for_each_cached(|_, cached| {
+                for sym in &cached.analysis.symbols {
+                    if sym.name != name { continue; }
+                    if let SymbolDetail::Handler { owner: o, params, .. } = &sym.detail {
+                        if o == owner {
+                            registrations.push((
+                                sym.selection_span.start.row + 1,
+                                display_handler_params(params),
+                            ));
+                        }
+                    }
+                }
+            });
+        }
+        registrations.sort();
+        registrations.dedup();
+
+        // Dispatchers: union across stacked registrations, current-file only
+        // (plugins declare them consistently, no need to walk deps).
+        let registrations_ref: Vec<&Symbol> = self.symbols.iter()
+            .filter(|s| s.name == name)
+            .filter(|s| matches!(
+                &s.detail,
+                SymbolDetail::Handler { owner: o, .. } if o == owner
+            ))
+            .collect();
+
+        // Union dispatcher lists across the current-file registrations.
+        let mut dispatchers: Vec<String> = registrations_ref.iter()
+            .filter_map(|s| match &s.detail {
+                SymbolDetail::Handler { dispatchers, .. } => Some(dispatchers.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        // If we have only cross-file registrations, pull dispatchers from
+        // the module index cache too so the hover still shows the
+        // dispatcher list to the consumer.
+        if dispatchers.is_empty() {
+            if let Some(idx) = module_index {
+                idx.for_each_cached(|_, cached| {
+                    for sym in &cached.analysis.symbols {
+                        if sym.name != name { continue; }
+                        if let SymbolDetail::Handler { owner: o, dispatchers: ds, .. } = &sym.detail {
+                            if o == owner { dispatchers.extend(ds.clone()); }
+                        }
+                    }
+                });
+            }
+        }
+        dispatchers.sort();
+        dispatchers.dedup();
+
+        let mut text = String::new();
+        text.push_str(&format!("**handler `{}`** on `{}`\n\n", name, class));
+
+        if registrations.is_empty() {
+            text.push_str("*no handler registered in this workspace — dispatch will be a no-op*");
+            return text;
+        }
+
+        let plural = if registrations.len() == 1 { "" } else { "s" };
+        text.push_str(&format!(
+            "*{} registration{} stack{}:*\n\n",
+            registrations.len(),
+            plural,
+            if registrations.len() == 1 { "s" } else { "" },
+        ));
+
+        for (line, display) in &registrations {
+            text.push_str(&format!(
+                "- **line {}:** `({})`\n",
+                line,
+                display.join(", "),
+            ));
+        }
+
+        if !dispatchers.is_empty() {
+            text.push_str(&format!(
+                "\n*Dispatch via:* `{}`",
+                dispatchers.iter()
+                    .map(|d| {
+                        if Some(d.as_str()) == active_dispatcher {
+                            format!("**->{}(...)**", d)
+                        } else {
+                            format!("->{}(...)", d)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+
+        text
+    }
+
+    // helpers defined at module scope below
+
     /// Resolve a method through the cross-file inheritance chain only.
     fn resolve_cross_file_method(
         &self,
@@ -2318,6 +2622,29 @@ impl FileAnalysis {
                     (sym.name.clone(), Some("field".to_string()), Vec::new())
                 }
                 SymKind::HashKeyDef => continue, // Skip hash key defs from outline
+                SymKind::Handler => {
+                    // Show registered handlers in the outline so users can
+                    // see at a glance which events/routes/etc. a class
+                    // wires up. Label includes the name + param shape so
+                    // stacked registrations with different signatures are
+                    // visually distinct.
+                    let detail = match &sym.detail {
+                        SymbolDetail::Handler { params, .. } => {
+                            let display: Vec<String> = params
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, p)| !(*i == 0 && matches!(
+                                    p.name.as_str(),
+                                    "$self" | "$self_in" | "$emitter"
+                                )))
+                                .map(|(_, p)| p.name.clone())
+                                .collect();
+                            Some(format!("handler ({})", display.join(", ")))
+                        }
+                        _ => Some("handler".to_string()),
+                    };
+                    (sym.name.clone(), detail, Vec::new())
+                }
             };
 
             result.push(OutlineSymbol {
@@ -2450,6 +2777,11 @@ impl FileAnalysis {
                     tokens.push(PerlSemanticToken { span: r.span, token_type: TOK_NAMESPACE, modifiers: 0 });
                 }
                 RefKind::HashKeyAccess { .. } => {
+                    tokens.push(PerlSemanticToken { span: r.span, token_type: TOK_PROPERTY, modifiers: 0 });
+                }
+                RefKind::DispatchCall { .. } => {
+                    // Colors dispatch-call event names like property keys —
+                    // same visual weight as other named members of a class.
                     tokens.push(PerlSemanticToken { span: r.span, token_type: TOK_PROPERTY, modifiers: 0 });
                 }
             }
@@ -3361,6 +3693,20 @@ fn span_size(span: &Span) -> usize {
     rows * 10000 + cols
 }
 
+/// Strip the implicit invocant param from a handler signature so hover
+/// and sig help don't include the `$self` the user never types.
+fn display_handler_params(params: &[ParamInfo]) -> Vec<String> {
+    params
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| !(*i == 0 && matches!(
+            p.name.as_str(),
+            "$self" | "$self_in" | "$emitter"
+        )))
+        .map(|(_, p)| p.name.clone())
+        .collect()
+}
+
 fn source_line_at(source: &str, row: usize) -> &str {
     source.lines().nth(row).unwrap_or("")
 }
@@ -3564,6 +3910,7 @@ mod tests {
                     return_type: Some(InferredType::HashRef),
                     doc: None,
                 },
+                namespace: Namespace::Language,
             }],
             vec![],
             vec![],

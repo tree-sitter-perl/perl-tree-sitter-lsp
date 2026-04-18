@@ -508,6 +508,10 @@ impl LanguageServer for Backend {
                 );
                 return Ok(if refs.is_empty() { None } else { Some(refs) });
             }
+            Some(RenameKind::Handler { owner, name }) => TargetRef {
+                name: name.clone(),
+                kind: TargetKind::Handler { owner, name },
+            },
         };
 
         // Cross-file walk: workspace + open + deps.
@@ -560,6 +564,12 @@ impl LanguageServer for Backend {
         match rename_kind {
             Some(crate::file_analysis::RenameKind::Variable) => {
                 // Single-file only — lexical scope doesn't cross files
+                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
+            }
+            Some(crate::file_analysis::RenameKind::Handler { .. }) => {
+                // Cross-file handler rename not yet wired — fall back to
+                // single-file for the moment. This will edit the Handler
+                // symbol + every DispatchCall ref in the current file.
                 Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
             }
             Some(crate::file_analysis::RenameKind::Function(ref name))

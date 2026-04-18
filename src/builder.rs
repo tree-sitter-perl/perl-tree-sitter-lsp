@@ -3,12 +3,46 @@
 //! One depth-first walk populates scopes, symbols, refs, type constraints,
 //! and fold ranges. Post-passes resolve hash key owners and variable refs.
 
+use std::sync::{Arc, OnceLock};
+
 use tree_sitter::{Node, Point, Tree};
 
 use crate::file_analysis::*;
+use crate::plugin::{self, PluginRegistry};
+
+/// Process-wide plugin registry, built once with the bundled Rhai plugins
+/// (plus anything discovered under `$PERL_LSP_PLUGIN_DIR`). All `build()`
+/// calls share it; tests that need isolation use `build_with_plugins()`.
+fn default_plugin_registry() -> Arc<PluginRegistry> {
+    static REG: OnceLock<Arc<PluginRegistry>> = OnceLock::new();
+    REG.get_or_init(|| {
+        let engine = Arc::new(plugin::rhai_host::make_engine());
+        let mut reg = PluginRegistry::new();
+        for p in plugin::rhai_host::load_bundled(engine.clone()) {
+            reg.register(p);
+        }
+        if let Ok(dir) = std::env::var("PERL_LSP_PLUGIN_DIR") {
+            let path = std::path::PathBuf::from(dir);
+            for p in plugin::rhai_host::load_plugin_dir(&path, engine) {
+                reg.register(p);
+            }
+        }
+        Arc::new(reg)
+    }).clone()
+}
 
 /// Build a FileAnalysis from a parsed tree in a single walk.
 pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
+    build_with_plugins(tree, source, default_plugin_registry())
+}
+
+/// Build with a caller-provided plugin registry. Tests use this to swap in
+/// deterministic plugin sets; the global default is otherwise shared.
+pub fn build_with_plugins(
+    tree: &Tree,
+    source: &[u8],
+    plugins: Arc<PluginRegistry>,
+) -> FileAnalysis {
     let mut b = Builder {
         source,
         scopes: Vec::new(),
@@ -23,6 +57,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
         package_parents: std::collections::HashMap::new(),
+        package_uses: std::collections::HashMap::new(),
         sub_return_delegations: std::collections::HashMap::new(),
         framework_modes: std::collections::HashMap::new(),
         framework_imports: std::collections::HashSet::new(),
@@ -33,6 +68,7 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         current_package: None,
         next_scope_id: 0,
         next_symbol_id: 0,
+        plugins,
     };
 
     // Create file-level scope and walk
@@ -143,6 +179,9 @@ struct Builder<'a> {
     pod_texts: Vec<String>,
     /// Parent classes for each package (from use parent/base, @ISA, class :isa).
     package_parents: std::collections::HashMap<String, Vec<String>>,
+    /// Modules the current package has `use`d, in source order. Used by
+    /// `PluginRegistry::applicable` for `Trigger::UsesModule` matching.
+    package_uses: std::collections::HashMap<String, Vec<String>>,
     /// sub_name → delegated sub name, for bodies that are `return other()` or
     /// a bare trailing call. Used to propagate hash-key ownership through
     /// intermediate subs so `sub chain { return get_config() }` doesn't
@@ -165,6 +204,10 @@ struct Builder<'a> {
     current_package: Option<String>,
     next_scope_id: u32,
     next_symbol_id: u32,
+
+    /// Framework plugin registry. Shared Arc so multiple builders in one
+    /// process avoid re-compiling the same Rhai scripts.
+    plugins: Arc<PluginRegistry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -209,6 +252,18 @@ impl<'a> Builder<'a> {
     // ---- Symbol/Ref creation ----
 
     fn add_symbol(&mut self, name: String, kind: SymKind, span: Span, selection_span: Span, detail: SymbolDetail) -> SymbolId {
+        self.add_symbol_ns(name, kind, span, selection_span, detail, Namespace::Language)
+    }
+
+    fn add_symbol_ns(
+        &mut self,
+        name: String,
+        kind: SymKind,
+        span: Span,
+        selection_span: Span,
+        detail: SymbolDetail,
+        namespace: Namespace,
+    ) -> SymbolId {
         let id = SymbolId(self.next_symbol_id);
         self.next_symbol_id += 1;
         self.symbols.push(Symbol {
@@ -220,6 +275,7 @@ impl<'a> Builder<'a> {
             scope: self.current_scope(),
             package: self.current_package.clone(),
             detail,
+            namespace,
         });
         id
     }
@@ -233,6 +289,391 @@ impl<'a> Builder<'a> {
             access,
             resolves_to: None,
         });
+    }
+
+    // ---- Plugin dispatch helpers ----
+
+    /// Normalize a call's `arguments` field into a flat list of argument
+    /// nodes. Tree-sitter-perl wraps multi-arg lists in `list_expression`;
+    /// single-arg calls present the arg directly.
+    fn extract_call_args(&self, call_node: Node<'a>) -> Vec<Node<'a>> {
+        let args = match call_node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
+            (0..args.named_child_count())
+                .filter_map(|i| args.named_child(i))
+                .collect()
+        } else {
+            vec![args]
+        }
+    }
+
+    /// Build an `ArgInfo` for a plugin. Constant-folds literals, barewords,
+    /// and `$var` references that accumulate in `constant_strings`. When the
+    /// arg is an anonymous sub, also extracts its param list so plugins
+    /// registering handlers (`->on('ready', sub ($s, $m) {})`) can preserve
+    /// the handler signature for later sig-help lookup.
+    fn arg_info_for(&self, arg: Node<'a>) -> plugin::ArgInfo {
+        let text = arg.utf8_text(self.source).unwrap_or("").to_string();
+        let string_value = match arg.kind() {
+            "string_literal" | "interpolated_string_literal" => {
+                let stripped = text.trim_start_matches(['\'', '"'])
+                    .trim_end_matches(['\'', '"'])
+                    .to_string();
+                Some(stripped)
+            }
+            // `autoquoted_bareword` is what the LHS of fat-comma parses
+            // as (`key => value`) — `bareword` never appears there. The
+            // `bareword` branch catches the other contexts (e.g. unquoted
+            // positional args) where the token text IS the string value.
+            "autoquoted_bareword" | "bareword" => Some(text.clone()),
+            "scalar" | "array" | "hash" => {
+                self.resolve_constant_strings(&text, 0)
+                    .and_then(|v| v.into_iter().next())
+            }
+            _ => None,
+        };
+        let inferred_type = self.infer_expression_type(arg, false);
+        let sub_params = if arg.kind() == "anonymous_subroutine_expression" {
+            self.extract_anonymous_sub_params(arg)
+        } else {
+            Vec::new()
+        };
+        plugin::ArgInfo {
+            text,
+            string_value,
+            span: node_to_span(arg),
+            inferred_type,
+            sub_params,
+        }
+    }
+
+    /// Extract params from an anonymous sub. Reuses the builder's existing
+    /// named-sub param extraction (signature syntax + `@_` unpack) so the
+    /// two codepaths can't diverge. Returns EmittedParam entries suitable
+    /// for plugin consumption.
+    fn extract_anonymous_sub_params(&self, sub_node: Node<'a>) -> Vec<plugin::EmittedParam> {
+        // extract_params handles both signature syntax and a rich set of
+        // @_/shift/$_[N] fallback patterns for named subs. Reuse it here.
+        let mut params: Vec<plugin::EmittedParam> = self.extract_params(sub_node)
+            .into_iter()
+            .map(|p| plugin::EmittedParam {
+                name: p.name,
+                default: p.default,
+                is_slurpy: p.is_slurpy,
+            })
+            .collect();
+        if !params.is_empty() { return params; }
+
+        // Fallback for shapes extract_params doesn't recognize: scan the
+        // body for a top-level `my (...) = @_` unpack.
+        let body = sub_node.child_by_field_name("body")
+            .or_else(|| {
+                (0..sub_node.named_child_count())
+                    .filter_map(|i| sub_node.named_child(i))
+                    .find(|c| c.kind() == "block")
+            });
+        if let Some(body) = body {
+            for i in 0..body.named_child_count() {
+                let Some(stmt) = body.named_child(i) else { continue };
+                if let Some(extracted) = self.extract_my_at_underscore(stmt) {
+                    params = extracted;
+                    break;
+                }
+                break;
+            }
+        }
+        params
+    }
+
+    /// Match `my (V1, V2, @rest) = @_` — the common legacy unpack. Only
+    /// the exact shape `my (...) = @_` counts; more elaborate forms aren't
+    /// worth the heuristic complexity here and can be layered on later.
+    fn extract_my_at_underscore(&self, stmt: Node<'a>) -> Option<Vec<plugin::EmittedParam>> {
+        let text = stmt.utf8_text(self.source).ok()?;
+        let trimmed = text.trim().trim_end_matches(';').trim();
+        let rest = trimmed.strip_prefix("my")?.trim_start();
+        let rest = rest.strip_prefix('(')?;
+        let (inner, after) = rest.split_once(')')?;
+        let after = after.trim();
+        if !after.starts_with('=') { return None; }
+        let rhs = after.trim_start_matches('=').trim();
+        if rhs != "@_" { return None; }
+
+        let params: Vec<plugin::EmittedParam> = inner
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|name| plugin::EmittedParam {
+                is_slurpy: name.starts_with('@') || name.starts_with('%'),
+                name,
+                default: None,
+            })
+            .collect();
+        if params.is_empty() { None } else { Some(params) }
+    }
+
+    /// Best-effort receiver-type resolution for a method call. Handles:
+    ///   * `$self` / `__PACKAGE__`        → current package
+    ///   * bare `Pkg::Name`               → literal class
+    ///   * `$var` with a prior `my $var = Pkg->new` → looked up in
+    ///     `type_constraints` (reverse scan; latest wins). This lets the
+    ///     mojo-events plugin resolve `$obj->emit(...)` in a consumer file
+    ///     to the producer's class, enabling cross-file def/ref pairing.
+    fn receiver_type_for(&self, invocant_text: Option<&str>) -> Option<InferredType> {
+        let text = invocant_text?;
+        if text == "$self" || text == "__PACKAGE__" {
+            return self.current_package.clone().map(InferredType::ClassName);
+        }
+        if text.starts_with('$') {
+            return self.type_constraints.iter().rev().find_map(|tc| {
+                if tc.variable == text { Some(tc.inferred_type.clone()) } else { None }
+            });
+        }
+        if text.starts_with('@') || text.starts_with('%') {
+            return None;
+        }
+        Some(InferredType::ClassName(text.to_string()))
+    }
+
+    /// Transitive parent walk within the current file. Depth-limited like
+    /// `resolve_method_in_ancestors`. Returns parents in BFS order. Used
+    /// for plugin trigger matching so a class that transitively extends
+    /// `Mojo::EventEmitter` (via an intermediate base) still fires its
+    /// plugins — matches Perl's own MRO behavior.
+    fn transitive_parents(&self, pkg: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = self.package_parents.get(pkg).cloned().unwrap_or_default();
+        let mut depth = 0;
+        while let Some(p) = stack.pop() {
+            if depth > 20 { break; }
+            if !seen.insert(p.clone()) { continue; }
+            out.push(p.clone());
+            if let Some(grandparents) = self.package_parents.get(&p) {
+                for gp in grandparents {
+                    stack.push(gp.clone());
+                }
+            }
+            depth += 1;
+        }
+        out
+    }
+
+    /// Build the read-only snapshot plugins see, minus the call-shape bits
+    /// that only method-call vs function-call callers know.
+    fn base_call_context(
+        &self,
+        args_raw: Vec<Node<'a>>,
+        call_span: Span,
+        selection_span: Span,
+    ) -> plugin::CallContext {
+        let args: Vec<plugin::ArgInfo> = args_raw.iter().map(|n| self.arg_info_for(*n)).collect();
+        let parents = self.current_package.as_ref()
+            .map(|p| self.transitive_parents(p))
+            .unwrap_or_default();
+        let uses = self.current_package.as_ref()
+            .and_then(|p| self.package_uses.get(p))
+            .cloned()
+            .unwrap_or_default();
+        plugin::CallContext {
+            call_kind: plugin::CallKind::Function,
+            function_name: None,
+            method_name: None,
+            receiver_text: None,
+            receiver_type: None,
+            args,
+            call_span,
+            selection_span,
+            current_package: self.current_package.clone(),
+            current_package_parents: parents,
+            current_package_uses: uses,
+        }
+    }
+
+    /// Run every applicable plugin's `on_method_call` hook and apply each
+    /// returned `EmitAction`.
+    /// Run every applicable plugin's `on_function_call` hook. Used for
+    /// top-level calls (`get '/path' => sub {}`, `has 'attr' => ...`)
+    /// that aren't method calls. Mirrors dispatch_method_call_plugins.
+    fn dispatch_function_call_plugins(&mut self, ctx: plugin::CallContext) {
+        if self.plugins.is_empty() { return; }
+        let parents = self.current_package.as_ref()
+            .map(|p| self.transitive_parents(p))
+            .unwrap_or_default();
+        let uses = self.current_package.as_ref()
+            .and_then(|p| self.package_uses.get(p))
+            .cloned()
+            .unwrap_or_default();
+        let query = plugin::TriggerQuery {
+            package_uses: &uses,
+            package_parents: &parents,
+        };
+        let actions: Vec<(String, plugin::EmitAction)> = self.plugins
+            .applicable(&query)
+            .flat_map(|p| {
+                let id = p.id().to_string();
+                p.on_function_call(&ctx).into_iter().map(move |a| (id.clone(), a))
+            })
+            .collect();
+        for (plugin_id, action) in actions {
+            self.apply_emit_action(plugin_id, action);
+        }
+    }
+
+    fn dispatch_method_call_plugins(&mut self, ctx: plugin::CallContext) {
+        if self.plugins.is_empty() { return; }
+        let parents = self.current_package.as_ref()
+            .map(|p| self.transitive_parents(p))
+            .unwrap_or_default();
+        let uses = self.current_package.as_ref()
+            .and_then(|p| self.package_uses.get(p))
+            .cloned()
+            .unwrap_or_default();
+        let query = plugin::TriggerQuery {
+            package_uses: &uses,
+            package_parents: &parents,
+        };
+        let actions: Vec<(String, plugin::EmitAction)> = self.plugins
+            .applicable(&query)
+            .flat_map(|p| {
+                let id = p.id().to_string();
+                p.on_method_call(&ctx).into_iter().map(move |a| (id.clone(), a))
+            })
+            .collect();
+        for (plugin_id, action) in actions {
+            self.apply_emit_action(plugin_id, action);
+        }
+    }
+
+    /// Convert a plugin-produced `EmitAction` into real builder state. All
+    /// emitted symbols carry a `Namespace::Framework { id }` tag so downstream
+    /// queries can distinguish plugin-synthesized entities from native ones.
+    fn apply_emit_action(&mut self, plugin_id: String, action: plugin::EmitAction) {
+        let ns = Namespace::framework(plugin_id.clone());
+        match action {
+            plugin::EmitAction::Method {
+                name,
+                span,
+                selection_span,
+                params,
+                is_method,
+                return_type,
+                doc,
+                on_class,
+            } => {
+                let detail = SymbolDetail::Sub {
+                    params: params.into_iter().map(Into::into).collect(),
+                    is_method,
+                    return_type,
+                    doc,
+                };
+                // Target package for this emission: either the plugin's
+                // override or the current build state.
+                let target_pkg = on_class.clone().or_else(|| self.current_package.clone());
+
+                // Dedup: two plugin emissions for the same (name, package,
+                // namespace) collapse to the first. Comes up naturally
+                // with dotted-helper prefixes — `thing.hi` and
+                // `thing.there` both want to register `thing` as a
+                // namespace method; the second is a no-op. Dedup happens
+                // here (not in the plugin) so every plugin author gets
+                // it for free and can't accidentally double-emit.
+                let already_emitted = self.symbols.iter().any(|s| {
+                    s.name == name
+                        && s.kind == SymKind::Method
+                        && s.package == target_pkg
+                        && s.namespace == ns
+                });
+                if already_emitted { return; }
+
+                // `on_class` temporarily overrides current_package so the
+                // emitted Symbol lands with the requested `package`. The
+                // only sanctioned way for a plugin to attach a method to
+                // a class that isn't the one being built — kept narrow
+                // so plugins can't silently reparent other emissions.
+                if let Some(pkg) = on_class {
+                    let saved = self.current_package.take();
+                    self.current_package = Some(pkg);
+                    self.add_symbol_ns(name, SymKind::Method, span, selection_span, detail, ns);
+                    self.current_package = saved;
+                } else {
+                    self.add_symbol_ns(name, SymKind::Method, span, selection_span, detail, ns);
+                }
+            }
+            plugin::EmitAction::HashKeyDef { name, owner, span, selection_span } => {
+                let detail = SymbolDetail::HashKeyDef { owner, is_dynamic: false };
+                self.add_symbol_ns(name, SymKind::HashKeyDef, span, selection_span, detail, ns);
+            }
+            plugin::EmitAction::HashKeyAccess { name, owner, var_text, span, access } => {
+                // `owner: Some(owner)` so the phase-5 linkage pass (which looks
+                // for HashKeyAccess → HashKeyDef by name+owner) pairs these
+                // refs to both in-file and cross-file defs automatically.
+                self.refs.push(Ref {
+                    kind: RefKind::HashKeyAccess { var_text, owner: Some(owner) },
+                    span,
+                    scope: self.current_scope(),
+                    target_name: name,
+                    access,
+                    resolves_to: None,
+                });
+            }
+            plugin::EmitAction::Handler {
+                name, owner, dispatchers, params, span, selection_span,
+            } => {
+                let detail = SymbolDetail::Handler {
+                    owner,
+                    dispatchers,
+                    params: params.into_iter().map(Into::into).collect(),
+                };
+                self.add_symbol_ns(name, SymKind::Handler, span, selection_span, detail, ns);
+            }
+            plugin::EmitAction::MethodCallRef { method_name, invocant, span, invocant_span } => {
+                // Standard MethodCall ref — gd/gr/hover/rename route to
+                // the usual resolution path (inheritance walk + module
+                // index + type inference). The plugin's job is just
+                // "there's a call to method X on invocant Y here".
+                self.refs.push(Ref {
+                    kind: RefKind::MethodCall {
+                        invocant,
+                        invocant_span,
+                        method_name_span: span,
+                    },
+                    span,
+                    scope: self.current_scope(),
+                    target_name: method_name,
+                    access: AccessKind::Read,
+                    resolves_to: None,
+                });
+            }
+            plugin::EmitAction::DispatchCall { name, dispatcher, owner, span, var_text } => {
+                // Same pattern as HashKeyAccess: record the owner so
+                // `build_indices` can link the ref to its Handler def in
+                // O(1) and `resolve::refs_to` matches cross-file by
+                // (owner, name). The var_text lives on the kind for
+                // features that want to show the receiver in hover.
+                let _ = var_text; // reserved for future hover enrichment
+                self.refs.push(Ref {
+                    kind: RefKind::DispatchCall { dispatcher, owner: Some(owner) },
+                    span,
+                    scope: self.current_scope(),
+                    target_name: name,
+                    access: AccessKind::Read,
+                    resolves_to: None,
+                });
+            }
+            plugin::EmitAction::Symbol { name, kind, span, selection_span, detail } => {
+                self.add_symbol_ns(name, kind, span, selection_span, detail, ns);
+            }
+            plugin::EmitAction::PackageParent { package, parent } => {
+                self.package_parents.entry(package).or_default().push(parent);
+            }
+            plugin::EmitAction::FrameworkImport { keyword } => {
+                self.framework_imports.insert(keyword);
+            }
+        }
     }
 
     // ---- Main visitor ----
@@ -1069,6 +1510,15 @@ impl<'a> Builder<'a> {
                     node_to_span(module_node),
                     SymbolDetail::None,
                 );
+
+                // Track uses per-package so `Trigger::UsesModule` matches.
+                // Populated before any plugin-dispatch site reads it.
+                if let Some(pkg) = self.current_package.as_ref().cloned() {
+                    self.package_uses
+                        .entry(pkg)
+                        .or_default()
+                        .push(module_name.to_string());
+                }
 
                 // Detect framework mode from use statements
                 if let Some(pkg) = self.current_package.as_ref().cloned() {
@@ -1972,6 +2422,23 @@ impl<'a> Builder<'a> {
                 if name == "push" {
                     self.visit_push_call(node);
                 }
+
+                // Framework plugin dispatch for function calls. Mirrors
+                // the method-call path so plugins (e.g. Mojolicious::Lite
+                // routes: `get '/path' => sub {}`) get the same
+                // trigger/ctx/EmitAction flow as method-call plugins.
+                if !self.plugins.is_empty() {
+                    let args_raw = self.extract_call_args(node);
+                    let func_name_span = node_to_span(func_node);
+                    let mut ctx = self.base_call_context(
+                        args_raw,
+                        node_to_span(node),
+                        func_name_span,
+                    );
+                    ctx.call_kind = plugin::CallKind::Function;
+                    ctx.function_name = Some(name.to_string());
+                    self.dispatch_function_call_plugins(ctx);
+                }
             }
         }
         self.visit_children(node);
@@ -2392,6 +2859,7 @@ impl<'a> Builder<'a> {
                     SymbolDetail::HashKeyDef {
                         owner: owner.clone(),
                         is_dynamic: false,
+
                     },
                 );
             }
@@ -2648,6 +3116,25 @@ impl<'a> Builder<'a> {
                 if self.is_dbic_class() {
                     self.visit_dbic_class_method(node, name);
                 }
+            }
+        }
+
+        // Framework plugin dispatch. Runs after native handlers so plugin
+        // emissions are purely additive — a third-party plugin targeting
+        // `->on()` can't accidentally break DBIC `->add_columns()`.
+        if !self.plugins.is_empty() {
+            if let Some(ref name) = method_name {
+                let args_raw = self.extract_call_args(node);
+                let mut ctx = self.base_call_context(
+                    args_raw,
+                    node_to_span(node),
+                    method_name_span,
+                );
+                ctx.call_kind = plugin::CallKind::Method;
+                ctx.method_name = Some(name.clone());
+                ctx.receiver_text = invocant_text.clone();
+                ctx.receiver_type = self.receiver_type_for(invocant_text.as_deref());
+                self.dispatch_method_call_plugins(ctx);
             }
         }
 
@@ -3174,6 +3661,7 @@ impl<'a> Builder<'a> {
                                         SymbolDetail::HashKeyDef {
                                             owner: owner.clone(),
                                             is_dynamic: false,
+                    
                                         },
                                     );
                                 }
@@ -6448,5 +6936,552 @@ sub test { my $self = shift; $self->$method() }
             .filter(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "get_name")
             .collect();
         assert!(!method_refs.is_empty(), "dynamic method call should resolve to get_name");
+    }
+
+    // ---- Framework plugin integration ----
+
+    /// End-to-end: the bundled `mojo-events` Rhai plugin should synthesize a
+    /// `HashKeyDef` for every literal event name passed to `->on(...)`
+    /// inside a class that inherits from `Mojo::EventEmitter`. This is the
+    /// proof that Rhai scripts emit real symbols that land in FileAnalysis
+    /// with the `Framework` namespace stamp.
+    #[test]
+    fn plugin_mojo_events_on_literal_emits_handler_symbol() {
+        let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub new {
+    my $class = shift;
+    my $self = bless {}, $class;
+    $self->on('connect', sub { ... });
+    $self->on('message', sub { ... });
+    $self;
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+
+        let handlers: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-events"))
+            .collect();
+
+        let names: std::collections::HashSet<&str> = handlers.iter()
+            .map(|s| s.name.as_str()).collect();
+        assert!(names.contains("connect"),
+            "mojo-events should emit Handler for 'connect'; got: {:?}", names);
+        assert!(names.contains("message"),
+            "mojo-events should emit Handler for 'message'; got: {:?}", names);
+
+        // Each Handler should also carry the dispatcher set — at minimum
+        // 'emit' (the canonical Mojo dispatch method).
+        for h in &handlers {
+            if let SymbolDetail::Handler { dispatchers, .. } = &h.detail {
+                assert!(dispatchers.iter().any(|d| d == "emit"),
+                    "Handler for {} should declare `emit` dispatcher", h.name);
+            } else {
+                panic!("expected Handler detail on {}", h.name);
+            }
+        }
+    }
+
+    /// Dynamic event names must not produce spurious HashKeyDefs.
+    #[test]
+    fn plugin_mojo_events_dynamic_name_does_not_emit() {
+        let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my ($self, $name) = @_;
+    $self->on($name, sub { ... });
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+        let plugin_handlers: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-events"))
+            .collect();
+        assert!(plugin_handlers.is_empty(),
+            "dynamic event name must not emit handlers; got: {:?}",
+            plugin_handlers.iter().map(|s| &s.name).collect::<Vec<_>>());
+    }
+
+    /// Const folding through the plugin: `my $name = 'connect'; ...` means
+    /// the plugin receives `arg.string_value == "connect"` and emits a
+    /// symbol named "connect" — not "$name". The plugin itself contains no
+    /// folding logic; the builder does it once in `arg_info_for` and every
+    /// plugin gets folded values for free.
+    #[test]
+    fn plugin_mojo_events_const_folds_scalar_event_name() {
+        let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my $self = shift;
+    my $evt = 'disconnect';
+    $self->on($evt, sub { ... });
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+
+        let names: std::collections::HashSet<&str> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-events"))
+            .map(|s| s.name.as_str()).collect();
+        assert!(names.contains("disconnect"),
+            "const-folded event name should emit 'disconnect'; got: {:?}", names);
+        assert!(!names.contains("$evt"),
+            "variable text must not leak through as symbol name");
+    }
+
+    /// Transitive inheritance: a class whose parent (in the same file)
+    /// extends Mojo::EventEmitter should still trigger the plugin. Proves
+    /// the builder's transitive_parents walk composes with `ClassIsa`.
+    #[test]
+    fn plugin_mojo_events_triggers_through_transitive_parent() {
+        let src = r#"
+package Mid;
+use parent 'Mojo::EventEmitter';
+
+package Leaf;
+use parent 'Mid';
+
+sub wire {
+    my $self = shift;
+    $self->on('ready', sub { ... });
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+        let ready: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && s.name == "ready"
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-events"))
+            .collect();
+        assert_eq!(ready.len(), 1,
+            "Leaf extends Mid extends Mojo::EventEmitter — plugin must fire transitively");
+    }
+
+    /// Cross-file def/ref pairing. Producer.pm wires events via ->on, Consumer.pm
+    /// calls ->emit on a producer instance. Both plugin emissions end up with
+    /// `HashKeyOwner::Class("Producer")`, so `resolve::refs_to` finds the
+    /// consumer's access ref from the producer's def query — no LSP code is
+    /// plugin-aware.
+    #[test]
+    fn plugin_mojo_events_cross_file_ref_pairing() {
+        use crate::file_store::FileStore;
+        use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
+        use std::path::PathBuf;
+        use crate::file_analysis::HandlerOwner;
+
+        let producer_src = r#"
+package Producer;
+use parent 'Mojo::EventEmitter';
+
+sub new {
+    my $class = shift;
+    my $self = bless {}, $class;
+    $self->on('ready', sub { warn "ready" });
+    return $self;
+}
+1;
+"#;
+        let consumer_src = r#"
+package Consumer;
+use parent 'Mojo::EventEmitter';
+
+sub run {
+    my $p = Producer->new;
+    $p->emit('ready');
+    $p->unsubscribe('ready');
+}
+1;
+"#;
+
+        let store = FileStore::new();
+        let producer_path = PathBuf::from("/tmp/plugin_producer.pm");
+        let consumer_path = PathBuf::from("/tmp/plugin_consumer.pm");
+
+        store.insert_workspace(producer_path.clone(), build_fa(producer_src));
+        store.insert_workspace(consumer_path.clone(), build_fa(consumer_src));
+
+        let results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "ready".to_string(),
+                kind: TargetKind::Handler {
+                    owner: HandlerOwner::Class("Producer".to_string()),
+                    name: "ready".to_string(),
+                },
+            },
+            RoleMask::EDITABLE,
+        );
+
+        let producer_hits = results.iter().filter(|r| {
+            matches!(&r.key, crate::file_store::FileKey::Path(p) if p == &producer_path)
+        }).count();
+        let consumer_hits = results.iter().filter(|r| {
+            matches!(&r.key, crate::file_store::FileKey::Path(p) if p == &consumer_path)
+        }).count();
+
+        assert!(producer_hits >= 1,
+            "producer should have ≥1 hit (the ->on Handler def); results: {:?}", results);
+        assert!(consumer_hits >= 1,
+            "consumer should have ≥1 hit (the ->emit DispatchCall); results: {:?}", results);
+    }
+
+    /// mojo-helpers: a helper registration in a Lite script produces a
+    /// Method on Mojolicious::Controller, so every subclass picks it up
+    /// through the normal inheritance walk. Proves cross-class emission:
+    /// the plugin's emission goes to a *different* package than the one
+    /// being built.
+    #[test]
+    fn plugin_mojo_helpers_registers_method_on_controller() {
+        let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(current_user => sub {
+    my ($c, $extra) = @_;
+    return { id => 1 };
+});
+"#;
+        let fa = build_fa(src);
+
+        let helpers: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Method
+                && s.name == "current_user"
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
+            .collect();
+
+        assert_eq!(helpers.len(), 1, "one helper method emitted");
+        let helper = helpers[0];
+        assert_eq!(helper.package.as_deref(), Some("Mojolicious::Controller"),
+            "helper lives on the shared Controller base, not the Lite script's package");
+        if let SymbolDetail::Sub { params, .. } = &helper.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$extra"],
+                "helper's sub params flow through to the Method signature");
+        } else {
+            panic!("helper detail should be Sub");
+        }
+    }
+
+    /// Dotted helpers chain into namespace methods: `users.create` means
+    /// `$c->users->create`. Each non-leaf segment emits a parameterless
+    /// Method returning a synthetic proxy class; the leaf emits on the
+    /// innermost proxy with the helper's real params. Shared prefixes
+    /// dedup — `thing.hi` and `thing.there` must only ever produce one
+    /// `thing` symbol (not two), so completion + outline stay clean.
+    #[test]
+    fn plugin_mojo_helpers_dotted_chain_with_shared_prefix_dedup() {
+        let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper('thing.hi'    => sub { my ($c, $arg_a) = @_; });
+$app->helper('thing.there' => sub { my ($c, $arg_b) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        // Exactly one `thing` method on Mojolicious::Controller,
+        // despite two dotted helpers sharing that prefix.
+        let thing_syms: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.name == "thing" && s.kind == SymKind::Method
+                && s.package.as_deref() == Some("Mojolicious::Controller"))
+            .collect();
+        assert_eq!(thing_syms.len(), 1,
+            "shared prefix must dedup: one `thing` method, got {}",
+            thing_syms.len());
+
+        // Its return_type is the shared proxy class.
+        if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(n)), .. }
+            = &thing_syms[0].detail
+        {
+            assert_eq!(n, "Mojolicious::Controller::_Helper::thing");
+        } else {
+            panic!("thing's return type should be the shared proxy class");
+        }
+
+        // Both leaves exist on the shared proxy class, each with its own params.
+        let hi = fa.symbols.iter().find(|s| s.name == "hi" && s.kind == SymKind::Method)
+            .expect("hi leaf emitted");
+        let there = fa.symbols.iter().find(|s| s.name == "there" && s.kind == SymKind::Method)
+            .expect("there leaf emitted");
+        assert_eq!(hi.package.as_deref(), Some("Mojolicious::Controller::_Helper::thing"));
+        assert_eq!(there.package.as_deref(), Some("Mojolicious::Controller::_Helper::thing"));
+        if let SymbolDetail::Sub { params, .. } = &hi.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$arg_a"]);
+        }
+        if let SymbolDetail::Sub { params, .. } = &there.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$arg_b"]);
+        }
+    }
+
+    /// Three-level dotted helper chains: `admin.users.purge` synthesizes
+    /// two intermediate proxies, each with the right return_type, and
+    /// the leaf lands on the innermost proxy.
+    #[test]
+    fn plugin_mojo_helpers_three_level_dotted_chain() {
+        let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        let admin = fa.symbols.iter()
+            .find(|s| s.name == "admin" && s.kind == SymKind::Method
+                && s.package.as_deref() == Some("Mojolicious::Controller"))
+            .expect("admin on Controller");
+        let users = fa.symbols.iter()
+            .find(|s| s.name == "users" && s.kind == SymKind::Method
+                && s.package.as_deref() == Some("Mojolicious::Controller::_Helper::admin"))
+            .expect("users on admin proxy");
+        let purge = fa.symbols.iter()
+            .find(|s| s.name == "purge" && s.kind == SymKind::Method
+                && s.package.as_deref() == Some("Mojolicious::Controller::_Helper::admin::users"))
+            .expect("purge leaf on admin.users proxy");
+
+        // Each non-leaf returns the next proxy in the chain.
+        if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(n)), .. } = &admin.detail {
+            assert_eq!(n, "Mojolicious::Controller::_Helper::admin");
+        }
+        if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(n)), .. } = &users.detail {
+            assert_eq!(n, "Mojolicious::Controller::_Helper::admin::users");
+        }
+        // Leaf carries the helper's actual params.
+        if let SymbolDetail::Sub { params, .. } = &purge.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$force"]);
+        }
+    }
+
+    /// mojo-lite: top-level route verbs (`get`, `post`, etc.) register
+    /// Handlers keyed by URL path, with ["url_for"] as the dispatcher so
+    /// `url_for('/users')` can find them. Exercises the on_function_call
+    /// plugin hook that mojo-events doesn't use.
+    #[test]
+    fn plugin_mojo_lite_registers_handlers_for_routes() {
+        let src = r#"
+package main;
+use Mojolicious::Lite;
+
+get '/users' => sub {
+    my ($c, $arg) = @_;
+    $c->render(text => 'hi');
+};
+
+post '/login' => sub {
+    my ($c, $user, $pw) = @_;
+};
+
+app->start;
+"#;
+        let fa = build_fa(src);
+
+        let route_handlers: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-lite"))
+            .collect();
+
+        let names: std::collections::HashSet<&str> = route_handlers.iter()
+            .map(|s| s.name.as_str()).collect();
+        assert!(names.contains("/users"), "GET /users handler emitted; got: {:?}", names);
+        assert!(names.contains("/login"), "POST /login handler emitted; got: {:?}", names);
+
+        // Each handler declares url_for as its dispatcher so completion
+        // inside `url_for('|')` surfaces every route.
+        for h in &route_handlers {
+            if let SymbolDetail::Handler { dispatchers, .. } = &h.detail {
+                assert!(dispatchers.iter().any(|d| d == "url_for"),
+                    "handler {} should dispatch via url_for", h.name);
+            }
+        }
+
+        // Handler params come from the handler sub's signature —
+        // different per route, so they round-trip correctly.
+        let login = route_handlers.iter().find(|h| h.name == "/login").unwrap();
+        if let SymbolDetail::Handler { params, .. } = &login.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$user", "$pw"]);
+        }
+    }
+
+    /// Routes are first-class things, not just refs. Every `->to(...)`
+    /// emits BOTH a MethodCallRef (cross-file target link) AND a
+    /// Handler symbol (route-as-entity — outline-visible, workspace-
+    /// searchable, discoverable via url_for completion). Mirrors the
+    /// mojo-lite model so route symbols are symmetric regardless of
+    /// declaration flavor.
+    #[test]
+    fn plugin_mojo_routes_emits_both_ref_and_handler_symbol() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+$r->post('/users')->to(controller => 'Users', action => 'create');
+"#;
+        let fa = build_fa(src);
+
+        // Each route: one MethodCallRef + one Handler symbol.
+        let method_refs: Vec<&Ref> = fa.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::MethodCall { .. })
+                && (r.target_name == "list" || r.target_name == "create"))
+            .collect();
+        assert_eq!(method_refs.len(), 2, "one MethodCallRef per route");
+
+        let route_syms: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-routes"))
+            .collect();
+        assert_eq!(route_syms.len(), 2,
+            "one Handler symbol per route so outline + workspace-symbol find them");
+
+        let names: std::collections::HashSet<&str> = route_syms.iter()
+            .map(|s| s.name.as_str()).collect();
+        assert!(names.contains("Users#list"),
+            "route identity `Users#list` present; got: {:?}", names);
+        assert!(names.contains("Users#create"),
+            "route identity `Users#create` present; got: {:?}", names);
+
+        // Dispatcher is url_for so completion inside `url_for('|')`
+        // offers every registered route.
+        for s in &route_syms {
+            if let SymbolDetail::Handler { dispatchers, owner, .. } = &s.detail {
+                assert!(dispatchers.iter().any(|d| d == "url_for"),
+                    "route {} should dispatch via url_for", s.name);
+                // Owner is the declaring package — not the target class.
+                // A route is declared IN MyApp, even though it TARGETS Users.
+                assert!(matches!(owner, HandlerOwner::Class(c) if c == "MyApp"),
+                    "route owner is declaring package (MyApp), not target (Users)");
+            }
+        }
+    }
+
+    /// mojo-routes short form: `->to('Users#list')` emits a MethodCall
+    /// ref pointing to `Users::list`. Cursor on the string → gd jumps
+    /// cross-file to the Users controller's list method, same as any
+    /// regular method call. No routes-specific resolution code; it's
+    /// just a Ref that happens to live inside a string literal.
+    #[test]
+    fn plugin_mojo_routes_short_form_emits_method_call_ref() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+"#;
+        let fa = build_fa(src);
+
+        let route_refs: Vec<&Ref> = fa.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::MethodCall { .. })
+                && r.target_name == "list")
+            .collect();
+
+        assert!(!route_refs.is_empty(), "at least one MethodCall ref for 'list'");
+        let r = route_refs.iter().find(|r| {
+            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+        }).expect("MethodCall with invocant=Users");
+
+        // Sanity: ref span covers the string literal so cursor anywhere
+        // in the 'Users#list' range lands on the ref.
+        assert!(r.span.end.column > r.span.start.column,
+            "method ref has non-empty span");
+    }
+
+    /// mojo-routes long form: `->to(controller => 'Users', action => 'list')`.
+    /// Walks kwarg pairs, pairs up controller+action, emits the ref
+    /// with span on the action value.
+    #[test]
+    fn plugin_mojo_routes_long_form_emits_method_call_ref() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to(controller => 'Users', action => 'list');
+"#;
+        let fa = build_fa(src);
+
+        let has_ref = fa.refs.iter().any(|r| {
+            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+                && r.target_name == "list"
+        });
+        assert!(has_ref, "long-form ->to(controller=>, action=>) must produce MethodCall ref");
+    }
+
+    /// mojo-helpers cross-file: when a Lite script registers a helper
+    /// `greet`, the resulting Method symbol's `package` is
+    /// `Mojolicious::Controller`. Any consumer file — controller
+    /// subclass or otherwise — finds it via the standard workspace
+    /// walk + inheritance chain without a single mojo-helpers-aware
+    /// line in the consumer-side code path.
+    #[test]
+    fn plugin_mojo_helpers_land_on_controller_package() {
+        let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+app->helper(greet => sub {
+    my ($c, $name) = @_;
+    return "hello, $name";
+});
+1;
+"#;
+        let fa = build_fa(src);
+        let greet = fa.symbols.iter()
+            .find(|s| s.name == "greet" && s.kind == SymKind::Method)
+            .expect("helper must emit a Method named greet");
+        assert_eq!(greet.package.as_deref(), Some("Mojolicious::Controller"),
+            "helper Method must be packaged on the shared controller base; \
+             that's what lets every subclass pick it up via inheritance walk");
+        assert!(matches!(&greet.namespace, Namespace::Framework { id } if id == "mojo-helpers"));
+    }
+
+    /// Plugin triggers must gate emission. A class that doesn't inherit from
+    /// Mojo::EventEmitter should see no mojo-events emissions even if it
+    /// happens to call a method named `->on(...)`.
+    #[test]
+    fn plugin_mojo_events_triggers_gate_emission() {
+        let src = r#"
+package My::Unrelated;
+
+sub new {
+    my $class = shift;
+    my $self = bless {}, $class;
+    $self->on('connect', sub { ... });
+    $self;
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+        let plugin_syms: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| matches!(&s.namespace,
+                Namespace::Framework { id } if id == "mojo-events"))
+            .collect();
+        assert!(plugin_syms.is_empty(),
+            "untriggered package must not get plugin emissions; got: {:?}",
+            plugin_syms.iter().map(|s| &s.name).collect::<Vec<_>>());
     }
 }
