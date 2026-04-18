@@ -327,21 +327,48 @@ pub fn completion_items(
     // Dispatch-target completions are orthogonal to the context match:
     // a user typing inside `$obj->emit(^)` is simultaneously after a `->`
     // (tree detects `Method`) and inside call args (general path would
-    // apply too). Pull the call context out once and prepend handler
-    // completions whenever we're at arg-0 of a dispatcher method.
-    // Routing through the Handler/DispatchCall abstraction keeps this
-    // consistent with hover + sig help — one source of truth for "what
-    // handlers live on this class".
+    // apply too). Pull the call context out once, prepend handler
+    // completions at arg-0, and — just as importantly — SUPPRESS the
+    // global sub/module firehose at arg-N>0 so comma-triggered
+    // completion inside a dispatch call doesn't dump hundreds of
+    // unrelated symbols. Sig help is the right affordance past arg-0;
+    // completion gets out of the way.
     let mut candidates: Vec<CompletionCandidate> = Vec::new();
+    let mut suppress_firehose = false;
     if let Some(call_ctx) = cursor_context::find_call_context(tree, source.as_bytes(), point) {
-        if call_ctx.is_method && call_ctx.active_param == 0 {
-            candidates.extend(dispatch_target_completions(
-                analysis,
-                module_index,
-                call_ctx.invocant.as_deref(),
-                &call_ctx.name,
-                point,
-            ));
+        if call_ctx.is_method {
+            let dispatch_class = resolve_invocant_class(
+                analysis, call_ctx.invocant.as_deref(), point,
+            );
+            let has_any_handlers = dispatch_class.as_ref().is_some_and(|c|
+                class_has_dispatch_handlers(analysis, module_index, c, &call_ctx.name)
+            );
+
+            if call_ctx.active_param == 0 && has_any_handlers {
+                // arg-0 of a known dispatcher: handlers at the top,
+                // suppress the global sub/module firehose that would
+                // otherwise drown them.
+                candidates.extend(dispatch_target_completions(
+                    analysis,
+                    module_index,
+                    call_ctx.invocant.as_deref(),
+                    &call_ctx.name,
+                    point,
+                    tree,
+                ));
+                suppress_firehose = true;
+            } else if call_ctx.active_param > 0 && has_any_handlers {
+                // Past arg-0 in a known dispatcher: the only sensible
+                // completion is variables-in-scope (candidates for
+                // passing as the next arg). Sig help handles shape
+                // guidance. Short-circuit the context match entirely.
+                let vars_only: Vec<CompletionCandidate> = analysis.complete_general(point)
+                    .into_iter()
+                    .filter(|c| matches!(c.kind, FaSymKind::Variable | FaSymKind::Field))
+                    .collect();
+                candidates.extend(vars_only);
+                return candidates.drain(..).map(candidate_to_completion_item).collect();
+            }
         }
     }
 
@@ -406,11 +433,15 @@ pub fn completion_items(
             }
             items.extend(analysis.complete_general(point));
 
-            // Add imported function completions
-            items.extend(imported_function_completions(analysis, module_index));
-
-            // Add completions from unimported modules (with auto-import edits)
-            items.extend(unimported_function_completions(analysis, module_index, point, stable_packages));
+            // Global sub/module firehose: useful at top-level
+            // positions, harmful when we just offered dispatch
+            // handlers at arg-0 (they'd drown in it). `suppress_firehose`
+            // is set above when we know the cursor is at arg-0 of a
+            // known dispatcher call.
+            if !suppress_firehose {
+                items.extend(imported_function_completions(analysis, module_index));
+                items.extend(unimported_function_completions(analysis, module_index, point, stable_packages));
+            }
 
             items
         }
@@ -641,6 +672,57 @@ pub fn folding_ranges(analysis: &FileAnalysis) -> Vec<FoldingRange> {
 
 // ---- Signature help ----
 
+/// Does this class have ANY registered Handlers matching the method
+/// name as a declared dispatcher? Used to decide whether we're in a
+/// "known dispatch call" context — gates the noise-suppression logic
+/// around it so the firehose of unrelated subs only gets suppressed
+/// when we actually know this is a dispatcher call site.
+fn class_has_dispatch_handlers(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    class: &str,
+    dispatcher: &str,
+) -> bool {
+    let matches = |sym: &crate::file_analysis::Symbol| -> bool {
+        let SymbolDetail::Handler { owner, dispatchers, .. } = &sym.detail else { return false };
+        let HandlerOwner::Class(n) = owner;
+        if n != class { return false; }
+        dispatchers.is_empty() || dispatchers.iter().any(|d| d == dispatcher)
+    };
+    if analysis.symbols.iter().any(&matches) { return true; }
+    let mut found = false;
+    module_index.for_each_cached(|_, cached| {
+        if found { return; }
+        if cached.analysis.symbols.iter().any(&matches) { found = true; }
+    });
+    found
+}
+
+/// True if the cursor sits somewhere that makes wrapping-quotes in the
+/// insert_text wrong. Two cases:
+///   * cursor in a `string_literal` / `interpolated_string_literal`
+///     (the quotes are already typed)
+///   * cursor at a fat-comma LHS autoquote position (the `=>` will
+///     autoquote whatever bareword lands there)
+fn cursor_in_string_or_autoquote(tree: &Tree, point: Point) -> bool {
+    let Some(mut node) = tree.root_node().descendant_for_point_range(point, point) else {
+        return false;
+    };
+    // Walk upward a handful of levels — tree-sitter may hand back a
+    // token node first; the enclosing string_literal is typically one
+    // or two parents up.
+    for _ in 0..4 {
+        match node.kind() {
+            "string_literal" | "interpolated_string_literal"
+            | "string_content" | "autoquoted_bareword" => return true,
+            _ => {}
+        }
+        let Some(p) = node.parent() else { break };
+        node = p;
+    }
+    false
+}
+
 /// Completions for the first arg of a string-dispatched method call.
 /// Walks every Handler symbol (local + cross-file via module index),
 /// filters by (owner class matches receiver, dispatcher matches method
@@ -653,11 +735,24 @@ fn dispatch_target_completions(
     invocant: Option<&str>,
     method_name: &str,
     point: Point,
+    tree: &Tree,
 ) -> Vec<CompletionCandidate> {
     let class = match resolve_invocant_class(analysis, invocant, point) {
         Some(c) => c,
         None => return Vec::new(),
     };
+
+    // Quote-aware insert_text. Three cases:
+    //   * cursor inside a string_literal (`->emit('|')`) — the quotes
+    //     are already there, emit bare name.
+    //   * cursor at fat-comma LHS autoquote position (`->emit(|=>...)`)
+    //     — no quotes needed, Perl auto-quotes barewords on fat-comma
+    //     LHS. (Dispatch shouldn't normally fire here, but defensive.)
+    //   * anywhere else — emit with surrounding quotes so one accept
+    //     keystroke produces `'name'` in bare parens.
+    // Implemented as a closure so the branching stays adjacent to the
+    // decision and every emitted candidate is consistent.
+    let needs_quotes = !cursor_in_string_or_autoquote(tree, point);
 
     // Accumulate (handler_name → display_params + provenance) so stacked
     // registrations across files appear once in the completion list.
@@ -702,9 +797,14 @@ fn dispatch_target_completions(
             // `fa_completion_kind` — consistent with outline and hover.
             kind: FaSymKind::Handler,
             detail: Some(detail),
-            // The string arg users type needs quotes — insert them so
-            // `$self->emit(^)` → `$self->emit('connect')` in one keystroke.
-            insert_text: Some(format!("'{}'", name)),
+            // Bare inside quotes / autoquote, quoted otherwise — see
+            // `needs_quotes` above. Accepting the suggestion lands
+            // correct source text regardless of where the cursor was.
+            insert_text: Some(if needs_quotes {
+                format!("'{}'", name)
+            } else {
+                name.clone()
+            }),
             // Top of the list: handlers are the canonical completion in
             // this position when a dispatcher is declared for them.
             sort_priority: 0,
@@ -2460,6 +2560,94 @@ sub fire {
         assert!(connect.sort_text.as_deref().unwrap_or("zzz").starts_with("00"),
             "handler sort should be first: {:?}", connect.sort_text);
         assert!(disconnect.sort_text.as_deref().unwrap_or("zzz").starts_with("00"));
+    }
+
+    /// Bug: dispatch-target completion always wrapped the label in
+    /// quotes — so if the cursor was already inside `''`, accepting
+    /// `connect` inserted `''connect''`. Now detects the string
+    /// context via the tree and emits bare text.
+    #[test]
+    fn completion_dispatch_inside_quotes_does_not_double_quote() {
+        let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my $self = shift;
+    $self->on('connect', sub { my ($s) = @_; });
+}
+
+sub fire {
+    my $self = shift;
+    $self->emit('');
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        // Cursor BETWEEN the two quotes in `->emit('')`.
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("->emit('')"))
+            .unwrap();
+        let col = line.find("('").unwrap() + 2;
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+        let connect = items.iter().find(|i| i.label == "connect")
+            .expect("connect handler offered inside '|'");
+        assert_eq!(connect.insert_text.as_deref(), Some("connect"),
+            "cursor is inside quotes; insert_text must NOT wrap with more quotes");
+    }
+
+    /// Bug: typing `,` inside a known dispatch call (`->emit('x', |)`)
+    /// triggered completion which ran the global sub/module firehose —
+    /// useless here. Now suppresses imported/unimported function
+    /// completions when we're inside a known dispatcher call; sig
+    /// help remains the right affordance for guiding arg shape.
+    #[test]
+    fn completion_after_comma_in_dispatch_call_suppresses_firehose() {
+        let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire_one {}
+sub wire_two {}
+sub completely_unrelated {}
+
+sub wire {
+    my $self = shift;
+    $self->on('connect', sub { my ($s, $sock) = @_; });
+}
+
+sub fire {
+    my $self = shift;
+    $self->emit('connect', );
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("->emit('connect',"))
+            .unwrap();
+        let col = line.find(", )").unwrap() + 2;
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        assert!(!labels.contains(&"completely_unrelated"),
+            "unrelated sub must not appear in dispatch arg completion: {:?}",
+            labels);
+        assert!(!labels.contains(&"wire_one"),
+            "wire_one leak — dispatch arg completion should stay quiet: {:?}",
+            labels);
     }
 
     /// Mid-string completion for route targets. Cursor inside
