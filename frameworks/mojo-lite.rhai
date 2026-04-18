@@ -64,6 +64,8 @@ fn on_function_call(ctx) {
         params = args[1].sub_params;
     }
 
+    // Lite routes display as Methods too — same reasoning as
+    // mojo-routes: routes dispatch handlers, they aren't events.
     out += #{
         Handler: #{
             name: path,
@@ -72,6 +74,7 @@ fn on_function_call(ctx) {
             params: params,
             span: args[0].span,
             selection_span: args[0].span,
+            display: "Method",
         }
     };
 

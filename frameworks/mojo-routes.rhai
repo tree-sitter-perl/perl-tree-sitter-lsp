@@ -66,6 +66,10 @@ fn route_emissions(controller, action, span, current_package) {
 
     // (b) route-as-thing Handler, owned by the declaring package
     let owner_class = if current_package == () { "main" } else { current_package };
+    // Routes display as Methods in the outline — they dispatch to a
+    // controller action (a real method elsewhere). Event would be
+    // misleading; these aren't things you react to, they're things
+    // you *invoke* indirectly.
     items += #{
         Handler: #{
             name: controller + "#" + action,
@@ -74,6 +78,7 @@ fn route_emissions(controller, action, span, current_package) {
             params: [],
             span: span,
             selection_span: span,
+            display: "Method",
         }
     };
 

@@ -475,6 +475,21 @@ pub fn index_workspace(
     root: &std::path::Path,
     files: &crate::file_store::FileStore,
 ) -> usize {
+    index_workspace_with_index(root, files, None)
+}
+
+/// Variant that also registers each indexed file in the given
+/// `ModuleIndex` under its primary package name. Used so workspace
+/// modules participate in cross-file lookups (method resolution,
+/// Handler walks, etc.) without waiting for an on-demand `use`
+/// resolve. Without this, `->to('Users#list')` couldn't find
+/// `test_files/lib/Users.pm` because nothing ever triggers a
+/// module_index populate for workspace files.
+pub fn index_workspace_with_index(
+    root: &std::path::Path,
+    files: &crate::file_store::FileStore,
+    module_index: Option<&crate::module_index::ModuleIndex>,
+) -> usize {
     use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
     use rayon::prelude::*;
@@ -508,7 +523,11 @@ pub fn index_workspace(
 
         match result {
             Ok(Some(analysis)) => {
-                files.insert_workspace(path.clone(), analysis);
+                let arc = std::sync::Arc::new(analysis);
+                files.insert_workspace_arc(path.clone(), arc.clone());
+                if let Some(idx) = module_index {
+                    idx.register_workspace_module(path.clone(), arc);
+                }
                 count.fetch_add(1, Ordering::Relaxed);
             }
             Ok(None) => { /* parse failed, skip */ }

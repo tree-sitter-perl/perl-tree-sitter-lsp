@@ -234,10 +234,20 @@ pub enum SymbolDetail {
     /// Mojo events, `["forward"]` for Catalyst actions. `params` is the
     /// handler's sub signature, consumed by signature help at call
     /// sites and by hover to describe the handler shape.
+    ///
+    /// `display` is the plugin's choice of LSP kind for outline,
+    /// completion icon, and workspace-symbol presentation. Handlers
+    /// share internal machinery (refs_by_target, stacking semantics,
+    /// cross-file resolution) but aren't all "events" — Mojo events
+    /// are, but routes are methods, config keys are fields, etc.
+    /// The plugin says what the user sees; the abstraction stays one
+    /// thing internally.
     Handler {
         owner: HandlerOwner,
         dispatchers: Vec<String>,
         params: Vec<ParamInfo>,
+        #[serde(default)]
+        display: HandlerDisplay,
     },
     /// Package, Module, or other kinds needing no extra data.
     None,
@@ -411,6 +421,30 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
 
 // ---- Handler owner ----
 
+/// Plugin-chosen LSP display kind for a `Handler`. Handlers all share
+/// the same internal mechanism (string-dispatched, stacked, cross-file),
+/// but they aren't all the same thing *semantically* — routes are
+/// method-ish, events are event-ish, config keys are field-ish. The
+/// plugin decides what icon the editor shows.
+///
+/// Expand this enum when a plugin has a concept that doesn't fit any
+/// existing variant; every variant maps to a corresponding LSP
+/// `SymbolKind` / `CompletionItemKind` via thin translation in
+/// `symbols.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HandlerDisplay {
+    Event,
+    Method,
+    Function,
+    Field,
+    Property,
+    Constant,
+}
+
+impl Default for HandlerDisplay {
+    fn default() -> Self { Self::Event }
+}
+
 /// Owner of a `Handler` symbol. Distinct from `HashKeyOwner` because
 /// hash keys and dispatch handlers are different concepts even though
 /// both happen to be keyed by a name under a class. Keeping them split
@@ -486,6 +520,11 @@ pub struct OutlineSymbol {
     pub span: Span,
     pub selection_span: Span,
     pub children: Vec<OutlineSymbol>,
+    /// For `Handler` symbols, the plugin-chosen LSP display kind.
+    /// Carried here so the outline→DocumentSymbol conversion doesn't
+    /// need to re-resolve the SymbolDetail. `None` for non-Handler
+    /// kinds (they use the fixed SymKind → LSP mapping).
+    pub handler_display: Option<HandlerDisplay>,
 }
 
 // ---- Semantic tokens ----
@@ -2651,6 +2690,11 @@ impl FileAnalysis {
                 }
             };
 
+            let handler_display = if let SymbolDetail::Handler { display, .. } = &sym.detail {
+                Some(*display)
+            } else {
+                None
+            };
             result.push(OutlineSymbol {
                 name,
                 detail,
@@ -2658,6 +2702,7 @@ impl FileAnalysis {
                 span: sym.span,
                 selection_span: sym.selection_span,
                 children,
+                handler_display,
             });
         }
 

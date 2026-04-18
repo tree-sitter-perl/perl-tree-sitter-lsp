@@ -275,6 +275,7 @@ impl LanguageServer for Backend {
         // Spawn workspace indexing in background with progress reporting
         let files = Arc::clone(&self.files);
         let client = self.client.clone();
+        let module_index = Arc::clone(&self.module_index);
         let root = self.module_index.workspace_root();
         tokio::task::spawn_blocking(move || {
             if let Some(root_uri) = root {
@@ -301,7 +302,11 @@ impl LanguageServer for Backend {
                         },
                     ));
 
-                    let count = crate::module_resolver::index_workspace(&root_path, &files);
+                    let count = crate::module_resolver::index_workspace_with_index(
+                        &root_path,
+                        &files,
+                        Some(&module_index),
+                    );
 
                     // End progress
                     rt.block_on(client.send_notification::<notification::Progress>(

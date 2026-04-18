@@ -494,6 +494,34 @@ impl ModuleIndex {
         self.cache.insert(module_name.to_string(), cached);
     }
 
+    /// Register a workspace-indexed file under its primary package name
+    /// so cross-file resolution (method lookup, Handler walks) can find
+    /// it without first requiring an `@INC` resolve. Workspace files
+    /// otherwise live only in `FileStore` — this bridges them into the
+    /// ModuleIndex so queries that key on package name work uniformly
+    /// whether the target came from `use` or from the project tree.
+    ///
+    /// No-op for files without a `package` declaration (top-level scripts).
+    pub fn register_workspace_module(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
+        let Some(module_name) = first_package_name(&analysis) else { return };
+        let cached = Arc::new(CachedModule::new(path, analysis.clone()));
+        // Reverse index: every module-visible named symbol contributes
+        // so name-keyed queries find this workspace module too.
+        for sym in &analysis.symbols {
+            if matches!(
+                sym.kind,
+                SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class
+                    | SymKind::Module | SymKind::HashKeyDef | SymKind::Handler,
+            ) {
+                self.reverse_index
+                    .entry(sym.name.clone())
+                    .or_default()
+                    .push(module_name.clone());
+            }
+        }
+        self.cache.insert(module_name, Some(cached));
+    }
+
     /// Block until `module_name` appears in the cache, or timeout.
     #[cfg(test)]
     pub fn wait_resolved(&self, module_name: &str, timeout: std::time::Duration) -> bool {
@@ -545,6 +573,20 @@ impl ModuleIndex {
 /// Return the parents of the primary package of a module, preferring the
 /// package with the same name as `module_name` and falling back to the
 /// single-package case if only one package exists in the file.
+/// First `package X;` declaration in a FileAnalysis. Used to decide
+/// under what name a workspace file should be registered in the
+/// module index so cross-file method resolution (which keys on
+/// package name, e.g. "Users" for `->to('Users#list')`) can find it.
+/// Returns `None` for scripts with no explicit package declaration.
+pub fn first_package_name(analysis: &FileAnalysis) -> Option<String> {
+    for sym in &analysis.symbols {
+        if matches!(sym.kind, SymKind::Package | SymKind::Class) {
+            return Some(sym.name.clone());
+        }
+    }
+    None
+}
+
 pub fn primary_package_parents(analysis: &FileAnalysis, module_name: &str) -> Vec<String> {
     if let Some(parents) = analysis.package_parents.get(module_name) {
         return parents.clone();

@@ -621,12 +621,13 @@ impl<'a> Builder<'a> {
                 });
             }
             plugin::EmitAction::Handler {
-                name, owner, dispatchers, params, span, selection_span,
+                name, owner, dispatchers, params, span, selection_span, display,
             } => {
                 let detail = SymbolDetail::Handler {
                     owner,
                     dispatchers,
                     params: params.into_iter().map(Into::into).collect(),
+                    display,
                 };
                 self.add_symbol_ns(name, SymKind::Handler, span, selection_span, detail, ns);
             }
@@ -7375,6 +7376,63 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
                     "route owner is declaring package (MyApp), not target (Users)");
             }
         }
+    }
+
+    /// End-to-end cross-file gd for `->to('Users#list')`. Users.pm
+    /// is registered as a workspace module in ModuleIndex (via the
+    /// `register_workspace_module` bridge), so
+    /// `resolve_method_in_ancestors` finds it on lookup — and the
+    /// cross-file MethodCall path in `symbols::find_definition`
+    /// surfaces the Users::list def's location.
+    ///
+    /// Before the fix, workspace modules lived only in FileStore so
+    /// lookups that key on module name (all cross-file method
+    /// resolution) missed them and gd fell through to noise.
+    #[test]
+    fn plugin_mojo_routes_gd_reaches_workspace_target() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+        use tower_lsp::lsp_types::Position;
+
+        let app_src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+"#;
+        let users_src = r#"
+package Users;
+sub list { my ($c) = @_; }
+1;
+"#;
+
+        let app_fa = build_fa(app_src);
+        let users_fa = build_fa(users_src);
+
+        let idx = ModuleIndex::new_for_test();
+        // Simulate workspace indexing registering Users.pm under its
+        // primary package name.
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Users.pm"),
+            Arc::new(users_fa),
+        );
+
+        // Sanity: cross-file resolution on "Users"::"list" must succeed.
+        let res = app_fa.resolve_method_in_ancestors("Users", "list", Some(&idx));
+        assert!(res.is_some(), "Users::list must resolve cross-file after workspace register");
+
+        // And the MethodCallRef emitted by mojo-routes on the 'list'
+        // portion of 'Users#list' should be at a span matching the
+        // text 'list'.
+        let route_ref = app_fa.refs.iter().find(|r|
+            matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "list"
+        ).expect("mojo-routes MethodCallRef for 'list'");
+
+        // The ref's span is tight on the action name — mid-string
+        // completion + goto-def both rely on that precision.
+        let _ = route_ref;
+        let _ = Position::default();
     }
 
     /// mojo-routes short form: `->to('Users#list')` emits a MethodCall

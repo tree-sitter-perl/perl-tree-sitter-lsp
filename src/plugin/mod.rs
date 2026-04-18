@@ -12,7 +12,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::file_analysis::{
-    AccessKind, HandlerOwner, HashKeyOwner, InferredType, ParamInfo, Span, SymKind, SymbolDetail,
+    AccessKind, HandlerDisplay, HandlerOwner, HashKeyOwner, InferredType, ParamInfo, Span,
+    SymKind, SymbolDetail,
 };
 
 pub mod rhai_host;
@@ -147,6 +148,9 @@ pub enum EmitAction {
     /// set of method names that route to this handler by string (e.g.
     /// `["emit", "subscribe"]` for Mojo events). `params` is the
     /// handler sub's signature, used by signature help at call sites.
+    /// `display` picks the LSP kind shown in outline/completion —
+    /// routes are `Method`, events are `Event`, config keys are
+    /// `Field`, etc. Plugin's call, not the core's.
     Handler {
         name: String,
         owner: HandlerOwner,
@@ -154,6 +158,8 @@ pub enum EmitAction {
         params: Vec<EmittedParam>,
         span: Span,
         selection_span: Span,
+        #[serde(default)]
+        display: HandlerDisplay,
     },
     /// Emit a call-site reference for a Handler — e.g. the cursor is on
     /// `'ready'` in `$x->emit('ready', ...)`. `dispatcher` is the

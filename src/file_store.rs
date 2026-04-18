@@ -121,10 +121,17 @@ impl FileStore {
     /// Insert or replace a workspace entry, unless the same path is currently
     /// open (in which case the open entry is canonical).
     pub fn insert_workspace(&self, path: PathBuf, analysis: FileAnalysis) {
-        // If any open URL already points at this path, skip — the open entry wins.
+        self.insert_workspace_arc(path, Arc::new(analysis));
+    }
+
+    /// Pre-Arc'd variant — lets callers share the same analysis with
+    /// other systems (e.g. registering the same module into
+    /// ModuleIndex under its primary package name) without cloning
+    /// the FileAnalysis twice at workspace-index startup.
+    pub fn insert_workspace_arc(&self, path: PathBuf, analysis: Arc<FileAnalysis>) {
         let shadowed = self.url_to_path.iter().any(|e| e.value() == &path);
         if !shadowed {
-            self.workspace.insert(path, Arc::new(analysis));
+            self.workspace.insert(path, analysis);
         }
     }
 

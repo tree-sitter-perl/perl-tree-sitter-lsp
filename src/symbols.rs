@@ -43,20 +43,54 @@ fn fa_sym_kind_to_lsp(kind: &FaSymKind) -> SymbolKind {
         FaSymKind::Class => SymbolKind::CLASS,
         FaSymKind::Module => SymbolKind::MODULE,
         FaSymKind::HashKeyDef => SymbolKind::KEY,
-        // Handler is string-dispatched (not a real Perl method); EVENT
-        // is the closest LSP kind — it's a named thing you react to
-        // by firing, like keyboard/IO events in other languages.
+        // Handler's actual LSP kind depends on the plugin's
+        // `display` choice — this fallback only fires for paths
+        // that don't carry detail, which is rare. Event is the
+        // conservative default.
         FaSymKind::Handler => SymbolKind::EVENT,
+    }
+}
+
+/// Plugin-chosen Handler display → LSP SymbolKind. Called from the
+/// outline path where OutlineSymbol carries `handler_display`.
+fn handler_display_to_symbol_kind(d: &crate::file_analysis::HandlerDisplay) -> SymbolKind {
+    use crate::file_analysis::HandlerDisplay as H;
+    match d {
+        H::Event => SymbolKind::EVENT,
+        H::Method => SymbolKind::METHOD,
+        H::Function => SymbolKind::FUNCTION,
+        H::Field => SymbolKind::FIELD,
+        H::Property => SymbolKind::PROPERTY,
+        H::Constant => SymbolKind::CONSTANT,
+    }
+}
+
+fn handler_display_to_completion_kind(d: &crate::file_analysis::HandlerDisplay) -> CompletionItemKind {
+    use crate::file_analysis::HandlerDisplay as H;
+    match d {
+        H::Event => CompletionItemKind::EVENT,
+        H::Method => CompletionItemKind::METHOD,
+        H::Function => CompletionItemKind::FUNCTION,
+        H::Field => CompletionItemKind::FIELD,
+        H::Property => CompletionItemKind::PROPERTY,
+        H::Constant => CompletionItemKind::CONSTANT,
     }
 }
 
 #[allow(deprecated)]
 fn outline_to_document_symbol(s: &OutlineSymbol) -> DocumentSymbol {
     let children: Vec<DocumentSymbol> = s.children.iter().map(outline_to_document_symbol).collect();
+    // Handler's LSP kind comes from the plugin's chosen display. Falls
+    // back to Event only if the outline wasn't populated with a
+    // display (older analyses or non-Handler kinds).
+    let kind = match s.handler_display {
+        Some(ref d) => handler_display_to_symbol_kind(d),
+        None => fa_sym_kind_to_lsp(&s.kind),
+    };
     DocumentSymbol {
         name: s.name.clone(),
         detail: s.detail.clone(),
-        kind: fa_sym_kind_to_lsp(&s.kind),
+        kind,
         tags: None,
         deprecated: None,
         range: span_to_range(s.span),
@@ -824,7 +858,7 @@ fn dispatch_target_completions(
         std::collections::BTreeMap::new();
 
     let mut consider = |sym: &crate::file_analysis::Symbol, file_tag: &str| {
-        let SymbolDetail::Handler { owner, dispatchers, params } = &sym.detail else { return };
+        let SymbolDetail::Handler { owner, dispatchers, params, .. } = &sym.detail else { return };
         let HandlerOwner::Class(n) = owner;
         if n != &class { return; }
         if !dispatchers.is_empty() && !dispatchers.iter().any(|d| d == method_name) {
@@ -1017,7 +1051,7 @@ fn string_dispatch_signature_for(
     let push_sig = |signatures: &mut Vec<SignatureInformation>,
                     sym: &crate::file_analysis::Symbol,
                     provenance: Option<&str>| {
-        let SymbolDetail::Handler { owner, dispatchers, params } = &sym.detail else { return };
+        let SymbolDetail::Handler { owner, dispatchers, params, .. } = &sym.detail else { return };
         let HandlerOwner::Class(n) = owner;
         if n != class { return; }
         let dispatcher_ok = dispatchers.is_empty()
