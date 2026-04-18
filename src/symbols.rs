@@ -312,12 +312,36 @@ fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
                 .collect(),
         )
     };
+    // `filter_text` is what LSP clients match the typed prefix against
+    // when narrowing the completion list client-side. By default it's
+    // the label. But when `insert_text` differs (e.g. dispatch-target
+    // candidates insert `'connect'` while the label is just `connect`),
+    // some clients fall back to `insert_text` for filtering — then
+    // typing `c` after `(` stops matching because insert_text starts
+    // with `'`. Set filter_text explicitly to the bare label so
+    // client-side filtering keys on the name regardless.
+    let filter_text = Some(c.label.clone());
+
+    // Sort text places dispatch handlers ABOVE anything
+    // complete_general can produce. Both default to sort_priority 0;
+    // tied at "000" they interleave alphabetically (connect, fire,
+    // message, wire) which makes handlers look like they're mixed
+    // into noise. Prefixing with a space character ensures the
+    // handler group sorts first as a block — space (0x20) < digit
+    // (0x30) lexicographically. Non-handlers keep the existing
+    // priority-based ordering.
+    let sort_text = if matches!(c.kind, FaSymKind::Handler) {
+        Some(format!(" {:03}{}", c.sort_priority, c.label))
+    } else {
+        Some(format!("{:03}", c.sort_priority))
+    };
     CompletionItem {
         label: c.label,
         kind: Some(fa_completion_kind(&c.kind)),
         detail: c.detail,
         insert_text: c.insert_text,
-        sort_text: Some(format!("{:03}", c.sort_priority)),
+        filter_text,
+        sort_text,
         additional_text_edits,
         ..Default::default()
     }
@@ -2637,9 +2661,52 @@ sub fire {
             "detail should expose handler params: {:?}", connect.detail);
 
         // Sort text puts handlers ahead of other general completions.
-        assert!(connect.sort_text.as_deref().unwrap_or("zzz").starts_with("00"),
-            "handler sort should be first: {:?}", connect.sort_text);
-        assert!(disconnect.sort_text.as_deref().unwrap_or("zzz").starts_with("00"));
+        // Space prefix sorts lex-before any digit-prefixed sort_text,
+        // guaranteeing handlers as a top block even when surrounding
+        // items (local subs at PRIORITY_LOCAL=0) tie on numeric priority.
+        assert!(connect.sort_text.as_deref().unwrap_or("zzz").starts_with(' '),
+            "handler sort should lead with space to outrank digit-prefixed sort_text: {:?}",
+            connect.sort_text);
+        assert!(disconnect.sort_text.as_deref().unwrap_or("zzz").starts_with(' '));
+    }
+
+    /// Bug B: dispatch-target items set their `insert_text` to
+    /// `'name'` (quoted) but left `filter_text` unset — some LSP
+    /// clients fall back to `insert_text` for client-side prefix
+    /// matching, so typing `c` after `(` fails to match `'connect'`
+    /// (prefix starts with `'`, not `c`). `filter_text` now pins
+    /// client-side matching to the bare label regardless of insert
+    /// shape; typing a character keeps the handler visible.
+    #[test]
+    fn completion_dispatch_filter_text_matches_bare_name() {
+        let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+sub wire { my $self = shift; $self->on('connect', sub {}); }
+sub fire { my $self = shift; $self->emit(); }
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+        let idx = ModuleIndex::new_for_test();
+
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("->emit()"))
+            .unwrap();
+        let col = line.find("emit(").unwrap() + "emit(".len();
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+        let connect = items.iter().find(|i| i.label == "connect")
+            .expect("connect handler offered");
+
+        // filter_text is the bare name — the client can prefix-match on
+        // `c`/`co`/`con`/... even though insert_text is `'connect'`.
+        assert_eq!(connect.filter_text.as_deref(), Some("connect"),
+            "filter_text must be the bare label, not the quoted insert_text");
+        assert_eq!(connect.insert_text.as_deref(), Some("'connect'"),
+            "insert_text still quotes for the bare-parens case");
     }
 
     /// Bug: dispatch-target completion always wrapped the label in
