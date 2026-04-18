@@ -180,6 +180,41 @@ pub fn find_definition(
             }
         }
 
+        // Cross-file DispatchCall goto-def: a `$consumer->emit('ready', ...)`
+        // in one file should jump to `$producer->on('ready', sub)` in
+        // another. `find_definition` above only walks the current file's
+        // symbols; for DispatchCall we enumerate every cached module
+        // looking for Handlers matching (owner, name). Multiple stacked
+        // registrations → return all as an Array so the editor can show
+        // the picker.
+        if let RefKind::DispatchCall { owner: Some(owner), .. } = &r.kind {
+            use crate::file_analysis::SymbolDetail;
+            let mut locs: Vec<Location> = Vec::new();
+            for module_name in module_index.modules_with_symbol(&r.target_name) {
+                let Some(cached) = module_index.get_cached(&module_name) else { continue };
+                for sym in &cached.analysis.symbols {
+                    if sym.name != r.target_name { continue; }
+                    if let SymbolDetail::Handler { owner: o, .. } = &sym.detail {
+                        if o == owner {
+                            if let Ok(module_uri) = Url::from_file_path(&cached.path) {
+                                locs.push(Location {
+                                    uri: module_uri,
+                                    range: span_to_range(sym.selection_span),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if !locs.is_empty() {
+                return Some(if locs.len() == 1 {
+                    GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap())
+                } else {
+                    GotoDefinitionResponse::Array(locs)
+                });
+            }
+        }
+
         // Cross-file method goto-def: resolve inherited methods through module index
         if let RefKind::MethodCall { ref invocant, ref invocant_span, .. } = r.kind {
             use crate::file_analysis::MethodResolution;
@@ -690,6 +725,11 @@ fn class_has_dispatch_handlers(
         dispatchers.is_empty() || dispatchers.iter().any(|d| d == dispatcher)
     };
     if analysis.symbols.iter().any(&matches) { return true; }
+    // Workspace-wide scan: same tradeoff as dispatch completion —
+    // class-wide "any handler exists?" isn't name-keyed, so the
+    // reverse index doesn't speed this up. Short-circuits on first
+    // hit, so average cost is tiny when handlers exist and only
+    // pays full walk when nothing matches.
     let mut found = false;
     module_index.for_each_cached(|_, cached| {
         if found { return; }
@@ -779,6 +819,13 @@ fn dispatch_target_completions(
     for sym in &analysis.symbols {
         consider(sym, "this file");
     }
+    // Dispatch completion: offer handlers from any module on the
+    // receiver's class. The reverse index only speeds up by-NAME
+    // lookups; we want every handler on this class, across all names.
+    // Names vary per handler, so we can't pre-filter — but this is
+    // still O(workspace) by design (completion intentionally surfaces
+    // everything available). Acceptable because completion UI shows
+    // a small subset anyway; the full list is rarely large per class.
     module_index.for_each_cached(|module_name, cached| {
         for sym in &cached.analysis.symbols {
             consider(sym, module_name);
@@ -925,25 +972,33 @@ fn span_contains_span(outer: &crate::file_analysis::Span, inner: &crate::file_an
     o_start <= i_start && i_end <= o_end
 }
 
-/// Build sig help for a known (class, dispatcher, handler_name) — the
-/// ref-driven path feeds this directly; the text path derives the same
-/// tuple and calls in too. One place to format stacked handler sigs.
+/// Build sig help for a known (class, dispatcher, handler_name). Walks
+/// the current file's symbols AND every cached module — otherwise a
+/// consumer file that emits against a producer-defined handler gets no
+/// sig help, even though hover already walks cross-file (the two must
+/// agree — same abstraction, same reach).
 fn string_dispatch_signature_for(
     analysis: &FileAnalysis,
+    module_index: Option<&ModuleIndex>,
     class: &str,
     dispatcher: &str,
     handler_name: &str,
     active_param: usize,
 ) -> Option<SignatureHelp> {
     let mut signatures: Vec<SignatureInformation> = Vec::new();
-    for sym in &analysis.symbols {
-        if sym.name != handler_name { continue; }
-        let SymbolDetail::Handler { owner, dispatchers, params } = &sym.detail else { continue };
+
+    // Shared builder — used both for in-file and cross-file symbol walks
+    // so a handler's sig is formatted identically regardless of where
+    // it lives.
+    let push_sig = |signatures: &mut Vec<SignatureInformation>,
+                    sym: &crate::file_analysis::Symbol,
+                    provenance: Option<&str>| {
+        let SymbolDetail::Handler { owner, dispatchers, params } = &sym.detail else { return };
         let HandlerOwner::Class(n) = owner;
-        if n != class { continue; }
+        if n != class { return; }
         let dispatcher_ok = dispatchers.is_empty()
             || dispatchers.iter().any(|d| d == dispatcher);
-        if !dispatcher_ok || params.is_empty() { continue; }
+        if !dispatcher_ok || params.is_empty() { return; }
 
         let display: Vec<&ParamInfo> = params
             .iter()
@@ -964,16 +1019,38 @@ fn string_dispatch_signature_for(
                 documentation: None,
             })
             .collect();
-        signatures.push(SignatureInformation {
-            label: format!("{}('{}', {})", dispatcher, handler_name, labels.join(", ")),
-            documentation: Some(Documentation::String(format!(
+        let doc = match provenance {
+            Some(p) => format!(
+                "{} handler on `{}`, registered at {} line {}",
+                handler_name, class, p, sym.selection_span.start.row + 1,
+            ),
+            None => format!(
                 "{} handler on `{}`, registered at line {}",
                 handler_name, class, sym.selection_span.start.row + 1,
-            ))),
+            ),
+        };
+        signatures.push(SignatureInformation {
+            label: format!("{}('{}', {})", dispatcher, handler_name, labels.join(", ")),
+            documentation: Some(Documentation::String(doc)),
             parameters: Some(parameters),
             active_parameter: None,
         });
+    };
+
+    for sym in &analysis.symbols {
+        if sym.name != handler_name { continue; }
+        push_sig(&mut signatures, sym, None);
     }
+    if let Some(idx) = module_index {
+        for module_name in idx.modules_with_symbol(handler_name) {
+            let Some(cached) = idx.get_cached(&module_name) else { continue };
+            for sym in &cached.analysis.symbols {
+                if sym.name != handler_name { continue; }
+                push_sig(&mut signatures, sym, Some(module_name.as_str()));
+            }
+        }
+    }
+
     if signatures.is_empty() { return None; }
     Some(SignatureHelp {
         signatures,
@@ -1016,6 +1093,7 @@ fn resolve_invocant_class(
 /// no DispatchCall ref exists yet.
 fn string_dispatch_signature(
     analysis: &FileAnalysis,
+    module_index: Option<&ModuleIndex>,
     invocant: Option<&str>,
     dispatcher: &str,
     handler_name: &str,
@@ -1023,7 +1101,7 @@ fn string_dispatch_signature(
     point: Point,
 ) -> Option<SignatureHelp> {
     let class = resolve_invocant_class(analysis, invocant, point)?;
-    string_dispatch_signature_for(analysis, &class, dispatcher, handler_name, active_param)
+    string_dispatch_signature_for(analysis, module_index, &class, dispatcher, handler_name, active_param)
 }
 
 pub fn signature_help(
@@ -1057,6 +1135,7 @@ pub fn signature_help(
         {
             if let Some(sig) = string_dispatch_signature_for(
                 analysis,
+                Some(module_index),
                 &owner_class,
                 &dispatcher,
                 &handler_name,
@@ -1073,6 +1152,7 @@ pub fn signature_help(
         if let Some(ref name) = call_ctx.first_arg_string {
             if let Some(sig) = string_dispatch_signature(
                 analysis,
+                Some(module_index),
                 call_ctx.invocant.as_deref(),
                 &call_ctx.name,
                 name,

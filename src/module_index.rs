@@ -191,7 +191,19 @@ pub(crate) struct WorkspaceRootChannel {
 #[allow(dead_code)]
 pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
-    /// Reverse index: function name → list of module names that export it.
+    /// Reverse symbol index: name → list of module names whose
+    /// `FileAnalysis` contains at least one symbol with that name
+    /// (of any module-visible kind — Sub, Method, Package, Class,
+    /// Module, HashKeyDef, Handler). Populated at resolve + cache-
+    /// warm time. Queries that want narrower semantics (only exports,
+    /// only Handlers on a given class, only methods of a given kind,
+    /// etc.) filter the result themselves via per-module inspection.
+    ///
+    /// This is the single generic "find me modules with symbol X"
+    /// primitive — hover, signature help, goto-def, auto-import, and
+    /// the unimported-completion path all route through it instead
+    /// of reinventing per-feature cache walks. Different features
+    /// apply their own override / stacking rules on top.
     reverse_index: Arc<DashMap<String, Vec<String>>>,
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
@@ -359,17 +371,39 @@ impl ModuleIndex {
         None
     }
 
-    /// Find all cached modules that export the given function name.
-    /// Uses the reverse index — O(1) lookup instead of scanning all modules.
+    /// Find all cached modules that *export* the given function name.
+    /// Starts from the generic symbol index, then filters to modules
+    /// whose `export` / `export_ok` list actually contains the name —
+    /// the reverse_index covers every named symbol, not just exports.
     pub fn find_exporters(&self, func_name: &str) -> Vec<String> {
-        match self.reverse_index.get(func_name) {
+        let mut result: Vec<String> = self.modules_with_symbol(func_name)
+            .into_iter()
+            .filter(|m| {
+                self.get_cached(m)
+                    .map(|c| c.analysis.export.iter().any(|e| e == func_name)
+                        || c.analysis.export_ok.iter().any(|e| e == func_name))
+                    .unwrap_or(false)
+            })
+            .collect();
+        result.sort();
+        result.dedup();
+        result
+    }
+
+    /// Generic "find modules with a symbol named N" primitive —
+    /// O(1) hash + O(matches) scan, replaces every `for_each_cached`
+    /// pattern where the predicate is name-based. Callers apply their
+    /// own kind/detail filter + override/stacking semantics after
+    /// picking which specific symbols matter to them.
+    pub fn modules_with_symbol(&self, name: &str) -> Vec<String> {
+        match self.reverse_index.get(name) {
             Some(modules) => {
                 let mut result = modules.clone();
                 result.sort();
                 result.dedup();
                 result
             }
-            None => vec![],
+            None => Vec::new(),
         }
     }
 

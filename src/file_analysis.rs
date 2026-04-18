@@ -2368,10 +2368,13 @@ impl FileAnalysis {
             })
             .collect();
 
-        // Cross-file walk: every cached module in the workspace gets
-        // scanned for Handler symbols with the same (owner, name).
+        // Cross-file walk — now O(matches) instead of O(workspace)
+        // via the name-based reverse index on ModuleIndex. Only modules
+        // that have a symbol with this name are visited; most of the
+        // workspace is skipped without any per-module inspection.
         if let Some(idx) = module_index {
-            idx.for_each_cached(|_, cached| {
+            for module_name in idx.modules_with_symbol(name) {
+                let Some(cached) = idx.get_cached(&module_name) else { continue };
                 for sym in &cached.analysis.symbols {
                     if sym.name != name { continue; }
                     if let SymbolDetail::Handler { owner: o, params, .. } = &sym.detail {
@@ -2383,7 +2386,7 @@ impl FileAnalysis {
                         }
                     }
                 }
-            });
+            }
         }
         registrations.sort();
         registrations.dedup();
@@ -2411,14 +2414,15 @@ impl FileAnalysis {
         // dispatcher list to the consumer.
         if dispatchers.is_empty() {
             if let Some(idx) = module_index {
-                idx.for_each_cached(|_, cached| {
+                for module_name in idx.modules_with_symbol(name) {
+                    let Some(cached) = idx.get_cached(&module_name) else { continue };
                     for sym in &cached.analysis.symbols {
                         if sym.name != name { continue; }
                         if let SymbolDetail::Handler { owner: o, dispatchers: ds, .. } = &sym.detail {
                             if o == owner { dispatchers.extend(ds.clone()); }
                         }
                     }
-                });
+                }
             }
         }
         dispatchers.sort();

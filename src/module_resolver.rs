@@ -315,6 +315,25 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
     guard.clone().flatten()
 }
 
+/// Names of every module-visible symbol in the analysis. Variables and
+/// fields are skipped — they're file-local and can't be queried across
+/// files. Deduplicated via a set first so a module with 10 subs named
+/// `foo` (unlikely but possible) contributes one entry, not ten.
+fn indexable_symbol_names(analysis: &crate::file_analysis::FileAnalysis) -> Vec<String> {
+    use crate::file_analysis::SymKind;
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sym in &analysis.symbols {
+        if matches!(
+            sym.kind,
+            SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class
+                | SymKind::Module | SymKind::HashKeyDef | SymKind::Handler,
+        ) {
+            names.insert(sym.name.clone());
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// Insert a resolved module into the cache and update the reverse index.
 fn insert_into_cache(
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
@@ -323,9 +342,9 @@ fn insert_into_cache(
     result: Option<Arc<CachedModule>>,
 ) {
     if let Some(ref cached) = result {
-        for func in cached.analysis.export.iter().chain(cached.analysis.export_ok.iter()) {
+        for name in indexable_symbol_names(&cached.analysis) {
             reverse_index
-                .entry(func.clone())
+                .entry(name)
                 .or_default()
                 .push(module_name.to_string());
         }
@@ -340,9 +359,9 @@ fn rebuild_reverse_index(
 ) {
     for entry in cache.iter() {
         if let Some(ref cached) = *entry.value() {
-            for func in cached.analysis.export.iter().chain(cached.analysis.export_ok.iter()) {
+            for name in indexable_symbol_names(&cached.analysis) {
                 reverse_index
-                    .entry(func.clone())
+                    .entry(name)
                     .or_default()
                     .push(entry.key().clone());
             }
