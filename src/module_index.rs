@@ -516,6 +516,11 @@ impl ModuleIndex {
     /// No-op for files without a `package` declaration (top-level scripts).
     pub fn register_workspace_module(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         let Some(module_name) = first_package_name(&analysis) else { return };
+        // Canonicalize the path — `Url::from_file_path` in symbols.rs
+        // requires absolute paths, so relative workspace paths (e.g.
+        // "./test_files/lib/Users.pm" from CLI `.` root) would silently
+        // fail conversion and break cross-file goto-def.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
         let mut classes_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for sym in &analysis.symbols {

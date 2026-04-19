@@ -372,48 +372,46 @@ fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
     let (source, tree, analysis) = parse_file(file);
     let point = parse_point(line_str, col_str);
 
-    if let Some(span) = analysis.find_definition(point, Some(&tree), Some(source.as_bytes()), None) {
-        println!("{}:{}:{}", file, span.start.row + 1, span.start.column + 1);
-        return;
-    }
+    // Build a real ModuleIndex and register workspace modules the same
+    // way the backend does, so CLI gd goes through the production
+    // cross-file resolution path (Handler/MethodCallRef/DispatchCall/
+    // inheritance walk via class_content_index) instead of the CLI's
+    // old ad-hoc workspace scan. Keeps nvim and CLI results in sync.
+    let idx = module_index::ModuleIndex::new_for_cli();
+    let files = file_store::FileStore::new();
+    let root_path = std::path::PathBuf::from(root);
+    module_resolver::index_workspace_with_index(&root_path, &files, Some(&idx));
 
-    // Cross-file: check if it's a method/package ref that resolves via workspace
-    let ws = index_workspace(root);
+    let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+    let uri = tower_lsp::lsp_types::Url::from_file_path(&abs)
+        .unwrap_or_else(|_| tower_lsp::lsp_types::Url::parse("file:///unknown").unwrap());
+    let pos = tower_lsp::lsp_types::Position {
+        line: point.row as u32,
+        character: point.column as u32,
+    };
 
-    if let Some(r) = analysis.ref_at(point) {
-        match &r.kind {
-            file_analysis::RefKind::FunctionCall | file_analysis::RefKind::MethodCall { .. } => {
-                for entry in ws.workspace_raw().iter() {
-                    for sym in &entry.value().symbols {
-                        if sym.name == r.target_name
-                            && matches!(sym.kind, file_analysis::SymKind::Sub | file_analysis::SymKind::Method)
-                        {
-                            println!("{}:{}:{}", entry.key().display(),
-                                sym.selection_span.start.row + 1,
-                                sym.selection_span.start.column + 1);
-                            return;
-                        }
-                    }
-                }
-            }
-            file_analysis::RefKind::PackageRef => {
-                for entry in ws.workspace_raw().iter() {
-                    for sym in &entry.value().symbols {
-                        if sym.name == r.target_name
-                            && matches!(sym.kind, file_analysis::SymKind::Package | file_analysis::SymKind::Class)
-                        {
-                            println!("{}:{}:{}", entry.key().display(),
-                                sym.selection_span.start.row + 1,
-                                sym.selection_span.start.column + 1);
-                            return;
-                        }
-                    }
-                }
-            }
-            _ => {}
+    if let Some(resp) = symbols::find_definition(&analysis, pos, &uri, &idx, &tree, &source) {
+        use tower_lsp::lsp_types::GotoDefinitionResponse;
+        let first = match resp {
+            GotoDefinitionResponse::Scalar(loc) => Some(loc),
+            GotoDefinitionResponse::Array(v) => v.into_iter().next(),
+            GotoDefinitionResponse::Link(v) => v.into_iter().next().map(|l| tower_lsp::lsp_types::Location {
+                uri: l.target_uri,
+                range: l.target_range,
+            }),
+        };
+        if let Some(loc) = first {
+            let path = loc.uri.to_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| loc.uri.to_string());
+            println!("{}:{}:{}", path,
+                loc.range.start.line + 1,
+                loc.range.start.character + 1);
+            return;
         }
     }
 
+    let _ = files; // suppress unused-variable warnings
     eprintln!("No definition found at {}:{}", line_str, col_str);
     std::process::exit(1);
 }
