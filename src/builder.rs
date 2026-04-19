@@ -7858,4 +7858,164 @@ sub new {
             "untriggered package must not get plugin emissions; got: {:?}",
             plugin_syms.iter().map(|s| &s.name).collect::<Vec<_>>());
     }
+
+    /// Minion plugin: `$minion->add_task(NAME, sub { ... })` emits a
+    /// Handler (owner: Minion) with the task's sub params, typed $job
+    /// in the callback body, and a DispatchCall ref on the name.
+    #[test]
+    fn plugin_minion_add_task_registers_handler() {
+        let src = r#"
+package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject) = @_;
+    $job->finish;
+});
+"#;
+        let fa = build_fa(src);
+
+        let handler = fa.symbols.iter()
+            .find(|s| s.kind == SymKind::Handler
+                && s.name == "send_email"
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "minion"))
+            .expect("add_task must emit a Handler named send_email");
+
+        let SymbolDetail::Handler { ref owner, ref dispatchers, ref params, ref display, .. }
+            = handler.detail else { panic!("handler detail should be Handler") };
+        assert!(matches!(owner, HandlerOwner::Class(c) if c == "Minion"));
+        assert!(dispatchers.iter().any(|d| d == "enqueue"));
+        assert!(matches!(display, HandlerDisplay::Function));
+        // Callback params: $job flagged as invocant, then the rest.
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["$job", "$to", "$subject"]);
+        assert!(params[0].is_invocant, "Minion::Job is the callback's invocant");
+
+        // DispatchCall on the name (registration itself is a reference).
+        let dc = fa.refs.iter()
+            .find(|r| matches!(&r.kind, RefKind::DispatchCall { dispatcher, .. } if dispatcher == "add_task"))
+            .expect("add_task must emit a DispatchCall ref");
+        assert_eq!(dc.target_name, "send_email");
+    }
+
+    /// `$minion->enqueue(NAME, ...)` emits a DispatchCall for the name
+    /// so gd/gr compose against the add_task Handler.
+    #[test]
+    fn plugin_minion_enqueue_emits_dispatch_call() {
+        let src = r#"
+package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job) = @_; });
+$minion->enqueue(send_email => ['alice']);
+$minion->enqueue_p(send_email => ['bob']);
+"#;
+        let fa = build_fa(src);
+
+        let dispatchers: Vec<&str> = fa.refs.iter()
+            .filter_map(|r| match &r.kind {
+                RefKind::DispatchCall { dispatcher, .. }
+                    if r.target_name == "send_email" => Some(dispatcher.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(dispatchers.contains(&"enqueue"),
+            "enqueue('send_email', ...) must emit a DispatchCall; got: {:?}", dispatchers);
+        assert!(dispatchers.contains(&"enqueue_p"),
+            "enqueue_p must emit a DispatchCall too; got: {:?}", dispatchers);
+    }
+
+    /// $job inside an add_task callback is typed as Minion::Job so
+    /// completion on $job-> resolves to Minion::Job methods.
+    #[test]
+    fn plugin_minion_types_job_inside_task_body() {
+        let src = r#"
+package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job) = @_;
+    $job->finish;
+});
+"#;
+        let fa = build_fa(src);
+
+        // `$job` should have a type constraint inside the callback.
+        let tc = fa.type_constraints.iter()
+            .find(|t| t.variable == "$job"
+                && matches!(&t.inferred_type, InferredType::ClassName(c) if c == "Minion::Job"))
+            .expect("$job must be typed Minion::Job inside add_task callback");
+        assert!(!matches!(tc.inferred_type, InferredType::FirstParam { .. }),
+            "type should be plugin-declared ClassName, not builder's FirstParam");
+    }
+
+    /// Minion's `enqueue` options go in a hashref at position 3
+    /// (`enqueue(task, [args], {priority => 10})`). The plugin emits
+    /// HashKeyDefs for the common keys owned by Sub{Minion,enqueue}
+    /// — what's missing is cursor-context routing for "hash literal
+    /// as positional arg" → `HashKey { source_sub: "enqueue" }`.
+    /// Skipped until the core learns that shape; the emission side is
+    /// pinned here so regressing it trips.
+    #[test]
+    fn plugin_minion_enqueue_options_hashkeys_emitted() {
+        let src = r#"
+package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->enqueue(task_x => ['arg'] => { priority => 10 });
+"#;
+        let fa = build_fa(src);
+
+        // Options emitted as HashKeyDef symbols owned by Sub{Minion, enqueue}.
+        let option_names: Vec<&str> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::HashKeyDef
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "minion"))
+            .map(|s| s.name.as_str())
+            .collect();
+        for expected in &["priority", "queue", "delay", "attempts", "notes", "parents", "expire", "lax"] {
+            assert!(option_names.contains(expected),
+                "enqueue option `{}` must be emitted; got: {:?}",
+                expected, option_names);
+        }
+    }
+
+    /// TODO: sig help on the array argument of enqueue
+    /// (`$minion->enqueue('task', [|])`) should show the task's
+    /// params. Minion unpacks the arrayref into the task callback's
+    /// positionals, so the ideal UX offers `$to, $subject, $body`
+    /// when the cursor is inside the `[...]`. Needs core-side
+    /// support for "dispatcher's positional N is the argument list
+    /// in an arrayref". Marked ignored until that lands.
+    #[test]
+    #[ignore = "TODO: sig help on arrayref positional — needs core support"]
+    fn plugin_minion_sig_help_on_enqueue_array_args() {
+        // When this test is un-ignored, it should:
+        //   1. Build a file with add_task + enqueue sites.
+        //   2. Query sig help at a point inside the `[...]` of the
+        //      enqueue call.
+        //   3. Assert the signature lists the task's params ($to, $subject, ...)
+        //      — minus $job, which is invocant-stripped.
+        panic!("not yet implemented — tracking arrayref-positional sig help");
+    }
+
+    /// TODO: hash-key completion on the enqueue options hash
+    /// (`$minion->enqueue('task', [args], { | })`). The HashKeyDefs
+    /// are emitted by the plugin (pinned above), but the cursor-
+    /// context layer doesn't currently recognize a hash literal as
+    /// a positional argument to a method call — so the completion
+    /// list isn't routed to HashKeyOwner::Sub { package: Minion,
+    /// name: enqueue }. Ignored until that routing lands.
+    #[test]
+    #[ignore = "TODO: hash-key routing for positional hashref args — needs core support"]
+    fn plugin_minion_hashkey_help_on_enqueue_options() {
+        // When this test is un-ignored, it should:
+        //   1. Build a file with an enqueue call ending in `{ |`.
+        //   2. Query completion at a point inside the options hash.
+        //   3. Assert `priority`, `queue`, `delay`, etc. appear.
+        panic!("not yet implemented — tracking hashref-positional completion");
+    }
 }
