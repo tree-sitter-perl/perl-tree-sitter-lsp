@@ -277,6 +277,16 @@ impl PluginRegistry {
         self.plugins.is_empty()
     }
 
+    /// Every registered plugin, unfiltered. Used for hooks that
+    /// can't rely on the trigger filter — `on_use` in particular,
+    /// because the `UsesModule(X)` trigger is false UNTIL `use X`
+    /// has been processed, so filtering would prevent the plugin
+    /// from ever hooking the statement that introduces the trigger.
+    /// Plugins that use `on_use` should filter on `ctx.module_name`.
+    pub fn all(&self) -> impl Iterator<Item = &dyn FrameworkPlugin> {
+        self.plugins.iter().map(|p| p.as_ref())
+    }
+
     /// Return plugins whose triggers match the current package context.
     pub fn applicable<'a>(
         &'a self,

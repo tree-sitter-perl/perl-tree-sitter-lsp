@@ -495,6 +495,30 @@ impl<'a> Builder<'a> {
 
     /// Run every applicable plugin's `on_method_call` hook and apply each
     /// returned `EmitAction`.
+    /// Run every applicable plugin's `on_use` hook. Used for
+    /// `use` statements that autoimport a fixed verb set (Mojolicious::Lite,
+    /// Dancer2, etc.) — plugins emit `FrameworkImport` actions per
+    /// imported verb so our unresolved-function diagnostic skips them.
+    ///
+    /// `on_use` bypasses the normal trigger filter: every plugin sees
+    /// every use. The plugin checks the module name itself. This is
+    /// because `use` statements are the *place where* triggers become
+    /// true for a package — the UsesModule("X") trigger wouldn't match
+    /// at the exact statement that introduces X.
+    fn dispatch_use_plugins(&mut self, ctx: plugin::UseContext) {
+        if self.plugins.is_empty() { return; }
+        let actions: Vec<(String, plugin::EmitAction)> = self.plugins
+            .all()
+            .flat_map(|p| {
+                let id = p.id().to_string();
+                p.on_use(&ctx).into_iter().map(move |a| (id.clone(), a))
+            })
+            .collect();
+        for (plugin_id, action) in actions {
+            self.apply_emit_action(plugin_id, action);
+        }
+    }
+
     /// Run every applicable plugin's `on_function_call` hook. Used for
     /// top-level calls (`get '/path' => sub {}`, `has 'attr' => ...`)
     /// that aren't method calls. Mirrors dispatch_method_call_plugins.
@@ -1597,10 +1621,26 @@ impl<'a> Builder<'a> {
                 }
                 self.imports.push(Import {
                     module_name: module_name.to_string(),
-                    imported_symbols,
+                    imported_symbols: imported_symbols.clone(),
                     span: node_to_span(node),
                     qw_close_paren,
                 });
+
+                // Plugin dispatch for use-statements. Mojolicious::Lite
+                // autoimports a verb set (`get`, `post`, `helper`, ...)
+                // — the plugin emits `FrameworkImport` actions so our
+                // unresolved-function diagnostic doesn't flag them.
+                if !self.plugins.is_empty() {
+                    let raw_args = self.extract_mojo_base_args(node);
+                    let ctx = plugin::UseContext {
+                        module_name: module_name.to_string(),
+                        imports: imported_symbols,
+                        raw_args,
+                        current_package: self.current_package.clone(),
+                        span: node_to_span(node),
+                    };
+                    self.dispatch_use_plugins(ctx);
+                }
             }
         }
         // Don't recurse — use statements don't contain interesting sub-nodes
@@ -7271,6 +7311,30 @@ $app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
         if let SymbolDetail::Sub { params, .. } = &purge.detail {
             let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
             assert_eq!(names, vec!["$c", "$force"]);
+        }
+    }
+
+    /// `use Mojolicious::Lite` autoimports a fixed verb set — our
+    /// unresolved-function diagnostic must skip them. The plugin's
+    /// `on_use` hook emits FrameworkImport actions for each; the
+    /// builder stashes them in framework_imports so the diagnostic
+    /// filter drops matching FunctionCall refs.
+    #[test]
+    fn plugin_mojo_lite_autoimports_verbs() {
+        let src = r#"
+package main;
+use Mojolicious::Lite;
+
+get '/x' => sub {};
+post '/y' => sub {};
+helper foo => sub {};
+"#;
+        let fa = build_fa(src);
+        for verb in &["get", "post", "put", "del", "patch",
+                      "any", "under", "websocket",
+                      "app", "helper", "hook", "plugin", "group"] {
+            assert!(fa.framework_imports.contains(*verb),
+                "{} must be autoimported by use Mojolicious::Lite", verb);
         }
     }
 

@@ -26,6 +26,25 @@ fn triggers() {
     ]
 }
 
+// `use Mojolicious::Lite` autoimports a fixed verb set. Without this,
+// every `get`/`post`/`helper`/etc. call in the Lite script trips the
+// unresolved-function diagnostic. We emit a FrameworkImport per verb
+// so the diagnostic skip list has them.
+fn on_use(ctx) {
+    if ctx.module_name != "Mojolicious::Lite" { return []; }
+    let verbs = [
+        "get", "post", "put", "del", "patch", "options", "any",
+        "under", "websocket",
+        "app", "helper", "hook", "plugin",
+        "group",
+    ];
+    let out = [];
+    for v in verbs {
+        out += #{ FrameworkImport: #{ keyword: v } };
+    }
+    out
+}
+
 fn on_function_call(ctx) {
     let out = [];
 
