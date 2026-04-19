@@ -348,6 +348,12 @@ fn insert_into_cache(
                 .or_default()
                 .push(module_name.to_string());
         }
+        // `class_content_index` isn't threaded through the resolver
+        // APIs yet — resolver-path registration populates it via the
+        // `post_insert_hook` call below if provided by the caller.
+        // (Initially only workspace-index registration uses it; the
+        // resolver thread path is not yet on this hot path for
+        // plugin-synthesized content.)
     }
     cache.insert(module_name.to_string(), result);
 }

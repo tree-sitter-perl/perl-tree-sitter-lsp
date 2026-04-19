@@ -7552,6 +7552,60 @@ $r->get('/users')->to(controller => 'Users', action => 'list');
         assert!(has_ref, "long-form ->to(controller=>, action=>) must produce MethodCall ref");
     }
 
+    /// Helpers emitted by mojo-helpers land on Mojolicious::Controller.
+    /// A controller subclass in ANOTHER file (standard workspace layout)
+    /// must see them when walking methods — the class_content_index
+    /// bridges the lookup because the synthesizing module's primary
+    /// package isn't Mojolicious::Controller.
+    #[test]
+    fn plugin_mojo_helpers_reachable_cross_file_from_controller() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        // Lite script with a helper.
+        let lite_src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(greet => sub { my ($c, $who) = @_; });
+"#;
+        // Controller subclass in another file.
+        let ctrl_src = r#"
+package MyApp::Controller::Home;
+use parent 'Mojolicious::Controller';
+1;
+"#;
+
+        let lite_fa = Arc::new(build_fa(lite_src));
+        let ctrl_fa = build_fa(ctrl_src);
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/MyApp.pm"),
+            lite_fa.clone(),
+        );
+
+        // class_content_index knows MyApp.pm hosts synthesized Methods
+        // on Mojolicious::Controller.
+        let mods = idx.modules_with_class_content("Mojolicious::Controller");
+        assert!(mods.iter().any(|m| m == "MyApp"),
+            "MyApp module should be listed as content-holder for \
+             Mojolicious::Controller; got: {:?}", mods);
+
+        // Completion on MyApp::Controller::Home inheriting from
+        // Mojolicious::Controller should walk up and find `greet`.
+        let candidates = ctrl_fa.complete_methods_for_class(
+            "MyApp::Controller::Home",
+            Some(&idx),
+        );
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"greet"),
+            "helper `greet` emitted on Mojolicious::Controller in \
+             MyApp.pm should complete on subclasses; got: {:?}",
+            labels);
+    }
+
     /// mojo-helpers cross-file: when a Lite script registers a helper
     /// `greet`, the resulting Method symbol's `package` is
     /// `Mojolicious::Controller`. Any consumer file — controller

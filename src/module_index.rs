@@ -205,6 +205,15 @@ pub struct ModuleIndex {
     /// of reinventing per-feature cache walks. Different features
     /// apply their own override / stacking rules on top.
     reverse_index: Arc<DashMap<String, Vec<String>>>,
+    /// Class → modules that contain ANY symbol whose `package` field
+    /// equals that class. Complements `reverse_index` (which is
+    /// name-keyed) for the "find methods on class X" query — plugins
+    /// can emit methods on another class via `on_class` override, so
+    /// the method's `package` doesn't match its file's primary
+    /// package. Without this, cross-file inheritance walks for
+    /// synthesized helpers on Mojolicious::Controller miss the module
+    /// that declared them.
+    class_content_index: Arc<DashMap<String, Vec<String>>>,
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
     stale_modules: Arc<DashMap<String, ()>>,
@@ -255,6 +264,7 @@ impl ModuleIndex {
         ModuleIndex {
             cache,
             reverse_index,
+            class_content_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             queue,
@@ -412,6 +422,7 @@ impl ModuleIndex {
         ModuleIndex {
             cache: Arc::new(DashMap::new()),
             reverse_index: Arc::new(DashMap::new()),
+            class_content_index: Arc::new(DashMap::new()),
             stale_modules: Arc::new(DashMap::new()),
             available_modules: Arc::new(DashMap::new()),
             queue: Arc::new(ResolveQueue {
@@ -466,6 +477,7 @@ impl ModuleIndex {
         ModuleIndex {
             cache,
             reverse_index,
+            class_content_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             queue,
@@ -505,9 +517,9 @@ impl ModuleIndex {
     pub fn register_workspace_module(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         let Some(module_name) = first_package_name(&analysis) else { return };
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
-        // Reverse index: every module-visible named symbol contributes
-        // so name-keyed queries find this workspace module too.
+        let mut classes_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for sym in &analysis.symbols {
+            // Name-keyed reverse index (every module-visible symbol).
             if matches!(
                 sym.kind,
                 SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class
@@ -518,8 +530,40 @@ impl ModuleIndex {
                     .or_default()
                     .push(module_name.clone());
             }
+            // Class-content index: for every method/sub with a package
+            // field, note that this module has content on that class.
+            // Critical for plugin-emitted methods with `on_class` override
+            // — a helper's `package` can differ from its file's primary
+            // package, so the normal `get_cached(class)` lookup misses.
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Handler) {
+                if let Some(ref pkg) = sym.package {
+                    if classes_seen.insert(pkg.clone()) {
+                        self.class_content_index
+                            .entry(pkg.clone())
+                            .or_default()
+                            .push(module_name.clone());
+                    }
+                }
+            }
         }
         self.cache.insert(module_name, Some(cached));
+    }
+
+    /// Every cached module that contains at least one symbol whose
+    /// `package` field equals `class_name`. Used by method-completion's
+    /// cross-file walk to find modules that synthesize methods onto
+    /// external classes (Mojo helpers, Catalyst attribute handlers,
+    /// DBIC relationship chains, etc.).
+    pub fn modules_with_class_content(&self, class_name: &str) -> Vec<String> {
+        match self.class_content_index.get(class_name) {
+            Some(mods) => {
+                let mut result = mods.clone();
+                result.sort();
+                result.dedup();
+                result
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Block until `module_name` appears in the cache, or timeout.

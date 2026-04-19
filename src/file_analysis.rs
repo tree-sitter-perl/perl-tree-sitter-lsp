@@ -1483,12 +1483,34 @@ impl FileAnalysis {
 
         // Walk cross-file parents
         if let Some(idx) = module_index {
-            // Methods from the cross-file module itself
-            if let Some(cached) = idx.get_cached(class_name) {
+            // Gather candidate modules two ways:
+            //   (1) cached under `class_name` itself — the usual
+            //       "there's a module whose package IS this class"
+            //   (2) any module that has content attributed to this
+            //       class (plugin-synthesized methods with on_class
+            //       override: helpers on Mojolicious::Controller
+            //       declared from a Lite script whose primary
+            //       package is MyApp, etc.).
+            // Walk each, dedup by (symbol name).
+            let mut modules_to_scan: Vec<String> = idx.modules_with_class_content(class_name);
+            if !modules_to_scan.iter().any(|m| m == class_name) {
+                // ensure `class_name` itself is included if cached
+                if idx.get_cached(class_name).is_some() {
+                    modules_to_scan.push(class_name.to_string());
+                }
+            }
+            for mod_name in modules_to_scan {
+                let Some(cached) = idx.get_cached(&mod_name) else { continue };
                 for sym in &cached.analysis.symbols {
                     if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                         continue;
                     }
+                    // For plugin-emitted methods with on_class, the
+                    // `package` is the target class. For the usual
+                    // same-package methods, `package` equals the
+                    // module's primary package which IS class_name.
+                    let pkg_match = sym.package.as_deref() == Some(class_name);
+                    if !pkg_match { continue; }
                     if seen_names.contains(&sym.name) {
                         continue;
                     }
@@ -1671,11 +1693,21 @@ impl FileAnalysis {
                             return Some(span);
                         }
                     }
-                    // Fall back to any sub/method with that name
-                    for &sid in self.symbols_named(&r.target_name) {
-                        let sym = self.symbol(sid);
-                        if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                            return Some(sym.selection_span);
+                    // Last-resort "any sub/method with that name" fallback.
+                    // Only fires when we couldn't resolve the invocant at
+                    // all — if we knew the target class but couldn't find
+                    // the method there, jumping to an unrelated sub is
+                    // actively harmful (plugin-emitted MethodCallRefs
+                    // targeting `'Users#create'` would otherwise latch
+                    // onto a `create` helper synthesized on some unrelated
+                    // class). Returning None is better — the LSP adapter
+                    // can still try cross-file paths.
+                    if class_name.is_none() {
+                        for &sid in self.symbols_named(&r.target_name) {
+                            let sym = self.symbol(sid);
+                            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                                return Some(sym.selection_span);
+                            }
                         }
                     }
                 }
