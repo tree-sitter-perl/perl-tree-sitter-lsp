@@ -30,18 +30,88 @@ fn triggers() {
 // every `get`/`post`/`helper`/etc. call in the Lite script trips the
 // unresolved-function diagnostic. We emit a FrameworkImport per verb
 // so the diagnostic skip list has them.
+// DSL verbs Mojolicious::Lite autoimports. Each entry is a
+// (name, doc) pair — rendered on hover. `app` and the route verbs
+// get proper Sub symbols (with return types where meaningful) so
+// hover/gd work; the rest fall back to FrameworkImport to silence
+// the unresolved-function diagnostic without over-promising.
+fn dsl_docs() {
+    #{
+        "app":       "The Mojolicious application instance.",
+        "get":       "Register a route for HTTP GET. `get '/path' => sub { ... }`",
+        "post":      "Register a route for HTTP POST.",
+        "put":       "Register a route for HTTP PUT.",
+        "del":       "Register a route for HTTP DELETE.",
+        "patch":     "Register a route for HTTP PATCH.",
+        "options":   "Register a route for HTTP OPTIONS.",
+        "any":       "Register a route that matches any HTTP method.",
+        "under":     "Register a middleware route. Nested routes fire only when the under-route allows the request.",
+        "websocket": "Register a WebSocket route.",
+        "helper":    "Register a controller helper. `helper NAME => sub { my ($c, ...) = @_; ... }`",
+        "hook":      "Attach a callback to a Mojolicious hook (before_dispatch, after_render, …).",
+        "plugin":    "Load a Mojolicious plugin.",
+        "group":     "Group routes so common prefixes/middlewares apply to all of them.",
+    }
+}
+
 fn on_use(ctx) {
     if ctx.module_name != "Mojolicious::Lite" { return []; }
-    let verbs = [
+    let out = [];
+    let docs = dsl_docs();
+
+    // `app` returns the Mojolicious instance — type it so `app->routes`
+    // resolves and completion offers instance methods. FrameworkImport
+    // keeps the unresolved-function diagnostic happy; the typed Sub
+    // symbol layered on top is what gives hover/gd/completion.
+    out += #{ FrameworkImport: #{ keyword: "app" } };
+    out += #{
+        Symbol: #{
+            name: "app",
+            kind: "Sub",
+            span: ctx.span,
+            selection_span: ctx.span,
+            detail: #{
+                Sub: #{
+                    params: [],
+                    is_method: false,
+                    return_type: #{ ClassName: "Mojolicious" },
+                    doc: docs["app"],
+                    display: "Function",
+                }
+            },
+        }
+    };
+
+    // Route-declaration verbs. No return type — they're called for
+    // side effect — but hover surfaces the usage hint. FrameworkImport
+    // still emitted alongside to keep the diagnostic path unchanged.
+    let verbs_rest = [
         "get", "post", "put", "del", "patch", "options", "any",
         "under", "websocket",
-        "app", "helper", "hook", "plugin",
+        "helper", "hook", "plugin",
         "group",
     ];
-    let out = [];
-    for v in verbs {
+    for v in verbs_rest {
         out += #{ FrameworkImport: #{ keyword: v } };
+        out += #{
+            Symbol: #{
+                name: v,
+                kind: "Sub",
+                span: ctx.span,
+                selection_span: ctx.span,
+                detail: #{
+                    Sub: #{
+                        params: [],
+                        is_method: false,
+                        return_type: (),
+                        doc: docs[v],
+                        display: "Function",
+                    }
+                },
+            }
+        };
     }
+
     out
 }
 
@@ -78,9 +148,11 @@ fn on_function_call(ctx) {
     // Find the handler sub arg. In Lite syntax `get '/x' => sub {...}`
     // the sub is args[1]; but other forms (e.g. `get '/x' => 'Ctrl#act'`
     // with string target) are handled by mojo-routes — skip here.
+    // The route handler's first positional is always the Mojolicious
+    // controller; flag it so the call-site display drops it.
     let params = [];
     if args.len() >= 2 {
-        params = args[1].sub_params;
+        params = as_invocant_params(args[1].sub_params);
     }
 
     // Lite routes render as Function — same reasoning as mojo-routes:
@@ -96,6 +168,19 @@ fn on_function_call(ctx) {
             display: "Function",
         }
     };
+
+    // Type the route-handler's first positional as Mojolicious::Controller
+    // so `$c->...` inside `get '/path' => sub { my $c = shift; $c->... }`
+    // resolves to controller methods + helpers.
+    if params.len() >= 1 && args.len() >= 2 {
+        out += #{
+            VarType: #{
+                variable: params[0].name,
+                at: args[1].span,
+                inferred_type: #{ ClassName: "Mojolicious::Controller" },
+            }
+        };
+    }
 
     out
 }

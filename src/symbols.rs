@@ -871,10 +871,8 @@ fn dispatch_target_completions(
         }
         let display: Vec<String> = params
             .iter()
-            .enumerate()
-            .filter(|(i, p)| !(*i == 0 && matches!(p.name.as_str(),
-                "$self" | "$self_in" | "$emitter")))
-            .map(|(_, p)| p.name.clone())
+            .filter(|p| !p.is_invocant)
+            .map(|p| p.name.clone())
             .collect();
         acc.entry(sym.name.clone()).or_insert((display, file_tag.to_string()));
     };
@@ -1066,10 +1064,7 @@ fn string_dispatch_signature_for(
 
         let display: Vec<&ParamInfo> = params
             .iter()
-            .enumerate()
-            .filter(|(i, p)| !(*i == 0 && matches!(p.name.as_str(),
-                "$self" | "$self_in" | "$emitter")))
-            .map(|(_, p)| p)
+            .filter(|p| !p.is_invocant)
             .collect();
         let labels: Vec<String> = display.iter()
             .map(|p| match &p.default {
@@ -1365,6 +1360,16 @@ pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
                 }
             }
             FaSymKind::Sub | FaSymKind::Method => {
+                // Plugin-synthesized subs/methods often have
+                // return_type set to internal proxy classes (Mojo
+                // helpers' `_Helper::users` chain, DBIC ResultSet
+                // wrappers, etc.). The kind icon + hover already
+                // carry the useful info; the inlay hint just
+                // repeats a long dotted class name at every
+                // declaration. Suppress it for framework symbols.
+                if sym.namespace.is_framework() {
+                    continue;
+                }
                 if let SymbolDetail::Sub { return_type: Some(ref rt), .. } = sym.detail {
                     // Only show non-trivial return types
                     if matches!(rt, InferredType::Numeric | InferredType::String) {

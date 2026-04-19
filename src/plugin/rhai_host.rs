@@ -55,6 +55,23 @@ pub fn make_engine() -> Engine {
         to_dynamic(InferredType::ClassName(class)).unwrap_or(Dynamic::UNIT)
     });
 
+    // Mark a param-list's first element as the implicit invocant.
+    // Framework callbacks typically receive the receiver as their
+    // first positional (`$c` for Mojolicious helpers, `$self_in`
+    // for Mojo::EventEmitter handlers, etc.); the plugin knows
+    // this, the core does not. Running the array through this
+    // helper tells sig help / hover / outline to drop param 0 at
+    // display time without the core matching on names.
+    engine.register_fn("as_invocant_params", |list: Array| -> Array {
+        let mut out = list;
+        if let Some(first) = out.get_mut(0) {
+            if let Ok(mut m) = first.as_map_mut() {
+                m.insert("is_invocant".into(), Dynamic::from(true));
+            }
+        }
+        out
+    });
+
     // Subspan helper: plugins frequently want to narrow a parser-given
     // span (e.g. a whole string literal) down to a portion of its
     // content (the method-name half of `"Controller#action"`). This

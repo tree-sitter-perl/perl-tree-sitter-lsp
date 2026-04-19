@@ -43,8 +43,26 @@ fn on_method_call(ctx) {
     let name = args[0].string_value;
     if name == () { return out; }
 
-    let params = args[1].sub_params;
+    // `$app->helper(NAME => sub { my ($c, @rest) = @_; ... })` — the
+    // helper's first positional is the Mojolicious controller. Flag
+    // it so sig help / hover / outline don't show `$c` at call sites.
+    let params = as_invocant_params(args[1].sub_params);
     let name_span = args[0].span;
+
+    // Type the first positional inside the callback body as
+    // Mojolicious::Controller — lets `$c->...` inside the callback
+    // complete against controller methods + helpers. Anchor the
+    // constraint to the sub's span; the builder resolves to the
+    // callback's actual scope after the walk.
+    if params.len() >= 1 {
+        out += #{
+            VarType: #{
+                variable: params[0].name,
+                at: args[1].span,
+                inferred_type: #{ ClassName: "Mojolicious::Controller" },
+            }
+        };
+    }
 
     // Split on '.' — single-segment names are the common case and
     // produce exactly one Method per entry class. Dotted names chain.

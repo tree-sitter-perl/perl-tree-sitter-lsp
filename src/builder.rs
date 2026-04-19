@@ -49,6 +49,7 @@ pub fn build_with_plugins(
         symbols: Vec::new(),
         refs: Vec::new(),
         type_constraints: Vec::new(),
+        deferred_var_types: Vec::new(),
         fold_ranges: Vec::new(),
         imports: Vec::new(),
         return_infos: Vec::new(),
@@ -76,6 +77,27 @@ pub fn build_with_plugins(
     b.visit_children(tree.root_node());
     b.pop_scope();
     let _ = file_scope;
+
+    // Flush plugin-emitted VarType constraints now that every scope
+    // has been pushed. Each uses scope_at on the declared anchor point
+    // so a `$app->helper(... sub { my ($c) = @_; ... })` emission
+    // lands inside the callback body rather than the outer file scope.
+    let deferred = std::mem::take(&mut b.deferred_var_types);
+    for d in deferred {
+        let scope = b
+            .scopes
+            .iter()
+            .rev()
+            .find(|s| crate::file_analysis::contains_point(&s.span, d.at.start))
+            .map(|s| s.id)
+            .unwrap_or(ScopeId(0));
+        b.type_constraints.push(TypeConstraint {
+            variable: d.variable,
+            scope,
+            constraint_span: d.at,
+            inferred_type: d.inferred_type,
+        });
+    }
 
     // Post-pass 1: resolve variable refs -> resolves_to
     b.resolve_variable_refs();
@@ -158,6 +180,12 @@ fn walk_return_delegation_chain(
     current
 }
 
+struct DeferredVarType {
+    variable: String,
+    at: Span,
+    inferred_type: InferredType,
+}
+
 struct Builder<'a> {
     source: &'a [u8],
 
@@ -165,6 +193,11 @@ struct Builder<'a> {
     symbols: Vec<Symbol>,
     refs: Vec<Ref>,
     type_constraints: Vec<TypeConstraint>,
+    /// Plugin-emitted `VarType` constraints, resolved to scopes only
+    /// after the whole CST has been walked (plugin dispatch runs
+    /// before we recurse into call args, so at emit-time the target
+    /// scope usually doesn't exist yet).
+    deferred_var_types: Vec<DeferredVarType>,
     fold_ranges: Vec<FoldRange>,
     imports: Vec<Import>,
     /// Return values collected during the walk (explicit `return` + implicit last expr).
@@ -363,6 +396,7 @@ impl<'a> Builder<'a> {
                 name: p.name,
                 default: p.default,
                 is_slurpy: p.is_slurpy,
+                    is_invocant: false,
             })
             .collect();
         if !params.is_empty() { return params; }
@@ -410,6 +444,7 @@ impl<'a> Builder<'a> {
                 is_slurpy: name.starts_with('@') || name.starts_with('%'),
                 name,
                 default: None,
+                is_invocant: false,
             })
             .collect();
         if params.is_empty() { None } else { Some(params) }
@@ -434,6 +469,19 @@ impl<'a> Builder<'a> {
         }
         if text.starts_with('@') || text.starts_with('%') {
             return None;
+        }
+        // Bareword invocant. Perl lets `foo->bar` mean either
+        // "method bar on package foo" OR "result of calling foo()"
+        // if `foo` is a declared sub. When we know about a local
+        // Sub/Method named `foo` with a return_type, that wins —
+        // `app->routes` in a Mojolicious::Lite script resolves to
+        // the plugin-synthesized `sub app() :: Mojolicious`.
+        for sym in &self.symbols {
+            if sym.name != text { continue; }
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+            if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
+                return Some(rt.clone());
+            }
         }
         Some(InferredType::ClassName(text.to_string()))
     }
@@ -699,6 +747,18 @@ impl<'a> Builder<'a> {
             }
             plugin::EmitAction::FrameworkImport { keyword } => {
                 self.framework_imports.insert(keyword);
+            }
+            plugin::EmitAction::VarType { variable, at, inferred_type } => {
+                // Scope resolution is deferred to the end of the build —
+                // plugin dispatch runs BEFORE we recurse into call
+                // arguments, so the callback body's scope doesn't exist
+                // yet. Queue the request and apply it once every scope
+                // has been pushed.
+                self.deferred_var_types.push(DeferredVarType {
+                    variable,
+                    at,
+                    inferred_type,
+                });
             }
         }
     }
@@ -1067,7 +1127,31 @@ impl<'a> Builder<'a> {
         };
 
         // Extract params
-        let params = self.extract_params(node);
+        let mut params = self.extract_params(node);
+
+        // Invocant detection for Perl-native subs:
+        //   * `method foo { ... }` (v5.38) is always a method — first
+        //     positional is the invocant.
+        //   * Regular `sub` bodies use two Perl-native signals:
+        //       - first positional named `$self`/`$class`/`$this`/`$proto`
+        //       - or the enclosing package declares inheritance (a sub
+        //         in a subclass is, by Perl OO convention, a method)
+        //     Either triggers invocant marking; name stays free so the
+        //     user can call it `$c`/`$ctx`/whatever.
+        // Framework-specific invocant markers (`as_invocant_params` from
+        // a plugin) stack on top via EmittedParam → ParamInfo.
+        if let Some(first) = params.first_mut() {
+            let name_says_invocant = matches!(
+                first.name.strip_prefix('$').unwrap_or(""),
+                "self" | "class" | "this" | "proto"
+            );
+            let pkg_is_subclass = self.current_package
+                .as_ref()
+                .map_or(false, |p| self.package_parents.contains_key(p));
+            if is_method || name_says_invocant || pkg_is_subclass {
+                first.is_invocant = true;
+            }
+        }
 
         // Extract preceding POD/comment documentation
         let doc = self.extract_preceding_doc(node, &name);
@@ -1158,7 +1242,7 @@ impl<'a> Builder<'a> {
                                 .into_iter()
                                 .map(|(name, _)| {
                                     let is_slurpy = name.starts_with('@') || name.starts_with('%');
-                                    ParamInfo { name, default: None, is_slurpy }
+                                    ParamInfo { name, default: None, is_slurpy, is_invocant: false }
                                 })
                                 .collect();
                             // Combine any preceding shift params with @_ params
@@ -1176,6 +1260,7 @@ impl<'a> Builder<'a> {
                             name: var_name,
                             default,
                             is_slurpy: false,
+                    is_invocant: false,
                         });
                         continue;
                     }
@@ -1186,6 +1271,7 @@ impl<'a> Builder<'a> {
                             name: var_name,
                             default: None,
                             is_slurpy: false,
+                    is_invocant: false,
                         });
                         continue;
                     }
@@ -1278,7 +1364,7 @@ impl<'a> Builder<'a> {
                 match param.kind() {
                     "mandatory_parameter" => {
                         if let Some(var) = self.first_var_child(param) {
-                            params.push(ParamInfo { name: var, default: None, is_slurpy: false });
+                            params.push(ParamInfo { name: var, default: None, is_slurpy: false, is_invocant: false });
                         }
                     }
                     "optional_parameter" => {
@@ -1291,18 +1377,18 @@ impl<'a> Builder<'a> {
                             .and_then(|d| d.utf8_text(self.source).ok())
                             .map(|s| s.to_string());
                         if let Some(name) = var {
-                            params.push(ParamInfo { name, default, is_slurpy: false });
+                            params.push(ParamInfo { name, default, is_slurpy: false, is_invocant: false });
                         }
                     }
                     "slurpy_parameter" => {
                         if let Some(var) = self.first_var_child(param) {
-                            params.push(ParamInfo { name: var, default: None, is_slurpy: true });
+                            params.push(ParamInfo { name: var, default: None, is_slurpy: true, is_invocant: false });
                         }
                     }
                     "scalar" | "array" | "hash" => {
                         if let Ok(text) = param.utf8_text(self.source) {
                             let is_slurpy = matches!(param.kind(), "array" | "hash");
-                            params.push(ParamInfo { name: text.to_string(), default: None, is_slurpy });
+                            params.push(ParamInfo { name: text.to_string(), default: None, is_slurpy, is_invocant: false });
                         }
                     }
                     _ => {}
@@ -1346,11 +1432,14 @@ impl<'a> Builder<'a> {
         if params.is_empty() { return; }
         let first = &params[0];
         if !first.name.starts_with('$') { return; }
-        // Common self-like names
-        let bare = &first.name[1..];
-        if !matches!(bare, "self" | "class" | "this" | "proto") { return; }
 
-        // Find enclosing package
+        // Use the `is_invocant` flag set at extract time rather than
+        // matching on names. This way `sub list { my ($c) = @_ }` in a
+        // controller types `$c` as the current package the same way
+        // `sub new { my ($self) = @_ }` always has — the caller side
+        // (builder or plugin) owns the invocancy decision.
+        if !first.is_invocant { return; }
+
         if let Some(ref pkg) = self.current_package {
             self.type_constraints.push(TypeConstraint {
                 variable: first.name.clone(),
@@ -1435,6 +1524,7 @@ impl<'a> Builder<'a> {
                                 name: format!("${}", bare_name),
                                 default: None,
                                 is_slurpy: false,
+                    is_invocant: false,
                             }],
                             is_method: true,
                             return_type: None,
@@ -2818,6 +2908,7 @@ impl<'a> Builder<'a> {
                                     name: "$val".into(),
                                     default: None,
                                     is_slurpy: false,
+                    is_invocant: false,
                                 }],
                                 is_method: true,
                                 return_type: return_type.clone(),
@@ -2839,6 +2930,7 @@ impl<'a> Builder<'a> {
                                     name: "$val".into(),
                                     default: None,
                                     is_slurpy: false,
+                    is_invocant: false,
                                 }],
                                 is_method: true,
                                 return_type: return_type.clone(),
@@ -2881,6 +2973,7 @@ impl<'a> Builder<'a> {
                                 name: "$val".into(),
                                 default: None,
                                 is_slurpy: false,
+                    is_invocant: false,
                             }],
                             is_method: true,
                             return_type: self.current_package.as_ref()
@@ -3249,6 +3342,7 @@ impl<'a> Builder<'a> {
                         name: "$val".into(),
                         default: None,
                         is_slurpy: false,
+                    is_invocant: false,
                     }],
                     is_method: true,
                     return_type: None,

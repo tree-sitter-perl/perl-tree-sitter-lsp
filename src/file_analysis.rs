@@ -180,7 +180,7 @@ pub struct Symbol {
     pub namespace: Namespace,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymKind {
     Variable,
     Sub,
@@ -275,6 +275,14 @@ pub struct ParamInfo {
     pub name: String,
     pub default: Option<String>,
     pub is_slurpy: bool,
+    /// True when this param is the implicit receiver of the call,
+    /// supplied by the caller via `$obj->method(...)` rather than
+    /// written in the argument list. Sig help, hover, and outline
+    /// drop invocant params so users see what they actually type.
+    /// Whoever constructs the ParamInfo is responsible for setting
+    /// this — the core never infers it from the name.
+    #[serde(default)]
+    pub is_invocant: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2665,10 +2673,15 @@ impl FileAnalysis {
             }
         }
 
-        // Append return type for subs/methods
+        // Append return type + preceding/POD doc for subs/methods.
         if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-            if let SymbolDetail::Sub { return_type: Some(ref rt), .. } = sym.detail {
-                text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+            if let SymbolDetail::Sub { ref return_type, ref doc, .. } = sym.detail {
+                if let Some(rt) = return_type {
+                    text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
+                }
+                if let Some(d) = doc {
+                    text.push_str(&format!("\n\n{}", d));
+                }
             }
         }
 
@@ -2688,9 +2701,28 @@ impl FileAnalysis {
     fn outline_children_of(&self, parent_scope: ScopeId) -> Vec<OutlineSymbol> {
         let mut result = Vec::new();
 
+        // Plugin fan-out (e.g. Mojo helpers register a Method on both
+        // Mojolicious::Controller AND Mojolicious) produces multiple
+        // Symbols with the same (name, kind, span). Completion and
+        // resolution want them all; the outline wants one entry.
+        // Keyed by (kind, name, span_start) — tight enough to dedup
+        // true fan-out without collapsing user-written overloads.
+        let mut outline_seen: HashSet<(SymKind, String, usize, usize)> = HashSet::new();
+
         for sym in &self.symbols {
             if sym.scope != parent_scope {
                 continue;
+            }
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method) && sym.namespace.is_framework() {
+                let key = (
+                    sym.kind,
+                    sym.name.clone(),
+                    sym.span.start.row,
+                    sym.span.start.column,
+                );
+                if !outline_seen.insert(key) {
+                    continue;
+                }
             }
 
             let (name, detail, children) = match sym.kind {
@@ -2699,16 +2731,26 @@ impl FileAnalysis {
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
-                    let prefix = sub_display_prefix(&sym.detail, "sub");
-                    (format!("{} {}", prefix, sym.name), None, children)
+                    // Plugin-emitted subs with a display override render
+                    // with just the name — the kind icon already carries
+                    // "this is framework-synthesized" so a "fn"/"method"
+                    // prefix is redundant noise.
+                    let label = match sub_display_override(&sym.detail) {
+                        Some(_) => sym.name.clone(),
+                        None => format!("sub {}", sym.name),
+                    };
+                    (label, None, children)
                 }
                 SymKind::Method => {
                     let body_scope = self.find_body_scope(sym);
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
-                    let prefix = sub_display_prefix(&sym.detail, "method");
-                    (format!("{} {}", prefix, sym.name), None, children)
+                    let label = match sub_display_override(&sym.detail) {
+                        Some(_) => sym.name.clone(),
+                        None => format!("method {}", sym.name),
+                    };
+                    (label, None, children)
                 }
                 SymKind::Class => {
                     let body_scope = self.find_body_scope(sym);
@@ -2751,12 +2793,8 @@ impl FileAnalysis {
                         SymbolDetail::Handler { params, .. } => {
                             let display: Vec<String> = params
                                 .iter()
-                                .enumerate()
-                                .filter(|(i, p)| !(*i == 0 && matches!(
-                                    p.name.as_str(),
-                                    "$self" | "$self_in" | "$emitter"
-                                )))
-                                .map(|(_, p)| p.name.clone())
+                                .filter(|p| !p.is_invocant)
+                                .map(|p| p.name.clone())
                                 .collect();
                             Some(format!("handler ({})", display.join(", ")))
                         }
@@ -3856,12 +3894,8 @@ fn span_size(span: &Span) -> usize {
 fn display_handler_params(params: &[ParamInfo]) -> Vec<String> {
     params
         .iter()
-        .enumerate()
-        .filter(|(i, p)| !(*i == 0 && matches!(
-            p.name.as_str(),
-            "$self" | "$self_in" | "$emitter"
-        )))
-        .map(|(_, p)| p.name.clone())
+        .filter(|p| !p.is_invocant)
+        .map(|p| p.name.clone())
         .collect()
 }
 

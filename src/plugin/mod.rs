@@ -82,6 +82,12 @@ pub struct EmittedParam {
     pub name: String,
     pub default: Option<String>,
     pub is_slurpy: bool,
+    /// Set on params that the user never types at the call site
+    /// (`$self` for Perl methods, `$c` for Mojolicious helpers, …).
+    /// Whoever emits the params decides — the core never infers
+    /// invocancy from a name.
+    #[serde(default)]
+    pub is_invocant: bool,
 }
 
 impl From<EmittedParam> for ParamInfo {
@@ -90,6 +96,7 @@ impl From<EmittedParam> for ParamInfo {
             name: p.name,
             default: p.default,
             is_slurpy: p.is_slurpy,
+            is_invocant: p.is_invocant,
         }
     }
 }
@@ -215,6 +222,19 @@ pub enum EmitAction {
         span: Span,
         selection_span: Span,
         detail: SymbolDetail,
+    },
+    /// Declare a type for a variable inside a scope. Plugins use this
+    /// when they know a framework-provided variable's type that the
+    /// builder can't infer — the classic case being callback arguments:
+    /// `$app->helper(NAME => sub { my ($c) = @_; ... })` — the plugin
+    /// knows `$c` is a Mojolicious controller, the core doesn't.
+    /// `at` names any point inside the scope the constraint should
+    /// apply to (typically the callback body's span); the builder
+    /// resolves it to an actual scope via `scope_at(at)`.
+    VarType {
+        variable: String,
+        at: Span,
+        inferred_type: InferredType,
     },
 }
 
@@ -403,6 +423,7 @@ mod tests {
             name: "$val".into(),
             default: None,
             is_slurpy: false,
+            is_invocant: false,
         };
         let pi: ParamInfo = ep.into();
         assert_eq!(pi.name, "$val");

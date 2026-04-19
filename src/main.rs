@@ -291,6 +291,8 @@ fn cli_outline(file: &str) {
     let (_source, _tree, analysis) = parse_file(file);
 
     let mut results = Vec::new();
+    let mut outline_seen: std::collections::HashSet<(String, String, usize, usize)> =
+        std::collections::HashSet::new();
     for sym in &analysis.symbols {
         match sym.kind {
             file_analysis::SymKind::Sub | file_analysis::SymKind::Method
@@ -308,8 +310,11 @@ fn cli_outline(file: &str) {
             entry["package"] = serde_json::json!(pkg);
         }
         if let file_analysis::SymbolDetail::Sub { ref params, ref return_type, is_method, ref display, .. } = sym.detail {
-            if !params.is_empty() {
-                let param_names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            if params.iter().any(|p| !p.is_invocant) {
+                let param_names: Vec<&str> = params.iter()
+                    .filter(|p| !p.is_invocant)
+                    .map(|p| p.name.as_str())
+                    .collect();
                 entry["params"] = serde_json::json!(param_names);
             }
             if let Some(ref rt) = return_type {
@@ -323,10 +328,32 @@ fn cli_outline(file: &str) {
             }
         }
         if let file_analysis::SymbolDetail::Handler { ref params, ref dispatchers, ref display, .. } = sym.detail {
-            let param_names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            let param_names: Vec<&str> = params.iter()
+                .filter(|p| !p.is_invocant)
+                .map(|p| p.name.as_str())
+                .collect();
             entry["params"] = serde_json::json!(param_names);
             entry["dispatchers"] = serde_json::json!(dispatchers);
             entry["display"] = serde_json::json!(format!("{:?}", display));
+        }
+
+        // Fan-out dedup: framework plugins may register the same Symbol
+        // on multiple classes (Mojo helpers on Controller AND the app
+        // class) for resolution; the outline should only show it once.
+        use file_analysis::Namespace;
+        let is_framework = matches!(sym.namespace, Namespace::Framework { .. });
+        let is_dupeable = is_framework && matches!(sym.kind,
+            file_analysis::SymKind::Sub | file_analysis::SymKind::Method);
+        if is_dupeable {
+            let key = (
+                format!("{:?}", sym.kind),
+                sym.name.clone(),
+                sym.span.start.row,
+                sym.span.start.column,
+            );
+            if !outline_seen.insert(key) {
+                continue;
+            }
         }
         results.push(entry);
     }

@@ -76,7 +76,11 @@ fn on_method_call(ctx) {
     if is_register {
         let params = [];
         if ctx.args.len() >= 2 {
-            params = ctx.args[1].sub_params;
+            // Mojo::EventEmitter passes the emitter as the callback's
+            // first positional. The param list is otherwise verbatim
+            // from the handler sub; `as_invocant_params` flags just
+            // position 0 so sig help drops it at display time.
+            params = as_invocant_params(ctx.args[1].sub_params);
         }
 
         out += #{
@@ -89,6 +93,19 @@ fn on_method_call(ctx) {
                 selection_span: ev.name_span,
             }
         };
+
+        // Type the callback's first positional as the emitter class
+        // so the user can ->-complete on it inside the handler body.
+        // `ev.owner` is a Class map — project back to the string.
+        if params.len() >= 1 && ctx.args.len() >= 2 {
+            out += #{
+                VarType: #{
+                    variable: params[0].name,
+                    at: ctx.args[1].span,
+                    inferred_type: #{ ClassName: ev.owner.Class },
+                }
+            };
+        }
     }
 
     out
