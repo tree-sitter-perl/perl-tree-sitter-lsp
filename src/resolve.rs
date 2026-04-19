@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use tower_lsp::lsp_types::Url;
 
-use crate::file_analysis::{AccessKind, FileAnalysis, HandlerOwner, RefKind, Span, SymKind, SymbolDetail};
+use crate::file_analysis::{AccessKind, FileAnalysis, HandlerOwner, RefKind, Span, SymKind};
 use crate::file_store::{FileKey, FileStore};
 use crate::module_index::ModuleIndex;
 

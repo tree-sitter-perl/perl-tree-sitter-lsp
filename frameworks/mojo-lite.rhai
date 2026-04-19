@@ -83,17 +83,61 @@ fn on_function_call(ctx) {
         params = args[1].sub_params;
     }
 
-    // Lite routes display as Methods too — same reasoning as
-    // mojo-routes: routes dispatch handlers, they aren't events.
+    // Lite routes render as Function — same reasoning as mojo-routes:
+    // they're framework-synthesized URL callables, not Perl methods.
     out += #{
         Handler: #{
             name: path,
             owner: #{ Class: owner_class },
-            dispatchers: ["url_for"],
+            dispatchers: ["url_for", "redirect_to"],
             params: params,
             span: args[0].span,
             selection_span: args[0].span,
-            display: "Method",
+            display: "Function",
+        }
+    };
+
+    out
+}
+
+// Dispatchers that take a URL string and resolve to a Lite route.
+// `url_for` generates a URL for a named route; `redirect_to` issues
+// a 302 to the given path. Both make the string argument a real
+// reference to the route's Handler — gd/gr/hover all compose.
+fn on_method_call(ctx) {
+    let out = [];
+    let mname = ctx.method_name;
+    if mname == () { return out; }
+
+    // Rhai: top-level `const` arrays don't hoist into fn scope
+    // reliably; keep the list inline here.
+    let dispatchers = ["url_for", "redirect_to"];
+    let is_url_dispatch = false;
+    for d in dispatchers {
+        if d == mname { is_url_dispatch = true; break; }
+    }
+    if !is_url_dispatch { return out; }
+
+    let args = ctx.args;
+    if args.len() < 1 { return out; }
+
+    let path = args[0].string_value;
+    if path == () { return out; }
+
+    // Owner: routes are registered under the Lite app's own package.
+    // `current_package` at the call site is usually `main` (Lite) or
+    // whichever controller is calling back into url_for — either way,
+    // the Handlers we're pointing at live under the calling package.
+    let owner_class = ctx.current_package;
+    if owner_class == () { return out; }
+
+    out += #{
+        DispatchCall: #{
+            name: path,
+            dispatcher: mname,
+            owner: #{ Class: owner_class },
+            span: args[0].span,
+            var_text: "",
         }
     };
 

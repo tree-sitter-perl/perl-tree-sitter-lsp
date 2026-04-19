@@ -27,6 +27,12 @@ fn triggers() {
     ]
 }
 
+// Helpers live on multiple classes in Mojolicious: the application
+// instance (`$app`) AND every controller (`$c`). Users call them on
+// both — `$app->current_user` from a hook, `$c->current_user` from an
+// action. We emit on both entry points; the shared proxy prefix means
+// dotted helpers only pay the fan-out once per leaf.
+
 fn on_method_call(ctx) {
     let out = [];
     if ctx.method_name != "helper" { return out; }
@@ -41,23 +47,31 @@ fn on_method_call(ctx) {
     let name_span = args[0].span;
 
     // Split on '.' — single-segment names are the common case and
-    // produce exactly one Method, same as before. Dotted names chain.
+    // produce exactly one Method per entry class. Dotted names chain.
     let segments = name.split(".");
+    // Entry classes where helpers become methods. Both Controller and
+    // Mojolicious (the app class) so `$c->...` AND `$app->...` complete.
+    let entry_classes = ["Mojolicious::Controller", "Mojolicious"];
 
     if segments.len() == 1 {
-        // Simple helper: Method on Mojolicious::Controller.
-        out += #{
-            Method: #{
-                name: name,
-                span: name_span,
-                selection_span: name_span,
-                params: params,
-                is_method: true,
-                return_type: (),
-                doc: (),
-                on_class: "Mojolicious::Controller",
-            }
-        };
+        // Simple helper: Method on each entry class. Display as Function
+        // so completion/outline show a helper-kind glyph rather than a
+        // Perl-method one — framework-synthesized, not hand-written.
+        for entry in entry_classes {
+            out += #{
+                Method: #{
+                    name: name,
+                    span: name_span,
+                    selection_span: name_span,
+                    params: params,
+                    is_method: true,
+                    return_type: (),
+                    doc: (),
+                    on_class: entry,
+                    display: "Function",
+                }
+            };
+        }
         return out;
     }
 
@@ -66,11 +80,32 @@ fn on_method_call(ctx) {
     // proxy-class path directly using `::` separators so the name is
     // deterministic per prefix and two helpers sharing a prefix
     // (`users.create`, `users.delete`) collapse onto the same proxy.
+    //
+    // Fan-out first-segment emission across the entry classes, then
+    // the deeper chain lives on the shared proxy (one copy).
     let n = segments.len();
     let proxy_base = "Mojolicious::Controller::_Helper";
-    let proxy_path = proxy_base;
-    let owner_class = "Mojolicious::Controller";
-    for i in 0..(n - 1) {
+    let first_seg = segments[0];
+    let first_proxy = proxy_base + "::" + first_seg;
+    for entry in entry_classes {
+        out += #{
+            Method: #{
+                name: first_seg,
+                span: name_span,
+                selection_span: name_span,
+                params: [],
+                is_method: true,
+                return_type: #{ ClassName: first_proxy },
+                doc: (),
+                on_class: entry,
+                display: "Function",
+            }
+        };
+    }
+
+    let proxy_path = first_proxy;
+    let owner_class = first_proxy;
+    for i in 1..(n - 1) {
         let seg = segments[i];
         proxy_path = proxy_path + "::" + seg;
 
@@ -84,6 +119,7 @@ fn on_method_call(ctx) {
                 return_type: #{ ClassName: proxy_path },
                 doc: (),
                 on_class: owner_class,
+                display: "Function",
             }
         };
 
@@ -102,6 +138,7 @@ fn on_method_call(ctx) {
             return_type: (),
             doc: (),
             on_class: owner_class,
+            display: "Function",
         }
     };
 

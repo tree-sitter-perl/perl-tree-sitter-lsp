@@ -213,6 +213,13 @@ pub enum SymbolDetail {
         return_type: Option<InferredType>,
         /// Pre-rendered markdown from POD or comments preceding this sub.
         doc: Option<String>,
+        /// Optional plugin-provided display override. Framework-synthesized
+        /// methods (Mojo helpers, Dancer routes, DBIC relationships, etc.)
+        /// resolve/complete/goto-def the same as a regular Method, but the
+        /// plugin gets the final word on which LSP kind they render as.
+        /// `None` leaves the default (Method → METHOD, Sub → FUNCTION).
+        #[serde(default)]
+        display: Option<HandlerDisplay>,
     },
     Class {
         parent: Option<String>,
@@ -557,6 +564,36 @@ pub struct PerlSemanticToken {
     pub span: Span,
     pub token_type: u32,
     pub modifiers: u32,
+}
+
+/// Plugin-chosen LSP display for a Sub-detail symbol, if any. Null for
+/// everything else — lets completion/outline carry plugin intent
+/// without each site re-matching on detail shape.
+fn sub_display_override(detail: &SymbolDetail) -> Option<HandlerDisplay> {
+    if let SymbolDetail::Sub { display, .. } = detail {
+        *display
+    } else {
+        None
+    }
+}
+
+/// Outline prefix honoring a plugin-provided display override. Falls
+/// back to the language default (`sub`/`method`) when no override is
+/// set. Keeps the label aligned with the icon so "method users" doesn't
+/// render next to a Function-kind glyph.
+fn sub_display_prefix(detail: &SymbolDetail, default: &'static str) -> &'static str {
+    if let SymbolDetail::Sub { display: Some(d), .. } = detail {
+        match d {
+            HandlerDisplay::Event => "event",
+            HandlerDisplay::Method => "method",
+            HandlerDisplay::Function => "fn",
+            HandlerDisplay::Field => "field",
+            HandlerDisplay::Property => "property",
+            HandlerDisplay::Constant => "const",
+        }
+    } else {
+        default
+    }
 }
 
 fn sigil_modifier(sigil: char) -> u32 {
@@ -1428,6 +1465,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
+                display_override: None,
                 });
                 seen_names.insert("new".to_string());
                 break;
@@ -1460,6 +1498,7 @@ impl FileAnalysis {
                 if self.symbol_in_class(sym.id, class_name) && !seen_names.contains(&sym.name) {
                     seen_names.insert(sym.name.clone());
                     let defining = if class_name != original_class { Some(class_name) } else { None };
+                    let display_override = sub_display_override(&sym.detail);
                     candidates.push(CompletionCandidate {
                         label: sym.name.clone(),
                         kind: sym.kind,
@@ -1467,6 +1506,7 @@ impl FileAnalysis {
                         insert_text: None,
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
+                        display_override,
                     });
                 }
             }
@@ -1520,6 +1560,7 @@ impl FileAnalysis {
                     let kind = if is_method { SymKind::Method } else { SymKind::Sub };
                     let defining = if class_name != original_class { Some(class_name) } else { None };
                     let detail = self.method_detail(original_class, &sym.name, defining, module_index);
+                    let display_override = sub_display_override(&sym.detail);
                     candidates.push(CompletionCandidate {
                         label: sym.name.clone(),
                         kind,
@@ -1527,6 +1568,7 @@ impl FileAnalysis {
                         insert_text: None,
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
+                        display_override,
                     });
                 }
             }
@@ -2657,14 +2699,16 @@ impl FileAnalysis {
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
-                    (format!("sub {}", sym.name), None, children)
+                    let prefix = sub_display_prefix(&sym.detail, "sub");
+                    (format!("{} {}", prefix, sym.name), None, children)
                 }
                 SymKind::Method => {
                     let body_scope = self.find_body_scope(sym);
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
-                    (format!("method {}", sym.name), None, children)
+                    let prefix = sub_display_prefix(&sym.detail, "method");
+                    (format!("{} {}", prefix, sym.name), None, children)
                 }
                 SymKind::Class => {
                     let body_scope = self.find_body_scope(sym);
@@ -2722,10 +2766,10 @@ impl FileAnalysis {
                 }
             };
 
-            let handler_display = if let SymbolDetail::Handler { display, .. } = &sym.detail {
-                Some(*display)
-            } else {
-                None
+            let handler_display = match &sym.detail {
+                SymbolDetail::Handler { display, .. } => Some(*display),
+                SymbolDetail::Sub { display: Some(d), .. } => Some(*d),
+                _ => None,
             };
             result.push(OutlineSymbol {
                 name,
@@ -2946,6 +2990,11 @@ pub struct CompletionCandidate {
     pub sort_priority: u8,
     /// Additional text edits applied when this candidate is accepted (e.g. auto-import).
     pub additional_edits: Vec<(Span, String)>,
+    /// Plugin-provided display override. When `Some`, the LSP adapter renders
+    /// the candidate with this kind instead of `kind`'s default mapping. Lets
+    /// helpers/routes/DSL verbs carry their plugin-chosen icon all the way
+    /// through completion without leaking plugin specifics into the core.
+    pub display_override: Option<HandlerDisplay>,
 }
 
 /// Signature info for a sub/method, resolved from the symbol table.
@@ -3057,10 +3106,21 @@ impl FileAnalysis {
             }
         }
 
-        // Fallback: all subs/methods in file
+        // Fallback: native subs/methods in file, deduped by label.
+        //
+        // Plugin-synthesized entries are skipped on purpose. A plugin
+        // emits Methods on specific classes (Mojo helpers on
+        // Controller, DBIC accessors on the schema, etc.); without a
+        // known receiver type we can't say which ones apply here.
+        // Surfacing them blindly dumps framework noise onto every
+        // untyped `$x->` call site. Native entries stay — those are
+        // always valid candidates regardless of receiver.
+        let mut seen = HashSet::<String>::new();
         self.symbols
             .iter()
             .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .filter(|s| !s.namespace.is_framework())
+            .filter(|s| seen.insert(s.name.clone()))
             .map(|s| CompletionCandidate {
                 label: s.name.clone(),
                 kind: s.kind,
@@ -3075,6 +3135,7 @@ impl FileAnalysis {
                 insert_text: None,
                 sort_priority: PRIORITY_FILE_WIDE,
                 additional_edits: vec![],
+                display_override: sub_display_override(&s.detail),
             })
             .collect()
     }
@@ -3108,6 +3169,7 @@ impl FileAnalysis {
                 insert_text: None,
                 sort_priority: if is_dynamic { PRIORITY_DYNAMIC } else { PRIORITY_FILE_WIDE },
                 additional_edits: vec![],
+                display_override: None,
             });
         }
 
@@ -3180,6 +3242,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_FILE_WIDE,
                     additional_edits: vec![],
+                display_override: None,
                 });
             }
         }
@@ -3201,6 +3264,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_LESS_RELEVANT,
                     additional_edits: vec![],
+                display_override: None,
                 });
             }
         }
@@ -3284,6 +3348,7 @@ impl FileAnalysis {
                         insert_text: Some(format!("{} => ", k)),
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
+                display_override: None,
                     })
                     .collect()
             }
@@ -3303,6 +3368,7 @@ impl FileAnalysis {
                         insert_text: Some(format!("{} => ", k)),
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
+                display_override: None,
                     })
                     .collect()
             }
@@ -3588,6 +3654,7 @@ impl FileAnalysis {
                                     insert_text: Some(format!("{} => ", key)),
                                     sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
+                display_override: None,
                                 });
                             }
                         }
@@ -3647,6 +3714,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(bare_name.to_string()),
                     sort_priority: priority,
                     additional_edits: vec![],
+                display_override: None,
                 });
             }
             if decl_sigil == '@' {
@@ -3657,6 +3725,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}[", bare_name)),
                     sort_priority: priority,
                     additional_edits: vec![],
+                display_override: None,
                 });
                 out.push(CompletionCandidate {
                     label: format!("$#{}", bare_name),
@@ -3667,6 +3736,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("#{}", bare_name)),
                     sort_priority: priority.saturating_add(1),
                     additional_edits: vec![],
+                display_override: None,
                 });
             }
             if decl_sigil == '%' {
@@ -3677,6 +3747,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}{{", bare_name)),
                     sort_priority: priority,
                     additional_edits: vec![],
+                display_override: None,
                 });
             }
         }
@@ -3689,6 +3760,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(bare_name.to_string()),
                     sort_priority: priority,
                     additional_edits: vec![],
+                display_override: None,
                 });
                 out.push(CompletionCandidate {
                     label: format!("@{}[]", bare_name),
@@ -3697,6 +3769,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}[", bare_name)),
                     sort_priority: priority.saturating_add(1),
                     additional_edits: vec![],
+                display_override: None,
                 });
             }
             if decl_sigil == '%' {
@@ -3707,6 +3780,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}{{", bare_name)),
                     sort_priority: priority,
                     additional_edits: vec![],
+                display_override: None,
                 });
             }
         }
@@ -3719,6 +3793,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(bare_name.to_string()),
                     sort_priority: priority,
                     additional_edits: vec![],
+                display_override: None,
                 });
                 out.push(CompletionCandidate {
                     label: format!("%{}{{}}", bare_name),
@@ -3727,6 +3802,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}{{", bare_name)),
                     sort_priority: priority.saturating_add(1),
                     additional_edits: vec![],
+                display_override: None,
                 });
             }
             if decl_sigil == '@' {
@@ -3737,6 +3813,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}[", bare_name)),
                     sort_priority: priority,
                     additional_edits: vec![],
+                display_override: None,
                 });
             }
         }
@@ -3990,6 +4067,7 @@ mod tests {
                     is_method: false,
                     return_type: Some(InferredType::HashRef),
                     doc: None,
+                    display: None,
                 },
                 namespace: Namespace::Language,
             }],

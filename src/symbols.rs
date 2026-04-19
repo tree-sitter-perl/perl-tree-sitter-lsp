@@ -5,7 +5,7 @@ use tree_sitter::{Point, Tree};
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
     contains_point, format_inferred_type, CompletionCandidate, FileAnalysis, FoldKind,
-    HandlerOwner, HashKeyOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
+    HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
     SymKind as FaSymKind, SymbolDetail, PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT,
     PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
@@ -369,9 +369,14 @@ fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
     } else {
         Some(format!("{:03}", c.sort_priority))
     };
+    let kind = if let Some(ref d) = c.display_override {
+        handler_display_to_completion_kind(d)
+    } else {
+        fa_completion_kind(&c.kind)
+    };
     CompletionItem {
         label: c.label,
-        kind: Some(fa_completion_kind(&c.kind)),
+        kind: Some(kind),
         detail: c.detail,
         insert_text: c.insert_text,
         filter_text,
@@ -914,6 +919,7 @@ fn dispatch_target_completions(
             // this position when a dispatcher is declared for them.
             sort_priority: 0,
             additional_edits: Vec::new(),
+                display_override: None,
         }
     }).collect()
 }
@@ -1454,6 +1460,7 @@ fn imported_function_completions(
                 insert_text: None,
                 sort_priority: PRIORITY_EXPLICIT_IMPORT,
                 additional_edits: vec![],
+                display_override: None,
             });
         }
 
@@ -1513,6 +1520,7 @@ fn imported_function_completions(
                     insert_text: None,
                     sort_priority: priority,
                     additional_edits,
+                    display_override: None,
                 });
             }
         }
@@ -1594,6 +1602,7 @@ fn unimported_function_completions(
                     insert_span,
                     format!("use {} qw({});\n", module_name, name),
                 )],
+                display_override: None,
             });
         }
     });

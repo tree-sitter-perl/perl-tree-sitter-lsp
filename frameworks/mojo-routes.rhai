@@ -70,6 +70,10 @@ fn route_emissions(controller, action, span, current_package) {
     // controller action (a real method elsewhere). Event would be
     // misleading; these aren't things you react to, they're things
     // you *invoke* indirectly.
+    // Routes aren't methods — they're named URL patterns that dispatch
+    // to a controller action. Rendering them as Function gives them a
+    // distinct icon from both Perl methods and events, matching how
+    // users think about them (helper-y, framework-y callables).
     items += #{
         Handler: #{
             name: controller + "#" + action,
@@ -78,7 +82,7 @@ fn route_emissions(controller, action, span, current_package) {
             params: [],
             span: span,
             selection_span: span,
-            display: "Method",
+            display: "Function",
         }
     };
 

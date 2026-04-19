@@ -307,7 +307,7 @@ fn cli_outline(file: &str) {
         if let Some(ref pkg) = sym.package {
             entry["package"] = serde_json::json!(pkg);
         }
-        if let file_analysis::SymbolDetail::Sub { ref params, ref return_type, is_method, .. } = sym.detail {
+        if let file_analysis::SymbolDetail::Sub { ref params, ref return_type, is_method, ref display, .. } = sym.detail {
             if !params.is_empty() {
                 let param_names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
                 entry["params"] = serde_json::json!(param_names);
@@ -318,11 +318,15 @@ fn cli_outline(file: &str) {
             if is_method {
                 entry["is_method"] = serde_json::json!(true);
             }
+            if let Some(d) = display {
+                entry["display"] = serde_json::json!(format!("{:?}", d));
+            }
         }
-        if let file_analysis::SymbolDetail::Handler { ref params, ref dispatchers, .. } = sym.detail {
+        if let file_analysis::SymbolDetail::Handler { ref params, ref dispatchers, ref display, .. } = sym.detail {
             let param_names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
             entry["params"] = serde_json::json!(param_names);
             entry["dispatchers"] = serde_json::json!(dispatchers);
+            entry["display"] = serde_json::json!(format!("{:?}", display));
         }
         results.push(entry);
     }

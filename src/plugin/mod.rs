@@ -114,6 +114,13 @@ pub enum EmitAction {
         doc: Option<String>,
         #[serde(default)]
         on_class: Option<String>,
+        /// Plugin's choice of LSP display kind (shown in outline + completion).
+        /// `None` = use the default (Method → METHOD, Sub → FUNCTION) — the
+        /// common case for plugins that just need "a method lives here". Set
+        /// this when the synthesized callable is semantically distinct from a
+        /// hand-written method (helpers, routes, DSL verbs, …).
+        #[serde(default)]
+        display: Option<HandlerDisplay>,
     },
     /// Synthesize a `HashKeyDef` for a constructor/stash/etc. key.
     HashKeyDef {
@@ -412,6 +419,7 @@ mod tests {
             return_type: None,
             doc: None,
             on_class: None,
+            display: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         assert!(json.contains("\"Method\""));

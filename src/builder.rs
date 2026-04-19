@@ -587,12 +587,14 @@ impl<'a> Builder<'a> {
                 return_type,
                 doc,
                 on_class,
+                display,
             } => {
                 let detail = SymbolDetail::Sub {
                     params: params.into_iter().map(Into::into).collect(),
                     is_method,
                     return_type,
                     doc,
+                    display,
                 };
                 // Target package for this emission: either the plugin's
                 // override or the current build state.
@@ -1075,7 +1077,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc },
+            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc, display: None },
         );
 
         // Push sub scope
@@ -1418,7 +1420,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None },
+                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None, display: None },
                     );
                 }
                 if has_writer {
@@ -1437,6 +1439,7 @@ impl<'a> Builder<'a> {
                             is_method: true,
                             return_type: None,
                             doc: None,
+                            display: None,
                         },
                     );
                 }
@@ -2800,6 +2803,7 @@ impl<'a> Builder<'a> {
                             is_method: true,
                             return_type: return_type.clone(),
                             doc: None,
+                            display: None,
                         },
                     );
                     // Setter for rw
@@ -2818,6 +2822,7 @@ impl<'a> Builder<'a> {
                                 is_method: true,
                                 return_type: return_type.clone(),
                                 doc: None,
+                                display: None,
                             },
                         );
                     }
@@ -2838,6 +2843,7 @@ impl<'a> Builder<'a> {
                                 is_method: true,
                                 return_type: return_type.clone(),
                                 doc: None,
+                                display: None,
                             },
                         );
                     }
@@ -2861,6 +2867,7 @@ impl<'a> Builder<'a> {
                             is_method: true,
                             return_type: getter_type.clone(),
                             doc: None,
+                            display: None,
                         },
                     );
                     // Setter: fluent, returns $self for chaining
@@ -2879,6 +2886,7 @@ impl<'a> Builder<'a> {
                             return_type: self.current_package.as_ref()
                                 .map(|pkg| InferredType::ClassName(pkg.clone())),
                             doc: None,
+                            display: None,
                         },
                     );
                 }
@@ -3245,6 +3253,7 @@ impl<'a> Builder<'a> {
                     is_method: true,
                     return_type: None,
                     doc: None,
+                    display: None,
                 },
             );
         }
@@ -3330,6 +3339,7 @@ impl<'a> Builder<'a> {
                     is_method: true,
                     return_type,
                     doc: None,
+                    display: None,
                 },
             );
         }
@@ -7206,16 +7216,30 @@ $app->helper(current_user => sub {
                 && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
             .collect();
 
-        assert_eq!(helpers.len(), 1, "one helper method emitted");
-        let helper = helpers[0];
-        assert_eq!(helper.package.as_deref(), Some("Mojolicious::Controller"),
-            "helper lives on the shared Controller base, not the Lite script's package");
-        if let SymbolDetail::Sub { params, .. } = &helper.detail {
-            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
-            assert_eq!(names, vec!["$c", "$extra"],
-                "helper's sub params flow through to the Method signature");
-        } else {
-            panic!("helper detail should be Sub");
+        // Helpers register on BOTH Mojolicious::Controller and the
+        // Mojolicious app class so `$c->current_user` AND
+        // `$app->current_user` both complete / goto-def.
+        assert_eq!(helpers.len(), 2, "one helper per entry class");
+        let on_controller = helpers.iter()
+            .find(|h| h.package.as_deref() == Some("Mojolicious::Controller"))
+            .expect("Controller-class helper");
+        let on_app = helpers.iter()
+            .find(|h| h.package.as_deref() == Some("Mojolicious"))
+            .expect("app-class helper");
+
+        for helper in [on_controller, on_app] {
+            if let SymbolDetail::Sub { params, display, .. } = &helper.detail {
+                let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+                assert_eq!(names, vec!["$c", "$extra"],
+                    "helper's sub params flow through to the Method signature");
+                assert_eq!(
+                    *display,
+                    Some(crate::file_analysis::HandlerDisplay::Function),
+                    "helpers render as Function, not plain Method",
+                );
+            } else {
+                panic!("helper detail should be Sub");
+            }
         }
     }
 
@@ -7632,6 +7656,86 @@ app->helper(greet => sub {
             "helper Method must be packaged on the shared controller base; \
              that's what lets every subclass pick it up via inheritance walk");
         assert!(matches!(&greet.namespace, Namespace::Framework { id } if id == "mojo-helpers"));
+    }
+
+    /// Helpers complete on both `$c` (Controller) and `$app` (the
+    /// Mojolicious app class). Every helper registers a Method on each
+    /// entry class, so `complete_methods_for_class` for either class
+    /// surfaces the helper. Dotted chain roots also land on both
+    /// classes; the deeper proxies stay on the shared prefix.
+    #[test]
+    fn plugin_mojo_helpers_complete_on_app_class_too() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(current_user => sub { my ($c) = @_; });
+$app->helper('users.create' => sub { my ($c, $name) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        for class in ["Mojolicious::Controller", "Mojolicious"] {
+            let candidates = fa.complete_methods_for_class(class, None);
+            let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+            assert!(
+                labels.contains(&"current_user"),
+                "`current_user` must complete on {}; got: {:?}",
+                class, labels,
+            );
+            assert!(
+                labels.contains(&"users"),
+                "`users` (dotted-helper root) must complete on {}; got: {:?}",
+                class, labels,
+            );
+        }
+    }
+
+    /// mojo-lite route URLs are referenced from `->url_for(...)` and
+    /// `->redirect_to(...)`. Both emit `DispatchCall` refs tight to
+    /// the URL string so gd/gr compose via the standard Handler
+    /// resolution path — no Lite-aware code in the core.
+    #[test]
+    fn plugin_mojo_lite_url_dispatch_emits_refs() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+get '/hello' => sub {
+    my ($c) = @_;
+    $c->render(text => 'hi');
+};
+
+sub after {
+    my ($c) = @_;
+    $c->redirect_to('/hello');
+    my $u = $c->url_for('/hello');
+}
+"#;
+        let fa = build_fa(src);
+
+        let dispatch_refs: Vec<&crate::file_analysis::Ref> = fa.refs.iter()
+            .filter(|r| matches!(&r.kind, RefKind::DispatchCall { .. }))
+            .filter(|r| r.target_name == "/hello")
+            .collect();
+
+        let dispatchers: Vec<&str> = dispatch_refs.iter()
+            .map(|r| match &r.kind {
+                RefKind::DispatchCall { dispatcher, .. } => dispatcher.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+
+        assert!(
+            dispatchers.contains(&"redirect_to"),
+            "redirect_to('/hello') must emit a DispatchCall ref; got: {:?}",
+            dispatchers,
+        );
+        assert!(
+            dispatchers.contains(&"url_for"),
+            "url_for('/hello') must emit a DispatchCall ref; got: {:?}",
+            dispatchers,
+        );
     }
 
     /// Plugin triggers must gate emission. A class that doesn't inherit from
