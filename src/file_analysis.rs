@@ -220,6 +220,23 @@ pub enum SymbolDetail {
         /// `None` leaves the default (Method → METHOD, Sub → FUNCTION).
         #[serde(default)]
         display: Option<HandlerDisplay>,
+        /// Suppress this symbol in the document outline / workspace
+        /// symbol list. Plugins synthesizing DSL imports (Mojolicious::Lite's
+        /// `get`/`post`/`app`/...) set it so hover/gd/completion still work
+        /// on the name, but the outline stays focused on user-visible
+        /// structure. Whoever constructs the detail decides — the core
+        /// never infers.
+        #[serde(default)]
+        hide_in_outline: bool,
+        /// The return type is plugin-internal plumbing — use it for
+        /// chain resolution but don't render it in completion details,
+        /// hover return-type lines, or inlay hints. Lets framework
+        /// plugins thread proxy classes (Mojo helper namespaces, DBIC
+        /// result wrappers, etc.) without leaking "returns:
+        /// _Helper::users::create" at every call site. Plugin-declared,
+        /// no core heuristic on the type name.
+        #[serde(default)]
+        opaque_return: bool,
     },
     Class {
         parent: Option<String>,
@@ -255,6 +272,21 @@ pub enum SymbolDetail {
         params: Vec<ParamInfo>,
         #[serde(default)]
         display: HandlerDisplay,
+        /// Plugin-declared dispatch shape. When `Some(n)`, dispatcher
+        /// calls pass the handler's positional args inside an arrayref
+        /// at dispatcher-arg position `n` (0-indexed, counting from
+        /// the dispatcher's own arg list). Sig help routes accordingly:
+        /// cursor inside `[...]` at that position → show `params`.
+        /// `None` → plain positional after the name (like Mojo events).
+        /// Minion's `enqueue(task, [@args], {opts})` sets this to 1.
+        #[serde(default)]
+        args_in_arrayref_at: Option<usize>,
+        /// Suppress this handler in the document outline. Plugins set
+        /// it for framework-synthesized entries that shouldn't clutter
+        /// the user's navigation view — hover/gd/completion still find
+        /// them via the symbol table.
+        #[serde(default)]
+        hide_in_outline: bool,
     },
     /// Package, Module, or other kinds needing no extra data.
     None,
@@ -1448,10 +1480,35 @@ impl FileAnalysis {
             class_name.to_string()
         };
         if let Some(ref rt) = self.find_method_return_type(class_name, method_name, module_index, None) {
+            // `opaque_return` lets the declaring plugin say "this
+            // whole chain link is internal plumbing — don't render
+            // the class name OR the return type". The chain still
+            // resolves (find_method_return_type returned the proxy),
+            // but the user doesn't see the proxy-class path at every
+            // completion detail line. Plugin-declared; the core
+            // never inspects names.
+            if self.method_opaque_return(class_name, method_name) {
+                return String::new();
+            }
             format!("{} → {}", base, format_inferred_type(rt))
         } else {
             base
         }
+    }
+
+    /// Does the Method/Sub `method_name` on `class_name` opt out of
+    /// rendering its return type at call sites? Plugin-declared via
+    /// `opaque_return` on the symbol's detail.
+    fn method_opaque_return(&self, class_name: &str, method_name: &str) -> bool {
+        for sym in &self.symbols {
+            if sym.name != method_name { continue; }
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+            if sym.package.as_deref() != Some(class_name) { continue; }
+            if let SymbolDetail::Sub { opaque_return, .. } = &sym.detail {
+                if *opaque_return { return true; }
+            }
+        }
+        false
     }
 
     /// Complete methods for a known class name, walking the inheritance chain.
@@ -2713,6 +2770,15 @@ impl FileAnalysis {
             if sym.scope != parent_scope {
                 continue;
             }
+            // Per-symbol opt-out. Plugins mark DSL imports / internal
+            // infrastructure so the outline stays focused on real
+            // user-visible structure.
+            let hidden = match &sym.detail {
+                SymbolDetail::Sub { hide_in_outline, .. } => *hide_in_outline,
+                SymbolDetail::Handler { hide_in_outline, .. } => *hide_in_outline,
+                _ => false,
+            };
+            if hidden { continue; }
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) && sym.namespace.is_framework() {
                 let key = (
                     sym.kind,
@@ -3251,6 +3317,72 @@ impl FileAnalysis {
         }
         let imported_owner = HashKeyOwner::Sub { package: None, name: sub_name.to_string() };
         push_unique(self.complete_hash_keys_for_owner(&imported_owner), &mut out, &mut seen);
+
+        // Final sweep: match any HashKeyDef whose owner is Sub{name: sub_name}
+        // regardless of package. Covers plugin-synthesized options (e.g.
+        // `Sub { package: Minion, name: enqueue }` from the minion plugin)
+        // where the sub itself isn't in the local symbol table.
+        let pseudo_syms: Vec<_> = self.symbols.iter()
+            .filter(|s| {
+                if !matches!(s.kind, SymKind::HashKeyDef) { return false; }
+                matches!(&s.detail, SymbolDetail::HashKeyDef {
+                    owner: HashKeyOwner::Sub { name, .. }, ..
+                } if name == sub_name)
+            })
+            .collect();
+        for def in pseudo_syms {
+            if seen.insert(def.name.clone()) {
+                let detail = format!("{}() option", sub_name);
+                out.push(CompletionCandidate {
+                    label: def.name.clone(),
+                    kind: SymKind::Variable,
+                    detail: Some(detail),
+                    insert_text: None,
+                    sort_priority: PRIORITY_FILE_WIDE,
+                    additional_edits: vec![],
+                    display_override: None,
+                });
+            }
+        }
+
+        // Body-derived keys: if the sub has a final hashref-ish param
+        // (`sub foo { my ($x, $opts) = @_; $opts->{priority} }`), the
+        // key accesses in the body reveal the expected option names.
+        // Mirror of `complete_keyval_args` but for the nested-hash-literal
+        // call shape (`foo($x, { | })`) routed through HashKey context.
+        for sym in &self.symbols {
+            if sym.name != sub_name { continue; }
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+            let params = match &sym.detail {
+                SymbolDetail::Sub { params, .. } => params,
+                _ => continue,
+            };
+            let hashish = params
+                .iter()
+                .find(|p| p.is_slurpy && p.name.starts_with('%'))
+                .or_else(|| params
+                    .last()
+                    .filter(|p| !p.is_invocant && p.name.starts_with('$')));
+            let bare_name = match hashish {
+                Some(p) if p.name.len() > 1 => &p.name[1..],
+                _ => continue,
+            };
+            let Some(body_scope) = self.find_body_scope(sym) else { continue };
+            for k in self.hash_keys_in_scope(bare_name, body_scope) {
+                if seen.insert(k.clone()) {
+                    out.push(CompletionCandidate {
+                        label: k,
+                        kind: SymKind::Variable,
+                        detail: Some(format!("{}() option", sub_name)),
+                        insert_text: None,
+                        sort_priority: PRIORITY_FILE_WIDE,
+                        additional_edits: vec![],
+                        display_override: None,
+                    });
+                }
+            }
+        }
+
         out
     }
 
@@ -3355,11 +3487,20 @@ impl FileAnalysis {
                     _ => return Vec::new(),
                 };
 
-                // Find slurpy %hash param
-                let slurpy = params
+                // Pick the param that carries key=>value pairs:
+                //   * slurpy `%opts` is the classic shape
+                //   * final `$opts` scalar deref'd as a hashref in the
+                //     body (`$opts->{…}`) is the same pattern — we
+                //     collect the same way, just strip the `$` sigil
+                //     when scanning the body. Previously only slurpy
+                //     worked; every "options-hashref" sub missed out.
+                let hashish = params
                     .iter()
-                    .find(|p| p.is_slurpy && p.name.starts_with('%'));
-                let slurpy_name = match slurpy {
+                    .find(|p| p.is_slurpy && p.name.starts_with('%'))
+                    .or_else(|| params
+                        .last()
+                        .filter(|p| !p.is_invocant && p.name.starts_with('$')));
+                let slurpy_name = match hashish {
                     Some(p) => {
                         if p.name.starts_with('%') || p.name.starts_with('$') || p.name.starts_with('@') {
                             &p.name[1..]
@@ -3376,6 +3517,10 @@ impl FileAnalysis {
                     Some(scope_id) => self.hash_keys_in_scope(slurpy_name, scope_id),
                     None => Vec::new(),
                 };
+                // Bail silently when the chosen scalar doesn't actually
+                // get deref'd as a hash — the last-param heuristic is
+                // loose; no accesses means "not an options param".
+                if keys.is_empty() { return Vec::new(); }
 
                 keys.into_iter()
                     .filter(|k| !used_keys.contains(k))
@@ -4102,6 +4247,8 @@ mod tests {
                     return_type: Some(InferredType::HashRef),
                     doc: None,
                     display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
                 },
                 namespace: Namespace::Language,
             }],

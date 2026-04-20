@@ -63,6 +63,8 @@ fn on_use(ctx) {
     // resolves and completion offers instance methods. FrameworkImport
     // keeps the unresolved-function diagnostic happy; the typed Sub
     // symbol layered on top is what gives hover/gd/completion.
+    // `hide_in_outline: true` — DSL imports shouldn't clutter the
+    // user's navigation view.
     out += #{ FrameworkImport: #{ keyword: "app" } };
     out += #{
         Symbol: #{
@@ -77,6 +79,7 @@ fn on_use(ctx) {
                     return_type: #{ ClassName: "Mojolicious" },
                     doc: docs["app"],
                     display: "Function",
+                    hide_in_outline: true,
                 }
             },
         }
@@ -106,6 +109,7 @@ fn on_use(ctx) {
                         return_type: (),
                         doc: docs[v],
                         display: "Function",
+                        hide_in_outline: true,
                     }
                 },
             }
@@ -155,8 +159,11 @@ fn on_function_call(ctx) {
         params = as_invocant_params(args[1].sub_params);
     }
 
-    // Lite routes render as Function — same reasoning as mojo-routes:
-    // they're framework-synthesized URL callables, not Perl methods.
+    // Lite routes are framework-synthesized URL callables. `display`
+    // still set (so when other surfaces DO render them the icon is
+    // right), but `hide_in_outline` keeps the user's outline focused
+    // on the actual Perl structure — routes exist at their call
+    // sites, not as standalone top-level symbols.
     out += #{
         Handler: #{
             name: path,
@@ -166,6 +173,7 @@ fn on_function_call(ctx) {
             span: args[0].span,
             selection_span: args[0].span,
             display: "Function",
+            hide_in_outline: true,
         }
     };
 

@@ -128,6 +128,19 @@ pub enum EmitAction {
         /// hand-written method (helpers, routes, DSL verbs, …).
         #[serde(default)]
         display: Option<HandlerDisplay>,
+        /// Hide this symbol from the outline. Use for framework
+        /// imports (Mojolicious::Lite's `get`/`post`/...) and other
+        /// synthesized infrastructure that shouldn't clutter
+        /// navigation — hover/gd/completion still work.
+        #[serde(default)]
+        hide_in_outline: bool,
+        /// The return type is internal plumbing. Participates in
+        /// chain resolution (`$app->admin->users` walks through it)
+        /// but isn't rendered in completion / hover / inlay hints.
+        /// Plugin's call — it knows whether its return type is a
+        /// real user-facing class or a synthetic pass-through.
+        #[serde(default)]
+        opaque_return: bool,
     },
     /// Synthesize a `HashKeyDef` for a constructor/stash/etc. key.
     HashKeyDef {
@@ -174,6 +187,16 @@ pub enum EmitAction {
         selection_span: Span,
         #[serde(default)]
         display: HandlerDisplay,
+        /// Dispatch shape. `Some(n)` = handler args ride inside an
+        /// arrayref at dispatcher-arg position `n`; sig help then fires
+        /// when the cursor is inside `[...]` at that position (Minion's
+        /// `enqueue(task, [@args])` uses 1). Default: plain positional
+        /// (matches `emit('name', arg1, arg2)` style).
+        #[serde(default)]
+        args_in_arrayref_at: Option<usize>,
+        /// Hide from document outline (see Method variant).
+        #[serde(default)]
+        hide_in_outline: bool,
     },
     /// Emit a call-site reference for a Handler — e.g. the cursor is on
     /// `'ready'` in `$x->emit('ready', ...)`. `dispatcher` is the
@@ -441,6 +464,8 @@ mod tests {
             doc: None,
             on_class: None,
             display: None,
+            hide_in_outline: false,
+            opaque_return: false,
         };
         let json = serde_json::to_string(&action).unwrap();
         assert!(json.contains("\"Method\""));

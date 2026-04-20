@@ -300,6 +300,14 @@ fn cli_outline(file: &str) {
             | file_analysis::SymKind::Variable | file_analysis::SymKind::Handler => {}
             _ => continue,
         }
+        // Honor plugin-opted-out symbols: DSL imports, framework
+        // infrastructure, anything the plugin flagged as non-outline.
+        let hidden = match &sym.detail {
+            file_analysis::SymbolDetail::Sub { hide_in_outline, .. } => *hide_in_outline,
+            file_analysis::SymbolDetail::Handler { hide_in_outline, .. } => *hide_in_outline,
+            _ => false,
+        };
+        if hidden { continue; }
         let mut entry = serde_json::json!({
             "name": sym.name,
             "kind": format!("{:?}", sym.kind),

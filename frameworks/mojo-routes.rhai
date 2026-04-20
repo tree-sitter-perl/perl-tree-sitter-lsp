@@ -71,9 +71,9 @@ fn route_emissions(controller, action, span, current_package) {
     // misleading; these aren't things you react to, they're things
     // you *invoke* indirectly.
     // Routes aren't methods — they're named URL patterns that dispatch
-    // to a controller action. Rendering them as Function gives them a
-    // distinct icon from both Perl methods and events, matching how
-    // users think about them (helper-y, framework-y callables).
+    // to a controller action. Hidden from outline (the outline is for
+    // user-written Perl structure; routes are framework wiring), but
+    // the Handler symbol is still there for gd/gr/workspace-symbol.
     items += #{
         Handler: #{
             name: controller + "#" + action,
@@ -83,6 +83,7 @@ fn route_emissions(controller, action, span, current_package) {
             span: span,
             selection_span: span,
             display: "Function",
+            hide_in_outline: true,
         }
     };
 

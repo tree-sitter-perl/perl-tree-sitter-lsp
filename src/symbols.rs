@@ -1026,6 +1026,175 @@ fn dispatch_info_for_enclosing_call(
     None
 }
 
+/// Detect "cursor inside an arrayref that is a positional arg to a
+/// dispatcher call, matching the Handler's `args_in_arrayref_at`".
+/// Returns (handler_name, owner_class, dispatcher_method, active_param_within_arrayref).
+///
+/// The plugin already declared the call shape on each Handler it
+/// registered; our job is to (a) find the enclosing
+/// `anonymous_array_expression` and its position in the outer
+/// call's argument list, (b) find the Handler by first-string-arg
+/// name + dispatcher, and (c) confirm its `args_in_arrayref_at`
+/// matches the positional index. No plugin-specific logic here —
+/// the core reads the declaration and routes accordingly.
+fn dispatch_info_for_enclosing_arrayref_call(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &[u8],
+    point: Point,
+) -> Option<(String, String, String, usize)> {
+    use tree_sitter::Node;
+
+    // Walk up to the nearest anonymous_array_expression (the `[ ... ]`
+    // literal). Then walk one step further to the enclosing call.
+    let mut n = tree.root_node().descendant_for_point_range(point, point)?;
+    let array_node: Node = loop {
+        if n.kind() == "anonymous_array_expression" {
+            break n;
+        }
+        n = n.parent()?;
+    };
+
+    // Position within the arrayref: comma count before cursor, inside
+    // the array's own span (we stop scanning at the array boundaries).
+    let active_in_arrayref = count_commas_inside_node(array_node, source, point);
+
+    // Enclosing call.
+    let mut p = array_node.parent()?;
+    for _ in 0..8 {
+        match p.kind() {
+            "method_call_expression" | "function_call_expression"
+            | "ambiguous_function_call_expression" => break,
+            _ => p = p.parent()?,
+        }
+    }
+    let call = p;
+
+    // Args list for the enclosing call — find the arrayref's positional
+    // index among the call's top-level arguments.
+    let args_node = call.child_by_field_name("arguments")?;
+    let positional_index = positional_index_of_node(args_node, array_node)?;
+
+    // Dispatcher name + first-string-arg name from the call.
+    let (dispatcher, first_string_arg) = call_dispatcher_and_name(call, source)?;
+
+    // Locate the Handler by name + dispatcher + arrayref position.
+    // Scan local symbols; cross-file can extend later — the arrayref
+    // shape is the same invariant as the positional one.
+    for sym in &analysis.symbols {
+        if sym.name != first_string_arg { continue; }
+        let SymbolDetail::Handler {
+            owner, dispatchers, args_in_arrayref_at, ..
+        } = &sym.detail else { continue };
+        let HandlerOwner::Class(class) = owner;
+        if !dispatchers.iter().any(|d| d == &dispatcher) { continue; }
+        if *args_in_arrayref_at != Some(positional_index) { continue; }
+        return Some((
+            first_string_arg,
+            class.clone(),
+            dispatcher,
+            active_in_arrayref,
+        ));
+    }
+    None
+}
+
+/// Count `,` separators inside a container node that occur before
+/// `point`. Used to pick the active parameter inside an arrayref arg.
+fn count_commas_inside_node(node: tree_sitter::Node, source: &[u8], point: Point) -> usize {
+    let mut count = 0;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let child_end = child.end_position();
+        let child_start = child.start_position();
+        let before_cursor = (child_end.row, child_end.column) <= (point.row, point.column);
+        if !before_cursor { break; }
+        if !child.is_named() {
+            if let Ok(text) = child.utf8_text(source) {
+                if text == "," { count += 1; }
+            }
+        }
+        // skip past; we only count at this depth
+        let _ = child_start;
+    }
+    count
+}
+
+/// Index of `target` among the direct argument nodes of `args_node`.
+/// `,` and `=>` bump the index; `=>` is treated the same as `,`.
+fn positional_index_of_node(args_node: tree_sitter::Node, target: tree_sitter::Node) -> Option<usize> {
+    let mut index = 0;
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.id() == target.id() {
+            return Some(index);
+        }
+        if !child.is_named() {
+            // separator — bump index
+            continue;
+        }
+        // named child = an argument; separators come between
+        // — count the named child BEFORE the separator.
+        // We pre-increment only when we see a comma, so use a
+        // different scheme: count named args as we pass them.
+        index += 1;
+    }
+    None
+}
+
+/// Extract `(method_name, first_arg_as_string)` from a call node.
+/// The first-string-arg is const-folded via the literal text only;
+/// plugin-emitted DispatchCall already accounts for const-folded
+/// variables, but this path is the text-level fallback used when no
+/// DispatchCall was emitted (arrayref dispatchers emit at the name
+/// string, so the ref is available — still, text-level works too).
+fn call_dispatcher_and_name(
+    call: tree_sitter::Node,
+    source: &[u8],
+) -> Option<(String, String)> {
+    let dispatcher = match call.kind() {
+        "method_call_expression" => call
+            .child_by_field_name("method")?
+            .utf8_text(source)
+            .ok()?
+            .to_string(),
+        "function_call_expression" | "ambiguous_function_call_expression" => call
+            .child_by_field_name("function")?
+            .utf8_text(source)
+            .ok()?
+            .to_string(),
+        _ => return None,
+    };
+    let args = call.child_by_field_name("arguments")?;
+    let first = first_named_child_as_string(args, source)?;
+    Some((dispatcher, first))
+}
+
+/// Return the first string-literal/bareword argument content, when
+/// the call's first arg is constant.
+fn first_named_child_as_string(
+    args_node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<String> {
+    let first = if args_node.kind() == "list_expression"
+        || args_node.kind() == "parenthesized_expression"
+    {
+        args_node.named_child(0)?
+    } else {
+        args_node
+    };
+    let text = first.utf8_text(source).ok()?;
+    match first.kind() {
+        "string_literal" | "interpolated_string_literal" => Some(
+            text.trim_start_matches(['\'', '"'])
+                .trim_end_matches(['\'', '"'])
+                .to_string(),
+        ),
+        "bareword" | "autoquoted_bareword" => Some(text.to_string()),
+        _ => None,
+    }
+}
+
 fn span_contains_span(outer: &crate::file_analysis::Span, inner: &crate::file_analysis::Span) -> bool {
     let o_start = (outer.start.row, outer.start.column);
     let o_end   = (outer.end.row,   outer.end.column);
@@ -1182,6 +1351,31 @@ pub fn signature_help(
     // Stacked defs (multiple `->on('ready', sub {...})` wire-ups) each
     // contribute one `SignatureInformation` so users see every handler
     // shape they might be dispatching to.
+    // Arrayref-wrapped args: plugins can declare that a dispatcher
+    // passes handler args inside an arrayref at some positional slot
+    // (Minion's `enqueue(task, [@args], {opts})`). When the cursor
+    // sits inside such an arrayref, the active parameter is the
+    // comma index WITHIN the arrayref, and the handler's params are
+    // what we want to surface. Try this path before the plain
+    // positional dispatch path so arrayref-aware plugins take
+    // precedence at the right position.
+    if let Some((handler_name, owner_class, dispatcher, active_in_arrayref)) =
+        dispatch_info_for_enclosing_arrayref_call(analysis, tree, text.as_bytes(), point)
+    {
+        if let Some(sig) = string_dispatch_signature_for(
+            analysis,
+            Some(module_index),
+            &owner_class,
+            &dispatcher,
+            &handler_name,
+            // active_param is 1-indexed downstream (saturating_sub(1)), so
+            // bump by 1 to match the positional convention.
+            active_in_arrayref + 1,
+        ) {
+            return Some(sig);
+        }
+    }
+
     if call_ctx.is_method && call_ctx.active_param >= 1 {
         // Primary path: find the DispatchCall ref the plugin already
         // emitted for this call site. Its `target_name`, `owner`, and

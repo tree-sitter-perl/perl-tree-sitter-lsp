@@ -300,6 +300,23 @@ pub fn detect_cursor_context_tree(
                     }
                 }
             }
+            "anonymous_hash_expression" => {
+                // `{ key => ... }` literal. If it lives as a positional
+                // argument to a method/function call, the hash's owner
+                // is the called sub — mirror of "inside ->{…}" detection
+                // so `foo($x, { | })` completes against foo()'s final
+                // hashref-arg keys. Only trigger when the cursor is at
+                // a key position inside the literal (even-comma count).
+                if let Some(call_name) = enclosing_call_for_hash_arg(current, source) {
+                    if cursor_at_hash_key_slot(current, point) {
+                        return Some(CursorContext::HashKey {
+                            owner_type: None,
+                            var_text: String::new(),
+                            source_sub: Some(call_name),
+                        });
+                    }
+                }
+            }
             "ERROR" => {
                 // Incomplete expression: look for `expr->{` or `expr->` patterns
                 // in error recovery
@@ -312,6 +329,46 @@ pub fn detect_cursor_context_tree(
         current = current.parent()?;
     }
     None
+}
+
+/// For an `anonymous_hash_expression` node, find the enclosing
+/// method/function call whose argument list contains it. Returns the
+/// callee name; None when the hash literal lives outside any call
+/// (e.g. `my $cfg = { ... }` — a pure constructor, no caller context).
+/// Used by cursor-context detection to route `foo($x, { | })` to the
+/// callee's HashKey completions without touching the core's hash-
+/// ownership model.
+fn enclosing_call_for_hash_arg(hash_node: Node, source: &[u8]) -> Option<String> {
+    // Walk up until we find the call whose args include this hash.
+    // Stop at a sub-scope boundary (block/sub-body) so we don't
+    // leak across function boundaries.
+    let mut n = hash_node;
+    for _ in 0..16 {
+        let parent = n.parent()?;
+        match parent.kind() {
+            "method_call_expression" => {
+                let method = parent.child_by_field_name("method")?;
+                return method.utf8_text(source).ok().map(|s| s.to_string());
+            }
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                let func = parent.child_by_field_name("function")?;
+                return func.utf8_text(source).ok().map(|s| s.to_string());
+            }
+            "block" | "subroutine_declaration_statement"
+            | "method_declaration_statement" | "anonymous_subroutine_expression"
+            | "class_statement" | "package_statement" => return None,
+            _ => {}
+        }
+        n = parent;
+    }
+    None
+}
+
+/// Inside an `anonymous_hash_expression`, determine whether the cursor
+/// sits at a key slot (even number of `,`/`=>` separators since the
+/// opening `{`). Matches the call-arg key-vs-value counting.
+fn cursor_at_hash_key_slot(hash_node: Node, point: Point) -> bool {
+    count_separators_before(hash_node, point) % 2 == 0
 }
 
 /// Resolve the type of a tree-sitter node used as an invocant or hash owner.

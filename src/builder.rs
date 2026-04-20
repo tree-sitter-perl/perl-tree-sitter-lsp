@@ -636,6 +636,8 @@ impl<'a> Builder<'a> {
                 doc,
                 on_class,
                 display,
+                hide_in_outline,
+                opaque_return,
             } => {
                 let detail = SymbolDetail::Sub {
                     params: params.into_iter().map(Into::into).collect(),
@@ -643,6 +645,8 @@ impl<'a> Builder<'a> {
                     return_type,
                     doc,
                     display,
+                    hide_in_outline,
+                    opaque_return,
                 };
                 // Target package for this emission: either the plugin's
                 // override or the current build state.
@@ -696,12 +700,15 @@ impl<'a> Builder<'a> {
             }
             plugin::EmitAction::Handler {
                 name, owner, dispatchers, params, span, selection_span, display,
+                args_in_arrayref_at, hide_in_outline,
             } => {
                 let detail = SymbolDetail::Handler {
                     owner,
                     dispatchers,
                     params: params.into_iter().map(Into::into).collect(),
                     display,
+                    args_in_arrayref_at,
+                    hide_in_outline,
                 };
                 self.add_symbol_ns(name, SymKind::Handler, span, selection_span, detail, ns);
             }
@@ -1161,7 +1168,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc, display: None },
+            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc, display: None, hide_in_outline: false, opaque_return: false },
         );
 
         // Push sub scope
@@ -1509,7 +1516,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None, display: None },
+                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None, display: None, hide_in_outline: false, opaque_return: false },
                     );
                 }
                 if has_writer {
@@ -1530,6 +1537,8 @@ impl<'a> Builder<'a> {
                             return_type: None,
                             doc: None,
                             display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
                         },
                     );
                 }
@@ -2894,6 +2903,8 @@ impl<'a> Builder<'a> {
                             return_type: return_type.clone(),
                             doc: None,
                             display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
                         },
                     );
                     // Setter for rw
@@ -2914,6 +2925,8 @@ impl<'a> Builder<'a> {
                                 return_type: return_type.clone(),
                                 doc: None,
                                 display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
                             },
                         );
                     }
@@ -2936,6 +2949,8 @@ impl<'a> Builder<'a> {
                                 return_type: return_type.clone(),
                                 doc: None,
                                 display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
                             },
                         );
                     }
@@ -2960,6 +2975,8 @@ impl<'a> Builder<'a> {
                             return_type: getter_type.clone(),
                             doc: None,
                             display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
                         },
                     );
                     // Setter: fluent, returns $self for chaining
@@ -2980,6 +2997,8 @@ impl<'a> Builder<'a> {
                                 .map(|pkg| InferredType::ClassName(pkg.clone())),
                             doc: None,
                             display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
                         },
                     );
                 }
@@ -3348,6 +3367,8 @@ impl<'a> Builder<'a> {
                     return_type: None,
                     doc: None,
                     display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
                 },
             );
         }
@@ -3434,6 +3455,8 @@ impl<'a> Builder<'a> {
                     return_type,
                     doc: None,
                     display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
                 },
             );
         }
@@ -7983,39 +8006,165 @@ $minion->enqueue(task_x => ['arg'] => { priority => 10 });
         }
     }
 
-    /// TODO: sig help on the array argument of enqueue
-    /// (`$minion->enqueue('task', [|])`) should show the task's
-    /// params. Minion unpacks the arrayref into the task callback's
-    /// positionals, so the ideal UX offers `$to, $subject, $body`
-    /// when the cursor is inside the `[...]`. Needs core-side
-    /// support for "dispatcher's positional N is the argument list
-    /// in an arrayref". Marked ignored until that lands.
+    /// `$app->admin->` (chained helper call) completion returns the
+    /// proxy class's methods — not the fallback full-file list.
+    /// Validates that `resolve_expression_type` chains through the
+    /// plugin-synthesized opaque return and
+    /// `complete_methods_for_class` finds methods on the proxy.
     #[test]
-    #[ignore = "TODO: sig help on arrayref positional — needs core support"]
-    fn plugin_minion_sig_help_on_enqueue_array_args() {
-        // When this test is un-ignored, it should:
-        //   1. Build a file with add_task + enqueue sites.
-        //   2. Query sig help at a point inside the `[...]` of the
-        //      enqueue call.
-        //   3. Assert the signature lists the task's params ($to, $subject, ...)
-        //      — minus $job, which is invocant-stripped.
-        panic!("not yet implemented — tracking arrayref-positional sig help");
+    fn plugin_mojo_helpers_chained_proxy_completion() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        // 1. `$app->admin` resolves to the first-level proxy.
+        let admin_proxy = fa.find_method_return_type(
+            "Mojolicious", "admin", None, None,
+        ).expect("admin on Mojolicious has a return_type");
+        let admin_class = admin_proxy.class_name()
+            .expect("proxy return_type is a ClassName");
+        assert_eq!(admin_class, "Mojolicious::Controller::_Helper::admin");
+
+        // 2. `$app->admin->` completion shows the `users` proxy step.
+        let candidates = fa.complete_methods_for_class(admin_class, None);
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"users"),
+            "chain completion on admin proxy must surface `users`; got: {:?}",
+            labels);
+        // And the `users` step's detail must NOT leak the internal
+        // `_Helper::admin::users` proxy class name — the plugin
+        // declared the return type opaque.
+        let users_cand = candidates.iter().find(|c| c.label == "users").unwrap();
+        assert!(
+            !users_cand.detail.as_deref().unwrap_or("").contains("_Helper"),
+            "opaque_return must hide the proxy class from detail: {:?}",
+            users_cand.detail,
+        );
+
+        // 3. Two levels in — `$app->admin->users` → the innermost proxy.
+        let users_proxy = fa.find_method_return_type(
+            admin_class, "users", None, None,
+        ).expect("users on admin proxy has a return_type");
+        let users_class = users_proxy.class_name().unwrap();
+        assert_eq!(users_class, "Mojolicious::Controller::_Helper::admin::users");
+
+        // 4. Leaf completion shows `purge`.
+        let leaf_candidates = fa.complete_methods_for_class(users_class, None);
+        let leaf_labels: Vec<&str> = leaf_candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(leaf_labels.contains(&"purge"),
+            "leaf proxy must offer `purge`; got: {:?}", leaf_labels);
     }
 
-    /// TODO: hash-key completion on the enqueue options hash
-    /// (`$minion->enqueue('task', [args], { | })`). The HashKeyDefs
-    /// are emitted by the plugin (pinned above), but the cursor-
-    /// context layer doesn't currently recognize a hash literal as
-    /// a positional argument to a method call — so the completion
-    /// list isn't routed to HashKeyOwner::Sub { package: Minion,
-    /// name: enqueue }. Ignored until that routing lands.
+    /// Sig help when the cursor sits inside the arrayref at position 1
+    /// of `enqueue` — the core routes via the Handler's
+    /// `args_in_arrayref_at` declaration (set by the minion plugin)
+    /// and shows the task's params (invocant-stripped). Plugin-agnostic
+    /// on the sig-help side: all the core needs is the declaration.
     #[test]
-    #[ignore = "TODO: hash-key routing for positional hashref args — needs core support"]
+    fn plugin_minion_sig_help_on_enqueue_array_args() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::{Parser, Point};
+
+        let src = r#"package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject, $body) = @_;
+});
+$minion->enqueue(send_email => [ ]);
+"#;
+        let fa = build_fa(src);
+
+        // Cursor inside the enqueue call's arrayref: point at the
+        // single space between the `[` and `]` on the last line.
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Find the `[ ]` — cursor at col AFTER `[`.
+        let mut cursor_point: Option<Point> = None;
+        for (row, line) in src.lines().enumerate() {
+            if line.contains("enqueue(send_email") {
+                if let Some(col) = line.find("[ ") {
+                    cursor_point = Some(Point::new(row, col + 1));
+                }
+            }
+        }
+        let cursor_point = cursor_point.expect("locate cursor inside [ ]");
+        let pos = Position { line: cursor_point.row as u32, character: cursor_point.column as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
+            .expect("sig help must fire inside enqueue's arrayref");
+
+        // At least one signature, matching the `send_email` handler
+        // (the task's params minus $job).
+        assert!(!sig.signatures.is_empty(), "at least one signature");
+        let info = &sig.signatures[0];
+        let label = &info.label;
+        assert!(label.contains("send_email"),
+            "sig label must reference the handler name: {:?}", label);
+        assert!(label.contains("$to"),
+            "sig should surface task params (`$to`): {:?}", label);
+        assert!(!label.contains("$job"),
+            "invocant `$job` must be stripped from display: {:?}", label);
+    }
+
+    /// Hash-key completion on the enqueue options hash
+    /// (`$minion->enqueue('task', [args], { | })`) — the cursor_context
+    /// layer now recognizes a nested hash literal as a positional
+    /// argument and routes it to `HashKeyOwner::Sub { name: enqueue }`.
+    #[test]
     fn plugin_minion_hashkey_help_on_enqueue_options() {
-        // When this test is un-ignored, it should:
-        //   1. Build a file with an enqueue call ending in `{ |`.
-        //   2. Query completion at a point inside the options hash.
-        //   3. Assert `priority`, `queue`, `delay`, etc. appear.
-        panic!("not yet implemented — tracking hashref-positional completion");
+        use tree_sitter::{Parser, Point};
+        let src = r#"package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->enqueue(task_x => ['arg'] => { });
+"#;
+        // Build + parse
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Cursor inside the empty options hash literal `{ | }`.
+        // Line 4 (0-indexed) column after "{ " — aim at the middle
+        // of the hash's interior.
+        let src_bytes = src.as_bytes();
+        let mut cursor: Option<Point> = None;
+        for (row, line) in src.lines().enumerate() {
+            if let Some(col) = line.find("{ ") {
+                cursor = Some(Point::new(row, col + 2));
+            }
+        }
+        let cursor = cursor.expect("find the `{ ` in the source");
+
+        let ctx = crate::cursor_context::detect_cursor_context_tree(
+            &tree, src_bytes, cursor, &fa,
+        ).expect("context should be detected inside hash literal");
+        match ctx {
+            crate::cursor_context::CursorContext::HashKey { source_sub, .. } => {
+                assert_eq!(source_sub.as_deref(), Some("enqueue"),
+                    "nested {{ }} at call-arg position routes to the callee");
+            }
+            other => panic!("expected HashKey context, got {:?}", other),
+        }
+
+        // Completion path surfaces the plugin's HashKeyDefs.
+        let candidates = fa.complete_hash_keys_for_sub("enqueue", cursor);
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        for expected in &["priority", "queue", "delay", "attempts"] {
+            assert!(labels.contains(expected),
+                "enqueue option `{}` must complete; got: {:?}",
+                expected, labels);
+        }
     }
 }

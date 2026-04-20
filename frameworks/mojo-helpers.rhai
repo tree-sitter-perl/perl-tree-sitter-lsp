@@ -72,9 +72,9 @@ fn on_method_call(ctx) {
     let entry_classes = ["Mojolicious::Controller", "Mojolicious"];
 
     if segments.len() == 1 {
-        // Simple helper: Method on each entry class. Display as Function
-        // so completion/outline show a helper-kind glyph rather than a
-        // Perl-method one — framework-synthesized, not hand-written.
+        // Simple helper: Method on each entry class. `hide_in_outline`
+        // keeps the user's outline focused on their actual code —
+        // helpers exist at their call sites, not as top-level symbols.
         for entry in entry_classes {
             out += #{
                 Method: #{
@@ -87,9 +87,23 @@ fn on_method_call(ctx) {
                     doc: (),
                     on_class: entry,
                     display: "Function",
+                    hide_in_outline: true,
                 }
             };
         }
+        // Anchor a MethodCallRef at the name span so gr/hover on the
+        // helper name land on the synthesized Method — otherwise
+        // ref_at returns the outer `$app->helper(...)` call's ref
+        // (target: `helper`) and gr lists every helper-registration
+        // site as a "reference" to the name.
+        out += #{
+            MethodCallRef: #{
+                method_name: name,
+                invocant: "Mojolicious::Controller",
+                span: name_span,
+                invocant_span: (),
+            }
+        };
         return out;
     }
 
@@ -117,6 +131,8 @@ fn on_method_call(ctx) {
                 doc: (),
                 on_class: entry,
                 display: "Function",
+                hide_in_outline: true,
+                opaque_return: true,
             }
         };
     }
@@ -138,6 +154,8 @@ fn on_method_call(ctx) {
                 doc: (),
                 on_class: owner_class,
                 display: "Function",
+                hide_in_outline: true,
+                opaque_return: true,
             }
         };
 
@@ -157,6 +175,21 @@ fn on_method_call(ctx) {
             doc: (),
             on_class: owner_class,
             display: "Function",
+            hide_in_outline: true,
+        }
+    };
+
+    // Anchor a MethodCallRef at the name span so gr/hover on the
+    // helper name land on the synthesized Method — not on the
+    // enclosing `$app->helper(...)` call's method ref. Without this,
+    // `ref_at` falls through to the outer MethodCall (target: `helper`),
+    // which is why "gr on current_user shows every $app->helper site".
+    out += #{
+        MethodCallRef: #{
+            method_name: leaf,
+            invocant: owner_class,
+            span: name_span,
+            invocant_span: (),
         }
     };
 
