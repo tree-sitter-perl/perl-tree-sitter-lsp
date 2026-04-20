@@ -1923,7 +1923,18 @@ impl FileAnalysis {
                 if r.target_name == sym.name && r.resolves_to.is_none() {
                     match (&r.kind, &sym.kind) {
                         (RefKind::FunctionCall, SymKind::Sub) => results.push((r.span, r.access)),
-                        (RefKind::MethodCall { .. }, SymKind::Sub | SymKind::Method) => results.push((r.span, r.access)),
+                        (RefKind::MethodCall { method_name_span, .. }, SymKind::Sub | SymKind::Method) => {
+                            // Method-call ref.span covers the whole
+                            // `$obj->foo(...)` expression so gd/hover
+                            // can land anywhere inside. For highlight
+                            // + reference rendering we want just the
+                            // method identifier — otherwise the
+                            // underline sprawls across the entire
+                            // call, which looks broken when multiple
+                            // refs match (every `$app->helper(...)`
+                            // site, every argument, etc.).
+                            results.push((*method_name_span, r.access));
+                        }
                         (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module) => results.push((r.span, r.access)),
                         _ => {}
                     }

@@ -8006,6 +8006,48 @@ $minion->enqueue(task_x => ['arg'] => { priority => 10 });
         }
     }
 
+    /// documentHighlight on a method-call identifier must highlight
+    /// JUST the method name, not the whole `$obj->method(...)` span.
+    /// Before this pin: hovering `helper` on one `$app->helper(NAME =>
+    /// sub { ... })` site underlined every other registration's full
+    /// multi-line call expression — args, sub bodies, closing `);`
+    /// all included. Regression trigger: MethodCall ref.span covers
+    /// the whole call (needed for gd/ref_at inside-args lookup);
+    /// highlight path now uses `method_name_span` from the ref kind.
+    #[test]
+    fn method_call_highlight_uses_method_name_span_only() {
+        let src = r#"package MyApp;
+sub do_thing { }
+sub run {
+    my ($self, $x) = @_;
+    $self->do_thing($x, 1, 2);
+    $self->do_thing(3);
+}
+"#;
+        let fa = build_fa(src);
+
+        // Cursor on `do_thing` at the first call site. Highlight
+        // must return ranges whose width == len("do_thing"), never
+        // a range that spans past the closing `)` or crosses into
+        // the next line.
+        let row = 4; // 0-indexed: `    $self->do_thing($x, 1, 2);`
+        let col = src.lines().nth(row).unwrap().find("do_thing").unwrap();
+        let point = tree_sitter::Point::new(row, col + 1);
+
+        let hits = fa.find_highlights(point, None, None);
+        assert!(!hits.is_empty(), "should highlight at least one occurrence");
+
+        for (span, _access) in &hits {
+            // Must be single-line + width exactly 8 ("do_thing").
+            assert_eq!(span.start.row, span.end.row,
+                "highlight must not span multiple lines; got: {:?}", span);
+            let width = span.end.column - span.start.column;
+            assert_eq!(width, "do_thing".len(),
+                "highlight width must match method identifier; got {}: {:?}",
+                width, span);
+        }
+    }
+
     /// `$app->admin->` (chained helper call) completion returns the
     /// proxy class's methods — not the fallback full-file list.
     /// Validates that `resolve_expression_type` chains through the
