@@ -8006,6 +8006,179 @@ $minion->enqueue(task_x => ['arg'] => { priority => 10 });
         }
     }
 
+    /// Cross-file helper chain completion: Users.pm inherits from
+    /// Mojolicious::Controller; helpers declared in a sibling Lite
+    /// file register Methods on Controller. From Users.pm, cursor at
+    /// `$c->`, `$c->users->`, `$c->admin->` must all resolve through
+    /// the proxy classes even though the methods live in another
+    /// file and the CPAN-cached Controller doesn't know about them.
+    ///
+    /// Regression trigger: `resolve_method_in_ancestors` used to scan
+    /// only `get_cached(class)` cross-file, missing plugin-emitted
+    /// methods that live in other modules under the same `package`.
+    /// `detect_cursor_context_tree` also only called `resolve_expression_type`
+    /// without a module_index, so chain resolution of `$c->users->`
+    /// fell through to the untyped fallback and returned Users's own
+    /// methods (list, create) instead of the proxy chain's leaves.
+    #[test]
+    fn plugin_mojo_helpers_cross_file_chain_completion() {
+        use tree_sitter::Parser;
+        use tower_lsp::lsp_types::Position;
+
+        // The Lite file — declares the helpers.
+        let lite_src = r#"package MyApp;
+use strict;
+use warnings;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+
+$app->helper(current_user => sub { my ($c, $fallback) = @_; });
+$app->helper('users.create' => sub { my ($c, $name, $email) = @_; });
+$app->helper('users.delete' => sub { my ($c, $id) = @_; });
+$app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
+"#;
+        let lite_fa = build_fa(lite_src);
+
+        // The controller file — inherits from Mojolicious::Controller
+        // and expects to reach the helpers cross-file. This is where
+        // the user's `$c->` completion is happening in real life.
+        let src = r#"package Users;
+use strict;
+use warnings;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    $c->;
+    $c->users->;
+    $c->admin->;
+}
+"#;
+        let fa = build_fa(src);
+
+        // Sanity — Users.pm's own analysis has `list` but not the
+        // helpers (they're declared in the Lite file).
+        let users_subs: Vec<&str> = fa.symbols.iter()
+            .filter(|s| matches!(s.kind, SymKind::Method | SymKind::Sub))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(users_subs, vec!["list"], "Users.pm owns only `list`");
+
+        // Now simulate the nvim completion pipeline at `$c->` position.
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Populate a ModuleIndex with a mock Mojolicious::Controller
+        // that has a few native-looking methods (render, stash, etc.).
+        // Matches the user's env where CPAN Mojolicious is installed
+        // and its Controller is cached cross-file. Register the Lite
+        // script itself too — workspace indexer would.
+        // Workspace has BOTH files registered — mirrors nvim startup
+        // after Rayon indexes the .pm/.pl set.
+        let idx = std::sync::Arc::new(crate::module_index::ModuleIndex::new_for_test());
+        let lite_fa = std::sync::Arc::new(lite_fa);
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/MyApp.pm"),
+            lite_fa.clone(),
+        );
+        let users_fa = std::sync::Arc::new(build_fa(src));
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/lib/Users.pm"),
+            users_fa.clone(),
+        );
+
+        let ctrl_src = r#"package Mojolicious::Controller;
+sub render { my ($self, %args) = @_; }
+sub stash { my ($self, $key) = @_; }
+sub req { my ($self) = @_; }
+sub res { my ($self) = @_; }
+sub session { my ($self, $key) = @_; }
+1;
+"#;
+        let ctrl_fa = std::sync::Arc::new(build_fa(ctrl_src));
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Controller.pm"),
+            ctrl_fa,
+        );
+
+        // The workspace knows the Lite file hosts Controller content.
+        let mods = idx.modules_with_class_content("Mojolicious::Controller");
+        assert!(mods.iter().any(|m| m == "MyApp"),
+            "workspace index must list MyApp.pm under Controller content-holders; got: {:?}",
+            mods);
+
+        // Part 1: `$c->` completion in Users.pm surfaces both the
+        // inherited native methods AND the plugin-emitted helpers
+        // (cross-file, via Controller → modules_with_class_content).
+        let pos = |row: u32, col: u32| Position { line: row, character: col };
+        let call_label_set = |items: &[tower_lsp::lsp_types::CompletionItem]| -> Vec<String> {
+            items.iter().map(|it| it.label.clone()).collect()
+        };
+
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos(7, 8), &idx, None);
+        let labels = call_label_set(&items);
+        for expected in &["list", "render", "stash", "current_user", "users", "admin"] {
+            assert!(labels.iter().any(|l| l == expected),
+                "$c-> must offer `{}`; got: {:?}", expected, labels);
+        }
+
+        // Part 2: `$c->users->` (chained cross-file) resolves to the
+        // _Helper::users proxy and surfaces its leaves. Before the
+        // fix: cursor_context couldn't resolve the chain without a
+        // module_index, so completion fell through to Users's own
+        // methods (`list`).
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos(8, 15), &idx, None);
+        let labels = call_label_set(&items);
+        assert_eq!(
+            labels.iter().collect::<std::collections::HashSet<_>>(),
+            ["create", "delete"].iter().map(|s| s.to_string()).collect::<Vec<_>>()
+                .iter().collect::<std::collections::HashSet<_>>(),
+            "$c->users-> must offer exactly the helper chain leaves (create/delete); got: {:?}",
+            labels,
+        );
+        assert!(!labels.iter().any(|l| l == "list"),
+            "$c->users-> must NOT fall back to Users.pm's own `list`; got: {:?}",
+            labels);
+
+        // Part 3: `$c->admin->` resolves through the first-level proxy
+        // to the innermost `users` step.
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos(9, 15), &idx, None);
+        let labels = call_label_set(&items);
+        assert_eq!(labels, vec!["users"],
+            "$c->admin-> must offer exactly `users`; got: {:?}", labels);
+
+        // Part 4: the proxy's detail is suppressed (opaque_return).
+        // No `_Helper::...` string should leak into the user-facing
+        // detail of a helper-root completion entry, even cross-file.
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos(7, 8), &idx, None);
+        let users_item = items.iter().find(|it| it.label == "users").unwrap();
+        let admin_item = items.iter().find(|it| it.label == "admin").unwrap();
+        for (name, item) in [("users", users_item), ("admin", admin_item)] {
+            let d = item.detail.as_deref().unwrap_or("");
+            assert!(!d.contains("_Helper"),
+                "opaque_return must suppress proxy class in `{}`'s detail cross-file; got: {:?}",
+                name, d);
+        }
+
+        // Part 5: no "unresolved-method" diagnostic for helper calls
+        // that now resolve cross-file. The diagnostic builder walks
+        // resolve_method_in_ancestors; our fix extends that to pick
+        // up plugin-emitted methods on parent classes declared
+        // elsewhere in the workspace.
+        let diags = crate::symbols::collect_diagnostics(&fa, &idx);
+        for diag in &diags {
+            let msg = &diag.message;
+            assert!(!msg.contains("'users' is not defined"),
+                "no diagnostic for helper middle hop `users`; got: {}", msg);
+            assert!(!msg.contains("'admin' is not defined"),
+                "no diagnostic for helper middle hop `admin`; got: {}", msg);
+            assert!(!msg.contains("'current_user' is not defined"),
+                "no diagnostic for helper `current_user`; got: {}", msg);
+        }
+    }
+
     /// documentHighlight on a method-call identifier must highlight
     /// JUST the method name, not the whole `$obj->method(...)` span.
     /// Before this pin: hovering `helper` on one `$app->helper(NAME =>
@@ -8100,6 +8273,52 @@ $app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
         let leaf_labels: Vec<&str> = leaf_candidates.iter().map(|c| c.label.as_str()).collect();
         assert!(leaf_labels.contains(&"purge"),
             "leaf proxy must offer `purge`; got: {:?}", leaf_labels);
+    }
+
+    /// Sig help on a helper call strips `$c` like it strips `$self`.
+    /// The helper plugin flags its callback's first param as invocant
+    /// via `as_invocant_params`; the core sig help path drops any
+    /// invocant-flagged first positional instead of name-matching
+    /// `$self`/`$class` only.
+    #[test]
+    fn plugin_mojo_helpers_sig_help_strips_invocant() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(current_user => sub {
+    my ($c, $fallback) = @_;
+});
+
+sub act {
+    my ($c) = @_;
+    $c->current_user();
+}
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Cursor inside `$c->current_user(|)` — between the parens.
+        let (row, col) = src.lines().enumerate()
+            .find_map(|(r, l)| l.find("current_user()").map(|c| (r, c + "current_user(".len())))
+            .expect("find call site");
+        let pos = Position { line: row as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
+            .expect("sig help fires on helper call");
+
+        let info = &sig.signatures[0];
+        assert!(info.label.contains("current_user"), "label: {:?}", info.label);
+        assert!(info.label.contains("$fallback"),
+            "sig should show declared param `$fallback`; got: {:?}", info.label);
+        assert!(!info.label.contains("$c"),
+            "`$c` must be stripped as invocant; got: {:?}", info.label);
     }
 
     /// Sig help when the cursor sits inside the arrayref at position 1

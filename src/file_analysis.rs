@@ -1409,19 +1409,37 @@ impl FileAnalysis {
             }
             Some(MethodResolution::CrossFile { ref class }) => {
                 module_index.and_then(|idx| {
-                    let cached = idx.get_cached(class)?;
-                    let sub = cached.sub_info(method_name)?;
-
-                    // If no arity info or no overloads, return primary.
-                    let counts = sub.param_counts();
-                    let has_overloads = counts.len() > 1;
-                    let target = match arg_count {
-                        Some(n) if has_overloads => n,
-                        _ => return sub.return_type().cloned(),
-                    };
-
-                    sub.return_type_for_arity(target).cloned()
-                        .or_else(|| sub.return_type().cloned())
+                    // Primary path: the class's own cached module has
+                    // the sub. That's the CPAN/user-module case.
+                    if let Some(cached) = idx.get_cached(class) {
+                        if let Some(sub) = cached.sub_info(method_name) {
+                            let counts = sub.param_counts();
+                            let has_overloads = counts.len() > 1;
+                            let target = match arg_count {
+                                Some(n) if has_overloads => n,
+                                _ => return sub.return_type().cloned(),
+                            };
+                            return sub.return_type_for_arity(target).cloned()
+                                .or_else(|| sub.return_type().cloned());
+                        }
+                    }
+                    // Plugin-emitted path: method packaged on `class`
+                    // but declared in another module (helper chain
+                    // roots, DBIC relationship accessors emitted from
+                    // the resultset, etc.). Find the symbol whose
+                    // package == class and read its return_type.
+                    for mod_name in idx.modules_with_class_content(class) {
+                        let Some(cached) = idx.get_cached(&mod_name) else { continue };
+                        for sym in &cached.analysis.symbols {
+                            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                            if sym.package.as_deref() != Some(class.as_str()) { continue; }
+                            if sym.name != method_name { continue; }
+                            if let SymbolDetail::Sub { return_type, .. } = &sym.detail {
+                                return return_type.clone();
+                            }
+                        }
+                    }
+                    None
                 })
             }
             None => None,
@@ -1487,7 +1505,18 @@ impl FileAnalysis {
             // but the user doesn't see the proxy-class path at every
             // completion detail line. Plugin-declared; the core
             // never inspects names.
-            if self.method_opaque_return(class_name, method_name) {
+            //
+            // Check both the completion context class AND the
+            // defining class (when the method is inherited from a
+            // parent): the plugin declares opacity on the symbol
+            // where the method LIVES, which is the defining class
+            // during a cross-class walk (e.g. Users inheriting the
+            // helper from Mojolicious::Controller).
+            let opaque = self.method_opaque_return_cross_file(class_name, method_name, module_index)
+                || defining_class.is_some_and(|dc| {
+                    self.method_opaque_return_cross_file(dc, method_name, module_index)
+                });
+            if opaque {
                 return String::new();
             }
             format!("{} → {}", base, format_inferred_type(rt))
@@ -1498,14 +1527,47 @@ impl FileAnalysis {
 
     /// Does the Method/Sub `method_name` on `class_name` opt out of
     /// rendering its return type at call sites? Plugin-declared via
-    /// `opaque_return` on the symbol's detail.
+    /// `opaque_return` on the symbol's detail. Walks both local
+    /// symbols and any cross-file modules that emit content on the
+    /// class (plugin helpers land in the file where the registration
+    /// runs, not in the target class's own module).
     fn method_opaque_return(&self, class_name: &str, method_name: &str) -> bool {
+        let check = |sym: &Symbol| -> bool {
+            if sym.name != method_name { return false; }
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return false; }
+            if sym.package.as_deref() != Some(class_name) { return false; }
+            matches!(&sym.detail, SymbolDetail::Sub { opaque_return: true, .. })
+        };
         for sym in &self.symbols {
-            if sym.name != method_name { continue; }
-            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-            if sym.package.as_deref() != Some(class_name) { continue; }
-            if let SymbolDetail::Sub { opaque_return, .. } = &sym.detail {
-                if *opaque_return { return true; }
+            if check(sym) { return true; }
+        }
+        false
+    }
+
+    /// Cross-file-aware variant: used by `method_detail` during
+    /// completion to decide whether to suppress the proxy chain in
+    /// the detail string, even when the declaring plugin emitted the
+    /// method from another file. Same contract as
+    /// `method_opaque_return` otherwise.
+    fn method_opaque_return_cross_file(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> bool {
+        if self.method_opaque_return(class_name, method_name) {
+            return true;
+        }
+        let Some(idx) = module_index else { return false };
+        for mod_name in idx.modules_with_class_content(class_name) {
+            let Some(cached) = idx.get_cached(&mod_name) else { continue };
+            for sym in &cached.analysis.symbols {
+                if sym.name != method_name { continue; }
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                if sym.package.as_deref() != Some(class_name) { continue; }
+                if matches!(&sym.detail, SymbolDetail::Sub { opaque_return: true, .. }) {
+                    return true;
+                }
             }
         }
         false
@@ -2496,6 +2558,27 @@ impl FileAnalysis {
         if let Some(idx) = module_index {
             if let Some(cached) = idx.get_cached(class_name) {
                 if cached.has_sub(method_name) {
+                    return Some(MethodResolution::CrossFile {
+                        class: class_name.to_string(),
+                    });
+                }
+            }
+            // Plugin-emitted methods land in the file where the
+            // registration runs, not in the target class's own
+            // module. `$app->helper('users.create' => ...)` in
+            // MyApp.pm produces a Method packaged on
+            // `Mojolicious::Controller`, but the Controller module
+            // itself (cached from CPAN) has no such sub. Without
+            // this scan, `$c->users->...` chain resolution fails in
+            // every consumer file, and the same gap feeds the
+            // unresolved-function diagnostic for helper call sites.
+            // Mirrors what collect_ancestor_methods already does.
+            for mod_name in idx.modules_with_class_content(class_name) {
+                let Some(cached) = idx.get_cached(&mod_name) else { continue };
+                for sym in &cached.analysis.symbols {
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                    if sym.package.as_deref() != Some(class_name) { continue; }
+                    if sym.name != method_name { continue; }
                     return Some(MethodResolution::CrossFile {
                         class: class_name.to_string(),
                     });
@@ -3594,12 +3677,12 @@ impl FileAnalysis {
                         .first()
                         .map_or(false, |p| p.name == "$self" || p.name == "$class");
 
-                // Strip $self/$class from method params
-                if is_method && !params.is_empty() {
-                    let first = &params[0].name;
-                    if first == "$self" || first == "$class" {
-                        params.remove(0);
-                    }
+                // Strip the implicit invocant from the display list.
+                // `is_invocant` covers both Perl-native `$self`/`$class`
+                // (flagged by the builder at extract time) and plugin-
+                // marked framework invocants (`$c` for helpers, etc.).
+                if !params.is_empty() && params[0].is_invocant {
+                    params.remove(0);
                 }
 
                 Some(SignatureInfo {
@@ -3625,14 +3708,15 @@ impl FileAnalysis {
                 let is_method = is_method || cf_is_method
                     || params.first().map_or(false, |p| p.name == "$self" || p.name == "$class");
 
-                // Strip $self/$class from method params (and their types).
-                if is_method && !params.is_empty() {
-                    let first = &params[0].name;
-                    if first == "$self" || first == "$class" {
-                        params.remove(0);
-                        if !param_types.is_empty() {
-                            param_types.remove(0);
-                        }
+                // Same invocant-strip as the local branch — by flag,
+                // not by name. Cross-file ParamInfo carries the flag
+                // through the cache (set by the plugin or builder at
+                // build time), so `$c` on a helper is dropped the
+                // same way `$self` on a Perl method is.
+                if !params.is_empty() && params[0].is_invocant {
+                    params.remove(0);
+                    if !param_types.is_empty() {
+                        param_types.remove(0);
                     }
                 }
 

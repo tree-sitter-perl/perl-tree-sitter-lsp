@@ -253,6 +253,22 @@ pub fn detect_cursor_context_tree(
     point: Point,
     analysis: &FileAnalysis,
 ) -> Option<CursorContext> {
+    detect_cursor_context_tree_with_index(tree, source, point, analysis, None)
+}
+
+/// Variant that threads a module index through for cross-file type
+/// resolution. Callers that have an index (the LSP completion path)
+/// use this so chained calls like `$c->helper_root->...` see methods
+/// declared in other files — without the index, `$c->users` can't
+/// resolve to the helper's synthetic return type and completion
+/// falls through to the untyped path.
+pub fn detect_cursor_context_tree_with_index(
+    tree: &Tree,
+    source: &[u8],
+    point: Point,
+    analysis: &FileAnalysis,
+    module_index: Option<&crate::module_index::ModuleIndex>,
+) -> Option<CursorContext> {
     // Find the node at/just before the cursor
     let check_point = if point.column > 0 {
         Point::new(point.row, point.column - 1)
@@ -278,13 +294,13 @@ pub fn detect_cursor_context_tree(
                                     || parent.kind() == "function_call_expression"
                                 {
                                     let invocant_text = parent.utf8_text(source).unwrap_or("").to_string();
-                                    let invocant_type = resolve_node_type(parent, source, analysis, point);
+                                    let invocant_type = resolve_node_type(parent, source, analysis, point, module_index);
                                     return Some(CursorContext::Method { invocant_type, invocant_text });
                                 }
                             }
                         }
                         let invocant_text = invocant_node.utf8_text(source).unwrap_or("").to_string();
-                        let invocant_type = resolve_node_type(invocant_node, source, analysis, point);
+                        let invocant_type = resolve_node_type(invocant_node, source, analysis, point, module_index);
                         return Some(CursorContext::Method { invocant_type, invocant_text });
                     }
                 }
@@ -294,7 +310,7 @@ pub fn detect_cursor_context_tree(
                 if let Some(base) = current.named_child(0) {
                     if base.end_position() < point {
                         let var_text = base.utf8_text(source).unwrap_or("").to_string();
-                        let owner_type = resolve_node_type(base, source, analysis, point);
+                        let owner_type = resolve_node_type(base, source, analysis, point, module_index);
                         let source_sub = extract_call_name(base, source);
                         return Some(CursorContext::HashKey { owner_type, var_text, source_sub });
                     }
@@ -320,7 +336,7 @@ pub fn detect_cursor_context_tree(
             "ERROR" => {
                 // Incomplete expression: look for `expr->{` or `expr->` patterns
                 // in error recovery
-                if let Some(ctx) = detect_from_error_node(current, source, point, analysis) {
+                if let Some(ctx) = detect_from_error_node(current, source, point, analysis, module_index) {
                     return Some(ctx);
                 }
             }
@@ -373,7 +389,13 @@ fn cursor_at_hash_key_slot(hash_node: Node, point: Point) -> bool {
 
 /// Resolve the type of a tree-sitter node used as an invocant or hash owner.
 /// Handles both simple variables (via `inferred_type`) and complex expressions.
-fn resolve_node_type(node: Node, source: &[u8], analysis: &FileAnalysis, point: Point) -> Option<InferredType> {
+fn resolve_node_type(
+    node: Node,
+    source: &[u8],
+    analysis: &FileAnalysis,
+    point: Point,
+    module_index: Option<&crate::module_index::ModuleIndex>,
+) -> Option<InferredType> {
     match node.kind() {
         "scalar" | "array" | "hash" => {
             let text = node.utf8_text(source).ok()?;
@@ -383,7 +405,7 @@ fn resolve_node_type(node: Node, source: &[u8], analysis: &FileAnalysis, point: 
             let text = node.utf8_text(source).ok()?;
             Some(InferredType::ClassName(text.to_string()))
         }
-        _ => analysis.resolve_expression_type(node, source, None),
+        _ => analysis.resolve_expression_type(node, source, module_index),
     }
 }
 
@@ -398,6 +420,7 @@ fn detect_from_error_node(
     source: &[u8],
     point: Point,
     analysis: &FileAnalysis,
+    module_index: Option<&crate::module_index::ModuleIndex>,
 ) -> Option<CursorContext> {
     let mut last_expr: Option<Node> = None;
     let mut saw_arrow = false;
@@ -434,7 +457,7 @@ fn detect_from_error_node(
 
     if let Some(expr) = last_expr {
         let text = expr.utf8_text(source).unwrap_or("").to_string();
-        let resolved_type = resolve_node_type(expr, source, analysis, point);
+        let resolved_type = resolve_node_type(expr, source, analysis, point, module_index);
         if saw_brace {
             let source_sub = extract_call_name(expr, source);
             return Some(CursorContext::HashKey { owner_type: resolved_type, var_text: text, source_sub });

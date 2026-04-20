@@ -397,7 +397,9 @@ pub fn completion_items(
     let point = position_to_point(pos);
 
     // Try tree-based detection first for expression-based contexts
-    let ctx = cursor_context::detect_cursor_context_tree(tree, source.as_bytes(), point, analysis)
+    let ctx = cursor_context::detect_cursor_context_tree_with_index(
+        tree, source.as_bytes(), point, analysis, Some(module_index),
+    )
         .unwrap_or_else(|| cursor_context::detect_cursor_context(source, point, Some(analysis)));
 
     // Mid-string completion for plugin-emitted MethodCallRefs. When the
