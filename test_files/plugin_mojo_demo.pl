@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # ============================================================================
-# MOJO FRAMEWORK PLUGIN DEMO — four Rhai plugins, one file.
+# MOJO FRAMEWORK PLUGIN DEMO — five Rhai plugins, one file.
 #
 # `mojo-events`   — $emitter->on('evt', sub {}) / $x->emit('evt', ...)
 # `mojo-helpers`  — $app->helper('name' => sub {}) registers methods on
@@ -10,6 +10,9 @@
 #                   ref so gd jumps to the controller's method.
 # `mojo-lite`     — get/post/etc. at top level register Handler symbols
 #                   keyed by URL path, dispatched via url_for().
+# `minion`        — $minion->add_task(NAME => sub { ... }) registers a
+#                   task; $minion->enqueue(NAME => [args]) dispatches.
+#                   `$job` inside the task body is typed Minion::Job.
 #
 # Open this file in nvim (`./dev.sh test_files/plugin_mojo_demo.pl`). Try:
 #   `<leader>o`  → outline shows events (EVENT), helpers (Method), routes
@@ -21,6 +24,11 @@
 #   `gd` / `gr`  → everywhere you'd expect, including cross-file.
 #   trigger sig-help inside `->emit('connect', ^` — two registered
 #   handlers stack as alternatives.
+#   inside `$minion->enqueue('send_email', [^])` — the task's params
+#   surface (arrayref-wrapped sig help, declared by the plugin).
+#   inside `$minion->enqueue('send_email', [...], { ^ })` — hash-key
+#   completion offers `priority`, `queue`, `delay`, … (plugin emits
+#   HashKeyDefs for the options hash).
 # ============================================================================
 
 package MyApp;
@@ -82,6 +90,37 @@ any '/fallback' => sub {
     my $c = shift;
     $c->render(text => 'nope', status => 404);
 };
+
+# ── minion: task queue — add_task + enqueue ──────────────────────────
+#
+# Cursor on `send_email` anywhere → gd jumps to the add_task site,
+# gr shows every enqueue + perform site.
+# Inside the task body, `$job->` completes against Minion::Job.
+# Sig help inside `$minion->enqueue('send_email', [^])` shows the
+# task's params ($to, $subject, $body) — $job stripped as invocant.
+# Inside the options hash `{ ^ }` — completion offers Minion's
+# enqueue-time keys (priority, queue, delay, attempts, ...).
+use Minion;
+my $minion = Minion->new;
+
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject, $body) = @_;
+    $job->note(started_at => time);
+    $job->finish({ to => $to, ok => 1 });
+});
+
+$minion->add_task(resize_image => sub {
+    my ($job, $path, $width, $height) = @_;
+    $job->fail('no path') unless $path;
+});
+
+# Enqueue sites — gd on the name jumps to add_task.
+$minion->enqueue(send_email  => ['alice@example.com', 'hi',  'body']);
+$minion->enqueue(resize_image => ['/tmp/a.png', 800, 600], { priority => 10 });
+$minion->enqueue_p(send_email => ['bob@example.com', 'hey', 'body']);
+
+# Foreground execution (for tests/debugging).
+$minion->perform_jobs;
 
 # ── mojo-events: handlers on an EventEmitter subclass ──
 #
