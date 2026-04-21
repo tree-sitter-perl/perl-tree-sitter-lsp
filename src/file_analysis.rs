@@ -180,6 +180,22 @@ pub struct Symbol {
     pub namespace: Namespace,
 }
 
+impl Symbol {
+    /// Bare variable/field name without the sigil. Uses the sigil stored
+    /// in `detail` so we never re-derive it by text-stripping (which would
+    /// mis-handle forms like `$$ref` if the name ever carried that shape).
+    /// For non-variable symbols, returns `name` unchanged.
+    pub fn bare_name(&self) -> &str {
+        match &self.detail {
+            SymbolDetail::Variable { sigil, .. } | SymbolDetail::Field { sigil, .. } => {
+                let off = sigil.len_utf8();
+                self.name.get(off..).unwrap_or(&self.name)
+            }
+            _ => &self.name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymKind {
     Variable,
@@ -1568,11 +1584,7 @@ impl FileAnalysis {
                     if attributes.contains(&"param".to_string())
                         && self.symbol_in_class(sym.id, class_name)
                     {
-                        let bare = sym.name
-                            .trim_start_matches('$')
-                            .trim_start_matches('@')
-                            .trim_start_matches('%');
-                        if bare == key {
+                        if sym.bare_name() == key {
                             return Some(sym.selection_span);
                         }
                     }
@@ -4172,12 +4184,7 @@ impl FileAnalysis {
                     if attributes.contains(&"param".to_string()) {
                         // Check this field belongs to the class
                         if self.symbol_in_class(sym.id, class_name) {
-                            let key = sym
-                                .name
-                                .trim_start_matches('$')
-                                .trim_start_matches('@')
-                                .trim_start_matches('%')
-                                .to_string();
+                            let key = sym.bare_name().to_string();
                             if !used_keys.contains(&key) {
                                 candidates.push(CompletionCandidate {
                                     label: format!("{} =>", key),

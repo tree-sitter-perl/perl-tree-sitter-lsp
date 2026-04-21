@@ -165,6 +165,79 @@ fn extract_delegated_call_name<'a>(return_node: Node<'a>, source: &'a [u8]) -> O
     Some(call_name.rsplit("::").next().unwrap_or(call_name).to_string())
 }
 
+/// Find the `varname` child of a variable node (`scalar`/`array`/`hash`/etc.).
+/// The grammar aliases its `_var_indirob` into a `varname` node whose text
+/// is the bare variable name — no sigil, no braces. For `${foo}` the outer
+/// `scalar` text is `${foo}` but the `varname` child text is just `foo`;
+/// for `$:whatever` it's whatever TSP decided is the name token.
+///
+/// For `${$hash{k}}` and other nontrivial derefs the varname child is a
+/// `block` — callers that only want a simple identifier should check the
+/// returned node's kind (`varname` text is only meaningful for the
+/// identifier form).
+fn find_varname_child<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if child.kind() == "varname" {
+                return Some(child);
+            }
+        }
+    }
+    None
+}
+
+/// Re-parse an `isa` value as Perl and extract the class name from
+/// `InstanceOf['Foo::Bar']` / `InstanceOf["Foo::Bar"]`. Tree-sitter-perl
+/// parses this as `ambiguous_function_call_expression` with function
+/// `InstanceOf` and an `anonymous_array_expression` argument containing
+/// a single string literal — we walk that shape and ignore everything
+/// else (if the tree doesn't match, this isn't an InstanceOf).
+fn parse_instance_of(isa: &str) -> Option<String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(isa, None)?;
+    let source = isa.as_bytes();
+
+    // Walk to the first ambiguous_function_call_expression.
+    fn find_call<'a>(node: Node<'a>) -> Option<Node<'a>> {
+        if node.kind() == "ambiguous_function_call_expression"
+            || node.kind() == "function_call_expression"
+        {
+            return Some(node);
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i) {
+                if let Some(found) = find_call(c) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    let call = find_call(tree.root_node())?;
+    let func = call.child_by_field_name("function")?;
+    if func.utf8_text(source).ok()? != "InstanceOf" {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    if args.kind() != "anonymous_array_expression" && args.kind() != "array_ref_expression" {
+        return None;
+    }
+    for i in 0..args.named_child_count() {
+        let child = args.named_child(i)?;
+        if matches!(child.kind(), "string_literal" | "interpolated_string_literal") {
+            for j in 0..child.named_child_count() {
+                if let Some(content) = child.named_child(j) {
+                    if content.kind() == "string_content" {
+                        return content.utf8_text(source).ok().map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Walk the delegation chain starting at `start` until we find a sub that
 /// actually owns HashKeyDefs, or run out of links. Cycle-safe via a visited
 /// set; caps at a small depth since delegation chains in real code are short.
@@ -366,10 +439,10 @@ impl<'a> Builder<'a> {
         let text = arg.utf8_text(self.source).unwrap_or("").to_string();
         let string_value = match arg.kind() {
             "string_literal" | "interpolated_string_literal" => {
-                let stripped = text.trim_start_matches(['\'', '"'])
-                    .trim_end_matches(['\'', '"'])
-                    .to_string();
-                Some(stripped)
+                // Read the string_content child — quote-flavor-agnostic
+                // (handles q{}, qq!!, heredocs, etc.). An empty literal
+                // has no content child, so default to "".
+                Some(self.extract_string_content(arg).unwrap_or_default())
             }
             // `autoquoted_bareword` is what the LHS of fat-comma parses
             // as (`key => value`) — `bareword` never appears there. The
@@ -397,71 +470,20 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Extract params from an anonymous sub. Reuses the builder's existing
-    /// named-sub param extraction (signature syntax + `@_` unpack) so the
-    /// two codepaths can't diverge. Returns EmittedParam entries suitable
-    /// for plugin consumption.
+    /// Extract params from an anonymous sub. Delegates to the builder's
+    /// shared named-sub extractor (signature syntax + `my (...) = @_` +
+    /// `shift`/`$_[N]` unpacks, all via tree walking) so the two codepaths
+    /// can't diverge.
     fn extract_anonymous_sub_params(&self, sub_node: Node<'a>) -> Vec<plugin::EmittedParam> {
-        // extract_params handles both signature syntax and a rich set of
-        // @_/shift/$_[N] fallback patterns for named subs. Reuse it here.
-        let mut params: Vec<plugin::EmittedParam> = self.extract_params(sub_node)
+        self.extract_params(sub_node)
             .into_iter()
             .map(|p| plugin::EmittedParam {
                 name: p.name,
                 default: p.default,
                 is_slurpy: p.is_slurpy,
-                    is_invocant: false,
-            })
-            .collect();
-        if !params.is_empty() { return params; }
-
-        // Fallback for shapes extract_params doesn't recognize: scan the
-        // body for a top-level `my (...) = @_` unpack.
-        let body = sub_node.child_by_field_name("body")
-            .or_else(|| {
-                (0..sub_node.named_child_count())
-                    .filter_map(|i| sub_node.named_child(i))
-                    .find(|c| c.kind() == "block")
-            });
-        if let Some(body) = body {
-            for i in 0..body.named_child_count() {
-                let Some(stmt) = body.named_child(i) else { continue };
-                if let Some(extracted) = self.extract_my_at_underscore(stmt) {
-                    params = extracted;
-                    break;
-                }
-                break;
-            }
-        }
-        params
-    }
-
-    /// Match `my (V1, V2, @rest) = @_` — the common legacy unpack. Only
-    /// the exact shape `my (...) = @_` counts; more elaborate forms aren't
-    /// worth the heuristic complexity here and can be layered on later.
-    fn extract_my_at_underscore(&self, stmt: Node<'a>) -> Option<Vec<plugin::EmittedParam>> {
-        let text = stmt.utf8_text(self.source).ok()?;
-        let trimmed = text.trim().trim_end_matches(';').trim();
-        let rest = trimmed.strip_prefix("my")?.trim_start();
-        let rest = rest.strip_prefix('(')?;
-        let (inner, after) = rest.split_once(')')?;
-        let after = after.trim();
-        if !after.starts_with('=') { return None; }
-        let rhs = after.trim_start_matches('=').trim();
-        if rhs != "@_" { return None; }
-
-        let params: Vec<plugin::EmittedParam> = inner
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .map(|name| plugin::EmittedParam {
-                is_slurpy: name.starts_with('@') || name.starts_with('%'),
-                name,
-                default: None,
                 is_invocant: false,
             })
-            .collect();
-        if params.is_empty() { None } else { Some(params) }
+            .collect()
     }
 
     /// Best-effort receiver-type resolution for a method call. Handles:
@@ -912,6 +934,9 @@ impl<'a> Builder<'a> {
             "container_variable" | "slice_container_variable" | "keyval_container_variable" => {
                 self.visit_container_ref(node);
             }
+            // $#foo — scalar-shaped but resolves to the underlying @foo.
+            // The sigil is `$#`; the varname child holds the bare name.
+            "arraylen" => self.visit_arraylen_ref(node),
 
             // Call expressions
             "function_call_expression" | "ambiguous_function_call_expression" => {
@@ -1287,8 +1312,8 @@ impl<'a> Builder<'a> {
         // a plugin) stack on top via EmittedParam → ParamInfo.
         if let Some(first) = params.first_mut() {
             let name_says_invocant = matches!(
-                first.name.strip_prefix('$').unwrap_or(""),
-                "self" | "class" | "this" | "proto"
+                first.name.as_str(),
+                "$self" | "$class" | "$this" | "$proto"
             );
             let pkg_is_subclass = self.current_package
                 .as_ref()
@@ -2660,6 +2685,24 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// `$#foo` — arraylen. TSP gives us a distinct `arraylen` node
+    /// with a `varname` child; the access resolves to `@foo`. We emit
+    /// a ContainerAccess ref so goto-def and rename treat it like
+    /// any other indirect access into the array.
+    fn visit_arraylen_ref(&mut self, node: Node<'a>) {
+        let bare = match find_varname_child(node).and_then(|v| v.utf8_text(self.source).ok()) {
+            Some(b) => b,
+            None => return,
+        };
+        let access = self.determine_access(node);
+        self.add_ref(
+            RefKind::ContainerAccess,
+            node_to_span(node),
+            format!("@{}", bare),
+            access,
+        );
+    }
+
     fn visit_function_call(&mut self, node: Node<'a>) {
         if let Some(func_node) = node.child_by_field_name("function") {
             if let Ok(name) = func_node.utf8_text(self.source) {
@@ -3299,15 +3342,12 @@ impl<'a> Builder<'a> {
             "CodeRef" => Some(InferredType::CodeRef),
             "RegexpRef" => Some(InferredType::Regexp),
             _ => {
-                // InstanceOf['Foo::Bar'] (Moo style)
-                if isa.starts_with("InstanceOf[") {
-                    let inner = isa.trim_start_matches("InstanceOf[")
-                        .trim_end_matches(']')
-                        .trim_matches('\'')
-                        .trim_matches('"');
-                    if !inner.is_empty() {
-                        return Some(InferredType::ClassName(inner.to_string()));
-                    }
+                // InstanceOf['Foo::Bar'] (Moo style) — the isa value is
+                // valid-ish Perl syntax, so re-parse it with tree-sitter
+                // and pull the class name out of the tree rather than
+                // hand-stripping brackets and quotes.
+                if let Some(class) = parse_instance_of(isa) {
+                    return Some(InferredType::ClassName(class));
                 }
                 // Moose allows class names as types (contains :: or starts uppercase)
                 if mode == FrameworkMode::Moose && (isa.contains("::") || isa.starts_with(|c: char| c.is_uppercase())) {
@@ -3709,8 +3749,8 @@ impl<'a> Builder<'a> {
     fn collect_vars_walk(&self, node: Node<'a>, out: &mut Vec<(String, Span)>) {
         match node.kind() {
             "scalar" | "array" | "hash" => {
-                if let Ok(text) = node.utf8_text(self.source) {
-                    out.push((text.to_string(), node_to_span(node)));
+                if let Some(name) = self.build_var_name(node) {
+                    out.push((name, node_to_span(node)));
                 }
             }
             _ => {
@@ -3723,11 +3763,37 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Build a variable's canonical name by reading the tree: sigil
+    /// comes from the node kind (`scalar` → `$`, `array` → `@`, `hash`
+    /// → `%`), bare name comes from the `varname` child. This keeps us
+    /// correct for edge cases where the full node text isn't just
+    /// `sigil + identifier` — e.g. `${foo}` (text `${foo}`, varname
+    /// `foo`), `$:field` (whatever TSP aliases into varname), or any
+    /// future TSP-added sigil-bearing syntax. The previous
+    /// `node.utf8_text()` + caller-side sigil-stripping broke on every
+    /// one of those shapes (`{foo}`, `:field`, etc.).
+    ///
+    /// Falls back to the full node text when the varname child is
+    /// missing (ERROR recovery, partial parses).
+    fn build_var_name(&self, node: Node<'a>) -> Option<String> {
+        let sigil = match node.kind() {
+            "scalar" => '$',
+            "array" => '@',
+            "hash" => '%',
+            _ => return node.utf8_text(self.source).ok().map(|s| s.to_string()),
+        };
+        let varname = find_varname_child(node).and_then(|v| v.utf8_text(self.source).ok());
+        match varname {
+            Some(name) => Some(format!("{}{}", sigil, name)),
+            None => node.utf8_text(self.source).ok().map(|s| s.to_string()),
+        }
+    }
+
     fn first_var_child(&self, node: Node<'a>) -> Option<String> {
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i) {
                 if matches!(child.kind(), "scalar" | "array" | "hash") {
-                    return child.utf8_text(self.source).ok().map(|s| s.to_string());
+                    return self.build_var_name(child);
                 }
             }
         }
@@ -3766,23 +3832,45 @@ impl<'a> Builder<'a> {
         AccessKind::Read
     }
 
+    /// Map a container/slice/keyval access node to the name of the
+    /// variable it actually reads. The sigil on the access site is
+    /// NOT the declared sigil:
+    ///
+    ///   $foo[0]         → @foo   (array element, under array_element_expression)
+    ///   $foo{hi}        → %foo   (hash element, under hash_element_expression)
+    ///   @foo[0..1]      → @foo   (array slice — parent `slice_expression` field `array:`)
+    ///   @foo{qw/.../}   → %foo   (hash slice — parent `slice_expression` field `hash:`)
+    ///   %foo[0..1]      → @foo   (KV slice of array — `keyval_expression` field `array:`)
+    ///   %foo{a}         → %foo   (KV slice of hash — `keyval_expression` field `hash:`)
+    ///
+    /// For slice/keyval we ask the parent which *field* this node is
+    /// filling, because the sigil on the child is always `@` (slice)
+    /// or `%` (keyval) regardless of the underlying container. Bare
+    /// name comes from the `varname` child so forms like `@{$ref}[0]`
+    /// (ERROR/block-varname) don't produce garbage.
     fn canonicalize_container(&self, node: Node<'a>, text: &str) -> String {
-        // $hash{key} → %hash, $arr[0] → @arr, etc.
-        if let Some(parent) = node.parent() {
-            let parent_kind = parent.kind();
-            if parent_kind == "hash_element_expression" || parent_kind == "keyval_container_variable" {
-                // Container is a hash access — underlying variable is %name
-                if text.starts_with('$') {
-                    return format!("%{}", &text[1..]);
-                }
-            } else if parent_kind == "array_element_expression" || parent_kind == "slice_container_variable" {
-                // Container is an array access — underlying variable is @name
-                if text.starts_with('$') || text.starts_with('@') {
-                    return format!("@{}", &text[1..]);
+        let fallback = || text.to_string();
+        let parent = match node.parent() { Some(p) => p, None => return fallback() };
+        let bare = match find_varname_child(node).and_then(|v| v.utf8_text(self.source).ok()) {
+            Some(b) => b,
+            None => return fallback(),
+        };
+
+        let target_sigil: char = match parent.kind() {
+            "array_element_expression" => '@',
+            "hash_element_expression" => '%',
+            "slice_expression" | "keyval_expression" => {
+                if parent.child_by_field_name("array").map_or(false, |c| c == node) {
+                    '@'
+                } else if parent.child_by_field_name("hash").map_or(false, |c| c == node) {
+                    '%'
+                } else {
+                    return fallback();
                 }
             }
-        }
-        text.to_string()
+            _ => return fallback(),
+        };
+        format!("{}{}", target_sigil, bare)
     }
 
     /// Extract the function name from a call expression (function_call or ambiguous_function_call).
@@ -4418,6 +4506,107 @@ mod tests {
     fn build_fa(source: &str) -> FileAnalysis {
         let tree = parse(source);
         build(&tree, source.as_bytes())
+    }
+
+    // ---- varname-based extraction ----
+
+    /// Adversarial: every flavor of `foo` access (plain, element, slice,
+    /// KV slice, arraylen) must canonicalize to the underlying
+    /// `$foo`/`@foo`/`%foo` Variable symbol — NOT to "$foo" across the
+    /// board. TSP exposes the container kind via distinct node types
+    /// (`container_variable`, `slice_container_variable`,
+    /// `keyval_container_variable`, `arraylen`) + a `hash:`/`array:`
+    /// field on the parent. Our job is to route each to the correct
+    /// declared symbol.
+    #[test]
+    fn sigil_disambiguation_across_access_forms() {
+        let src = "\
+my ($foo, @foo, %foo);
+$foo;
+$foo[0];
+$foo{hi};
+@foo[0..1];
+@foo{qw/hi there/};
+$#foo;
+%foo[0..1];
+%foo{a};
+";
+        let fa = build_fa(src);
+
+        // Three distinct declarations.
+        let decls: std::collections::HashMap<&str, _> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Variable && s.scope == ScopeId(0)
+                && matches!(s.name.as_str(), "$foo" | "@foo" | "%foo"))
+            .map(|s| (s.name.as_str(), s.id))
+            .collect();
+        assert!(decls.contains_key("$foo"), "missing scalar decl");
+        assert!(decls.contains_key("@foo"), "missing array decl");
+        assert!(decls.contains_key("%foo"), "missing hash decl");
+
+        // Collect every Variable/ContainerAccess ref, keyed by the line
+        // it sits on. Line 0 is the declaration — skip it.
+        let mut refs_by_line: std::collections::HashMap<usize, Vec<&str>> = Default::default();
+        for r in &fa.refs {
+            if !matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) { continue; }
+            if r.access == AccessKind::Declaration { continue; }
+            refs_by_line.entry(r.span.start.row).or_default().push(r.target_name.as_str());
+        }
+
+        let expected: &[(usize, &str, &str)] = &[
+            (1, "$foo",                "$foo"), // plain scalar
+            (2, "$foo[0]",             "@foo"), // array element access
+            (3, "$foo{hi}",            "%foo"), // hash element access
+            (4, "@foo[0..1]",          "@foo"), // array slice
+            (5, "@foo{qw/hi there/}",  "%foo"), // hash slice — Perl semantic
+            (6, "$#foo",               "@foo"), // arraylen
+            (7, "%foo[0..1]",          "@foo"), // KV slice of array (5.20+)
+            (8, "%foo{a}",             "%foo"), // KV slice of hash
+        ];
+
+        let mut failures: Vec<String> = Vec::new();
+        for (line, form, want) in expected {
+            let got = refs_by_line.get(line).cloned().unwrap_or_default();
+            if got.as_slice() != [*want] {
+                failures.push(format!(
+                    "  line {} `{}` → want [{}], got {:?}",
+                    line, form, want, got));
+            }
+        }
+        assert!(failures.is_empty(),
+            "sigil disambiguation failures:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn braced_var_declaration_names_match_bare_form() {
+        // `my ${foo}` is just `my $foo`. Before the varname refactor we
+        // stored the declared name as the full node text `${foo}`, so a
+        // later `$foo` reference couldn't resolve to it. Now both share
+        // the canonical `$foo` name.
+        let fa = build_fa("my ${foo} = 1;\n$foo;\n");
+        let decls: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Variable && s.name == "$foo")
+            .collect();
+        assert_eq!(decls.len(), 1, "expected one $foo symbol, got {:?}",
+            fa.symbols.iter().filter(|s| s.kind == SymKind::Variable).map(|s| &s.name).collect::<Vec<_>>());
+    }
+
+    // ---- parse_instance_of ----
+
+    #[test]
+    fn parse_instance_of_single_quoted() {
+        assert_eq!(parse_instance_of("InstanceOf['Foo::Bar']").as_deref(), Some("Foo::Bar"));
+    }
+
+    #[test]
+    fn parse_instance_of_double_quoted() {
+        assert_eq!(parse_instance_of("InstanceOf[\"Foo::Bar\"]").as_deref(), Some("Foo::Bar"));
+    }
+
+    #[test]
+    fn parse_instance_of_rejects_non_instance_of() {
+        assert_eq!(parse_instance_of("Str"), None);
+        assert_eq!(parse_instance_of("ArrayRef[Int]"), None);
+        assert_eq!(parse_instance_of("My::Class"), None);
     }
 
     // ---- Scope tests ----
