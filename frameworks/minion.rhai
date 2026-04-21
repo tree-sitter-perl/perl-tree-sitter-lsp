@@ -193,16 +193,16 @@ fn on_method_call(ctx) {
             }
         };
 
-        // Register the task into a per-package Minion namespace. Bridges
-        // to Minion so `for_each_entity_bridged_to("Minion", ...)` finds
-        // task Handlers alongside the `dispatch_targets_for` delegation
-        // path used by the completion hook. One namespace per enclosing
-        // package; multiple add_task sites accumulate entities.
-        let ns_id = if ctx.current_package == () {
-            "minion:main"
-        } else {
-            "minion:" + ctx.current_package
-        };
+        // Register the task into the Minion namespace. Tasks attach
+        // to the Minion CLASS (receiver type), not to whatever Perl
+        // package the `add_task` call happens to be in — that binding
+        // is an accident of where the helper code lives, not a
+        // semantic property of the task. All add_task sites in the
+        // file accumulate into the one "minion:Minion" namespace.
+        // (Per-instance namespacing — "all tasks on THIS $minion" —
+        // is the next step; kicking down the road until instance
+        // identity is a first-class primitive.)
+        let ns_id = "minion:Minion";
         out += #{
             PluginNamespace: #{
                 id: ns_id,
@@ -257,26 +257,42 @@ fn is_minion_dispatch_call(callframe) {
 }
 
 // Sig help at dispatcher cursor positions we claim.
-//   * Inside the handler-args arrayref → Show(task sig, active=arrayref slot)
+//   * Inside the handler-args arrayref → ShowHandler(task sig, slot)
 //   * Inside the options hash          → Silent (suppress native so
 //                                         the task sig doesn't leak
 //                                         into enqueue's own options)
-//   * Anywhere else at our dispatcher  → None (no claim — let the
-//                                         native path render enqueue's
-//                                         own signature)
+//   * Anywhere else inside the call    → ShowCallSig — cursor is in
+//                                         enqueue but NOT at the task's
+//                                         args slot. Core skips the
+//                                         string-dispatch fallback (it
+//                                         would otherwise key the task
+//                                         sig off the outer call's
+//                                         positional count, surfacing
+//                                         random task params) and shows
+//                                         enqueue's own method sig.
 fn on_signature_help(ctx) {
     let callframe = ctx["call"];
     if !is_minion_dispatch_call(callframe) { return (); }
 
     let container = ctx.cursor_inside;
-    if container == () { return (); }
+    if container == () {
+        // Cursor is inside the enqueue call but outside any nested
+        // container — the slot where the options hash or a stray comma
+        // lives. Task-sig doesn't apply; claim the call for ourselves
+        // so native won't mis-fire.
+        return #{ ShowCallSig: () };
+    }
 
     if container.kind == "Hash" {
         // Options hash is enqueue's OWN arg — suppress the native
         // string-dispatch sig help that would show the task's shape.
         return #{ Silent: () };
     }
-    if container.kind != "Array" { return (); }
+    if container.kind != "Array" {
+        // Some other container shape we don't model — still our call,
+        // still want to skip string-dispatch.
+        return #{ ShowCallSig: () };
+    }
 
     if callframe.args.len() < 1 { return (); }
     let name = callframe.args[0].string_value;

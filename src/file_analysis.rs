@@ -3046,6 +3046,17 @@ impl FileAnalysis {
         // Find the file scope (ScopeId(0))
         let file_scope = ScopeId(0);
         let mut out = self.outline_children_of(file_scope);
+        // Non-block `package X;` / `class X;` sibling scopes are
+        // tagged `ScopeKind::Package` and flatten into the file-level
+        // outline (each entity — helper, route, task — sits directly
+        // under the file, not nested under a package entry).
+        for scope in &self.scopes {
+            if scope.parent == Some(file_scope)
+                && matches!(scope.kind, ScopeKind::Package)
+            {
+                out.extend(self.outline_children_of(scope.id));
+            }
+        }
 
         // Plugin namespaces as navigable outline entries. Entities
         // themselves still show flat at file scope (the Helper/Route/Task

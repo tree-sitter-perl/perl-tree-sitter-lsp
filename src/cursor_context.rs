@@ -477,7 +477,7 @@ pub fn find_call_context(tree: &Tree, source: &[u8], point: Point) -> Option<Cal
     let (name, is_method, invocant, args_node) = find_call_at_cursor(tree, source, point)?;
 
     let active_param = match args_node {
-        Some(args) => count_commas_before(args, point),
+        Some(args) => active_slot_in_node(args, point),
         None => 0,
     };
 
@@ -753,28 +753,50 @@ fn parse_call_from_error<'a>(
 
 // ---- Counting helpers ----
 
-/// Count top-level commas before cursor → active parameter index.
-fn count_commas_before(node: Node, cursor: Point) -> usize {
+/// Index of the positional-argument slot the cursor is sitting in,
+/// scoped to a single call-args / container node. Tree-based: counts
+/// the NAMED children (which are the positional arguments) whose end
+/// lies at-or-before the cursor. Counts fat-commas and literal commas
+/// the same way, because they're both just separators between named
+/// children in the parser — there's no text matching here.
+///
+///   `enqueue('t', [a], {})` cursor inside `[a]` → 1 named child
+///     (the string_literal `'t'`) has ended before cursor → slot 1.
+///
+///   `enqueue(t => [a], {})` cursor inside `[a]` → 1 named child
+///     (the autoquoted_bareword `t`) has ended → slot 1. Same answer.
+pub fn active_slot_in_node(node: Node, cursor: Point) -> usize {
+    let scope = item_scope(node);
     let mut count = 0;
-    let mut depth = 0;
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            if child.start_position() >= cursor {
-                break;
-            }
-            match child.kind() {
-                "(" | "[" | "{" => depth += 1,
-                ")" | "]" | "}" => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
-                }
-                "," if depth == 0 => count += 1,
-                _ => {}
-            }
+    let c_pos = (cursor.row, cursor.column);
+    let mut walker = scope.walk();
+    for child in scope.named_children(&mut walker) {
+        let e = child.end_position();
+        if (e.row, e.column) <= c_pos {
+            // Child has ended at-or-before the cursor — cursor is
+            // past this slot.
+            count += 1;
+        } else {
+            // Cursor is inside this child (or before it). Either way,
+            // this is the slot the cursor is currently in; stop.
+            break;
         }
     }
     count
+}
+
+/// tree-sitter-perl wraps multi-item container contents in an inner
+/// `list_expression`, so `[a, b, c]` parses as an
+/// `anonymous_array_expression` whose only named child is a
+/// `list_expression` holding the items. Callers want to iterate the
+/// items directly — descend through that single-child wrapper.
+fn item_scope(node: Node) -> Node {
+    let mut walker = node.walk();
+    let named: Vec<_> = node.named_children(&mut walker).collect();
+    if named.len() == 1 && named[0].kind() == "list_expression" {
+        return named[0];
+    }
+    node
 }
 
 /// Count both `,` and `=>` separators before cursor at top-level depth.
@@ -936,7 +958,7 @@ pub fn build_plugin_query_context(
                 "anonymous_array_expression" => {
                     found = Some(ContainerFrame {
                         kind: ContainerKind::Array,
-                        active_slot: count_commas_inside_node(node, source, point),
+                        active_slot: active_slot_in_node(node, point),
                         existing_keys: Vec::new(),
                     });
                     break;
@@ -945,7 +967,7 @@ pub fn build_plugin_query_context(
                     let used = used_keys_in_enclosing_hash(tree, source, point);
                     found = Some(ContainerFrame {
                         kind: ContainerKind::Hash,
-                        active_slot: count_commas_inside_node(node, source, point),
+                        active_slot: active_slot_in_node(node, point),
                         existing_keys: used.into_iter().collect(),
                     });
                     break;
@@ -963,55 +985,6 @@ pub fn build_plugin_query_context(
 
     if call.is_none() && container.is_none() { return None; }
     Some(SigHelpQueryContext { call, cursor_inside: container, current_package })
-}
-
-/// Count `,` separators inside a container node that occur before
-/// `point`. Walks ALL descendants (not just direct children) because
-/// tree-sitter-perl often wraps a container's contents in a nested
-/// `list_expression` — the commas live there, not at the top level.
-/// Skips commas nested inside another array/hash literal to keep the
-/// count scoped to THIS container's own slots.
-pub fn count_commas_inside_node(node: Node, source: &[u8], point: Point) -> usize {
-    let mut count = 0;
-    let p_pos = (point.row, point.column);
-
-    fn walk(
-        node: Node,
-        source: &[u8],
-        p_pos: (usize, usize),
-        count: &mut usize,
-        skip_root: bool,
-    ) {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            let s = child.start_position();
-            if (s.row, s.column) > p_pos { break; }
-
-            // Don't descend into nested array/hash literals — their
-            // commas belong to the inner scope, not ours.
-            if !skip_root
-                && matches!(child.kind(),
-                    "anonymous_array_expression" | "anonymous_hash_expression")
-            {
-                continue;
-            }
-
-            if !child.is_named() {
-                let e = child.end_position();
-                if (e.row, e.column) > p_pos { continue; }
-                if let Ok(text) = child.utf8_text(source) {
-                    if text == "," {
-                        *count += 1;
-                    }
-                }
-            } else {
-                walk(child, source, p_pos, count, false);
-            }
-        }
-    }
-
-    walk(node, source, p_pos, &mut count, true);
-    count
 }
 
 // ---- Selection ranges (tree-based) ----

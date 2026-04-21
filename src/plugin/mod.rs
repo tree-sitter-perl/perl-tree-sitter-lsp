@@ -475,6 +475,13 @@ pub enum PluginSigHelpAnswer {
         /// needs the raw Handler-params index.
         active_param: usize,
     },
+    /// Cursor is inside a call the plugin recognizes, but not in the
+    /// slot it claims (e.g. outside Minion `enqueue`'s arrayref, which
+    /// is where the task's args actually live). Core skips the
+    /// string-dispatch fallback — which would otherwise show the
+    /// task's sig indexed by the OUTER call's comma count, picking a
+    /// random task param — and falls through to the method's OWN sig.
+    ShowCallSig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

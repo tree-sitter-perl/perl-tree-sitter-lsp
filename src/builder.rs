@@ -76,6 +76,13 @@ pub fn build_with_plugins(
     // Create file-level scope and walk
     let file_scope = b.push_scope(ScopeKind::File, node_to_span(tree.root_node()), None);
     b.visit_children(tree.root_node());
+    // Close any non-block `package`/`class` sibling scopes still open
+    // at EOF — their spans were seeded with the file end, so popping
+    // without trimming leaves them covering exactly the right range.
+    while let Some(&top) = b.scope_stack.last() {
+        if top == file_scope { break; }
+        b.pop_scope();
+    }
     b.pop_scope();
     let _ = file_scope;
 
@@ -1047,10 +1054,6 @@ impl<'a> Builder<'a> {
         let name_node = node.child_by_field_name("name").unwrap();
         self.current_package = Some(name.clone());
 
-        // Update the current scope's package
-        let scope = self.current_scope();
-        self.scopes[scope.0 as usize].package = Some(name.clone());
-
         self.add_symbol(
             name.clone(),
             SymKind::Package,
@@ -1059,16 +1062,56 @@ impl<'a> Builder<'a> {
             SymbolDetail::None,
         );
 
-        // Block packages: `package Foo { ... }` — recurse into the block
         let has_block = (0..node.child_count())
             .any(|i| node.child(i).map_or(false, |c| c.kind() == "block"));
         if has_block {
+            // `package Foo { ... }` — scope is the block.
             self.add_fold_range(node);
             let prev_package = self.current_package.take();
             self.current_package = Some(name);
             self.visit_children(node);
             self.current_package = prev_package;
+        } else {
+            // `package Foo;` — thread a Package scope spanning from
+            // this statement to end-of-file (trimmed retroactively if
+            // another `package X;` appears later). Without this, two
+            // successive top-level packages stamp the same root scope
+            // and `package_at(point)` reports the LAST name for every
+            // point, including points inside the earlier region.
+            self.open_sibling_scope(ScopeKind::Package, node.start_position(), Some(name));
         }
+    }
+
+    /// Close any currently-open Package/Class sibling scope at the top
+    /// of the stack, trimming its span to end at `close_at`. Used when a
+    /// later `package X;` / `class Y;` supersedes an earlier one.
+    fn close_sibling_scope_if_open(&mut self, close_at: Point) {
+        while let Some(&top) = self.scope_stack.last() {
+            let kind = &self.scopes[top.0 as usize].kind;
+            // Only non-block `package`/`class` scopes (tagged as
+            // `ScopeKind::Package`) are sibling scopes that get
+            // supplanted by a successor. Block-scoped Class stays
+            // pushed until its block ends.
+            if !matches!(kind, ScopeKind::Package) { break; }
+            self.scopes[top.0 as usize].span.end = close_at;
+            self.scope_stack.pop();
+        }
+    }
+
+    /// Open a Package/Class scope that flows until the next same-level
+    /// sibling or end of file. Prior sibling is closed at `start`. The
+    /// new scope's end is initially the FILE-level scope's end (acting
+    /// as "end of file") and gets trimmed if a successor appears.
+    fn open_sibling_scope(&mut self, kind: ScopeKind, start: Point, package: Option<String>) {
+        self.close_sibling_scope_if_open(start);
+        // Use the outer (file) scope's end as the default terminator.
+        let file_end = self
+            .scope_stack
+            .first()
+            .map(|id| self.scopes[id.0 as usize].span.end)
+            .unwrap_or(start);
+        let span = Span { start, end: file_end };
+        self.push_scope(kind, span, package);
     }
 
     fn visit_class(&mut self, node: Node<'a>) {
@@ -1152,10 +1195,13 @@ impl<'a> Builder<'a> {
             self.pop_scope();
             self.current_package = prev_package;
         } else {
-            // Flat class (class Foo;): like package, stays in effect until next package/class
+            // Flat `class Foo;` — same semantics as non-block
+            // `package Foo;`: threads a sibling scope tagged as
+            // `ScopeKind::Package` so it flattens-in-outline and the
+            // class name flows via `scope.package`. The Class SYMBOL
+            // is still emitted above — this is just the scope.
             self.current_package = Some(name.clone());
-            let scope = self.current_scope();
-            self.scopes[scope.0 as usize].package = Some(name);
+            self.open_sibling_scope(ScopeKind::Package, node.start_position(), Some(name));
         }
     }
 
@@ -8446,6 +8492,171 @@ sub new {
             .expect("event must be in outline of its declaring file");
         assert_eq!(lsp_kind(event), SymbolKind::EVENT,
             "events stay EVENT — the one LSP kind that fits");
+    }
+
+    /// Real-file invariant pinning the original nvim repro: line 118
+    /// of plugin_mojo_demo.pl, which sits textually in `package MyApp`
+    /// but before the fix was reported as `MyApp::Progress` (the LAST-
+    /// declared package in the file) — so Minion's trigger didn't
+    /// match, the plugin hook didn't fire, and the native path
+    /// mis-keyed the task's sig off the enqueue parens.
+    ///
+    /// Pinned points:
+    ///   * cursor inside `'alice@example.com'` → $to   (slot 0)
+    ///   * cursor inside `'hi'`                → $subject (slot 1)
+    ///   * cursor inside `'body'`              → $body   (slot 2)
+    ///   * cursor past the closing `]`          → NOT the task sig
+    #[test]
+    fn enqueue_sighelp_line_118_of_demo() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_files/plugin_mojo_demo.pl");
+        let src = std::fs::read_to_string(&path).unwrap();
+        let fa = build_fa(&src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&src, None).unwrap();
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+
+        let line_idx = 117u32; // line 118 (1-indexed) = 117 (0-indexed)
+        let line = src.lines().nth(line_idx as usize).unwrap();
+
+        let cases: &[(&str, &str, Option<u32>)] = &[
+            ("alice@example.com", "'alice", Some(0)),
+            ("hi",                "'hi'",   Some(1)),
+            ("body",              "'body'", Some(2)),
+        ];
+        for (slot_label, needle, expected) in cases {
+            let col = (line.find(needle).unwrap() + 2) as u32;
+            let pos = Position { line: line_idx, character: col };
+            let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx)
+                .unwrap_or_else(|| panic!("[{slot_label}] sig help must fire"));
+            assert!(sig.signatures[0].label.contains("send_email"),
+                "[{slot_label}] task sig expected; got {:?}", sig.signatures[0].label);
+            assert_eq!(sig.active_parameter, *expected,
+                "[{slot_label}] wrong slot; got {:?}", sig.active_parameter);
+        }
+
+        // Past the closing `]` — must NOT show the task sig.
+        let col = (line.rfind(']').unwrap() + 1) as u32;
+        let pos = Position { line: line_idx, character: col };
+        if let Some(s) = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx) {
+            let lbl = &s.signatures[0].label;
+            assert!(!lbl.contains("send_email"),
+                "past `]`: task sig must not leak; got {lbl:?}");
+        }
+    }
+
+    /// Pinned invariant for the real-nvim Minion sig-help bug:
+    ///
+    ///   * Fat commas and literal commas must produce the SAME
+    ///     signature-help behavior at identical cursor positions.
+    ///     Two cases before the fix: (a) inside the arrayref, both
+    ///     variants routed to the task sig — that worked. (b) once
+    ///     the cursor left the arrayref, the native string-dispatch
+    ///     path keyed the task's active_param off the outer call's
+    ///     literal-comma count, surfacing `$subject` at the options-
+    ///     hash slot, and `$body` several slots into a run of
+    ///     trailing commas. Both wrong in obviously different ways.
+    ///
+    ///   * Cursor inside the arrayref → task sig, correct slot.
+    ///   * Cursor outside the arrayref but still in the enqueue call
+    ///     → NEVER the task sig. Falls through to enqueue's own
+    ///     method sig (none here, since Minion.pm isn't indexed in
+    ///     the test — `None` is the acceptable outcome).
+    ///
+    /// If this regresses, the sweep-style bug is back: flip to
+    /// `DUMP_SWEEP=1 cargo test` to get a per-column dump.
+    #[test]
+    fn enqueue_sighelp_separator_agnostic() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let cases: &[(&str, &str)] = &[
+            ("literal-comma", "$minion->enqueue('send_email', [ 'alice' ], {})"),
+            ("fat-comma",     "$minion->enqueue(send_email => [ 'alice' ], , , , )"),
+        ];
+
+        let header = "package MyApp;\nuse Minion;\nmy $minion = Minion->new;\n\
+             $minion->add_task(send_email => sub { my ($job, $to, $subject, $body) = @_; });\n";
+
+        let dump = std::env::var("DUMP_SWEEP").is_ok();
+        let mut dump_out = String::new();
+
+        for (label, call_line) in cases {
+            let src = format!("{}{};\n", header, call_line);
+            let fa = build_fa(&src);
+            let mut parser = Parser::new();
+            parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+            let tree = parser.parse(&src, None).unwrap();
+            let idx = crate::module_index::ModuleIndex::new_for_test();
+
+            let line_idx = src.lines().position(|l| l.starts_with("$minion->enqueue")).unwrap();
+            let line = src.lines().nth(line_idx).unwrap();
+
+            // Cursor inside 'alice' → task sig, slot 0 ($to).
+            let in_alice = line.find("'alice'").unwrap() + 3;
+            let pos = Position { line: line_idx as u32, character: in_alice as u32 };
+            let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx)
+                .unwrap_or_else(|| panic!("[{label}] cursor in 'alice' must fire task sig"));
+            assert!(sig.signatures[0].label.contains("send_email"),
+                "[{label}] in 'alice' → task sig; got: {:?}", sig.signatures[0].label);
+            assert_eq!(sig.active_parameter, Some(0),
+                "[{label}] in 'alice' → $to (slot 0); got {:?}", sig.active_parameter);
+
+            // Cursor past the `]` but still inside the enqueue parens
+            // → the options-hash slot / trailing-comma space. MUST NOT
+            // show the task sig. `None` is acceptable (enqueue's own
+            // method isn't indexed in this test).
+            let past_bracket = line.find(']').unwrap() + 2;
+            let pos = Position { line: line_idx as u32, character: past_bracket as u32 };
+            let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx);
+            if let Some(s) = &sig {
+                let lbl = &s.signatures[0].label;
+                assert!(!lbl.contains("send_email"),
+                    "[{label}] past `]`: task sig must NOT show; got: {:?}", lbl);
+            }
+
+            // Fat-comma specific: sweep the trailing-commas region
+            // and ensure NONE of those columns surface the task sig.
+            // Before the fix, each literal comma bumped active_param
+            // and produced $subject / $body at arbitrary positions.
+            if *label == "fat-comma" {
+                let start = line.find(']').unwrap() + 1;
+                let end = line.rfind(')').unwrap();
+                for col in start..=end {
+                    let pos = Position { line: line_idx as u32, character: col as u32 };
+                    let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx);
+                    if let Some(s) = &sig {
+                        let lbl = &s.signatures[0].label;
+                        assert!(!lbl.contains("send_email"),
+                            "[{label}] col {col}: task sig leaked into trailing-comma region; got: {:?}",
+                            lbl);
+                    }
+                }
+            }
+
+            if dump {
+                dump_out.push_str(&format!("\n=== {} ===\n{}\n", label, line));
+                for col in 0..=line.len() {
+                    let pos = Position { line: line_idx as u32, character: col as u32 };
+                    let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx);
+                    let label_str = match &sig {
+                        None => "<none>".to_string(),
+                        Some(s) => format!("ap={:?} sig={}",
+                            s.active_parameter,
+                            s.signatures.first().map(|si| si.label.as_str()).unwrap_or("")),
+                    };
+                    let ch = line.chars().nth(col).map(|c| c.to_string())
+                        .unwrap_or_else(|| "<eol>".into());
+                    dump_out.push_str(&format!("col {:>3} ({:<5}): {}\n", col, ch, label_str));
+                }
+            }
+        }
+
+        if dump { panic!("{}", dump_out); }
     }
 
     /// Sanity: the minion plugin registers a task Handler with the

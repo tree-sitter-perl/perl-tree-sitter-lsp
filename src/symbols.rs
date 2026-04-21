@@ -1357,6 +1357,7 @@ pub fn signature_help(
     // show a custom sig (arrayref-wrapped handler args) OR silently
     // claim the slot to suppress native sig (cursor in an options
     // hash of a dispatcher — native would mis-show the task sig).
+    let mut skip_string_dispatch = false;
     if let Some(qctx) = cursor_context::build_plugin_query_context(analysis, tree, text.as_bytes(), point) {
         let registry = crate::builder::default_plugin_registry();
         let (uses, parents) = analysis.trigger_view_at(point);
@@ -1392,6 +1393,15 @@ pub fn signature_help(
                     // — suppress native to avoid fallthrough mis-fires.
                     return None;
                 }
+                Some(crate::plugin::PluginSigHelpAnswer::ShowCallSig) => {
+                    // Plugin recognizes this call but the cursor isn't
+                    // in its args slot. Skip the native string-dispatch
+                    // fallback (which would key the task's sig off the
+                    // OUTER call's positional count) and fall through
+                    // to the method's OWN signature.
+                    skip_string_dispatch = true;
+                    break;
+                }
                 None => {}
             }
         }
@@ -1412,7 +1422,7 @@ pub fn signature_help(
     // in this function — the hook sees the Array container + active
     // slot and returns the task sig. No core-side arrayref branching.
 
-    if call_ctx.is_method && call_ctx.active_param >= 1 {
+    if !skip_string_dispatch && call_ctx.is_method && call_ctx.active_param >= 1 {
         // Primary path: find the DispatchCall ref the plugin already
         // emitted for this call site. Its `target_name`, `owner`, and
         // `dispatcher` were all computed with the builder's full
