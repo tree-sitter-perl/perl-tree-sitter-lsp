@@ -614,10 +614,16 @@ impl ModuleIndex {
                 let bridges_class = ns.bridges.iter().any(|b|
                     matches!(b, crate::file_analysis::Bridge::Class(c) if c == class_name));
                 if !bridges_class { continue; }
+                // Namespace membership IS the filter — if this namespace
+                // bridges to `class_name`, every entity it owns is
+                // visible from `class_name`. We used to additionally
+                // require `sym.package == class_name`, which forced
+                // mojo-helpers to fan-out one Method per bridge class.
+                // Now the plugin picks ONE canonical home package and
+                // the namespace's bridges control visibility.
                 for sym_id in &ns.entities {
                     let idx = sym_id.0 as usize;
                     let Some(sym) = cached.analysis.symbols.get(idx) else { continue };
-                    if sym.package.as_deref() != Some(class_name) { continue; }
                     visit(&cached, sym);
                 }
             }

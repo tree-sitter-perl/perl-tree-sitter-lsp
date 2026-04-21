@@ -65,11 +65,16 @@ fn on_method_call(ctx) {
     }
 
     // Split on '.' — single-segment names are the common case and
-    // produce exactly one Method per entry class. Dotted names chain.
+    // produce exactly one Method. Dotted names chain.
     let segments = name.split(".");
-    // Entry classes where helpers become methods. Both Controller and
-    // Mojolicious (the app class) so `$c->...` AND `$app->...` complete.
-    let entry_classes = ["Mojolicious::Controller", "Mojolicious"];
+    // `$c->helper` AND `$app->helper` both need to resolve. We used
+    // to fan-out one Method per class (Controller + Mojolicious), but
+    // that made namespace entities ambiguous (two Symbols per helper)
+    // and required a second scan per call site. Phase 2 of the plugin
+    // arch moves to ONE Method, owned by `Mojolicious::Controller`,
+    // and a PluginNamespace whose bridges cover both entry classes —
+    // for_each_entity_bridged_to matches via bridge union, so the
+    // same Method surfaces from a `Mojolicious` query too.
 
     // App namespace — one per current_package. Find-or-create on the
     // core side. Bridges to both Controller (so `$c->helper` works) and
@@ -86,26 +91,24 @@ fn on_method_call(ctx) {
     ];
 
     if segments.len() == 1 {
-        // Simple helper: Method on each entry class.
-        for entry in entry_classes {
-            out += #{
-                Method: #{
-                    name: name,
-                    span: name_span,
-                    selection_span: name_span,
-                    params: params,
-                    is_method: true,
-                    return_type: (),
-                    doc: (),
-                    on_class: entry,
-                    display: "Helper",
-                    hide_in_outline: false,
-                }
-            };
-        }
-        // Register the helper into the app namespace. Fan-out on two
-        // classes means TWO Symbols share the same name; both land as
-        // namespace entities via the name-keyed resolution.
+        // Simple helper: ONE Method on the canonical entry class.
+        out += #{
+            Method: #{
+                name: name,
+                span: name_span,
+                selection_span: name_span,
+                params: params,
+                is_method: true,
+                return_type: (),
+                doc: (),
+                on_class: "Mojolicious::Controller",
+                display: "Helper",
+                hide_in_outline: false,
+            }
+        };
+        // Register the helper into the app namespace. Bridges to both
+        // Controller and Mojolicious; the single Method's package is
+        // Controller, and the bridge-union lookup finds it from both.
         out += #{
             PluginNamespace: #{
                 id: app_ns_id,
@@ -137,29 +140,27 @@ fn on_method_call(ctx) {
     // deterministic per prefix and two helpers sharing a prefix
     // (`users.create`, `users.delete`) collapse onto the same proxy.
     //
-    // Fan-out first-segment emission across the entry classes, then
-    // the deeper chain lives on the shared proxy (one copy).
+    // First segment: ONE Method owned by Controller. The namespace's
+    // bridge-union surfaces it from a Mojolicious query too.
     let n = segments.len();
     let proxy_base = "Mojolicious::Controller::_Helper";
     let first_seg = segments[0];
     let first_proxy = proxy_base + "::" + first_seg;
-    for entry in entry_classes {
-        out += #{
-            Method: #{
-                name: first_seg,
-                span: name_span,
-                selection_span: name_span,
-                params: [],
-                is_method: true,
-                return_type: #{ ClassName: first_proxy },
-                doc: (),
-                on_class: entry,
-                display: "Helper",
-                hide_in_outline: false,
-                opaque_return: true,
-            }
-        };
-    }
+    out += #{
+        Method: #{
+            name: first_seg,
+            span: name_span,
+            selection_span: name_span,
+            params: [],
+            is_method: true,
+            return_type: #{ ClassName: first_proxy },
+            doc: (),
+            on_class: "Mojolicious::Controller",
+            display: "Helper",
+            hide_in_outline: false,
+            opaque_return: true,
+        }
+    };
 
     let proxy_path = first_proxy;
     let owner_class = first_proxy;
@@ -203,30 +204,51 @@ fn on_method_call(ctx) {
         }
     };
 
-    // Register the full chain into the app namespace. Every proxy
-    // class the chain walks through gets its own Bridge::Class so
-    // lookups "find methods on _Helper::admin" hit the namespace
-    // directly — no class_content_index fallback needed.
-    let chain_bridges = app_bridges;
-    let chain_entity_names = [first_seg];
-    // Walk the proxy classes we just emitted Methods onto: first_proxy
-    // holds the first segment's target, then each intermediate seg's
-    // proxy_path, plus the innermost owner_class for the leaf.
-    chain_bridges.push(#{ Class: first_proxy });
-    let proxy_walk = first_proxy;
-    for i in 1..(n - 1) {
-        proxy_walk = proxy_walk + "::" + segments[i];
-        chain_bridges.push(#{ Class: proxy_walk });
-        chain_entity_names.push(segments[i]);
-    }
-    chain_entity_names.push(segments[n - 1]);
-
+    // Register the chain across TWO kinds of namespaces so bridge
+    // visibility stays isolated per proxy level:
+    //
+    //   1. App namespace (bridges: Controller, Mojolicious) — owns
+    //      ONLY the first segment (the entry point from `$c`/`$app`).
+    //      Query Controller/Mojolicious → gets top-level helpers +
+    //      chain roots, but NOT proxy-only entities (no create/delete
+    //      leaking into `$c->` completion).
+    //   2. One namespace per proxy level (bridges: just that proxy
+    //      class) — owns the entities that live ON that proxy.
+    //      Query _Helper::users → gets exactly {create, delete, admin}.
     out += #{
         PluginNamespace: #{
             id: app_ns_id,
             kind: "app",
-            bridges: chain_bridges,
-            entity_names: chain_entity_names,
+            bridges: app_bridges,
+            entity_names: [first_seg],
+            decl_span: ctx.call_span,
+        }
+    };
+
+    // Walk proxy levels: each intermediate segment goes into its
+    // parent proxy's namespace; the leaf goes into the innermost
+    // proxy's namespace.
+    let current_proxy = first_proxy;
+    for i in 1..(n - 1) {
+        let seg = segments[i];
+        out += #{
+            PluginNamespace: #{
+                id: "mojo-proxy:" + current_proxy,
+                kind: "proxy",
+                bridges: [#{ Class: current_proxy }],
+                entity_names: [seg],
+                decl_span: ctx.call_span,
+            }
+        };
+        current_proxy = current_proxy + "::" + seg;
+    }
+    // Leaf on the innermost proxy.
+    out += #{
+        PluginNamespace: #{
+            id: "mojo-proxy:" + current_proxy,
+            kind: "proxy",
+            bridges: [#{ Class: current_proxy }],
+            entity_names: [segments[n - 1]],
             decl_span: ctx.call_span,
         }
     };

@@ -1751,6 +1751,37 @@ impl FileAnalysis {
             }
         }
 
+        // Local plugin-namespace entities bridged to this class. The
+        // same-file equivalent of `for_each_entity_bridged_to` — plugin
+        // namespaces in THIS FileAnalysis whose bridges include
+        // `class_name`. Namespace membership is the sole filter (per
+        // `for_each_entity_bridged_to` docs); entity packages can be
+        // different from `class_name` (e.g. a helper Method whose
+        // package is `Mojolicious::Controller` surfacing from a
+        // `Mojolicious` query when the namespace bridges both).
+        for ns in &self.plugin_namespaces {
+            let bridges_class = ns.bridges.iter().any(|b|
+                matches!(b, Bridge::Class(c) if c == class_name));
+            if !bridges_class { continue; }
+            for sym_id in &ns.entities {
+                let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                if seen_names.contains(&sym.name) { continue; }
+                seen_names.insert(sym.name.clone());
+                let defining = if class_name != original_class { Some(class_name) } else { None };
+                let display_override = sub_display_override(&sym.detail);
+                candidates.push(CompletionCandidate {
+                    label: sym.name.clone(),
+                    kind: sym.kind,
+                    detail: Some(self.method_detail(original_class, &sym.name, defining, module_index)),
+                    insert_text: None,
+                    sort_priority: PRIORITY_LOCAL,
+                    additional_edits: vec![],
+                    display_override,
+                });
+            }
+        }
+
         // Walk local parents
         if let Some(parents) = self.package_parents.get(class_name) {
             for parent in parents {
@@ -2748,6 +2779,27 @@ impl FileAnalysis {
                     return Some(MethodResolution::Local {
                         class: class_name.to_string(),
                         sym_id: sid,
+                    });
+                }
+            }
+        }
+
+        // Local plugin-namespace entities bridged to class_name.
+        // Matches `collect_ancestor_methods`' local-namespace scan so a
+        // helper whose Method has package=`Mojolicious::Controller`
+        // resolves when the receiver is `Mojolicious` (or any class the
+        // namespace bridges to).
+        for ns in &self.plugin_namespaces {
+            let bridges_class = ns.bridges.iter().any(|b|
+                matches!(b, Bridge::Class(c) if c == class_name));
+            if !bridges_class { continue; }
+            for sym_id in &ns.entities {
+                let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                if sym.name == method_name {
+                    return Some(MethodResolution::Local {
+                        class: class_name.to_string(),
+                        sym_id: *sym_id,
                     });
                 }
             }

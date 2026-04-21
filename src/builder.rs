@@ -830,36 +830,6 @@ impl<'a> Builder<'a> {
                     .map(|s| s.id)
                     .collect();
 
-                // Debug hint for plugin authors: if the namespace has at
-                // least one Class bridge, every resolved entity's package
-                // should match one of those bridge classes — otherwise
-                // `for_each_entity_bridged_to` will silently skip it at
-                // lookup time (per-entity `sym.package` filter). Warn
-                // rather than assert: the plugin may intentionally emit
-                // entities meant for other bridge kinds once wired.
-                #[cfg(debug_assertions)]
-                {
-                    let bridge_classes: Vec<&str> = bridges.iter()
-                        .map(|crate::file_analysis::Bridge::Class(c)| c.as_str())
-                        .collect();
-                    if !bridge_classes.is_empty() {
-                        for eid in &entities {
-                            let sym = &self.symbols[eid.0 as usize];
-                            let pkg_matches = sym.package.as_deref()
-                                .map(|p| bridge_classes.iter().any(|c| *c == p))
-                                .unwrap_or(false);
-                            if !pkg_matches {
-                                log::warn!(
-                                    "plugin `{}` namespace `{}`: entity `{}` has package={:?} \
-                                     but no matching Bridge::Class in {:?} — cross-file lookup \
-                                     via for_each_entity_bridged_to will silently skip it",
-                                    plugin_id_for_ns, id, sym.name, sym.package, bridge_classes,
-                                );
-                            }
-                        }
-                    }
-                }
-
                 // Namespace identity is (plugin_id, id) — not just `id`.
                 // Two plugins that both pick "app" as an id belong to
                 // different namespaces; matching only on `id` would
@@ -7635,11 +7605,11 @@ sub run {
             "consumer should have ≥1 hit (the ->emit DispatchCall); results: {:?}", results);
     }
 
-    /// mojo-helpers: a helper registration in a Lite script produces a
-    /// Method on Mojolicious::Controller, so every subclass picks it up
-    /// through the normal inheritance walk. Proves cross-class emission:
-    /// the plugin's emission goes to a *different* package than the one
-    /// being built.
+    /// mojo-helpers: Phase-2 architecture emits ONE Method per helper,
+    /// owned by `Mojolicious::Controller` — the canonical home for
+    /// controller-callable helpers. The PluginNamespace's bridges cover
+    /// both Controller and Mojolicious so `$c->name` AND `$app->name`
+    /// both resolve through namespace lookup (no Symbol fan-out).
     #[test]
     fn plugin_mojo_helpers_registers_method_on_controller() {
         let src = r#"
@@ -7660,33 +7630,38 @@ $app->helper(current_user => sub {
                 && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
             .collect();
 
-        // Helpers register on BOTH Mojolicious::Controller and the
-        // Mojolicious app class so `$c->current_user` AND
-        // `$app->current_user` both complete / goto-def.
-        assert_eq!(helpers.len(), 2, "one helper per entry class");
-        let on_controller = helpers.iter()
-            .find(|h| h.package.as_deref() == Some("Mojolicious::Controller"))
-            .expect("Controller-class helper");
-        let on_app = helpers.iter()
-            .find(|h| h.package.as_deref() == Some("Mojolicious"))
-            .expect("app-class helper");
+        assert_eq!(helpers.len(), 1, "one Method per helper (no fan-out — Phase 2)");
+        let helper = helpers[0];
+        assert_eq!(helper.package.as_deref(), Some("Mojolicious::Controller"),
+            "canonical home is Mojolicious::Controller");
 
-        for helper in [on_controller, on_app] {
-            if let SymbolDetail::Sub { params, display, .. } = &helper.detail {
-                let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
-                assert_eq!(names, vec!["$c", "$extra"],
-                    "helper's sub params flow through to the Method signature");
-                assert_eq!(
-                    *display,
-                    Some(crate::file_analysis::HandlerDisplay::Helper),
-                    "helpers render as HandlerDisplay::Helper — the LSP kind is \
-                     FUNCTION (the enum doesn't have Helper), the outline word \
-                     is 'helper'. See HandlerDisplay::outline_word.",
-                );
-            } else {
-                panic!("helper detail should be Sub");
-            }
+        if let SymbolDetail::Sub { params, display, .. } = &helper.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$extra"],
+                "helper's sub params flow through to the Method signature");
+            assert_eq!(
+                *display,
+                Some(crate::file_analysis::HandlerDisplay::Helper),
+                "helpers render as HandlerDisplay::Helper — the LSP kind is \
+                 FUNCTION (the enum doesn't have Helper), the outline word \
+                 is 'helper'. See HandlerDisplay::outline_word.",
+            );
+        } else {
+            panic!("helper detail should be Sub");
         }
+
+        // The PluginNamespace owns the bridge visibility: its Class
+        // bridges cover both entry classes.
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n| n.plugin_id == "mojo-helpers" && n.entities.contains(&helper.id))
+            .expect("helper belongs to a mojo-helpers namespace");
+        let bridge_classes: std::collections::HashSet<&str> = ns.bridges.iter()
+            .map(|Bridge::Class(c)| c.as_str())
+            .collect();
+        assert!(bridge_classes.contains("Mojolicious::Controller"),
+            "namespace bridges Controller");
+        assert!(bridge_classes.contains("Mojolicious"),
+            "namespace bridges Mojolicious (the app class)");
     }
 
     /// Dotted helpers chain into namespace methods: `users.create` means
