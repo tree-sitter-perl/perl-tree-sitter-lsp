@@ -7351,8 +7351,10 @@ $app->helper(current_user => sub {
                     "helper's sub params flow through to the Method signature");
                 assert_eq!(
                     *display,
-                    Some(crate::file_analysis::HandlerDisplay::Function),
-                    "helpers render as Function, not plain Method",
+                    Some(crate::file_analysis::HandlerDisplay::Helper),
+                    "helpers render as HandlerDisplay::Helper — the LSP kind is \
+                     FUNCTION (the enum doesn't have Helper), the outline word \
+                     is 'helper'. See HandlerDisplay::outline_word.",
                 );
             } else {
                 panic!("helper detail should be Sub");
@@ -7909,7 +7911,8 @@ $minion->add_task(send_email => sub {
             = handler.detail else { panic!("handler detail should be Handler") };
         assert!(matches!(owner, HandlerOwner::Class(c) if c == "Minion"));
         assert!(dispatchers.iter().any(|d| d == "enqueue"));
-        assert!(matches!(display, HandlerDisplay::Function));
+        assert!(matches!(display, HandlerDisplay::Task),
+            "minion tasks render as HandlerDisplay::Task (LSP kind FUNCTION, outline word 'task')");
         // Callback params: $job flagged as invocant, then the rest.
         let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["$job", "$to", "$subject"]);
@@ -8273,6 +8276,194 @@ $app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
         let leaf_labels: Vec<&str> = leaf_candidates.iter().map(|c| c.label.as_str()).collect();
         assert!(leaf_labels.contains(&"purge"),
             "leaf proxy must offer `purge`; got: {:?}", leaf_labels);
+    }
+
+    // ==== Three tests pinning this round's user-facing contracts. ====
+    //
+    // They begin RED and get fixed one at a time below. Shape of each is
+    // "source code + cursor position + real-pipeline assertion" so we
+    // can't lie about internal function results passing while the LSP
+    // experience breaks.
+
+    /// Test 1 — outline detail names the semantic kind, kind stays
+    /// FUNCTION (user config can map it). Helpers / routes / tasks
+    /// each get their domain word in `detail`; events stay as EVENT.
+    #[test]
+    fn outline_detail_names_the_semantic_kind() {
+        use tower_lsp::lsp_types::SymbolKind;
+        let src = r#"package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(current_user => sub { my ($c) = @_; });
+
+my $r = app->routes;
+$r->get('/x')->to('Users#list');
+
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job) = @_; });
+
+package MyEmitter;
+use parent 'Mojo::EventEmitter';
+sub new {
+    my $self = bless {}, shift;
+    $self->on('ready', sub { my ($s) = @_; });
+    $self;
+}
+"#;
+        let fa = build_fa(src);
+        let outline = fa.document_symbols();
+
+        // Flatten outline tree for easy lookup.
+        fn flatten<'a>(out: &'a [crate::file_analysis::OutlineSymbol], acc: &mut Vec<&'a crate::file_analysis::OutlineSymbol>) {
+            for s in out {
+                acc.push(s);
+                flatten(&s.children, acc);
+            }
+        }
+        let mut all = Vec::new();
+        flatten(&outline, &mut all);
+
+        let lsp_kind = |os: &crate::file_analysis::OutlineSymbol| -> SymbolKind {
+            crate::symbols::outline_lsp_kind(os)
+        };
+
+        let helper = all.iter().find(|s| s.name.contains("current_user"))
+            .expect("helper must be in outline of its declaring file");
+        assert_eq!(lsp_kind(helper), SymbolKind::FUNCTION,
+            "helpers render as FUNCTION (user's nvim config handles label)");
+        assert!(helper.detail.as_deref().unwrap_or("").contains("helper"),
+            "helper outline detail must contain 'helper'; got: {:?}", helper.detail);
+
+        let route = all.iter().find(|s| s.name.contains("Users#list"))
+            .expect("route must be in outline of its declaring file");
+        assert_eq!(lsp_kind(route), SymbolKind::FUNCTION);
+        assert!(route.detail.as_deref().unwrap_or("").contains("route"),
+            "route outline detail must contain 'route'; got: {:?}", route.detail);
+
+        let task = all.iter().find(|s| s.name.contains("send_email"))
+            .expect("task must be in outline of its declaring file");
+        assert_eq!(lsp_kind(task), SymbolKind::FUNCTION);
+        assert!(task.detail.as_deref().unwrap_or("").contains("task"),
+            "task outline detail must contain 'task'; got: {:?}", task.detail);
+
+        let event = all.iter().find(|s| s.name.contains("ready"))
+            .expect("event must be in outline of its declaring file");
+        assert_eq!(lsp_kind(event), SymbolKind::EVENT,
+            "events stay EVENT — the one LSP kind that fits");
+    }
+
+    /// Test 2 — arrayref sig help, through the REAL LSP pipeline.
+    /// `active_parameter` counts within the arrayref, not the outer
+    /// enqueue call. Label is the task's sig, not enqueue's.
+    #[test]
+    fn enqueue_arrayref_sig_help_active_param_is_local_to_arrayref() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject, $body) = @_;
+});
+$minion->enqueue(send_email => ['alice', 'hi', ]);
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Cursor AFTER the second comma inside the arrayref — expected
+        // active_param = 2 (zero-indexed: the slot for $body).
+        let anchor = "'alice', 'hi', ";
+        let (row, col) = src.lines().enumerate()
+            .find_map(|(r, l)| l.find(anchor).map(|c| (r, c + anchor.len())))
+            .expect("anchor in source");
+        let pos = Position { line: row as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
+            .expect("sig help must fire inside enqueue's arrayref");
+
+        let info = &sig.signatures[0];
+        assert!(info.label.contains("send_email"),
+            "label must reference the task, not enqueue; got: {:?}", info.label);
+        assert!(info.label.contains("$body"),
+            "label must surface the task's params; got: {:?}", info.label);
+        assert_eq!(sig.active_parameter, Some(2),
+            "active_parameter must be scoped to the arrayref (2 = $body), \
+             not the outer enqueue call; got: {:?}", sig.active_parameter);
+    }
+
+    /// Test 3a — hash-key completion on an empty enqueue options hash.
+    /// Real pipeline (completion_items), not the internal fn.
+    #[test]
+    fn enqueue_options_hash_completion_empty() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->enqueue(task_x => ['a'], {  });
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let anchor = "{ ";
+        let (row, col) = src.lines().enumerate()
+            .find_map(|(r, l)| l.find(anchor).map(|c| (r, c + anchor.len())))
+            .unwrap();
+        let pos = Position { line: row as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        for expected in &["priority", "queue", "delay", "attempts"] {
+            assert!(labels.contains(expected),
+                "empty-hash: `{}` must complete; got: {:?}", expected, labels);
+        }
+    }
+
+    /// Test 3b — with an existing key in the hash, it must NOT be
+    /// offered again; the rest of the options must still appear.
+    #[test]
+    fn enqueue_options_hash_completion_with_existing_keys() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->enqueue(task_x => ['a'], { priority => 10,  });
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let anchor = "priority => 10, ";
+        let (row, col) = src.lines().enumerate()
+            .find_map(|(r, l)| l.find(anchor).map(|c| (r, c + anchor.len())))
+            .unwrap();
+        let pos = Position { line: row as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        assert!(labels.contains(&"queue"),
+            "with-existing: `queue` must still complete; got: {:?}", labels);
+        assert!(labels.contains(&"delay"),
+            "with-existing: `delay` must still complete; got: {:?}", labels);
+        assert!(!labels.contains(&"priority"),
+            "with-existing: `priority` is already used — must NOT re-appear; got: {:?}",
+            labels);
     }
 
     /// Sig help on a helper call strips `$c` like it strips `$self`.

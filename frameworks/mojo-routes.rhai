@@ -82,8 +82,8 @@ fn route_emissions(controller, action, span, current_package) {
             params: [],
             span: span,
             selection_span: span,
-            display: "Function",
-            hide_in_outline: true,
+            display: "Route",
+            hide_in_outline: false,
         }
     };
 

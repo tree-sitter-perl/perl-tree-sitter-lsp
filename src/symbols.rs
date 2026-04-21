@@ -62,6 +62,11 @@ fn handler_display_to_symbol_kind(d: &crate::file_analysis::HandlerDisplay) -> S
         H::Field => SymbolKind::FIELD,
         H::Property => SymbolKind::PROPERTY,
         H::Constant => SymbolKind::CONSTANT,
+        // Helper / Route / Task → FUNCTION. LSP's `SymbolKind` enum
+        // is frozen; the distinguishing word lives in `detail` so
+        // client configs (or built-in rendering) can surface
+        // `helper` / `route` / `task` without protocol extension.
+        H::Helper | H::Route | H::Task => SymbolKind::FUNCTION,
     }
 }
 
@@ -74,19 +79,23 @@ fn handler_display_to_completion_kind(d: &crate::file_analysis::HandlerDisplay) 
         H::Field => CompletionItemKind::FIELD,
         H::Property => CompletionItemKind::PROPERTY,
         H::Constant => CompletionItemKind::CONSTANT,
+        H::Helper | H::Route | H::Task => CompletionItemKind::FUNCTION,
+    }
+}
+
+/// The LSP `SymbolKind` we'd emit for an outline node. Pulled out so
+/// tests can pin behavior without reconstructing the conversion.
+pub fn outline_lsp_kind(s: &OutlineSymbol) -> SymbolKind {
+    match s.handler_display {
+        Some(ref d) => handler_display_to_symbol_kind(d),
+        None => fa_sym_kind_to_lsp(&s.kind),
     }
 }
 
 #[allow(deprecated)]
 fn outline_to_document_symbol(s: &OutlineSymbol) -> DocumentSymbol {
     let children: Vec<DocumentSymbol> = s.children.iter().map(outline_to_document_symbol).collect();
-    // Handler's LSP kind comes from the plugin's chosen display. Falls
-    // back to Event only if the outline wasn't populated with a
-    // display (older analyses or non-Handler kinds).
-    let kind = match s.handler_display {
-        Some(ref d) => handler_display_to_symbol_kind(d),
-        None => fa_sym_kind_to_lsp(&s.kind),
-    };
+    let kind = outline_lsp_kind(s);
     DocumentSymbol {
         name: s.name.clone(),
         detail: s.detail.clone(),
@@ -487,19 +496,27 @@ pub fn completion_items(
             }
         }
         CursorContext::HashKey { ref owner_type, ref var_text, ref source_sub } => {
-            if let Some(ref ty) = owner_type {
-                if let Some(cn) = ty.class_name() {
-                    analysis.complete_hash_keys_for_class(cn, point)
-                } else if let Some(ref sub_name) = source_sub {
-                    analysis.complete_hash_keys_for_sub(sub_name, point)
-                } else {
-                    // HashRef with no source_sub from context — fall back to
-                    // resolve_hash_key_owner which checks call bindings
-                    analysis.complete_hash_keys(var_text, point)
-                }
+            // Keys already written in the enclosing hash literal —
+            // they shouldn't re-appear in the suggestions. Scoped to
+            // the hash_expression directly so unrelated nearby calls
+            // don't interfere. Works for both class-typed hashes and
+            // sub-owned ones.
+            let used = cursor_context::used_keys_in_enclosing_hash(tree, source.as_bytes(), point);
+            let class_name = owner_type.as_ref().and_then(|t| t.class_name());
+            let candidates = if let Some(cn) = class_name {
+                analysis.complete_hash_keys_for_class(cn, point)
+            } else if let Some(ref sub_name) = source_sub {
+                // Routes to HashKeyOwner::Sub { name } — catches both
+                // plugin-emitted HashKeyDefs (minion enqueue options)
+                // AND body-derived keys from `$opts->{...}` accesses
+                // in a final-hashref param. Previously this branch
+                // was skipped when owner_type was None, so real hash
+                // literals at a call-arg position returned nothing.
+                analysis.complete_hash_keys_for_sub(sub_name, point)
             } else {
                 analysis.complete_hash_keys(var_text, point)
-            }
+            };
+            candidates.into_iter().filter(|c| !used.contains(&c.label)).collect()
         }
         CursorContext::UseStatement { ref module_prefix, in_import_list, ref module_name } => {
             if in_import_list {
@@ -1102,23 +1119,52 @@ fn dispatch_info_for_enclosing_arrayref_call(
 }
 
 /// Count `,` separators inside a container node that occur before
-/// `point`. Used to pick the active parameter inside an arrayref arg.
+/// `point`. Walks ALL descendants (not just direct children) because
+/// tree-sitter-perl often wraps a container's contents in a nested
+/// `list_expression` — the commas live there, not at the top level.
+/// Skips commas nested inside another array/hash literal to keep the
+/// count scoped to THIS container's own slots.
 fn count_commas_inside_node(node: tree_sitter::Node, source: &[u8], point: Point) -> usize {
     let mut count = 0;
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        let child_end = child.end_position();
-        let child_start = child.start_position();
-        let before_cursor = (child_end.row, child_end.column) <= (point.row, point.column);
-        if !before_cursor { break; }
-        if !child.is_named() {
-            if let Ok(text) = child.utf8_text(source) {
-                if text == "," { count += 1; }
+    let p_pos = (point.row, point.column);
+
+    fn walk(
+        node: tree_sitter::Node,
+        source: &[u8],
+        p_pos: (usize, usize),
+        count: &mut usize,
+        skip_root: bool,
+    ) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            let e = child.end_position();
+            if (e.row, e.column) > p_pos { break; }
+
+            // Don't descend into nested array/hash literals — their
+            // commas belong to the inner scope, not ours.
+            if !skip_root
+                && matches!(child.kind(),
+                    "anonymous_array_expression" | "anonymous_hash_expression")
+            {
+                continue;
+            }
+
+            if !child.is_named() {
+                if let Ok(text) = child.utf8_text(source) {
+                    if text == "," {
+                        *count += 1;
+                    }
+                }
+            } else {
+                // Descend through wrappers (list_expression,
+                // parenthesized_expression, etc.) but never the
+                // nested-literal boundaries filtered above.
+                walk(child, source, p_pos, count, false);
             }
         }
-        // skip past; we only count at this depth
-        let _ = child_start;
     }
+
+    walk(node, source, p_pos, &mut count, true);
     count
 }
 

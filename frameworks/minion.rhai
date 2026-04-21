@@ -184,7 +184,7 @@ fn on_method_call(ctx) {
                 // Tasks render as Function, not Event — you don't
                 // subscribe to them, you enqueue calls. Matches how
                 // mojo-routes chose Function over Event.
-                display: "Function",
+                display: "Task",
                 // Minion unpacks the arrayref at position 1 into the
                 // task callback's positionals (`enqueue(task, [@args])`).
                 // Flags sig help to fire when cursor is inside `[...]`

@@ -794,6 +794,41 @@ fn count_separators_before(node: Node, cursor: Point) -> usize {
 }
 
 /// Collect keys already used at the call site (barewords/strings before `=>`).
+/// Collect keys already present in the innermost hash literal at
+/// the cursor position. Returns an empty set when the cursor isn't
+/// inside one. Completion uses this to avoid re-offering a key the
+/// user has already written.
+pub fn used_keys_in_enclosing_hash(tree: &Tree, source: &[u8], point: Point) -> HashSet<String> {
+    let check_point = if point.column > 0 {
+        Point::new(point.row, point.column - 1)
+    } else {
+        point
+    };
+    let Some(mut node) = tree.root_node().descendant_for_point_range(check_point, check_point)
+        else { return HashSet::new() };
+    for _ in 0..16 {
+        if node.kind() == "anonymous_hash_expression" {
+            // Child layout varies: sometimes the pairs are direct
+            // children of the hash node (`{ x => 1 }`); sometimes
+            // they're wrapped in a list_expression (`{ x => 1, y
+            // => 2 }`). Probe both — the pair-detector is the same
+            // shape regardless.
+            let mut used = collect_used_keys_at_callsite(node, source);
+            for i in 0..node.named_child_count() {
+                if let Some(inner) = node.named_child(i) {
+                    if inner.kind() == "list_expression" {
+                        used.extend(collect_used_keys_at_callsite(inner, source));
+                    }
+                }
+            }
+            return used;
+        }
+        let Some(parent) = node.parent() else { break };
+        node = parent;
+    }
+    HashSet::new()
+}
+
 fn collect_used_keys_at_callsite(args: Node, source: &[u8]) -> HashSet<String> {
     let mut used = HashSet::new();
     for i in 0..args.child_count() {

@@ -486,10 +486,36 @@ pub enum HandlerDisplay {
     Field,
     Property,
     Constant,
+    /// Plugin-synthesized callable on the framework's app instance.
+    /// Renders with LSP kind FUNCTION; outline detail prints "helper".
+    Helper,
+    /// Framework-declared URL pattern. Same LSP kind as Helper/Task;
+    /// outline detail prints "route" so the client can disambiguate.
+    Route,
+    /// Job-queue / worker task (Minion etc.). Helper-kin for the LSP
+    /// kind, distinct "task" word in outline detail.
+    Task,
 }
 
 impl Default for HandlerDisplay {
     fn default() -> Self { Self::Event }
+}
+
+impl HandlerDisplay {
+    /// Short human-readable word the outline puts in `detail` so LSP
+    /// clients can show `[Function] name — helper` even though the
+    /// LSP kind enum doesn't have a Helper variant. Returns `None`
+    /// for display kinds that don't carry a distinguishing word
+    /// beyond the LSP kind itself.
+    pub fn outline_word(&self) -> Option<&'static str> {
+        match self {
+            HandlerDisplay::Event => Some("event"),
+            HandlerDisplay::Helper => Some("helper"),
+            HandlerDisplay::Route => Some("route"),
+            HandlerDisplay::Task => Some("task"),
+            _ => None,
+        }
+    }
 }
 
 /// Owner of a `Handler` symbol. Distinct from `HashKeyOwner` because
@@ -630,6 +656,9 @@ fn sub_display_prefix(detail: &SymbolDetail, default: &'static str) -> &'static 
             HandlerDisplay::Field => "field",
             HandlerDisplay::Property => "property",
             HandlerDisplay::Constant => "const",
+            HandlerDisplay::Helper => "helper",
+            HandlerDisplay::Route => "route",
+            HandlerDisplay::Task => "task",
         }
     } else {
         default
@@ -2891,26 +2920,31 @@ impl FileAnalysis {
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
-                    // Plugin-emitted subs with a display override render
-                    // with just the name — the kind icon already carries
-                    // "this is framework-synthesized" so a "fn"/"method"
-                    // prefix is redundant noise.
-                    let label = match sub_display_override(&sym.detail) {
+                    let disp = sub_display_override(&sym.detail);
+                    let label = match disp {
                         Some(_) => sym.name.clone(),
                         None => format!("sub {}", sym.name),
                     };
-                    (label, None, children)
+                    // Plugin-emitted subs carry a semantic word
+                    // (helper/route/task/…) in `detail` so clients
+                    // can render `[Function] name — helper` without
+                    // needing a new LSP kind. `outline_word` is None
+                    // for plain Method/Function/Field/etc.
+                    let outline_detail = disp.and_then(|d| d.outline_word()).map(|s| s.to_string());
+                    (label, outline_detail, children)
                 }
                 SymKind::Method => {
                     let body_scope = self.find_body_scope(sym);
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
-                    let label = match sub_display_override(&sym.detail) {
+                    let disp = sub_display_override(&sym.detail);
+                    let label = match disp {
                         Some(_) => sym.name.clone(),
                         None => format!("method {}", sym.name),
                     };
-                    (label, None, children)
+                    let outline_detail = disp.and_then(|d| d.outline_word()).map(|s| s.to_string());
+                    (label, outline_detail, children)
                 }
                 SymKind::Class => {
                     let body_scope = self.find_body_scope(sym);
@@ -2944,19 +2978,24 @@ impl FileAnalysis {
                 }
                 SymKind::HashKeyDef => continue, // Skip hash key defs from outline
                 SymKind::Handler => {
-                    // Show registered handlers in the outline so users can
-                    // see at a glance which events/routes/etc. a class
-                    // wires up. Label includes the name + param shape so
-                    // stacked registrations with different signatures are
-                    // visually distinct.
+                    // Show registered handlers in the outline. The
+                    // semantic word comes from the plugin's display
+                    // choice (`event`/`route`/`task`/…); params ride
+                    // along so stacked registrations with different
+                    // signatures are visually distinct.
                     let detail = match &sym.detail {
-                        SymbolDetail::Handler { params, .. } => {
-                            let display: Vec<String> = params
+                        SymbolDetail::Handler { params, display, .. } => {
+                            let visible: Vec<String> = params
                                 .iter()
                                 .filter(|p| !p.is_invocant)
                                 .map(|p| p.name.clone())
                                 .collect();
-                            Some(format!("handler ({})", display.join(", ")))
+                            let word = display.outline_word().unwrap_or("handler");
+                            if visible.is_empty() {
+                                Some(word.to_string())
+                            } else {
+                                Some(format!("{} ({})", word, visible.join(", ")))
+                            }
                         }
                         _ => Some("handler".to_string()),
                     };

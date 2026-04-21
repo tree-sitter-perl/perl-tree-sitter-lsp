@@ -86,8 +86,8 @@ fn on_method_call(ctx) {
                     return_type: (),
                     doc: (),
                     on_class: entry,
-                    display: "Function",
-                    hide_in_outline: true,
+                    display: "Helper",
+                    hide_in_outline: false,
                 }
             };
         }
@@ -130,8 +130,8 @@ fn on_method_call(ctx) {
                 return_type: #{ ClassName: first_proxy },
                 doc: (),
                 on_class: entry,
-                display: "Function",
-                hide_in_outline: true,
+                display: "Helper",
+                hide_in_outline: false,
                 opaque_return: true,
             }
         };
@@ -153,8 +153,8 @@ fn on_method_call(ctx) {
                 return_type: #{ ClassName: proxy_path },
                 doc: (),
                 on_class: owner_class,
-                display: "Function",
-                hide_in_outline: true,
+                display: "Helper",
+                hide_in_outline: false,
                 opaque_return: true,
             }
         };
@@ -174,8 +174,8 @@ fn on_method_call(ctx) {
             return_type: (),
             doc: (),
             on_class: owner_class,
-            display: "Function",
-            hide_in_outline: true,
+            display: "Helper",
+            hide_in_outline: false,
         }
     };
 

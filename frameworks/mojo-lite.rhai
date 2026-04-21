@@ -172,8 +172,8 @@ fn on_function_call(ctx) {
             params: params,
             span: args[0].span,
             selection_span: args[0].span,
-            display: "Function",
-            hide_in_outline: true,
+            display: "Route",
+            hide_in_outline: false,
         }
     };
 
