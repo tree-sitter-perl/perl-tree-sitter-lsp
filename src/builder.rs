@@ -437,11 +437,23 @@ impl<'a> Builder<'a> {
     /// the handler signature for later sig-help lookup.
     fn arg_info_for(&self, arg: Node<'a>) -> plugin::ArgInfo {
         let text = arg.utf8_text(self.source).unwrap_or("").to_string();
+        let mut content_span: Option<Span> = None;
         let string_value = match arg.kind() {
             "string_literal" | "interpolated_string_literal" => {
                 // Read the string_content child — quote-flavor-agnostic
                 // (handles q{}, qq!!, heredocs, etc.). An empty literal
                 // has no content child, so default to "".
+                // Also capture the content span so plugins can address
+                // positions inside the string without hardcoding
+                // quote-length offsets into the outer node's span.
+                for i in 0..arg.named_child_count() {
+                    if let Some(c) = arg.named_child(i) {
+                        if c.kind() == "string_content" {
+                            content_span = Some(node_to_span(c));
+                            break;
+                        }
+                    }
+                }
                 Some(self.extract_string_content(arg).unwrap_or_default())
             }
             // `autoquoted_bareword` is what the LHS of fat-comma parses
@@ -465,6 +477,7 @@ impl<'a> Builder<'a> {
             text,
             string_value,
             span: node_to_span(arg),
+            content_span,
             inferred_type,
             sub_params,
         }
@@ -7995,6 +8008,77 @@ $r->get('/users')->to(controller => 'Users', action => 'list');
                 && r.target_name == "list"
         });
         assert!(has_ref, "long-form ->to(controller=>, action=>) must produce MethodCall ref");
+    }
+
+    /// `$r->get('/users')->to('Users#list')->name('users_list')` — the
+    /// `->name()` call registers a symbolic handle. `url_for('users_list')`
+    /// and `redirect_to('users_list')` must resolve to it, the same way
+    /// they resolve to `'Users#list'`. Without `->name()`, calls like
+    /// `url_for('users_list')` sit unresolved.
+    #[test]
+    fn plugin_mojo_routes_name_registers_url_for_handle() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list')->name('users_list');
+"#;
+        let fa = build_fa(src);
+
+        let route_name_handler = fa.symbols.iter().find(|s| {
+            s.kind == SymKind::Handler && s.name == "users_list"
+        });
+        assert!(route_name_handler.is_some(),
+            "->name('users_list') must emit a Handler; handlers: {:?}",
+            fa.symbols.iter().filter(|s| s.kind == SymKind::Handler)
+                .map(|s| &s.name).collect::<Vec<_>>());
+
+        let sym = route_name_handler.unwrap();
+        if let SymbolDetail::Handler { dispatchers, .. } = &sym.detail {
+            assert!(dispatchers.iter().any(|d| d == "url_for"),
+                "named route must dispatch via url_for");
+            assert!(dispatchers.iter().any(|d| d == "redirect_to"),
+                "named route must dispatch via redirect_to");
+        } else {
+            panic!("route-name symbol should be Handler; got {:?}", sym.detail);
+        }
+
+        // The route name should be in a mojo-routes namespace bridged
+        // to the declaring package, so cross-file `url_for('users_list')`
+        // from other files in the workspace resolves.
+        let ns = fa.plugin_namespaces.iter().find(|n|
+            n.plugin_id == "mojo-routes" && n.entities.contains(&sym.id));
+        assert!(ns.is_some(), "named route must belong to a mojo-routes namespace");
+    }
+
+    /// `->to('X#y')` routes dispatch via both `url_for` and `redirect_to`
+    /// (Phase-2 follow-up — `redirect_to` used to be Lite-only). Matches
+    /// Mojolicious's actual API where redirect_to on a controller resolves
+    /// named routes identically to url_for.
+    #[test]
+    fn plugin_mojo_routes_to_dispatches_via_redirect_to_too() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+"#;
+        let fa = build_fa(src);
+
+        let route_handler = fa.symbols.iter().find(|s| {
+            s.kind == SymKind::Handler && s.name == "Users#list"
+        }).expect("Users#list Handler");
+
+        if let SymbolDetail::Handler { dispatchers, .. } = &route_handler.detail {
+            assert!(dispatchers.iter().any(|d| d == "url_for"),
+                "->to route must dispatch via url_for");
+            assert!(dispatchers.iter().any(|d| d == "redirect_to"),
+                "->to route must dispatch via redirect_to");
+        } else {
+            panic!("route symbol should be Handler");
+        }
     }
 
     /// Helpers emitted by mojo-helpers land on Mojolicious::Controller.

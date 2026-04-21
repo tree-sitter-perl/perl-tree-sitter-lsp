@@ -79,7 +79,7 @@ fn route_emissions(controller, action, span, current_package) {
         Handler: #{
             name: handler_name,
             owner: #{ Class: owner_class },
-            dispatchers: ["url_for"],
+            dispatchers: ["url_for", "redirect_to"],
             params: [],
             span: span,
             selection_span: span,
@@ -106,43 +106,95 @@ fn route_emissions(controller, action, span, current_package) {
     items
 }
 
+// `$r->get('/path')->to('Ctrl#act')->name('users_list')` — the
+// `->name()` call gives the route a symbolic handle that users then
+// pass to `url_for`/`redirect_to`. By the time the plugin sees this
+// call the route builder chain has already typed, but we can't
+// reliably walk backward to confirm. Pragmatic: in a Mojolicious-ish
+// package, treat every `->name('X')` with a single string arg as a
+// route-name registration. If the user happens to call `.name()` on
+// something that isn't a route, url_for completion will offer an
+// extra name — minor false positive, not a regression.
+fn emit_route_name(ctx, name, span) {
+    let owner_class = if ctx.current_package == () { "main" } else { ctx.current_package };
+    let items = [];
+    items += #{
+        Handler: #{
+            name: name,
+            owner: #{ Class: owner_class },
+            dispatchers: ["url_for", "redirect_to"],
+            params: [],
+            span: span,
+            selection_span: span,
+            display: "Route",
+            hide_in_outline: false,
+        }
+    };
+    items += #{
+        PluginNamespace: #{
+            id: "mojo-routes:" + owner_class,
+            kind: "routes",
+            bridges: [ #{ Class: owner_class } ],
+            entity_names: [name],
+            decl_span: span,
+        }
+    };
+    items
+}
+
 fn on_method_call(ctx) {
     let out = [];
+
+    if ctx.method_name == "name" {
+        let args = ctx.args;
+        if args.len() != 1 { return out; }
+        let name = args[0].string_value;
+        if name == () || name == "" { return out; }
+        // Use the string_content span — captured by the builder from
+        // the `string_content` tree node, so it's already quote-free
+        // regardless of literal flavor (`'x'`, `"x"`, `q{x}`, `qq!x!`,
+        // heredoc). `content_span` is `()` when the arg isn't a string
+        // literal or is empty; fall back to full span in that case.
+        let inner_span = args[0].content_span;
+        if inner_span == () { inner_span = args[0].span; }
+        return emit_route_name(ctx, name, inner_span);
+    }
 
     if ctx.method_name != "to" { return out; }
 
     let args = ctx.args;
     if args.len() < 1 { return out; }
 
-    // Short form: `'Controller#action'`. We narrow the MethodCallRef
-    // span to just the action-name portion so mid-string completion
+    // Short form: `'Controller#action'`. Narrow the MethodCallRef span
+    // to just the action-name portion so mid-string completion
     // (core-side) can use `source[span_start..cursor]` as the typed
     // prefix directly, without any `#`-aware logic in the core.
     //
-    // Position math on the literal `'Users#list'`:
-    //   col+0 : opening quote
-    //   col+1 : 'U' (start of Controller)
-    //   col+1+len(Controller) : '#'
-    //   col+2+len(Controller) : 'l' (start of action)
-    //   col+2+len(Controller)+len(action) : closing quote
+    // We subspan INTO the `content_span` (which excludes quote
+    // delimiters), not the outer arg span. Offsets are into the
+    // string's content, not the raw literal — so a `q{Users#list}`
+    // or heredoc-bodied arg works the same as `'Users#list'`.
     let first = args[0].string_value;
     if first != () && first.contains("#") {
         let parts = first.split("#");
         if parts.len() == 2 {
             let controller = parts[0];
             let action = parts[1];
-            let action_start = 1 + controller.len() + 1;              // quote + ctrl + '#'
-            let action_end   = action_start + action.len();
-            let action_span = subspan_cols(args[0].span, action_start, action_end);
-            return route_emissions(controller, action, action_span, ctx.current_package);
+            let base = args[0].content_span;
+            if base != () {
+                // `#` is right after the controller substring in the
+                // content; action starts one column past that.
+                let action_start = controller.len() + 1;
+                let action_end   = action_start + action.len();
+                let action_span = subspan_cols(base, action_start, action_end);
+                return route_emissions(controller, action, action_span, ctx.current_package);
+            }
         }
     }
 
     // Long form: `->to(controller => 'Users', action => 'list')`.
-    // For the action string we also tighten the span to exclude the
-    // quotes — same reason as above: core-side completion uses
-    // `source[span..cursor]` as the typed prefix, so quote characters
-    // would leak into prefix matching.
+    // `content_span` gives us the action string's contents directly —
+    // no quote math needed.
     let controller = "";
     let action = "";
     let action_span = ();
@@ -156,8 +208,8 @@ fn on_method_call(ctx) {
             let v = args[i + 1].string_value;
             if v != () {
                 action = v;
-                // Narrow to content-only (strip the surrounding quotes).
-                action_span = subspan_cols(args[i + 1].span, 1, 1 + action.len());
+                action_span = args[i + 1].content_span;
+                if action_span == () { action_span = args[i + 1].span; }
             }
         }
         i += 2;

@@ -34,6 +34,15 @@ pub struct ArgInfo {
     /// through `constant_strings`. `None` means "runtime/unknown".
     pub string_value: Option<String>,
     pub span: Span,
+    /// For string-literal args, the span of the INNER content only —
+    /// excludes the quote delimiters, heredoc markers, or `q{}`/`qq!!`
+    /// wrappers. Comes directly from the `string_content` tree node,
+    /// so plugins never need to compute offsets into the raw text.
+    ///
+    /// `None` for non-string args or empty string literals (no
+    /// `string_content` child to point at).
+    #[serde(default)]
+    pub content_span: Option<Span>,
     pub inferred_type: Option<InferredType>,
     /// If this arg is an anonymous sub (`sub ($a, $b) { ... }` or a block
     /// that begins with `my ($a, $b) = @_`), its extracted param list.
