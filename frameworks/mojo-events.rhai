@@ -94,6 +94,21 @@ fn on_method_call(ctx) {
             }
         };
 
+        // Register the event into a namespace per emitter class. Bridges
+        // to the emitter class so workspace-wide "events on EmitterX"
+        // lookups walk `for_each_entity_bridged_to(EmitterX, ...)` and
+        // find the Handler entities. One namespace per emitter class per
+        // file; multiple on/once/subscribe sites accumulate entities.
+        out += #{
+            PluginNamespace: #{
+                id: "mojo-events:" + ev.owner.Class,
+                kind: "events",
+                bridges: [ #{ Class: ev.owner.Class } ],
+                entity_names: [ev.name],
+                decl_span: ev.name_span,
+            }
+        };
+
         // Type the callback's first positional as the emitter class
         // so the user can ->-complete on it inside the handler body.
         // `ev.owner` is a Class map — project back to the string.

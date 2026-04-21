@@ -194,6 +194,26 @@ fn on_method_call(ctx) {
             }
         };
 
+        // Register the task into a per-package Minion namespace. Bridges
+        // to Minion so `for_each_entity_bridged_to("Minion", ...)` finds
+        // task Handlers alongside the `dispatch_targets_for` delegation
+        // path used by the completion hook. One namespace per enclosing
+        // package; multiple add_task sites accumulate entities.
+        let ns_id = if ctx.current_package == () {
+            "minion:main"
+        } else {
+            "minion:" + ctx.current_package
+        };
+        out += #{
+            PluginNamespace: #{
+                id: ns_id,
+                kind: "tasks",
+                bridges: [ #{ Class: "Minion" } ],
+                entity_names: [task.name],
+                decl_span: task.name_span,
+            }
+        };
+
         // Type the callback's `$job` (or whatever the user named it)
         // as Minion::Job so `$job->fail`, `->finish`, `->note`,
         // `->retry` complete inside the task body.

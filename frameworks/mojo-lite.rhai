@@ -177,6 +177,21 @@ fn on_function_call(ctx) {
         }
     };
 
+    // Register the route into a per-app Lite routes namespace. Bridges
+    // to the declaring package (usually `main` for Lite scripts) so
+    // `for_each_entity_bridged_to(owner_class, ...)` finds the route
+    // Handlers. Same emission shape as mojo-routes so the two flavors
+    // aggregate through the same query primitive.
+    out += #{
+        PluginNamespace: #{
+            id: "mojo-lite:" + owner_class,
+            kind: "routes",
+            bridges: [ #{ Class: owner_class } ],
+            entity_names: [path],
+            decl_span: args[0].span,
+        }
+    };
+
     // Type the route-handler's first positional as Mojolicious::Controller
     // so `$c->...` inside `get '/path' => sub { my $c = shift; $c->... }`
     // resolves to controller methods + helpers.

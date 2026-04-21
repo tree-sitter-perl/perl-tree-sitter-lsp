@@ -454,8 +454,9 @@ mod tests {
         };
 
         let emissions = plugin.on_method_call(&ctx);
-        // DispatchCall (ref) + Handler (def).
-        assert_eq!(emissions.len(), 2, "dispatch call + handler; got: {:?}", emissions);
+        // DispatchCall (ref) + Handler (def) + PluginNamespace (bridge).
+        assert_eq!(emissions.len(), 3,
+            "dispatch call + handler + namespace; got: {:?}", emissions);
 
         let has_dispatch = emissions.iter().any(|e| {
             matches!(e, EmitAction::DispatchCall { name, dispatcher, .. }
@@ -467,6 +468,15 @@ mod tests {
             matches!(e, EmitAction::Handler { name, .. } if name == "connect")
         });
         assert!(has_handler, "missing Handler symbol for 'connect'");
+
+        let has_namespace = emissions.iter().any(|e| {
+            matches!(e, EmitAction::PluginNamespace { id, kind, entity_names, .. }
+                if id == "mojo-events:My::Emitter"
+                    && kind == "events"
+                    && entity_names.iter().any(|n| n == "connect"))
+        });
+        assert!(has_namespace,
+            "missing PluginNamespace for My::Emitter events; got: {:?}", emissions);
     }
 
     #[test]

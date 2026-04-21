@@ -74,9 +74,10 @@ fn route_emissions(controller, action, span, current_package) {
     // to a controller action. Hidden from outline (the outline is for
     // user-written Perl structure; routes are framework wiring), but
     // the Handler symbol is still there for gd/gr/workspace-symbol.
+    let handler_name = controller + "#" + action;
     items += #{
         Handler: #{
-            name: controller + "#" + action,
+            name: handler_name,
             owner: #{ Class: owner_class },
             dispatchers: ["url_for"],
             params: [],
@@ -84,6 +85,21 @@ fn route_emissions(controller, action, span, current_package) {
             selection_span: span,
             display: "Route",
             hide_in_outline: false,
+        }
+    };
+
+    // Register the route into a per-app routes namespace. Bridges to
+    // the declaring package so workspace tooling that walks
+    // `for_each_entity_bridged_to(owner_class, ...)` sees the route
+    // Handlers. One namespace per declaring package; multiple routes
+    // accumulate entities under the same id.
+    items += #{
+        PluginNamespace: #{
+            id: "mojo-routes:" + owner_class,
+            kind: "routes",
+            bridges: [ #{ Class: owner_class } ],
+            entity_names: [handler_name],
+            decl_span: span,
         }
     };
 

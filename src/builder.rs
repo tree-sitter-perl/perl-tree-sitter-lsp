@@ -8638,6 +8638,152 @@ $app->helper('users.create' => sub { my ($c) = @_; });
         assert_eq!(count, 1, "one namespace per app, not one per helper");
     }
 
+    /// mojo-events emits a PluginNamespace per emitter class. Bridges to
+    /// the emitter class; entity_names are the event Handler names.
+    /// Multiple `->on/->once/->subscribe` wire-ups on the same emitter
+    /// accumulate under the same namespace id.
+    #[test]
+    fn mojo_events_emits_emitter_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+sub register {
+    my $self = shift;
+    $self->on(connect => sub { my ($e) = @_; });
+    $self->on(disconnect => sub { my ($e) = @_; });
+    $self->once(ready => sub { my ($e) = @_; });
+}
+"#;
+        let fa = build_fa(src);
+
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n| n.plugin_id == "mojo-events" && n.kind == "events")
+            .expect("mojo-events must declare an emitter namespace");
+
+        assert!(ns.bridges.contains(&Bridge::Class("My::Emitter".into())),
+            "must bridge the emitter class; got: {:?}", ns.bridges);
+
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        for ev in ["connect", "disconnect", "ready"] {
+            assert!(entity_names.contains(&ev),
+                "event `{}` must land in the namespace; got: {:?}", ev, entity_names);
+        }
+
+        let count = fa.plugin_namespaces.iter()
+            .filter(|n| n.plugin_id == "mojo-events" && n.id == ns.id)
+            .count();
+        assert_eq!(count, 1, "one namespace per emitter, not one per wire-up");
+    }
+
+    /// mojo-routes emits a PluginNamespace per declaring package. Each
+    /// `->to('Ctrl#action')` call's Handler lands as a namespace entity;
+    /// bridges point at the owner class so outline/workspace tooling can
+    /// walk `for_each_entity_bridged_to(owner, ...)` to find the routes.
+    #[test]
+    fn mojo_routes_emits_app_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package MyApp;
+use Mojolicious;
+sub startup {
+    my $self = shift;
+    my $r = $self->routes;
+    $r->get('/users')->to('Users#list');
+    $r->post('/users')->to('Users#create');
+}
+"#;
+        let fa = build_fa(src);
+
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n| n.plugin_id == "mojo-routes" && n.kind == "routes")
+            .expect("mojo-routes must declare a routes namespace");
+
+        assert!(ns.bridges.contains(&Bridge::Class("MyApp".into())),
+            "must bridge the declaring package; got: {:?}", ns.bridges);
+
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        assert!(entity_names.contains(&"Users#list"),
+            "route Users#list must land in the namespace; got: {:?}", entity_names);
+        assert!(entity_names.contains(&"Users#create"),
+            "route Users#create must land in the namespace; got: {:?}", entity_names);
+
+        let count = fa.plugin_namespaces.iter()
+            .filter(|n| n.plugin_id == "mojo-routes" && n.id == ns.id)
+            .count();
+        assert_eq!(count, 1, "one namespace per declaring package, not one per route");
+    }
+
+    /// mojo-lite emits a PluginNamespace per Lite app. Entity names are
+    /// the route paths (the same string that mojo-lite stamps into the
+    /// Handler). Bridges to the declaring package (`main` for toplevel
+    /// Lite scripts) so downstream lookups use the shared bridge path.
+    #[test]
+    fn mojo_lite_emits_app_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package main;
+use Mojolicious::Lite;
+get '/users' => sub { my $c = shift; };
+post '/login' => sub { my $c = shift; };
+"#;
+        let fa = build_fa(src);
+
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n| n.plugin_id == "mojo-lite" && n.kind == "routes")
+            .expect("mojo-lite must declare a routes namespace");
+
+        assert!(ns.bridges.contains(&Bridge::Class("main".into())),
+            "must bridge the declaring package (main for Lite); got: {:?}", ns.bridges);
+
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        assert!(entity_names.contains(&"/users"),
+            "route /users must land in the namespace; got: {:?}", entity_names);
+        assert!(entity_names.contains(&"/login"),
+            "route /login must land in the namespace; got: {:?}", entity_names);
+    }
+
+    /// minion emits a PluginNamespace per enclosing package. Tasks land
+    /// as entities; bridge is `Class(Minion)` so the namespace feeds the
+    /// same cross-file lookup primitive used by the other plugins.
+    /// (The `dispatch_targets_for` completion-hook path is independent —
+    /// the namespace here is for outline/workspace-symbol and future
+    /// consolidation of the task-lookup path.)
+    #[test]
+    fn minion_emits_tasks_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job) = @_; });
+$minion->add_task(resize_image => sub { my ($job) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n| n.plugin_id == "minion" && n.kind == "tasks")
+            .expect("minion must declare a tasks namespace");
+
+        assert!(ns.bridges.contains(&Bridge::Class("Minion".into())),
+            "must bridge Minion; got: {:?}", ns.bridges);
+
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        assert!(entity_names.contains(&"send_email"),
+            "task send_email must land in the namespace; got: {:?}", entity_names);
+        assert!(entity_names.contains(&"resize_image"),
+            "task resize_image must land in the namespace; got: {:?}", entity_names);
+
+        let count = fa.plugin_namespaces.iter()
+            .filter(|n| n.plugin_id == "minion" && n.id == ns.id)
+            .count();
+        assert_eq!(count, 1, "one namespace per package, not one per add_task");
+    }
+
     /// RED — sig help at the OPTIONS hash of enqueue should show
     /// enqueue's own signature, not the task's. Currently broken:
     /// the string-dispatch sig help fires whenever the cursor is past
