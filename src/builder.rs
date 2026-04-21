@@ -8541,6 +8541,150 @@ $minion->enqueue(task_x => ['a'], { priority => 10,  });
             labels);
     }
 
+    /// RED — sig help at the OPTIONS hash of enqueue should show
+    /// enqueue's own signature, not the task's. Currently broken:
+    /// the string-dispatch sig help fires whenever the cursor is past
+    /// arg-0 of a dispatcher call, regardless of whether the cursor
+    /// is actually inside the handler-args slot. For `enqueue`,
+    /// handler args live INSIDE the arrayref at slot 1 — slot 2 is
+    /// enqueue's own options hash.
+    ///
+    /// Proper fix: plugin-controlled dispatch (see
+    /// `docs/prompt-plugin-architecture.md` — IoC query hooks).
+    /// The plugin decides when sig help applies to the handler vs
+    /// when it applies to the dispatcher itself. Core-side fix is
+    /// possible (narrow the string-dispatch path to the declared
+    /// handler-args slot) but fragile; leaving as RED until the
+    /// IoC hook lands.
+    #[test]
+    #[ignore = "BLOCKED on plugin IoC sig help — see docs/prompt-plugin-architecture.md"]
+    fn enqueue_options_hash_sig_help_is_enqueue_not_task() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject) = @_;
+});
+$minion->enqueue(send_email => ['a', 'b'], {  });
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let line_idx = src.lines().position(|l| l.contains("enqueue(send_email"))
+            .unwrap();
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("{  }").unwrap() + 2;
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
+            .expect("sig help fires on options hash");
+
+        // When this goes green: sig help inside the options hash
+        // should reflect enqueue's own signature, NOT the task's.
+        // Options include `priority`, `queue`, etc. — those are the
+        // keys the user is about to type, and sig help should stay
+        // out of the way (completion is the right affordance here).
+        let info = &sig.signatures[0];
+        assert!(!info.label.contains("send_email"),
+            "options hash is NOT dispatching to the task — sig help \
+             should be enqueue's own shape or absent entirely. Got: {:?}",
+            info.label);
+        assert!(!info.label.contains("$subject"),
+            "task params must NOT leak into enqueue's options hash sig; \
+             got: {:?}", info.label);
+    }
+
+    /// RED — completion at arg-0 of enqueue should offer ONLY
+    /// registered task names (Handler dispatch targets), not a
+    /// union of tasks + every other `Minion` instance method.
+    /// Matches the real nvim env where CPAN-installed Minion brings
+    /// ~30 instance methods cross-file, which leak in when a
+    /// user types `$minion->enqueue(|)`.
+    ///
+    /// Same arch gap as the sig-help one above: the core doesn't
+    /// know that `enqueue`'s arg-0 is semantically "pick a task
+    /// name", so `dispatch_target_completions` contributes task
+    /// names but instance methods reach in through completion of
+    /// the receiver's class methods on the `$minion->` receiver.
+    ///
+    /// Proper fix: plugin-controlled `on_completion` hook + the
+    /// PluginNamespace entities indexed for fast "names of kind
+    /// `task` on this minion" lookup. See the arch doc.
+    #[test]
+    #[ignore = "BLOCKED on plugin IoC completion — see docs/prompt-plugin-architecture.md"]
+    fn enqueue_arg0_offers_task_names_only() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        // Task-declaring file.
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job) = @_; });
+$minion->add_task(resize_image => sub { my ($job) = @_; });
+$minion->enqueue();
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Mock CPAN Minion with realistic instance methods that
+        // would otherwise leak into `$minion->enqueue(|)`. Uses the
+        // same workspace-module-registration path nvim startup uses.
+        let minion_src = r#"package Minion;
+sub new { my $class = shift; bless {}, $class }
+sub enqueue     { my ($self, $task, $args, $opts) = @_; }
+sub enqueue_p   { my ($self, $task, $args, $opts) = @_; }
+sub perform_jobs { my ($self) = @_; }
+sub backend     { my ($self) = @_; }
+sub reset       { my ($self) = @_; }
+sub stats       { my ($self) = @_; }
+sub worker      { my ($self) = @_; }
+sub repair      { my ($self) = @_; }
+sub foreground  { my ($self, $id) = @_; }
+1;
+"#;
+        let minion_fa = std::sync::Arc::new(build_fa(minion_src));
+        let idx = std::sync::Arc::new(crate::module_index::ModuleIndex::new_for_test());
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Minion.pm"),
+            minion_fa,
+        );
+
+        // Cursor inside `enqueue(|)` — just after the `(`.
+        let line_idx = src.lines().position(|l| l.ends_with("enqueue();"))
+            .unwrap();
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("enqueue(").unwrap() + "enqueue(".len();
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        assert!(labels.contains(&"send_email"),
+            "task names must appear at enqueue's arg 0; got: {:?}", labels);
+        assert!(labels.contains(&"resize_image"),
+            "every registered task name must be offered; got: {:?}", labels);
+
+        // The tight contract — only tasks, nothing else. When this
+        // goes green we'll know the plugin owns the completion shape
+        // at this position and the Minion-method firehose is gone.
+        for label in &labels {
+            assert!(
+                *label == "send_email" || *label == "resize_image",
+                "only task names should appear at enqueue's arg 0; \
+                 got unexpected `{}` in {:?}", label, labels,
+            );
+        }
+    }
+
     /// Sig help on a helper call strips `$c` like it strips `$self`.
     /// The helper plugin flags its callback's first param as invocant
     /// via `as_invocant_params`; the core sig help path drops any

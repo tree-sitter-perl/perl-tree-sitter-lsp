@@ -207,6 +207,39 @@ their own outline only enumerates their own Symbols. This is already
 how it works today — mojo-helpers' Method symbols are in MyApp.pm's
 analysis, not in Users.pm's. No new scoping logic needed.
 
+## Pinned red tests waiting for this refactor
+
+Two `#[ignore]`'d tests in `src/builder.rs` capture the exact
+user-visible bugs that the architecture needs to fix. They're red —
+un-ignore each with `--ignored` to see the current output vs the
+contract. Both go green when the plugin owns dispatch semantics.
+
+**`enqueue_options_hash_sig_help_is_enqueue_not_task`**
+
+Cursor inside `{  }` on `$minion->enqueue('t', [args], {  })`. The
+string-dispatch sig help path currently fires whenever the cursor is
+past arg-0 of a known dispatcher, regardless of whether it's
+actually inside the handler-args slot. For enqueue, handler args
+live INSIDE the arrayref at slot 1; slot 2 is enqueue's own options
+hash. Sig help today shows `send_email($to, $subject)` — it should
+show enqueue's own signature (or stay absent so completion runs).
+
+Fix: plugin's `on_signature_help` hook inspects the cursor context
+and returns None when it's not inside the declared handler-args slot;
+core falls through to the regular enqueue sig help.
+
+**`enqueue_arg0_offers_task_names_only`**
+
+Cursor at arg-0 of `$minion->enqueue(|)` with cross-file CPAN Minion
+registered. Completion offers task names AND every Minion instance
+method (`new`, `stats`, `worker`, `repair`, …). Tasks should be the
+ONLY thing offered — arg-0 of enqueue is semantically "pick a task
+name", not "call a method on $minion".
+
+Fix: `on_completion` hook returns the task-names list directly;
+core suppresses the normal method-of-receiver completion path when
+the plugin claims this arg slot.
+
 ## Open questions for next time
 
 - Bridge resolution order: when a plugin namespace's bridge matches a
