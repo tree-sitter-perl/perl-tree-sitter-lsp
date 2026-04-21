@@ -48,6 +48,7 @@ fn fa_sym_kind_to_lsp(kind: &FaSymKind) -> SymbolKind {
         // that don't carry detail, which is rare. Event is the
         // conservative default.
         FaSymKind::Handler => SymbolKind::EVENT,
+        FaSymKind::Namespace => SymbolKind::NAMESPACE,
     }
 }
 
@@ -123,6 +124,28 @@ pub fn extract_symbols(analysis: &FileAnalysis) -> Vec<DocumentSymbol> {
 }
 
 #[allow(deprecated)]
+/// Surface a plugin-controlled namespace in `workspace/symbol` results.
+/// The namespace isn't a Perl symbol, but users want to jump to "where
+/// my Minion tasks live" or "the mojo app for this package" — this
+/// puts it on the same search surface as packages/subs.
+#[allow(deprecated)]
+pub fn plugin_namespace_to_workspace_info(
+    ns: &crate::file_analysis::PluginNamespace,
+    uri: Url,
+) -> SymbolInformation {
+    SymbolInformation {
+        name: format!("[{}] {}", ns.kind, ns.id),
+        kind: SymbolKind::NAMESPACE,
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri,
+            range: span_to_range(ns.decl_span),
+        },
+        container_name: Some(ns.plugin_id.clone()),
+    }
+}
+
 pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
     use crate::file_analysis::SymKind as FaSymKind;
     // Only include significant symbols (subs, methods, packages, classes)
@@ -338,6 +361,7 @@ fn fa_completion_kind(kind: &FaSymKind) -> CompletionItemKind {
         FaSymKind::Module => CompletionItemKind::MODULE,
         FaSymKind::HashKeyDef => CompletionItemKind::PROPERTY,
         FaSymKind::Handler => CompletionItemKind::EVENT,
+        FaSymKind::Namespace => CompletionItemKind::MODULE,
     }
 }
 
@@ -409,11 +433,16 @@ pub fn completion_items(
     // contribute items and optionally claim exclusivity for the slot
     // (e.g. Minion's arg-0 task-name completion: pure tasks, no
     // Minion instance-method firehose).
-    if let Some(qctx) = build_plugin_query_context(analysis, tree, source.as_bytes(), point) {
+    if let Some(qctx) = cursor_context::build_plugin_query_context(analysis, tree, source.as_bytes(), point) {
         let registry = crate::builder::default_plugin_registry();
+        let (uses, parents) = analysis.trigger_view_at(point);
+        let query = crate::plugin::TriggerQuery {
+            package_uses: &uses,
+            package_parents: &parents,
+        };
         let mut plugin_items: Vec<CompletionItem> = Vec::new();
         let mut exclusive = false;
-        for p in registry.all() {
+        for p in registry.applicable(&query) {
             if let Some(answer) = p.on_completion(&qctx) {
                 if answer.exclusive { exclusive = true; }
                 for c in answer.items {
@@ -497,9 +526,7 @@ fn completion_items_native(
     let mut suppress_firehose = false;
     if let Some(call_ctx) = cursor_context::find_call_context(tree, source.as_bytes(), point) {
         if call_ctx.is_method {
-            let dispatch_class = resolve_invocant_class(
-                analysis, call_ctx.invocant.as_deref(), point,
-            );
+            let dispatch_class = analysis.invocant_text_to_class(call_ctx.invocant.as_deref(), point);
             let has_any_handlers = dispatch_class.as_ref().is_some_and(|c|
                 class_has_dispatch_handlers(analysis, module_index, c, &call_ctx.name)
             );
@@ -919,7 +946,7 @@ fn dispatch_target_completions(
     point: Point,
     tree: &Tree,
 ) -> Vec<CompletionCandidate> {
-    let class = match resolve_invocant_class(analysis, invocant, point) {
+    let class = match analysis.invocant_text_to_class(invocant, point) {
         Some(c) => c,
         None => return Vec::new(),
     };
@@ -1083,18 +1110,11 @@ fn dispatch_target_items_for(
     owner_class: &str,
     dispatcher_names: &[String],
 ) -> Vec<CompletionItem> {
-    use crate::file_analysis::{HandlerOwner, SymbolDetail};
+    use crate::file_analysis::SymbolDetail;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<CompletionItem> = Vec::new();
-    let mut consider = |sym: &crate::file_analysis::Symbol| {
-        let SymbolDetail::Handler { owner, dispatchers, display, .. } = &sym.detail else { return };
-        let HandlerOwner::Class(c) = owner;
-        if c != owner_class { return; }
-        if !dispatcher_names.is_empty()
-            && !dispatchers.iter().any(|d| dispatcher_names.iter().any(|n| n == d))
-        {
-            return;
-        }
+    let mut emit = |sym: &crate::file_analysis::Symbol| {
+        let SymbolDetail::Handler { display, .. } = &sym.detail else { return };
         if !seen.insert(sym.name.clone()) { return; }
         let detail = display.outline_word().map(|s| s.to_string());
         out.push(CompletionItem {
@@ -1107,12 +1127,12 @@ fn dispatch_target_items_for(
             ..Default::default()
         });
     };
-    for sym in &analysis.symbols {
-        consider(sym);
+    for sym in analysis.handlers_for_owner(owner_class, dispatcher_names) {
+        emit(sym);
     }
     module_index.for_each_cached(|_, cached| {
-        for sym in &cached.analysis.symbols {
-            consider(sym);
+        for sym in cached.analysis.handlers_for_owner(owner_class, dispatcher_names) {
+            emit(sym);
         }
     });
     out
@@ -1177,72 +1197,6 @@ fn plugin_completion_to_item(p: crate::plugin::PluginCompletion) -> CompletionIt
     }
 }
 
-/// Build the `SigHelpQueryContext`/`CompletionQueryContext` a plugin
-/// query hook consumes. Extracts the innermost call at the cursor,
-/// the innermost nested container (array/hash), and the enclosing
-/// package. Returns `None` when no enclosing call exists and no
-/// plugin could plausibly claim the slot.
-fn build_plugin_query_context(
-    analysis: &FileAnalysis,
-    tree: &Tree,
-    source: &[u8],
-    point: Point,
-) -> Option<crate::plugin::SigHelpQueryContext> {
-    use crate::plugin::{CallFrame, ContainerFrame, ContainerKind, SigHelpQueryContext};
-    use crate::cursor_context as cc;
-
-    let call_ctx = cc::find_call_context(tree, source, point);
-    let call = call_ctx.as_ref().map(|c| CallFrame {
-        is_method: c.is_method,
-        name: c.name.clone(),
-        receiver_text: c.invocant.clone(),
-        receiver_type: c.invocant.as_deref()
-            .and_then(|inv| resolve_invocant_class(analysis, Some(inv), point))
-            .map(InferredType::ClassName),
-        args: Vec::new(), // sub_params-less view — plugin inspects tree or call name
-        cursor_arg_index: c.active_param,
-    });
-
-    // Innermost nested container: walk up from cursor to find the
-    // first anonymous_array_expression or anonymous_hash_expression
-    // before we exit the enclosing call.
-    let container = {
-        let mut n = tree.root_node().descendant_for_point_range(point, point);
-        let mut found: Option<ContainerFrame> = None;
-        while let Some(node) = n {
-            match node.kind() {
-                "anonymous_array_expression" => {
-                    found = Some(ContainerFrame {
-                        kind: ContainerKind::Array,
-                        active_slot: count_commas_inside_node(node, source, point),
-                        existing_keys: Vec::new(),
-                    });
-                    break;
-                }
-                "anonymous_hash_expression" => {
-                    let used = cc::used_keys_in_enclosing_hash(tree, source, point);
-                    found = Some(ContainerFrame {
-                        kind: ContainerKind::Hash,
-                        active_slot: count_commas_inside_node(node, source, point),
-                        existing_keys: used.into_iter().collect(),
-                    });
-                    break;
-                }
-                "method_call_expression" | "function_call_expression"
-                | "ambiguous_function_call_expression" => break,
-                _ => {}
-            }
-            n = node.parent();
-        }
-        found
-    };
-
-    let current_package = analysis.package_at(point).map(|s| s.to_string());
-
-    if call.is_none() && container.is_none() { return None; }
-    Some(SigHelpQueryContext { call, cursor_inside: container, current_package })
-}
-
 /// Find the enclosing method_call_expression at `point` and return any
 /// `DispatchCall` ref whose span sits inside that call's argument list.
 /// Returns `(handler_name, owner_class, dispatcher)` — all three are
@@ -1275,213 +1229,6 @@ fn dispatch_info_for_enclosing_call(
         return Some((r.target_name.clone(), class, dispatcher.clone()));
     }
     None
-}
-
-/// Detect "cursor inside an arrayref that is a positional arg to a
-/// dispatcher call, matching the Handler's `args_in_arrayref_at`".
-/// Returns (handler_name, owner_class, dispatcher_method, active_param_within_arrayref).
-///
-/// The plugin already declared the call shape on each Handler it
-/// registered; our job is to (a) find the enclosing
-/// `anonymous_array_expression` and its position in the outer
-/// call's argument list, (b) find the Handler by first-string-arg
-/// name + dispatcher, and (c) confirm its `args_in_arrayref_at`
-/// matches the positional index. No plugin-specific logic here —
-/// the core reads the declaration and routes accordingly.
-fn dispatch_info_for_enclosing_arrayref_call(
-    analysis: &FileAnalysis,
-    tree: &Tree,
-    source: &[u8],
-    point: Point,
-) -> Option<(String, String, String, usize)> {
-    use tree_sitter::Node;
-
-    // Walk up to the nearest anonymous_array_expression (the `[ ... ]`
-    // literal). Then walk one step further to the enclosing call.
-    let mut n = tree.root_node().descendant_for_point_range(point, point)?;
-    let array_node: Node = loop {
-        if n.kind() == "anonymous_array_expression" {
-            break n;
-        }
-        n = n.parent()?;
-    };
-
-    // Position within the arrayref: comma count before cursor, inside
-    // the array's own span (we stop scanning at the array boundaries).
-    let active_in_arrayref = count_commas_inside_node(array_node, source, point);
-
-    // Enclosing call.
-    let mut p = array_node.parent()?;
-    for _ in 0..8 {
-        match p.kind() {
-            "method_call_expression" | "function_call_expression"
-            | "ambiguous_function_call_expression" => break,
-            _ => p = p.parent()?,
-        }
-    }
-    let call = p;
-
-    // Args list for the enclosing call — find the arrayref's positional
-    // index among the call's top-level arguments.
-    let args_node = call.child_by_field_name("arguments")?;
-    let positional_index = positional_index_of_node(args_node, array_node)?;
-
-    // Dispatcher name + first-string-arg name from the call.
-    let (dispatcher, first_string_arg) = call_dispatcher_and_name(call, source)?;
-
-    // Locate the Handler by name + dispatcher + arrayref position.
-    // Scan local symbols; cross-file can extend later — the arrayref
-    // shape is the same invariant as the positional one.
-    for sym in &analysis.symbols {
-        if sym.name != first_string_arg { continue; }
-        let SymbolDetail::Handler {
-            owner, dispatchers, args_in_arrayref_at, ..
-        } = &sym.detail else { continue };
-        let HandlerOwner::Class(class) = owner;
-        if !dispatchers.iter().any(|d| d == &dispatcher) { continue; }
-        if *args_in_arrayref_at != Some(positional_index) { continue; }
-        return Some((
-            first_string_arg,
-            class.clone(),
-            dispatcher,
-            active_in_arrayref,
-        ));
-    }
-    None
-}
-
-/// Count `,` separators inside a container node that occur before
-/// `point`. Walks ALL descendants (not just direct children) because
-/// tree-sitter-perl often wraps a container's contents in a nested
-/// `list_expression` — the commas live there, not at the top level.
-/// Skips commas nested inside another array/hash literal to keep the
-/// count scoped to THIS container's own slots.
-///
-/// Loop break uses the child's START position, not its end — a
-/// wrapping `list_expression` starts BEFORE the cursor and ends AFTER
-/// it (the cursor lives inside one of its elements), so we still
-/// need to descend to count the commas before the cursor. Leaf
-/// tokens (`,`, `[`, `=>`, …) only count when their end is also
-/// before the cursor, guarding against the cursor sitting mid-token.
-fn count_commas_inside_node(node: tree_sitter::Node, source: &[u8], point: Point) -> usize {
-    let mut count = 0;
-    let p_pos = (point.row, point.column);
-
-    fn walk(
-        node: tree_sitter::Node,
-        source: &[u8],
-        p_pos: (usize, usize),
-        count: &mut usize,
-        skip_root: bool,
-    ) {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            let s = child.start_position();
-            if (s.row, s.column) > p_pos { break; }
-
-            // Don't descend into nested array/hash literals — their
-            // commas belong to the inner scope, not ours.
-            if !skip_root
-                && matches!(child.kind(),
-                    "anonymous_array_expression" | "anonymous_hash_expression")
-            {
-                continue;
-            }
-
-            if !child.is_named() {
-                let e = child.end_position();
-                if (e.row, e.column) > p_pos { continue; }
-                if let Ok(text) = child.utf8_text(source) {
-                    if text == "," {
-                        *count += 1;
-                    }
-                }
-            } else {
-                // Descend through wrappers (list_expression,
-                // parenthesized_expression, etc.); a named node that
-                // SPANS the cursor still hosts commas before it.
-                walk(child, source, p_pos, count, false);
-            }
-        }
-    }
-
-    walk(node, source, p_pos, &mut count, true);
-    count
-}
-
-/// Index of `target` among the direct argument nodes of `args_node`.
-/// `,` and `=>` bump the index; `=>` is treated the same as `,`.
-fn positional_index_of_node(args_node: tree_sitter::Node, target: tree_sitter::Node) -> Option<usize> {
-    let mut index = 0;
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        if child.id() == target.id() {
-            return Some(index);
-        }
-        if !child.is_named() {
-            // separator — bump index
-            continue;
-        }
-        // named child = an argument; separators come between
-        // — count the named child BEFORE the separator.
-        // We pre-increment only when we see a comma, so use a
-        // different scheme: count named args as we pass them.
-        index += 1;
-    }
-    None
-}
-
-/// Extract `(method_name, first_arg_as_string)` from a call node.
-/// The first-string-arg is const-folded via the literal text only;
-/// plugin-emitted DispatchCall already accounts for const-folded
-/// variables, but this path is the text-level fallback used when no
-/// DispatchCall was emitted (arrayref dispatchers emit at the name
-/// string, so the ref is available — still, text-level works too).
-fn call_dispatcher_and_name(
-    call: tree_sitter::Node,
-    source: &[u8],
-) -> Option<(String, String)> {
-    let dispatcher = match call.kind() {
-        "method_call_expression" => call
-            .child_by_field_name("method")?
-            .utf8_text(source)
-            .ok()?
-            .to_string(),
-        "function_call_expression" | "ambiguous_function_call_expression" => call
-            .child_by_field_name("function")?
-            .utf8_text(source)
-            .ok()?
-            .to_string(),
-        _ => return None,
-    };
-    let args = call.child_by_field_name("arguments")?;
-    let first = first_named_child_as_string(args, source)?;
-    Some((dispatcher, first))
-}
-
-/// Return the first string-literal/bareword argument content, when
-/// the call's first arg is constant.
-fn first_named_child_as_string(
-    args_node: tree_sitter::Node,
-    source: &[u8],
-) -> Option<String> {
-    let first = if args_node.kind() == "list_expression"
-        || args_node.kind() == "parenthesized_expression"
-    {
-        args_node.named_child(0)?
-    } else {
-        args_node
-    };
-    let text = first.utf8_text(source).ok()?;
-    match first.kind() {
-        "string_literal" | "interpolated_string_literal" => Some(
-            text.trim_start_matches(['\'', '"'])
-                .trim_end_matches(['\'', '"'])
-                .to_string(),
-        ),
-        "bareword" | "autoquoted_bareword" => Some(text.to_string()),
-        _ => None,
-    }
 }
 
 fn span_contains_span(outer: &crate::file_analysis::Span, inner: &crate::file_analysis::Span) -> bool {
@@ -1581,30 +1328,6 @@ fn string_dispatch_signature_for(
 ///   * bare `Pkg::Name`         → the literal class
 ///   * `$var`                   → looked up via `analysis.inferred_type`
 /// Returns `None` when the expression doesn't resolve to a known class.
-fn resolve_invocant_class(
-    analysis: &FileAnalysis,
-    invocant: Option<&str>,
-    point: Point,
-) -> Option<String> {
-    let text = invocant?;
-    if text == "$self" || text == "__PACKAGE__" {
-        return analysis.package_at(point).map(|s| s.to_string());
-    }
-    if let Some(stripped) = text.strip_prefix('$') {
-        let var_name = format!("${}", stripped);
-        if let Some(ty) = analysis.inferred_type(&var_name, point) {
-            if let crate::file_analysis::InferredType::ClassName(n) = ty {
-                return Some(n.clone());
-            }
-        }
-        return None;
-    }
-    if text.starts_with('@') || text.starts_with('%') {
-        return None;
-    }
-    Some(text.to_string())
-}
-
 /// Text-driven entry point: resolve invocant → class, then delegate to
 /// `string_dispatch_signature_for`. Used for mid-editing states where
 /// no DispatchCall ref exists yet.
@@ -1617,7 +1340,7 @@ fn string_dispatch_signature(
     active_param: usize,
     point: Point,
 ) -> Option<SignatureHelp> {
-    let class = resolve_invocant_class(analysis, invocant, point)?;
+    let class = analysis.invocant_text_to_class(invocant, point)?;
     string_dispatch_signature_for(analysis, module_index, &class, dispatcher, handler_name, active_param)
 }
 
@@ -1634,14 +1357,39 @@ pub fn signature_help(
     // show a custom sig (arrayref-wrapped handler args) OR silently
     // claim the slot to suppress native sig (cursor in an options
     // hash of a dispatcher — native would mis-show the task sig).
-    if let Some(qctx) = build_plugin_query_context(analysis, tree, text.as_bytes(), point) {
+    if let Some(qctx) = cursor_context::build_plugin_query_context(analysis, tree, text.as_bytes(), point) {
         let registry = crate::builder::default_plugin_registry();
-        for p in registry.all() {
+        let (uses, parents) = analysis.trigger_view_at(point);
+        let query = crate::plugin::TriggerQuery {
+            package_uses: &uses,
+            package_parents: &parents,
+        };
+        for p in registry.applicable(&query) {
             match p.on_signature_help(&qctx) {
                 Some(crate::plugin::PluginSigHelpAnswer::Show(psig)) => {
                     return Some(plugin_sig_to_lsp(psig));
                 }
                 Some(crate::plugin::PluginSigHelpAnswer::Silent) => {
+                    return None;
+                }
+                Some(crate::plugin::PluginSigHelpAnswer::ShowHandler {
+                    owner_class, dispatcher, handler_name, active_param,
+                }) => {
+                    // Core-side Handler lookup — same machinery the
+                    // native DispatchCall path uses, just triggered by
+                    // plugin instead of ref. `active_param` is a
+                    // displayed index; `string_dispatch_signature_for`
+                    // applies the +1 offset to match its internal
+                    // convention (params[0] is invocant, stripped).
+                    if let Some(sig) = string_dispatch_signature_for(
+                        analysis, Some(module_index),
+                        &owner_class, &dispatcher, &handler_name,
+                        active_param + 1,
+                    ) {
+                        return Some(sig);
+                    }
+                    // Plugin claimed the slot but no Handler was found
+                    // — suppress native to avoid fallthrough mis-fires.
                     return None;
                 }
                 None => {}
@@ -1659,30 +1407,10 @@ pub fn signature_help(
     // Stacked defs (multiple `->on('ready', sub {...})` wire-ups) each
     // contribute one `SignatureInformation` so users see every handler
     // shape they might be dispatching to.
-    // Arrayref-wrapped args: plugins can declare that a dispatcher
-    // passes handler args inside an arrayref at some positional slot
-    // (Minion's `enqueue(task, [@args], {opts})`). When the cursor
-    // sits inside such an arrayref, the active parameter is the
-    // comma index WITHIN the arrayref, and the handler's params are
-    // what we want to surface. Try this path before the plain
-    // positional dispatch path so arrayref-aware plugins take
-    // precedence at the right position.
-    if let Some((handler_name, owner_class, dispatcher, active_in_arrayref)) =
-        dispatch_info_for_enclosing_arrayref_call(analysis, tree, text.as_bytes(), point)
-    {
-        if let Some(sig) = string_dispatch_signature_for(
-            analysis,
-            Some(module_index),
-            &owner_class,
-            &dispatcher,
-            &handler_name,
-            // active_param is 1-indexed downstream (saturating_sub(1)), so
-            // bump by 1 to match the positional convention.
-            active_in_arrayref + 1,
-        ) {
-            return Some(sig);
-        }
-    }
+    // Arrayref-wrapped handler args (Minion's `enqueue(task, [@args])`)
+    // are handled by the plugin's `on_signature_help` IoC hook earlier
+    // in this function — the hook sees the Array container + active
+    // slot and returns the task sig. No core-side arrayref branching.
 
     if call_ctx.is_method && call_ctx.active_param >= 1 {
         // Primary path: find the DispatchCall ref the plugin already

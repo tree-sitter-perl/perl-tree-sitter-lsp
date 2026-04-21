@@ -19,7 +19,7 @@ const SCHEMA_VERSION: &str = "9";
 /// Bumped when the builder's analysis output changes shape in a way that
 /// invalidates cached blobs. Unlike `SCHEMA_VERSION`, this does not drop
 /// the table — stale entries are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 3;
+pub const EXTRACT_VERSION: i64 = 4;
 
 /// zstd compression level for the `analysis` blob. Lower numbers are faster;
 /// 3 is zstd's default and gives a solid space/speed tradeoff.
@@ -343,6 +343,62 @@ mod tests {
         let loaded = loaded.as_ref().unwrap();
         assert_eq!(loaded.analysis.export, vec!["foo", "bar"]);
         assert_eq!(loaded.analysis.export_ok, vec!["baz"]);
+
+        let _ = std::fs::remove_file(&pm);
+    }
+
+    /// Pin-the-fix: `plugin_namespaces` survives the bincode +
+    /// zstd + SQLite round trip with entities, bridges, and
+    /// plugin_id intact. Without this test, schema drift on the
+    /// PluginNamespace struct would silently truncate cached
+    /// modules and we'd notice only when cross-file bridge lookups
+    /// mysteriously missed entries.
+    #[test]
+    fn test_db_plugin_namespaces_roundtrip() {
+        let conn = test_db();
+        let dir = std::env::temp_dir();
+        let pm = dir.join("TestMojoApp_namespaces.pm");
+        // A Mojolicious::Lite script — mojo-lite + mojo-routes +
+        // mojo-helpers should all emit namespaces that round-trip.
+        std::fs::write(&pm,
+            "package TestMojoApp;\n\
+             use Mojolicious::Lite;\n\
+             app->helper(current_user => sub { my ($c) = @_; });\n\
+             get '/users' => sub { my $c = shift; };\n\
+             1;\n"
+        ).unwrap();
+
+        let source = std::fs::read_to_string(&pm).unwrap();
+        let cached = Some(parse_source_to_cached(&source, &pm));
+        let original_ns_count = cached.as_ref().unwrap()
+            .analysis.plugin_namespaces.len();
+        assert!(original_ns_count > 0,
+            "sanity: fixture must produce at least one PluginNamespace");
+
+        save_to_db(&conn, "TestMojoApp", &cached, "import");
+
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
+        let (n, stale) = warm_cache(&conn, &cache);
+        assert_eq!(n, 1);
+        assert!(stale.is_empty(), "fresh insert should not be stale");
+
+        let loaded = cache.get("TestMojoApp").unwrap();
+        let loaded = loaded.as_ref().unwrap();
+        let loaded_ns = &loaded.analysis.plugin_namespaces;
+        assert_eq!(loaded_ns.len(), original_ns_count,
+            "PluginNamespace count must round-trip; got: {:?}", loaded_ns);
+
+        // Every namespace must preserve its plugin_id, kind, and at
+        // least one Bridge::Class — the three fields that `bridges_index`
+        // and `for_each_entity_bridged_to` depend on.
+        for ns in loaded_ns {
+            assert!(!ns.plugin_id.is_empty(), "plugin_id preserved");
+            assert!(!ns.kind.is_empty(), "kind preserved");
+            assert!(!ns.bridges.is_empty(), "bridges preserved");
+            assert!(ns.bridges.iter().any(|b|
+                matches!(b, crate::file_analysis::Bridge::Class(_))),
+                "at least one Class bridge survives");
+        }
 
         let _ = std::fs::remove_file(&pm);
     }

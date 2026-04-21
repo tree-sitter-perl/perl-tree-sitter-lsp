@@ -126,6 +126,7 @@ pub fn build_with_plugins(
         b.export,
         b.export_ok,
         b.plugin_namespaces,
+        b.package_uses,
     )
 }
 
@@ -706,14 +707,13 @@ impl<'a> Builder<'a> {
             }
             plugin::EmitAction::Handler {
                 name, owner, dispatchers, params, span, selection_span, display,
-                args_in_arrayref_at, hide_in_outline,
+                hide_in_outline,
             } => {
                 let detail = SymbolDetail::Handler {
                     owner,
                     dispatchers,
                     params: params.into_iter().map(Into::into).collect(),
                     display,
-                    args_in_arrayref_at,
                     hide_in_outline,
                 };
                 self.add_symbol_ns(name, SymKind::Handler, span, selection_span, detail, ns);
@@ -786,16 +786,58 @@ impl<'a> Builder<'a> {
                 // is resolved now against symbols already emitted by
                 // this plugin in THIS dispatch (and any earlier one).
                 let plugin_id_for_ns = plugin_id.clone();
+                // O(symbols) with O(1) name lookup — the previous
+                // `entity_names.iter().any(...)` inside the filter was
+                // O(symbols × entity_names). Helpers register dozens
+                // of names per app; the quadratic scan compounds.
+                let entity_name_set: std::collections::HashSet<&str> =
+                    entity_names.iter().map(|s| s.as_str()).collect();
                 let entities: Vec<_> = self.symbols.iter()
                     .filter(|s| matches!(
                         &s.namespace,
                         crate::file_analysis::Namespace::Framework { id } if id == &plugin_id_for_ns
                     ))
-                    .filter(|s| entity_names.iter().any(|n| n == &s.name))
+                    .filter(|s| entity_name_set.contains(s.name.as_str()))
                     .map(|s| s.id)
                     .collect();
 
-                if let Some(existing) = self.plugin_namespaces.iter_mut().find(|n| n.id == id) {
+                // Debug hint for plugin authors: if the namespace has at
+                // least one Class bridge, every resolved entity's package
+                // should match one of those bridge classes — otherwise
+                // `for_each_entity_bridged_to` will silently skip it at
+                // lookup time (per-entity `sym.package` filter). Warn
+                // rather than assert: the plugin may intentionally emit
+                // entities meant for other bridge kinds once wired.
+                #[cfg(debug_assertions)]
+                {
+                    let bridge_classes: Vec<&str> = bridges.iter()
+                        .map(|crate::file_analysis::Bridge::Class(c)| c.as_str())
+                        .collect();
+                    if !bridge_classes.is_empty() {
+                        for eid in &entities {
+                            let sym = &self.symbols[eid.0 as usize];
+                            let pkg_matches = sym.package.as_deref()
+                                .map(|p| bridge_classes.iter().any(|c| *c == p))
+                                .unwrap_or(false);
+                            if !pkg_matches {
+                                log::warn!(
+                                    "plugin `{}` namespace `{}`: entity `{}` has package={:?} \
+                                     but no matching Bridge::Class in {:?} — cross-file lookup \
+                                     via for_each_entity_bridged_to will silently skip it",
+                                    plugin_id_for_ns, id, sym.name, sym.package, bridge_classes,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Namespace identity is (plugin_id, id) — not just `id`.
+                // Two plugins that both pick "app" as an id belong to
+                // different namespaces; matching only on `id` would
+                // silently merge entities and bridges across plugins.
+                let existing = self.plugin_namespaces.iter_mut()
+                    .find(|n| n.id == id && n.plugin_id == plugin_id_for_ns);
+                if let Some(existing) = existing {
                     for b in bridges {
                         if !existing.bridges.contains(&b) {
                             existing.bridges.push(b);
@@ -8406,11 +8448,12 @@ sub new {
             "events stay EVENT — the one LSP kind that fits");
     }
 
-    /// Sanity: the minion plugin's Handler actually carries
-    /// args_in_arrayref_at=Some(1). If this regresses, sig help
-    /// has no chance of finding the arrayref-shape match.
+    /// Sanity: the minion plugin registers a task Handler with the
+    /// expected shape. The arrayref-sig-help behavior itself lives in
+    /// the plugin's `on_signature_help` IoC hook (tested end-to-end
+    /// below) — no data flag on the Handler.
     #[test]
-    fn minion_handler_has_args_in_arrayref_at_set() {
+    fn minion_registers_task_handler() {
         let src = r#"package MyApp;
 use Minion;
 my $minion = Minion->new;
@@ -8420,11 +8463,13 @@ $minion->add_task(send_email => sub { my ($job, $to) = @_; });
         let h = fa.symbols.iter()
             .find(|s| s.kind == SymKind::Handler && s.name == "send_email")
             .expect("handler exists");
-        let SymbolDetail::Handler { args_in_arrayref_at, .. } = h.detail else {
+        let SymbolDetail::Handler { dispatchers, display, .. } = &h.detail else {
             panic!("detail shape");
         };
-        assert_eq!(args_in_arrayref_at, Some(1),
-            "plugin must declare args_in_arrayref_at: 1 for enqueue-shape dispatchers");
+        assert!(dispatchers.iter().any(|d| d == "enqueue"),
+            "must list enqueue as a dispatcher; got: {:?}", dispatchers);
+        assert!(matches!(display, HandlerDisplay::Task),
+            "task handlers display as Task; got: {:?}", display);
     }
 
     /// Test 2 — arrayref sig help, through the REAL LSP pipeline.
@@ -8609,15 +8654,17 @@ $app->helper('users.create' => sub { my ($c) = @_; });
 "#;
         let fa = build_fa(src);
 
+        // Identify by semantic shape (kind + bridges), not by plugin
+        // id — the contract is "there's an 'app' namespace bridging to
+        // both Controller and Mojolicious", not "a plugin literally
+        // called mojo-helpers emits it".
         let ns = fa.plugin_namespaces.iter()
-            .find(|n| n.plugin_id == "mojo-helpers" && n.kind == "app")
-            .expect("mojo-helpers must declare an app namespace");
-
-        // Two bridges — controller for `$c->`, Mojolicious for `$app->`.
-        assert!(ns.bridges.contains(&Bridge::Class("Mojolicious::Controller".into())),
-            "must bridge Controller; got: {:?}", ns.bridges);
-        assert!(ns.bridges.contains(&Bridge::Class("Mojolicious".into())),
-            "must bridge Mojolicious (app class); got: {:?}", ns.bridges);
+            .find(|n|
+                n.kind == "app"
+                && n.bridges.contains(&Bridge::Class("Mojolicious::Controller".into()))
+                && n.bridges.contains(&Bridge::Class("Mojolicious".into()))
+            )
+            .expect("an `app` namespace must bridge both Controller and Mojolicious");
 
         // Entities cover both registered helpers, through the
         // name-keyed resolution that expands fan-out Methods.
@@ -8629,13 +8676,57 @@ $app->helper('users.create' => sub { my ($c) = @_; });
         assert!(entity_names.contains(&"users"),
             "dotted-helper root must land in the namespace; got: {:?}", entity_names);
 
-        // Namespace ID is stable per enclosing package — one
-        // namespace for MyApp regardless of how many helpers it
-        // registers.
+        // Namespace ID is stable per enclosing package — one namespace
+        // for MyApp regardless of how many helpers it registers. Scope
+        // the count to this namespace's own (plugin_id, id) pair.
         let count = fa.plugin_namespaces.iter()
-            .filter(|n| n.plugin_id == "mojo-helpers" && n.id == ns.id)
+            .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
             .count();
         assert_eq!(count, 1, "one namespace per app, not one per helper");
+    }
+
+    /// Rule #8 follow-through: plugin_namespaces must be READ somewhere.
+    /// Outline surfaces them as NAMESPACE entries so "this file hosts a
+    /// mojo app / Minion instance / events emitter" is navigable. Also
+    /// proves document_symbols doesn't regress the flat entity listing.
+    #[test]
+    fn plugin_namespaces_appear_in_document_outline() {
+        let src = r#"package MyApp;
+use Mojolicious::Lite;
+app->helper(current_user => sub { my ($c) = @_; });
+get '/home' => sub { my $c = shift; };
+"#;
+        let fa = build_fa(src);
+        let outline = fa.document_symbols();
+
+        let ns_entries: Vec<&crate::file_analysis::OutlineSymbol> = outline.iter()
+            .filter(|o| o.kind == SymKind::Namespace)
+            .collect();
+        assert!(!ns_entries.is_empty(),
+            "outline must surface plugin_namespaces as Namespace entries; got: {:?}",
+            outline.iter().map(|o| (&o.name, &o.kind)).collect::<Vec<_>>());
+
+        // Every namespace outline entry carries its kind in the name
+        // so users can distinguish `[app]` from `[routes]` from `[tasks]`.
+        for ns in &ns_entries {
+            assert!(ns.name.starts_with('['),
+                "namespace outline entries should show kind in brackets; got: {:?}", ns.name);
+        }
+
+        // Individual helpers + routes still show flat at file scope —
+        // the namespace entry doesn't hide them (user explicitly asked
+        // for flat [Helper] / [Route] entries). Find current_user and
+        // /home somewhere in the outline (possibly nested).
+        fn walk<'a>(xs: &'a [crate::file_analysis::OutlineSymbol], out: &mut Vec<&'a str>) {
+            for x in xs {
+                out.push(x.name.as_str());
+                walk(&x.children, out);
+            }
+        }
+        let mut all = Vec::new();
+        walk(&outline, &mut all);
+        assert!(all.iter().any(|n| n.contains("current_user")),
+            "helper must still appear flat in outline; got: {:?}", all);
     }
 
     /// mojo-events emits a PluginNamespace per emitter class. Bridges to
@@ -8657,11 +8748,11 @@ sub register {
         let fa = build_fa(src);
 
         let ns = fa.plugin_namespaces.iter()
-            .find(|n| n.plugin_id == "mojo-events" && n.kind == "events")
-            .expect("mojo-events must declare an emitter namespace");
-
-        assert!(ns.bridges.contains(&Bridge::Class("My::Emitter".into())),
-            "must bridge the emitter class; got: {:?}", ns.bridges);
+            .find(|n|
+                n.kind == "events"
+                && n.bridges.contains(&Bridge::Class("My::Emitter".into()))
+            )
+            .expect("an `events` namespace must bridge My::Emitter");
 
         let entity_names: Vec<&str> = ns.entities.iter()
             .map(|id| fa.symbol(*id).name.as_str())
@@ -8672,7 +8763,7 @@ sub register {
         }
 
         let count = fa.plugin_namespaces.iter()
-            .filter(|n| n.plugin_id == "mojo-events" && n.id == ns.id)
+            .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
             .count();
         assert_eq!(count, 1, "one namespace per emitter, not one per wire-up");
     }
@@ -8695,12 +8786,18 @@ sub startup {
 "#;
         let fa = build_fa(src);
 
+        // Identify by semantic shape — a `routes` namespace that
+        // bridges to the declaring package. Two flavors of route
+        // plugin (full Mojolicious and Lite) both emit `kind: "routes"`,
+        // so also check that the entity names are the Controller#action
+        // form to distinguish from path-based Lite routes.
         let ns = fa.plugin_namespaces.iter()
-            .find(|n| n.plugin_id == "mojo-routes" && n.kind == "routes")
-            .expect("mojo-routes must declare a routes namespace");
-
-        assert!(ns.bridges.contains(&Bridge::Class("MyApp".into())),
-            "must bridge the declaring package; got: {:?}", ns.bridges);
+            .find(|n|
+                n.kind == "routes"
+                && n.bridges.contains(&Bridge::Class("MyApp".into()))
+                && n.entities.iter().any(|id| fa.symbol(*id).name.contains('#'))
+            )
+            .expect("a `routes` namespace must bridge MyApp with Ctrl#action entities");
 
         let entity_names: Vec<&str> = ns.entities.iter()
             .map(|id| fa.symbol(*id).name.as_str())
@@ -8711,7 +8808,7 @@ sub startup {
             "route Users#create must land in the namespace; got: {:?}", entity_names);
 
         let count = fa.plugin_namespaces.iter()
-            .filter(|n| n.plugin_id == "mojo-routes" && n.id == ns.id)
+            .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
             .count();
         assert_eq!(count, 1, "one namespace per declaring package, not one per route");
     }
@@ -8730,12 +8827,15 @@ post '/login' => sub { my $c = shift; };
 "#;
         let fa = build_fa(src);
 
+        // Identify by semantic shape: a `routes` namespace bridging to
+        // `main` (the Lite app's package) with path-shaped entity names.
         let ns = fa.plugin_namespaces.iter()
-            .find(|n| n.plugin_id == "mojo-lite" && n.kind == "routes")
-            .expect("mojo-lite must declare a routes namespace");
-
-        assert!(ns.bridges.contains(&Bridge::Class("main".into())),
-            "must bridge the declaring package (main for Lite); got: {:?}", ns.bridges);
+            .find(|n|
+                n.kind == "routes"
+                && n.bridges.contains(&Bridge::Class("main".into()))
+                && n.entities.iter().any(|id| fa.symbol(*id).name.starts_with('/'))
+            )
+            .expect("a Lite `routes` namespace must bridge main with /path entities");
 
         let entity_names: Vec<&str> = ns.entities.iter()
             .map(|id| fa.symbol(*id).name.as_str())
@@ -8764,11 +8864,11 @@ $minion->add_task(resize_image => sub { my ($job) = @_; });
         let fa = build_fa(src);
 
         let ns = fa.plugin_namespaces.iter()
-            .find(|n| n.plugin_id == "minion" && n.kind == "tasks")
-            .expect("minion must declare a tasks namespace");
-
-        assert!(ns.bridges.contains(&Bridge::Class("Minion".into())),
-            "must bridge Minion; got: {:?}", ns.bridges);
+            .find(|n|
+                n.kind == "tasks"
+                && n.bridges.contains(&Bridge::Class("Minion".into()))
+            )
+            .expect("a `tasks` namespace must bridge Minion");
 
         let entity_names: Vec<&str> = ns.entities.iter()
             .map(|id| fa.symbol(*id).name.as_str())
@@ -8779,7 +8879,7 @@ $minion->add_task(resize_image => sub { my ($job) = @_; });
             "task resize_image must land in the namespace; got: {:?}", entity_names);
 
         let count = fa.plugin_namespaces.iter()
-            .filter(|n| n.plugin_id == "minion" && n.id == ns.id)
+            .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
             .count();
         assert_eq!(count, 1, "one namespace per package, not one per add_task");
     }
@@ -8826,26 +8926,15 @@ $minion->enqueue(send_email => ['a', 'b'], {  });
         let idx = crate::module_index::ModuleIndex::new_for_test();
         let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx);
 
-        // The contract: the task's sig must NOT show up in the
-        // options hash. The plugin's `on_signature_help` claims the
-        // slot with `Silent` so the native string-dispatch path
-        // doesn't run. Either `None` (silent) or a sig that isn't
-        // the task's is acceptable; showing `send_email($to, …)` is
-        // the regression we're pinning against.
-        match sig {
-            None => {}
-            Some(sh) => {
-                for info in &sh.signatures {
-                    assert!(!info.label.contains("send_email"),
-                        "options hash is NOT dispatching to the task — \
-                         sig help should be enqueue's own shape or absent. \
-                         Got: {:?}", info.label);
-                    assert!(!info.label.contains("$subject"),
-                        "task params must NOT leak into enqueue's options \
-                         hash sig; got: {:?}", info.label);
-                }
-            }
-        }
+        // Tight contract: `PluginSigHelpAnswer::Silent` returns None
+        // from `signature_help` — full stop. The plugin explicitly
+        // claims the slot to block the native string-dispatch path
+        // that would mis-show the task's sig. Anything else means
+        // either the plugin stopped claiming, or the core's Silent
+        // handler regressed.
+        assert!(sig.is_none(),
+            "plugin `Silent` on the options-hash slot must suppress native \
+             sig help entirely; got: {:?}", sig);
     }
 
     /// RED — completion at arg-0 of enqueue should offer ONLY

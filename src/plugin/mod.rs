@@ -101,8 +101,28 @@ impl From<EmittedParam> for ParamInfo {
     }
 }
 
+/// What a plugin's emit hook can contribute to the builder.
+///
+/// Two classes of action live in this enum; the distinction matters
+/// when adding a new variant.
+///
+/// **Data emissions** (`Method`, `HashKeyDef`, `HashKeyAccess`,
+/// `Handler`, `DispatchCall`, `MethodCallRef`, `Symbol`, `PackageParent`,
+/// `PluginNamespace`) contribute to the serialized `FileAnalysis` graph.
+/// They round-trip through bincode and survive the module boundary.
+/// Adding one of these is purely additive — no builder coupling.
+///
+/// **Builder side-effects** (`FrameworkImport`, `VarType`) reach INTO
+/// the builder's in-progress state (`framework_imports`,
+/// `deferred_var_types`). They're pragmatic: the Perl-semantic data
+/// they carry doesn't fit the plain Symbol/Ref vocabulary (the callback
+/// body's scope doesn't exist yet when `VarType` is emitted), but they
+/// ARE the exceptions — prefer a data emission when you can express the
+/// same thing that way. New side-effect variants need explicit sign-off.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EmitAction {
+    // ==== Data emissions ====
+
     /// Emit an accessor-style method. Shorthand for Symbol + SymKind::Method +
     /// SymbolDetail::Sub. The plugin's id becomes the symbol's Namespace tag.
     ///
@@ -167,8 +187,6 @@ pub enum EmitAction {
     /// Register a parent class on the current package. Used for
     /// `use Mojo::Base 'App'` style inheritance detection.
     PackageParent { package: String, parent: String },
-    /// Implicit keyword import (same purpose as builder's `framework_imports`).
-    FrameworkImport { keyword: String },
     /// Register a named Handler on a class — a string-dispatched callable
     /// that isn't a Perl method. Multiple Handlers with the same
     /// (owner, name) stack instead of overriding. `dispatchers` is the
@@ -187,13 +205,6 @@ pub enum EmitAction {
         selection_span: Span,
         #[serde(default)]
         display: HandlerDisplay,
-        /// Dispatch shape. `Some(n)` = handler args ride inside an
-        /// arrayref at dispatcher-arg position `n`; sig help then fires
-        /// when the cursor is inside `[...]` at that position (Minion's
-        /// `enqueue(task, [@args])` uses 1). Default: plain positional
-        /// (matches `emit('name', arg1, arg2)` style).
-        #[serde(default)]
-        args_in_arrayref_at: Option<usize>,
         /// Hide from document outline (see Method variant).
         #[serde(default)]
         hide_in_outline: bool,
@@ -277,6 +288,18 @@ pub enum EmitAction {
         /// registration call (`$app->plugin('Minion', ...)` etc.).
         decl_span: Span,
     },
+    // ==== Builder side-effects ====
+    // These reach into builder internals rather than adding to the
+    // serialized graph. They work, but they're the exception, not
+    // the pattern — expand the data vocabulary before adding new ones.
+
+    /// Implicit keyword import (same purpose as builder's
+    /// `framework_imports`). Silences the unresolved-function
+    /// diagnostic for DSL verbs (`get`, `post`, `has`, `with`, ...)
+    /// that a framework auto-imports. Side-effect: mutates
+    /// `Builder.framework_imports`.
+    FrameworkImport { keyword: String },
+
     /// Declare a type for a variable inside a scope. Plugins use this
     /// when they know a framework-provided variable's type that the
     /// builder can't infer — the classic case being callback arguments:
@@ -284,7 +307,9 @@ pub enum EmitAction {
     /// knows `$c` is a Mojolicious controller, the core doesn't.
     /// `at` names any point inside the scope the constraint should
     /// apply to (typically the callback body's span); the builder
-    /// resolves it to an actual scope via `scope_at(at)`.
+    /// resolves it to an actual scope via `scope_at(at)`. Side-effect:
+    /// queues a deferred scope resolution into
+    /// `Builder.deferred_var_types`.
     VarType {
         variable: String,
         at: Span,
@@ -425,8 +450,31 @@ pub struct PluginSignatureHelp {
 /// sig or silently claim the slot (suppresses native sig help).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PluginSigHelpAnswer {
+    /// Plugin-rendered signature — used when the shape is entirely
+    /// synthetic (the task wrapper form, say) and no existing Handler
+    /// backs it.
     Show(PluginSignatureHelp),
+    /// Claim the slot silently — suppresses native sig help without
+    /// contributing anything. Used when the cursor sits in a position
+    /// where the native path would mis-fire (e.g. the options hash of
+    /// `enqueue` — native would show the task's sig instead of enqueue's
+    /// own options).
     Silent,
+    /// Delegate to the core: "render the sig for this Handler". The
+    /// plugin has already resolved which Handler the cursor points at
+    /// and which param slot is active; the core does the param lookup
+    /// (including cross-file via `handlers_for_owner`) and invocant
+    /// stripping. Same delegation pattern as completion's
+    /// `dispatch_targets_for`.
+    ShowHandler {
+        owner_class: String,
+        dispatcher: String,
+        handler_name: String,
+        /// Active-param index in the DISPLAYED signature (post invocant
+        /// strip). The core maps it through `saturating_sub(1)` if it
+        /// needs the raw Handler-params index.
+        active_param: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -570,11 +618,27 @@ mod tests {
     struct StubPlugin {
         id: &'static str,
         triggers: Vec<Trigger>,
+        sig_answer: Option<PluginSigHelpAnswer>,
+        completion_answer: Option<PluginCompletionAnswer>,
     }
 
     impl FrameworkPlugin for StubPlugin {
         fn id(&self) -> &str { self.id }
         fn triggers(&self) -> &[Trigger] { &self.triggers }
+        fn on_signature_help(&self, _ctx: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> {
+            self.sig_answer.clone()
+        }
+        fn on_completion(&self, _ctx: &CompletionQueryContext) -> Option<PluginCompletionAnswer> {
+            self.completion_answer.clone()
+        }
+    }
+
+    fn stub(id: &'static str) -> StubPlugin {
+        StubPlugin { id, triggers: vec![Trigger::Always], sig_answer: None, completion_answer: None }
+    }
+
+    fn empty_qctx() -> SigHelpQueryContext {
+        SigHelpQueryContext { call: None, cursor_inside: None, current_package: None }
     }
 
     #[test]
@@ -583,6 +647,8 @@ mod tests {
         reg.register(Box::new(StubPlugin {
             id: "mojo-base",
             triggers: vec![Trigger::UsesModule("Mojo::Base".into())],
+            sig_answer: None,
+            completion_answer: None,
         }));
 
         let uses_mojo: Vec<String> = vec!["Mojo::Base".into()];
@@ -608,6 +674,8 @@ mod tests {
         reg.register(Box::new(StubPlugin {
             id: "dbic",
             triggers: vec![Trigger::ClassIsa("DBIx::Class".into())],
+            sig_answer: None,
+            completion_answer: None,
         }));
 
         let uses: Vec<String> = vec![];
@@ -657,5 +725,117 @@ mod tests {
         let json = serde_json::to_string(&action).unwrap();
         assert!(json.contains("\"Method\""));
         assert!(json.contains("\"foo\""));
+    }
+
+    // ---- IoC query hook semantics ----
+    //
+    // The tests below pin the contract that the symbols.rs wiring
+    // relies on: iteration order is registration order, first
+    // answer wins at a per-plugin level, and `Silent` / `exclusive`
+    // are honored without bundled-plugin coupling.
+
+    #[test]
+    fn iteration_order_is_registration_order() {
+        // If two plugins both claim a slot, the first-registered one
+        // wins. symbols.rs uses `applicable()` which returns an iter
+        // over `self.plugins` in registration order, so the "who
+        // wins" question collapses to "who registered first".
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(stub("first")));
+        reg.register(Box::new(stub("second")));
+
+        let uses: Vec<String> = vec![];
+        let parents: Vec<String> = vec![];
+        let ids: Vec<&str> = reg.applicable(&TriggerQuery {
+            package_uses: &uses, package_parents: &parents,
+        }).map(|p| p.id()).collect();
+        assert_eq!(ids, vec!["first", "second"],
+            "applicable() preserves registration order — symbols.rs relies on \
+             this for deterministic first-match-wins behavior");
+    }
+
+    #[test]
+    fn sig_help_silent_variant_is_distinct_from_show() {
+        // The `Silent` variant must carry no payload; symbols.rs
+        // branches on it directly. Round-tripping through serde
+        // catches any future refactor that accidentally flattens it.
+        let silent = PluginSigHelpAnswer::Silent;
+        let json = serde_json::to_string(&silent).unwrap();
+        let back: PluginSigHelpAnswer = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, PluginSigHelpAnswer::Silent));
+
+        // Show carries a signature — distinct JSON shape.
+        let show = PluginSigHelpAnswer::Show(PluginSignatureHelp {
+            label: "x".into(), params: vec![], active_param: 0,
+        });
+        let show_json = serde_json::to_string(&show).unwrap();
+        assert!(show_json.contains("Show"));
+        assert!(!show_json.contains("\"Silent\""));
+    }
+
+    #[test]
+    fn completion_exclusive_and_dispatch_targets_coexist() {
+        // `exclusive` and `dispatch_targets_for` are orthogonal: a
+        // plugin can claim the slot AND delegate handler-name
+        // population to the core in the same answer. symbols.rs
+        // returns early on `exclusive` but still walks
+        // `dispatch_targets_for` first.
+        let ans = PluginCompletionAnswer {
+            items: vec![],
+            exclusive: true,
+            dispatch_targets_for: Some(DispatchTargetRequest {
+                owner_class: "Minion".into(),
+                dispatcher_names: vec!["enqueue".into()],
+            }),
+        };
+        assert!(ans.exclusive);
+        assert!(ans.dispatch_targets_for.is_some());
+        // Round-trip — both fields must survive.
+        let json = serde_json::to_string(&ans).unwrap();
+        let back: PluginCompletionAnswer = serde_json::from_str(&json).unwrap();
+        assert!(back.exclusive);
+        assert_eq!(
+            back.dispatch_targets_for.unwrap().owner_class,
+            "Minion"
+        );
+    }
+
+    #[test]
+    fn first_answering_plugin_claims_sig_help() {
+        // Mirror of how symbols.rs iterates: break on first Some.
+        // Second plugin never runs. This documents the contract so a
+        // future refactor that wants "all plugins contribute" has to
+        // explicitly change this test.
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(StubPlugin {
+            id: "winner",
+            triggers: vec![Trigger::Always],
+            sig_answer: Some(PluginSigHelpAnswer::Silent),
+            completion_answer: None,
+        }));
+        reg.register(Box::new(StubPlugin {
+            id: "loser",
+            triggers: vec![Trigger::Always],
+            sig_answer: Some(PluginSigHelpAnswer::Show(PluginSignatureHelp {
+                label: "never-seen".into(), params: vec![], active_param: 0,
+            })),
+            completion_answer: None,
+        }));
+
+        let uses: Vec<String> = vec![];
+        let parents: Vec<String> = vec![];
+        let qctx = empty_qctx();
+        let mut answers = Vec::new();
+        for p in reg.applicable(&TriggerQuery {
+            package_uses: &uses, package_parents: &parents,
+        }) {
+            if let Some(a) = p.on_signature_help(&qctx) {
+                answers.push((p.id().to_string(), a));
+                break; // symbols.rs breaks on first Some — tested here
+            }
+        }
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].0, "winner");
+        assert!(matches!(answers[0].1, PluginSigHelpAnswer::Silent));
     }
 }

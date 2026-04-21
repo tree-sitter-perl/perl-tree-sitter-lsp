@@ -906,6 +906,15 @@ impl LanguageServer for Backend {
                     }
                 }
             }
+            // Plugin namespaces — match on both id and kind so users
+            // can find "the minion tasks in this workspace" via either
+            // "minion" or "tasks".
+            for ns in &analysis.plugin_namespaces {
+                let hay = format!("{} {}", ns.id.to_lowercase(), ns.kind.to_lowercase());
+                if hay.contains(&query) {
+                    results.push(symbols::plugin_namespace_to_workspace_info(ns, uri.clone()));
+                }
+            }
         });
 
         if results.is_empty() {

@@ -185,12 +185,11 @@ fn on_method_call(ctx) {
                 // subscribe to them, you enqueue calls. Matches how
                 // mojo-routes chose Function over Event.
                 display: "Task",
-                // Minion unpacks the arrayref at position 1 into the
-                // task callback's positionals (`enqueue(task, [@args])`).
-                // Flags sig help to fire when cursor is inside `[...]`
-                // at that slot — the core reads the declaration and
-                // routes; no Minion-specific branching anywhere else.
-                args_in_arrayref_at: 1,
+                // Arrayref-shape sig help (`enqueue(task, [@args])`) is
+                // owned by this plugin's `on_signature_help` hook below
+                // — the IoC path inspects `cursor_inside.kind == Array`
+                // and `active_slot == 1`, then returns the task sig.
+                // No core-side arrayref declaration; no data flag.
             }
         };
 
@@ -283,14 +282,15 @@ fn on_signature_help(ctx) {
     let name = callframe.args[0].string_value;
     if name == () { return (); }
 
-    // `params` is a placeholder — the task's real signature lives
-    // on the Handler symbol. Full resolution requires a symbol-table
-    // lookup primitive the host will expose (see
-    // docs/prompt-plugin-architecture.md "Open questions").
+    // Delegate to the core to resolve the task Handler + render its
+    // signature. We've identified WHICH handler (by name + owner +
+    // dispatcher) and the active slot; the core does the param lookup
+    // (local + cross-file via handlers_for_owner) and invocant strip.
     #{
-        Show: #{
-            label: "enqueue('" + name + "', [ args ])",
-            params: [name + " args"],
+        ShowHandler: #{
+            owner_class: "Minion",
+            dispatcher: callframe.name,
+            handler_name: name,
             active_param: container.active_slot,
         }
     }

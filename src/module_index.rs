@@ -518,38 +518,58 @@ impl ModuleIndex {
         // fail conversion and break cross-file goto-def.
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
-        let mut classes_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Re-registration happens on file-watcher save. Old edges in
+        // `reverse_index` and `bridges_index` still point at this module,
+        // so without a purge they accumulate forever — a name or bridge
+        // that a previous version declared lingers after it's removed,
+        // and cross-file lookups return phantom modules.
+        self.purge_module_edges(&module_name);
+
+        let mut name_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for sym in &analysis.symbols {
             // Name-keyed reverse index (every module-visible symbol).
             if matches!(
                 sym.kind,
                 SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class
                     | SymKind::Module | SymKind::HashKeyDef | SymKind::Handler,
-            ) {
+            ) && name_seen.insert(sym.name.as_str()) {
                 self.reverse_index
                     .entry(sym.name.clone())
                     .or_default()
                     .push(module_name.clone());
             }
         }
-        let _ = classes_seen;
         // Bridges index: any PluginNamespace whose Bridge::Class(c)
         // matches means this module declares a namespace reachable
         // from class `c`. One entry per class per module (dedup).
         let mut bridge_classes_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for ns in &analysis.plugin_namespaces {
-            for bridge in &ns.bridges {
-                if let crate::file_analysis::Bridge::Class(c) = bridge {
-                    if bridge_classes_seen.insert(c.clone()) {
-                        self.bridges_index
-                            .entry(c.clone())
-                            .or_default()
-                            .push(module_name.clone());
-                    }
+            for crate::file_analysis::Bridge::Class(c) in &ns.bridges {
+                if bridge_classes_seen.insert(c.clone()) {
+                    self.bridges_index
+                        .entry(c.clone())
+                        .or_default()
+                        .push(module_name.clone());
                 }
             }
         }
         self.cache.insert(module_name, Some(cached));
+    }
+
+    /// Remove `module_name` from every `reverse_index` and `bridges_index`
+    /// bucket it currently sits in. Called from
+    /// `register_workspace_module` before the re-insert so stale edges
+    /// from a prior version of the same module don't accumulate.
+    fn purge_module_edges(&self, module_name: &str) {
+        self.reverse_index.retain(|_name, mods| {
+            mods.retain(|m| m != module_name);
+            !mods.is_empty()
+        });
+        self.bridges_index.retain(|_class, mods| {
+            mods.retain(|m| m != module_name);
+            !mods.is_empty()
+        });
     }
 
     /// Every cached module that declares at least one `PluginNamespace`

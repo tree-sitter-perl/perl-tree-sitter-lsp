@@ -197,6 +197,11 @@ pub enum SymKind {
     /// selects which Handler to run. Multiple Handlers with the same
     /// `(owner, name)` stack, they don't override.
     Handler,
+    /// Plugin-controlled scope (mojo app, Minion instance, mojo-events
+    /// emitter). Surfaces in the document outline and workspace symbol
+    /// search as a navigable entry. Outline entity — not backed by a
+    /// Perl symbol, so most queries (gd/gr/rename) don't hit it.
+    Namespace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,15 +277,6 @@ pub enum SymbolDetail {
         params: Vec<ParamInfo>,
         #[serde(default)]
         display: HandlerDisplay,
-        /// Plugin-declared dispatch shape. When `Some(n)`, dispatcher
-        /// calls pass the handler's positional args inside an arrayref
-        /// at dispatcher-arg position `n` (0-indexed, counting from
-        /// the dispatcher's own arg list). Sig help routes accordingly:
-        /// cursor inside `[...]` at that position → show `params`.
-        /// `None` → plain positional after the name (like Mojo events).
-        /// Minion's `enqueue(task, [@args], {opts})` sets this to 1.
-        #[serde(default)]
-        args_in_arrayref_at: Option<usize>,
         /// Suppress this handler in the document outline. Plugins set
         /// it for framework-synthesized entries that shouldn't clutter
         /// the user's navigation view — hover/gd/completion still find
@@ -576,19 +572,17 @@ pub struct PluginNamespace {
 /// When a lookup asks "what's reachable from class X?", the core
 /// unions Perl-native methods with entities from every namespace
 /// whose bridges match X.
+///
+/// Currently only `Class` is wired — `Bareword` / `Variable` would
+/// require lookup machinery (`bareword_index`, per-variable bridge
+/// table) that doesn't exist yet. Re-add them when a concrete plugin
+/// needs the shape; speculative variants just rot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Bridge {
     /// Any expression typed as this class (or a subclass reached via
     /// inheritance walk) can see this namespace's entities. The
     /// canonical bridge for framework helpers on controllers.
     Class(String),
-    /// A bareword function call returns an instance in this
-    /// namespace. `app` in Mojolicious::Lite returns the app.
-    Bareword(String),
-    /// A specific named variable resolves to an instance of this
-    /// namespace. Used sparingly — plugins generally prefer
-    /// Class/Bareword.
-    Variable(String),
 }
 
 // ---- Hash key owner (for scope graph) ----
@@ -753,6 +747,12 @@ pub struct FileAnalysis {
     /// Populated by the builder from use parent/base, @ISA, and class :isa.
     pub package_parents: HashMap<String, Vec<String>>,
 
+    /// Modules `use`-d inside each package in this file. Parallel to
+    /// `package_parents`: keyed by the enclosing package name, values are
+    /// module names. Powers trigger-matching for plugin query hooks
+    /// (emit-path builder state isn't visible at cursor time).
+    pub package_uses: HashMap<String, Vec<String>>,
+
     /// Return types from imported functions (populated after build from module index).
     pub imported_return_types: HashMap<String, InferredType>,
 
@@ -812,6 +812,7 @@ impl FileAnalysis {
         export: Vec<String>,
         export_ok: Vec<String>,
         plugin_namespaces: Vec<PluginNamespace>,
+        package_uses: HashMap<String, Vec<String>>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -823,6 +824,7 @@ impl FileAnalysis {
             call_bindings,
             method_call_bindings,
             package_parents,
+            package_uses,
             imported_return_types: HashMap::new(),
             framework_imports,
             export,
@@ -1843,6 +1845,84 @@ impl FileAnalysis {
             }
         }
         None
+    }
+
+    /// Iterate Handler symbols whose owner class is `owner_class` and
+    /// that dispatch through any of `dispatchers`. When `dispatchers`
+    /// is empty, all handlers for that class match. Powers plugin
+    /// `dispatch_targets_for` (rule #5: this extraction lives on the
+    /// data model, not duplicated in symbols.rs).
+    pub fn handlers_for_owner<'a>(
+        &'a self,
+        owner_class: &'a str,
+        dispatchers: &'a [String],
+    ) -> impl Iterator<Item = &'a Symbol> + 'a {
+        self.symbols.iter().filter(move |sym| {
+            let SymbolDetail::Handler { owner, dispatchers: dd, .. } = &sym.detail else {
+                return false;
+            };
+            let HandlerOwner::Class(c) = owner;
+            if c != owner_class { return false; }
+            if !dispatchers.is_empty()
+                && !dd.iter().any(|d| dispatchers.iter().any(|n| n == d))
+            {
+                return false;
+            }
+            true
+        })
+    }
+
+    /// Trigger-matching view for plugin query hooks at `point`: the
+    /// modules `use`d inside the enclosing package plus the transitive
+    /// parent chain. Mirrors what the builder assembles at emit time so
+    /// query hooks can be gated by the same `PluginRegistry::applicable`
+    /// filter instead of running against every bundled plugin.
+    pub fn trigger_view_at(&self, point: Point) -> (Vec<String>, Vec<String>) {
+        let pkg = match self.package_at(point) {
+            Some(p) => p.to_string(),
+            None => return (Vec::new(), Vec::new()),
+        };
+        let uses = self.package_uses.get(&pkg).cloned().unwrap_or_default();
+        let mut parents = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![pkg.clone()];
+        while let Some(cur) = stack.pop() {
+            if let Some(ps) = self.package_parents.get(&cur) {
+                for p in ps {
+                    if seen.insert(p.clone()) {
+                        parents.push(p.clone());
+                        stack.push(p.clone());
+                    }
+                }
+            }
+        }
+        (uses, parents)
+    }
+
+    /// Resolve the class name for an invocant expression text (the token
+    /// left of `->`). Handles the two Perl conventions `$self` and
+    /// `__PACKAGE__` by falling back to the enclosing package; typed
+    /// scalars go through `inferred_type`; barewords are treated as
+    /// class names verbatim.
+    ///
+    /// This is Perl-semantic resolution, so it belongs on the data
+    /// layer (rule #3). Callers in `symbols.rs` / `cursor_context.rs`
+    /// compose this; they don't repeat the rules.
+    pub fn invocant_text_to_class(&self, invocant: Option<&str>, point: Point) -> Option<String> {
+        let text = invocant?;
+        if text == "$self" || text == "__PACKAGE__" {
+            return self.package_at(point).map(|s| s.to_string());
+        }
+        if text.starts_with('$') {
+            if let Some(InferredType::ClassName(n)) = self.inferred_type(text, point) {
+                return Some(n.clone());
+            }
+            return None;
+        }
+        if text.starts_with('@') || text.starts_with('%') {
+            return None;
+        }
+        Some(text.to_string())
     }
 
     /// Find all symbols with a given name.
@@ -2965,7 +3045,35 @@ impl FileAnalysis {
     pub fn document_symbols(&self) -> Vec<OutlineSymbol> {
         // Find the file scope (ScopeId(0))
         let file_scope = ScopeId(0);
-        self.outline_children_of(file_scope)
+        let mut out = self.outline_children_of(file_scope);
+
+        // Plugin namespaces as navigable outline entries. Entities
+        // themselves still show flat at file scope (the Helper/Route/Task
+        // detail words make them individually visible) — the namespace
+        // entry adds a "this file hosts a <kind>" anchor you can jump
+        // to, and is the one surface that actually reads
+        // `plugin_namespaces` (rule #8's otherwise-ghost data).
+        for ns in &self.plugin_namespaces {
+            let name = format!("[{}] {}", ns.kind, ns.id);
+            let bridge_names: Vec<&str> = ns.bridges.iter()
+                .map(|b| match b { Bridge::Class(c) => c.as_str() })
+                .collect();
+            let detail = if bridge_names.is_empty() {
+                None
+            } else {
+                Some(format!("bridges: {}", bridge_names.join(", ")))
+            };
+            out.push(OutlineSymbol {
+                name,
+                detail,
+                kind: SymKind::Namespace,
+                span: ns.decl_span,
+                selection_span: ns.decl_span,
+                children: Vec::new(),
+                handler_display: None,
+            });
+        }
+        out
     }
 
     fn outline_children_of(&self, parent_scope: ScopeId) -> Vec<OutlineSymbol> {
@@ -3090,6 +3198,12 @@ impl FileAnalysis {
                         _ => Some("handler".to_string()),
                     };
                     (sym.name.clone(), detail, Vec::new())
+                }
+                SymKind::Namespace => {
+                    // Real Namespace entries are appended by
+                    // `document_symbols` from `plugin_namespaces`,
+                    // not from the symbol table. Nothing to do here.
+                    continue;
                 }
             };
 
@@ -4387,6 +4501,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
         )
     }
 
@@ -4488,6 +4603,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
         );
         assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
         assert_eq!(fa.sub_return_type("nonexistent"), None);
@@ -4612,6 +4728,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
         );
 
         let mut imported = HashMap::new();

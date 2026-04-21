@@ -29,6 +29,17 @@ use super::{
 pub fn make_engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(64, 64);
+    // Kill switch: a runaway Rhai script (infinite loop, stuck on a bad
+    // input) would otherwise hang the LSP build thread indefinitely.
+    // 1M operations is comfortably more than any sensible plugin hook
+    // needs (emit hooks top out in the hundreds; query hooks lower) and
+    // low enough to bail in well under a second on modern hardware.
+    // Override via `PERL_LSP_RHAI_MAX_OPS` for debugging heavy plugins.
+    let max_ops: u64 = std::env::var("PERL_LSP_RHAI_MAX_OPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000);
+    engine.set_max_operations(max_ops);
 
     // Shorthand constructors for `HashKeyOwner` — Rhai scripts avoid writing
     // enum discriminants by using these helper functions.
@@ -167,7 +178,12 @@ impl RhaiPlugin {
         let v = match out {
             Ok(v) => v,
             Err(e) => {
-                log::warn!("plugin `{}`::{} failed: {}", self.id, fn_name, e);
+                // A Rhai call failure is a plugin bug (bad script, kill
+                // switch triggered, panic inside the VM) — log at
+                // ERROR, not warn. `warn!` gets filtered by default
+                // log levels and the user sees missing features with
+                // no hint.
+                log::error!("plugin `{}`::{} failed: {}", self.id, fn_name, e);
                 return None;
             }
         };
@@ -175,7 +191,7 @@ impl RhaiPlugin {
         match from_dynamic::<T>(&v) {
             Ok(parsed) => Some(parsed),
             Err(e) => {
-                log::warn!("plugin `{}`::{} bad return: {}", self.id, fn_name, e);
+                log::error!("plugin `{}`::{} bad return: {}", self.id, fn_name, e);
                 None
             }
         }
@@ -187,7 +203,7 @@ impl RhaiPlugin {
         let arr = match out {
             Ok(a) => a,
             Err(e) => {
-                log::warn!("plugin `{}`::{} failed: {}", self.id, fn_name, e);
+                log::error!("plugin `{}`::{} failed: {}", self.id, fn_name, e);
                 return Vec::new();
             }
         };
@@ -195,7 +211,7 @@ impl RhaiPlugin {
             .filter_map(|d| {
                 from_dynamic::<EmitAction>(&d)
                     .map_err(|e| {
-                        log::warn!(
+                        log::error!(
                             "plugin `{}`::{} bad emission: {}",
                             self.id,
                             fn_name,

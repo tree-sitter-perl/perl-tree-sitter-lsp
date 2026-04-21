@@ -240,6 +240,48 @@ Fix: `on_completion` hook returns the task-names list directly;
 core suppresses the normal method-of-receiver completion path when
 the plugin claims this arg slot.
 
+## Rhai scripting gotchas
+
+Plugins are written in Rhai (see `frameworks/*.rhai`). A few tripwires
+that aren't obvious until you hit them:
+
+### Reserved keywords as field names
+
+Rhai reserves a set of keywords. Any context field whose name collides
+with one of them can't be accessed with the usual `ctx.field` syntax —
+Rhai parses `ctx.call` as a method call on `ctx`, not a field read.
+Worse, some keyword collisions surface as cryptic parse errors instead
+of "reserved word" diagnostics.
+
+**Workarounds:**
+
+1. Read with bracket syntax: `let cf = ctx["call"];` — this is what
+   every bundled plugin uses for `call`.
+2. When BUILDING a map for emission, use bracket-insert for reserved
+   keys: `let m = #{}; m["package"] = "Minion"; m["name"] = "enqueue";`
+   — direct `#{ package: "Minion" }` fails to parse.
+
+**Known collisions as of this writing:** `call`, `package`, `fn`, `let`,
+`if`, `for`, `while`, `return`, `switch`, `loop`, `break`, `continue`,
+`throw`, `try`, `catch`, `import`, `export`, `as`, `in`, `is`, `this`,
+`const`, `private`, `public`. Check `rhai::tokenizer::is_reserved_keyword`
+before introducing a new field name.
+
+### Rhai kill switch
+
+`make_engine()` sets `max_operations = 1_000_000` (overridable via
+`PERL_LSP_RHAI_MAX_OPS`). A runaway loop bails instead of hanging the
+build thread. Third-party plugins under `PERL_LSP_PLUGIN_DIR` get the
+same limit — no trust boundary between bundled and user scripts.
+
+### Errors are logged, not raised
+
+`RhaiPlugin::dispatch` and `call_opt_map` log failures at `log::error!`
+and return empty results. A plugin bug (bad emission shape, Rhai parse
+error, kill-switch trigger) drops the emission silently — the user
+sees "my helpers aren't registering" with no panic. `RUST_LOG=error`
+surfaces these during development.
+
 ## Open questions for next time
 
 - Bridge resolution order: when a plugin namespace's bridge matches a

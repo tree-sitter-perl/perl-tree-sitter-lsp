@@ -512,14 +512,23 @@ fn first_arg_as_string(args: Node, source: &[u8]) -> Option<String> {
     } else {
         args
     };
-    let text = first.utf8_text(source).ok()?;
     match first.kind() {
-        "string_literal" | "interpolated_string_literal" => Some(
-            text.trim_start_matches(['\'', '"'])
-                .trim_end_matches(['\'', '"'])
-                .to_string(),
-        ),
-        "bareword" => Some(text.to_string()),
+        "string_literal" | "interpolated_string_literal" => {
+            // Pull the `string_content` child — quote-flavor-agnostic
+            // (q{}, qq{}, heredocs, '' vs "") and avoids the
+            // trim-delimiters brittleness.
+            for i in 0..first.named_child_count() {
+                if let Some(child) = first.named_child(i) {
+                    if child.kind() == "string_content" {
+                        return child.utf8_text(source).ok().map(|s| s.to_string());
+                    }
+                }
+            }
+            Some(String::new())
+        }
+        "bareword" | "autoquoted_bareword" => {
+            first.utf8_text(source).ok().map(|s| s.to_string())
+        }
         _ => None,
     }
 }
@@ -862,6 +871,147 @@ fn extract_key_text(node: Node, source: &[u8]) -> Option<String> {
         "string_content" => node.utf8_text(source).ok().map(|s| s.to_string()),
         _ => None, // dynamic keys — don't include
     }
+}
+
+// ---- Plugin query-hook context ----
+
+/// Build the `SigHelpQueryContext` / `CompletionQueryContext` a plugin
+/// query hook consumes. Extracts the innermost call at the cursor, the
+/// innermost nested container (array/hash), and the enclosing package.
+/// Returns `None` when no enclosing call exists and no plugin could
+/// plausibly claim the slot.
+///
+/// Lives in cursor_context.rs (rule #6 — this is cursor-position
+/// analysis) so the plugin hook wiring in symbols.rs stays an adapter
+/// and doesn't walk the tree directly (rule #3).
+pub fn build_plugin_query_context(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &[u8],
+    point: Point,
+) -> Option<crate::plugin::SigHelpQueryContext> {
+    use crate::plugin::{CallFrame, ContainerFrame, ContainerKind, SigHelpQueryContext};
+
+    let call_ctx = find_call_context(tree, source, point);
+    let call = call_ctx.as_ref().map(|c| {
+        // Minimal arg list: just the first positional as a folded string
+        // when available. Dispatcher plugins (Minion, mojo-events) need
+        // the task / event name to look up the right Handler. We don't
+        // walk the full arg list here — that would duplicate the
+        // builder's extraction at cursor time, and plugins that need
+        // more can request richer context via a future extension.
+        let args = match c.first_arg_string.as_ref() {
+            Some(s) => vec![crate::plugin::ArgInfo {
+                text: s.clone(),
+                string_value: Some(s.clone()),
+                span: crate::file_analysis::Span {
+                    start: point,
+                    end: point,
+                },
+                inferred_type: Some(InferredType::String),
+                sub_params: Vec::new(),
+            }],
+            None => Vec::new(),
+        };
+        CallFrame {
+            is_method: c.is_method,
+            name: c.name.clone(),
+            receiver_text: c.invocant.clone(),
+            receiver_type: c.invocant.as_deref()
+                .and_then(|inv| analysis.invocant_text_to_class(Some(inv), point))
+                .map(InferredType::ClassName),
+            args,
+            cursor_arg_index: c.active_param,
+        }
+    });
+
+    // Innermost nested container: walk up from cursor to find the
+    // first anonymous_array_expression or anonymous_hash_expression
+    // before we exit the enclosing call.
+    let container = {
+        let mut n = tree.root_node().descendant_for_point_range(point, point);
+        let mut found: Option<ContainerFrame> = None;
+        while let Some(node) = n {
+            match node.kind() {
+                "anonymous_array_expression" => {
+                    found = Some(ContainerFrame {
+                        kind: ContainerKind::Array,
+                        active_slot: count_commas_inside_node(node, source, point),
+                        existing_keys: Vec::new(),
+                    });
+                    break;
+                }
+                "anonymous_hash_expression" => {
+                    let used = used_keys_in_enclosing_hash(tree, source, point);
+                    found = Some(ContainerFrame {
+                        kind: ContainerKind::Hash,
+                        active_slot: count_commas_inside_node(node, source, point),
+                        existing_keys: used.into_iter().collect(),
+                    });
+                    break;
+                }
+                "method_call_expression" | "function_call_expression"
+                | "ambiguous_function_call_expression" => break,
+                _ => {}
+            }
+            n = node.parent();
+        }
+        found
+    };
+
+    let current_package = analysis.package_at(point).map(|s| s.to_string());
+
+    if call.is_none() && container.is_none() { return None; }
+    Some(SigHelpQueryContext { call, cursor_inside: container, current_package })
+}
+
+/// Count `,` separators inside a container node that occur before
+/// `point`. Walks ALL descendants (not just direct children) because
+/// tree-sitter-perl often wraps a container's contents in a nested
+/// `list_expression` — the commas live there, not at the top level.
+/// Skips commas nested inside another array/hash literal to keep the
+/// count scoped to THIS container's own slots.
+pub fn count_commas_inside_node(node: Node, source: &[u8], point: Point) -> usize {
+    let mut count = 0;
+    let p_pos = (point.row, point.column);
+
+    fn walk(
+        node: Node,
+        source: &[u8],
+        p_pos: (usize, usize),
+        count: &mut usize,
+        skip_root: bool,
+    ) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            let s = child.start_position();
+            if (s.row, s.column) > p_pos { break; }
+
+            // Don't descend into nested array/hash literals — their
+            // commas belong to the inner scope, not ours.
+            if !skip_root
+                && matches!(child.kind(),
+                    "anonymous_array_expression" | "anonymous_hash_expression")
+            {
+                continue;
+            }
+
+            if !child.is_named() {
+                let e = child.end_position();
+                if (e.row, e.column) > p_pos { continue; }
+                if let Ok(text) = child.utf8_text(source) {
+                    if text == "," {
+                        *count += 1;
+                    }
+                }
+            } else {
+                walk(child, source, p_pos, count, false);
+            }
+        }
+    }
+
+    walk(node, source, p_pos, &mut count, true);
+    count
 }
 
 // ---- Selection ranges (tree-based) ----
