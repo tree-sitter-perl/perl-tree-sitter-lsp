@@ -213,7 +213,19 @@ pub struct ModuleIndex {
     /// package. Without this, cross-file inheritance walks for
     /// synthesized helpers on Mojolicious::Controller miss the module
     /// that declared them.
+    ///
+    /// TODO — slated for removal once all bundled plugins emit
+    /// `PluginNamespace` with explicit `Bridge`s. At that point
+    /// `namespaces_bridged_to` covers every case that needs this
+    /// index today. See docs/prompt-plugin-architecture.md.
     class_content_index: Arc<DashMap<String, Vec<String>>>,
+    /// Class → modules declaring at least one `PluginNamespace`
+    /// whose `bridges` list contains `Bridge::Class(class)`. The
+    /// successor to `class_content_index` — explicit (plugin
+    /// declares its bridges), supports multiple instances (each
+    /// app is its own namespace), and avoids the symbol-package
+    /// inference. Queried through `namespaces_bridged_to`.
+    bridges_index: Arc<DashMap<String, Vec<String>>>,
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
     stale_modules: Arc<DashMap<String, ()>>,
@@ -265,6 +277,7 @@ impl ModuleIndex {
             cache,
             reverse_index,
             class_content_index: Arc::new(DashMap::new()),
+            bridges_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             queue,
@@ -423,6 +436,7 @@ impl ModuleIndex {
             cache: Arc::new(DashMap::new()),
             reverse_index: Arc::new(DashMap::new()),
             class_content_index: Arc::new(DashMap::new()),
+            bridges_index: Arc::new(DashMap::new()),
             stale_modules: Arc::new(DashMap::new()),
             available_modules: Arc::new(DashMap::new()),
             queue: Arc::new(ResolveQueue {
@@ -478,6 +492,7 @@ impl ModuleIndex {
             cache,
             reverse_index,
             class_content_index: Arc::new(DashMap::new()),
+            bridges_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             queue,
@@ -551,7 +566,41 @@ impl ModuleIndex {
                 }
             }
         }
+        // Bridges index: any PluginNamespace whose Bridge::Class(c)
+        // matches means this module declares a namespace reachable
+        // from class `c`. One entry per class per module (dedup).
+        let mut bridge_classes_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ns in &analysis.plugin_namespaces {
+            for bridge in &ns.bridges {
+                if let crate::file_analysis::Bridge::Class(c) = bridge {
+                    if bridge_classes_seen.insert(c.clone()) {
+                        self.bridges_index
+                            .entry(c.clone())
+                            .or_default()
+                            .push(module_name.clone());
+                    }
+                }
+            }
+        }
         self.cache.insert(module_name, Some(cached));
+    }
+
+    /// Every cached module that declares at least one `PluginNamespace`
+    /// whose `bridges` list includes `Bridge::Class(class_name)`.
+    /// Callers then pull the namespace's entities from the module's
+    /// `FileAnalysis` and iterate. Successor to
+    /// `modules_with_class_content` — explicit bridges instead of
+    /// symbol-package inference.
+    pub fn modules_bridging_to(&self, class_name: &str) -> Vec<String> {
+        match self.bridges_index.get(class_name) {
+            Some(mods) => {
+                let mut result = mods.clone();
+                result.sort();
+                result.dedup();
+                result
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Every cached module that contains at least one symbol whose

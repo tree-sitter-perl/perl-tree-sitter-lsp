@@ -8591,6 +8591,51 @@ $minion->enqueue(task_x => ['a'], { priority => 10,  });
             labels);
     }
 
+    /// mojo-helpers emits a PluginNamespace for the app, bridging to
+    /// `Mojolicious::Controller` and `Mojolicious`. Each registered
+    /// helper's name is an entity; the two fan-out Method symbols
+    /// (one per entry class) both land in the namespace via name
+    /// resolution. Multi-app workspaces get one namespace per app.
+    #[test]
+    fn mojo_helpers_emits_app_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package MyApp;
+use Mojolicious::Lite;
+my $app = Mojolicious->new;
+$app->helper(current_user => sub { my ($c) = @_; });
+$app->helper('users.create' => sub { my ($c) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n| n.plugin_id == "mojo-helpers" && n.kind == "app")
+            .expect("mojo-helpers must declare an app namespace");
+
+        // Two bridges — controller for `$c->`, Mojolicious for `$app->`.
+        assert!(ns.bridges.contains(&Bridge::Class("Mojolicious::Controller".into())),
+            "must bridge Controller; got: {:?}", ns.bridges);
+        assert!(ns.bridges.contains(&Bridge::Class("Mojolicious".into())),
+            "must bridge Mojolicious (app class); got: {:?}", ns.bridges);
+
+        // Entities cover both registered helpers, through the
+        // name-keyed resolution that expands fan-out Methods.
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        assert!(entity_names.contains(&"current_user"),
+            "simple helper must land in the namespace; got: {:?}", entity_names);
+        assert!(entity_names.contains(&"users"),
+            "dotted-helper root must land in the namespace; got: {:?}", entity_names);
+
+        // Namespace ID is stable per enclosing package — one
+        // namespace for MyApp regardless of how many helpers it
+        // registers.
+        let count = fa.plugin_namespaces.iter()
+            .filter(|n| n.plugin_id == "mojo-helpers" && n.id == ns.id)
+            .count();
+        assert_eq!(count, 1, "one namespace per app, not one per helper");
+    }
+
     /// RED — sig help at the OPTIONS hash of enqueue should show
     /// enqueue's own signature, not the task's. Currently broken:
     /// the string-dispatch sig help fires whenever the cursor is past

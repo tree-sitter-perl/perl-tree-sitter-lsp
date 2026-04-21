@@ -71,10 +71,22 @@ fn on_method_call(ctx) {
     // Mojolicious (the app class) so `$c->...` AND `$app->...` complete.
     let entry_classes = ["Mojolicious::Controller", "Mojolicious"];
 
+    // App namespace — one per current_package. Find-or-create on the
+    // core side. Bridges to both Controller (so `$c->helper` works) and
+    // Mojolicious (so `$app->helper` works). Entity names accumulate
+    // as we register more helpers on the same app.
+    let app_ns_id = if ctx.current_package == () {
+        "mojo-app:main"
+    } else {
+        "mojo-app:" + ctx.current_package
+    };
+    let app_bridges = [
+        #{ Class: "Mojolicious::Controller" },
+        #{ Class: "Mojolicious" },
+    ];
+
     if segments.len() == 1 {
-        // Simple helper: Method on each entry class. `hide_in_outline`
-        // keeps the user's outline focused on their actual code —
-        // helpers exist at their call sites, not as top-level symbols.
+        // Simple helper: Method on each entry class.
         for entry in entry_classes {
             out += #{
                 Method: #{
@@ -91,6 +103,18 @@ fn on_method_call(ctx) {
                 }
             };
         }
+        // Register the helper into the app namespace. Fan-out on two
+        // classes means TWO Symbols share the same name; both land as
+        // namespace entities via the name-keyed resolution.
+        out += #{
+            PluginNamespace: #{
+                id: app_ns_id,
+                kind: "app",
+                bridges: app_bridges,
+                entity_names: [name],
+                decl_span: ctx.call_span,
+            }
+        };
         // Anchor a MethodCallRef at the name span so gr/hover on the
         // helper name land on the synthesized Method — otherwise
         // ref_at returns the outer `$app->helper(...)` call's ref
@@ -179,11 +203,24 @@ fn on_method_call(ctx) {
         }
     };
 
+    // Register the chain's root into the app namespace. The root is
+    // the first segment — the thing you reach from Perl-space. The
+    // chain's proxy classes (and the leaf on its innermost proxy) are
+    // regular Methods on their respective classes, resolved through
+    // normal chain resolution once you're past the first hop.
+    out += #{
+        PluginNamespace: #{
+            id: app_ns_id,
+            kind: "app",
+            bridges: app_bridges,
+            entity_names: [first_seg],
+            decl_span: ctx.call_span,
+        }
+    };
+
     // Anchor a MethodCallRef at the name span so gr/hover on the
     // helper name land on the synthesized Method — not on the
-    // enclosing `$app->helper(...)` call's method ref. Without this,
-    // `ref_at` falls through to the outer MethodCall (target: `helper`),
-    // which is why "gr on current_user shows every $app->helper site".
+    // enclosing `$app->helper(...)` call's method ref.
     out += #{
         MethodCallRef: #{
             method_name: leaf,
