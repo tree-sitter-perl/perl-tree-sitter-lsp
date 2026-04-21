@@ -8354,11 +8354,35 @@ sub new {
             "events stay EVENT — the one LSP kind that fits");
     }
 
-    /// Test 2 — arrayref sig help, through the REAL LSP pipeline.
-    /// `active_parameter` counts within the arrayref, not the outer
-    /// enqueue call. Label is the task's sig, not enqueue's.
+    /// Sanity: the minion plugin's Handler actually carries
+    /// args_in_arrayref_at=Some(1). If this regresses, sig help
+    /// has no chance of finding the arrayref-shape match.
     #[test]
-    fn enqueue_arrayref_sig_help_active_param_is_local_to_arrayref() {
+    fn minion_handler_has_args_in_arrayref_at_set() {
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job, $to) = @_; });
+"#;
+        let fa = build_fa(src);
+        let h = fa.symbols.iter()
+            .find(|s| s.kind == SymKind::Handler && s.name == "send_email")
+            .expect("handler exists");
+        let SymbolDetail::Handler { args_in_arrayref_at, .. } = h.detail else {
+            panic!("detail shape");
+        };
+        assert_eq!(args_in_arrayref_at, Some(1),
+            "plugin must declare args_in_arrayref_at: 1 for enqueue-shape dispatchers");
+    }
+
+    /// Test 2 — arrayref sig help, through the REAL LSP pipeline.
+    /// Cursor sits INSIDE the middle string literal `'hi'` — the
+    /// shape a user actually produces in nvim. active_parameter must
+    /// be 1 (= $subject). Earlier version of this test used a
+    /// cursor-right-after-comma position that nobody types at, and
+    /// passed while the real nvim experience was broken.
+    #[test]
+    fn enqueue_arrayref_sig_help_active_param_inside_string() {
         use tower_lsp::lsp_types::Position;
         use tree_sitter::Parser;
 
@@ -8368,37 +8392,79 @@ my $minion = Minion->new;
 $minion->add_task(send_email => sub {
     my ($job, $to, $subject, $body) = @_;
 });
-$minion->enqueue(send_email => ['alice', 'hi', ]);
+$minion->enqueue(send_email => ['alice', 'hi', 'body']);
 "#;
         let fa = build_fa(src);
         let mut parser = Parser::new();
         parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
         let tree = parser.parse(src, None).unwrap();
 
-        // Cursor AFTER the second comma inside the arrayref — expected
-        // active_param = 2 (zero-indexed: the slot for $body).
-        let anchor = "'alice', 'hi', ";
-        let (row, col) = src.lines().enumerate()
-            .find_map(|(r, l)| l.find(anchor).map(|c| (r, c + anchor.len())))
-            .expect("anchor in source");
-        let pos = Position { line: row as u32, character: col as u32 };
+        // Cursor between `h` and `i` of `'hi'` — the middle slot of
+        // the arrayref, which is $subject.
+        let line_idx = src.lines().position(|l| l.contains("enqueue(send_email"))
+            .expect("enqueue line present");
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("'hi'").unwrap() + 2; // between h and i
+        let pos = Position { line: line_idx as u32, character: col as u32 };
 
         let idx = crate::module_index::ModuleIndex::new_for_test();
         let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
-            .expect("sig help must fire inside enqueue's arrayref");
+            .expect("sig help must fire inside a string-literal arrayref arg");
 
         let info = &sig.signatures[0];
         assert!(info.label.contains("send_email"),
-            "label must reference the task, not enqueue; got: {:?}", info.label);
-        assert!(info.label.contains("$body"),
-            "label must surface the task's params; got: {:?}", info.label);
-        assert_eq!(sig.active_parameter, Some(2),
-            "active_parameter must be scoped to the arrayref (2 = $body), \
-             not the outer enqueue call; got: {:?}", sig.active_parameter);
+            "label references the task, not enqueue; got: {:?}", info.label);
+        assert!(info.label.contains("$subject"),
+            "label surfaces the task's params; got: {:?}", info.label);
+        assert_eq!(sig.active_parameter, Some(1),
+            "cursor inside `'hi'` → $subject (index 1), NOT $to. \
+             If you see 0 here, sig help isn't recognizing it's inside \
+             the arrayref at slot 1; got: {:?}", sig.active_parameter);
     }
 
-    /// Test 3a — hash-key completion on an empty enqueue options hash.
-    /// Real pipeline (completion_items), not the internal fn.
+    /// Sig help must also land on the LAST arrayref slot when the
+    /// cursor is inside its string literal. Pinned separately from
+    /// the middle-slot test because count_commas can off-by-one on
+    /// the last slot if the walker breaks wrong.
+    #[test]
+    fn enqueue_arrayref_sig_help_active_param_inside_last_string() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject, $body) = @_;
+});
+$minion->enqueue(send_email => ['alice', 'hi', 'body']);
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let line_idx = src.lines().position(|l| l.contains("enqueue(send_email"))
+            .unwrap();
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("'body'").unwrap() + 3; // inside "body"
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
+            .expect("sig help fires inside the last string too");
+
+        assert_eq!(sig.active_parameter, Some(2),
+            "cursor inside `'body'` → $body (index 2); got: {:?}",
+            sig.active_parameter);
+    }
+
+    /// Test 3a — hash-key completion on an empty enqueue options hash
+    /// in a file that ALSO has a matching add_task. The earlier
+    /// version of this test used an enqueue for an unknown task name,
+    /// which accidentally sidestepped the dispatch-args short-circuit
+    /// — nvim's real experience (task registered, enqueue at 3rd arg)
+    /// was silently broken. Pin the real shape.
     #[test]
     fn enqueue_options_hash_completion_empty() {
         use tower_lsp::lsp_types::Position;
@@ -8407,6 +8473,7 @@ $minion->enqueue(send_email => ['alice', 'hi', ]);
         let src = r#"package MyApp;
 use Minion;
 my $minion = Minion->new;
+$minion->add_task(task_x => sub { my ($job, $a) = @_; });
 $minion->enqueue(task_x => ['a'], {  });
 "#;
         let fa = build_fa(src);
@@ -8414,11 +8481,14 @@ $minion->enqueue(task_x => ['a'], {  });
         parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
         let tree = parser.parse(src, None).unwrap();
 
-        let anchor = "{ ";
-        let (row, col) = src.lines().enumerate()
-            .find_map(|(r, l)| l.find(anchor).map(|c| (r, c + anchor.len())))
-            .unwrap();
-        let pos = Position { line: row as u32, character: col as u32 };
+        // Cursor inside the enqueue options hash — `{  }` on the
+        // enqueue line. Can't just search for "{ " globally because
+        // the sub body `sub { my ($job` matches first.
+        let line_idx = src.lines().position(|l| l.contains("enqueue(task_x"))
+            .expect("enqueue line");
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("{  }").unwrap() + 2; // halfway between `{` and `}`
+        let pos = Position { line: line_idx as u32, character: col as u32 };
 
         let idx = crate::module_index::ModuleIndex::new_for_test();
         let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
@@ -8432,6 +8502,8 @@ $minion->enqueue(task_x => ['a'], {  });
 
     /// Test 3b — with an existing key in the hash, it must NOT be
     /// offered again; the rest of the options must still appear.
+    /// Same task-registered shape as 3a so the dispatch-args
+    /// short-circuit IS active and gets properly bypassed on HashKey.
     #[test]
     fn enqueue_options_hash_completion_with_existing_keys() {
         use tower_lsp::lsp_types::Position;
@@ -8440,6 +8512,7 @@ $minion->enqueue(task_x => ['a'], {  });
         let src = r#"package MyApp;
 use Minion;
 my $minion = Minion->new;
+$minion->add_task(task_x => sub { my ($job, $a) = @_; });
 $minion->enqueue(task_x => ['a'], { priority => 10,  });
 "#;
         let fa = build_fa(src);
@@ -8447,11 +8520,13 @@ $minion->enqueue(task_x => ['a'], { priority => 10,  });
         parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
         let tree = parser.parse(src, None).unwrap();
 
-        let anchor = "priority => 10, ";
-        let (row, col) = src.lines().enumerate()
-            .find_map(|(r, l)| l.find(anchor).map(|c| (r, c + anchor.len())))
-            .unwrap();
-        let pos = Position { line: row as u32, character: col as u32 };
+        // Scope the anchor to the enqueue line so the sub body's own
+        // brace/comma pattern doesn't claim the match first.
+        let line_idx = src.lines().position(|l| l.contains("enqueue(task_x"))
+            .expect("enqueue line");
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("priority => 10, ").unwrap() + "priority => 10, ".len();
+        let pos = Position { line: line_idx as u32, character: col as u32 };
 
         let idx = crate::module_index::ModuleIndex::new_for_test();
         let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);

@@ -466,11 +466,20 @@ pub fn completion_items(
                     tree,
                 ));
                 suppress_firehose = true;
-            } else if call_ctx.active_param > 0 && has_any_handlers {
+            } else if call_ctx.active_param > 0 && has_any_handlers
+                && !matches!(ctx, CursorContext::HashKey { .. })
+            {
                 // Past arg-0 in a known dispatcher: the only sensible
                 // completion is variables-in-scope (candidates for
                 // passing as the next arg). Sig help handles shape
                 // guidance. Short-circuit the context match entirely.
+                //
+                // EXCEPT when the cursor is sitting inside a nested
+                // hash literal — that's a HashKey context and the
+                // callee (or a plugin) has real keys to offer for it
+                // (Minion's `enqueue(..., [...], { | })` options).
+                // Skipping the short-circuit there lets the HashKey
+                // match run and populate `priority`/`queue`/etc.
                 let vars_only: Vec<CompletionCandidate> = analysis.complete_general(point)
                     .into_iter()
                     .filter(|c| matches!(c.kind, FaSymKind::Variable | FaSymKind::Field))
@@ -1124,6 +1133,13 @@ fn dispatch_info_for_enclosing_arrayref_call(
 /// `list_expression` — the commas live there, not at the top level.
 /// Skips commas nested inside another array/hash literal to keep the
 /// count scoped to THIS container's own slots.
+///
+/// Loop break uses the child's START position, not its end — a
+/// wrapping `list_expression` starts BEFORE the cursor and ends AFTER
+/// it (the cursor lives inside one of its elements), so we still
+/// need to descend to count the commas before the cursor. Leaf
+/// tokens (`,`, `[`, `=>`, …) only count when their end is also
+/// before the cursor, guarding against the cursor sitting mid-token.
 fn count_commas_inside_node(node: tree_sitter::Node, source: &[u8], point: Point) -> usize {
     let mut count = 0;
     let p_pos = (point.row, point.column);
@@ -1137,8 +1153,8 @@ fn count_commas_inside_node(node: tree_sitter::Node, source: &[u8], point: Point
     ) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            let e = child.end_position();
-            if (e.row, e.column) > p_pos { break; }
+            let s = child.start_position();
+            if (s.row, s.column) > p_pos { break; }
 
             // Don't descend into nested array/hash literals — their
             // commas belong to the inner scope, not ours.
@@ -1150,6 +1166,8 @@ fn count_commas_inside_node(node: tree_sitter::Node, source: &[u8], point: Point
             }
 
             if !child.is_named() {
+                let e = child.end_position();
+                if (e.row, e.column) > p_pos { continue; }
                 if let Ok(text) = child.utf8_text(source) {
                     if text == "," {
                         *count += 1;
@@ -1157,8 +1175,8 @@ fn count_commas_inside_node(node: tree_sitter::Node, source: &[u8], point: Point
                 }
             } else {
                 // Descend through wrappers (list_expression,
-                // parenthesized_expression, etc.) but never the
-                // nested-literal boundaries filtered above.
+                // parenthesized_expression, etc.); a named node that
+                // SPANS the cursor still hosts commas before it.
                 walk(child, source, p_pos, count, false);
             }
         }
