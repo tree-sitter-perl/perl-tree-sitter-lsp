@@ -205,26 +205,13 @@ pub struct ModuleIndex {
     /// of reinventing per-feature cache walks. Different features
     /// apply their own override / stacking rules on top.
     reverse_index: Arc<DashMap<String, Vec<String>>>,
-    /// Class → modules that contain ANY symbol whose `package` field
-    /// equals that class. Complements `reverse_index` (which is
-    /// name-keyed) for the "find methods on class X" query — plugins
-    /// can emit methods on another class via `on_class` override, so
-    /// the method's `package` doesn't match its file's primary
-    /// package. Without this, cross-file inheritance walks for
-    /// synthesized helpers on Mojolicious::Controller miss the module
-    /// that declared them.
-    ///
-    /// TODO — slated for removal once all bundled plugins emit
-    /// `PluginNamespace` with explicit `Bridge`s. At that point
-    /// `namespaces_bridged_to` covers every case that needs this
-    /// index today. See docs/prompt-plugin-architecture.md.
-    class_content_index: Arc<DashMap<String, Vec<String>>>,
     /// Class → modules declaring at least one `PluginNamespace`
     /// whose `bridges` list contains `Bridge::Class(class)`. The
-    /// successor to `class_content_index` — explicit (plugin
-    /// declares its bridges), supports multiple instances (each
-    /// app is its own namespace), and avoids the symbol-package
-    /// inference. Queried through `namespaces_bridged_to`.
+    /// one reverse index for plugin-synthesized content — explicit
+    /// (plugin declares its bridges), supports multiple instances
+    /// (each app is its own namespace), and avoids the inferred
+    /// "any symbol with this package" variant that used to live
+    /// alongside this one. Queried through `for_each_entity_bridged_to`.
     bridges_index: Arc<DashMap<String, Vec<String>>>,
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
@@ -275,9 +262,7 @@ impl ModuleIndex {
 
         ModuleIndex {
             cache,
-            reverse_index,
-            class_content_index: Arc::new(DashMap::new()),
-            bridges_index: Arc::new(DashMap::new()),
+            reverse_index,            bridges_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             queue,
@@ -434,9 +419,7 @@ impl ModuleIndex {
     pub fn new_for_cli() -> Self {
         ModuleIndex {
             cache: Arc::new(DashMap::new()),
-            reverse_index: Arc::new(DashMap::new()),
-            class_content_index: Arc::new(DashMap::new()),
-            bridges_index: Arc::new(DashMap::new()),
+            reverse_index: Arc::new(DashMap::new()),            bridges_index: Arc::new(DashMap::new()),
             stale_modules: Arc::new(DashMap::new()),
             available_modules: Arc::new(DashMap::new()),
             queue: Arc::new(ResolveQueue {
@@ -490,9 +473,7 @@ impl ModuleIndex {
 
         ModuleIndex {
             cache,
-            reverse_index,
-            class_content_index: Arc::new(DashMap::new()),
-            bridges_index: Arc::new(DashMap::new()),
+            reverse_index,            bridges_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             queue,
@@ -550,22 +531,8 @@ impl ModuleIndex {
                     .or_default()
                     .push(module_name.clone());
             }
-            // Class-content index: for every method/sub with a package
-            // field, note that this module has content on that class.
-            // Critical for plugin-emitted methods with `on_class` override
-            // — a helper's `package` can differ from its file's primary
-            // package, so the normal `get_cached(class)` lookup misses.
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Handler) {
-                if let Some(ref pkg) = sym.package {
-                    if classes_seen.insert(pkg.clone()) {
-                        self.class_content_index
-                            .entry(pkg.clone())
-                            .or_default()
-                            .push(module_name.clone());
-                    }
-                }
-            }
         }
+        let _ = classes_seen;
         // Bridges index: any PluginNamespace whose Bridge::Class(c)
         // matches means this module declares a namespace reachable
         // from class `c`. One entry per class per module (dedup).
@@ -603,20 +570,37 @@ impl ModuleIndex {
         }
     }
 
-    /// Every cached module that contains at least one symbol whose
-    /// `package` field equals `class_name`. Used by method-completion's
-    /// cross-file walk to find modules that synthesize methods onto
-    /// external classes (Mojo helpers, Catalyst attribute handlers,
-    /// DBIC relationship chains, etc.).
-    pub fn modules_with_class_content(&self, class_name: &str) -> Vec<String> {
-        match self.class_content_index.get(class_name) {
-            Some(mods) => {
-                let mut result = mods.clone();
-                result.sort();
-                result.dedup();
-                result
+    /// Run a closure on every `Symbol` reachable from `class_name`
+    /// through a plugin bridge. The namespace-wide `Bridge::Class(X)`
+    /// identifies which namespaces to walk; per-entity `package`
+    /// narrows to "this entity is bound on class X specifically".
+    /// Lets one namespace span multiple classes (Mojo helpers on
+    /// both Controller and Mojolicious, plus each proxy class in a
+    /// dotted chain) without every entity being visible on every
+    /// bridged class.
+    ///
+    /// Single source of truth for plugin-synthesized entity lookup
+    /// across files. Replaces the former `modules_with_class_content`
+    /// / per-caller symbol.package scan that kept getting forgotten
+    /// by new features.
+    pub fn for_each_entity_bridged_to(
+        &self,
+        class_name: &str,
+        mut visit: impl FnMut(&Arc<CachedModule>, &crate::file_analysis::Symbol),
+    ) {
+        for mod_name in self.modules_bridging_to(class_name) {
+            let Some(cached) = self.get_cached(&mod_name) else { continue };
+            for ns in &cached.analysis.plugin_namespaces {
+                let bridges_class = ns.bridges.iter().any(|b|
+                    matches!(b, crate::file_analysis::Bridge::Class(c) if c == class_name));
+                if !bridges_class { continue; }
+                for sym_id in &ns.entities {
+                    let idx = sym_id.0 as usize;
+                    let Some(sym) = cached.analysis.symbols.get(idx) else { continue };
+                    if sym.package.as_deref() != Some(class_name) { continue; }
+                    visit(&cached, sym);
+                }
             }
-            None => Vec::new(),
         }
     }
 

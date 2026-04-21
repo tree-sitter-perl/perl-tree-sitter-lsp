@@ -7779,11 +7779,11 @@ use parent 'Mojolicious::Controller';
             lite_fa.clone(),
         );
 
-        // class_content_index knows MyApp.pm hosts synthesized Methods
-        // on Mojolicious::Controller.
-        let mods = idx.modules_with_class_content("Mojolicious::Controller");
+        // bridges_index knows MyApp.pm declares a namespace bridged to
+        // Mojolicious::Controller (mojo-helpers' app namespace).
+        let mods = idx.modules_bridging_to("Mojolicious::Controller");
         assert!(mods.iter().any(|m| m == "MyApp"),
-            "MyApp module should be listed as content-holder for \
+            "MyApp module should be listed as bridged to \
              Mojolicious::Controller; got: {:?}", mods);
 
         // Completion on MyApp::Controller::Home inheriting from
@@ -8156,15 +8156,17 @@ sub session { my ($self, $key) = @_; }
             ctrl_fa,
         );
 
-        // The workspace knows the Lite file hosts Controller content.
-        let mods = idx.modules_with_class_content("Mojolicious::Controller");
+        // The workspace knows the Lite file declares a namespace
+        // bridged to Mojolicious::Controller (the mojo-helpers app
+        // namespace emits `Bridge::Class("Mojolicious::Controller")`).
+        let mods = idx.modules_bridging_to("Mojolicious::Controller");
         assert!(mods.iter().any(|m| m == "MyApp"),
-            "workspace index must list MyApp.pm under Controller content-holders; got: {:?}",
+            "workspace index must list MyApp.pm bridged to Controller; got: {:?}",
             mods);
 
         // Part 1: `$c->` completion in Users.pm surfaces both the
         // inherited native methods AND the plugin-emitted helpers
-        // (cross-file, via Controller → modules_with_class_content).
+        // (cross-file, via the app namespace's Class(Controller) bridge).
         let pos = |row: u32, col: u32| Position { line: row, character: col };
         let call_label_set = |items: &[tower_lsp::lsp_types::CompletionItem]| -> Vec<String> {
             items.iter().map(|it| it.label.clone()).collect()

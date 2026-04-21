@@ -1524,23 +1524,22 @@ impl FileAnalysis {
                                 .or_else(|| sub.return_type().cloned());
                         }
                     }
-                    // Plugin-emitted path: method packaged on `class`
-                    // but declared in another module (helper chain
-                    // roots, DBIC relationship accessors emitted from
-                    // the resultset, etc.). Find the symbol whose
-                    // package == class and read its return_type.
-                    for mod_name in idx.modules_with_class_content(class) {
-                        let Some(cached) = idx.get_cached(&mod_name) else { continue };
-                        for sym in &cached.analysis.symbols {
-                            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                            if sym.package.as_deref() != Some(class.as_str()) { continue; }
-                            if sym.name != method_name { continue; }
-                            if let SymbolDetail::Sub { return_type, .. } = &sym.detail {
-                                return return_type.clone();
-                            }
+                    // Plugin-emitted path: method reachable from `class`
+                    // through a PluginNamespace bridge but declared in
+                    // another module (helper chain roots, DBIC
+                    // relationship accessors emitted from the resultset,
+                    // etc.). Walk the namespace entities, not the raw
+                    // symbol table — that's what explicit bridges buy us.
+                    let mut found: Option<InferredType> = None;
+                    idx.for_each_entity_bridged_to(class, |_cached, sym| {
+                        if found.is_some() { return; }
+                        if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
+                        if sym.name != method_name { return; }
+                        if let SymbolDetail::Sub { return_type, .. } = &sym.detail {
+                            found = return_type.clone();
                         }
-                    }
-                    None
+                    });
+                    found
                 })
             }
             None => None,
@@ -1660,18 +1659,16 @@ impl FileAnalysis {
             return true;
         }
         let Some(idx) = module_index else { return false };
-        for mod_name in idx.modules_with_class_content(class_name) {
-            let Some(cached) = idx.get_cached(&mod_name) else { continue };
-            for sym in &cached.analysis.symbols {
-                if sym.name != method_name { continue; }
-                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                if sym.package.as_deref() != Some(class_name) { continue; }
-                if matches!(&sym.detail, SymbolDetail::Sub { opaque_return: true, .. }) {
-                    return true;
-                }
+        let mut found = false;
+        idx.for_each_entity_bridged_to(class_name, |_cached, sym| {
+            if found { return; }
+            if sym.name != method_name { return; }
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
+            if matches!(&sym.detail, SymbolDetail::Sub { opaque_return: true, .. }) {
+                found = true;
             }
-        }
-        false
+        });
+        found
     }
 
     /// Complete methods for a known class name, walking the inheritance chain.
@@ -1751,37 +1748,57 @@ impl FileAnalysis {
 
         // Walk cross-file parents
         if let Some(idx) = module_index {
-            // Gather candidate modules two ways:
-            //   (1) cached under `class_name` itself — the usual
-            //       "there's a module whose package IS this class"
-            //   (2) any module that has content attributed to this
-            //       class (plugin-synthesized methods with on_class
-            //       override: helpers on Mojolicious::Controller
-            //       declared from a Lite script whose primary
-            //       package is MyApp, etc.).
-            // Walk each, dedup by (symbol name).
-            let mut modules_to_scan: Vec<String> = idx.modules_with_class_content(class_name);
-            if !modules_to_scan.iter().any(|m| m == class_name) {
-                // ensure `class_name` itself is included if cached
-                if idx.get_cached(class_name).is_some() {
-                    modules_to_scan.push(class_name.to_string());
-                }
+            // Two sources of candidates:
+            //   (1) Plugin entities reached through bridges (helpers,
+            //       routes, tasks, etc. — explicit `Bridge::Class(X)`
+            //       declarations from PluginNamespaces across the
+            //       workspace).
+            //   (2) The cached module whose primary package IS
+            //       class_name (real CPAN/user-defined methods on the
+            //       class itself).
+            // Collect into a temporary list to avoid borrow-checker
+            // issues with the closure capturing &mut seen_names/candidates.
+            let mut bridged: Vec<(String, SymKind, Option<SymbolDetail>, Option<InferredType>)> = Vec::new();
+            idx.for_each_entity_bridged_to(class_name, |_cached, sym| {
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
+                let rt = if let SymbolDetail::Sub { return_type, .. } = &sym.detail {
+                    return_type.clone()
+                } else { None };
+                let _ = rt; // Ownership: we push a Sub detail below and read its return_type
+                bridged.push((
+                    sym.name.clone(),
+                    sym.kind,
+                    Some(sym.detail.clone()),
+                    None,
+                ));
+            });
+            for (name, kind, detail, _rt) in bridged {
+                if seen_names.contains(&name) { continue; }
+                seen_names.insert(name.clone());
+                let is_method = kind == SymKind::Method
+                    || matches!(detail, Some(SymbolDetail::Sub { is_method: true, .. }));
+                let kind = if is_method { SymKind::Method } else { SymKind::Sub };
+                let defining = if class_name != original_class { Some(class_name) } else { None };
+                let method_detail_str = self.method_detail(original_class, &name, defining, module_index);
+                let display_override = detail.as_ref()
+                    .map(|d| sub_display_override(d))
+                    .unwrap_or(None);
+                candidates.push(CompletionCandidate {
+                    label: name,
+                    kind,
+                    detail: Some(method_detail_str),
+                    insert_text: None,
+                    sort_priority: PRIORITY_LOCAL,
+                    additional_edits: vec![],
+                    display_override,
+                });
             }
-            for mod_name in modules_to_scan {
-                let Some(cached) = idx.get_cached(&mod_name) else { continue };
+            // (2) Real methods on class_name's own cached module.
+            if let Some(cached) = idx.get_cached(class_name) {
                 for sym in &cached.analysis.symbols {
-                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                        continue;
-                    }
-                    // For plugin-emitted methods with on_class, the
-                    // `package` is the target class. For the usual
-                    // same-package methods, `package` equals the
-                    // module's primary package which IS class_name.
-                    let pkg_match = sym.package.as_deref() == Some(class_name);
-                    if !pkg_match { continue; }
-                    if seen_names.contains(&sym.name) {
-                        continue;
-                    }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                    if sym.package.as_deref() != Some(class_name) { continue; }
+                    if seen_names.contains(&sym.name) { continue; }
                     seen_names.insert(sym.name.clone());
                     let is_method = sym.kind == SymKind::Method
                         || matches!(sym.detail, SymbolDetail::Sub { is_method: true, .. });
@@ -2674,16 +2691,17 @@ impl FileAnalysis {
             // every consumer file, and the same gap feeds the
             // unresolved-function diagnostic for helper call sites.
             // Mirrors what collect_ancestor_methods already does.
-            for mod_name in idx.modules_with_class_content(class_name) {
-                let Some(cached) = idx.get_cached(&mod_name) else { continue };
-                for sym in &cached.analysis.symbols {
-                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                    if sym.package.as_deref() != Some(class_name) { continue; }
-                    if sym.name != method_name { continue; }
-                    return Some(MethodResolution::CrossFile {
-                        class: class_name.to_string(),
-                    });
-                }
+            let mut bridged_hit = false;
+            idx.for_each_entity_bridged_to(class_name, |_cached, sym| {
+                if bridged_hit { return; }
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
+                if sym.name != method_name { return; }
+                bridged_hit = true;
+            });
+            if bridged_hit {
+                return Some(MethodResolution::CrossFile {
+                    class: class_name.to_string(),
+                });
             }
             // Walk cross-file parent chain
             let cross_parents = idx.parents_cached(class_name);

@@ -203,17 +203,30 @@ fn on_method_call(ctx) {
         }
     };
 
-    // Register the chain's root into the app namespace. The root is
-    // the first segment — the thing you reach from Perl-space. The
-    // chain's proxy classes (and the leaf on its innermost proxy) are
-    // regular Methods on their respective classes, resolved through
-    // normal chain resolution once you're past the first hop.
+    // Register the full chain into the app namespace. Every proxy
+    // class the chain walks through gets its own Bridge::Class so
+    // lookups "find methods on _Helper::admin" hit the namespace
+    // directly — no class_content_index fallback needed.
+    let chain_bridges = app_bridges;
+    let chain_entity_names = [first_seg];
+    // Walk the proxy classes we just emitted Methods onto: first_proxy
+    // holds the first segment's target, then each intermediate seg's
+    // proxy_path, plus the innermost owner_class for the leaf.
+    chain_bridges.push(#{ Class: first_proxy });
+    let proxy_walk = first_proxy;
+    for i in 1..(n - 1) {
+        proxy_walk = proxy_walk + "::" + segments[i];
+        chain_bridges.push(#{ Class: proxy_walk });
+        chain_entity_names.push(segments[i]);
+    }
+    chain_entity_names.push(segments[n - 1]);
+
     out += #{
         PluginNamespace: #{
             id: app_ns_id,
             kind: "app",
-            bridges: app_bridges,
-            entity_names: [first_seg],
+            bridges: chain_bridges,
+            entity_names: chain_entity_names,
             decl_span: ctx.call_span,
         }
     };
