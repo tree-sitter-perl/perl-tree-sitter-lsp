@@ -506,6 +506,78 @@ impl<'a> Builder<'a> {
     ///     `type_constraints` (reverse scan; latest wins). This lets the
     ///     mojo-events plugin resolve `$obj->emit(...)` in a consumer file
     ///     to the producer's class, enabling cross-file def/ref pairing.
+    /// Resolve a method-call invocant NODE to a class name, using the
+    /// tree so chain invocants (`Sner->new->hi`) work. Returns the
+    /// resolved class for:
+    ///   - bareword `Foo`            → `Foo`
+    ///   - `__PACKAGE__`             → current package
+    ///   - typed `$var`              → ClassName from the type constraint
+    ///   - `$self`                   → current package
+    ///   - `Foo->new` (chain)        → `Foo` (constructor)
+    ///   - `X->method()` chain       → return type of `X::method` if it's
+    ///                                 a ClassName (via the same recursion
+    ///                                 + return_type-on-Sub lookup)
+    /// Unresolvable cases return `None` — refs_to treats that as no
+    /// match rather than cross-linking unrelated classes.
+    fn resolve_invocant_class_tree(&self, node: Node<'a>) -> Option<String> {
+        match node.kind() {
+            "method_call_expression" => {
+                // Chain case. Recurse into the inner invocant to get
+                // the inner call's receiver class, then look up the
+                // inner method's return type on that class.
+                let inner_invocant = node.child_by_field_name("invocant")?;
+                let method = node.child_by_field_name("method")?;
+                let method_name = method.utf8_text(self.source).ok()?;
+                // `Foo->new` — cheap special-case: constructor on a
+                // bareword class returns that class. Handles the
+                // overwhelmingly common `Class->new->chain...` shape
+                // without needing Sub return_type lookups on `new`.
+                if method_name == "new" {
+                    if let Some(c) = self.extract_constructor_class(node) {
+                        return Some(c);
+                    }
+                }
+                let inner_class = self.resolve_invocant_class_tree(inner_invocant)?;
+                // Look up `inner_class::method_name` locally. Only
+                // resolve when its return type is a ClassName — we're
+                // building a class path, so non-class returns break
+                // the chain.
+                for sym in &self.symbols {
+                    if sym.name != method_name { continue; }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                    if sym.package.as_deref() != Some(inner_class.as_str()) { continue; }
+                    if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
+                        return Some(c.clone());
+                    }
+                }
+                None
+            }
+            "scalar" => {
+                let text = node.utf8_text(self.source).ok()?;
+                if text == "$self" {
+                    return self.current_package.clone();
+                }
+                // Variable with a ClassName type constraint.
+                self.type_constraints.iter().rev().find_map(|tc| {
+                    if tc.variable != text { return None; }
+                    if let InferredType::ClassName(c) = &tc.inferred_type {
+                        Some(c.clone())
+                    } else {
+                        None
+                    }
+                })
+            }
+            "bareword" | "package" => {
+                let text = node.utf8_text(self.source).ok()?;
+                if text == "__PACKAGE__" {
+                    return self.current_package.clone();
+                }
+                Some(text.to_string())
+            }
+            _ => None,
+        }
+    }
+
     fn receiver_type_for(&self, invocant_text: Option<&str>) -> Option<InferredType> {
         let text = invocant_text?;
         if text == "$self" || text == "__PACKAGE__" {
@@ -765,11 +837,24 @@ impl<'a> Builder<'a> {
                 // the usual resolution path (inheritance walk + module
                 // index + type inference). The plugin's job is just
                 // "there's a call to method X on invocant Y here".
+                // Plugins declare `invocant` as the intended receiver
+                // class (e.g. route plugin uses "Users" for `->to('Users#list')`);
+                // treat that as the resolved class unless it's a sigil-shape.
+                let invocant_class = if invocant.is_empty()
+                    || invocant.starts_with('$')
+                    || invocant.starts_with('@')
+                    || invocant.starts_with('%')
+                {
+                    None
+                } else {
+                    Some(invocant.clone())
+                };
                 self.refs.push(Ref {
                     kind: RefKind::MethodCall {
                         invocant,
                         invocant_span,
                         method_name_span: span,
+                        invocant_class,
                     },
                     span,
                     scope: self.current_scope(),
@@ -3392,6 +3477,13 @@ impl<'a> Builder<'a> {
             .filter(|n| !matches!(n.kind(), "scalar" | "array" | "hash" | "bareword" | "package"))
             .map(|n| node_to_span(n));
 
+        // Resolve invocant to a class at build time using the tree —
+        // handles simple shapes directly, and chain invocants like
+        // `Sner->new->hi` via `resolve_invocant_class_tree`. Stored on
+        // the ref so downstream (refs_to / rename) matches class-scoped
+        // without re-resolving.
+        let invocant_class = invocant_node.and_then(|n| self.resolve_invocant_class_tree(n));
+
         if let Some(ref name) = method_name {
             // Dynamic method dispatch: $self->$method() — resolve $method if known
             if name.starts_with('$') {
@@ -3402,6 +3494,7 @@ impl<'a> Builder<'a> {
                                 invocant: invocant.clone().unwrap_or_default(),
                                 invocant_span,
                                 method_name_span,
+                                invocant_class: invocant_class.clone(),
                             },
                             node_to_span(node),
                             rname,
@@ -3415,6 +3508,7 @@ impl<'a> Builder<'a> {
                         invocant: invocant.clone().unwrap_or_default(),
                         invocant_span,
                         method_name_span,
+                        invocant_class: invocant_class.clone(),
                     },
                     node_to_span(node),
                     name.clone(),
@@ -8078,6 +8172,85 @@ $r->get('/users')->to('Users#list');
                 "->to route must dispatch via redirect_to");
         } else {
             panic!("route symbol should be Handler");
+        }
+    }
+
+    /// Adversarial: a dotted helper `users.create` and a route whose
+    /// action is `Users#create` both end up with a Perl-level symbol
+    /// named `create`. They are UNRELATED:
+    ///
+    ///   * `users.create` lives on `Mojolicious::Controller::_Helper::users`
+    ///     — a synthetic proxy class invented by the plugin. It's called
+    ///     as `$c->users->create(...)`.
+    ///   * `Users#create` points at a method `create` on the user's
+    ///     `Users` controller class. It's called via dispatch, not
+    ///     chained off a helper.
+    ///
+    /// Name-based resolution would cross-link them (goto-def on either
+    /// jumps to the other, find-references unions the two unrelated
+    /// call sites). Class-aware resolution must keep them apart: the
+    /// route's MethodCallRef targets class `Users`, the helper's leaf
+    /// lives on `_Helper::users`.
+    #[test]
+    fn helper_and_route_with_same_leaf_name_do_not_cross_link() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+$app->helper('users.create', sub ($c, $user) {});
+$app->routes->post('/users')->to(controller => 'Users', action => 'create');
+"#;
+        let fa = build_fa(src);
+
+        // --- Fact-finding: what actually got emitted? ---
+
+        // The helper leaf `create` should live on the proxy class.
+        let helper_create: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.name == "create"
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
+            .collect();
+        assert_eq!(helper_create.len(), 1, "one helper-leaf named 'create'");
+        let helper_create = helper_create[0];
+        assert_eq!(helper_create.package.as_deref(),
+            Some("Mojolicious::Controller::_Helper::users"),
+            "helper leaf lives on the proxy class, NOT on Users");
+
+        // The route emits a MethodCallRef method_name=create invocant=Users.
+        let route_ref = fa.refs.iter().find(|r| {
+            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+                && r.target_name == "create"
+        }).expect("route should emit MethodCall create@Users");
+
+        // --- The bug: does the route's ref resolve to the helper? ---
+
+        // If resolves_to is Some(sym_id), it MUST NOT point to the
+        // helper — the helper lives on a different class.
+        if let Some(target_sid) = route_ref.resolves_to {
+            assert_ne!(target_sid, helper_create.id,
+                "route MethodCall(create @ Users) must NOT resolve to the \
+                 helper-leaf on _Helper::users — they share a name only");
+        }
+
+        // Cross-resolution via the public API: refs_to_symbol(helper)
+        // must NOT include the route's ref.
+        let refs_to_helper = fa.refs_to(helper_create.id);
+        for r in &refs_to_helper {
+            assert_ne!(
+                (r.span.start.row, r.span.start.column),
+                (route_ref.span.start.row, route_ref.span.start.column),
+                "route ref showed up as a reference to the helper — cross-link bug. \
+                 Helper is on _Helper::users, route targets Users, they shouldn't mix."
+            );
+        }
+
+        // And the mirror: resolve_method_in_ancestors on class `Users`
+        // for method `create` must NOT return the helper-leaf. The
+        // helper's class is _Helper::users, not Users.
+        let resolution = fa.resolve_method_in_ancestors("Users", "create", None);
+        if let Some(crate::file_analysis::MethodResolution::Local { sym_id, .. }) = resolution {
+            assert_ne!(sym_id, helper_create.id,
+                "resolve_method_in_ancestors(Users, create) returned the helper — \
+                 class-awareness broken");
         }
     }
 

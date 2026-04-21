@@ -43,8 +43,13 @@ pub struct TargetRef {
 pub enum TargetKind {
     /// A sub or function name (cross-file call-site matching).
     Sub,
-    /// A method name — matches MethodCall refs anywhere.
-    Method,
+    /// A method on a specific class. Matches `Sub`/`Method` symbols
+    /// whose `package == class`, and `MethodCall` refs whose invocant
+    /// resolves to `class` in that file's analysis. Class-scoping is
+    /// mandatory — name-only matching silently unions unrelated
+    /// classes that share a method name (e.g. `Foo::run` and
+    /// `Bar::run`, or a mojo-helper leaf with a route's action).
+    Method { class: String },
     /// A package/class/module name — matches PackageRef refs.
     Package,
     /// A hash key owned by a specific sub's return value. `package` is the
@@ -174,7 +179,10 @@ fn collect_from_analysis(
         }
         let matches_kind = match &target.kind {
             TargetKind::Sub => sym.kind == SymKind::Sub,
-            TargetKind::Method => matches!(sym.kind, SymKind::Sub | SymKind::Method),
+            TargetKind::Method { class } => {
+                matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                    && sym.package.as_deref() == Some(class.as_str())
+            }
             TargetKind::Package => matches!(
                 sym.kind,
                 SymKind::Package | SymKind::Class | SymKind::Module
@@ -214,8 +222,27 @@ fn collect_from_analysis(
         let matches_kind = match (&target.kind, &r.kind) {
             (TargetKind::Sub, RefKind::FunctionCall) => true,
             (TargetKind::Sub, RefKind::MethodCall { .. }) => true,
-            (TargetKind::Method, RefKind::FunctionCall) => true,
-            (TargetKind::Method, RefKind::MethodCall { .. }) => true,
+            // Bareword `Pkg::method()` call inside the target class —
+            // matches. Qualified function-call refs include the `::`
+            // chain in `target_name`; we filter by name above, and
+            // trust the class invariant here.
+            (TargetKind::Method { .. }, RefKind::FunctionCall) => true,
+            (TargetKind::Method { class: wanted },
+             RefKind::MethodCall { invocant, invocant_span, invocant_class, .. }) => {
+                // Prefer the build-time `invocant_class` (handles
+                // chain invocants like `Foo->new->m` that plain text
+                // resolution can't). Fall back to
+                // `invocant_text_to_class` for callbacks where the
+                // class couldn't be pinned at build. Unresolvable →
+                // EXCLUDE the ref (avoids cross-linking unrelated
+                // classes that share a method name).
+                let resolved: Option<String> = invocant_class.clone()
+                    .or_else(|| {
+                        let point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
+                        analysis.invocant_text_to_class(Some(invocant), point)
+                    });
+                resolved.as_deref() == Some(wanted.as_str())
+            }
             (TargetKind::Package, RefKind::PackageRef) => true,
             (
                 TargetKind::HashKeyOfSub { package, name },
@@ -293,6 +320,232 @@ mod tests {
                 && r.access == AccessKind::Read),
             "expected call to foo in file B, got {:?}", results,
         );
+    }
+
+    /// Adversarial #1: a dotted helper `users.create` and a route's
+    /// `Users#create` share a method name but live on different
+    /// classes. gr on one must NOT pick up the other.
+    ///
+    /// Helper leaf lives on `Mojolicious::Controller::_Helper::users`.
+    /// Route target is `Users::create`. They only share a name.
+    #[test]
+    fn refs_to_helper_leaf_excludes_unrelated_route_with_same_method_name() {
+        let store = FileStore::new();
+        let path = PathBuf::from("/tmp/helper_route_overlap.pm");
+
+        let fa = parse(r#"
+package MyApp;
+use Mojolicious::Lite;
+
+$app->helper('users.create', sub ($c, $user) {});
+$app->routes->post('/users')->to(controller => 'Users', action => 'create');
+"#);
+        store.insert_workspace(path.clone(), fa);
+
+        // gr on the helper's `create` leaf (class = _Helper::users).
+        // Must NOT include the route's `create` ref (targets Users).
+        let helper_results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "create".to_string(),
+                kind: TargetKind::Method {
+                    class: "Mojolicious::Controller::_Helper::users".to_string(),
+                },
+            },
+            RoleMask::EDITABLE,
+        );
+        // Route's 'create' string sits at column ~67 on line 5
+        // (0-indexed). Anything there is the route, not the helper.
+        for r in &helper_results {
+            let col = r.span.start.column;
+            assert!(
+                !(r.span.start.row == 5 && col > 50),
+                "gr on helper leaf _Helper::users::create picked up the \
+                 route's Users::create ref (line {}, col {}) — unrelated \
+                 class, shouldn't appear",
+                r.span.start.row, col,
+            );
+        }
+
+        // Mirror: gr on the route's `create` target (class = Users).
+        // Must NOT include the helper's Method declaration.
+        let route_results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "create".to_string(),
+                kind: TargetKind::Method {
+                    class: "Users".to_string(),
+                },
+            },
+            RoleMask::EDITABLE,
+        );
+        // Helper's 'create' leaf is at line 4 col ~13 (inside the
+        // 'users.create' string — the plugin narrows spans to the leaf
+        // segment).
+        for r in &route_results {
+            assert!(
+                !(r.span.start.row == 4 && r.span.start.column < 30),
+                "gr on route Users::create picked up the helper leaf \
+                 _Helper::users::create (line {}, col {}) — unrelated class",
+                r.span.start.row, r.span.start.column,
+            );
+        }
+    }
+
+    /// Adversarial #2: two plain Perl packages, each with its own
+    /// `run` method. `$f->run` targets `Foo::run`; `$b->run` targets
+    /// `Bar::run`. gr on Foo's run must not union with Bar's.
+    #[test]
+    fn refs_to_method_is_class_scoped_plain_packages() {
+        let store = FileStore::new();
+        let path = PathBuf::from("/tmp/two_classes_same_method.pm");
+
+        let fa = parse(r#"
+package Foo;
+sub new { bless {}, shift }
+sub run { "foo" }
+
+package Bar;
+sub new { bless {}, shift }
+sub run { "bar" }
+
+package main;
+my $f = Foo->new;
+my $b = Bar->new;
+$f->run;
+$b->run;
+1;
+"#);
+        store.insert_workspace(path.clone(), fa);
+
+        let foo_results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "run".to_string(),
+                kind: TargetKind::Method { class: "Foo".to_string() },
+            },
+            RoleMask::EDITABLE,
+        );
+        // Must include Foo::run decl and `$f->run` call. Must NOT
+        // include Bar::run decl or `$b->run` call.
+        let foo_lines: Vec<usize> = foo_results.iter().map(|r| r.span.start.row).collect();
+        assert!(foo_lines.contains(&3),  // `sub run` in package Foo
+            "Foo::run decl (line 3) missing from Foo results: {:?}", foo_lines);
+        assert!(foo_lines.contains(&12), // `$f->run` call
+            "$f->run call (line 12) missing from Foo results: {:?}", foo_lines);
+        assert!(!foo_lines.contains(&7), // `sub run` in package Bar
+            "Bar::run decl (line 7) wrongly included in Foo results: {:?}", foo_lines);
+        assert!(!foo_lines.contains(&13), // `$b->run` call
+            "$b->run call (line 13) wrongly included in Foo results: {:?}", foo_lines);
+
+        let bar_results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "run".to_string(),
+                kind: TargetKind::Method { class: "Bar".to_string() },
+            },
+            RoleMask::EDITABLE,
+        );
+        let bar_lines: Vec<usize> = bar_results.iter().map(|r| r.span.start.row).collect();
+        assert!(bar_lines.contains(&7),
+            "Bar::run decl (line 7) missing from Bar results: {:?}", bar_lines);
+        assert!(bar_lines.contains(&13),
+            "$b->run call (line 13) missing from Bar results: {:?}", bar_lines);
+        assert!(!bar_lines.contains(&3),
+            "Foo::run decl (line 3) wrongly included in Bar results: {:?}", bar_lines);
+        assert!(!bar_lines.contains(&12),
+            "$f->run call (line 12) wrongly included in Bar results: {:?}", bar_lines);
+    }
+
+    /// Adversarial #3: Corinna classes with same method name. Both
+    /// call shapes must class-resolve correctly:
+    ///
+    ///   (a) Variable-bound: `my $s = Sner->new; $s->hi` — `$s` gets
+    ///       a ClassName(Sner) type constraint, so invocant resolution
+    ///       finds the class via the variable-type flow.
+    ///   (b) Inline chain: `Sner->new->hi` — the outer `->hi`'s
+    ///       invocant is a `method_call_expression`. The build-time
+    ///       `invocant_class` field on MethodCall refs is populated by
+    ///       `resolve_invocant_class_tree`, which walks chain invocants
+    ///       including `<Class>->new` constructors.
+    ///
+    /// Critical invariant either way: no cross-linking between Sner
+    /// and Bler.
+    #[test]
+    fn refs_to_method_is_class_scoped_corinna() {
+        let store = FileStore::new();
+        let path = PathBuf::from("/tmp/corinna_classes.pm");
+
+        let fa = parse(r#"use v5.38;
+
+class Sner {
+    method hi {}
+}
+class Bler {
+    method hi {}
+}
+
+my $s = Sner->new;
+my $b = Bler->new;
+$s->hi;
+$b->hi;
+Sner->new->hi;
+Bler->new->hi;
+1;
+"#);
+        store.insert_workspace(path.clone(), fa);
+
+        let sner_results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "hi".to_string(),
+                kind: TargetKind::Method { class: "Sner".to_string() },
+            },
+            RoleMask::EDITABLE,
+        );
+        let sner_lines: Vec<usize> = sner_results.iter().map(|r| r.span.start.row).collect();
+        assert!(sner_lines.contains(&3),
+            "Sner::hi decl missing: {:?}", sner_lines);
+        assert!(sner_lines.contains(&11),
+            "$s->hi (variable-bound) missing: {:?}", sner_lines);
+        assert!(sner_lines.contains(&13),
+            "Sner->new->hi (inline chain) missing — chain invocant resolution \
+             via build-time invocant_class should cover this: {:?}", sner_lines);
+        // No Bler anywhere in Sner results.
+        assert!(!sner_lines.contains(&6),
+            "Bler::hi decl wrongly in Sner results: {:?}", sner_lines);
+        assert!(!sner_lines.contains(&12),
+            "$b->hi wrongly in Sner results: {:?}", sner_lines);
+        assert!(!sner_lines.contains(&14),
+            "Bler->new->hi wrongly in Sner results: {:?}", sner_lines);
+
+        let bler_results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "hi".to_string(),
+                kind: TargetKind::Method { class: "Bler".to_string() },
+            },
+            RoleMask::EDITABLE,
+        );
+        let bler_lines: Vec<usize> = bler_results.iter().map(|r| r.span.start.row).collect();
+        assert!(bler_lines.contains(&6),
+            "Bler::hi decl missing: {:?}", bler_lines);
+        assert!(bler_lines.contains(&12),
+            "$b->hi missing: {:?}", bler_lines);
+        assert!(bler_lines.contains(&14),
+            "Bler->new->hi (inline chain) missing: {:?}", bler_lines);
+        assert!(!bler_lines.contains(&3),
+            "Sner::hi decl wrongly in Bler results: {:?}", bler_lines);
+        assert!(!bler_lines.contains(&11),
+            "$s->hi wrongly in Bler results: {:?}", bler_lines);
+        assert!(!bler_lines.contains(&13),
+            "Sner->new->hi wrongly in Bler results: {:?}", bler_lines);
     }
 
     #[test]

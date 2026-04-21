@@ -356,7 +356,11 @@ pub enum RenameKind {
     Variable,
     Function(String),
     Package(String),
-    Method(String),
+    /// A method with its owning class. Cross-file walks use `class`
+    /// to avoid unioning unrelated classes that share a method name
+    /// (e.g. `Foo::run` vs `Bar::run`, mojo-helper leaves vs route
+    /// targets).
+    Method { name: String, class: String },
     HashKey(String),
     /// Rename a `Handler` by (owner, name) — touches the handler symbol's
     /// name + every `DispatchCall` ref targeting it.
@@ -374,6 +378,17 @@ pub enum RefKind {
         invocant_span: Option<Span>,
         /// Span of just the method name (for rename — r.span covers the whole expression).
         method_name_span: Span,
+        /// Resolved class of the invocant at build time, when derivable
+        /// from the tree. Populated for:
+        ///   - `$self`/`__PACKAGE__` → current package
+        ///   - bareword `Foo` → `Foo`
+        ///   - typed `$var` → constraint's ClassName
+        ///   - `Foo->new` chain invocant → `Foo` (via extract_constructor_class)
+        /// `None` means "couldn't pin a class at build time" — refs_to
+        /// treats that as no-match (safe default, avoids cross-linking
+        /// unrelated classes that share a method name).
+        #[serde(default)]
+        invocant_class: Option<String>,
     },
     PackageRef,
     HashKeyAccess {
@@ -2491,28 +2506,75 @@ impl FileAnalysis {
     }
 
     /// Determine what kind of rename is appropriate for the cursor position.
+    ///
+    /// For `RenameKind::Method`, the class is mandatory (so cross-file
+    /// walks don't cross-link unrelated classes that share a method
+    /// name). When the invocant can't be resolved to a class, rename
+    /// falls through to symbol-at resolution; if that also has no
+    /// class context (orphan Sub), returns `None` — the cursor isn't
+    /// on something we can safely rename.
     pub fn rename_kind_at(&self, point: Point) -> Option<RenameKind> {
         if let Some(r) = self.ref_at(point) {
-            return Some(match &r.kind {
-                RefKind::Variable | RefKind::ContainerAccess => RenameKind::Variable,
-                RefKind::FunctionCall => RenameKind::Function(r.target_name.clone()),
-                RefKind::MethodCall { .. } => RenameKind::Method(r.target_name.clone()),
-                RefKind::PackageRef => RenameKind::Package(r.target_name.clone()),
-                RefKind::HashKeyAccess { .. } => RenameKind::HashKey(r.target_name.clone()),
+            match &r.kind {
+                RefKind::Variable | RefKind::ContainerAccess => return Some(RenameKind::Variable),
+                RefKind::FunctionCall => return Some(RenameKind::Function(r.target_name.clone())),
+                RefKind::MethodCall { invocant, invocant_span, invocant_class, .. } => {
+                    // Prefer build-time class (chain-resolved);
+                    // fall back to text-based resolution.
+                    let class = invocant_class.clone()
+                        .or_else(|| {
+                            let resolve_point = invocant_span.map(|s| s.start).unwrap_or(point);
+                            self.invocant_text_to_class(Some(invocant), resolve_point)
+                        });
+                    if let Some(class) = class {
+                        return Some(RenameKind::Method {
+                            name: r.target_name.clone(),
+                            class,
+                        });
+                    }
+                    // Invocant unresolvable — try symbol-at fallback
+                    // below; if that also has no class, bail rather
+                    // than return a class-less Method rename.
+                }
+                RefKind::PackageRef => return Some(RenameKind::Package(r.target_name.clone())),
+                RefKind::HashKeyAccess { .. } => return Some(RenameKind::HashKey(r.target_name.clone())),
                 RefKind::DispatchCall { owner: Some(owner), .. } => {
-                    RenameKind::Handler { owner: owner.clone(), name: r.target_name.clone() }
+                    return Some(RenameKind::Handler {
+                        owner: owner.clone(),
+                        name: r.target_name.clone(),
+                    });
                 }
                 // Unresolved DispatchCall — owner couldn't be determined
-                // at build time, so rename can't safely scope. Fall through
-                // to the symbol-at check below which returns None.
+                // at build time, so rename can't safely scope.
                 RefKind::DispatchCall { owner: None, .. } => return None,
-            });
+            }
         }
         if let Some(sym) = self.symbol_at(point) {
             return match sym.kind {
                 SymKind::Variable | SymKind::Field => Some(RenameKind::Variable),
-                SymKind::Sub => Some(RenameKind::Function(sym.name.clone())),
-                SymKind::Method => Some(RenameKind::Method(sym.name.clone())),
+                SymKind::Sub => {
+                    // A `Sub` symbol with a package is a method-shaped
+                    // entity (e.g. inside `package Foo { sub run {} }`).
+                    // If there's a package, treat rename as class-scoped
+                    // so cross-file walks don't hit same-named subs in
+                    // unrelated packages. Bare package-less subs remain
+                    // Function-kind (file-scope).
+                    if let Some(pkg) = sym.package.as_deref() {
+                        Some(RenameKind::Method {
+                            name: sym.name.clone(),
+                            class: pkg.to_string(),
+                        })
+                    } else {
+                        Some(RenameKind::Function(sym.name.clone()))
+                    }
+                }
+                SymKind::Method => {
+                    let class = sym.package.clone()?;
+                    Some(RenameKind::Method {
+                        name: sym.name.clone(),
+                        class,
+                    })
+                }
                 SymKind::Package | SymKind::Class => Some(RenameKind::Package(sym.name.clone())),
                 SymKind::Handler => {
                     if let SymbolDetail::Handler { owner, .. } = &sym.detail {
@@ -2545,6 +2607,46 @@ impl FileAnalysis {
                     }
                     _ => {}
                 }
+            }
+        }
+        edits
+    }
+
+    /// Class-scoped method rename. Matches decls whose package equals
+    /// `class`, and `MethodCall` refs whose invocant resolves to
+    /// `class` in this file's analysis. Same filter shape as
+    /// `resolve::refs_to` for `TargetKind::Method`, so rename and
+    /// references agree on what "the same method" means.
+    pub fn rename_method_in_class(&self, old_name: &str, class: &str, new_name: &str) -> Vec<(Span, String)> {
+        let mut edits = Vec::new();
+        for sym in &self.symbols {
+            if sym.name != old_name { continue; }
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+            if sym.package.as_deref() != Some(class) { continue; }
+            edits.push((sym.selection_span, new_name.to_string()));
+        }
+        for r in &self.refs {
+            if r.target_name != old_name { continue; }
+            match &r.kind {
+                RefKind::MethodCall { invocant, invocant_span, method_name_span, invocant_class } => {
+                    // Prefer the build-time resolved class (handles
+                    // chains like `Foo->new->m`); fall back to
+                    // text-based resolution when not pinned.
+                    let resolved: Option<String> = invocant_class.clone()
+                        .or_else(|| {
+                            let resolve_point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
+                            self.invocant_text_to_class(Some(invocant), resolve_point)
+                        });
+                    if resolved.as_deref() == Some(class) {
+                        edits.push((*method_name_span, new_name.to_string()));
+                    }
+                }
+                // Qualified function-call form `Class::method()` — name
+                // includes "::" but filter is on `target_name == old_name`
+                // (bare method name), so FunctionCall refs never match
+                // a class-scoped method rename here. Left as future work
+                // if/when we need to canonicalize those.
+                _ => {}
             }
         }
         edits

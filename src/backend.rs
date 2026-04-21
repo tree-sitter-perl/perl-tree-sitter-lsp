@@ -435,9 +435,9 @@ impl LanguageServer for Backend {
                 name,
                 kind: TargetKind::Sub,
             },
-            Some(RenameKind::Method(name)) => TargetRef {
+            Some(RenameKind::Method { name, class }) => TargetRef {
                 name,
-                kind: TargetKind::Method,
+                kind: TargetKind::Method { class },
             },
             Some(RenameKind::Package(name)) => TargetRef {
                 name,
@@ -577,25 +577,30 @@ impl LanguageServer for Backend {
                 // symbol + every DispatchCall ref in the current file.
                 Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
             }
-            Some(crate::file_analysis::RenameKind::Function(ref name))
-            | Some(crate::file_analysis::RenameKind::Method(ref name))
-            | Some(crate::file_analysis::RenameKind::Package(ref name))
-            | Some(crate::file_analysis::RenameKind::HashKey(ref name)) => {
-                let rename_fn: fn(&FileAnalysis, &str, &str) -> Vec<(crate::file_analysis::Span, String)> = match &rename_kind {
-                    Some(crate::file_analysis::RenameKind::Function(_)) => FileAnalysis::rename_sub,
-                    Some(crate::file_analysis::RenameKind::Package(_)) => FileAnalysis::rename_package,
-                    Some(crate::file_analysis::RenameKind::Method(_)) => FileAnalysis::rename_sub,
-                    Some(crate::file_analysis::RenameKind::HashKey(_)) => {
-                        // Hash keys: single-file for now
-                        return Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)));
+            Some(crate::file_analysis::RenameKind::HashKey(_)) => {
+                // Hash keys: single-file for now
+                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
+            }
+            Some(crate::file_analysis::RenameKind::Function(_))
+            | Some(crate::file_analysis::RenameKind::Method { .. })
+            | Some(crate::file_analysis::RenameKind::Package(_)) => {
+                // Unpack per-kind name + build a per-kind rename closure.
+                let (name, rename_fn): (String, Box<dyn Fn(&FileAnalysis, &str, &str) -> Vec<(crate::file_analysis::Span, String)>>) = match rename_kind.as_ref().unwrap() {
+                    crate::file_analysis::RenameKind::Function(n) =>
+                        (n.clone(), Box::new(FileAnalysis::rename_sub)),
+                    crate::file_analysis::RenameKind::Method { name, class } => {
+                        let c = class.clone();
+                        (name.clone(), Box::new(move |fa, old, new| fa.rename_method_in_class(old, &c, new)))
                     }
+                    crate::file_analysis::RenameKind::Package(n) =>
+                        (n.clone(), Box::new(FileAnalysis::rename_package)),
                     _ => unreachable!(),
                 };
 
                 let mut all_changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
 
                 let mut collect = |uri: Url, analysis: &FileAnalysis| {
-                    let edits = rename_fn(analysis, name, new_name);
+                    let edits = rename_fn(analysis, &name, new_name);
                     if !edits.is_empty() {
                         all_changes.entry(uri).or_default().extend(
                             edits.into_iter().map(|(span, text)| TextEdit {

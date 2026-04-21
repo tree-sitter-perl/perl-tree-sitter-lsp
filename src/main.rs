@@ -549,13 +549,15 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
                 all_edits.insert(file_path.display().to_string(), json_edits);
             }
         }
-        file_analysis::RenameKind::Function(_) | file_analysis::RenameKind::Method(_) => {
-            let name = match &rename_kind {
-                file_analysis::RenameKind::Function(n) | file_analysis::RenameKind::Method(n) => n.clone(),
-                _ => unreachable!(),
-            };
+        file_analysis::RenameKind::Function(_) | file_analysis::RenameKind::Method { .. } => {
             for entry in ws.workspace_raw().iter() {
-                let edits = entry.value().rename_sub(&name, new_name);
+                let edits = match &rename_kind {
+                    file_analysis::RenameKind::Function(n) =>
+                        entry.value().rename_sub(n, new_name),
+                    file_analysis::RenameKind::Method { name, class } =>
+                        entry.value().rename_method_in_class(name, class, new_name),
+                    _ => unreachable!(),
+                };
                 if !edits.is_empty() {
                     let json_edits: Vec<_> = edits.into_iter()
                         .map(|(span, text)| span_to_json(span, text))
