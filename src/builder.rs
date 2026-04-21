@@ -13,7 +13,7 @@ use crate::plugin::{self, PluginRegistry};
 /// Process-wide plugin registry, built once with the bundled Rhai plugins
 /// (plus anything discovered under `$PERL_LSP_PLUGIN_DIR`). All `build()`
 /// calls share it; tests that need isolation use `build_with_plugins()`.
-fn default_plugin_registry() -> Arc<PluginRegistry> {
+pub fn default_plugin_registry() -> Arc<PluginRegistry> {
     static REG: OnceLock<Arc<PluginRegistry>> = OnceLock::new();
     REG.get_or_init(|| {
         let engine = Arc::new(plugin::rhai_host::make_engine());
@@ -8654,7 +8654,6 @@ $app->helper('users.create' => sub { my ($c) = @_; });
     /// handler-args slot) but fragile; leaving as RED until the
     /// IoC hook lands.
     #[test]
-    #[ignore = "BLOCKED on plugin IoC sig help — see docs/prompt-plugin-architecture.md"]
     fn enqueue_options_hash_sig_help_is_enqueue_not_task() {
         use tower_lsp::lsp_types::Position;
         use tree_sitter::Parser;
@@ -8679,22 +8678,28 @@ $minion->enqueue(send_email => ['a', 'b'], {  });
         let pos = Position { line: line_idx as u32, character: col as u32 };
 
         let idx = crate::module_index::ModuleIndex::new_for_test();
-        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
-            .expect("sig help fires on options hash");
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx);
 
-        // When this goes green: sig help inside the options hash
-        // should reflect enqueue's own signature, NOT the task's.
-        // Options include `priority`, `queue`, etc. — those are the
-        // keys the user is about to type, and sig help should stay
-        // out of the way (completion is the right affordance here).
-        let info = &sig.signatures[0];
-        assert!(!info.label.contains("send_email"),
-            "options hash is NOT dispatching to the task — sig help \
-             should be enqueue's own shape or absent entirely. Got: {:?}",
-            info.label);
-        assert!(!info.label.contains("$subject"),
-            "task params must NOT leak into enqueue's options hash sig; \
-             got: {:?}", info.label);
+        // The contract: the task's sig must NOT show up in the
+        // options hash. The plugin's `on_signature_help` claims the
+        // slot with `Silent` so the native string-dispatch path
+        // doesn't run. Either `None` (silent) or a sig that isn't
+        // the task's is acceptable; showing `send_email($to, …)` is
+        // the regression we're pinning against.
+        match sig {
+            None => {}
+            Some(sh) => {
+                for info in &sh.signatures {
+                    assert!(!info.label.contains("send_email"),
+                        "options hash is NOT dispatching to the task — \
+                         sig help should be enqueue's own shape or absent. \
+                         Got: {:?}", info.label);
+                    assert!(!info.label.contains("$subject"),
+                        "task params must NOT leak into enqueue's options \
+                         hash sig; got: {:?}", info.label);
+                }
+            }
+        }
     }
 
     /// RED — completion at arg-0 of enqueue should offer ONLY
@@ -8714,7 +8719,6 @@ $minion->enqueue(send_email => ['a', 'b'], {  });
     /// PluginNamespace entities indexed for fast "names of kind
     /// `task` on this minion" lookup. See the arch doc.
     #[test]
-    #[ignore = "BLOCKED on plugin IoC completion — see docs/prompt-plugin-architecture.md"]
     fn enqueue_arg0_offers_task_names_only() {
         use tower_lsp::lsp_types::Position;
         use tree_sitter::Parser;

@@ -19,7 +19,10 @@ use rhai::{
 use crate::file_analysis::{HashKeyOwner, InferredType, Span};
 use tree_sitter::Point;
 
-use super::{CallContext, EmitAction, FrameworkPlugin, Trigger, UseContext};
+use super::{
+    CallContext, CompletionQueryContext, EmitAction, FrameworkPlugin, PluginCompletionAnswer,
+    PluginSigHelpAnswer, SigHelpQueryContext, Trigger, UseContext,
+};
 
 /// An engine built with our helpers and type registrations. Engines are
 /// cheap to reuse; scripts share one instance across all callbacks.
@@ -106,6 +109,8 @@ pub struct RhaiPlugin {
     has_on_function_call: bool,
     has_on_method_call: bool,
     has_on_use: bool,
+    has_on_signature_help: bool,
+    has_on_completion: bool,
 }
 
 impl RhaiPlugin {
@@ -143,11 +148,37 @@ impl RhaiPlugin {
             has_on_function_call: signatures.iter().any(|n| n == "on_function_call"),
             has_on_method_call: signatures.iter().any(|n| n == "on_method_call"),
             has_on_use: signatures.iter().any(|n| n == "on_use"),
+            has_on_signature_help: signatures.iter().any(|n| n == "on_signature_help"),
+            has_on_completion: signatures.iter().any(|n| n == "on_completion"),
             id,
             triggers,
             engine,
             ast: Arc::new(ast),
         })
+    }
+
+    /// Call a Rhai query hook that returns a single map (sig help)
+    /// or nil. Returns `None` if the script's fn returned unit or
+    /// the call failed — plugins stay silent unless they have
+    /// something to contribute.
+    fn call_opt_map<T: serde::de::DeserializeOwned>(&self, fn_name: &str, arg: Dynamic) -> Option<T> {
+        let out: Result<Dynamic, _> =
+            self.engine.call_fn(&mut rhai::Scope::new(), &self.ast, fn_name, (arg,));
+        let v = match out {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("plugin `{}`::{} failed: {}", self.id, fn_name, e);
+                return None;
+            }
+        };
+        if v.is_unit() { return None; }
+        match from_dynamic::<T>(&v) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                log::warn!("plugin `{}`::{} bad return: {}", self.id, fn_name, e);
+                None
+            }
+        }
     }
 
     fn dispatch(&self, fn_name: &str, arg: Dynamic) -> Vec<EmitAction> {
@@ -210,6 +241,18 @@ impl FrameworkPlugin for RhaiPlugin {
                 Vec::new()
             }
         }
+    }
+
+    fn on_signature_help(&self, ctx: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> {
+        if !self.has_on_signature_help { return None; }
+        let d = to_dynamic(ctx).ok()?;
+        self.call_opt_map("on_signature_help", d)
+    }
+
+    fn on_completion(&self, ctx: &CompletionQueryContext) -> Option<PluginCompletionAnswer> {
+        if !self.has_on_completion { return None; }
+        let d = to_dynamic(ctx).ok()?;
+        self.call_opt_map("on_completion", d)
     }
 
     fn on_use(&self, ctx: &UseContext) -> Vec<EmitAction> {

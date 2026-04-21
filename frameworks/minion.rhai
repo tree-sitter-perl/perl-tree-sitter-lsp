@@ -210,3 +210,92 @@ fn on_method_call(ctx) {
 
     out
 }
+
+// ---- Query hooks (IoC) ----
+
+// Dispatchers that look a task up by name — the hook-side analog of
+// the `dispatchers:` list on the Handler emission above.
+fn is_enqueue_dispatcher(name) {
+    let names = ["enqueue", "enqueue_p", "perform_jobs",
+                 "perform_jobs_in_foreground", "foreground"];
+    let hit = false;
+    for d in names { if d == name { hit = true; break; } }
+    hit
+}
+
+fn is_minion_dispatch_call(callframe) {
+    if callframe == () { return false; }
+    if !callframe.is_method { return false; }
+    if !is_enqueue_dispatcher(callframe.name) { return false; }
+    let rt = callframe.receiver_type;
+    if rt != () && rt.contains("ClassName") {
+        let rcn = rt.ClassName;
+        return rcn == "Minion" || rcn.starts_with("Minion::");
+    }
+    // Untyped receiver is OK — the method-name + trigger filter
+    // already narrowed us to Minion-shaped calls.
+    true
+}
+
+// Sig help at dispatcher cursor positions we claim.
+//   * Inside the handler-args arrayref → Show(task sig, active=arrayref slot)
+//   * Inside the options hash          → Silent (suppress native so
+//                                         the task sig doesn't leak
+//                                         into enqueue's own options)
+//   * Anywhere else at our dispatcher  → None (no claim — let the
+//                                         native path render enqueue's
+//                                         own signature)
+fn on_signature_help(ctx) {
+    let callframe = ctx["call"];
+    if !is_minion_dispatch_call(callframe) { return (); }
+
+    let container = ctx.cursor_inside;
+    if container == () { return (); }
+
+    if container.kind == "Hash" {
+        // Options hash is enqueue's OWN arg — suppress the native
+        // string-dispatch sig help that would show the task's shape.
+        return #{ Silent: () };
+    }
+    if container.kind != "Array" { return (); }
+
+    if callframe.args.len() < 1 { return (); }
+    let name = callframe.args[0].string_value;
+    if name == () { return (); }
+
+    // `params` is a placeholder — the task's real signature lives
+    // on the Handler symbol. Full resolution requires a symbol-table
+    // lookup primitive the host will expose (see
+    // docs/prompt-plugin-architecture.md "Open questions").
+    #{
+        Show: #{
+            label: "enqueue('" + name + "', [ args ])",
+            params: [name + " args"],
+            active_param: container.active_slot,
+        }
+    }
+}
+
+// Completion at enqueue's arg-0 — the task name slot. Suppress the
+// native method-of-receiver firehose; let the core populate items
+// from Handler symbols with owner=Minion via the dispatch_targets_for
+// delegation.
+fn on_completion(ctx) {
+    let callframe = ctx["call"];
+    if !is_minion_dispatch_call(callframe) { return (); }
+
+    if callframe.cursor_arg_index != 0 { return (); }
+    if ctx.cursor_inside != () { return (); }
+
+    #{
+        items: [],
+        exclusive: true,
+        dispatch_targets_for: #{
+            owner_class: "Minion",
+            dispatcher_names: [
+                "enqueue", "enqueue_p", "perform_jobs",
+                "perform_jobs_in_foreground", "foreground",
+            ],
+        },
+    }
+}

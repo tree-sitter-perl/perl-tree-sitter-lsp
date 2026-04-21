@@ -60,7 +60,23 @@ Type inference + invariant derivation: `docs/prompt-type-inference-spec.md` capt
 
    When multiple refs overlap at a position, `ref_at` must return the **most specific** (narrowest span). A `HashKeyAccess` for `timeout` inside a `MethodCall` for `connect` should win over the `MethodCall`.
 
-8. **Provenance: refs should trace back to their source.** When a ref is derived from another value (constant folding, import re-export, framework synthesis), the derivation chain should be traceable for rename and cross-referencing. Key provenance chains:
+8. **Plugin-synthesized content is owned by `PluginNamespace`, not Perl classes.** See `docs/prompt-plugin-architecture.md` for the full model. Short form:
+
+   - A `PluginNamespace` (in `file_analysis.rs`) is a plugin-controlled scope with `id`, `kind`, `bridges`, and `entities` (SymbolIds). Helpers / routes / tasks live in namespaces, NOT as methods bolted onto `Mojolicious::Controller` etc. Multi-instance (two apps in one workspace) works because each gets its own namespace id.
+
+   - `Bridge::Class(name)` declares "Perl expressions typed as `name` can see this namespace's entities". The single cross-file lookup is `ModuleIndex::for_each_entity_bridged_to(class, |cached, sym|) { ... }` — it walks `bridges_index`, applies the namespace-level `Bridge::Class` filter, and the per-entity `sym.package` filter. No other reverse indexes for plugin content.
+
+   - **Retired** (do not reintroduce): `class_content_index` / `modules_with_class_content`. They inferred plugin reach from `symbol.package`; explicit plugin-declared bridges replaced them. If a new lookup needs to find plugin-emitted methods on a class, route through `for_each_entity_bridged_to` — do NOT add a parallel reverse index.
+
+   - Plugins have TWO kinds of hooks:
+     - **Emit hooks** (`on_use`, `on_function_call`, `on_method_call`) run at parse time. Plugin returns `Vec<EmitAction>` for the builder to apply. Declarative.
+     - **Query hooks** (`on_signature_help`, `on_completion`) run at cursor time in `symbols.rs`. Plugin inspects `SigHelpQueryContext` / `CompletionQueryContext` and returns an answer. Imperative. Used for shape-dependent behavior (arrayref-wrapped handler args, dispatcher name slots) that data emission can't express.
+
+   - `PluginSigHelpAnswer::Silent` / `PluginCompletionAnswer.exclusive: bool` let a plugin claim a cursor slot without offering content — suppresses native paths that would mishandle it. Use sparingly: only when the plugin knows native will get it wrong.
+
+   - `PluginCompletionAnswer.dispatch_targets_for: Option<DispatchTargetRequest>` asks the core to populate completion items from Handler symbols with a given owner + dispatcher names. Plugins delegate rather than re-walking the symbol table.
+
+9. **Provenance: refs should trace back to their source.** When a ref is derived from another value (constant folding, import re-export, framework synthesis), the derivation chain should be traceable for rename and cross-referencing. Key provenance chains:
 
    - **Constant folding:** `my $m = 'process'; $self->$m()` → the `MethodCall` ref targeting `"process"` was derived from the string literal `'process'`. Renaming `process` should update the source string.
    - **`has` declarations:** `has name => (is => 'ro')` is a single source of truth that produces: an accessor Method symbol, a `HashKeyDef` for the constructor (`->new(name => ...)`), and a `HashKeyDef` for the internal hash (`$self->{name}`). Renaming any one should update all.

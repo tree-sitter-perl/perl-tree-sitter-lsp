@@ -311,6 +311,11 @@ pub trait FrameworkPlugin: Send + Sync {
     fn id(&self) -> &str;
     fn triggers(&self) -> &[Trigger];
 
+    // ---- Emit hooks (parse time) ----
+    //
+    // Plugin observes a CST event and returns facts to push into the
+    // symbol/ref/namespace tables. Declarative.
+
     #[allow(unused_variables)]
     fn on_use(&self, ctx: &UseContext) -> Vec<EmitAction> {
         Vec::new()
@@ -323,6 +328,157 @@ pub trait FrameworkPlugin: Send + Sync {
     fn on_method_call(&self, ctx: &CallContext) -> Vec<EmitAction> {
         Vec::new()
     }
+
+    // ---- Query hooks (cursor time) ----
+    //
+    // Plugin inspects the cursor context and answers "do I have
+    // something for this spot?". Imperative. Core asks every
+    // applicable plugin after the native pipeline runs.
+
+    /// Offer a signature at the cursor or claim the slot silently.
+    /// Called BEFORE native sig help so the plugin can both provide
+    /// its own shape AND suppress native when the plugin knows the
+    /// cursor sits at a position native would mishandle.
+    ///   * `None`               — plugin doesn't claim this cursor
+    ///   * `Some(Show(sig))`    — show this signature
+    ///   * `Some(Silent)`       — suppress native; show nothing
+    #[allow(unused_variables)]
+    fn on_signature_help(&self, ctx: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> {
+        None
+    }
+
+    /// Contribute completion items and optionally assert authority
+    /// over this cursor. Plugins return a `PluginCompletionAnswer`
+    /// with a list of candidates and a flag saying whether to
+    /// suppress the core's other completion sources at this spot
+    /// (used when the plugin knows the cursor's a name slot for its
+    /// dispatch, not a general method slot).
+    #[allow(unused_variables)]
+    fn on_completion(&self, ctx: &CompletionQueryContext) -> Option<PluginCompletionAnswer> {
+        None
+    }
+}
+
+// ---- Query-hook types ----
+
+/// What the core tells a plugin when asking `on_signature_help`.
+/// `on_completion` uses the same shape with `PluginCompletionAnswer`
+/// for the return value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigHelpQueryContext {
+    /// Innermost enclosing call at the cursor, if any.
+    pub call: Option<CallFrame>,
+    /// Nested container (array/hash literal) the cursor sits inside,
+    /// when the cursor is past the top-level call args — e.g. cursor
+    /// inside `[...]` at call-arg-1 of an enqueue dispatch. Lets a
+    /// plugin recognize "the cursor is inside my handler-args slot
+    /// wrapped in an arrayref" without the core knowing anything
+    /// about arrayref-wrapped dispatch.
+    pub cursor_inside: Option<ContainerFrame>,
+    /// `ctx.current_package` at the cursor — helps plugins pick the
+    /// right app/instance namespace when more than one exists.
+    pub current_package: Option<String>,
+}
+
+pub type CompletionQueryContext = SigHelpQueryContext;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallFrame {
+    pub is_method: bool,
+    pub name: String,
+    pub receiver_text: Option<String>,
+    pub receiver_type: Option<InferredType>,
+    pub args: Vec<ArgInfo>,
+    /// Zero-indexed top-level arg slot the cursor is at (commas at
+    /// the call's own arg list, not nested containers).
+    pub cursor_arg_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerFrame {
+    pub kind: ContainerKind,
+    /// The cursor's slot within THIS container (comma count INSIDE
+    /// the container before the cursor — `[a, b, ^]` = slot 2).
+    pub active_slot: usize,
+    /// For Hash containers: keys already written before the cursor.
+    /// Empty for Array.
+    pub existing_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContainerKind {
+    Array,
+    Hash,
+}
+
+/// A minimal signature-help payload that plugins can construct
+/// ergonomically. The core converts to full LSP `SignatureHelp`
+/// (filling in active_signature etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSignatureHelp {
+    pub label: String,
+    pub params: Vec<String>,
+    pub active_param: usize,
+}
+
+/// Plugin's answer to an `on_signature_help` query. Either show a
+/// sig or silently claim the slot (suppresses native sig help).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PluginSigHelpAnswer {
+    Show(PluginSignatureHelp),
+    Silent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginCompletionAnswer {
+    pub items: Vec<PluginCompletion>,
+    /// When true, core suppresses ALL native completion sources at
+    /// this cursor — the plugin has claimed the slot. Use sparingly:
+    /// only when the plugin knows the cursor's a dedicated dispatch
+    /// name slot (e.g. enqueue arg-0) where method-of-receiver is
+    /// nonsensical.
+    #[serde(default)]
+    pub exclusive: bool,
+    /// Optional request to the core: "also populate with every
+    /// handler name registered on this owner class via any of these
+    /// dispatcher methods". Avoids forcing every plugin to re-walk
+    /// the symbol table for a dispatcher-name completion slot. Core
+    /// materializes Handler symbols whose owner matches and whose
+    /// dispatchers list includes any of the named methods.
+    #[serde(default)]
+    pub dispatch_targets_for: Option<DispatchTargetRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchTargetRequest {
+    pub owner_class: String,
+    pub dispatcher_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginCompletion {
+    pub label: String,
+    /// Plugin-chosen LSP-adjacent kind. Core maps to CompletionItemKind.
+    pub kind: CompletionKindHint,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub insert_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompletionKindHint {
+    Function,
+    Method,
+    Field,
+    Property,
+    Value,
+    Event,
+    Operator,
+    Keyword,
+    Task,
+    Helper,
+    Route,
 }
 
 // ---- Registry ----

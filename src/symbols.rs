@@ -405,6 +405,57 @@ pub fn completion_items(
 ) -> Vec<CompletionItem> {
     let point = position_to_point(pos);
 
+    // Plugin query hook — runs BEFORE the native path. A plugin can
+    // contribute items and optionally claim exclusivity for the slot
+    // (e.g. Minion's arg-0 task-name completion: pure tasks, no
+    // Minion instance-method firehose).
+    if let Some(qctx) = build_plugin_query_context(analysis, tree, source.as_bytes(), point) {
+        let registry = crate::builder::default_plugin_registry();
+        let mut plugin_items: Vec<CompletionItem> = Vec::new();
+        let mut exclusive = false;
+        for p in registry.all() {
+            if let Some(answer) = p.on_completion(&qctx) {
+                if answer.exclusive { exclusive = true; }
+                for c in answer.items {
+                    plugin_items.push(plugin_completion_to_item(c));
+                }
+                // Plugin-delegated dispatch-target completion: walk
+                // Handler symbols whose owner matches and contribute
+                // their names as items. Saves each plugin from
+                // reimplementing the symbol-table scan.
+                if let Some(req) = answer.dispatch_targets_for {
+                    plugin_items.extend(dispatch_target_items_for(
+                        analysis, module_index, &req.owner_class, &req.dispatcher_names,
+                    ));
+                }
+            }
+        }
+        if exclusive {
+            return plugin_items;
+        }
+        if !plugin_items.is_empty() {
+            let native = completion_items_native(analysis, tree, source, pos, module_index, stable_packages);
+            let mut out = plugin_items;
+            out.extend(native);
+            return out;
+        }
+    }
+
+    completion_items_native(analysis, tree, source, pos, module_index, stable_packages)
+}
+
+/// Original native completion path. Renamed from `completion_items`
+/// so the plugin-aware wrapper above can fall through to it.
+fn completion_items_native(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &str,
+    pos: Position,
+    module_index: &ModuleIndex,
+    stable_packages: Option<&[(String, usize)]>,
+) -> Vec<CompletionItem> {
+    let point = position_to_point(pos);
+
     // Try tree-based detection first for expression-based contexts
     let ctx = cursor_context::detect_cursor_context_tree_with_index(
         tree, source.as_bytes(), point, analysis, Some(module_index),
@@ -1020,6 +1071,178 @@ fn mid_string_methodref_completions(
         .collect()
 }
 
+/// Materialize `PluginCompletion` items for every Handler symbol
+/// whose owner matches `owner_class` and whose `dispatchers` list
+/// contains any of `dispatcher_names`. Walks the local analysis AND
+/// every cross-file cached module. Used by plugin-delegated
+/// dispatch-name completion (Minion enqueue arg-0, Mojo emit arg-0,
+/// etc.).
+fn dispatch_target_items_for(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    owner_class: &str,
+    dispatcher_names: &[String],
+) -> Vec<CompletionItem> {
+    use crate::file_analysis::{HandlerOwner, SymbolDetail};
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<CompletionItem> = Vec::new();
+    let mut consider = |sym: &crate::file_analysis::Symbol| {
+        let SymbolDetail::Handler { owner, dispatchers, display, .. } = &sym.detail else { return };
+        let HandlerOwner::Class(c) = owner;
+        if c != owner_class { return; }
+        if !dispatcher_names.is_empty()
+            && !dispatchers.iter().any(|d| dispatcher_names.iter().any(|n| n == d))
+        {
+            return;
+        }
+        if !seen.insert(sym.name.clone()) { return; }
+        let detail = display.outline_word().map(|s| s.to_string());
+        out.push(CompletionItem {
+            label: sym.name.clone(),
+            kind: Some(handler_display_to_completion_kind(display)),
+            detail,
+            filter_text: Some(sym.name.clone()),
+            sort_text: Some(format!(" 000{}", sym.name)),
+            insert_text: Some(format!("'{}'", sym.name)),
+            ..Default::default()
+        });
+    };
+    for sym in &analysis.symbols {
+        consider(sym);
+    }
+    module_index.for_each_cached(|_, cached| {
+        for sym in &cached.analysis.symbols {
+            consider(sym);
+        }
+    });
+    out
+}
+
+/// Convert a plugin's minimal `PluginSignatureHelp` to the full LSP
+/// `SignatureHelp` shape. Core fills in `active_signature` and the
+/// per-parameter scaffolding so plugin-side Rhai stays ergonomic.
+fn plugin_sig_to_lsp(p: crate::plugin::PluginSignatureHelp) -> SignatureHelp {
+    let parameters: Vec<ParameterInformation> = p.params.iter().cloned()
+        .map(|label| ParameterInformation {
+            label: ParameterLabel::Simple(label),
+            documentation: None,
+        })
+        .collect();
+    SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label: p.label,
+            documentation: None,
+            parameters: Some(parameters),
+            active_parameter: Some(p.active_param as u32),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(p.active_param as u32),
+    }
+}
+
+/// Convert a plugin completion hint to LSP `CompletionItemKind`.
+fn plugin_completion_kind_hint(h: &crate::plugin::CompletionKindHint) -> CompletionItemKind {
+    use crate::plugin::CompletionKindHint as K;
+    match h {
+        K::Function | K::Task | K::Helper | K::Route => CompletionItemKind::FUNCTION,
+        K::Method => CompletionItemKind::METHOD,
+        K::Field => CompletionItemKind::FIELD,
+        K::Property => CompletionItemKind::PROPERTY,
+        K::Value => CompletionItemKind::VALUE,
+        K::Event => CompletionItemKind::EVENT,
+        K::Operator => CompletionItemKind::OPERATOR,
+        K::Keyword => CompletionItemKind::KEYWORD,
+    }
+}
+
+fn plugin_completion_to_item(p: crate::plugin::PluginCompletion) -> CompletionItem {
+    let filter_text = Some(p.label.clone());
+    let kind = plugin_completion_kind_hint(&p.kind);
+    // Map the semantic hint to an outline-style detail word so the
+    // client can distinguish Task/Helper/Route from plain Function.
+    let detail = p.detail.or_else(|| match p.kind {
+        crate::plugin::CompletionKindHint::Task => Some("task".into()),
+        crate::plugin::CompletionKindHint::Helper => Some("helper".into()),
+        crate::plugin::CompletionKindHint::Route => Some("route".into()),
+        _ => None,
+    });
+    CompletionItem {
+        label: p.label,
+        kind: Some(kind),
+        detail,
+        insert_text: p.insert_text,
+        filter_text,
+        sort_text: Some(" 000".into()), // space prefix sorts above digit-prefixed priorities
+        ..Default::default()
+    }
+}
+
+/// Build the `SigHelpQueryContext`/`CompletionQueryContext` a plugin
+/// query hook consumes. Extracts the innermost call at the cursor,
+/// the innermost nested container (array/hash), and the enclosing
+/// package. Returns `None` when no enclosing call exists and no
+/// plugin could plausibly claim the slot.
+fn build_plugin_query_context(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &[u8],
+    point: Point,
+) -> Option<crate::plugin::SigHelpQueryContext> {
+    use crate::plugin::{CallFrame, ContainerFrame, ContainerKind, SigHelpQueryContext};
+    use crate::cursor_context as cc;
+
+    let call_ctx = cc::find_call_context(tree, source, point);
+    let call = call_ctx.as_ref().map(|c| CallFrame {
+        is_method: c.is_method,
+        name: c.name.clone(),
+        receiver_text: c.invocant.clone(),
+        receiver_type: c.invocant.as_deref()
+            .and_then(|inv| resolve_invocant_class(analysis, Some(inv), point))
+            .map(InferredType::ClassName),
+        args: Vec::new(), // sub_params-less view — plugin inspects tree or call name
+        cursor_arg_index: c.active_param,
+    });
+
+    // Innermost nested container: walk up from cursor to find the
+    // first anonymous_array_expression or anonymous_hash_expression
+    // before we exit the enclosing call.
+    let container = {
+        let mut n = tree.root_node().descendant_for_point_range(point, point);
+        let mut found: Option<ContainerFrame> = None;
+        while let Some(node) = n {
+            match node.kind() {
+                "anonymous_array_expression" => {
+                    found = Some(ContainerFrame {
+                        kind: ContainerKind::Array,
+                        active_slot: count_commas_inside_node(node, source, point),
+                        existing_keys: Vec::new(),
+                    });
+                    break;
+                }
+                "anonymous_hash_expression" => {
+                    let used = cc::used_keys_in_enclosing_hash(tree, source, point);
+                    found = Some(ContainerFrame {
+                        kind: ContainerKind::Hash,
+                        active_slot: count_commas_inside_node(node, source, point),
+                        existing_keys: used.into_iter().collect(),
+                    });
+                    break;
+                }
+                "method_call_expression" | "function_call_expression"
+                | "ambiguous_function_call_expression" => break,
+                _ => {}
+            }
+            n = node.parent();
+        }
+        found
+    };
+
+    let current_package = analysis.package_at(point).map(|s| s.to_string());
+
+    if call.is_none() && container.is_none() { return None; }
+    Some(SigHelpQueryContext { call, cursor_inside: container, current_package })
+}
+
 /// Find the enclosing method_call_expression at `point` and return any
 /// `DispatchCall` ref whose span sits inside that call's argument list.
 /// Returns `(handler_name, owner_class, dispatcher)` — all three are
@@ -1406,6 +1629,25 @@ pub fn signature_help(
     module_index: &ModuleIndex,
 ) -> Option<SignatureHelp> {
     let point = position_to_point(pos);
+
+    // Plugin query hook — runs BEFORE native sig help. Plugin can
+    // show a custom sig (arrayref-wrapped handler args) OR silently
+    // claim the slot to suppress native sig (cursor in an options
+    // hash of a dispatcher — native would mis-show the task sig).
+    if let Some(qctx) = build_plugin_query_context(analysis, tree, text.as_bytes(), point) {
+        let registry = crate::builder::default_plugin_registry();
+        for p in registry.all() {
+            match p.on_signature_help(&qctx) {
+                Some(crate::plugin::PluginSigHelpAnswer::Show(psig)) => {
+                    return Some(plugin_sig_to_lsp(psig));
+                }
+                Some(crate::plugin::PluginSigHelpAnswer::Silent) => {
+                    return None;
+                }
+                None => {}
+            }
+        }
+    }
 
     // Step 1: cursor_context finds the enclosing call
     let call_ctx = cursor_context::find_call_context(tree, text.as_bytes(), point)?;
