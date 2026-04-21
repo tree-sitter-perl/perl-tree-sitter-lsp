@@ -65,6 +65,7 @@ pub fn build_with_plugins(
         constant_strings: std::collections::HashMap::new(),
         export: Vec::new(),
         export_ok: Vec::new(),
+        plugin_namespaces: Vec::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -124,6 +125,7 @@ pub fn build_with_plugins(
         b.framework_imports,
         b.export,
         b.export_ok,
+        b.plugin_namespaces,
     )
 }
 
@@ -231,6 +233,10 @@ struct Builder<'a> {
     export: Vec<String>,
     /// Exported function names from @EXPORT_OK assignments.
     export_ok: Vec<String>,
+    /// Plugin-declared namespaces collected during the walk via
+    /// `EmitAction::PluginNamespace`. Flushed into the final
+    /// `FileAnalysis.plugin_namespaces`.
+    plugin_namespaces: Vec<crate::file_analysis::PluginNamespace>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -766,6 +772,50 @@ impl<'a> Builder<'a> {
                     at,
                     inferred_type,
                 });
+            }
+            plugin::EmitAction::PluginNamespace {
+                id,
+                kind,
+                bridges,
+                entity_names,
+                decl_span,
+            } => {
+                // Find-or-create the namespace. Bridges union across
+                // repeated emissions so dotted helpers emitted one at
+                // a time aggregate into a single namespace; entity_names
+                // is resolved now against symbols already emitted by
+                // this plugin in THIS dispatch (and any earlier one).
+                let plugin_id_for_ns = plugin_id.clone();
+                let entities: Vec<_> = self.symbols.iter()
+                    .filter(|s| matches!(
+                        &s.namespace,
+                        crate::file_analysis::Namespace::Framework { id } if id == &plugin_id_for_ns
+                    ))
+                    .filter(|s| entity_names.iter().any(|n| n == &s.name))
+                    .map(|s| s.id)
+                    .collect();
+
+                if let Some(existing) = self.plugin_namespaces.iter_mut().find(|n| n.id == id) {
+                    for b in bridges {
+                        if !existing.bridges.contains(&b) {
+                            existing.bridges.push(b);
+                        }
+                    }
+                    for e in entities {
+                        if !existing.entities.contains(&e) {
+                            existing.entities.push(e);
+                        }
+                    }
+                } else {
+                    self.plugin_namespaces.push(crate::file_analysis::PluginNamespace {
+                        id,
+                        plugin_id: plugin_id_for_ns,
+                        kind,
+                        entities,
+                        bridges,
+                        decl_span,
+                    });
+                }
             }
         }
     }

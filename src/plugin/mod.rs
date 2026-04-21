@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::file_analysis::{
-    AccessKind, HandlerDisplay, HandlerOwner, HashKeyOwner, InferredType, ParamInfo, Span,
+    AccessKind, Bridge, HandlerDisplay, HandlerOwner, HashKeyOwner, InferredType, ParamInfo, Span,
     SymKind, SymbolDetail,
 };
 
@@ -245,6 +245,37 @@ pub enum EmitAction {
         span: Span,
         selection_span: Span,
         detail: SymbolDetail,
+    },
+    /// Declare a plugin namespace — a scope the plugin owns, with
+    /// bridges describing how Perl-space expressions reach it. The
+    /// builder collects namespaces declared via this action and
+    /// places them in `FileAnalysis.plugin_namespaces`; lookups
+    /// union entities from every namespace whose bridges match the
+    /// Perl class at the cursor.
+    ///
+    /// Entities are `SymbolId`s — plugins emit `Method` / `Handler` /
+    /// `Symbol` actions as usual to populate the symbol table, then
+    /// reference their IDs here. Rhai plugins: index returned
+    /// SymbolIds from `symbol_id(...)` helper (populated as of Phase 1).
+    PluginNamespace {
+        /// Plugin-generated unique identifier.
+        id: String,
+        /// Plugin-defined kind tag — `"app"`, `"minion"`, `"emitter"`, ….
+        kind: String,
+        /// Which Perl-space shapes reach this namespace.
+        bridges: Vec<Bridge>,
+        /// Names of entities the plugin emitted in this same dispatch.
+        /// The builder resolves each name to every matching `Symbol`
+        /// in the symbol table stamped with the same plugin's
+        /// `Namespace::Framework { id }`. Fan-out-on-multiple-classes
+        /// emissions (e.g. mojo-helpers' current_user on Controller
+        /// AND Mojolicious) all land in the same namespace via one
+        /// name lookup — plugins don't have to track SymbolIds.
+        #[serde(default)]
+        entity_names: Vec<String>,
+        /// Span the plugin is registering at — typically the
+        /// registration call (`$app->plugin('Minion', ...)` etc.).
+        decl_span: Span,
     },
     /// Declare a type for a variable inside a scope. Plugins use this
     /// when they know a framework-provided variable's type that the

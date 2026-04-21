@@ -529,6 +529,68 @@ pub enum HandlerOwner {
     Class(String),
 }
 
+// ---- Plugin namespace ----
+
+/// A plugin-controlled scope. Replaces the bolt-on of "plugin entities
+/// become Methods on a hijacked Perl class" with a first-class
+/// registration: the plugin says "I own a namespace — here's its
+/// bridges (how Perl-space expressions find it) and its entities".
+///
+/// Why this exists:
+///   * Helpers aren't methods on `Mojolicious::Controller`. They're
+///     callables on the app instance, reached THROUGH a controller.
+///   * Two apps in one workspace become two `PluginNamespace`s with
+///     the same `Class("Mojolicious::Controller")` bridge. Their
+///     entities don't collide at the class level — they're owned by
+///     the namespace, not the class.
+///   * Cross-file lookup is one primitive
+///     (`ModuleIndex::namespaces_bridged_to(class)`) instead of the
+///     patchwork of `class_content_index` / `reverse_index` /
+///     `modules_with_symbol`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginNamespace {
+    /// Plugin-generated unique identifier. E.g.
+    /// `"mojo-app:/abs/path/to/MyApp.pm"` or
+    /// `"minion:$minion@MyApp.pm:5"`. Plugin decides how to
+    /// disambiguate multiple instances in a single workspace.
+    pub id: String,
+    /// Which plugin registered this namespace — the Namespace::Framework
+    /// `id` that gets stamped on emitted entities.
+    pub plugin_id: String,
+    /// Plugin-defined kind tag. `"app"`, `"minion"`, `"emitter"`, …
+    /// Used by display/completion to tell users what sort of thing
+    /// a namespace member is.
+    pub kind: String,
+    /// Symbols that belong to this namespace. Cross-references into
+    /// the same FileAnalysis's `symbols` table — plugins still emit
+    /// Methods / Handlers normally; the namespace indexes them.
+    pub entities: Vec<SymbolId>,
+    /// How Perl-space expressions reach this namespace's entities.
+    pub bridges: Vec<Bridge>,
+    /// Span where the plugin declared the namespace (typically the
+    /// registration call — `$app->plugin('Minion', ...)` etc.).
+    pub decl_span: Span,
+}
+
+/// A connection from a Perl-space type/shape into a plugin namespace.
+/// When a lookup asks "what's reachable from class X?", the core
+/// unions Perl-native methods with entities from every namespace
+/// whose bridges match X.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Bridge {
+    /// Any expression typed as this class (or a subclass reached via
+    /// inheritance walk) can see this namespace's entities. The
+    /// canonical bridge for framework helpers on controllers.
+    Class(String),
+    /// A bareword function call returns an instance in this
+    /// namespace. `app` in Mojolicious::Lite returns the app.
+    Bareword(String),
+    /// A specific named variable resolves to an instance of this
+    /// namespace. Used sparingly — plugins generally prefer
+    /// Class/Bareword.
+    Variable(String),
+}
+
 // ---- Hash key owner (for scope graph) ----
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -703,6 +765,14 @@ pub struct FileAnalysis {
     /// Exported function names from `@EXPORT_OK = ...` assignments.
     pub export_ok: Vec<String>,
 
+    /// Plugin-declared namespaces. Each is a scope managed by a plugin
+    /// (a Mojolicious app, a Minion instance, an event-emitter subclass,
+    /// …). Declares bridges into Perl-space and owns a set of entities.
+    /// Lookups union these with native Perl resolution — see
+    /// `ModuleIndex::namespaces_bridged_to` for the cross-file primitive.
+    #[serde(default)]
+    pub plugin_namespaces: Vec<PluginNamespace>,
+
     // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
     #[serde(default)]
     base_type_constraint_count: usize,
@@ -741,6 +811,7 @@ impl FileAnalysis {
         framework_imports: HashSet<String>,
         export: Vec<String>,
         export_ok: Vec<String>,
+        plugin_namespaces: Vec<PluginNamespace>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -756,6 +827,7 @@ impl FileAnalysis {
             framework_imports,
             export,
             export_ok,
+            plugin_namespaces,
             base_type_constraint_count: 0,
             base_symbol_count: 0,
             scope_starts: Vec::new(),
@@ -4296,6 +4368,7 @@ mod tests {
             HashSet::new(),
             vec![],
             vec![],
+            vec![],
         )
     }
 
@@ -4394,6 +4467,7 @@ mod tests {
             HashMap::new(),
             vec![],
             HashSet::new(),
+            vec![],
             vec![],
             vec![],
         );
@@ -4517,6 +4591,7 @@ mod tests {
             HashMap::new(),
             vec![],
             HashSet::new(),
+            vec![],
             vec![],
             vec![],
         );
