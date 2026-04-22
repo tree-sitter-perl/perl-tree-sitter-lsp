@@ -544,7 +544,7 @@ impl<'a> Builder<'a> {
         }
         // (3) Imports — walk in reverse order so later `use` wins.
         for imp in self.imports.iter().rev() {
-            if imp.imported_symbols.iter().any(|s| s == call_name) {
+            if imp.imported_symbols.iter().any(|s| s.local_name == *call_name) {
                 return Some(imp.module_name.clone());
             }
         }
@@ -948,6 +948,20 @@ impl<'a> Builder<'a> {
             }
             plugin::EmitAction::FrameworkImport { keyword } => {
                 self.framework_imports.insert(keyword);
+            }
+            plugin::EmitAction::Import { module_name, imported_symbols, span } => {
+                // Plugin-synthetic `use` — indistinguishable from a
+                // hand-written `use Module qw(name1 name2)` downstream.
+                // The whole imported-function machinery (hover, gd,
+                // sig-help, unresolved-function diagnostic, completion
+                // detail) just works. `qw_close_paren` stays None —
+                // there's no qw list to insert into for auto-import.
+                self.imports.push(Import {
+                    module_name,
+                    imported_symbols,
+                    span,
+                    qw_close_paren: None,
+                });
             }
             plugin::EmitAction::VarType { variable, at, inferred_type } => {
                 // Scope resolution is deferred to the end of the build —
@@ -2011,35 +2025,44 @@ impl<'a> Builder<'a> {
                 }
 
                 // Extract imported symbols from qw(...) or list
-                let (imported_symbols, qw_close_paren) = self.extract_use_import_list(node);
+                let (raw_names, qw_close_paren) = self.extract_use_import_list(node);
                 // Emit FunctionCall refs for imported symbol names (for goto-def on import args).
                 // These refs pin to the module being imported from — the
                 // qw list IS the authoritative source.
                 if module_name != "parent" && module_name != "base" {
-                    if !imported_symbols.is_empty() {
-                        let sym_set: std::collections::HashSet<&str> = imported_symbols.iter().map(|s| s.as_str()).collect();
+                    if !raw_names.is_empty() {
+                        let sym_set: std::collections::HashSet<&str> = raw_names.iter().map(|s| s.as_str()).collect();
                         let kind = RefKind::FunctionCall {
                             resolved_package: Some(module_name.to_string()),
                         };
                         self.emit_refs_for_strings(node, &sym_set, kind);
                     }
                 }
+                // Tree-sitter parses `qw(a b)` as same-name imports — no
+                // syntactic support for `use Foo ( a => { -as => 'b' } )`
+                // yet, so this loop is pure `ImportedSymbol::same`. Plugin
+                // emissions (below) can produce renaming imports.
+                let imported_symbols: Vec<ImportedSymbol> = raw_names
+                    .iter()
+                    .map(|n| ImportedSymbol::same(n.clone()))
+                    .collect();
                 self.imports.push(Import {
                     module_name: module_name.to_string(),
-                    imported_symbols: imported_symbols.clone(),
+                    imported_symbols,
                     span: node_to_span(node),
                     qw_close_paren,
                 });
 
                 // Plugin dispatch for use-statements. Mojolicious::Lite
                 // autoimports a verb set (`get`, `post`, `helper`, ...)
-                // — the plugin emits `FrameworkImport` actions so our
-                // unresolved-function diagnostic doesn't flag them.
+                // — the plugin emits `Import` actions pointing at the
+                // real source module so hover/gd/sig-help flow through
+                // the existing imported-function resolution path.
                 if !self.plugins.is_empty() {
                     let raw_args = self.extract_mojo_base_args(node);
                     let ctx = plugin::UseContext {
                         module_name: module_name.to_string(),
-                        imports: imported_symbols,
+                        imports: raw_names,
                         raw_args,
                         current_package: self.current_package.clone(),
                         span: node_to_span(node),
@@ -2484,6 +2507,29 @@ impl<'a> Builder<'a> {
                             span: node_to_span(node),
                         });
                     }
+                } else if matches!(right.kind(), "bareword" | "scoped_identifier") {
+                    // No-paren RHS bareword that matches a known local sub —
+                    // `my $x = app;` where `app` is a plugin-synthesized
+                    // typed Sub. Tree-sitter parses it as a plain bareword
+                    // (not a function_call_expression), but Perl calls it
+                    // at runtime when the name resolves as a sub. Record
+                    // the binding so the return-type post-pass types `$x`.
+                    let name_opt = right.utf8_text(self.source).ok();
+                    if let Some(name) = name_opt {
+                        let is_known_sub = self.symbols.iter().any(|s|
+                            s.name == name
+                            && matches!(s.kind, SymKind::Sub | SymKind::Method));
+                        if is_known_sub {
+                            if let Some(vt) = self.get_var_text_from_lhs(left) {
+                                self.call_bindings.push(CallBinding {
+                                    variable: vt,
+                                    func_name: name.to_string(),
+                                    scope: self.current_scope(),
+                                    span: node_to_span(node),
+                                });
+                            }
+                        }
+                    }
                 } else if right.kind() == "method_call_expression" {
                     // RHS is a method call — record binding for return-type post-pass
                     if let Some(method_node) = right.child_by_field_name("method") {
@@ -2560,6 +2606,36 @@ impl<'a> Builder<'a> {
             }
             "method_call_expression" => {
                 self.extract_constructor_class(node).map(InferredType::ClassName)
+            }
+            // Named sub call (with or without parens) that resolves to a
+            // locally known Sub/Method with a declared return type.
+            //
+            //   sub foo :: Bar { … }        my $x = foo;          → $x : Bar
+            //   Mojo::Lite emits `sub app :: Mojolicious`, so:
+            //                                my $x = app;         → $x : Mojolicious
+            //                                app->routes->…       → chain seeded with Mojolicious
+            //
+            // Imported calls (no local symbol, return type unknown at
+            // build time) stay with the caller's CallBinding fallback
+            // so enrichment can fill them in when the module resolves.
+            "bareword" | "scoped_identifier"
+            | "function_call_expression" | "ambiguous_function_call_expression" => {
+                let name = match node.kind() {
+                    "bareword" | "scoped_identifier" => node.utf8_text(self.source).ok()?,
+                    _ => {
+                        let func = node.child_by_field_name("function")?;
+                        func.utf8_text(self.source).ok()?
+                    }
+                };
+                self.symbols.iter().find_map(|sym| {
+                    if sym.name != name { return None; }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return None; }
+                    if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
+                        Some(rt.clone())
+                    } else {
+                        None
+                    }
+                })
             }
             _ => None,
         }
@@ -6206,10 +6282,12 @@ has password => (is => 'rw');
         assert_eq!(fa.imports.len(), 2);
 
         assert_eq!(fa.imports[0].module_name, "List::Util");
-        assert_eq!(fa.imports[0].imported_symbols, vec!["first", "any", "all"]);
+        let names0: Vec<&str> = fa.imports[0].imported_symbols.iter().map(|s| s.local_name.as_str()).collect();
+        assert_eq!(names0, vec!["first", "any", "all"]);
 
         assert_eq!(fa.imports[1].module_name, "Scalar::Util");
-        assert_eq!(fa.imports[1].imported_symbols, vec!["blessed"]);
+        let names1: Vec<&str> = fa.imports[1].imported_symbols.iter().map(|s| s.local_name.as_str()).collect();
+        assert_eq!(names1, vec!["blessed"]);
     }
 
     #[test]
@@ -6253,7 +6331,8 @@ has password => (is => 'rw');
 
         // Import should exist
         assert_eq!(fa.imports.len(), 1);
-        assert_eq!(fa.imports[0].imported_symbols, vec!["first"]);
+        let names: Vec<&str> = fa.imports[0].imported_symbols.iter().map(|s| s.local_name.as_str()).collect();
+        assert_eq!(names, vec!["first"]);
     }
 
     #[test]
@@ -8303,6 +8382,332 @@ $r->get('/users')->to('Users#list');
         }
     }
 
+    // ==== AliasTo: DSL verbs delegate to real methods, not imaginary ones. ====
+    //
+    // `Mojolicious::Lite` monkey-patches `get`, `post`, `helper`, `app`, …
+    // into the caller at import time. At the Perl level each verb is just
+    // a thin pass-through to a real method:
+    //
+    //     sub { $routes->get(@_) }                  # get, post, put, any,
+    //                                               # options, patch, websocket
+    //     sub { $routes->delete(@_) }               # del
+    //     sub { $app->helper(@_) }                  # helper, hook, plugin
+    //     sub { $app }                              # app (returns the app)
+    //
+    // Previously the plugin fabricated a `SymbolDetail::Sub` per verb with a
+    // hand-written one-line `doc:` and, for `app`, a typed return. That's
+    // the "imaginary methods" the user pointed at: hover shows stub text,
+    // gd lands on the use statement, signature help has no params, and —
+    // worst — the synthesized Sub shadows chain resolution on real Mojo
+    // objects (`$routes->get('/x')->to(...)` loses the `to` intelligence).
+    //
+    // The fix: emit an *alias* that points at the real cross-file method.
+    // Hover, gd, sig help, and return-type inference all dereference the
+    // alias and use the real method's data. The tests below pin the
+    // expected behavior on real cross-file methods — they fail until
+    // `FunctionAlias` / `alias_to` lands in the data model and the
+    // resolution paths dereference it.
+
+    /// The user-visible "stomping" case: `$routes->get('/x')->to('X#y')` on
+    /// a real `Mojolicious::Routes` should chain through
+    /// `Mojolicious::Routes::Route::get` (fluent, returns its own class)
+    /// so `->to` resolves on `Mojolicious::Routes::Route`. The plugin-
+    /// synthesized top-level `get` Sub in the Lite script must NOT
+    /// intercept a method call on a real object of a different class.
+    #[test]
+    fn mojo_lite_chain_off_real_routes_preserves_real_method_chain() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let app_src = r#"
+package main;
+use Mojolicious::Lite;
+use Mojolicious;
+
+my $routes = Mojolicious::Routes->new;
+$routes->get('/users')->to('Users#list');
+"#;
+        // Stub Mojolicious::Routes::Route with a fluent `get` (returns
+        // its own class) so chain resolution can carry the type forward.
+        let route_pm_src = r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+
+sub get {
+    my $self = shift;
+    return $self;
+}
+
+sub to {
+    my $self = shift;
+    return $self;
+}
+1;
+"#;
+        // Mojolicious::Routes ISA Mojolicious::Routes::Route in real
+        // Mojo, so methods invoked on $routes (typed Mojolicious::Routes)
+        // flow up to the parent class via the normal inheritance walk.
+        let routes_pm_src = r#"
+package Mojolicious::Routes;
+use Mojo::Base 'Mojolicious::Routes::Route';
+1;
+"#;
+
+        let app_fa = build_fa(app_src);
+        let route_fa = build_fa(route_pm_src);
+        let routes_fa = build_fa(routes_pm_src);
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(route_fa),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes.pm"),
+            Arc::new(routes_fa),
+        );
+
+        // `$routes->get` must resolve to the real Mojolicious::Routes::Route::get
+        // via inheritance (Mojolicious::Routes → Mojolicious::Routes::Route) —
+        // NOT to the plugin's top-level `get` Sub emitted by mojo-lite.
+        // `class_name()` unifies ClassName and FirstParam — both are
+        // usable for downstream chain resolution.
+        let get_rt = app_fa.find_method_return_type(
+            "Mojolicious::Routes", "get", Some(&idx), None,
+        );
+        assert_eq!(
+            get_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "`$$routes->get` must chain through the REAL Mojolicious::Routes::Route::get — \
+             not the plugin's imaginary top-level `get` Sub. got: {:?}",
+            get_rt,
+        );
+
+        // Second hop: `->to(...)` on the Route object returned by `get`.
+        // User's wording: "get should return a to which is intelligent".
+        // Fluent Route — `to` stays on Mojolicious::Routes::Route so the
+        // chain can keep going (`->name(...)`, `->via(...)`, ...).
+        let to_rt = app_fa.find_method_return_type(
+            "Mojolicious::Routes::Route", "to", Some(&idx), None,
+        );
+        assert_eq!(
+            to_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "`->get('/x')->to(...)` must stay intelligent — Route::to is fluent, and \
+             further hops depend on it. got: {:?}",
+            to_rt,
+        );
+    }
+
+    /// Hover on the DSL verb `get` in `get '/x' => sub {}` must surface
+    /// the real `Mojolicious::Routes::Route::get` POD, not the plugin's
+    /// hand-written one-liner. Pins that the plugin's Sub symbol for
+    /// `get` is an alias — its hover dereferences to the real method.
+    #[test]
+    fn mojo_lite_dsl_verb_hover_uses_real_method_doc() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let app_src = r#"
+package main;
+use Mojolicious::Lite;
+
+get '/users' => sub { my $c = shift; };
+"#;
+        // Real method carries a recognizable POD line. The test matches
+        // on a substring that no hand-written plugin doc uses.
+        let route_pm_src = r#"
+package Mojolicious::Routes::Route;
+
+=head2 get
+
+  my $route = $r->get('/:foo' => sub ($c) {...});
+
+Generate route matching only GET requests. Shortcut for
+L<Mojolicious::Routes::Route/"any">.
+
+=cut
+
+sub get { my $self = shift; return $self; }
+1;
+"#;
+
+        let app_fa = build_fa(app_src);
+        let route_fa = build_fa(route_pm_src);
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(route_fa),
+        );
+
+        // Cursor on the `get` bareword at the call site.
+        let (row, line) = app_src.lines().enumerate()
+            .find(|(_, l)| l.starts_with("get "))
+            .expect("`get` call line");
+        let col = line.find("get").unwrap() + 1;
+        let point = tree_sitter::Point { row, column: col };
+
+        let hover = app_fa.hover_info(point, app_src, None, Some(&idx))
+            .expect("hover on DSL verb `get` returns text");
+
+        assert!(
+            hover.contains("Generate route matching only GET requests"),
+            "hover on `get` must surface the real Mojolicious::Routes::Route::get POD \
+             (verb is an alias, not an imaginary stub). got: {:?}",
+            hover,
+        );
+    }
+
+    /// `app` parses as a bareword invocant (`app->routes`). The plugin's
+    /// typed `app` Sub must make that bareword resolve to Mojolicious so
+    /// the chain can flow. Pins the bareword edge case explicitly — the
+    /// regression shape the user called out.
+    #[test]
+    fn mojo_lite_app_bareword_invocant_types_as_mojolicious() {
+        let src = r#"
+package main;
+use Mojolicious::Lite;
+
+my $x = app;
+"#;
+        let fa = build_fa(src);
+
+        // `$x = app` — $x should pick up the return type of the plugin's
+        // `app` Sub (ClassName("Mojolicious")).
+        let tc = fa.type_constraints.iter().find(|tc| tc.variable == "$x")
+            .expect("$x must carry a type constraint sourced from `app`'s return type");
+        assert!(
+            matches!(&tc.inferred_type, InferredType::ClassName(c) if c == "Mojolicious"),
+            "`$$x = app` must type as Mojolicious — bareword `app` resolves to the \
+             plugin's typed Sub. got: {:?}",
+            tc.inferred_type,
+        );
+    }
+
+    /// The headline case: the full `app->routes->get('/x')->to('X#y')`
+    /// chain must be fully intelligent at every hop. One plugin stub
+    /// at the head (`app` → Mojolicious) — everything else is real
+    /// cross-file method resolution.
+    ///
+    /// Every arrow is a separate assertion so a regression at any hop
+    /// points at the specific broken link:
+    ///
+    ///   app                                          → Mojolicious              (plugin-typed Sub)
+    ///   Mojolicious::routes                          → Mojolicious::Routes       (real Mojo::Base accessor)
+    ///   Mojolicious::Routes::get  (via parent Route) → Mojolicious::Routes::Route (fluent)
+    ///   Mojolicious::Routes::Route::to               → Mojolicious::Routes::Route (fluent)
+    ///
+    /// If any hop returns None the chain's "intelligence" collapses —
+    /// completion, hover, gd, sig-help all lose context from that point
+    /// forward. That collapse is the "hardcoded list" symptom the user
+    /// reported, flipped around.
+    #[test]
+    fn mojo_lite_app_routes_chain_is_fully_intelligent_to_the_end() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let app_src = r#"
+package main;
+use Mojolicious::Lite;
+
+app->routes->get('/users')->to('Users#list');
+"#;
+        let mojolicious_pm_src = r#"
+package Mojolicious;
+use Mojo::Base -base;
+
+has routes => sub { Mojolicious::Routes->new };
+1;
+"#;
+        let routes_pm_src = r#"
+package Mojolicious::Routes;
+use Mojo::Base 'Mojolicious::Routes::Route';
+1;
+"#;
+        let route_pm_src = r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+
+sub get { my $self = shift; return $self; }
+sub to  { my $self = shift; return $self; }
+1;
+"#;
+
+        let app_fa = build_fa(app_src);
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious.pm"),
+            Arc::new(build_fa(mojolicious_pm_src)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes.pm"),
+            Arc::new(build_fa(routes_pm_src)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(build_fa(route_pm_src)),
+        );
+
+        // Hop 1: `app` → Mojolicious. The plugin's typed Sub seeds the
+        // chain. This is the single sanctioned plugin stub.
+        let app_sym = app_fa.symbols.iter().find(|s|
+            s.name == "app"
+            && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-lite")
+        ).expect("mojo-lite plugin must synthesize `app`");
+        if let SymbolDetail::Sub { return_type: Some(rt), .. } = &app_sym.detail {
+            assert_eq!(rt.class_name(), Some("Mojolicious"),
+                "hop 1: `app` must type as Mojolicious — the one plugin stub the chain leans on");
+        } else {
+            panic!("hop 1: `app` must carry a typed return");
+        }
+
+        // Hop 2: Mojolicious::routes → Mojolicious::Routes. Real
+        // cross-file Mojo::Base accessor; the anon-sub default's
+        // `Mojolicious::Routes->new` is lifted as the return type.
+        let routes_rt = app_fa.find_method_return_type(
+            "Mojolicious", "routes", Some(&idx), None,
+        );
+        assert_eq!(
+            routes_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes"),
+            "hop 2: `Mojolicious::routes` must resolve cross-file to the real Mojo::Base \
+             accessor and return Mojolicious::Routes. got: {:?}",
+            routes_rt,
+        );
+
+        // Hop 3: Mojolicious::Routes::get → Mojolicious::Routes::Route.
+        // Resolves via inheritance (Routes ISA Route) to the real fluent
+        // method on the parent class. This is where plugin-synthesized
+        // `get` from mojo-lite MUST NOT stomp.
+        let get_rt = app_fa.find_method_return_type(
+            "Mojolicious::Routes", "get", Some(&idx), None,
+        );
+        assert_eq!(
+            get_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "hop 3: `$$routes->get` must chain through the REAL \
+             Mojolicious::Routes::Route::get (fluent) — not the plugin's \
+             imaginary top-level `get` Sub. got: {:?}",
+            get_rt,
+        );
+
+        // Hop 4: Mojolicious::Routes::Route::to → Mojolicious::Routes::Route.
+        // Fluent. After this, `->name(...)`/`->via(...)`/etc. must still
+        // resolve on Route — i.e. the chain keeps going, not collapses.
+        let to_rt = app_fa.find_method_return_type(
+            "Mojolicious::Routes::Route", "to", Some(&idx), None,
+        );
+        assert_eq!(
+            to_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "hop 4: `->to(...)` must chain through the real fluent `to` on \
+             Mojolicious::Routes::Route — preserving intelligence for further \
+             hops (->name, ->via, ...). got: {:?}",
+            to_rt,
+        );
+    }
+
     /// Adversarial: a dotted helper `users.create` and a route whose
     /// action is `Users#create` both end up with a Perl-level symbol
     /// named `create`. They are UNRELATED:
@@ -9069,8 +9474,13 @@ sub new {
         let tree = parser.parse(&src, None).unwrap();
         let idx = crate::module_index::ModuleIndex::new_for_test();
 
-        let line_idx = 117u32; // line 118 (1-indexed) = 117 (0-indexed)
-        let line = src.lines().nth(line_idx as usize).unwrap();
+        // Locate the enqueue call by content — line numbers in the
+        // demo file shift whenever it's edited, and the test's value
+        // is the signature-help behavior, not a literal row.
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("$minion->enqueue(send_email"))
+            .map(|(i, l)| (i as u32, l))
+            .expect("demo must contain the send_email enqueue site");
 
         let cases: &[(&str, &str, Option<u32>)] = &[
             ("alice@example.com", "'alice", Some(0)),

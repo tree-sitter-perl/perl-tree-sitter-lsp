@@ -35,6 +35,7 @@ package MyApp;
 use strict;
 use warnings;
 use Mojolicious::Lite;
+use Mojolicious;
 
 # ── mojo-helpers: simple + dotted chains ──
 #

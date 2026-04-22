@@ -146,6 +146,7 @@ pub fn plugin_namespace_to_workspace_info(
     }
 }
 
+#[allow(deprecated)]
 pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
     use crate::file_analysis::SymKind as FaSymKind;
     // Only include significant symbols (subs, methods, packages, classes)
@@ -187,16 +188,18 @@ pub fn find_definition(
     // Check if cursor is on a function call that matches an imported symbol
     if let Some(r) = analysis.ref_at(point) {
         if matches!(r.kind, RefKind::FunctionCall { .. }) {
-            if let Some((import, module_path)) =
+            if let Some((import, module_path, remote_name)) =
                 resolve_imported_function(analysis, &r.target_name, module_index)
             {
                 // Jump to the module's use statement in the current file
-                // (or the .pm file if we can resolve it)
+                // (or the .pm file if we can resolve it). Cross-file
+                // sub_info lookup uses REMOTE name — distinct from
+                // target_name for renaming imports.
                 if let Ok(module_uri) = Url::from_file_path(&module_path) {
                     // Try to get the actual definition line from the module index.
                     let def_line = module_index
                         .get_cached(&import.module_name)
-                        .and_then(|cached| cached.sub_info(&r.target_name).map(|s| s.def_line()));
+                        .and_then(|cached| cached.sub_info(&remote_name).map(|s| s.def_line()));
                     let def_range = match def_line {
                         Some(line) => Range {
                             start: Position { line, character: 0 },
@@ -795,14 +798,20 @@ pub fn hover_info(
     // Check if cursor is on an imported function call
     if let Some(r) = analysis.ref_at(point) {
         if matches!(r.kind, RefKind::FunctionCall { .. }) {
-            if let Some((import, _path)) =
+            if let Some((import, _path, remote_name)) =
                 resolve_imported_function(analysis, &r.target_name, module_index)
             {
                 let mut parts = Vec::new();
 
-                // Show signature if available.
+                // Show signature if available. Cross-file lookup uses
+                // the REMOTE name — for a renaming import (`del` →
+                // `delete`), cursor is on `del` but sub_info lives
+                // under `delete` in the cached module.
                 if let Some(cached) = module_index.get_cached(&import.module_name) {
-                    if let Some(sub_info) = cached.sub_info(&r.target_name) {
+                    if let Some(sub_info) = cached.sub_info(&remote_name) {
+                        // Present the sig under the LOCAL name — that's
+                        // what the user typed and what hover should lead
+                        // with; the remote name is just how we fetched it.
                         let sig = format_imported_signature(&r.target_name, &sub_info);
                         parts.push(format!("```perl\n{}\n```", sig));
                         if let Some(doc) = sub_info.doc() {
@@ -811,7 +820,14 @@ pub fn hover_info(
                     }
                 }
 
-                parts.push(format!("*imported from `{}`*", import.module_name));
+                if remote_name != r.target_name {
+                    parts.push(format!(
+                        "*imported from `{}` (as `{}`)*",
+                        import.module_name, remote_name
+                    ));
+                } else {
+                    parts.push(format!("*imported from `{}`*", import.module_name));
+                }
                 let markdown = parts.join("\n\n");
                 return Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
@@ -1689,17 +1705,21 @@ fn imported_function_completions(
     for import in &analysis.imports {
         let cached: Option<Arc<CachedModule>> = module_index.get_cached(&import.module_name);
 
-        // 1. Always offer explicitly imported symbols (from the qw list)
-        for name in &import.imported_symbols {
-            if !seen.insert(name.clone()) {
+        // 1. Always offer explicitly imported symbols (from the qw list).
+        // Dedup/dispatch by LOCAL name (what the user types); resolve
+        // detail against REMOTE name (what exists in the source module)
+        // so renaming imports like `del` → `delete` show the real doc.
+        for is in &import.imported_symbols {
+            let local = &is.local_name;
+            if !seen.insert(local.clone()) {
                 continue;
             }
-            if !analysis.symbols_named(name).is_empty() {
+            if !analysis.symbols_named(local).is_empty() {
                 continue;
             }
-            let detail = completion_detail_for_import(name, cached.as_deref(), &import.module_name);
+            let detail = completion_detail_for_import(is.remote(), cached.as_deref(), &import.module_name);
             candidates.push(CompletionCandidate {
-                label: name.clone(),
+                label: local.clone(),
                 kind: FaSymKind::Sub,
                 detail: Some(detail),
                 insert_text: None,
@@ -1860,23 +1880,34 @@ fn unimported_function_completions(
 /// Find which import provides a given function name.
 /// Checks both explicitly imported symbols and all @EXPORT/@EXPORT_OK
 /// from already-imported modules. Single DashMap lookup per module.
+///
+/// Returns the matched Import, the module's path, and the REMOTE name
+/// (the sub's actual name in the source module — differs from the
+/// caller's `func_name` only for renaming imports like `del` → `delete`).
+/// Callers use the remote name for `cached.sub_info(...)` lookups so
+/// hover/gd/sig-help reach the real sub.
 fn resolve_imported_function<'a>(
     analysis: &'a FileAnalysis,
     func_name: &str,
     module_index: &ModuleIndex,
-) -> Option<(&'a crate::file_analysis::Import, std::path::PathBuf)> {
+) -> Option<(&'a crate::file_analysis::Import, std::path::PathBuf, String)> {
     for import in &analysis.imports {
         if let Some(cached) = module_index.get_cached(&import.module_name) {
-            let explicitly_imported = import.imported_symbols.iter().any(|s| s == func_name);
+            let explicit = import.imported_symbols.iter().find(|s| s.local_name == *func_name);
+            if let Some(is) = explicit {
+                return Some((import, cached.path.clone(), is.remote().to_string()));
+            }
+            // Export lists are always in the remote namespace — a name
+            // appearing there matches a same-name use at the call site.
             let in_export_lists = cached.analysis.export.iter().any(|s| s == func_name)
                 || cached.analysis.export_ok.iter().any(|s| s == func_name);
-            if explicitly_imported || in_export_lists {
-                return Some((import, cached.path.clone()));
+            if in_export_lists {
+                return Some((import, cached.path.clone(), func_name.to_string()));
             }
-        } else if import.imported_symbols.iter().any(|s| s == func_name) {
+        } else if let Some(is) = import.imported_symbols.iter().find(|s| s.local_name == *func_name) {
             // Module not cached yet but explicitly listed in qw() — trust the import.
             if let Some(path) = module_index.module_path_cached(&import.module_name) {
-                return Some((import, path));
+                return Some((import, path, is.remote().to_string()));
             }
         }
     }
@@ -2001,7 +2032,7 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
         // Skip if explicitly listed in any import's qw(...),
         // or auto-imported via @EXPORT on a bare `use Foo;` (no qw list).
         let explicitly_imported = analysis.imports.iter().any(|imp| {
-            if imp.imported_symbols.iter().any(|s| s == name) {
+            if imp.imported_symbols.iter().any(|s| s.local_name == *name) {
                 return true;
             }
             // Bare `use Foo;` — check if function is in @EXPORT (auto-imported)
@@ -2020,7 +2051,7 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
 
         // Check if an imported module exports this function
         let range = span_to_range(r.span);
-        if let Some((import, _path)) = resolve_imported_function(analysis, name, module_index) {
+        if let Some((import, _path, _remote)) = resolve_imported_function(analysis, name, module_index) {
             // Importable but not yet in the qw() list → actionable hint
             diagnostics.push(Diagnostic {
                 range,

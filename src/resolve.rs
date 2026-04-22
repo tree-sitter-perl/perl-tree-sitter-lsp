@@ -614,8 +614,8 @@ $b->run;
         //                    "$f->run;" → cols 0..1 = "$f", 2..3 = "->",
         //                    4..6 = "run".
         //   line 12, col 4 — `$b->run` (cursor on "run").
-        let run_in_foo_decl = tree_sitter::Point { row: 2, column: 4 };
-        let run_in_bar_decl = tree_sitter::Point { row: 6, column: 4 };
+        let _run_in_foo_decl = tree_sitter::Point { row: 2, column: 4 };
+        let _run_in_bar_decl = tree_sitter::Point { row: 6, column: 4 };
         let f_run_call = tree_sitter::Point { row: 11, column: 4 };
         let b_run_call = tree_sitter::Point { row: 12, column: 4 };
 
@@ -870,6 +870,7 @@ hi();
         let src = r#"
 package MyApp;
 use Mojolicious::Lite;
+use Mojolicious;
 
 my $app = Mojolicious->new;
 $app->helper('users.create' => sub ($c, $name, $email) {});
@@ -883,10 +884,10 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
         let fa = crate::builder::build(&tree, src.as_bytes());
 
         // Lines (0-indexed; file starts with a blank row 0):
-        //   row 5 — `$app->helper('users.create' => sub ...);`
-        //   row 8 — `$r->post('/users')->to(controller => 'Users', action => 'create');`
-        let line_helper = 5;
-        let line_route = 8;
+        //   row 6 — `$app->helper('users.create' => sub ...);`
+        //   row 9 — `$r->post('/users')->to(controller => 'Users', action => 'create');`
+        let line_helper = 6;
+        let line_route = 9;
 
         let src_line = |n: usize| src.lines().nth(n).unwrap_or("");
         let helper_col = src_line(line_helper).find("create")
@@ -931,7 +932,7 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
         use tree_sitter::Parser;
 
         let store = FileStore::new();
-        let mut parse_build = |source: &str| {
+        let parse_build = |source: &str| {
             let mut parser = Parser::new();
             parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
             let tree = parser.parse(source, None).unwrap();

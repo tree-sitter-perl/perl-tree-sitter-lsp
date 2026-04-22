@@ -670,13 +670,70 @@ pub struct MethodCallBinding {
 
 // ---- Import ----
 
+/// One name brought into scope by a `use` statement.
+///
+/// `local_name` is how the name appears at call sites in this file.
+/// `remote_name` is the sub's real name in the source module — usually
+/// identical to `local_name` (the common case, encoded as `None` to
+/// keep the serialized form compact) and different only for renaming
+/// imports: `del` in Mojolicious::Lite is really `delete` on
+/// Mojolicious::Routes::Route, `use Exporter::Tiny ( foo => { -as => 'bar' } )`
+/// gives a `bar` locally pointing at the real `foo`, etc.
+///
+/// Cross-file lookups always resolve via `remote()` so hover, gd, sig
+/// help, and return-type inference use the real module's `sub_info`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ImportedSymbol {
+    pub local_name: String,
+    /// `None` means the local and remote names are the same.
+    ///
+    /// No `skip_serializing_if` — bincode is a non-self-describing
+    /// format and needs the field present on the wire regardless.
+    /// Self-describing formats (JSON, YAML) happily encode `null`
+    /// for None too, so keeping it always-serialized is fine
+    /// everywhere.
+    #[serde(default)]
+    pub remote_name: Option<String>,
+}
+
+impl ImportedSymbol {
+    /// Same-name import — the overwhelmingly common case.
+    pub fn same(name: impl Into<String>) -> Self {
+        Self { local_name: name.into(), remote_name: None }
+    }
+    /// Renaming import — local name differs from the real sub's name.
+    ///
+    /// Currently constructed only from Rhai plugins via serde-deserialized
+    /// maps (`#{ local_name: ..., remote_name: ... }`), so this Rust-side
+    /// constructor has no direct caller yet. Keeping it as documented public
+    /// API so future Rust callers (e.g. a hand-written parser for renaming
+    /// import syntax, or core plugins) have the canonical way to build one.
+    #[allow(dead_code)]
+    pub fn renamed(local: impl Into<String>, remote: impl Into<String>) -> Self {
+        let remote = remote.into();
+        let local = local.into();
+        // Collapse `remote == local` to the same-name shape so downstream
+        // code doesn't need to handle both representations.
+        if remote == local {
+            Self { local_name: local, remote_name: None }
+        } else {
+            Self { local_name: local, remote_name: Some(remote) }
+        }
+    }
+    /// Real name in the source module — used for cross-file sub_info lookup.
+    pub fn remote(&self) -> &str {
+        self.remote_name.as_deref().unwrap_or(&self.local_name)
+    }
+}
+
 /// A `use Foo::Bar qw(func1 func2)` statement parsed from the source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Import {
     /// Module name, e.g. "List::Util".
     pub module_name: String,
-    /// Explicitly imported symbols from `qw(...)`. Empty = bare `use Foo;`.
-    pub imported_symbols: Vec<String>,
+    /// Explicitly imported names from `qw(...)`. Empty = bare `use Foo;`.
+    /// Each entry carries local + (optional) remote name for renaming imports.
+    pub imported_symbols: Vec<ImportedSymbol>,
     /// Span of the entire `use` statement.
     pub span: Span,
     /// Position of the closing delimiter of the `qw()` list (the `)` character).
@@ -745,9 +802,11 @@ fn sub_display_override(detail: &SymbolDetail) -> Option<HandlerDisplay> {
 }
 
 /// Outline prefix honoring a plugin-provided display override. Falls
-/// back to the language default (`sub`/`method`) when no override is
-/// set. Keeps the label aligned with the icon so "method users" doesn't
-/// render next to a Function-kind glyph.
+/// back to the language default (`sub` / `method`) when no override
+/// is set. Keeps the label aligned with the icon so "method users"
+/// doesn't render next to a Function-kind glyph, and plugin-synthesized
+/// callables render with their semantic word (`helper users`, `route
+/// '/x'`, `task send_email`) instead of a flat `sub`.
 fn sub_display_prefix(detail: &SymbolDetail, default: &'static str) -> &'static str {
     if let SymbolDetail::Sub { display: Some(d), .. } = detail {
         match d {
@@ -2453,6 +2512,46 @@ impl FileAnalysis {
                             return Some(self.format_symbol_hover(sym, source));
                         }
                     }
+                    // Fall-through: the name might be a function imported
+                    // from another module (either hand-written `use` or a
+                    // plugin-synthesized Import like Mojolicious::Lite's
+                    // route verbs). Cross-file lookup pulls real POD,
+                    // real signature, real return type from the source
+                    // module's cached analysis.
+                    if let Some(idx) = module_index {
+                        for import in &self.imports {
+                            let matched = import.imported_symbols.iter()
+                                .find(|s| s.local_name == r.target_name);
+                            let Some(is) = matched else { continue };
+                            let Some(cached) = idx.get_cached(&import.module_name) else { continue };
+                            let Some(sub_info) = cached.sub_info(is.remote()) else { continue };
+
+                            let sig_params = sub_info.params().iter()
+                                .map(|p| p.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let mut sig = format!("sub {}({})", r.target_name, sig_params);
+                            if let Some(rt) = sub_info.return_type() {
+                                sig.push_str(&format!(" → {}", format_inferred_type(rt)));
+                            }
+                            let mut text = format!("```perl\n{}\n```", sig);
+                            if let Some(doc) = sub_info.doc() {
+                                text.push_str(&format!("\n\n{}", doc));
+                            }
+                            if is.remote() != r.target_name {
+                                text.push_str(&format!(
+                                    "\n\n*imported from `{}` (as `{}`)*",
+                                    import.module_name, is.remote()
+                                ));
+                            } else {
+                                text.push_str(&format!(
+                                    "\n\n*imported from `{}`*",
+                                    import.module_name
+                                ));
+                            }
+                            return Some(text);
+                        }
+                    }
                 }
                 RefKind::MethodCall { ref invocant, ref invocant_span, ref invocant_class, .. } => {
                     // Prefer the build-time `invocant_class` field
@@ -3427,16 +3526,16 @@ impl FileAnalysis {
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
+                    // Plugin-synthesized callables carry a semantic
+                    // word (helper/route/task/…) that replaces the
+                    // default `sub` prefix. Native subs render as
+                    // `sub name`; helpers render as `helper name`,
+                    // routes as `route '/x'`, etc. The icon comes
+                    // from `display_override` via a separate path;
+                    // the label here keeps them in lockstep.
+                    let prefix = sub_display_prefix(&sym.detail, "sub");
+                    let label = format!("{} {}", prefix, sym.name);
                     let disp = sub_display_override(&sym.detail);
-                    let label = match disp {
-                        Some(_) => sym.name.clone(),
-                        None => format!("sub {}", sym.name),
-                    };
-                    // Plugin-emitted subs carry a semantic word
-                    // (helper/route/task/…) in `detail` so clients
-                    // can render `[Function] name — helper` without
-                    // needing a new LSP kind. `outline_word` is None
-                    // for plain Method/Function/Field/etc.
                     let outline_detail = disp.and_then(|d| d.outline_word()).map(|s| s.to_string());
                     (label, outline_detail, children)
                 }
@@ -3445,11 +3544,9 @@ impl FileAnalysis {
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
+                    let prefix = sub_display_prefix(&sym.detail, "method");
+                    let label = format!("{} {}", prefix, sym.name);
                     let disp = sub_display_override(&sym.detail);
-                    let label = match disp {
-                        Some(_) => sym.name.clone(),
-                        None => format!("method {}", sym.name),
-                    };
                     let outline_detail = disp.and_then(|d| d.outline_word()).map(|s| s.to_string());
                     (label, outline_detail, children)
                 }
@@ -3612,7 +3709,7 @@ impl FileAnalysis {
 
         // ---- Refs: variables, functions, methods, properties, namespaces ----
         let imported_names: std::collections::HashSet<&str> = self.imports.iter()
-            .flat_map(|imp| imp.imported_symbols.iter().map(|s| s.as_str()))
+            .flat_map(|imp| imp.imported_symbols.iter().map(|s| s.local_name.as_str()))
             .collect();
 
         for r in &self.refs {
@@ -4344,9 +4441,9 @@ impl FileAnalysis {
         if !is_method {
             if let Some(idx) = module_index {
                 for import in &self.imports {
-                    if import.imported_symbols.iter().any(|s| s == name) {
+                    if let Some(is) = import.imported_symbols.iter().find(|s| s.local_name == *name) {
                         if let Some(cached) = idx.get_cached(&import.module_name) {
-                            if let Some(sub_info) = cached.sub_info(name) {
+                            if let Some(sub_info) = cached.sub_info(is.remote()) {
                                 return Some(cross_file_resolved(&sub_info));
                             }
                         }

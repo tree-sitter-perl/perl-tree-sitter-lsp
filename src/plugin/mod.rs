@@ -309,6 +309,27 @@ pub enum EmitAction {
     /// `Builder.framework_imports`.
     FrameworkImport { keyword: String },
 
+    /// Synthesize an `Import` for names a framework pulls into scope at
+    /// import time. `use Mojolicious::Lite` monkey-patches `get`, `post`,
+    /// `helper`, ... into the caller as thin pass-throughs to real
+    /// methods on `Mojolicious::Routes::Route` and `Mojolicious` — the
+    /// plugin emits this so hover/gd/sig-help on those names flow through
+    /// the existing imported-function resolution path to the real
+    /// source module (no fabricated docs).
+    ///
+    /// `imported_symbols` supports renaming imports: `del` in
+    /// Mojolicious::Lite is really `delete` on Route, so the plugin
+    /// emits `ImportedSymbol::renamed("del", "delete")`. Same-name
+    /// imports (the common case) use `ImportedSymbol::same(name)`.
+    ///
+    /// `span` is the `use` statement's span — used for gd's "jump to
+    /// use statement" branch and for range-based diagnostics.
+    Import {
+        module_name: String,
+        imported_symbols: Vec<crate::file_analysis::ImportedSymbol>,
+        span: Span,
+    },
+
     /// Declare a type for a variable inside a scope. Plugins use this
     /// when they know a framework-provided variable's type that the
     /// builder can't infer — the classic case being callback arguments:
@@ -568,10 +589,6 @@ impl PluginRegistry {
 
     pub fn register(&mut self, plugin: Box<dyn FrameworkPlugin>) {
         self.plugins.push(plugin);
-    }
-
-    pub fn len(&self) -> usize {
-        self.plugins.len()
     }
 
     pub fn is_empty(&self) -> bool {

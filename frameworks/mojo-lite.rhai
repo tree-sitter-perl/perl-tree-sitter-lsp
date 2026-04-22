@@ -26,45 +26,36 @@ fn triggers() {
     ]
 }
 
-// `use Mojolicious::Lite` autoimports a fixed verb set. Without this,
-// every `get`/`post`/`helper`/etc. call in the Lite script trips the
-// unresolved-function diagnostic. We emit a FrameworkImport per verb
-// so the diagnostic skip list has them.
-// DSL verbs Mojolicious::Lite autoimports. Each entry is a
-// (name, doc) pair — rendered on hover. `app` and the route verbs
-// get proper Sub symbols (with return types where meaningful) so
-// hover/gd work; the rest fall back to FrameworkImport to silence
-// the unresolved-function diagnostic without over-promising.
-fn dsl_docs() {
-    #{
-        "app":       "The Mojolicious application instance.",
-        "get":       "Register a route for HTTP GET. `get '/path' => sub { ... }`",
-        "post":      "Register a route for HTTP POST.",
-        "put":       "Register a route for HTTP PUT.",
-        "del":       "Register a route for HTTP DELETE.",
-        "patch":     "Register a route for HTTP PATCH.",
-        "options":   "Register a route for HTTP OPTIONS.",
-        "any":       "Register a route that matches any HTTP method.",
-        "under":     "Register a middleware route. Nested routes fire only when the under-route allows the request.",
-        "websocket": "Register a WebSocket route.",
-        "helper":    "Register a controller helper. `helper NAME => sub { my ($c, ...) = @_; ... }`",
-        "hook":      "Attach a callback to a Mojolicious hook (before_dispatch, after_render, …).",
-        "plugin":    "Load a Mojolicious plugin.",
-        "group":     "Group routes so common prefixes/middlewares apply to all of them.",
-    }
-}
+// `use Mojolicious::Lite` monkey-patches a fixed verb set into the
+// caller's package at import time. Modeling:
+//
+//   * Verbs that delegate to a real method elsewhere — `get`, `post`,
+//     `helper`, etc. — land as synthetic `Import`s pointing at the real
+//     source module (Mojolicious::Routes::Route for route verbs,
+//     Mojolicious for helper/hook/plugin). Hover, gd, and sig-help
+//     flow through the normal imported-function path to the real sub's
+//     POD/signature/return type.
+//
+//   * `del` is a rename: `del '/x' => sub {}` calls `$routes->delete(...)`.
+//     `ImportedSymbol::renamed("del", "delete")` gives the local name
+//     the user types + the remote name the LSP looks up cross-file.
+//
+//   * `app` and `group` are pure closures with nowhere real to point to
+//     (`sub { $app }`, a control-flow block). They stay as plugin-emitted
+//     Sub symbols — `app` typed as Mojolicious so the `app->routes` chain
+//     starts with intelligence; `group` bare.
+//
+//   * Every verb also emits `FrameworkImport` so the unresolved-function
+//     diagnostic skips them regardless of whether the real source module
+//     is resolved cross-file yet.
 
 fn on_use(ctx) {
     if ctx.module_name != "Mojolicious::Lite" { return []; }
     let out = [];
-    let docs = dsl_docs();
 
-    // `app` returns the Mojolicious instance — type it so `app->routes`
-    // resolves and completion offers instance methods. FrameworkImport
-    // keeps the unresolved-function diagnostic happy; the typed Sub
-    // symbol layered on top is what gives hover/gd/completion.
-    // `hide_in_outline: true` — DSL imports shouldn't clutter the
-    // user's navigation view.
+    // `app` — no real sub to link to; monkey-patched `sub { $app }`.
+    // Typed Sub is the one acknowledged stub; downstream chain flow
+    // (`app->routes->get->to`) depends on this return type.
     out += #{ FrameworkImport: #{ keyword: "app" } };
     out += #{
         Symbol: #{
@@ -77,7 +68,7 @@ fn on_use(ctx) {
                     params: [],
                     is_method: false,
                     return_type: #{ ClassName: "Mojolicious" },
-                    doc: docs["app"],
+                    doc: "The Mojolicious application instance.",
                     display: "Function",
                     hide_in_outline: true,
                 }
@@ -85,36 +76,65 @@ fn on_use(ctx) {
         }
     };
 
-    // Route-declaration verbs. No return type — they're called for
-    // side effect — but hover surfaces the usage hint. FrameworkImport
-    // still emitted alongside to keep the diagnostic path unchanged.
-    let verbs_rest = [
-        "get", "post", "put", "del", "patch", "options", "any",
+    // `group` — control-flow block. No corresponding method.
+    out += #{ FrameworkImport: #{ keyword: "group" } };
+    out += #{
+        Symbol: #{
+            name: "group",
+            kind: "Sub",
+            span: ctx.span,
+            selection_span: ctx.span,
+            detail: #{
+                Sub: #{
+                    params: [],
+                    is_method: false,
+                    return_type: (),
+                    doc: "Group routes so common prefixes/middlewares apply to all of them.",
+                    display: "Function",
+                    hide_in_outline: true,
+                }
+            },
+        }
+    };
+
+    // Route verbs → Mojolicious::Routes::Route. Each `$routes->$verb(@_)`
+    // internally, so the real POD/signature/return type live on Route.
+    let route_same_name_verbs = [
+        "get", "post", "put", "patch", "options", "any",
         "under", "websocket",
-        "helper", "hook", "plugin",
-        "group",
     ];
-    for v in verbs_rest {
+    let route_imports = [];
+    for v in route_same_name_verbs {
         out += #{ FrameworkImport: #{ keyword: v } };
-        out += #{
-            Symbol: #{
-                name: v,
-                kind: "Sub",
-                span: ctx.span,
-                selection_span: ctx.span,
-                detail: #{
-                    Sub: #{
-                        params: [],
-                        is_method: false,
-                        return_type: (),
-                        doc: docs[v],
-                        display: "Function",
-                        hide_in_outline: true,
-                    }
-                },
-            }
-        };
+        route_imports += #{ local_name: v };
     }
+    // `del` is the rename: local `del` → remote `delete` on Route.
+    out += #{ FrameworkImport: #{ keyword: "del" } };
+    route_imports += #{ local_name: "del", remote_name: "delete" };
+
+    out += #{
+        Import: #{
+            module_name: "Mojolicious::Routes::Route",
+            imported_symbols: route_imports,
+            span: ctx.span,
+        }
+    };
+
+    // Helper/hook/plugin verbs → Mojolicious. Each `$app->$name(@_)`
+    // internally; the real method is on the app class.
+    let mojo_verbs = ["helper", "hook", "plugin"];
+    let mojo_imports = [];
+    for v in mojo_verbs {
+        out += #{ FrameworkImport: #{ keyword: v } };
+        mojo_imports += #{ local_name: v };
+    }
+    out += #{
+        Import: #{
+            module_name: "Mojolicious",
+            imported_symbols: mojo_imports,
+            span: ctx.span,
+        }
+    };
 
     out
 }
