@@ -617,6 +617,25 @@ impl<'a> Builder<'a> {
                 if text == "__PACKAGE__" {
                     return self.current_package.clone();
                 }
+                // A bareword invocant is ambiguous: it could be a
+                // class-name reference (`Foo->method`) OR a zero-arg
+                // function call whose return type seeds the chain
+                // (`app->routes` where `sub app :: Mojolicious`).
+                //
+                // Prefer the function-call interpretation when a local
+                // Sub/Method with that name carries a ClassName return
+                // type — otherwise fall back to treating the text as
+                // a class. This is what `receiver_type_for` does for
+                // the plugin hook; mirroring it here fixes the same
+                // resolution gap for the chain-invocant path.
+                let bare = text.rsplit("::").next().unwrap_or(text);
+                for sym in &self.symbols {
+                    if sym.name != bare { continue; }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                    if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
+                        return Some(c.clone());
+                    }
+                }
                 Some(text.to_string())
             }
             "function_call_expression" | "ambiguous_function_call_expression" => {
@@ -2506,29 +2525,6 @@ impl<'a> Builder<'a> {
                             scope: self.current_scope(),
                             span: node_to_span(node),
                         });
-                    }
-                } else if matches!(right.kind(), "bareword" | "scoped_identifier") {
-                    // No-paren RHS bareword that matches a known local sub —
-                    // `my $x = app;` where `app` is a plugin-synthesized
-                    // typed Sub. Tree-sitter parses it as a plain bareword
-                    // (not a function_call_expression), but Perl calls it
-                    // at runtime when the name resolves as a sub. Record
-                    // the binding so the return-type post-pass types `$x`.
-                    let name_opt = right.utf8_text(self.source).ok();
-                    if let Some(name) = name_opt {
-                        let is_known_sub = self.symbols.iter().any(|s|
-                            s.name == name
-                            && matches!(s.kind, SymKind::Sub | SymKind::Method));
-                        if is_known_sub {
-                            if let Some(vt) = self.get_var_text_from_lhs(left) {
-                                self.call_bindings.push(CallBinding {
-                                    variable: vt,
-                                    func_name: name.to_string(),
-                                    scope: self.current_scope(),
-                                    span: node_to_span(node),
-                                });
-                            }
-                        }
                     }
                 } else if right.kind() == "method_call_expression" {
                     // RHS is a method call — record binding for return-type post-pass
@@ -9446,6 +9442,163 @@ sub new {
             .expect("event must be in outline of its declaring file");
         assert_eq!(lsp_kind(event), SymbolKind::EVENT,
             "events stay EVENT — the one LSP kind that fits");
+    }
+
+    /// Real-file invariant: every meaningful token on the
+    /// `app->routes` / `$r->get(...)->to(...)` lines of the mojo demo
+    /// must surface a useful hover AND a useful goto-def. This is the
+    /// exact scenario the user reports dead in nvim — hover returns
+    /// nothing, gd has nowhere to go.
+    ///
+    /// Probes (all on the actual demo file, not a synthetic snippet):
+    ///   * `app`    in `my $r = app->routes;`         → hover mentions Mojolicious; gd lands somewhere
+    ///   * `routes` in `app->routes`                  → hover mentions routes / Mojolicious::Routes; gd into Mojolicious.pm
+    ///   * `$r`     in `$r->get(...)`                 → hover shows the declaration line
+    ///   * `get`    in `$r->get(...)`                 → hover mentions the real Route::get POD; gd into Route.pm
+    ///   * `to`     in `->to('Users#list')`           → hover mentions Route::to; gd into Route.pm
+    ///
+    /// Any probe returning `None` for BOTH hover and gd is a bug. The
+    /// test enumerates each probe independently so failures pinpoint
+    /// which hop of the chain is broken, not "something somewhere".
+    #[test]
+    fn mojo_demo_lines_70_71_all_tokens_intelligent() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_files/plugin_mojo_demo.pl");
+        let src = std::fs::read_to_string(&path).unwrap();
+        let fa = build_fa(&src);
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&src, None).unwrap();
+
+        // Stub the three Mojo modules the chain walks through so
+        // cross-file resolution has something to reach. Shapes mirror
+        // the real @INC modules' method signatures.
+        let mojolicious_pm = r#"
+package Mojolicious;
+use Mojo::Base -base;
+
+=head2 routes
+
+Returns the router.
+
+=cut
+
+has routes => sub { Mojolicious::Routes->new };
+
+=head2 helper
+
+Register a helper.
+
+=cut
+
+sub helper { my $self = shift; }
+1;
+"#;
+        let routes_pm = r#"
+package Mojolicious::Routes;
+use Mojo::Base 'Mojolicious::Routes::Route';
+1;
+"#;
+        let route_pm = r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+
+=head2 get
+
+  my $route = $r->get('/:foo' => sub ($c) {...});
+
+Generate route matching only C<GET> requests.
+
+=cut
+
+sub get { my $self = shift; return $self; }
+
+=head2 to
+
+  $r->to('Users#list');
+
+Set the route's target.
+
+=cut
+
+sub to { my $self = shift; return $self; }
+1;
+"#;
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious.pm"),
+            Arc::new(build_fa(mojolicious_pm)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes.pm"),
+            Arc::new(build_fa(routes_pm)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(build_fa(route_pm)),
+        );
+
+        // Locate the two target lines by content — decoupled from
+        // absolute row numbers so reformats don't invalidate the test.
+        let (row_app_routes, line_app_routes) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("my $r = app->routes;"))
+            .map(|(i, l)| (i, l))
+            .expect("demo must contain `my $r = app->routes;`");
+        let (row_r_get_to, line_r_get_to) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("$r->get('/users')->to('Users#list');"))
+            .map(|(i, l)| (i, l))
+            .expect("demo must contain `$r->get('/users')->to('Users#list');`");
+
+        // Column helper — cursor one char into the token, not at its start,
+        // so `ref_at` / `symbol_at` hit the token reliably.
+        let col_of = |line: &str, needle: &str| -> usize {
+            line.find(needle).expect("needle in line") + 1
+        };
+        let probe = |row: usize, col: usize| tree_sitter::Point { row, column: col };
+
+        // Per-probe assertion. Any probe where BOTH hover and gd come
+        // back empty is a dead token — the user's reported symptom.
+        // Print detailed per-probe status so failures pinpoint the hop.
+        let check = |label: &str, point: tree_sitter::Point| {
+            let hover = fa.hover_info(point, &src, Some(&tree), Some(&idx));
+            let def = fa.find_definition(point, Some(&tree), Some(src.as_bytes()), Some(&idx));
+            assert!(
+                hover.is_some() || def.is_some(),
+                "[{label}] @ ({},{}) is a dead token — NO hover AND NO gd. \
+                 Chain-resolution hit a wall here. src: {:?}",
+                point.row, point.column,
+                src.lines().nth(point.row).unwrap_or("<oob>"),
+            );
+        };
+
+        // Line 70 probes.
+        check("app bareword",
+              probe(row_app_routes, col_of(line_app_routes, "app")));
+        check("routes accessor",
+              probe(row_app_routes, col_of(line_app_routes, "routes")));
+
+        // Line 71 probes.
+        check("$r receiver",
+              probe(row_r_get_to, col_of(line_r_get_to, "$r")));
+        check("get method",
+              probe(row_r_get_to, col_of(line_r_get_to, "->get") + 2)); // skip "->"
+        check("to method",
+              probe(row_r_get_to, col_of(line_r_get_to, "->to") + 2));
+
+        // Focused assertion on `app` — the bareword fix should be
+        // surfacing SOMETHING (the plugin's `app` Sub symbol at minimum).
+        let app_point = probe(row_app_routes, col_of(line_app_routes, "app"));
+        let app_hover = fa.hover_info(app_point, &src, Some(&tree), Some(&idx));
+        assert!(
+            app_hover.as_deref().map(|h| h.contains("Mojolicious")).unwrap_or(false),
+            "hover on `app` should mention Mojolicious (it's typed as \
+             the Mojolicious app instance). got: {:?}",
+            app_hover,
+        );
     }
 
     /// Real-file invariant pinning the original nvim repro: line 118
