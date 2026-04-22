@@ -9444,6 +9444,91 @@ sub new {
             "events stay EVENT — the one LSP kind that fits");
     }
 
+    /// Regression for the crash reported in the nvim LSP log:
+    /// `thread 'tokio-rt-worker' panicked at src/file_analysis.rs:1164:44:
+    /// index out of bounds: the len is 17 but the index is 17`.
+    ///
+    /// Root cause: `enrich_imported_types_with_keys` truncates
+    /// `type_constraints` back to baseline but leaves stale indices in
+    /// `type_constraints_by_var` from the previous enrichment. The next
+    /// enrichment's call to `resolve_method_call_types` invokes
+    /// `inferred_type`, which indexes into `type_constraints[idx]` —
+    /// OOB when idx points past the truncated length.
+    ///
+    /// Repro: enrich the same FileAnalysis twice with a module_index.
+    /// The second call must not panic.
+    #[test]
+    fn enrichment_twice_does_not_crash_on_stale_indices() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let app_src = r#"
+package main;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+"#;
+        let mojolicious_pm = r#"
+package Mojolicious;
+use Mojo::Base -base;
+has routes => sub { Mojolicious::Routes->new };
+1;
+"#;
+        let routes_pm = r#"
+package Mojolicious::Routes;
+use Mojo::Base 'Mojolicious::Routes::Route';
+1;
+"#;
+        let route_pm = r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+sub get { my $self = shift; return $self; }
+sub to  { my $self = shift; return $self; }
+1;
+"#;
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious.pm"),
+            Arc::new(build_fa(mojolicious_pm)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes.pm"),
+            Arc::new(build_fa(routes_pm)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(build_fa(route_pm)),
+        );
+
+        let mut fa = build_fa(app_src);
+        // First enrichment — simulates publish_diagnostics after module
+        // resolution. Populates type_constraints + type_constraints_by_var.
+        fa.enrich_imported_types_with_keys(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            Some(&idx),
+        );
+        // Second enrichment — simulates a subsequent change or refresh.
+        // Before the fix, the stale type_constraints_by_var indices
+        // panicked `inferred_type` during resolve_method_call_types.
+        fa.enrich_imported_types_with_keys(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            Some(&idx),
+        );
+
+        // Sanity: `$r` is still typed after the second run (not just
+        // "didn't crash" — the state is actually usable).
+        let r_type = fa.inferred_type("$r", tree_sitter::Point { row: 5, column: 0 });
+        assert!(
+            r_type.and_then(|t| t.class_name()) == Some("Mojolicious::Routes"),
+            "after two enrichments, $$r should still be typed as Mojolicious::Routes; got: {:?}",
+            r_type,
+        );
+    }
+
     /// Real-file invariant: every meaningful token on the
     /// `app->routes` / `$r->get(...)->to(...)` lines of the mojo demo
     /// must surface a useful hover AND a useful goto-def. This is the

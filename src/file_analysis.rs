@@ -892,8 +892,12 @@ pub struct FileAnalysis {
     symbols_by_scope: HashMap<ScopeId, Vec<SymbolId>>,
     #[serde(skip, default)]
     refs_by_name: HashMap<String, Vec<usize>>,
-    #[serde(skip, default)]
-    type_constraints_by_var: HashMap<String, Vec<usize>>,
+    // NB: no parallel index for `type_constraints`. We used to maintain
+    // a `HashMap<String, Vec<usize>>` pointing into the Vec and it
+    // desynced on every truncate+rebuild (stale indices → panic on
+    // lookup). `inferred_type` scans the Vec directly instead —
+    // correctness over a speculative speedup on data that's in the
+    // hundreds at worst.
     /// Refs indexed by the SymbolId they resolve to (phase 5).
     /// Every query for "refs to symbol X" collapses to an O(1) lookup here.
     #[serde(skip, default)]
@@ -940,7 +944,6 @@ impl FileAnalysis {
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
             refs_by_name: HashMap::new(),
-            type_constraints_by_var: HashMap::new(),
             refs_by_target: HashMap::new(),
         };
         fa.build_indices();
@@ -959,7 +962,6 @@ impl FileAnalysis {
         self.symbols_by_name.clear();
         self.symbols_by_scope.clear();
         self.refs_by_name.clear();
-        self.type_constraints_by_var.clear();
         self.refs_by_target.clear();
         self.build_indices();
     }
@@ -1059,14 +1061,6 @@ impl FileAnalysis {
                 self.refs_by_target.entry(sym_id).or_default().push(i);
             }
         }
-
-        // Type constraints by variable name
-        for (i, tc) in self.type_constraints.iter().enumerate() {
-            self.type_constraints_by_var
-                .entry(tc.variable.clone())
-                .or_default()
-                .push(i);
-        }
     }
 
     /// All refs that resolve to this symbol — O(1) lookup via the index.
@@ -1156,17 +1150,22 @@ impl FileAnalysis {
     }
 
     /// Get the inferred type of a variable at a point.
+    ///
+    /// Linear scan of `type_constraints`. The previous by-var index
+    /// map kept crashing the LSP whenever enrichment truncated the
+    /// vector without resyncing the indices — a whole class of bug
+    /// that Rust can't prevent when you maintain parallel data
+    /// structures by hand. On real files this vector is in the
+    /// hundreds at worst; the scan doesn't show up in profiles.
     pub fn inferred_type(&self, var_name: &str, point: Point) -> Option<&InferredType> {
-        let constraints = self.type_constraints_by_var.get(var_name)?;
-        // Find the best constraint: latest one before point, in a scope containing point
         let mut best: Option<&TypeConstraint> = None;
-        for &idx in constraints {
-            let tc = &self.type_constraints[idx];
+        for tc in &self.type_constraints {
+            if tc.variable != var_name { continue; }
             let scope = &self.scopes[tc.scope.0 as usize];
-            if contains_point(&scope.span, point) && tc.constraint_span.start <= point {
-                if best.is_none() || tc.constraint_span.start > best.unwrap().constraint_span.start {
-                    best = Some(tc);
-                }
+            if !contains_point(&scope.span, point) { continue; }
+            if tc.constraint_span.start > point { continue; }
+            if best.is_none() || tc.constraint_span.start > best.unwrap().constraint_span.start {
+                best = Some(tc);
             }
         }
         best.map(|tc| &tc.inferred_type)
@@ -1344,12 +1343,9 @@ impl FileAnalysis {
                         constraint_span: binding.span,
                         inferred_type: rt,
                     });
-                    // Incrementally update the index so the NEXT binding can see this constraint
-                    let idx = self.type_constraints.len() - 1;
-                    self.type_constraints_by_var
-                        .entry(binding.variable.clone())
-                        .or_default()
-                        .push(idx);
+                    // NB: the NEXT binding sees this constraint via the
+                    // linear scan in `inferred_type` — no parallel index
+                    // to keep in sync.
                 }
             }
         }
@@ -1364,14 +1360,6 @@ impl FileAnalysis {
     /// `build_indices` uses, so `refs_by_target` stays accurate after a
     /// cross-file hash-key binding resolves.
     fn rebuild_enrichment_indices(&mut self) {
-        self.type_constraints_by_var.clear();
-        for (i, tc) in self.type_constraints.iter().enumerate() {
-            self.type_constraints_by_var
-                .entry(tc.variable.clone())
-                .or_default()
-                .push(i);
-        }
-
         self.symbols_by_name.clear();
         self.symbols_by_scope.clear();
         for sym in &self.symbols {
