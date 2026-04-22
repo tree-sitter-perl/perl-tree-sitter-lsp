@@ -116,7 +116,15 @@ pub fn build_with_plugins(
     // Post-pass 3: infer return types for subs/methods
     b.resolve_return_types();
 
-    // Post-pass 4: fill in tail POD docs for subs that didn't get preceding doc
+    // Post-pass 4: re-resolve invocant classes on MethodCall refs now
+    // that sub return types are known. Function-call chains like
+    // `get_foo()->bar()` need `get_foo`'s return type to pin the
+    // receiver class of `->bar`; that return type is only computed
+    // in post-pass 3, so the during-walk `invocant_class` is empty
+    // for those refs. Walk the tree a second time and fill them in.
+    b.resolve_invocant_classes_post_pass(tree);
+
+    // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
     b.resolve_tail_pod_docs();
 
     FileAnalysis::new(
@@ -610,6 +618,22 @@ impl<'a> Builder<'a> {
                     return self.current_package.clone();
                 }
                 Some(text.to_string())
+            }
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                // `get_foo()->bar()` — the invocant of `->bar` is a
+                // function call. Look up the called sub locally and
+                // read its ClassName return type.
+                let func = node.child_by_field_name("function")?;
+                let name = func.utf8_text(self.source).ok()?;
+                let bare = name.rsplit("::").next().unwrap_or(name);
+                for sym in &self.symbols {
+                    if sym.name != bare { continue; }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                    if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
+                        return Some(c.clone());
+                    }
+                }
+                None
             }
             _ => None,
         }
@@ -4368,6 +4392,58 @@ impl<'a> Builder<'a> {
                     }
                 }
                 current = self.scopes[scope_id.0 as usize].parent;
+            }
+        }
+    }
+
+    /// Post-pass: re-resolve `invocant_class` on every MethodCall ref
+    /// using the tree + the now-final symbol table (return types
+    /// have been filled in by `resolve_return_types`). This catches
+    /// function-call chains like `get_foo()->bar()` where the
+    /// invocant's class can only be pinned after `get_foo`'s
+    /// return_type is known.
+    ///
+    /// Walks the tree: for each node whose byte span matches a
+    /// MethodCall ref's `invocant_span`, re-runs
+    /// `resolve_invocant_class_tree` and updates the ref in-place.
+    /// Refs whose class was already pinned during the walk keep
+    /// their value.
+    fn resolve_invocant_classes_post_pass(&mut self, tree: &Tree) {
+        use std::collections::HashMap;
+        // Index invocant nodes by (start_point, end_point) for
+        // O(1) lookup against ref.invocant_span.
+        let mut node_by_points: HashMap<(Point, Point), Node<'_>> = HashMap::new();
+        fn walk<'t>(node: Node<'t>, out: &mut HashMap<(Point, Point), Node<'t>>) {
+            if node.kind() == "method_call_expression" {
+                if let Some(inv) = node.child_by_field_name("invocant") {
+                    out.insert((inv.start_position(), inv.end_position()), inv);
+                }
+            }
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(tree.root_node(), &mut node_by_points);
+
+        // Collect ref indices + their invocant nodes first so we
+        // don't borrow `self.refs` mutably while also calling
+        // `resolve_invocant_class_tree` (which reads `&self`).
+        let mut pending: Vec<(usize, Node<'_>)> = Vec::new();
+        for (idx, r) in self.refs.iter().enumerate() {
+            if let RefKind::MethodCall { invocant_class, invocant_span: Some(sp), .. } = &r.kind {
+                if invocant_class.is_some() { continue; }
+                if let Some(n) = node_by_points.get(&(sp.start, sp.end)).copied() {
+                    pending.push((idx, n));
+                }
+            }
+        }
+        for (idx, node) in pending {
+            if let Some(class) = self.resolve_invocant_class_tree(node) {
+                if let RefKind::MethodCall { invocant_class, .. } = &mut self.refs[idx].kind {
+                    *invocant_class = Some(class);
+                }
             }
         }
     }

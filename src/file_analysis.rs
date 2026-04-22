@@ -2235,10 +2235,50 @@ impl FileAnalysis {
             let mut results = self.collect_refs_for_target(target_id, true, tree, source_bytes);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
             results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
-            results
-        } else {
-            Vec::new()
+            return results;
         }
+        // Fallback — cursor is on a ref whose target isn't defined in
+        // this file (cross-file method call, unresolved import). Match
+        // other refs in the same file that share (target_name, scope).
+        // Without this, documentHighlight on a cross-file method call
+        // returns empty even when other call sites for the same class+method
+        // exist in the file.
+        if let Some(r) = self.ref_at(point) {
+            let mut results: Vec<(Span, AccessKind)> = Vec::new();
+            match &r.kind {
+                RefKind::MethodCall { invocant_class: Some(cn), method_name_span, .. } => {
+                    let wanted_class = cn.clone();
+                    results.push((*method_name_span, r.access));
+                    for other in &self.refs {
+                        if std::ptr::eq(other, r) { continue; }
+                        if other.target_name != r.target_name { continue; }
+                        if let RefKind::MethodCall { invocant_class: Some(ocn), method_name_span: ms, .. } = &other.kind {
+                            if ocn == &wanted_class {
+                                results.push((*ms, other.access));
+                            }
+                        }
+                    }
+                }
+                RefKind::FunctionCall { resolved_package: Some(pkg) } => {
+                    let wanted_pkg = pkg.clone();
+                    results.push((r.span, r.access));
+                    for other in &self.refs {
+                        if std::ptr::eq(other, r) { continue; }
+                        if other.target_name != r.target_name { continue; }
+                        if let RefKind::FunctionCall { resolved_package: Some(op) } = &other.kind {
+                            if op == &wanted_pkg {
+                                results.push((other.span, other.access));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
+            results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
+            return results;
+        }
+        Vec::new()
     }
 
     /// Shared implementation for find_references and find_highlights.
@@ -2265,25 +2305,38 @@ impl FileAnalysis {
             results.push((r.span, r.access));
         }
 
-        // For subs/methods/packages/classes, also find refs by name
-        // (these kinds don't populate resolves_to during build and are matched
-        // by textual name across the refs table).
+        // For subs/methods/packages/classes, also find refs by name.
+        // Scope-filter callable refs (Sub / Method) by the target
+        // symbol's package — matches `resolve::refs_to` so
+        // documentHighlight and references agree on "same callable".
+        // Without this, cursor on one `create` highlights every other
+        // same-named method/sub in the file regardless of class
+        // (mojo-helper leaf on `_Helper::users` cross-highlighting
+        // the route's `Users::create` ref, etc.).
         if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
+            let sym_package = sym.package.clone();
             for r in &self.refs {
                 if r.target_name == sym.name && r.resolves_to.is_none() {
                     match (&r.kind, &sym.kind) {
-                        (RefKind::FunctionCall { .. }, SymKind::Sub) => results.push((r.span, r.access)),
-                        (RefKind::MethodCall { method_name_span, .. }, SymKind::Sub | SymKind::Method) => {
+                        (RefKind::FunctionCall { resolved_package }, SymKind::Sub) => {
+                            if *resolved_package == sym_package {
+                                results.push((r.span, r.access));
+                            }
+                        }
+                        (RefKind::MethodCall { method_name_span, invocant_class, .. },
+                         SymKind::Sub | SymKind::Method) => {
+                            // Same-class match only; unresolved or
+                            // different-class invocants are excluded.
                             // Method-call ref.span covers the whole
-                            // `$obj->foo(...)` expression so gd/hover
-                            // can land anywhere inside. For highlight
-                            // + reference rendering we want just the
-                            // method identifier — otherwise the
-                            // underline sprawls across the entire
-                            // call, which looks broken when multiple
-                            // refs match (every `$app->helper(...)`
-                            // site, every argument, etc.).
-                            results.push((*method_name_span, r.access));
+                            // `$obj->foo(...)` expression so we use
+                            // `method_name_span` to highlight just
+                            // the identifier.
+                            match (invocant_class, &sym_package) {
+                                (Some(cn), Some(pkg)) if cn == pkg => {
+                                    results.push((*method_name_span, r.access));
+                                }
+                                _ => {}
+                            }
                         }
                         (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module) => results.push((r.span, r.access)),
                         _ => {}
@@ -2740,12 +2793,46 @@ impl FileAnalysis {
                                 return Some((sym_id, true));
                             }
                             Some(MethodResolution::CrossFile { .. }) => {
-                                // Cross-file: no local SymbolId, fall through to name match
+                                // Cross-file: no local SymbolId. Match
+                                // a local symbol only when its package
+                                // equals the resolved class — no
+                                // same-name cross-class latching.
+                                for &sid in self.symbols_named(&r.target_name) {
+                                    let sym = self.symbol(sid);
+                                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                                    if sym.package.as_deref() == Some(cn.as_str()) {
+                                        return Some((sid, true));
+                                    }
+                                }
                             }
                             None => {}
                         }
+                        // No local match, and the class is known but
+                        // has no local decl — return a synthetic
+                        // target by name filtered to the class, so
+                        // collect_refs_for_target still walks refs
+                        // correctly. If there's NO matching symbol on
+                        // the class locally, produce no target —
+                        // better than cross-linking a same-named
+                        // method on a different class.
+                        for &sid in self.symbols_named(&r.target_name) {
+                            let sym = self.symbol(sid);
+                            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                            if sym.package.as_deref() == Some(cn.as_str()) {
+                                return Some((sid, true));
+                            }
+                        }
+                        // Class known but not defined locally — no
+                        // local symbol to anchor on. Caller may still
+                        // collect refs via `refs_to` at the LSP layer,
+                        // but highlight/definition within this file
+                        // have nothing to return.
+                        return None;
                     }
-                    // Fallback: any method with that name
+                    // Invocant class couldn't be pinned at all —
+                    // last-resort name match. Only reaches here for
+                    // refs the builder AND the runtime resolver both
+                    // failed on (rare: ERROR-recovered invocants).
                     for &sid in self.symbols_named(&r.target_name) {
                         if matches!(self.symbol(sid).kind, SymKind::Sub | SymKind::Method) {
                             return Some((sid, true));

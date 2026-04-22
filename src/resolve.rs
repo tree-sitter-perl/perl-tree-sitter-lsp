@@ -857,6 +857,186 @@ hi();
         );
     }
 
+    /// Adversarial: documentHighlight (the in-editor "highlight all
+    /// references of this identifier" feature) must respect the
+    /// same class/package scoping as gr and rename. The mojo demo
+    /// shape — a helper `users.create` and a route with
+    /// `action => 'create'` — has two distinct `create` symbols in
+    /// one file. Cursor on one must NOT highlight the other.
+    #[test]
+    fn document_highlight_respects_scope_on_shared_method_name() {
+        use tree_sitter::Parser;
+
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper('users.create' => sub ($c, $name, $email) {});
+
+my $r = app->routes;
+$r->post('/users')->to(controller => 'Users', action => 'create');
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let fa = crate::builder::build(&tree, src.as_bytes());
+
+        // Lines (0-indexed; file starts with a blank row 0):
+        //   row 5 — `$app->helper('users.create' => sub ...);`
+        //   row 8 — `$r->post('/users')->to(controller => 'Users', action => 'create');`
+        let line_helper = 5;
+        let line_route = 8;
+
+        let src_line = |n: usize| src.lines().nth(n).unwrap_or("");
+        let helper_col = src_line(line_helper).find("create")
+            .expect("'create' on helper line");
+        let route_col = src_line(line_route).rfind("create")
+            .expect("'create' on route line");
+
+        // documentHighlight from the HELPER side: cursor inside
+        // `users.create`. Must light up only helper-related spans,
+        // NOT the route's `create` string at row 8.
+        let helper_pt = tree_sitter::Point { row: line_helper, column: helper_col + 2 };
+        let helper_highlights = fa.find_highlights(helper_pt, Some(&tree), Some(src.as_bytes()));
+        let helper_rows: Vec<usize> = helper_highlights.iter()
+            .map(|(s, _)| s.start.row).collect();
+        assert!(helper_rows.contains(&line_helper),
+            "helper highlight missed its own site: {:?}", helper_rows);
+        assert!(!helper_rows.contains(&line_route),
+            "helper highlight leaked into the route line — class-scoping broken: {:?}",
+            helper_rows);
+
+        // Mirror: documentHighlight from the ROUTE side. Cursor on
+        // 'create' in `action => 'create'`. Must light up the route
+        // ref only, NOT the helper's `create` site at row 5.
+        let route_pt = tree_sitter::Point { row: line_route, column: route_col + 2 };
+        let route_highlights = fa.find_highlights(route_pt, Some(&tree), Some(src.as_bytes()));
+        let route_rows: Vec<usize> = route_highlights.iter()
+            .map(|(s, _)| s.start.row).collect();
+        assert!(route_rows.contains(&line_route),
+            "route highlight missed its own site: {:?}", route_rows);
+        assert!(!route_rows.contains(&line_helper),
+            "route highlight leaked into the helper line — class-scoping broken: {:?}",
+            route_rows);
+    }
+
+    /// Cross-file: gr on a `Users::create` method ref in one file
+    /// must find the definition in another workspace file AND every
+    /// call site across files — without cross-linking same-named
+    /// methods on unrelated classes.
+    #[test]
+    fn references_cross_file_method_respects_class_scope() {
+        use crate::file_analysis::RenameKind;
+        use tree_sitter::Parser;
+
+        let store = FileStore::new();
+        let mut parse_build = |source: &str| {
+            let mut parser = Parser::new();
+            parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            crate::builder::build(&tree, source.as_bytes())
+        };
+
+        // File 1: the route declaration.
+        let f1_src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+$app->helper('users.create' => sub ($c, $name) {});
+
+my $r = app->routes;
+$r->post('/users')->to(controller => 'Users', action => 'create');
+"#;
+        let f1 = parse_build(f1_src);
+        store.insert_workspace(PathBuf::from("/tmp/app.pm"), f1);
+
+        // File 2: Users controller with `sub create`.
+        let f2_src = r#"
+package Users;
+sub create {
+    my ($self, %args) = @_;
+    return { ok => 1 };
+}
+
+sub list { }
+1;
+"#;
+        let f2 = parse_build(f2_src);
+        store.insert_workspace(PathBuf::from("/tmp/users.pm"), f2);
+
+        // File 3: another caller that creates Users and invokes create.
+        let f3_src = r#"
+package Consumer;
+use Users;
+my $u = Users->new;
+$u->create(name => 'alice');
+1;
+"#;
+        let f3 = parse_build(f3_src);
+        store.insert_workspace(PathBuf::from("/tmp/consumer.pm"), f3);
+
+        // Probe: cursor on the route's 'create' action string in f1.
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let f1_tree = parser.parse(f1_src, None).unwrap();
+        let f1_fa = crate::builder::build(&f1_tree, f1_src.as_bytes());
+        // Row 7: `$r->post('/users')->to(controller => 'Users', action => 'create');`
+        let route_row = 7usize;
+        let line_route = f1_src.lines().nth(route_row).unwrap_or("");
+        let create_col = line_route.rfind("create").expect("'create' on route line");
+        let cursor = tree_sitter::Point { row: route_row, column: create_col + 2 };
+
+        let kind = f1_fa.rename_kind_at(cursor);
+        let target = match kind {
+            Some(RenameKind::Method { name, class }) => TargetRef {
+                name,
+                kind: TargetKind::Method { class },
+            },
+            other => panic!("expected Method, got {:?}", other),
+        };
+        // class must be "Users" — from the plugin's emitted invocant_class.
+        if let TargetKind::Method { ref class } = target.kind {
+            assert_eq!(class, "Users", "target class should be Users");
+        }
+
+        let refs = refs_to(&store, None, &target, RoleMask::EDITABLE);
+
+        // Collect (file-basename, row) for clarity.
+        let hits: Vec<(String, usize)> = refs.iter().map(|r| {
+            let fname = match &r.key {
+                FileKey::Path(p) => p.file_name().unwrap().to_str().unwrap().to_string(),
+                FileKey::Url(u) => u.to_string(),
+            };
+            (fname, r.span.start.row)
+        }).collect();
+
+        // Expected:
+        //   users.pm     — `sub create` decl (Users class)
+        //   consumer.pm  — `$u->create(...)` call
+        //   app.pm       — the route's 'create' ref at row 7
+        let has_users_decl = hits.iter().any(|(f, _)| f == "users.pm");
+        let has_consumer_call = hits.iter().any(|(f, _)| f == "consumer.pm");
+        let has_route_ref = hits.iter().any(|(f, r)| f == "app.pm" && *r == route_row);
+
+        assert!(has_users_decl,
+            "gr missed Users::create decl (users.pm row 2): {:?}", hits);
+        assert!(has_consumer_call,
+            "gr missed $u->create caller (consumer.pm row 4): {:?}", hits);
+        assert!(has_route_ref,
+            "gr missed route ref in app.pm: {:?}", hits);
+
+        // Must NOT include the helper's `users.create` in app.pm —
+        // that's on a different class.
+        let helper_row = f1_src.lines().enumerate()
+            .find(|(_, l)| l.contains("$app->helper"))
+            .map(|(i, _)| i).unwrap();
+        let leaked_helper = hits.iter().any(|(f, r)| f == "app.pm" && *r == helper_row);
+        assert!(!leaked_helper,
+            "gr wrongly included the helper on a different class at row {}: {:?}",
+            helper_row, hits);
+    }
+
     #[test]
     fn test_refs_to_empty_when_no_hits() {
         let store = FileStore::new();
