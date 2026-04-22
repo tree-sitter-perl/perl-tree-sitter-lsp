@@ -506,6 +506,43 @@ impl<'a> Builder<'a> {
     ///     `type_constraints` (reverse scan; latest wins). This lets the
     ///     mojo-events plugin resolve `$obj->emit(...)` in a consumer file
     ///     to the producer's class, enabling cross-file def/ref pairing.
+    /// Resolve a bare `foo()` call to the package whose `sub foo` it
+    /// refers to. Order mirrors Perl's name-lookup rule:
+    ///
+    ///   1. Explicit qualifier (`Foo::bar()` → `Foo`).
+    ///   2. Enclosing package that declares `sub <name>` locally (so
+    ///      `package Foo { sub bar {} bar(); }` resolves to `Foo`).
+    ///   3. Most-recent import whose `imported_symbols` lists this
+    ///      name (`use Bler qw/hi/` → `Bler`). Later imports win —
+    ///      Perl's later `use` shadows earlier one.
+    ///
+    /// Returns `None` when none of those pin a package. Downstream
+    /// class/package-scoped queries treat `None` as no-match rather
+    /// than falling back to name-only union.
+    fn resolve_call_package(&self, call_name: &str) -> Option<String> {
+        // (1) Qualified: `Foo::bar` → `Foo`.
+        if let Some(idx) = call_name.rfind("::") {
+            return Some(call_name[..idx].to_string());
+        }
+        // (2) Enclosing package defines the sub locally.
+        if let Some(ref pkg) = self.current_package {
+            if self.symbols.iter().any(|s| {
+                s.name == call_name
+                    && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                    && s.package.as_deref() == Some(pkg.as_str())
+            }) {
+                return Some(pkg.clone());
+            }
+        }
+        // (3) Imports — walk in reverse order so later `use` wins.
+        for imp in self.imports.iter().rev() {
+            if imp.imported_symbols.iter().any(|s| s == call_name) {
+                return Some(imp.module_name.clone());
+            }
+        }
+        None
+    }
+
     /// Resolve a method-call invocant NODE to a class name, using the
     /// tree so chain invocants (`Sner->new->hi`) work. Returns the
     /// resolved class for:
@@ -1145,7 +1182,14 @@ impl<'a> Builder<'a> {
             None => return,
         };
         let name_node = node.child_by_field_name("name").unwrap();
-        self.current_package = Some(name.clone());
+        // Capture the pre-existing package BEFORE touching
+        // current_package — the block form needs to restore to this
+        // value after visiting children. The previous code took()
+        // from current_package AFTER already mutating it, so
+        // prev_package would hold the NEW value and the restore was
+        // a no-op. That leaked `package Foo { ... }`'s name to
+        // every statement that followed at the same file scope.
+        let prev_package = self.current_package.clone();
 
         self.add_symbol(
             name.clone(),
@@ -1158,19 +1202,18 @@ impl<'a> Builder<'a> {
         let has_block = (0..node.child_count())
             .any(|i| node.child(i).map_or(false, |c| c.kind() == "block"));
         if has_block {
-            // `package Foo { ... }` — scope is the block.
+            // `package Foo { ... }` — scope is the block. Set package
+            // ONLY for the duration of the walk, then restore.
             self.add_fold_range(node);
-            let prev_package = self.current_package.take();
             self.current_package = Some(name);
             self.visit_children(node);
             self.current_package = prev_package;
         } else {
-            // `package Foo;` — thread a Package scope spanning from
-            // this statement to end-of-file (trimmed retroactively if
-            // another `package X;` appears later). Without this, two
-            // successive top-level packages stamp the same root scope
-            // and `package_at(point)` reports the LAST name for every
-            // point, including points inside the earlier region.
+            // `package Foo;` — the rest of the file (up to the next
+            // `package X;`) sits under this package. Set
+            // current_package for the remainder of this walk;
+            // open_sibling_scope handles the Scope-side bookkeeping.
+            self.current_package = Some(name.clone());
             self.open_sibling_scope(ScopeKind::Package, node.start_position(), Some(name));
         }
     }
@@ -1945,11 +1988,16 @@ impl<'a> Builder<'a> {
 
                 // Extract imported symbols from qw(...) or list
                 let (imported_symbols, qw_close_paren) = self.extract_use_import_list(node);
-                // Emit FunctionCall refs for imported symbol names (for goto-def on import args)
+                // Emit FunctionCall refs for imported symbol names (for goto-def on import args).
+                // These refs pin to the module being imported from — the
+                // qw list IS the authoritative source.
                 if module_name != "parent" && module_name != "base" {
                     if !imported_symbols.is_empty() {
                         let sym_set: std::collections::HashSet<&str> = imported_symbols.iter().map(|s| s.as_str()).collect();
-                        self.emit_refs_for_strings(node, &sym_set, RefKind::FunctionCall);
+                        let kind = RefKind::FunctionCall {
+                            resolved_package: Some(module_name.to_string()),
+                        };
+                        self.emit_refs_for_strings(node, &sym_set, kind);
                     }
                 }
                 self.imports.push(Import {
@@ -2774,8 +2822,9 @@ impl<'a> Builder<'a> {
     fn visit_function_call(&mut self, node: Node<'a>) {
         if let Some(func_node) = node.child_by_field_name("function") {
             if let Ok(name) = func_node.utf8_text(self.source) {
+                let resolved_package = self.resolve_call_package(name);
                 self.add_ref(
-                    RefKind::FunctionCall,
+                    RefKind::FunctionCall { resolved_package },
                     node_to_span(func_node),
                     name.to_string(),
                     AccessKind::Read,
@@ -5011,7 +5060,7 @@ $p->;
     fn test_function_call_ref() {
         let fa = build_fa("sub foo { }\nfoo();");
         let call_refs: Vec<_> = fa.refs.iter()
-            .filter(|r| r.target_name == "foo" && matches!(r.kind, RefKind::FunctionCall))
+            .filter(|r| r.target_name == "foo" && matches!(r.kind, RefKind::FunctionCall { .. }))
             .collect();
         assert_eq!(call_refs.len(), 1);
     }
@@ -5892,10 +5941,13 @@ sub test {
     $self->emit('done');
 }
 ");
-        let edits = fa.rename_sub("emit", "fire");
-        // Should find: 1 symbol def + 1 FunctionCall + 1 MethodCall = 3 edits
+        // `sub emit` in package Foo. Scope-aware rename with
+        // package=Foo catches the decl, the FunctionCall `emit()`,
+        // AND the MethodCall `$self->emit()` — two shapes of the
+        // same callable.
+        let edits = fa.rename_sub_in_package("emit", &Some("Foo".to_string()), "fire");
         assert!(edits.len() >= 3,
-            "rename_sub should find def + function call + method call, got {} edits", edits.len());
+            "rename_sub_in_package should find def + function call + method call, got {} edits", edits.len());
         for (_, text) in &edits {
             assert_eq!(text, "fire");
         }

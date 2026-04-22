@@ -478,19 +478,44 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
     if let Some(r) = analysis.ref_at(point) {
         let target = &r.target_name;
         let is_sub = matches!(r.kind,
-            file_analysis::RefKind::FunctionCall | file_analysis::RefKind::MethodCall { .. }
+            file_analysis::RefKind::FunctionCall { .. } | file_analysis::RefKind::MethodCall { .. }
         ) || analysis.symbol_at(point).map(|s| matches!(s.kind,
             file_analysis::SymKind::Sub | file_analysis::SymKind::Method
         )).unwrap_or(false);
 
         if is_sub || matches!(r.kind, file_analysis::RefKind::PackageRef) {
             let ws = index_workspace(root);
+            // Derive the scope (package for Sub, class for Method) so
+            // cross-file walks don't union unrelated packages that
+            // share a symbol name.
+            let scope_from_ref = match &r.kind {
+                file_analysis::RefKind::FunctionCall { resolved_package } =>
+                    Some(("sub", resolved_package.clone())),
+                file_analysis::RefKind::MethodCall { invocant_class, .. } =>
+                    invocant_class.as_ref().map(|c| ("method", Some(c.clone()))),
+                _ => None,
+            };
+            let scope_from_sym = analysis.symbol_at(point).and_then(|s| match s.kind {
+                file_analysis::SymKind::Sub => Some(("sub", s.package.clone())),
+                file_analysis::SymKind::Method => Some(("method", s.package.clone())),
+                _ => None,
+            });
+            let scope = scope_from_ref.or(scope_from_sym);
+
             for entry in ws.workspace_raw().iter() {
                 if *entry.key() == file_path { continue; }
-                let edits = if is_sub {
-                    entry.value().rename_sub(target, target)
-                } else {
+                let edits = if matches!(r.kind, file_analysis::RefKind::PackageRef) {
                     entry.value().rename_package(target, target)
+                } else {
+                    match &scope {
+                        Some(("sub", package)) =>
+                            entry.value().rename_sub_in_package(target, package, target),
+                        Some(("method", Some(class))) =>
+                            entry.value().rename_method_in_class(target, class, target),
+                        // Unresolvable method scope — skip rather than
+                        // cross-link. Matches refs_to / rename semantics.
+                        _ => Vec::new(),
+                    }
                 };
                 for (span, _) in edits {
                     results.push(serde_json::json!({
@@ -549,11 +574,11 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
                 all_edits.insert(file_path.display().to_string(), json_edits);
             }
         }
-        file_analysis::RenameKind::Function(_) | file_analysis::RenameKind::Method { .. } => {
+        file_analysis::RenameKind::Function { .. } | file_analysis::RenameKind::Method { .. } => {
             for entry in ws.workspace_raw().iter() {
                 let edits = match &rename_kind {
-                    file_analysis::RenameKind::Function(n) =>
-                        entry.value().rename_sub(n, new_name),
+                    file_analysis::RenameKind::Function { name, package } =>
+                        entry.value().rename_sub_in_package(name, package, new_name),
                     file_analysis::RenameKind::Method { name, class } =>
                         entry.value().rename_method_in_class(name, class, new_name),
                     _ => unreachable!(),

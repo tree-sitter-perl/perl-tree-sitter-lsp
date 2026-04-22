@@ -354,7 +354,11 @@ pub struct Ref {
 #[derive(Debug)]
 pub enum RenameKind {
     Variable,
-    Function(String),
+    /// A sub defined in (or imported from) a specific package.
+    /// `package == None` means a top-level/script sub with no
+    /// package context; otherwise package-scoped so cross-file
+    /// walks don't rename same-named subs in unrelated packages.
+    Function { name: String, package: Option<String> },
     Package(String),
     /// A method with its owning class. Cross-file walks use `class`
     /// to avoid unioning unrelated classes that share a method name
@@ -371,7 +375,17 @@ pub enum RenameKind {
 #[allow(dead_code)]
 pub enum RefKind {
     Variable,
-    FunctionCall,
+    /// Bare `foo()` or `Pkg::foo()` call. `resolved_package` is the
+    /// package whose `sub` this call actually targets — computed at
+    /// build time by walking the enclosing-package-then-imports graph
+    /// (see `Builder::resolve_call_package`). `None` means no pin (the
+    /// call site has no package context and no import covers it);
+    /// class/package-scoped queries treat unpinned refs as no-match
+    /// rather than cross-linking same-named subs across packages.
+    FunctionCall {
+        #[serde(default)]
+        resolved_package: Option<String>,
+    },
     MethodCall {
         invocant: String,
         /// Span of the invocant node (for complex expressions needing tree resolution).
@@ -2063,16 +2077,34 @@ impl FileAnalysis {
                         return Some(self.symbol(sym_id).selection_span);
                     }
                 }
-                RefKind::FunctionCall => {
+                RefKind::FunctionCall { resolved_package } => {
+                    // Package-scoped: pick the sub whose package
+                    // matches the ref's resolved_package. When the
+                    // call pinned a specific package (import or
+                    // local-package match), we MUST NOT jump to a
+                    // same-named sub in a different package — that's
+                    // the cross-class collision we're specifically
+                    // guarding against.
                     for &sid in self.symbols_named(&r.target_name) {
                         let sym = self.symbol(sid);
-                        if matches!(sym.kind, SymKind::Sub) {
+                        if sym.kind != SymKind::Sub { continue; }
+                        if sym.package == *resolved_package {
                             return Some(sym.selection_span);
                         }
                     }
+                    // Nothing local; leave cross-file resolution to
+                    // the LSP adapter (symbols::find_definition).
                 }
-                RefKind::MethodCall { ref invocant, ref invocant_span, .. } => {
-                    let class_name = self.resolve_method_invocant(invocant, invocant_span, r.scope, point, tree, source_bytes, module_index);
+                RefKind::MethodCall { ref invocant, ref invocant_span, ref invocant_class, .. } => {
+                    // Prefer the build-time `invocant_class` (pre-computed
+                    // by `resolve_invocant_class_tree`, handles chains
+                    // like `Foo->new->m`). Fall back to the runtime
+                    // resolver for refs where the builder couldn't pin
+                    // a class (rare — plugin-emitted refs from older
+                    // code paths, ERROR-recovered invocants).
+                    let class_name = invocant_class.clone().or_else(|| self.resolve_method_invocant(
+                        invocant, invocant_span, r.scope, point, tree, source_bytes, module_index,
+                    ));
 
                     // Check if cursor is on a named arg key in the call args,
                     // not on the method name itself. Resolve to hash key def or :param field.
@@ -2240,7 +2272,7 @@ impl FileAnalysis {
             for r in &self.refs {
                 if r.target_name == sym.name && r.resolves_to.is_none() {
                     match (&r.kind, &sym.kind) {
-                        (RefKind::FunctionCall, SymKind::Sub) => results.push((r.span, r.access)),
+                        (RefKind::FunctionCall { .. }, SymKind::Sub) => results.push((r.span, r.access)),
                         (RefKind::MethodCall { method_name_span, .. }, SymKind::Sub | SymKind::Method) => {
                             // Method-call ref.span covers the whole
                             // `$obj->foo(...)` expression so gd/hover
@@ -2302,10 +2334,10 @@ impl FileAnalysis {
                             && contains_point(&mr.span, point)
                             && mr.target_name != r.target_name);
                     if let Some(mr) = method_hover {
-                        if let RefKind::MethodCall { ref invocant, ref invocant_span, .. } = mr.kind {
-                            let class_name = self.resolve_method_invocant(
+                        if let RefKind::MethodCall { ref invocant, ref invocant_span, ref invocant_class, .. } = mr.kind {
+                            let class_name = invocant_class.clone().or_else(|| self.resolve_method_invocant(
                                 invocant, invocant_span, mr.scope, point, tree, Some(source.as_bytes()), module_index,
-                            );
+                            ));
                             if let Some(ref cn) = class_name {
                                 match self.resolve_method_in_ancestors(cn, &mr.target_name, module_index) {
                                     Some(MethodResolution::Local { sym_id, class: ref defining_class, .. }) => {
@@ -2358,18 +2390,24 @@ impl FileAnalysis {
                         return Some(self.format_symbol_hover_at(sym, source, point));
                     }
                 }
-                RefKind::FunctionCall => {
+                RefKind::FunctionCall { resolved_package } => {
+                    // Package-scoped: hover shows the sub whose
+                    // package matches what the ref resolved to.
                     for &sid in self.symbols_named(&r.target_name) {
                         let sym = self.symbol(sid);
-                        if matches!(sym.kind, SymKind::Sub) {
+                        if sym.kind != SymKind::Sub { continue; }
+                        if sym.package == *resolved_package {
                             return Some(self.format_symbol_hover(sym, source));
                         }
                     }
                 }
-                RefKind::MethodCall { ref invocant, ref invocant_span, .. } => {
-                    let class_name = self.resolve_method_invocant(
+                RefKind::MethodCall { ref invocant, ref invocant_span, ref invocant_class, .. } => {
+                    // Prefer the build-time `invocant_class` field
+                    // (handles chains); fall back to the runtime
+                    // tree-based resolver.
+                    let class_name = invocant_class.clone().or_else(|| self.resolve_method_invocant(
                         invocant, invocant_span, r.scope, point, tree, Some(source.as_bytes()), module_index,
-                    );
+                    ));
                     if let Some(ref cn) = class_name {
                         match self.resolve_method_in_ancestors(cn, &r.target_name, module_index) {
                             Some(MethodResolution::Local { sym_id, class: ref defining_class, .. }) => {
@@ -2517,7 +2555,12 @@ impl FileAnalysis {
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => return Some(RenameKind::Variable),
-                RefKind::FunctionCall => return Some(RenameKind::Function(r.target_name.clone())),
+                RefKind::FunctionCall { resolved_package } => {
+                    return Some(RenameKind::Function {
+                        name: r.target_name.clone(),
+                        package: resolved_package.clone(),
+                    });
+                }
                 RefKind::MethodCall { invocant, invocant_span, invocant_class, .. } => {
                     // Prefer build-time class (chain-resolved);
                     // fall back to text-based resolution.
@@ -2552,22 +2595,10 @@ impl FileAnalysis {
         if let Some(sym) = self.symbol_at(point) {
             return match sym.kind {
                 SymKind::Variable | SymKind::Field => Some(RenameKind::Variable),
-                SymKind::Sub => {
-                    // A `Sub` symbol with a package is a method-shaped
-                    // entity (e.g. inside `package Foo { sub run {} }`).
-                    // If there's a package, treat rename as class-scoped
-                    // so cross-file walks don't hit same-named subs in
-                    // unrelated packages. Bare package-less subs remain
-                    // Function-kind (file-scope).
-                    if let Some(pkg) = sym.package.as_deref() {
-                        Some(RenameKind::Method {
-                            name: sym.name.clone(),
-                            class: pkg.to_string(),
-                        })
-                    } else {
-                        Some(RenameKind::Function(sym.name.clone()))
-                    }
-                }
+                SymKind::Sub => Some(RenameKind::Function {
+                    name: sym.name.clone(),
+                    package: sym.package.clone(),
+                }),
                 SymKind::Method => {
                     let class = sym.package.clone()?;
                     Some(RenameKind::Method {
@@ -2589,67 +2620,72 @@ impl FileAnalysis {
 
     /// Find all occurrences of a sub name (def + ALL call refs) for cross-file rename.
     /// Searches both FunctionCall and MethodCall refs because Perl subs can be called either way.
-    pub fn rename_sub(&self, old_name: &str, new_name: &str) -> Vec<(Span, String)> {
-        let mut edits = Vec::new();
-        for sym in &self.symbols {
-            if sym.name == old_name && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                edits.push((sym.selection_span, new_name.to_string()));
-            }
-        }
-        for r in &self.refs {
-            if r.target_name == old_name {
-                match &r.kind {
-                    RefKind::FunctionCall => {
-                        edits.push((r.span, new_name.to_string()));
-                    }
-                    RefKind::MethodCall { method_name_span, .. } => {
-                        edits.push((*method_name_span, new_name.to_string()));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        edits
-    }
-
-    /// Class-scoped method rename. Matches decls whose package equals
-    /// `class`, and `MethodCall` refs whose invocant resolves to
-    /// `class` in this file's analysis. Same filter shape as
-    /// `resolve::refs_to` for `TargetKind::Method`, so rename and
-    /// references agree on what "the same method" means.
-    pub fn rename_method_in_class(&self, old_name: &str, class: &str, new_name: &str) -> Vec<(Span, String)> {
+    /// Scope-aware rename for a sub/method: matches decls + both
+    /// call shapes that resolve to this (scope, name) pair.
+    ///
+    ///   * decl walk — `Sub`/`Method` symbols whose `package == scope`
+    ///   * FunctionCall refs whose `resolved_package == scope`
+    ///   * MethodCall refs whose `invocant_class == scope`
+    ///
+    /// The two call shapes both resolve to the same underlying sub:
+    /// `package Foo; sub run {}` is callable as `run()` OR
+    /// `$self->run()` OR `Foo::run()`. A rename must rewrite every
+    /// shape, and must NOT rewrite same-named subs/methods in other
+    /// packages. When `scope == None`, matches top-level/script subs
+    /// with no package; FunctionCall refs whose resolver didn't pin
+    /// a package match those. MethodCall refs always need a class —
+    /// `None` scope never matches them.
+    fn rename_callable_in_scope(
+        &self,
+        old_name: &str,
+        scope: &Option<String>,
+        new_name: &str,
+    ) -> Vec<(Span, String)> {
         let mut edits = Vec::new();
         for sym in &self.symbols {
             if sym.name != old_name { continue; }
             if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-            if sym.package.as_deref() != Some(class) { continue; }
+            if sym.package != *scope { continue; }
             edits.push((sym.selection_span, new_name.to_string()));
         }
         for r in &self.refs {
             if r.target_name != old_name { continue; }
             match &r.kind {
-                RefKind::MethodCall { invocant, invocant_span, method_name_span, invocant_class } => {
-                    // Prefer the build-time resolved class (handles
-                    // chains like `Foo->new->m`); fall back to
-                    // text-based resolution when not pinned.
-                    let resolved: Option<String> = invocant_class.clone()
-                        .or_else(|| {
-                            let resolve_point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
-                            self.invocant_text_to_class(Some(invocant), resolve_point)
-                        });
-                    if resolved.as_deref() == Some(class) {
-                        edits.push((*method_name_span, new_name.to_string()));
+                RefKind::FunctionCall { resolved_package } => {
+                    if resolved_package == scope {
+                        edits.push((r.span, new_name.to_string()));
                     }
                 }
-                // Qualified function-call form `Class::method()` — name
-                // includes "::" but filter is on `target_name == old_name`
-                // (bare method name), so FunctionCall refs never match
-                // a class-scoped method rename here. Left as future work
-                // if/when we need to canonicalize those.
+                RefKind::MethodCall { invocant_class, method_name_span, .. } => {
+                    // MethodCall refs target a class — `None` scope
+                    // doesn't reach methods.
+                    if let (Some(cls), Some(wanted)) = (invocant_class, scope.as_ref()) {
+                        if cls == wanted {
+                            edits.push((*method_name_span, new_name.to_string()));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         edits
+    }
+
+    /// Package-scoped sub rename — public-API name used by the
+    /// Function rename path. Delegates to the unified
+    /// `rename_callable_in_scope`; the distinction between "function"
+    /// and "method" in Perl is just call shape, not identity.
+    pub fn rename_sub_in_package(&self, old_name: &str, package: &Option<String>, new_name: &str) -> Vec<(Span, String)> {
+        self.rename_callable_in_scope(old_name, package, new_name)
+    }
+
+    /// Class-scoped method rename — public-API name used by the
+    /// Method rename path. Same semantics as
+    /// `rename_sub_in_package(old, &Some(class), new)`: function and
+    /// method calls into the same package are two shapes of the same
+    /// callable.
+    pub fn rename_method_in_class(&self, old_name: &str, class: &str, new_name: &str) -> Vec<(Span, String)> {
+        self.rename_callable_in_scope(old_name, &Some(class.to_string()), new_name)
     }
 
     /// Find all occurrences of a package name (def + refs + use statements) for cross-file rename.
@@ -2684,17 +2720,19 @@ impl FileAnalysis {
                         return Some((sym.id, true));
                     }
                 }
-                RefKind::FunctionCall => {
+                RefKind::FunctionCall { resolved_package } => {
                     for &sid in self.symbols_named(&r.target_name) {
-                        if matches!(self.symbol(sid).kind, SymKind::Sub) {
+                        let sym = self.symbol(sid);
+                        if sym.kind != SymKind::Sub { continue; }
+                        if sym.package == *resolved_package {
                             return Some((sid, true));
                         }
                     }
                 }
-                RefKind::MethodCall { ref invocant, ref invocant_span, .. } => {
-                    let class_name = self.resolve_method_invocant(
+                RefKind::MethodCall { ref invocant, ref invocant_span, ref invocant_class, .. } => {
+                    let class_name = invocant_class.clone().or_else(|| self.resolve_method_invocant(
                         invocant, invocant_span, r.scope, point, tree, source_bytes, module_index,
-                    );
+                    ));
                     // Try inheritance-aware resolution first
                     if let Some(ref cn) = class_name {
                         match self.resolve_method_in_ancestors(cn, &r.target_name, module_index) {
@@ -3191,6 +3229,13 @@ impl FileAnalysis {
 
         // Append return type + preceding/POD doc for subs/methods.
         if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+            // Disambiguate `Foo::run` vs `Bar::run` by showing the
+            // owning package. Without this, two same-named subs in
+            // different packages both render identical hover text
+            // and the user can't tell which one the LSP resolved to.
+            if let Some(pkg) = sym.package.as_deref() {
+                text.push_str(&format!("\n\n*package {}*", pkg));
+            }
             if let SymbolDetail::Sub { ref return_type, ref doc, .. } = sym.detail {
                 if let Some(rt) = return_type {
                     text.push_str(&format!("\n\n*returns: {}*", format_inferred_type(rt)));
@@ -3498,7 +3543,7 @@ impl FileAnalysis {
                     if matches!(r.access, AccessKind::Write) { mods |= 1 << MOD_MODIFICATION; }
                     tokens.push(PerlSemanticToken { span: r.span, token_type, modifiers: mods });
                 }
-                RefKind::FunctionCall => {
+                RefKind::FunctionCall { .. } => {
                     // Framework DSL keywords → macro, otherwise function
                     let token_type = if self.framework_imports.contains(r.target_name.as_str()) {
                         TOK_MACRO

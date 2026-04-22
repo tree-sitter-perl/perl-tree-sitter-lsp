@@ -186,7 +186,7 @@ pub fn find_definition(
 
     // Check if cursor is on a function call that matches an imported symbol
     if let Some(r) = analysis.ref_at(point) {
-        if matches!(r.kind, RefKind::FunctionCall) {
+        if matches!(r.kind, RefKind::FunctionCall { .. }) {
             if let Some((import, module_path)) =
                 resolve_imported_function(analysis, &r.target_name, module_index)
             {
@@ -794,7 +794,7 @@ pub fn hover_info(
 
     // Check if cursor is on an imported function call
     if let Some(r) = analysis.ref_at(point) {
-        if matches!(r.kind, RefKind::FunctionCall) {
+        if matches!(r.kind, RefKind::FunctionCall { .. }) {
             if let Some((import, _path)) =
                 resolve_imported_function(analysis, &r.target_name, module_index)
             {
@@ -1968,7 +1968,7 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
     let mut diagnostics = Vec::new();
 
     for r in &analysis.refs {
-        if !matches!(r.kind, RefKind::FunctionCall) {
+        if !matches!(r.kind, RefKind::FunctionCall { .. }) {
             continue;
         }
         let name = &r.target_name;

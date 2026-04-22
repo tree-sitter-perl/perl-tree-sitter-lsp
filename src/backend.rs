@@ -431,9 +431,9 @@ impl LanguageServer for Backend {
 
         let point = symbols::position_to_point(pos);
         let target = match doc.analysis.rename_kind_at(point) {
-            Some(RenameKind::Function(name)) => TargetRef {
+            Some(RenameKind::Function { name, package }) => TargetRef {
                 name,
-                kind: TargetKind::Sub,
+                kind: TargetKind::Sub { package },
             },
             Some(RenameKind::Method { name, class }) => TargetRef {
                 name,
@@ -581,13 +581,15 @@ impl LanguageServer for Backend {
                 // Hash keys: single-file for now
                 Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
             }
-            Some(crate::file_analysis::RenameKind::Function(_))
+            Some(crate::file_analysis::RenameKind::Function { .. })
             | Some(crate::file_analysis::RenameKind::Method { .. })
             | Some(crate::file_analysis::RenameKind::Package(_)) => {
                 // Unpack per-kind name + build a per-kind rename closure.
                 let (name, rename_fn): (String, Box<dyn Fn(&FileAnalysis, &str, &str) -> Vec<(crate::file_analysis::Span, String)>>) = match rename_kind.as_ref().unwrap() {
-                    crate::file_analysis::RenameKind::Function(n) =>
-                        (n.clone(), Box::new(FileAnalysis::rename_sub)),
+                    crate::file_analysis::RenameKind::Function { name, package } => {
+                        let p = package.clone();
+                        (name.clone(), Box::new(move |fa, old, new| fa.rename_sub_in_package(old, &p, new)))
+                    }
                     crate::file_analysis::RenameKind::Method { name, class } => {
                         let c = class.clone();
                         (name.clone(), Box::new(move |fa, old, new| fa.rename_method_in_class(old, &c, new)))

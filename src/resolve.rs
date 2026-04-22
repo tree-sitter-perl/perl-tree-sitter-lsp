@@ -41,14 +41,16 @@ pub struct TargetRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
-    /// A sub or function name (cross-file call-site matching).
-    Sub,
+    /// A sub defined in a specific package. `None` = the sub has
+    /// no package context (top-level script). Matches `Sub`/`Method`
+    /// symbols whose `package` field equals this, and `FunctionCall`
+    /// refs whose `resolved_package` equals this. Package-scoping
+    /// mirrors method's class-scoping — name-only matching
+    /// cross-links `Foo::run` and `Bar::run`.
+    Sub { package: Option<String> },
     /// A method on a specific class. Matches `Sub`/`Method` symbols
     /// whose `package == class`, and `MethodCall` refs whose invocant
-    /// resolves to `class` in that file's analysis. Class-scoping is
-    /// mandatory — name-only matching silently unions unrelated
-    /// classes that share a method name (e.g. `Foo::run` and
-    /// `Bar::run`, or a mojo-helper leaf with a route's action).
+    /// resolves to `class`.
     Method { class: String },
     /// A package/class/module name — matches PackageRef refs.
     Package,
@@ -177,11 +179,21 @@ fn collect_from_analysis(
         if sym.name != target.name {
             continue;
         }
+        // Treat a sub and a method in the same package as the same
+        // callable — Perl's only distinction between them is call
+        // shape. `Sub { package }` matches exactly that scope (None
+        // = top-level script sub); `Method { class }` is the
+        // `Sub { package: Some(class) }` case with stricter intent.
+        let callable_scope: Option<Option<String>> = match &target.kind {
+            TargetKind::Sub { package } => Some(package.clone()),
+            TargetKind::Method { class } => Some(Some(class.clone())),
+            _ => None,
+        };
         let matches_kind = match &target.kind {
-            TargetKind::Sub => sym.kind == SymKind::Sub,
-            TargetKind::Method { class } => {
+            TargetKind::Sub { .. } | TargetKind::Method { .. } => {
+                let scope = callable_scope.as_ref().unwrap();
                 matches!(sym.kind, SymKind::Sub | SymKind::Method)
-                    && sym.package.as_deref() == Some(class.as_str())
+                    && sym.package == *scope
             }
             TargetKind::Package => matches!(
                 sym.kind,
@@ -215,33 +227,36 @@ fn collect_from_analysis(
     }
 
     // Collect usage refs.
+    let callable_scope_for_refs: Option<Option<String>> = match &target.kind {
+        TargetKind::Sub { package } => Some(package.clone()),
+        TargetKind::Method { class } => Some(Some(class.clone())),
+        _ => None,
+    };
     for r in &analysis.refs {
         if r.target_name != target.name {
             continue;
         }
+        // Sub + Method both match any call into that scope — function
+        // or method shape — per the "same callable, two shapes"
+        // invariant. Filter is a single scope comparison.
         let matches_kind = match (&target.kind, &r.kind) {
-            (TargetKind::Sub, RefKind::FunctionCall) => true,
-            (TargetKind::Sub, RefKind::MethodCall { .. }) => true,
-            // Bareword `Pkg::method()` call inside the target class —
-            // matches. Qualified function-call refs include the `::`
-            // chain in `target_name`; we filter by name above, and
-            // trust the class invariant here.
-            (TargetKind::Method { .. }, RefKind::FunctionCall) => true,
-            (TargetKind::Method { class: wanted },
-             RefKind::MethodCall { invocant, invocant_span, invocant_class, .. }) => {
-                // Prefer the build-time `invocant_class` (handles
-                // chain invocants like `Foo->new->m` that plain text
-                // resolution can't). Fall back to
-                // `invocant_text_to_class` for callbacks where the
-                // class couldn't be pinned at build. Unresolvable →
-                // EXCLUDE the ref (avoids cross-linking unrelated
-                // classes that share a method name).
-                let resolved: Option<String> = invocant_class.clone()
-                    .or_else(|| {
-                        let point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
-                        analysis.invocant_text_to_class(Some(invocant), point)
-                    });
-                resolved.as_deref() == Some(wanted.as_str())
+            (TargetKind::Sub { .. } | TargetKind::Method { .. },
+             RefKind::FunctionCall { resolved_package }) => {
+                let scope = callable_scope_for_refs.as_ref().unwrap();
+                resolved_package == scope
+            }
+            (TargetKind::Sub { .. } | TargetKind::Method { .. },
+             RefKind::MethodCall { invocant_class, .. }) => {
+                // Method-shaped call: match only when the ref's
+                // invocant resolved to the target scope. No text
+                // fallback — unresolved invocants are excluded rather
+                // than cross-linked. (Build-time
+                // `resolve_invocant_class_tree` handles chains.)
+                let scope = callable_scope_for_refs.as_ref().unwrap();
+                match (invocant_class, scope) {
+                    (Some(cn), Some(pkg)) => cn == pkg,
+                    _ => false, // package-less sub or unpinned method
+                }
             }
             (TargetKind::Package, RefKind::PackageRef) => true,
             (
@@ -291,12 +306,12 @@ mod tests {
         let path_a = PathBuf::from("/tmp/resolve_test_a.pm");
         let path_b = PathBuf::from("/tmp/resolve_test_b.pm");
 
-        // File A defines sub foo.
-        let fa_a = parse("package A;\nsub foo { 42 }\n1;\n");
+        // File A defines sub foo and exports it.
+        let fa_a = parse("package A;\nour @EXPORT_OK = qw/foo/;\nsub foo { 42 }\n1;\n");
         store.insert_workspace(path_a.clone(), fa_a);
 
-        // File B calls foo().
-        let fa_b = parse("package B;\nsub bar { foo(); }\n1;\n");
+        // File B imports foo from A and calls it.
+        let fa_b = parse("package B;\nuse A qw/foo/;\nsub bar { foo(); }\n1;\n");
         store.insert_workspace(path_b.clone(), fa_b);
 
         let results = refs_to(
@@ -304,7 +319,7 @@ mod tests {
             None,
             &TargetRef {
                 name: "foo".to_string(),
-                kind: TargetKind::Sub,
+                kind: TargetKind::Sub { package: Some("A".to_string()) },
             },
             RoleMask::EDITABLE,
         );
@@ -699,7 +714,6 @@ $b->run;
     /// hover_info, rename_kind_at, refs_to, rename_sub) keys off
     /// that field. Same shape as `invocant_class` on MethodCall.
     #[test]
-    #[ignore = "pin test — exposes import-graph-aware sub resolution gap; fix planned"]
     fn sub_refs_respect_import_graph_not_just_name() {
         use crate::file_analysis::RenameKind;
         use tree_sitter::Parser;
@@ -707,14 +721,28 @@ $b->run;
         // Note: tree-sitter-perl parses bare `hi;` (no parens) as a
         // plain bareword, not a function call — so we write `hi();`
         // here to get a real `function_call_expression`. The
-        // class-scoping concern this test exercises (import-graph
-        // aware resolution) is independent of the parens question.
+        // import-graph concern this test exercises is independent
+        // of the parens question.
+        //
+        // Three packages, each with `sub hi`:
+        //   - Sner — has @EXPORT_OK=qw/hi/, `use Sner;` (no import list
+        //     → imports nothing, only @EXPORT would auto-import).
+        //   - Bler — has @EXPORT_OK=qw/hi/, `use Bler qw/hi/` imports
+        //     `hi` explicitly. This is the one our `hi()` call hits.
+        //   - Xler — has `sub hi` too but no @EXPORT/@EXPORT_OK and
+        //     never `use`d. It's just *there* in the file, its `hi`
+        //     is unreachable to the main call. Double-pin: name-only
+        //     resolution would union all three; correct resolution
+        //     ignores Xler entirely.
         let src = r#"package Sner {
     our @EXPORT_OK = qw/hi/;
     sub hi {}
 }
 package Bler {
     our @EXPORT_OK = qw/hi/;
+    sub hi {}
+}
+package Xler {
     sub hi {}
 }
 
@@ -731,8 +759,9 @@ hi();
         // Positions (0-indexed rows; blank lines count):
         //   row 2  — `    sub hi {}` in Sner
         //   row 6  — `    sub hi {}` in Bler
-        //   row 12 — bare `hi;` call (after blank row 11)
-        let hi_call = tree_sitter::Point { row: 12, column: 0 };
+        //   row 9  — `    sub hi {}` in Xler (unreachable — never imported)
+        //   row 15 — `hi()` call
+        let hi_call = tree_sitter::Point { row: 15, column: 0 };
 
         let kind = fa.rename_kind_at(hi_call);
         let hover = fa.hover_info(hi_call, src, Some(&tree), None);
@@ -740,9 +769,9 @@ hi();
 
         // Rename kind — for gr/rename construction.
         let target = match kind.as_ref() {
-            Some(RenameKind::Function(name)) => TargetRef {
+            Some(RenameKind::Function { name, package }) => TargetRef {
                 name: name.clone(),
-                kind: TargetKind::Sub,
+                kind: TargetKind::Sub { package: package.clone() },
             },
             Some(RenameKind::Method { name, class }) => TargetRef {
                 name: name.clone(),
@@ -752,7 +781,8 @@ hi();
         };
 
         let rename_edits = match &kind {
-            Some(RenameKind::Function(name)) => fa.rename_sub(name, "renamed_hi"),
+            Some(RenameKind::Function { name, package }) =>
+                fa.rename_sub_in_package(name, package, "renamed_hi"),
             Some(RenameKind::Method { name, class }) =>
                 fa.rename_method_in_class(name, class, "renamed_hi"),
             _ => Vec::new(),
@@ -766,32 +796,34 @@ hi();
         // ---- Collect all findings ----
         let mut failures: Vec<String> = Vec::new();
 
-        // (1) hover: must mention Bler (imported source), not Sner.
+        // (1) hover: must mention Bler (imported source), not Sner or Xler.
         match &hover {
-            Some(h) if h.contains("Bler") && !h.contains("Sner") => { /* ok */ }
+            Some(h) if h.contains("Bler") && !h.contains("Sner") && !h.contains("Xler") => { /* ok */ }
             Some(h) => failures.push(format!(
-                "hover on `hi()` is class-ambiguous or wrong class; got: {:?} \
-                 (should mention Bler, not Sner)", h)),
+                "hover on `hi()` is ambiguous or names the wrong package; got: {:?} \
+                 (should mention Bler; must not mention Sner or Xler)", h)),
             None => failures.push("hover on `hi()` returned None".into()),
         }
 
-        // (2) gd: should jump to Bler::hi at row 6, NOT Sner::hi at row 2.
+        // (2) gd: must jump to Bler::hi (row 6). Not Sner::hi (row 2), not Xler::hi (row 9).
         match gd {
             Some(s) if s.start.row == 6 => { /* ok */ }
             Some(s) if s.start.row == 2 =>
                 failures.push(format!("gd jumped to Sner::hi (row 2) — \
-                    should follow the import graph to Bler::hi (row 6)")),
+                    should follow imports to Bler::hi (row 6)")),
+            Some(s) if s.start.row == 9 =>
+                failures.push(format!("gd jumped to Xler::hi (row 9) — \
+                    Xler isn't imported, it should be ignored")),
             Some(s) => failures.push(format!(
                 "gd jumped to row {} — expected row 6 (Bler::hi)", s.start.row)),
             None => failures.push("gd returned None".into()),
         }
 
-        // (3) gr: should include Bler::hi decl (row 6) + `hi()` call (row 12).
-        // Should NOT include Sner::hi decl (row 2) — it's in scope but not
-        // imported.
+        // (3) gr: should include Bler::hi decl (row 6) + `hi()` call (row 15).
+        // Must NOT include Sner::hi decl (row 2) or Xler::hi decl (row 9).
         let ref_rows: Vec<usize> = refs_result.iter().map(|r| r.span.start.row).collect();
-        if !ref_rows.contains(&12) {
-            failures.push(format!("gr missed the hi() call at row 12: {:?}", ref_rows));
+        if !ref_rows.contains(&15) {
+            failures.push(format!("gr missed the hi() call at row 15: {:?}", ref_rows));
         }
         if !ref_rows.contains(&6) {
             failures.push(format!("gr missed Bler::hi decl at row 6: {:?}", ref_rows));
@@ -799,17 +831,23 @@ hi();
         if ref_rows.contains(&2) {
             failures.push(format!("gr wrongly unioned Sner::hi decl at row 2: {:?}", ref_rows));
         }
+        if ref_rows.contains(&9) {
+            failures.push(format!("gr wrongly unioned Xler::hi decl at row 9: {:?}", ref_rows));
+        }
 
-        // (4) rename: should rewrite Bler::hi + hi() call; NOT Sner::hi.
+        // (4) rename: should rewrite Bler::hi + hi() call; NOT Sner::hi or Xler::hi.
         let rename_rows: Vec<usize> = rename_edits.iter().map(|(s, _)| s.start.row).collect();
-        if !rename_rows.contains(&12) {
-            failures.push(format!("rename missed hi() call at row 12: {:?}", rename_rows));
+        if !rename_rows.contains(&15) {
+            failures.push(format!("rename missed hi() call at row 15: {:?}", rename_rows));
         }
         if !rename_rows.contains(&6) {
             failures.push(format!("rename missed Bler::hi decl at row 6: {:?}", rename_rows));
         }
         if rename_rows.contains(&2) {
             failures.push(format!("rename wrongly rewrote Sner::hi decl at row 2: {:?}", rename_rows));
+        }
+        if rename_rows.contains(&9) {
+            failures.push(format!("rename wrongly rewrote Xler::hi decl at row 9: {:?}", rename_rows));
         }
 
         assert!(
@@ -830,7 +868,7 @@ hi();
             None,
             &TargetRef {
                 name: "nonexistent".to_string(),
-                kind: TargetKind::Sub,
+                kind: TargetKind::Sub { package: None },
             },
             RoleMask::EDITABLE,
         );
@@ -967,7 +1005,7 @@ hi();
             None,
             &TargetRef {
                 name: "foo".to_string(),
-                kind: TargetKind::Sub,
+                kind: TargetKind::Sub { package: None },
             },
             RoleMask::OPEN,
         );
