@@ -9542,6 +9542,19 @@ sub to { my $self = shift; return $self; }
             Arc::new(build_fa(route_pm)),
         );
 
+        // Cross-file enrichment — mirrors `Backend::enrich_analysis`.
+        // Without this pass, MethodCallBindings whose resolution needs
+        // a cross-file return type (e.g. `$r = app->routes` needs real
+        // Mojolicious.pm's `routes` accessor) don't land in
+        // `type_constraints`, and `$r` stays untyped.
+        let mut fa = fa;
+        fa.enrich_imported_types_with_keys(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            Some(&idx),
+        );
+        let fa = fa;
+
         // Locate the two target lines by content — decoupled from
         // absolute row numbers so reformats don't invalidate the test.
         let (row_app_routes, line_app_routes) = src.lines().enumerate()
@@ -9598,6 +9611,36 @@ sub to { my $self = shift; return $self; }
             "hover on `app` should mention Mojolicious (it's typed as \
              the Mojolicious app instance). got: {:?}",
             app_hover,
+        );
+
+        // Headline chain assertion: `$r` MUST be typed as
+        // Mojolicious::Routes after the `my $r = app->routes;` line.
+        // This is the single most important observable — without it,
+        // every `$r->...` downstream loses intelligence (precisely
+        // the user's report). `inferred_type` is the same query
+        // resolve_invocant_class uses for method resolution, so if
+        // this says None, nothing on line 71 can work.
+        let r_point = probe(row_r_get_to, col_of(line_r_get_to, "$r"));
+        let r_type = fa.inferred_type("$r", r_point);
+        assert_eq!(
+            r_type.and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes"),
+            "`$$r` must be typed as Mojolicious::Routes at the `$$r->get` \
+             call site. Without this, the rest of line 71 is dead. got: {:?}",
+            r_type,
+        );
+
+        // `$r->get` must resolve via inheritance (Mojolicious::Routes
+        // ISA Mojolicious::Routes::Route) to the real `get` method.
+        // Return type is fluent — stays on Route for `->to` to work.
+        let get_rt = fa.find_method_return_type(
+            "Mojolicious::Routes", "get", Some(&idx), None,
+        );
+        assert_eq!(
+            get_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "`$$r->get` must resolve to Mojolicious::Routes::Route::get \
+             via inheritance. got: {:?}", get_rt,
         );
     }
 

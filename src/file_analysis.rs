@@ -3044,7 +3044,23 @@ impl FileAnalysis {
                     None
                 })
         } else {
-            // Bareword invocant = class name directly
+            // Bareword invocant: ambiguous between class-name and
+            // zero-arg function call. If a local Sub/Method with this
+            // name has a ClassName return type, treat it as the call
+            // and use its return type — that's what Perl does at
+            // runtime when the name resolves as a sub. Falls back to
+            // class-name interpretation when no such sub exists.
+            // Mirrors the same rule in `receiver_type_for` and
+            // `resolve_invocant_class_tree` so every bareword-invocant
+            // path sees the same answer.
+            let bare = invocant.rsplit("::").next().unwrap_or(invocant);
+            for sym in &self.symbols {
+                if sym.name != bare { continue; }
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
+                    return Some(c.clone());
+                }
+            }
             Some(invocant.to_string())
         }
     }
