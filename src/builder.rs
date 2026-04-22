@@ -643,6 +643,19 @@ impl<'a> Builder<'a> {
             // Mojo's Route.pm uses it on every HTTP-verb method.
             // `func1op_call_expression` = bare `shift`, the tree-sitter
             // shape for single-token function-y operators with no parens.
+            //
+            // TODO: if false positives become annoying (e.g. a top-level
+            // sub inside a package that genuinely uses `shift->method(…)`
+            // on its first arg of a non-self type), introduce a heuristic
+            // here — e.g. only trust the shape when the enclosing sub
+            // has at least one OTHER method-like signal (declared as
+            // `method`, first `my ($self, ...) = @_`, `sub new { bless
+            // ... }` in the same package, etc.). `$self` itself is
+            // heuristic-free for exactly this reason — we trust the
+            // token — but `shift` is a broader token with legitimate
+            // non-self uses. Until a real false-positive report shows
+            // up, the no-heuristic version wins: silent inference beats
+            // no inference.
             "func1op_call_expression" if self.is_shift_call(node) => {
                 self.current_package.clone()
             }
@@ -652,6 +665,7 @@ impl<'a> Builder<'a> {
             //   (array_element_expression
             //     array:(container_variable (varname "_"))
             //     index:(number "0"))
+            // Same heuristic TODO applies as for `shift` above.
             "array_element_expression" => {
                 let array = node.child_by_field_name("array")?;
                 if array.kind() != "container_variable" { return None; }
