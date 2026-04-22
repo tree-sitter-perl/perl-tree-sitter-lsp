@@ -548,6 +548,134 @@ Bler->new->hi;
             "Sner->new->hi wrongly in Bler results: {:?}", bler_lines);
     }
 
+    /// ALL FOUR LSP paths (hover, gd, gr, rename) must class-scope
+    /// for two packages sharing a method name. Five different resolvers
+    /// exist in the codebase:
+    ///
+    ///   1. `Builder::resolve_invocant_class_tree` — populates
+    ///      `RefKind::MethodCall.invocant_class` at build time.
+    ///   2. `FileAnalysis::resolve_method_invocant` — tree-based,
+    ///      used by `find_definition` and `hover_info`.
+    ///   3. `FileAnalysis::resolve_invocant_class` — text fallback
+    ///      used by resolve_method_invocant.
+    ///   4. `FileAnalysis::invocant_text_to_class` — used by
+    ///      `rename_kind_at` and `refs_to` fallback.
+    ///   5. `FileAnalysis::rename_method_in_class` — my new one;
+    ///      filters rename edits by class.
+    ///
+    /// Classic copy-paste risk. This test drives all four LSP-visible
+    /// surfaces with a single Foo/Bar fixture and proves every path
+    /// stays on Foo when the cursor is on Foo, and on Bar when on
+    /// Bar. If any path drifts, its assertion fires.
+    #[test]
+    fn all_four_lsp_paths_class_scope_on_shared_method_name() {
+        use crate::file_analysis::RenameKind;
+        use tree_sitter::Parser;
+
+        let src = r#"package Foo;
+sub new { bless {}, shift }
+sub run { "foo" }
+
+package Bar;
+sub new { bless {}, shift }
+sub run { "bar" }
+
+package main;
+my $f = Foo->new;
+my $b = Bar->new;
+$f->run;
+$b->run;
+1;
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let fa = crate::builder::build(&tree, src.as_bytes());
+
+        // Line/col positions (0-indexed):
+        //   line 2, col 4  — `sub run` decl in Foo
+        //   line 6, col 4  — `sub run` decl in Bar
+        //   line 11, col 4 — `$f->run` (cursor on "run"). Line text:
+        //                    "$f->run;" → cols 0..1 = "$f", 2..3 = "->",
+        //                    4..6 = "run".
+        //   line 12, col 4 — `$b->run` (cursor on "run").
+        let run_in_foo_decl = tree_sitter::Point { row: 2, column: 4 };
+        let run_in_bar_decl = tree_sitter::Point { row: 6, column: 4 };
+        let f_run_call = tree_sitter::Point { row: 11, column: 4 };
+        let b_run_call = tree_sitter::Point { row: 12, column: 4 };
+
+        // ---- (1) hover — cursor on `$f->run`. Must mention Foo, not Bar.
+        let hover = fa.hover_info(f_run_call, src, Some(&tree), None)
+            .expect("hover on $f->run returns something");
+        assert!(hover.contains("Foo"),
+            "hover on $f->run should mention Foo; got: {:?}", hover);
+        assert!(!hover.contains("Bar"),
+            "hover on $f->run leaked Bar into the content: {:?}", hover);
+
+        // Mirror: hover on $b->run mentions Bar, not Foo.
+        let hover_b = fa.hover_info(b_run_call, src, Some(&tree), None)
+            .expect("hover on $b->run returns something");
+        assert!(hover_b.contains("Bar"),
+            "hover on $b->run should mention Bar; got: {:?}", hover_b);
+        assert!(!hover_b.contains("Foo"),
+            "hover on $b->run leaked Foo into the content: {:?}", hover_b);
+
+        // ---- (2) goto-def — $f->run must jump to Foo::run (line 2), not Bar::run (line 6).
+        let gd_f = fa.find_definition(f_run_call, Some(&tree), Some(src.as_bytes()), None)
+            .expect("gd on $f->run resolves");
+        assert_eq!(gd_f.start.row, 2,
+            "gd on $f->run jumped to line {} (expected 2 = Foo::run)", gd_f.start.row);
+
+        let gd_b = fa.find_definition(b_run_call, Some(&tree), Some(src.as_bytes()), None)
+            .expect("gd on $b->run resolves");
+        assert_eq!(gd_b.start.row, 6,
+            "gd on $b->run jumped to line {} (expected 6 = Bar::run)", gd_b.start.row);
+
+        // ---- (3) references — via rename_kind_at → TargetRef → refs_to.
+        let target_from_f = match fa.rename_kind_at(f_run_call) {
+            Some(RenameKind::Method { name, class }) => TargetRef {
+                name,
+                kind: TargetKind::Method { class },
+            },
+            other => panic!("rename_kind_at($f->run) should be Method{{class=Foo}}, got {:?}", other),
+        };
+        // Verify the class field was populated as Foo (not Bar, not missing).
+        if let TargetKind::Method { ref class } = target_from_f.kind {
+            assert_eq!(class, "Foo",
+                "rename_kind_at($f->run) resolved class as {:?}, expected Foo", class);
+        }
+
+        // ---- (4) rename — BEFORE moving `fa` into the store. Rename
+        // Foo::run to renamed_run. Must edit Foo::run decl + $f->run
+        // call, NOT Bar::run or $b->run.
+        let edits = fa.rename_method_in_class("run", "Foo", "renamed_run");
+        let edit_lines: Vec<usize> = edits.iter().map(|(span, _)| span.start.row).collect();
+        assert!(edit_lines.contains(&2),
+            "rename Foo::run missed the decl: {:?}", edit_lines);
+        assert!(edit_lines.contains(&11),
+            "rename Foo::run missed the $f->run call: {:?}", edit_lines);
+        assert!(!edit_lines.contains(&6),
+            "rename Foo::run wrongly rewrote Bar::run decl: {:?}", edit_lines);
+        assert!(!edit_lines.contains(&12),
+            "rename Foo::run wrongly rewrote $b->run call: {:?}", edit_lines);
+
+        // Move `fa` into the store for the refs_to walk.
+        let store = FileStore::new();
+        let path = PathBuf::from("/tmp/lsp_paths_fixture.pm");
+        store.insert_workspace(path.clone(), fa);
+
+        let foo_refs = refs_to(&store, None, &target_from_f, RoleMask::EDITABLE);
+        let foo_lines: Vec<usize> = foo_refs.iter().map(|r| r.span.start.row).collect();
+        assert!(foo_lines.contains(&2),  // Foo::run decl
+            "gr(Foo::run) missed decl: {:?}", foo_lines);
+        assert!(foo_lines.contains(&11), // $f->run call
+            "gr(Foo::run) missed $f->run call: {:?}", foo_lines);
+        assert!(!foo_lines.contains(&6), // Bar::run decl
+            "gr(Foo::run) wrongly included Bar::run decl: {:?}", foo_lines);
+        assert!(!foo_lines.contains(&12), // $b->run call
+            "gr(Foo::run) wrongly included $b->run call: {:?}", foo_lines);
+    }
+
     #[test]
     fn test_refs_to_empty_when_no_hits() {
         let store = FileStore::new();
