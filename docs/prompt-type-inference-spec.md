@@ -520,6 +520,164 @@ the unification refactor applied to FrameworkEntity.
 
 ---
 
+## Part 6 — Observation IR + framework-aware resolution
+
+### Motivation
+
+Today `InferredType` is a flat sum: `HashRef | ArrayRef | ClassName(Foo) | …`.
+Siblings in the sum are assumed mutually exclusive. But bless makes the
+"blessed hashref" case — `$self` is simultaneously an object of class `Foo`
+AND a hashref underneath. Observing `$self->{key}` inside `sub name` of
+Mojolicious::Routes::Route today looks like a *contradiction* ("was
+ClassName, now HashRef"), because the sum can only hold one. The
+inference site overwrites, the type flips to HashRef, and the chain
+dies at the next method call.
+
+The shape the code expresses is a **product**: (dispatch axis) × (rep
+axis). But the product's right home is the IR, not the user-facing
+type. Representation depends on the framework — Mojo::Base is
+hashref-backed, Perl 5.38 `class` uses inside-out / opaque refs, DBIC
+Result classes are something else again, and 1998-vintage
+`bless [], $class` is arrayref-backed. The IR collects facts; the
+resolver projects to a concrete `InferredType` using framework context.
+
+### Design
+
+Keep `InferredType` as the query-visible flat enum. Add a constraint
+bag keyed by variable + scope — a list of observations, never
+overwriting:
+
+```rust
+enum TypeObservation {
+    ClassAssertion(String),        // `my $x = Foo->new`
+    FirstParamInMethod,            // `shift` / `$_[0]` as invocant
+    HashRefAccess,                 // `$v->{k}`, `%$v`, `@$v{…}`
+    ArrayRefAccess,                // `$v->[i]`, `@$v`
+    CodeRefInvocation,             // `$v->()`, `&$v`
+    NumericUse, StringUse, RegexpUse,
+    BlessTarget(Rep),              // `bless [], $class` → Rep::Array
+    ReturnOf(SymbolId),            // fluent-chain binding target
+    // …
+}
+```
+
+Resolver signature:
+
+```rust
+fn resolve_type(
+    obs: &[TypeObservation],
+    framework_ctx: FrameworkCtx,
+) -> Option<InferredType>
+```
+
+Framework context carries the enclosing package's framework mode
+(reuse `builder::FrameworkMode` — Moo/Moose/MojoBase/etc.). Rules the
+resolver applies, roughly in order:
+
+1. **Class beats rep when consistent.** `ClassAssertion(Foo)` or
+   `FirstParamInMethod` with a known enclosing class dominates
+   `HashRefAccess` / `ArrayRefAccess` IF the framework's backing rep
+   matches the access kind. Mojo::Base + HashRefAccess = keep the
+   class. Perl 5.38 `class` + HashRefAccess = contradiction (warn).
+2. **Bless target pins the rep axis.** Seeing `bless [], $c` in the
+   same scope tells the resolver the rep side of the product is
+   `Array`.
+3. **Return-of chains fold.** `ReturnOf(sym)` looks up the sub's
+   return type; multiple ReturnOfs collapse via the existing multi-
+   dispatch-on-arity path (already landed).
+4. **Generic rep observations** with no class evidence resolve to the
+   plain HashRef / ArrayRef / CodeRef type.
+
+The existing `inferred_type(var, point)` becomes the query API; it
+calls `resolve_type` once per query, optionally memoised per (var,
+point). `TypeConstraint` stays for "asserted final type" edge cases
+(`my $x = Foo->new` is still directly a ClassAssertion observation,
+emitted at the assignment span).
+
+### Derived capabilities
+
+- **`sub name`-style methods don't flip their `$self` type.** The bag
+  is `[FirstParamInMethod, HashRefAccess("name"), HashRefAccess("custom")]`;
+  Mojo::Base says rep is Hash, so the resolver keeps
+  `ClassName(Route)`. Chain downstream of the method call stays typed.
+- **Bless variance handled uniformly.** Arrayref-backed classes work
+  out of the box — `BlessTarget(Array)` as an observation forces the
+  rep axis.
+- **Debuggable.** Inspect the bag; find the rogue observation; fix
+  the rule.
+
+### The hard sub-problem: arity multidispatch from procedural bodies
+
+Declared signatures already give us arity-multidispatch return types
+(landed). The tough case is **procedural** arity-discrimination:
+
+```perl
+sub name {
+    my $self = shift;
+    return $self->{name} unless @_;              # arity 0 → String
+    @$self{qw/name custom/} = (shift, 1);
+    return $self;                                 # arity ≥1 → self (fluent)
+}
+```
+
+No signature to read; the arity branch is expressed via `@_` tests
+(`unless @_`, `if @_ == 1`, `if scalar(@_) == N`, `return … unless @_`,
+`die unless @_ == 2`, `my ($x) = @_; return unless defined $x`).
+Extracting the arity-indexed return map from that requires:
+
+- Identifying *arity-gating conditionals*: recognize the shapes
+  (`unless @_`, `if @_ == N`, `if scalar @_ == N`, `@_ > N`, …) as
+  branches on the caller's arity.
+- Per-branch return-type collection: each arity-gated branch gets
+  its own return-type inference that produces a
+  `keyed_returns`-like arity→type map (Part 5a's structure, but keyed
+  by arity rather than by first-arg literal).
+- Defaults: the "fall-through" branch is the catch-all; its return
+  type applies to any arity not explicitly branched on.
+
+This is genuinely hard because:
+
+- The arity tests are idiomatic, not structural — every Perl codebase
+  spells them slightly differently. The detector needs several shapes.
+- Branches mutate variables (`shift` inside the condition reduces
+  `@_`); tracking whether the test fires before or after a `shift`
+  changes which arity the branch covers.
+- Implicit returns from fall-through combine with explicit early
+  returns (`return $self->{k} unless @_` + fall-through `return $self`).
+
+Not required for Mojo day-to-day — declared signatures cover the 90%
+case. Worth doing when we target plain-OOP Perl codebases or want to
+type through `name`-style getter/setter pairs. Land behind a focused
+test suite per arity shape.
+
+### Interplay with landed work
+
+- **Fluent chain** (already done): multi-hop `$a->m1(…)->m2(…)->m3()`
+  return-type propagation with arity-dispatch via declared signatures
+  — this chapter doesn't touch it. The new IR emits `ReturnOf(sym)`
+  observations that feed through the existing chain resolver.
+- **Ternary descent** (not done, independent): `A ? B : C`
+  infer-both-arms lives in `infer_expression_type`. Simple to land,
+  should land before this chapter — once the resolver is framework-
+  aware, ternary just pushes observations from both arms and the
+  resolver folds.
+- **Part 5b — Sum types + narrowing**: the narrowing constraint
+  (`if (ref $v eq 'ARRAY')`) becomes another observation kind with a
+  scoped applicability. Composes naturally.
+
+### Non-goals (for this chapter)
+
+- Rewriting every `InferredType` consumer. The resolver projects back
+  to `InferredType`; query sites don't care about the bag.
+- Full effect-tracking (which branch reads, which writes, which
+  throws). Keep to type-relevant observations.
+- Tracking arity through `@_` shift-sequences in depth — the arity
+  detector matches a finite set of idioms; anything stranger falls
+  back to the declared-signature path (which is zero information for
+  procedural bodies, and that's fine).
+
+---
+
 ## Implementation ordering
 
 All parts are mostly independent and can land separately.
@@ -533,6 +691,8 @@ All parts are mostly independent and can land separately.
 | 5a — Value-indexed returns | small; new `keyed_returns` on SymbolDetail::Sub | context-sensitive return types for dispatch subs | none |
 | 5b — Sum types + narrowing | medium; Union variant + narrowing_scope on TypeConstraint | tag-discriminated narrowing; diagnostics on wrong-variant access | none |
 | 5c — Parametric types (DBIC) | large; new `Parametric` variant + cursor-context wiring | DBIC column completion inside search/update/find; rename on columns | 1, 2 ideally |
+| 6 — Observation IR + framework-aware resolver | large; constraint bag + projection fn, migrate existing sites | blessed-vs-hashref refinement without flips; uniform bless-rep handling across Mojo/5.38-class/DBIC/legacy | ternary descent first |
+| 6b — Arity multidispatch from procedural bodies | large; arity-gating conditional detector + per-branch return types | `sub name { $self->{k} unless @_; … return $self }` pairs type correctly | 6 |
 
 Land each behind a pin-the-fix test pair (one showing the previously-
 broken behavior, one showing the now-correct one). This matches the
