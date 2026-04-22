@@ -162,6 +162,56 @@ pub fn spawn_resolver(
                         module_cache::save_to_db(conn, &module_name, &result, "import");
                     }
 
+                    // Descend into the module's own dependencies so the
+                    // chain keeps resolving beyond the open doc's direct
+                    // imports. Without this the cache stops at depth 1 —
+                    // e.g. opening a Mojolicious::Lite script resolves
+                    // Mojolicious.pm, but Mojolicious.pm's
+                    // `has routes => sub { Mojolicious::Routes->new }`
+                    // never triggers a resolve on Mojolicious::Routes,
+                    // and `$r->get` on line 71 of the demo chain-dies
+                    // because the intermediate class is a cache miss.
+                    //
+                    // The `seen` guard above makes this cycle-safe: a
+                    // transitively-enqueued name that was already
+                    // resolved at the current EXTRACT_VERSION gets
+                    // skipped on its next turn.
+                    if let Some(ref m) = result {
+                        let mut pending = queue.pending.lock().unwrap();
+                        let enqueue = |pending: &mut Vec<String>, name: String| {
+                            if name.is_empty() { return; }
+                            if cache.contains_key(&name) { return; }
+                            if seen.contains_key(&name) { return; }
+                            if !pending.iter().any(|p| p == &name) {
+                                pending.push(name);
+                            }
+                        };
+                        // Explicit imports — the module's own `use` statements.
+                        for imp in &m.analysis.imports {
+                            enqueue(&mut pending, imp.module_name.clone());
+                        }
+                        // Parent classes — inheritance chain.
+                        for parents in m.analysis.package_parents.values() {
+                            for parent in parents {
+                                enqueue(&mut pending, parent.clone());
+                            }
+                        }
+                        // ClassName return types — `has foo => sub { Bar->new }`,
+                        // plugin-emitted typed Subs, method return annotations.
+                        // These are the chain-invisible-but-reachable classes
+                        // the user's chain walks through at query time.
+                        for sym in &m.analysis.symbols {
+                            use crate::file_analysis::{SymKind, SymbolDetail, InferredType};
+                            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                            if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
+                                enqueue(&mut pending, c.clone());
+                            }
+                        }
+                        if !pending.is_empty() {
+                            queue.condvar.notify_one();
+                        }
+                    }
+
                     // Remove from stale set after successful re-resolution.
                     if is_re_resolve {
                         stale_modules.remove(&module_name);

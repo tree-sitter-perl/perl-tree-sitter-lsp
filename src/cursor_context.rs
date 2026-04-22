@@ -247,6 +247,7 @@ fn extract_invocant_from_prefix(prefix: &str) -> &str {
 ///
 /// Returns `None` if no expression-based context is detected (caller should
 /// fall back to text-based detection).
+#[cfg(test)]
 pub fn detect_cursor_context_tree(
     tree: &Tree,
     source: &[u8],

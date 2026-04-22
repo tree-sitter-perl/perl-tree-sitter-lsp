@@ -3662,6 +3662,39 @@ impl<'a> Builder<'a> {
             }
         }
 
+        // Bareword invocant that's really a function call (`app->routes`
+        // where `app` is a plugin-emitted Sub returning Mojolicious).
+        // The wider MethodCall ref covers the whole `app->routes` span,
+        // so cursor-on-`app` currently lands on a ref that describes
+        // `routes` — no semantic token on the bareword, no hover/gd
+        // targeting the sub itself. Emitting a narrower FunctionCall
+        // ref at the bareword span makes ref_at prefer it (innermost
+        // wins), which lets the existing FunctionCall paths (semantic
+        // tokens, hover, gd) light up the bareword as the call it is.
+        if let Some(inv_node) = invocant_node {
+            if inv_node.kind() == "bareword" {
+                if let Ok(bw_text) = inv_node.utf8_text(self.source) {
+                    // Find the matching sub and capture its package so
+                    // the FunctionCall ref's `resolved_package` points
+                    // at the real definer — otherwise find_definition
+                    // and hover_info's package-scoped match miss it.
+                    let matched_pkg = self.symbols.iter().find_map(|s| {
+                        if s.name != bw_text { return None; }
+                        if !matches!(s.kind, SymKind::Sub | SymKind::Method) { return None; }
+                        Some(s.package.clone())
+                    });
+                    if let Some(pkg) = matched_pkg {
+                        self.add_ref(
+                            RefKind::FunctionCall { resolved_package: pkg },
+                            node_to_span(inv_node),
+                            bw_text.to_string(),
+                            AccessKind::Read,
+                        );
+                    }
+                }
+            }
+        }
+
         // DBIC accessor synthesis: __PACKAGE__->add_columns(...), ->has_many(...), etc.
         let is_pkg_call = invocant_text.as_deref() == Some("__PACKAGE__")
             || (invocant_node.map(|n| n.kind()) == Some("package")
@@ -9687,15 +9720,44 @@ sub to { my $self = shift; return $self; }
         check("to method",
               probe(row_r_get_to, col_of(line_r_get_to, "->to") + 2));
 
-        // Focused assertion on `app` — the bareword fix should be
-        // surfacing SOMETHING (the plugin's `app` Sub symbol at minimum).
+        // Focused assertions on `app`:
+        //   1. Hover surfaces the plugin's `app` Sub doc — i.e. ref_at
+        //      resolves to the narrow FunctionCall ref for the bareword,
+        //      NOT the wider MethodCall ref that would describe `routes`.
+        //   2. A semantic token lands on the bareword span — the user
+        //      reported no highlight on `app->` in nvim; the narrow
+        //      FunctionCall ref is what feeds semantic tokens.
         let app_point = probe(row_app_routes, col_of(line_app_routes, "app"));
         let app_hover = fa.hover_info(app_point, &src, Some(&tree), Some(&idx));
+        let app_hover_text = app_hover.as_deref().unwrap_or("");
         assert!(
-            app_hover.as_deref().map(|h| h.contains("Mojolicious")).unwrap_or(false),
-            "hover on `app` should mention Mojolicious (it's typed as \
-             the Mojolicious app instance). got: {:?}",
+            app_hover_text.contains("The Mojolicious application instance"),
+            "hover on `app` must surface the plugin-emitted Sub's doc \
+             — proving ref_at picked the narrow FunctionCall ref, not \
+             the outer MethodCall for `routes`. got: {:?}",
             app_hover,
+        );
+
+        // Semantic token on the bareword — any token kind is fine, the
+        // point is SOMETHING lights it up.
+        let tokens = fa.semantic_tokens();
+        let app_row = row_app_routes;
+        let app_col_start = line_app_routes.find("app").unwrap();
+        let app_col_end = app_col_start + "app".len();
+        let app_has_token = tokens.iter().any(|t|
+            t.span.start.row == app_row
+            && t.span.start.column == app_col_start
+            && t.span.end.column == app_col_end
+        );
+        assert!(
+            app_has_token,
+            "semantic token must fire on the `app` bareword span — \
+             user reported no highlight and traced it to a missing \
+             Ref at the invocant. tokens near row {}: {:?}",
+            app_row,
+            tokens.iter()
+                .filter(|t| t.span.start.row == app_row)
+                .collect::<Vec<_>>(),
         );
 
         // Headline chain assertion: `$r` MUST be typed as
