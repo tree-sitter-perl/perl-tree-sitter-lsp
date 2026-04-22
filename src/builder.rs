@@ -638,7 +638,34 @@ impl<'a> Builder<'a> {
                 }
                 Some(text.to_string())
             }
+            // `shift` in method-body invocant position is the classic
+            // `$self` idiom: `sub get { shift->_generate_route(GET => @_) }`.
+            // Mojo's Route.pm uses it on every HTTP-verb method.
+            // `func1op_call_expression` = bare `shift`, the tree-sitter
+            // shape for single-token function-y operators with no parens.
+            "func1op_call_expression" if self.is_shift_call(node) => {
+                self.current_package.clone()
+            }
+            // `$_[0]` is the other first-arg idiom — used on hot code
+            // paths where the shift is too expensive. Same meaning as
+            // `shift`: the invocant (i.e. `$self`). Shape:
+            //   (array_element_expression
+            //     array:(container_variable (varname "_"))
+            //     index:(number "0"))
+            "array_element_expression" => {
+                let array = node.child_by_field_name("array")?;
+                if array.kind() != "container_variable" { return None; }
+                let varname = array.named_child(0)?;
+                if varname.utf8_text(self.source).ok() != Some("_") { return None; }
+                let index = node.child_by_field_name("index")?;
+                if index.utf8_text(self.source).ok() != Some("0") { return None; }
+                self.current_package.clone()
+            }
             "function_call_expression" | "ambiguous_function_call_expression" => {
+                // Paren'd `shift()` as invocant also means `$self`.
+                if self.is_shift_call(node) {
+                    return self.current_package.clone();
+                }
                 // `get_foo()->bar()` — the invocant of `->bar` is a
                 // function call. Look up the called sub locally and
                 // read its ClassName return type.
@@ -9475,6 +9502,87 @@ sub new {
             .expect("event must be in outline of its declaring file");
         assert_eq!(lsp_kind(event), SymbolKind::EVENT,
             "events stay EVENT — the one LSP kind that fits");
+    }
+
+    /// `sub get { shift->_generate_route(GET => @_) }` — the Mojo
+    /// Routes::Route pattern. `shift` in the invocant position of a
+    /// method call within a method body means `$self`, so the chain
+    /// invocant class must resolve to the enclosing package.
+    ///
+    /// Without this, every HTTP-verb method on Mojolicious::Routes::Route
+    /// has an unknowable chain and `$r->get(...)->to(...)` loses
+    /// intelligence at the `->to` hop.
+    #[test]
+    fn shift_as_self_in_method_body_resolves_to_current_package() {
+        let src = r#"
+package Mojolicious::Routes::Route;
+
+sub get { shift->_generate_route(GET => @_) }
+
+sub _generate_route {
+    my $self = shift;
+    return $self;
+}
+"#;
+        let fa = build_fa(src);
+
+        // The MethodCall ref for `_generate_route` (inside `get`'s body)
+        // must carry `invocant_class = Mojolicious::Routes::Route` —
+        // proving the build-time chain resolver treated `shift` as
+        // `$self` and looked up the enclosing package.
+        let gr_ref = fa.refs.iter().find(|r|
+            matches!(r.kind, RefKind::MethodCall { .. })
+            && r.target_name == "_generate_route"
+        ).expect("MethodCall ref for `_generate_route`");
+
+        if let RefKind::MethodCall { invocant_class, .. } = &gr_ref.kind {
+            assert_eq!(
+                invocant_class.as_deref(),
+                Some("Mojolicious::Routes::Route"),
+                "`shift->_generate_route` must resolve its invocant to \
+                 the enclosing package. got invocant_class: {:?}",
+                invocant_class,
+            );
+        } else {
+            panic!("expected MethodCall ref");
+        }
+    }
+
+    /// `sub is_endpoint { $_[0]->inline ? undef : ... }` — Mojo uses
+    /// `$_[0]` instead of `shift` on hot paths where the shift's arg-
+    /// list mutation is expensive. Same self-tell as `shift`.
+    #[test]
+    fn dollar_underscore_zero_as_self_resolves_to_current_package() {
+        let src = r#"
+package Mojolicious::Routes::Route;
+
+sub is_endpoint {
+    $_[0]->inline;
+}
+
+sub inline {
+    my $self = shift;
+    return $self;
+}
+"#;
+        let fa = build_fa(src);
+
+        let inline_ref = fa.refs.iter().find(|r|
+            matches!(r.kind, RefKind::MethodCall { .. })
+            && r.target_name == "inline"
+        ).expect("MethodCall ref for `inline`");
+
+        if let RefKind::MethodCall { invocant_class, .. } = &inline_ref.kind {
+            assert_eq!(
+                invocant_class.as_deref(),
+                Some("Mojolicious::Routes::Route"),
+                "`$$_[0]->inline` must resolve its invocant to the \
+                 enclosing package. got invocant_class: {:?}",
+                invocant_class,
+            );
+        } else {
+            panic!("expected MethodCall ref");
+        }
     }
 
     /// Regression for the crash reported in the nvim LSP log:
