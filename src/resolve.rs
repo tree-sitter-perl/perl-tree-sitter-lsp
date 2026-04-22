@@ -676,6 +676,149 @@ $b->run;
             "gr(Foo::run) wrongly included $b->run call: {:?}", foo_lines);
     }
 
+    /// Adversarial: two plain packages each declare `sub hi` and
+    /// `@EXPORT_OK = qw/hi/`. The caller does `use Sner;` (which
+    /// imports NOTHING — no @EXPORT, only @EXPORT_OK) and
+    /// `use Bler qw/hi/` (explicit import). The bare `hi()` call
+    /// therefore resolves to Bler's, not Sner's.
+    ///
+    /// All four LSP paths must stay on the imported one (Bler):
+    ///   * hover on `hi()` mentions Bler, not Sner.
+    ///   * gd on `hi()` jumps to `sub hi` in Bler.
+    ///   * gr on `hi()` includes the call + Bler::hi decl only.
+    ///   * rename rewrites Bler::hi + the call, NOT Sner::hi.
+    ///
+    /// Currently RED. The cross-class fix I landed only covered
+    /// MethodCall refs; FunctionCall refs are still name-only, and
+    /// the five different resolvers all collapse same-named subs
+    /// across packages.
+    ///
+    /// The structural fix: `RefKind::FunctionCall` needs
+    /// `resolved_package: Option<String>`, populated at build time
+    /// by consulting `Imports`. Every resolver (find_definition,
+    /// hover_info, rename_kind_at, refs_to, rename_sub) keys off
+    /// that field. Same shape as `invocant_class` on MethodCall.
+    #[test]
+    #[ignore = "pin test — exposes import-graph-aware sub resolution gap; fix planned"]
+    fn sub_refs_respect_import_graph_not_just_name() {
+        use crate::file_analysis::RenameKind;
+        use tree_sitter::Parser;
+
+        // Note: tree-sitter-perl parses bare `hi;` (no parens) as a
+        // plain bareword, not a function call — so we write `hi();`
+        // here to get a real `function_call_expression`. The
+        // class-scoping concern this test exercises (import-graph
+        // aware resolution) is independent of the parens question.
+        let src = r#"package Sner {
+    our @EXPORT_OK = qw/hi/;
+    sub hi {}
+}
+package Bler {
+    our @EXPORT_OK = qw/hi/;
+    sub hi {}
+}
+
+use Sner;
+use Bler qw/hi/;
+
+hi();
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let fa = crate::builder::build(&tree, src.as_bytes());
+
+        // Positions (0-indexed rows; blank lines count):
+        //   row 2  — `    sub hi {}` in Sner
+        //   row 6  — `    sub hi {}` in Bler
+        //   row 12 — bare `hi;` call (after blank row 11)
+        let hi_call = tree_sitter::Point { row: 12, column: 0 };
+
+        let kind = fa.rename_kind_at(hi_call);
+        let hover = fa.hover_info(hi_call, src, Some(&tree), None);
+        let gd = fa.find_definition(hi_call, Some(&tree), Some(src.as_bytes()), None);
+
+        // Rename kind — for gr/rename construction.
+        let target = match kind.as_ref() {
+            Some(RenameKind::Function(name)) => TargetRef {
+                name: name.clone(),
+                kind: TargetKind::Sub,
+            },
+            Some(RenameKind::Method { name, class }) => TargetRef {
+                name: name.clone(),
+                kind: TargetKind::Method { class: class.clone() },
+            },
+            other => panic!("unexpected rename_kind_at = {:?}", other),
+        };
+
+        let rename_edits = match &kind {
+            Some(RenameKind::Function(name)) => fa.rename_sub(name, "renamed_hi"),
+            Some(RenameKind::Method { name, class }) =>
+                fa.rename_method_in_class(name, class, "renamed_hi"),
+            _ => Vec::new(),
+        };
+
+        let store = FileStore::new();
+        let path = PathBuf::from("/tmp/sub_import_fixture.pm");
+        store.insert_workspace(path.clone(), fa);
+        let refs_result = refs_to(&store, None, &target, RoleMask::EDITABLE);
+
+        // ---- Collect all findings ----
+        let mut failures: Vec<String> = Vec::new();
+
+        // (1) hover: must mention Bler (imported source), not Sner.
+        match &hover {
+            Some(h) if h.contains("Bler") && !h.contains("Sner") => { /* ok */ }
+            Some(h) => failures.push(format!(
+                "hover on `hi()` is class-ambiguous or wrong class; got: {:?} \
+                 (should mention Bler, not Sner)", h)),
+            None => failures.push("hover on `hi()` returned None".into()),
+        }
+
+        // (2) gd: should jump to Bler::hi at row 6, NOT Sner::hi at row 2.
+        match gd {
+            Some(s) if s.start.row == 6 => { /* ok */ }
+            Some(s) if s.start.row == 2 =>
+                failures.push(format!("gd jumped to Sner::hi (row 2) — \
+                    should follow the import graph to Bler::hi (row 6)")),
+            Some(s) => failures.push(format!(
+                "gd jumped to row {} — expected row 6 (Bler::hi)", s.start.row)),
+            None => failures.push("gd returned None".into()),
+        }
+
+        // (3) gr: should include Bler::hi decl (row 6) + `hi()` call (row 12).
+        // Should NOT include Sner::hi decl (row 2) — it's in scope but not
+        // imported.
+        let ref_rows: Vec<usize> = refs_result.iter().map(|r| r.span.start.row).collect();
+        if !ref_rows.contains(&12) {
+            failures.push(format!("gr missed the hi() call at row 12: {:?}", ref_rows));
+        }
+        if !ref_rows.contains(&6) {
+            failures.push(format!("gr missed Bler::hi decl at row 6: {:?}", ref_rows));
+        }
+        if ref_rows.contains(&2) {
+            failures.push(format!("gr wrongly unioned Sner::hi decl at row 2: {:?}", ref_rows));
+        }
+
+        // (4) rename: should rewrite Bler::hi + hi() call; NOT Sner::hi.
+        let rename_rows: Vec<usize> = rename_edits.iter().map(|(s, _)| s.start.row).collect();
+        if !rename_rows.contains(&12) {
+            failures.push(format!("rename missed hi() call at row 12: {:?}", rename_rows));
+        }
+        if !rename_rows.contains(&6) {
+            failures.push(format!("rename missed Bler::hi decl at row 6: {:?}", rename_rows));
+        }
+        if rename_rows.contains(&2) {
+            failures.push(format!("rename wrongly rewrote Sner::hi decl at row 2: {:?}", rename_rows));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "import-graph-aware resolution broken across paths:\n  - {}",
+            failures.join("\n  - "),
+        );
+    }
+
     #[test]
     fn test_refs_to_empty_when_no_hits() {
         let store = FileStore::new();
