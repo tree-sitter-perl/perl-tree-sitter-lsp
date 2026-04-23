@@ -8266,10 +8266,16 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
             if let SymbolDetail::Handler { dispatchers, owner, .. } = &s.detail {
                 assert!(dispatchers.iter().any(|d| d == "url_for"),
                     "route {} should dispatch via url_for", s.name);
-                // Owner is the declaring package — not the target class.
-                // A route is declared IN MyApp, even though it TARGETS Users.
-                assert!(matches!(owner, HandlerOwner::Class(c) if c == "MyApp"),
-                    "route owner is declaring package (MyApp), not target (Users)");
+                // Owner is `Mojolicious::Controller` — url_for is a
+                // Controller method and the routes table is global
+                // per Mojo's runtime model. Owning on Controller lets
+                // `$c->url_for` in any controller resolve routes
+                // declared in any app file through ancestor walking.
+                // Not target-class (Users): routes exist independent
+                // of their target; two routes can target the same
+                // action (paginated/json/etc.).
+                assert!(matches!(owner, HandlerOwner::Class(c) if c == "Mojolicious::Controller"),
+                    "route owner is Mojolicious::Controller (shared base for url_for), not declaring package");
             }
         }
     }
@@ -8973,6 +8979,208 @@ $app->helper('users.create' => sub { my ($c, $name) = @_; });
                 class, labels,
             );
         }
+    }
+
+    /// Diagnostic pin: inside a controller action, `$c->url_for('|')`
+    /// must offer every named route declared in the workspace —
+    /// Lite paths, `Ctrl#action` pairs from `->to(...)`, and symbolic
+    /// `->name('foo')` handles. This is the completion side that the
+    /// `_emits_refs` / `_registers_url_for_handle` tests don't cover.
+    ///
+    /// Discovers two separate bugs at the same time:
+    ///   (1) Handler.owner is the *declaring* package (`MyApp`), so
+    ///       `$c->url_for(...)` on a `Users` controller fails the
+    ///       `owner_class == invocant_class` filter in
+    ///       `dispatch_target_completions`.
+    ///   (2) No coverage for "does url_for completion work at all".
+    #[test]
+    fn plugin_mojo_routes_url_for_completion_offers_route_names() {
+        use tree_sitter::Parser;
+        use tower_lsp::lsp_types::Position;
+
+        let app_src = r#"package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list')->name('users_list');
+$r->post('/users')->to(controller => 'Users', action => 'create');
+
+get '/hello' => sub { my ($c) = @_; };
+"#;
+        let app_fa = std::sync::Arc::new(build_fa(app_src));
+
+        let ctrl_src = r#"package Users;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    my $u = $c->url_for('x');
+}
+"#;
+        let ctrl_fa = build_fa(ctrl_src);
+
+        let idx = std::sync::Arc::new(crate::module_index::ModuleIndex::new_for_test());
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/app.pl"),
+            app_fa,
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Users.pm"),
+            std::sync::Arc::new(build_fa(ctrl_src)),
+        );
+
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(ctrl_src, None).unwrap();
+
+        // Cursor on the `x` inside `url_for('x')` — `active_param == 0`.
+        let pos = Position { line: 5, character: 25 };
+        let items = crate::symbols::completion_items(
+            &ctrl_fa, &tree, ctrl_src, pos, &idx, None,
+        );
+        let labels: Vec<String> = items.iter().map(|it| it.label.clone()).collect();
+
+        for expected in &["users_list", "Users#list", "/hello"] {
+            assert!(labels.iter().any(|l| l == expected),
+                "url_for('|') inside Users::list must offer `{}` (route declared in MyApp); got: {:?}",
+                expected, labels);
+        }
+    }
+
+    /// Red pin (user-reported): starting to type inside
+    /// `$c->url_for('|')` must not kill completion — the string
+    /// content should feed the prefix filter, not suppress it.
+    /// Covers two realistic live-editing shapes:
+    ///
+    /// 1. `url_for('|')` — cursor between the quotes, string body
+    ///    empty. Every route should appear (no prefix yet).
+    /// 2. `url_for('adm|')` — user has typed `adm`, cursor inside
+    ///    the string, closing quote already in place (what you get
+    ///    after auto-paired quotes). The returned list must be
+    ///    prefix-filterable by `adm` via either `filter_text` or a
+    ///    server-side restriction — `admin.users.purge`-style
+    ///    named routes should survive the filter, Lite `/hello`
+    ///    should drop out client-side.
+    ///
+    /// Existing work that this pin must use, NOT re-roll:
+    ///   * `candidate_to_completion_item` already sets
+    ///     `filter_text = Some(label)` so the quoted `insert_text`
+    ///     doesn't defeat client-side matching — covered by
+    ///     `completion_dispatch_filter_text_matches_bare_name`.
+    ///   * `mid_string_methodref_completions` handles the same
+    ///     shape for MethodCallRefs (`->to('Users#li|')`), slicing
+    ///     `source[span_start..cursor]` as the prefix.
+    #[test]
+    fn plugin_mojo_routes_url_for_completion_survives_typed_prefix() {
+        use tree_sitter::Parser;
+        use tower_lsp::lsp_types::Position;
+
+        let app_src = r#"package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list')->name('users_list');
+$r->get('/admin/users/purge')->to('Admin#purge')->name('admin_users_purge');
+
+get '/hello' => sub { my ($c) = @_; };
+"#;
+        let app_fa = std::sync::Arc::new(build_fa(app_src));
+
+        let idx = std::sync::Arc::new(crate::module_index::ModuleIndex::new_for_test());
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/app.pl"),
+            app_fa,
+        );
+
+        // Case 1: empty string, cursor between the quotes.
+        // `    my $u = $c->url_for('');`
+        //                          ^ char 24 (opening quote)
+        //                           ^ char 25 (cursor here)
+        //                           ^ char 25 (closing quote)
+        let empty_src = r#"package Users;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    my $u = $c->url_for('');
+}
+"#;
+        let empty_fa = build_fa(empty_src);
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Users_empty.pm"),
+            std::sync::Arc::new(build_fa(empty_src)),
+        );
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(empty_src, None).unwrap();
+        let items = crate::symbols::completion_items(
+            &empty_fa, &tree, empty_src,
+            Position { line: 5, character: 25 },
+            &idx, None,
+        );
+        let labels: Vec<String> = items.iter().map(|it| it.label.clone()).collect();
+        for expected in &["users_list", "admin_users_purge", "Users#list", "/hello"] {
+            assert!(labels.iter().any(|l| l == expected),
+                "empty url_for('|') must offer `{}`; got: {:?}",
+                expected, labels);
+        }
+
+        // Case 2: user has typed `adm`, closing quote in place.
+        // `    my $u = $c->url_for('adm');`
+        //                          ^ 24 opening quote
+        //                           ^ 25 a
+        //                            ^ 26 d
+        //                             ^ 27 m — cursor here after typing
+        //                              ^ 28 closing quote
+        let typed_src = r#"package Users;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    my $u = $c->url_for('adm');
+}
+"#;
+        let typed_fa = build_fa(typed_src);
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Users_typed.pm"),
+            std::sync::Arc::new(build_fa(typed_src)),
+        );
+        let tree = parser.parse(typed_src, None).unwrap();
+        let items = crate::symbols::completion_items(
+            &typed_fa, &tree, typed_src,
+            Position { line: 5, character: 27 },
+            &idx, None,
+        );
+
+        // Server returns the dispatch-handler set (all routes). The
+        // client narrows by `filter_text` (bare label) against the
+        // typed prefix `adm`. For this pin we assert the two things
+        // the server owes us:
+        //
+        //  (a) the set still includes routes whose LABEL starts with
+        //      `adm` — if the server dropped them before we got a
+        //      chance to filter, completion is "dead" as the user
+        //      described.
+        //  (b) every returned handler's `filter_text` is set to the
+        //      bare label so the client's prefix match keys on the
+        //      route name, not on the quoted insert_text (`'admin...'`
+        //      starts with `'`, not `a`).
+        let labels: Vec<String> = items.iter().map(|it| it.label.clone()).collect();
+        assert!(labels.iter().any(|l| l == "admin_users_purge"),
+            "typed prefix `adm` must still surface `admin_users_purge` from the \
+             server so client-side filter_text matching can narrow to it; got: {:?}",
+            labels);
+
+        let adm_item = items.iter()
+            .find(|it| it.label == "admin_users_purge")
+            .expect("admin_users_purge must be in returned items");
+        assert_eq!(
+            adm_item.filter_text.as_deref(),
+            Some("admin_users_purge"),
+            "dispatch handler `filter_text` must be the bare label so the \
+             typed `adm` (no quote) matches — otherwise starting to type the \
+             string kills completion",
+        );
     }
 
     /// mojo-lite route URLs are referenced from `->url_for(...)` and
@@ -10432,8 +10640,11 @@ sub register {
 
     /// mojo-routes emits a PluginNamespace per declaring package. Each
     /// `->to('Ctrl#action')` call's Handler lands as a namespace entity;
-    /// bridges point at the owner class so outline/workspace tooling can
-    /// walk `for_each_entity_bridged_to(owner, ...)` to find the routes.
+    /// the bridge points at `Mojolicious::Controller` (not the declaring
+    /// package) so `$c->url_for('|')` from any controller resolves via
+    /// `for_each_entity_bridged_to` walking through Controller in its
+    /// ancestor chain. Namespace id still keys on the declaring package
+    /// so future app-scoping has per-app buckets to narrow to.
     #[test]
     fn mojo_routes_emits_app_plugin_namespace() {
         use crate::file_analysis::Bridge;
@@ -10449,17 +10660,17 @@ sub startup {
         let fa = build_fa(src);
 
         // Identify by semantic shape — a `routes` namespace that
-        // bridges to the declaring package. Two flavors of route
-        // plugin (full Mojolicious and Lite) both emit `kind: "routes"`,
-        // so also check that the entity names are the Controller#action
-        // form to distinguish from path-based Lite routes.
+        // bridges to Mojolicious::Controller (the happy-path owner
+        // for the workspace-wide url_for lookup). Entity names are
+        // the Controller#action form, distinguishing from the Lite
+        // path-based flavor.
         let ns = fa.plugin_namespaces.iter()
             .find(|n|
                 n.kind == "routes"
-                && n.bridges.contains(&Bridge::Class("MyApp".into()))
+                && n.bridges.contains(&Bridge::Class("Mojolicious::Controller".into()))
                 && n.entities.iter().any(|id| fa.symbol(*id).name.contains('#'))
             )
-            .expect("a `routes` namespace must bridge MyApp with Ctrl#action entities");
+            .expect("a `routes` namespace must bridge Mojolicious::Controller with Ctrl#action entities");
 
         let entity_names: Vec<&str> = ns.entities.iter()
             .map(|id| fa.symbol(*id).name.as_str())
@@ -10477,8 +10688,10 @@ sub startup {
 
     /// mojo-lite emits a PluginNamespace per Lite app. Entity names are
     /// the route paths (the same string that mojo-lite stamps into the
-    /// Handler). Bridges to the declaring package (`main` for toplevel
-    /// Lite scripts) so downstream lookups use the shared bridge path.
+    /// Handler). Bridge is `Mojolicious::Controller` so `$c->url_for(|)`
+    /// inside any controller picks up these Lite routes too — mirrors
+    /// mojo-routes; the Lite script package lives on in the namespace
+    /// id (`mojo-lite:<pkg>`) for future app-scoping.
     #[test]
     fn mojo_lite_emits_app_plugin_namespace() {
         use crate::file_analysis::Bridge;
@@ -10489,15 +10702,13 @@ post '/login' => sub { my $c = shift; };
 "#;
         let fa = build_fa(src);
 
-        // Identify by semantic shape: a `routes` namespace bridging to
-        // `main` (the Lite app's package) with path-shaped entity names.
         let ns = fa.plugin_namespaces.iter()
             .find(|n|
                 n.kind == "routes"
-                && n.bridges.contains(&Bridge::Class("main".into()))
+                && n.bridges.contains(&Bridge::Class("Mojolicious::Controller".into()))
                 && n.entities.iter().any(|id| fa.symbol(*id).name.starts_with('/'))
             )
-            .expect("a Lite `routes` namespace must bridge main with /path entities");
+            .expect("a Lite `routes` namespace must bridge Mojolicious::Controller with /path entities");
 
         let entity_names: Vec<&str> = ns.entities.iter()
             .map(|id| fa.symbol(*id).name.as_str())

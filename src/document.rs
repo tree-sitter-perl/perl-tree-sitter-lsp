@@ -35,14 +35,6 @@ impl Document {
     }
 
     pub fn update(&mut self, new_text: String) {
-        // Dump the text we're about to parse so we can reproduce hangs.
-        // Written *before* parsing — if we hang, this file has the culprit.
-        if log::log_enabled!(log::Level::Debug) {
-            let dump_path = "/tmp/perl-lsp-last-update.pl";
-            let _ = std::fs::write(dump_path, &new_text);
-            log::debug!("Wrote {} bytes to {}", new_text.len(), dump_path);
-        }
-
         // Diff old vs new to find the changed region, then tell tree-sitter
         // exactly what changed so it can do targeted incremental reparsing.
         // This preserves valid nodes outside the edit, producing much better

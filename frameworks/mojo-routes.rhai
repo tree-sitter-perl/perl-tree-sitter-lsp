@@ -64,7 +64,15 @@ fn route_emissions(controller, action, span, current_package) {
         }
     };
 
-    // (b) route-as-thing Handler, owned by the declaring package.
+    // (b) route-as-thing Handler, owned by Mojolicious::Controller.
+    // Mojo's url_for/redirect_to are Controller methods that resolve
+    // against a global routes table — so a controller of ANY subclass
+    // reaches the same routes. Owning on Controller (not the declaring
+    // package) lets `$c->url_for(...)` inside a sibling controller
+    // find routes registered in the app file. Not yet app-scoped —
+    // once we distinguish multiple apps in a workspace, owners can
+    // narrow to the specific app.
+    //
     // Display is `Action`, not `Route` — this emission represents the
     // controller action bound by `->to('Users#list')`, not the route
     // itself. No request body lives at this source site; it's a
@@ -72,7 +80,7 @@ fn route_emissions(controller, action, span, current_package) {
     // Users#list` in the outline keeps it visually distinct from
     // `<route> GET /path` entries (mojo-lite terminal handlers),
     // which DO carry a body.
-    let owner_class = if current_package == () { "main" } else { current_package };
+    let owner_class = "Mojolicious::Controller";
     let handler_name = controller + "#" + action;
     items += #{
         Handler: #{
@@ -87,16 +95,19 @@ fn route_emissions(controller, action, span, current_package) {
         }
     };
 
-    // Register the route into a per-app routes namespace. Bridges to
-    // the declaring package so workspace tooling that walks
-    // `for_each_entity_bridged_to(owner_class, ...)` sees the route
-    // Handlers. One namespace per declaring package; multiple routes
-    // accumulate entities under the same id.
+    // Register the route into the Mojolicious::Controller routes
+    // namespace. Bridge to Controller so `for_each_entity_bridged_to(
+    // "Mojolicious::Controller", ...)` sees every route Handler in the
+    // workspace — that's what powers `$c->url_for('|')` completion in
+    // ANY controller. Namespace id stays keyed to the declaring
+    // package so multi-app workspaces track each app's routes
+    // separately for future app-scoping; the bridge is what controls
+    // visibility.
     items += #{
         PluginNamespace: #{
-            id: "mojo-routes:" + owner_class,
+            id: "mojo-routes:" + current_package,
             kind: "routes",
-            bridges: [ #{ Class: owner_class } ],
+            bridges: [ #{ Class: "Mojolicious::Controller" } ],
             entity_names: [handler_name],
             decl_span: span,
         }
@@ -115,7 +126,12 @@ fn route_emissions(controller, action, span, current_package) {
 // something that isn't a route, url_for completion will offer an
 // extra name — minor false positive, not a regression.
 fn emit_route_name(ctx, name, span) {
-    let owner_class = if ctx.current_package == () { "main" } else { ctx.current_package };
+    // Handler owned by Mojolicious::Controller (same reasoning as
+    // route_emissions): url_for/redirect_to are Controller methods
+    // that hit a global routes table, so the Handler belongs on the
+    // shared base, not the declaring package.
+    let owner_class = "Mojolicious::Controller";
+    let decl_pkg = if ctx.current_package == () { "main" } else { ctx.current_package };
     let items = [];
     items += #{
         Handler: #{
@@ -131,9 +147,9 @@ fn emit_route_name(ctx, name, span) {
     };
     items += #{
         PluginNamespace: #{
-            id: "mojo-routes:" + owner_class,
+            id: "mojo-routes:" + decl_pkg,
             kind: "routes",
-            bridges: [ #{ Class: owner_class } ],
+            bridges: [ #{ Class: "Mojolicious::Controller" } ],
             entity_names: [name],
             decl_span: span,
         }

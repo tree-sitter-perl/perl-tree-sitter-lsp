@@ -525,6 +525,13 @@ fn completion_items_native(
     // completion inside a dispatch call doesn't dump hundreds of
     // unrelated symbols. Sig help is the right affordance past arg-0;
     // completion gets out of the way.
+    // Dispatch-target items are built into a separate vec so we can
+    // retarget their textEdit range to the string-content span when
+    // the cursor is mid-string. Keeping them out of the shared
+    // `candidates` buffer avoids having to filter by kind later —
+    // identifier completions (variables/subs/methods) pass through
+    // the usual candidate → item conversion untouched.
+    let mut dispatch_items: Vec<CompletionItem> = Vec::new();
     let mut candidates: Vec<CompletionCandidate> = Vec::new();
     let mut suppress_firehose = false;
     if let Some(call_ctx) = cursor_context::find_call_context(tree, source.as_bytes(), point) {
@@ -533,19 +540,47 @@ fn completion_items_native(
             let has_any_handlers = dispatch_class.as_ref().is_some_and(|c|
                 class_has_dispatch_handlers(analysis, module_index, c, &call_ctx.name)
             );
+            // Debug line for dispatch completion — one-shot diagnoses
+            // every "starting to type kills completion" / "no routes
+            // offered" report. Includes the four values that together
+            // determine whether dispatch fires and which handlers pass
+            // the ancestor-walk filter: call name, invocant text,
+            // resolved class (None = inferred_type miss), active_param
+            // (>0 short-circuits to vars-only), and has_any_handlers
+            // (false = bridges empty or filter mismatch).
+            log::debug!(
+                "completion dispatch: method={:?} invocant={:?} class={:?} active_param={} has_handlers={}",
+                call_ctx.name, call_ctx.invocant, dispatch_class,
+                call_ctx.active_param, has_any_handlers,
+            );
 
             if call_ctx.active_param == 0 && has_any_handlers {
                 // arg-0 of a known dispatcher: handlers at the top,
                 // suppress the global sub/module firehose that would
                 // otherwise drown them.
-                candidates.extend(dispatch_target_completions(
+                let dispatch_cands = dispatch_target_completions(
                     analysis,
                     module_index,
                     call_ctx.invocant.as_deref(),
                     &call_ctx.name,
                     point,
                     tree,
-                ));
+                );
+                dispatch_items.extend(
+                    dispatch_cands.into_iter().map(candidate_to_completion_item),
+                );
+                // When the cursor is inside the string arg
+                // (`url_for('/us|ers/profile')`) pin each item's
+                // textEdit to the string-content span. The client's
+                // default word-at-cursor (nvim's `iskeyword` default
+                // excludes `/`, `#`, `:`) can't see across those
+                // chars, so filter_text alone is dropped for labels
+                // like `/users/profile` or `Users#list`. textEdit.range
+                // tells the client "filter by the whole in-range
+                // text" — works regardless of keyword class.
+                if let Some(span) = string_content_span_at(tree, point) {
+                    retarget_items_to_span(&mut dispatch_items, span);
+                }
                 suppress_firehose = true;
             } else if call_ctx.active_param > 0 && has_any_handlers
                 && !matches!(ctx, CursorContext::HashKey { .. })
@@ -658,6 +693,15 @@ fn completion_items_native(
         .drain(..)
         .map(candidate_to_completion_item)
         .collect();
+    // Dispatch items stay at the top — their sort_text already leads
+    // with a space so they group above the priority-numbered rest,
+    // but the authoritative ordering is "dispatch first" so they're
+    // prepended explicitly.
+    if !dispatch_items.is_empty() {
+        let mut with_dispatch = dispatch_items;
+        with_dispatch.extend(items);
+        items = with_dispatch;
+    }
 
     // Ref-type deref snippets when completing after ->
     if let CursorContext::Method { ref invocant_type, .. } = ctx {
@@ -903,24 +947,102 @@ fn class_has_dispatch_handlers(
     class: &str,
     dispatcher: &str,
 ) -> bool {
-    let matches = |sym: &crate::file_analysis::Symbol| -> bool {
-        let SymbolDetail::Handler { owner, dispatchers, .. } = &sym.detail else { return false };
-        let HandlerOwner::Class(n) = owner;
-        if n != class { return false; }
-        dispatchers.is_empty() || dispatchers.iter().any(|d| d == dispatcher)
-    };
-    if analysis.symbols.iter().any(&matches) { return true; }
-    // Workspace-wide scan: same tradeoff as dispatch completion —
-    // class-wide "any handler exists?" isn't name-keyed, so the
-    // reverse index doesn't speed this up. Short-circuits on first
-    // hit, so average cost is tiny when handlers exist and only
-    // pays full walk when nothing matches.
+    // Funnels through `for_each_dispatch_handler_on_class` (the
+    // ancestor-aware bridge walker) so this predicate agrees with
+    // `dispatch_target_completions`: if completion would offer at
+    // least one handler, this returns true. `found` short-circuits
+    // semantically — the walker still visits every class, but per-
+    // class closure exits cheaply once the flag is set.
     let mut found = false;
-    module_index.for_each_cached(|_, cached| {
-        if found { return; }
-        if cached.analysis.symbols.iter().any(&matches) { found = true; }
-    });
+    analysis.for_each_dispatch_handler_on_class(
+        class,
+        dispatcher,
+        Some(module_index),
+        |_sym, _prov| { found = true; },
+    );
     found
+}
+
+/// Span of the string-literal's CONTENT (between the quotes) at `point`,
+/// if the cursor is inside one. Returns `None` for non-string contexts.
+///
+/// Used by mid-string completions (dispatch-target handlers, method-ref
+/// mid-string) to anchor a `TextEdit` range. Without this, the client's
+/// word-at-cursor heuristic (nvim's `iskeyword` default excludes `/`
+/// and `#`) mis-extracts the typed prefix for non-identifier labels
+/// like `/users/profile` or `Users#list` and drops valid matches.
+/// Setting `textEdit.range` to the content span makes the client match
+/// the whole in-range text against the label.
+///
+/// Empty strings (`url_for('')`): no `string_content` child exists, so
+/// fall back to a zero-width span at the cursor. Any prefix match
+/// against "" passes, which is the right answer for "user hasn't
+/// typed anything in the string yet".
+fn string_content_span_at(tree: &Tree, point: Point) -> Option<Span> {
+    let mut node = tree.root_node().descendant_for_point_range(point, point)?;
+    for _ in 0..4 {
+        match node.kind() {
+            "string_content" => {
+                return Some(Span {
+                    start: node.start_position(),
+                    end: node.end_position(),
+                });
+            }
+            "string_literal" | "interpolated_string_literal" => {
+                // Boundary case: when the cursor sits at the END of
+                // the content (just before the closing quote) or on
+                // the closing quote itself, `descendant_for_point_range`
+                // lands on the literal wrapper instead of `string_content`
+                // — content ranges are half-open, so the end column
+                // isn't "contained". Look down for a `string_content`
+                // child and use its span. Otherwise we'd return a
+                // zero-width range at cursor, which makes textEdit
+                // APPEND the label after the user's typed text
+                // (`'/fall' → '/fall/fallback'`) instead of replacing it.
+                let mut walker = node.walk();
+                for child in node.named_children(&mut walker) {
+                    if child.kind() == "string_content" {
+                        return Some(Span {
+                            start: child.start_position(),
+                            end: child.end_position(),
+                        });
+                    }
+                }
+                // Genuinely empty literal (`''` with cursor between the
+                // quotes). Zero-width range at cursor is correct here —
+                // there's nothing to replace.
+                return Some(Span { start: point, end: point });
+            }
+            _ => {}
+        }
+        let Some(p) = node.parent() else { break };
+        node = p;
+    }
+    None
+}
+
+/// Rewrite each item's replace range to `span`, materialized as a
+/// `TextEdit` on `text_edit`. Used for mid-string completions where
+/// the client's default word-extraction would otherwise misfilter the
+/// item (see `string_content_span_at`).
+///
+/// `newText` is the bare `label` — NOT `insert_text`. `insert_text`
+/// from other code paths can carry wrapping quotes (`'connect'` for
+/// the bare-parens case), and the replace range we're setting already
+/// sits INSIDE the existing string's quotes. Threading insert_text
+/// through here would insert `'connect'` inside `''` → `''connect''`.
+/// Using the label keeps the invariant simple: whatever span we're
+/// replacing, the replacement is the identifier text, no decoration.
+/// `insert_text` is also cleared — textEdit takes precedence in the
+/// LSP spec, and leaving both set confuses some clients.
+fn retarget_items_to_span(items: &mut [CompletionItem], span: Span) {
+    let range = span_to_range(span);
+    for item in items {
+        item.text_edit = Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(
+            tower_lsp::lsp_types::TextEdit { range, new_text: item.label.clone() },
+        ));
+        item.insert_text = None;
+    }
 }
 
 /// True if the cursor sits somewhere that makes wrapping-quotes in the
@@ -981,39 +1103,24 @@ fn dispatch_target_completions(
 
     // Accumulate (handler_name → display_params + provenance) so stacked
     // registrations across files appear once in the completion list.
+    // The walker funnels local + namespace-bridged + cross-file via
+    // `for_each_entity_bridged_to` (rule #8) and walks ancestors so
+    // `$c->url_for('|')` on a `Users` controller surfaces routes whose
+    // Handlers live on `Mojolicious::Controller` (the shared base).
     let mut acc: std::collections::BTreeMap<String, (Vec<String>, String)> =
         std::collections::BTreeMap::new();
-
-    let mut consider = |sym: &crate::file_analysis::Symbol, file_tag: &str| {
-        let SymbolDetail::Handler { owner, dispatchers, params, .. } = &sym.detail else { return };
-        let HandlerOwner::Class(n) = owner;
-        if n != &class { return; }
-        if !dispatchers.is_empty() && !dispatchers.iter().any(|d| d == method_name) {
-            return;
-        }
-        let display: Vec<String> = params
-            .iter()
-            .filter(|p| !p.is_invocant)
-            .map(|p| p.name.clone())
-            .collect();
-        acc.entry(sym.name.clone()).or_insert((display, file_tag.to_string()));
-    };
-
-    for sym in &analysis.symbols {
-        consider(sym, "this file");
-    }
-    // Dispatch completion: offer handlers from any module on the
-    // receiver's class. The reverse index only speeds up by-NAME
-    // lookups; we want every handler on this class, across all names.
-    // Names vary per handler, so we can't pre-filter — but this is
-    // still O(workspace) by design (completion intentionally surfaces
-    // everything available). Acceptable because completion UI shows
-    // a small subset anyway; the full list is rarely large per class.
-    module_index.for_each_cached(|module_name, cached| {
-        for sym in &cached.analysis.symbols {
-            consider(sym, module_name);
-        }
-    });
+    analysis.for_each_dispatch_handler_on_class(
+        &class, method_name, Some(module_index),
+        |sym, provenance| {
+            let SymbolDetail::Handler { params, .. } = &sym.detail else { return };
+            let display: Vec<String> = params
+                .iter()
+                .filter(|p| !p.is_invocant)
+                .map(|p| p.name.clone())
+                .collect();
+            acc.entry(sym.name.clone()).or_insert((display, provenance.to_string()));
+        },
+    );
 
     acc.into_iter().map(|(name, (params, provenance))| {
         let detail = if params.is_empty() {
@@ -1103,7 +1210,7 @@ fn mid_string_methodref_completions(
     };
 
     let candidates = analysis.complete_methods_for_class(invocant_class, Some(module_index));
-    candidates
+    let mut items: Vec<CompletionItem> = candidates
         .into_iter()
         .filter(|c| typed.is_empty() || c.label.starts_with(typed))
         .map(|c| {
@@ -1111,7 +1218,14 @@ fn mid_string_methodref_completions(
             item.sort_text = Some(format!("000{}", item.label));
             item
         })
-        .collect()
+        .collect();
+    // Anchor the replace range to the ref's span (already tight on
+    // the method-name portion — plugins control its width). Without
+    // this, labels containing non-identifier chars (`Ctrl#act` past
+    // the `#`) get dropped by the client's word-match. Same fix as
+    // dispatch-target items, same reason.
+    retarget_items_to_span(&mut items, ref_span);
+    items
 }
 
 /// Materialize `PluginCompletion` items for every Handler symbol
@@ -3064,8 +3178,281 @@ sub fire {
         let items = completion_items(&analysis, &tree, src, pos, &idx, None);
         let connect = items.iter().find(|i| i.label == "connect")
             .expect("connect handler offered inside '|'");
-        assert_eq!(connect.insert_text.as_deref(), Some("connect"),
-            "cursor is inside quotes; insert_text must NOT wrap with more quotes");
+        // Cursor inside a string arg → item ships a textEdit pinned
+        // to the string-content span so the client's word-at-cursor
+        // heuristic can't drop it over non-identifier chars. The
+        // newText is the BARE handler name (no wrapping quotes) and
+        // insert_text is cleared — textEdit takes precedence in the
+        // LSP spec, and leaving insert_text alongside confuses some
+        // clients. The original "don't double-quote" invariant now
+        // reads off textEdit.newText instead of insert_text.
+        assert_eq!(connect.insert_text, None,
+            "cursor is inside quotes; insert_text is cleared in favor of textEdit");
+        use tower_lsp::lsp_types::CompletionTextEdit;
+        let Some(CompletionTextEdit::Edit(ref te)) = connect.text_edit else {
+            panic!("expected a TextEdit for mid-string dispatch item; got {:?}", connect.text_edit);
+        };
+        assert_eq!(te.new_text, "connect",
+            "textEdit.newText is the bare label — not `'connect'` (would double-quote inside '|')");
+    }
+
+    /// Red pin (user-reported): dispatch-target completions for labels
+    /// containing non-identifier chars (`/`, `#`) died client-side
+    /// because nvim's word-at-cursor heuristic uses `iskeyword`, which
+    /// excludes `/` and `#` by default. The server returned the item
+    /// with `filter_text = "/users/profile"` but the client extracted
+    /// `users` or `profile` (a word run starting/ending at the non-
+    /// keyword boundary) and dropped the item since neither is a
+    /// prefix of `/users/profile`. Same shape for `Users#list` — the
+    /// cursor parked past the `#` gave word `list`, which fails
+    /// `"Users#list".starts_with("list")`.
+    ///
+    /// Fix: emit `textEdit` with `range = string_content_span_at(...)`
+    /// so the client filters by the whole in-range text against the
+    /// full label — regardless of keyword class. This pin locks that
+    /// textEdit emission for BOTH flavors; regressing either re-
+    /// surfaces the bug for any route with a URL path or `Ctrl#act`
+    /// handler name.
+    #[test]
+    fn completion_dispatch_textedit_handles_non_keyword_labels() {
+        use crate::module_index::ModuleIndex;
+        use tower_lsp::lsp_types::CompletionTextEdit;
+
+        // Route declarations: one URL path (leading `/`), one
+        // `Ctrl#act` (embedded `#`). Both must survive mid-string
+        // completion inside `url_for('...')`.
+        let app_src = r#"package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+
+get '/users/profile' => sub { my ($c) = @_; };
+"#;
+        let app_fa = std::sync::Arc::new(crate::builder::build(
+            &{
+                let mut p = tree_sitter::Parser::new();
+                p.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+                p.parse(app_src, None).unwrap()
+            },
+            app_src.as_bytes(),
+        ));
+
+        let idx = std::sync::Arc::new(ModuleIndex::new_for_test());
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/app.pl"),
+            app_fa,
+        );
+
+        let ctrl_src = r#"package Users;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    $c->url_for('/users/profile');
+}
+"#;
+        let ctrl_fa = crate::builder::build(
+            &{
+                let mut p = tree_sitter::Parser::new();
+                p.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+                p.parse(ctrl_src, None).unwrap()
+            },
+            ctrl_src.as_bytes(),
+        );
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(ctrl_src, None).unwrap();
+
+        // Cursor deep inside the path, past the first `/` —
+        // `'/users/pr|ofile'`. Before the fix, nvim would extract
+        // `users` or `profile` from the chars around the cursor;
+        // neither is a prefix of the `/users/profile` label.
+        let line_idx = 5u32; // `    $c->url_for('/users/profile');`
+        let line = ctrl_src.lines().nth(line_idx as usize).unwrap();
+        let quote_start = line.find("'/users/profile").unwrap();
+        let pr_col = (quote_start + 1 + "/users/pr".len()) as u32;
+        let pos = Position { line: line_idx, character: pr_col };
+
+        let items = completion_items(&ctrl_fa, &tree, ctrl_src, pos, &idx, None);
+
+        let path_item = items.iter()
+            .find(|i| i.label == "/users/profile")
+            .expect("/users/profile must be offered (dispatch completion inside string)");
+
+        // insert_text is cleared; textEdit carries the range spanning
+        // the entire string content, so the client uses `/users/pr...`
+        // as the filter input and matches against the full label.
+        assert_eq!(path_item.insert_text, None,
+            "insert_text cleared — textEdit takes precedence for non-keyword-char labels");
+        let Some(CompletionTextEdit::Edit(ref te)) = path_item.text_edit else {
+            panic!("expected textEdit for `/users/profile`; got {:?}", path_item.text_edit);
+        };
+        assert_eq!(te.new_text, "/users/profile",
+            "textEdit.newText is the bare label, no surrounding quotes");
+        // Range must span the string CONTENT (between the quotes).
+        // Start column = col of first `/` (just after opening quote),
+        // end column = col of closing quote.
+        assert_eq!(te.range.start.line, line_idx);
+        assert_eq!(te.range.end.line, line_idx);
+        assert_eq!(
+            te.range.start.character,
+            (quote_start + 1) as u32,
+            "range start hugs the char just after the opening quote",
+        );
+        assert_eq!(
+            te.range.end.character,
+            (quote_start + 1 + "/users/profile".len()) as u32,
+            "range end hugs the closing quote — replacement stays INSIDE the existing quotes",
+        );
+
+        // Same check for the `Ctrl#act` flavor — cursor past the `#`.
+        let ctrl_src_hash = r#"package Users;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    $c->url_for('Users#list');
+}
+"#;
+        let ctrl_fa_hash = crate::builder::build(
+            &parser.parse(ctrl_src_hash, None).unwrap(),
+            ctrl_src_hash.as_bytes(),
+        );
+        let tree_hash = parser.parse(ctrl_src_hash, None).unwrap();
+        let line = ctrl_src_hash.lines().nth(5).unwrap();
+        let quote_start = line.find("'Users#list").unwrap();
+        let past_hash_col = (quote_start + 1 + "Users#li".len()) as u32;
+        let pos = Position { line: 5, character: past_hash_col };
+        let items = completion_items(&ctrl_fa_hash, &tree_hash, ctrl_src_hash, pos, &idx, None);
+        let hash_item = items.iter()
+            .find(|i| i.label == "Users#list")
+            .expect("Users#list must be offered when cursor is past the #");
+        assert_eq!(hash_item.insert_text, None);
+        let Some(CompletionTextEdit::Edit(ref te)) = hash_item.text_edit else {
+            panic!("expected textEdit for `Users#list`; got {:?}", hash_item.text_edit);
+        };
+        assert_eq!(te.new_text, "Users#list");
+    }
+
+    /// Red pin (user QA): accepting a dispatch completion APPENDED
+    /// the label instead of replacing the typed text — `url_for('/fall|')`
+    /// accepting `/fallback` yielded `url_for('/fall/fallback')`.
+    /// Root cause: `descendant_for_point_range` returns the enclosing
+    /// `string_literal` (not `string_content`) when the cursor sits
+    /// at the content's end boundary, because content ranges are
+    /// half-open. `string_content_span_at` then fell into the
+    /// zero-width "empty literal" branch and returned `(cursor,
+    /// cursor)` — textEdit replacing nothing = append. Fix descends
+    /// into the literal to find a `string_content` child before
+    /// giving up.
+    ///
+    /// This pin covers three cursor positions, each of which previously
+    /// hit the wrapper-instead-of-content path:
+    ///   1. INSIDE the content (baseline — already worked).
+    ///   2. AT the content's end boundary (just before closing quote).
+    ///   3. ON the closing quote itself.
+    /// All three must return a textEdit range covering the full
+    /// `string_content` span, so accepting the completion replaces
+    /// the typed prefix with the label cleanly.
+    #[test]
+    fn completion_dispatch_textedit_range_at_content_boundary() {
+        use crate::module_index::ModuleIndex;
+        use tower_lsp::lsp_types::CompletionTextEdit;
+
+        let app_src = r#"package MyApp;
+use Mojolicious::Lite;
+
+any '/fallback' => sub { my ($c) = @_; };
+"#;
+        let app_fa = std::sync::Arc::new(crate::builder::build(
+            &{
+                let mut p = tree_sitter::Parser::new();
+                p.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+                p.parse(app_src, None).unwrap()
+            },
+            app_src.as_bytes(),
+        ));
+
+        let idx = std::sync::Arc::new(ModuleIndex::new_for_test());
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/app.pl"),
+            app_fa,
+        );
+
+        let ctrl_src = r#"package Users;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    $c->url_for('/fall');
+}
+"#;
+        let ctrl_fa = crate::builder::build(
+            &{
+                let mut p = tree_sitter::Parser::new();
+                p.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+                p.parse(ctrl_src, None).unwrap()
+            },
+            ctrl_src.as_bytes(),
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(ctrl_src, None).unwrap();
+
+        // `    $c->url_for('/fall');`
+        let line_idx = 5u32;
+        let line = ctrl_src.lines().nth(line_idx as usize).unwrap();
+        let quote_start = line.find("'/fall'").unwrap();
+        let content_start = (quote_start + 1) as u32;               // `/`
+        let content_end = content_start + "/fall".len() as u32;     // just after `l`
+        let closing_quote_col = content_end;                        // the `'`
+
+        // Three cursor positions to exercise: inside the content,
+        // at the content's end boundary, and on the closing quote.
+        let cursor_variants = [
+            ("inside content", content_start + 3), // between `a` and `l`
+            ("end of content", content_end),       // just after `l`, before `'`
+            ("on closing quote", closing_quote_col),
+        ];
+
+        for (label, col) in cursor_variants {
+            let items = completion_items(
+                &ctrl_fa, &tree, ctrl_src,
+                Position { line: line_idx, character: col },
+                &idx, None,
+            );
+            let item = items.iter().find(|i| i.label == "/fallback")
+                .unwrap_or_else(|| panic!("{}: /fallback must be offered at col {}; \
+                                           got labels: {:?}",
+                    label, col, items.iter().map(|i| &i.label).collect::<Vec<_>>()));
+
+            let Some(CompletionTextEdit::Edit(ref te)) = item.text_edit else {
+                panic!("{}: expected textEdit; got {:?}", label, item.text_edit);
+            };
+            // Range must cover the FULL typed content, not zero-width.
+            // That way accepting `/fallback` REPLACES `/fall`, not
+            // appends to it — the pre-fix failure mode that produced
+            // `'/fall/fallback'`.
+            assert_eq!(
+                te.range.start.character,
+                content_start,
+                "{}: range start must hug the first content char; got range {:?}",
+                label, te.range,
+            );
+            assert_eq!(
+                te.range.end.character,
+                content_end,
+                "{}: range end must hug the closing quote (exclusive of it); got range {:?}",
+                label, te.range,
+            );
+            assert_eq!(
+                te.new_text, "/fallback",
+                "{}: newText is the bare label — no seasonal redundancy",
+                label,
+            );
+        }
     }
 
     /// Bug: typing `,` inside a known dispatch call (`->emit('x', |)`)

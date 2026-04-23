@@ -768,6 +768,19 @@ fn parse_call_from_error<'a>(
 ///     (the autoquoted_bareword `t`) has ended → slot 1. Same answer.
 pub fn active_slot_in_node(node: Node, cursor: Point) -> usize {
     let scope = item_scope(node);
+    // Only `list_expression` carries comma-separated slots. Single-arg
+    // calls like `url_for('Users#list')` pass the argument NODE
+    // directly as `arguments` (per the tree-sitter-perl CLAUDE.md
+    // note), so `scope` is the `string_literal` itself — iterating
+    // its named children counts INTERNAL structure (the lone
+    // `string_content`) and double-trips the "past this slot"
+    // boundary when the cursor reaches the content's end. That makes
+    // dispatch completion flip to `active_param=1` at the exact
+    // closing-quote cursor position the user lands on with `i` to
+    // edit inside the string.
+    if scope.kind() != "list_expression" {
+        return 0;
+    }
     let mut count = 0;
     let c_pos = (cursor.row, cursor.column);
     let mut walker = scope.walk();
@@ -1164,6 +1177,32 @@ mod tests {
             find_call_context(&tree, source.as_bytes(), Point::new(1, 10)).unwrap();
         assert_eq!(ctx.name, "foo");
         assert_eq!(ctx.active_param, 2);
+    }
+
+    /// Regression: cursor inside a single-arg call's string literal
+    /// (e.g. `url_for('Users#list')` with cursor on the `s` of `Users`)
+    /// must report `active_param = 0`. Before the fix, `active_slot_in_node`
+    /// iterated the string_literal's INTERNAL children (the lone
+    /// `string_content`) and counted it as a slot once the cursor
+    /// reached its end boundary — making dispatch completion die at
+    /// exactly the boundary where users expect it to narrow by the
+    /// typed content. Live symptom: in nvim, typing inside the
+    /// quotes randomly flipped the completion on/off (vs the stable
+    /// `active_param = 0` needed to surface handlers).
+    #[test]
+    fn test_call_context_cursor_inside_single_string_arg() {
+        let source = "$c->url_for('Users#list');";
+        let tree = parse(source);
+        for col in 12..=23 {
+            let ctx =
+                find_call_context(&tree, source.as_bytes(), Point::new(0, col)).unwrap();
+            assert_eq!(
+                ctx.active_param, 0,
+                "cursor at col {} inside `url_for('Users#list')` must be active_param=0; \
+                 got {}",
+                col, ctx.active_param,
+            );
+        }
     }
 
     #[test]

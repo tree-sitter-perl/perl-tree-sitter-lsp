@@ -185,10 +185,15 @@ fn on_function_call(ctx) {
     // form+submit pair) don't collapse into two visually-identical
     // outline entries. Dispatch still keys on `name: path` — url_for
     // matches on path, not verb.
+    //
+    // Owner is `Mojolicious::Controller` (not `main` / the Lite
+    // script's package): url_for/redirect_to are Controller methods,
+    // and routes should be reachable from any controller in the
+    // workspace. Same reasoning as mojo-routes.
     out += #{
         Handler: #{
             name: path,
-            owner: #{ Class: owner_class },
+            owner: #{ Class: "Mojolicious::Controller" },
             dispatchers: ["url_for", "redirect_to"],
             params: params,
             span: args[0].span,
@@ -199,16 +204,17 @@ fn on_function_call(ctx) {
         }
     };
 
-    // Register the route into a per-app Lite routes namespace. Bridges
-    // to the declaring package (usually `main` for Lite scripts) so
-    // `for_each_entity_bridged_to(owner_class, ...)` finds the route
-    // Handlers. Same emission shape as mojo-routes so the two flavors
-    // aggregate through the same query primitive.
+    // Bridge to Mojolicious::Controller so `for_each_entity_bridged_to(
+    // "Mojolicious::Controller", ...)` — the cross-file lookup that
+    // powers url_for completion in any controller — finds these route
+    // Handlers. Namespace id stays keyed on the declaring package so
+    // future app-scoping can still tell Lite scripts apart; the bridge
+    // controls visibility.
     out += #{
         PluginNamespace: #{
             id: "mojo-lite:" + owner_class,
             kind: "routes",
-            bridges: [ #{ Class: owner_class } ],
+            bridges: [ #{ Class: "Mojolicious::Controller" } ],
             entity_names: [path],
             decl_span: args[0].span,
         }

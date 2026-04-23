@@ -2031,10 +2031,17 @@ impl FileAnalysis {
             return self.package_at(point).map(|s| s.to_string());
         }
         if text.starts_with('$') {
-            if let Some(InferredType::ClassName(n)) = self.inferred_type(text, point) {
-                return Some(n.clone());
-            }
-            return None;
+            // Use `InferredType::class_name()` so BOTH `ClassName` and
+            // `FirstParam` resolve to their class — without this, a
+            // `my ($c) = @_` invocant in a controller method (typed
+            // `FirstParam { package: Users }`) falls back to None and
+            // dispatch-target completion never fires for `$c->url_for(|)`.
+            // Method completion on the same `$c` already uses this
+            // accessor; routing through it here keeps the two paths in
+            // sync. Rule #3.
+            return self.inferred_type(text, point)
+                .and_then(|t| t.class_name())
+                .map(str::to_string);
         }
         if text.starts_with('@') || text.starts_with('%') {
             return None;
@@ -3078,6 +3085,41 @@ impl FileAnalysis {
         }
     }
 
+    /// Single-source-of-truth DFS ancestor walk for every per-class
+    /// lookup on this file: walks `class_name` and every ancestor
+    /// (local `package_parents` ∪ cross-file `parents_cached`),
+    /// cycle-safe via `seen_classes`, depth-capped at 20 (matches
+    /// Perl's default MRO and the historical `resolve_method_in_ancestors`
+    /// bound). Visitor decides when to stop via `ControlFlow::Break`.
+    ///
+    /// Both `resolve_method_in_ancestors` (find-first) and
+    /// `for_each_dispatch_handler_on_class` (collect-all) route
+    /// through here so the two code paths can never drift on MRO
+    /// rules. New ancestor-aware queries should reuse it too rather
+    /// than reroll the walk.
+    fn for_each_ancestor_class(
+        &self,
+        class_name: &str,
+        module_index: Option<&ModuleIndex>,
+        mut visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
+    ) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = vec![class_name.to_string()];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.clone()) { continue; }
+            if seen.len() > 21 { break; } // matches the legacy depth guard
+            if let std::ops::ControlFlow::Break(()) = visit(&cur) {
+                return;
+            }
+            if let Some(ps) = self.package_parents.get(&cur) {
+                for p in ps { stack.push(p.clone()); }
+            }
+            if let Some(idx) = module_index {
+                for p in idx.parents_cached(&cur) { stack.push(p); }
+            }
+        }
+    }
+
     /// Walk the inheritance chain to find a method (DFS, matches Perl's default MRO).
     pub fn resolve_method_in_ancestors(
         &self,
@@ -3085,118 +3127,124 @@ impl FileAnalysis {
         method_name: &str,
         module_index: Option<&ModuleIndex>,
     ) -> Option<MethodResolution> {
-        self.resolve_method_in_ancestors_inner(class_name, method_name, module_index, 0)
-    }
-
-    fn resolve_method_in_ancestors_inner(
-        &self,
-        class_name: &str,
-        method_name: &str,
-        module_index: Option<&ModuleIndex>,
-        depth: usize,
-    ) -> Option<MethodResolution> {
-        if depth > 20 {
-            return None; // safety limit
-        }
-
-        // Check class_name directly (local symbols)
-        for &sid in self.symbols_named(method_name) {
-            let sym = self.symbol(sid);
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                if self.symbol_in_class(sid, class_name) {
-                    return Some(MethodResolution::Local {
-                        class: class_name.to_string(),
+        let mut result: Option<MethodResolution> = None;
+        self.for_each_ancestor_class(class_name, module_index, |cls| {
+            // (a) Local symbols in this file packaged under `cls`.
+            for &sid in self.symbols_named(method_name) {
+                let sym = self.symbol(sid);
+                if matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                    && self.symbol_in_class(sid, cls)
+                {
+                    result = Some(MethodResolution::Local {
+                        class: cls.to_string(),
                         sym_id: sid,
                     });
+                    return std::ops::ControlFlow::Break(());
                 }
             }
-        }
+            // (b) Local plugin-namespace entities bridged to `cls`.
+            for ns in &self.plugin_namespaces {
+                if !ns.bridges.iter().any(|b| matches!(b, Bridge::Class(c) if c == cls)) { continue; }
+                for sym_id in &ns.entities {
+                    let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                    if sym.name == method_name {
+                        result = Some(MethodResolution::Local {
+                            class: cls.to_string(),
+                            sym_id: *sym_id,
+                        });
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+            }
+            // (c) Cross-file: the cached module for `cls` itself
+            // (real CPAN/user-defined methods on the class) plus
+            // plugin-emitted methods registered via bridges from
+            // other workspace files. Per rule #8 the bridge index
+            // is the lookup — see `for_each_entity_bridged_to`.
+            if let Some(idx) = module_index {
+                if let Some(cached) = idx.get_cached(cls) {
+                    if cached.has_sub(method_name) {
+                        result = Some(MethodResolution::CrossFile { class: cls.to_string() });
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+                let mut bridged_hit = false;
+                idx.for_each_entity_bridged_to(cls, |_cached, sym| {
+                    if bridged_hit { return; }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
+                    if sym.name == method_name { bridged_hit = true; }
+                });
+                if bridged_hit {
+                    result = Some(MethodResolution::CrossFile { class: cls.to_string() });
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        result
+    }
 
-        // Local plugin-namespace entities bridged to class_name.
-        // Matches `collect_ancestor_methods`' local-namespace scan so a
-        // helper whose Method has package=`Mojolicious::Controller`
-        // resolves when the receiver is `Mojolicious` (or any class the
-        // namespace bridges to).
-        for ns in &self.plugin_namespaces {
-            let bridges_class = ns.bridges.iter().any(|b|
-                matches!(b, Bridge::Class(c) if c == class_name));
-            if !bridges_class { continue; }
-            for sym_id in &ns.entities {
-                let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
-                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                if sym.name == method_name {
-                    return Some(MethodResolution::Local {
-                        class: class_name.to_string(),
-                        sym_id: *sym_id,
-                    });
+    /// Collect every Handler visible from `class_name` whose `dispatchers`
+    /// list contains `dispatcher`. Walks the inheritance chain and at
+    /// each level pulls Handlers from (1) this file's symbols with
+    /// matching owner, (2) this file's `plugin_namespaces` bridged to
+    /// the current class, and (3) cross-file via
+    /// `module_index.for_each_entity_bridged_to` — rule #8.
+    ///
+    /// Shares `for_each_ancestor_class` with `resolve_method_in_ancestors`
+    /// so the two dispatch paths can't drift on MRO rules. Both
+    /// `dispatch_target_completions` and `class_has_dispatch_handlers`
+    /// in `symbols.rs` funnel through here.
+    ///
+    /// `visit(symbol, provenance)` — provenance is `"this file"` for
+    /// local hits and the cached module's filename for cross-file
+    /// hits (matches the existing detail-string contract).
+    pub fn for_each_dispatch_handler_on_class(
+        &self,
+        class_name: &str,
+        dispatcher: &str,
+        module_index: Option<&ModuleIndex>,
+        mut visit: impl FnMut(&Symbol, &str),
+    ) {
+        let disp_matches = |dd: &[String]| dd.iter().any(|d| d == dispatcher);
+        self.for_each_ancestor_class(class_name, module_index, |cls| {
+            // (1) Local Handler symbols owned by this class.
+            for sym in &self.symbols {
+                if let SymbolDetail::Handler { owner, dispatchers, .. } = &sym.detail {
+                    let HandlerOwner::Class(n) = owner;
+                    if n == cls && disp_matches(dispatchers) {
+                        visit(sym, "this file");
+                    }
                 }
             }
-        }
-
-        // Check local parents from package_parents
-        if let Some(parents) = self.package_parents.get(class_name) {
-            for parent in parents {
-                if let Some(res) = self.resolve_method_in_ancestors_inner(
-                    parent, method_name, module_index, depth + 1,
-                ) {
-                    return Some(res);
+            // (2) Local plugin-namespace bridge to `cls`.
+            for ns in &self.plugin_namespaces {
+                if !ns.bridges.iter().any(|b| matches!(b, Bridge::Class(c) if c == cls)) { continue; }
+                for sym_id in &ns.entities {
+                    let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
+                    if let SymbolDetail::Handler { dispatchers, .. } = &sym.detail {
+                        if disp_matches(dispatchers) {
+                            visit(sym, "this file");
+                        }
+                    }
                 }
             }
-        }
-
-        // Check cross-file parents via ModuleIndex
-        if let Some(idx) = module_index {
-            if let Some(cached) = idx.get_cached(class_name) {
-                if cached.has_sub(method_name) {
-                    return Some(MethodResolution::CrossFile {
-                        class: class_name.to_string(),
-                    });
-                }
-            }
-            // Plugin-emitted methods land in the file where the
-            // registration runs, not in the target class's own
-            // module. `$app->helper('users.create' => ...)` in
-            // MyApp.pm produces a Method packaged on
-            // `Mojolicious::Controller`, but the Controller module
-            // itself (cached from CPAN) has no such sub. Without
-            // this scan, `$c->users->...` chain resolution fails in
-            // every consumer file, and the same gap feeds the
-            // unresolved-function diagnostic for helper call sites.
-            // Mirrors what collect_ancestor_methods already does.
-            let mut bridged_hit = false;
-            idx.for_each_entity_bridged_to(class_name, |_cached, sym| {
-                if bridged_hit { return; }
-                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
-                if sym.name != method_name { return; }
-                bridged_hit = true;
-            });
-            if bridged_hit {
-                return Some(MethodResolution::CrossFile {
-                    class: class_name.to_string(),
+            // (3) Cross-file plugin-namespace bridge.
+            if let Some(idx) = module_index {
+                idx.for_each_entity_bridged_to(cls, |cached, sym| {
+                    if let SymbolDetail::Handler { dispatchers, .. } = &sym.detail {
+                        if disp_matches(dispatchers) {
+                            let prov = cached.path.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("cross-file");
+                            visit(sym, prov);
+                        }
+                    }
                 });
             }
-            // Walk cross-file parent chain
-            let cross_parents = idx.parents_cached(class_name);
-            for parent in &cross_parents {
-                // Check if parent is a local package first
-                if self.package_parents.contains_key(parent.as_str()) {
-                    if let Some(res) = self.resolve_method_in_ancestors_inner(
-                        parent, method_name, module_index, depth + 1,
-                    ) {
-                        return Some(res);
-                    }
-                } else {
-                    // Fully cross-file parent
-                    if let Some(res) = self.resolve_cross_file_method(
-                        parent, method_name, idx, depth + 1,
-                    ) {
-                        return Some(res);
-                    }
-                }
-            }
-        }
-
-        None
+            std::ops::ControlFlow::Continue(())
+        });
     }
 
     /// Hover text for a `Handler` symbol or `DispatchCall` ref. Shows
@@ -3335,35 +3383,9 @@ impl FileAnalysis {
     }
 
     // helpers defined at module scope below
-
-    /// Resolve a method through the cross-file inheritance chain only.
-    fn resolve_cross_file_method(
-        &self,
-        class_name: &str,
-        method_name: &str,
-        module_index: &ModuleIndex,
-        depth: usize,
-    ) -> Option<MethodResolution> {
-        if depth > 20 {
-            return None;
-        }
-        if let Some(cached) = module_index.get_cached(class_name) {
-            if cached.has_sub(method_name) {
-                return Some(MethodResolution::CrossFile {
-                    class: class_name.to_string(),
-                });
-            }
-        }
-        let parents = module_index.parents_cached(class_name);
-        for parent in &parents {
-            if let Some(res) = self.resolve_cross_file_method(
-                parent, method_name, module_index, depth + 1,
-            ) {
-                return Some(res);
-            }
-        }
-        None
-    }
+    // (`resolve_cross_file_method` retired — `resolve_method_in_ancestors`
+    // now routes through the unified `for_each_ancestor_class` traversal,
+    // which already unions local and cross-file parents.)
 
     /// Check if a symbol is defined within a class/package.
     pub(crate) fn symbol_in_class(&self, sym_id: SymbolId, class_name: &str) -> bool {
