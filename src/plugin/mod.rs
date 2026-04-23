@@ -170,6 +170,15 @@ pub enum EmitAction {
         /// real user-facing class or a synthetic pass-through.
         #[serde(default)]
         opaque_return: bool,
+        /// Outline-only identifier override. `name` stays authoritative
+        /// for method resolution — a Mojo helper chained leaf needs
+        /// `name: "create"` so `$c->users->create` resolves via the
+        /// proxy — but in the outline the user wants to see the full
+        /// dotted path `"users.create"`. Plugin sets this to the
+        /// identifier part only; the core prepends the kind word
+        /// ("helper") and appends the non-invocant params.
+        #[serde(default)]
+        outline_label: Option<String>,
     },
     /// Synthesize a `HashKeyDef` for a constructor/stash/etc. key.
     HashKeyDef {
@@ -217,6 +226,16 @@ pub enum EmitAction {
         /// Hide from document outline (see Method variant).
         #[serde(default)]
         hide_in_outline: bool,
+        /// Outline-only identifier override. `name` stays authoritative
+        /// for dispatch lookups (a `->emit('ready')` DispatchCall
+        /// matches Handlers by `name`), but the outline can show a
+        /// richer identifier — e.g. a mojo-lite route uses this to
+        /// prepend the HTTP verb ("GET /users/profile") so two
+        /// handlers on the same path (GET + POST) don't look
+        /// identical. Core prepends the kind word ("route") and
+        /// appends non-invocant params.
+        #[serde(default)]
+        outline_label: Option<String>,
     },
     /// Emit a call-site reference for a Handler — e.g. the cursor is on
     /// `'ready'` in `$x->emit('ready', ...)`. `dispatcher` is the
@@ -754,6 +773,7 @@ mod tests {
             display: None,
             hide_in_outline: false,
             opaque_return: false,
+            outline_label: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         assert!(json.contains("\"Method\""));

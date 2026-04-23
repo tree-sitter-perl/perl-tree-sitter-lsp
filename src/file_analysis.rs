@@ -178,6 +178,17 @@ pub struct Symbol {
     /// framework plugins stamp their plugin id.
     #[serde(default)]
     pub namespace: Namespace,
+    /// Optional outline-only display name override. When set, the document
+    /// outline uses this verbatim instead of `name` (and drops any
+    /// kind-specific prefix like "helper"/"method"). Plugin-controlled:
+    /// a chained Mojo helper leaf has `name: "create"` (so method
+    /// resolution works on `$c->users->create`) but needs
+    /// `outline_label: "users.create"` so the outline reflects the
+    /// declared helper path. A mojo-lite route uses it to prepend the
+    /// HTTP verb to the path. Doesn't affect resolution, rename, or
+    /// workspace-symbol.
+    #[serde(default)]
+    pub outline_label: Option<String>,
 }
 
 impl Symbol {
@@ -533,6 +544,15 @@ pub enum HandlerDisplay {
     /// Framework-declared URL pattern. Same LSP kind as Helper/Task;
     /// outline detail prints "route" so the client can disambiguate.
     Route,
+    /// A controller action referenced from a routing declaration —
+    /// e.g. the `Users#list` target of Mojolicious' `->to('Users#list')`
+    /// (Mojo's own docs call this an "action") or Catalyst's
+    /// `->forward('/users/list')`. Distinct from `Route` because no
+    /// request-handling body lives at this source site: it's a
+    /// cross-reference to a method that lives elsewhere. Outline word
+    /// "action" so `<route> GET /users` and `<action> Users#list` read
+    /// as two different kinds of line items.
+    Action,
     /// Job-queue / worker task (Minion etc.). Helper-kin for the LSP
     /// kind, distinct "task" word in outline detail.
     Task,
@@ -553,6 +573,7 @@ impl HandlerDisplay {
             HandlerDisplay::Event => Some("event"),
             HandlerDisplay::Helper => Some("helper"),
             HandlerDisplay::Route => Some("route"),
+            HandlerDisplay::Action => Some("action"),
             HandlerDisplay::Task => Some("task"),
             _ => None,
         }
@@ -798,30 +819,6 @@ fn sub_display_override(detail: &SymbolDetail) -> Option<HandlerDisplay> {
         *display
     } else {
         None
-    }
-}
-
-/// Outline prefix honoring a plugin-provided display override. Falls
-/// back to the language default (`sub` / `method`) when no override
-/// is set. Keeps the label aligned with the icon so "method users"
-/// doesn't render next to a Function-kind glyph, and plugin-synthesized
-/// callables render with their semantic word (`helper users`, `route
-/// '/x'`, `task send_email`) instead of a flat `sub`.
-fn sub_display_prefix(detail: &SymbolDetail, default: &'static str) -> &'static str {
-    if let SymbolDetail::Sub { display: Some(d), .. } = detail {
-        match d {
-            HandlerDisplay::Event => "event",
-            HandlerDisplay::Method => "method",
-            HandlerDisplay::Function => "fn",
-            HandlerDisplay::Field => "field",
-            HandlerDisplay::Property => "property",
-            HandlerDisplay::Constant => "const",
-            HandlerDisplay::Helper => "helper",
-            HandlerDisplay::Route => "route",
-            HandlerDisplay::Task => "task",
-        }
-    } else {
-        default
     }
 }
 
@@ -1258,6 +1255,7 @@ impl FileAnalysis {
 
                     },
                     namespace: Namespace::Language,
+                    outline_label: None,
                 });
             }
         }
@@ -3459,32 +3457,13 @@ impl FileAnalysis {
             }
         }
 
-        // Plugin namespaces as navigable outline entries. Entities
-        // themselves still show flat at file scope (the Helper/Route/Task
-        // detail words make them individually visible) — the namespace
-        // entry adds a "this file hosts a <kind>" anchor you can jump
-        // to, and is the one surface that actually reads
-        // `plugin_namespaces` (rule #8's otherwise-ghost data).
-        for ns in &self.plugin_namespaces {
-            let name = format!("[{}] {}", ns.kind, ns.id);
-            let bridge_names: Vec<&str> = ns.bridges.iter()
-                .map(|b| match b { Bridge::Class(c) => c.as_str() })
-                .collect();
-            let detail = if bridge_names.is_empty() {
-                None
-            } else {
-                Some(format!("bridges: {}", bridge_names.join(", ")))
-            };
-            out.push(OutlineSymbol {
-                name,
-                detail,
-                kind: SymKind::Namespace,
-                span: ns.decl_span,
-                selection_span: ns.decl_span,
-                children: Vec::new(),
-                handler_display: None,
-            });
-        }
+        // Plugin namespaces are NOT surfaced in the document outline.
+        // They exist for cross-file bridge lookups
+        // (`for_each_entity_bridged_to`), not as navigation targets —
+        // users look for the helpers/routes/tasks themselves, which
+        // already render flat with their `<word>` kind prefix.
+        // Surfacing the namespace as a separate entry adds a row with
+        // no unique information you can act on.
         out
     }
 
@@ -3525,32 +3504,37 @@ impl FileAnalysis {
             }
 
             let (name, detail, children) = match sym.kind {
-                SymKind::Sub => {
+                SymKind::Sub | SymKind::Method => {
                     let body_scope = self.find_body_scope(sym);
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
-                    // Plugin-synthesized callables carry a semantic
-                    // word (helper/route/task/…) that replaces the
-                    // default `sub` prefix. Native subs render as
-                    // `sub name`; helpers render as `helper name`,
-                    // routes as `route '/x'`, etc. The icon comes
-                    // from `display_override` via a separate path;
-                    // the label here keeps them in lockstep.
-                    let prefix = sub_display_prefix(&sym.detail, "sub");
-                    let label = format!("{} {}", prefix, sym.name);
+                    // Name format: "<word> identifier (params)".
+                    // The `<…>` wrapper is the visual distinguisher —
+                    // clients that render only `name` (nvim's builtin
+                    // document_symbol handler) get a kind cue that
+                    // survives the LSP-kind collapse (Helper → FUNCTION
+                    // erases "helper"). Plugins override via `display`;
+                    // native subs/methods use the bare "sub"/"method"
+                    // words. Params included for all — hand-written
+                    // subs want signatures in the outline as much as
+                    // framework-synthesized ones do.
                     let disp = sub_display_override(&sym.detail);
-                    let outline_detail = disp.and_then(|d| d.outline_word()).map(|s| s.to_string());
-                    (label, outline_detail, children)
-                }
-                SymKind::Method => {
-                    let body_scope = self.find_body_scope(sym);
-                    let children = body_scope
-                        .map(|s| self.outline_children_of(s))
-                        .unwrap_or_default();
-                    let prefix = sub_display_prefix(&sym.detail, "method");
-                    let label = format!("{} {}", prefix, sym.name);
-                    let disp = sub_display_override(&sym.detail);
+                    let default_word = if matches!(sym.kind, SymKind::Method) { "method" } else { "sub" };
+                    let word = disp.and_then(|d| d.outline_word()).unwrap_or(default_word);
+                    let identifier = sym.outline_label.clone().unwrap_or_else(|| sym.name.clone());
+                    let params_suffix = match &sym.detail {
+                        SymbolDetail::Sub { params, .. } => {
+                            let visible: Vec<&str> = params.iter()
+                                .filter(|p| !p.is_invocant)
+                                .map(|p| p.name.as_str())
+                                .collect();
+                            if visible.is_empty() { String::new() }
+                            else { format!(" ({})", visible.join(", ")) }
+                        }
+                        _ => String::new(),
+                    };
+                    let label = format!("<{}> {}{}", word, identifier, params_suffix);
                     let outline_detail = disp.and_then(|d| d.outline_word()).map(|s| s.to_string());
                     (label, outline_detail, children)
                 }
@@ -3587,27 +3571,33 @@ impl FileAnalysis {
                 SymKind::HashKeyDef => continue, // Skip hash key defs from outline
                 SymKind::Handler => {
                     // Show registered handlers in the outline. The
-                    // semantic word comes from the plugin's display
-                    // choice (`event`/`route`/`task`/…); params ride
-                    // along so stacked registrations with different
-                    // signatures are visually distinct.
-                    let detail = match &sym.detail {
+                    // semantic word (`event`/`route`/`task`/…) and
+                    // params ride along in the NAME — most outline
+                    // clients render only `name`, so baking it there
+                    // gives stacked registrations (two handlers on
+                    // the same name with different sigs, GET + POST
+                    // on the same path) visually distinct entries.
+                    // `outline_label` lets the plugin inject a
+                    // disambiguator (e.g. HTTP verb) into the
+                    // identifier slot without affecting dispatch
+                    // lookups, which still key on `sym.name`.
+                    let (word, params_suffix) = match &sym.detail {
                         SymbolDetail::Handler { params, display, .. } => {
-                            let visible: Vec<String> = params
+                            let word = display.outline_word().unwrap_or("handler");
+                            let visible: Vec<&str> = params
                                 .iter()
                                 .filter(|p| !p.is_invocant)
-                                .map(|p| p.name.clone())
+                                .map(|p| p.name.as_str())
                                 .collect();
-                            let word = display.outline_word().unwrap_or("handler");
-                            if visible.is_empty() {
-                                Some(word.to_string())
-                            } else {
-                                Some(format!("{} ({})", word, visible.join(", ")))
-                            }
+                            let suf = if visible.is_empty() { String::new() }
+                                else { format!(" ({})", visible.join(", ")) };
+                            (word, suf)
                         }
-                        _ => Some("handler".to_string()),
+                        _ => ("handler", String::new()),
                     };
-                    (sym.name.clone(), detail, Vec::new())
+                    let identifier = sym.outline_label.clone().unwrap_or_else(|| sym.name.clone());
+                    let label = format!("<{}> {}{}", word, identifier, params_suffix);
+                    (label, Some(word.to_string()), Vec::new())
                 }
                 SymKind::Namespace => {
                     // Real Namespace entries are appended by
@@ -4996,6 +4986,7 @@ mod tests {
                     opaque_return: false,
                 },
                 namespace: Namespace::Language,
+                outline_label: None,
             }],
             vec![],
             vec![],
@@ -5421,6 +5412,113 @@ mod tests {
     /// Previously broken: refs_by_target was absent. Even variable refs
     /// relied on a linear scan of `refs` per query. Phase 5 exposes an
     /// O(1) lookup for any resolved ref.
+    /// Pin the exhaustive document outline for `test_files/plugin_mojo_demo.pl`.
+    ///
+    /// Covers every plugin path in a single real file: mojo-helpers
+    /// (simple + dotted chains), mojo-routes (`->to`), mojo-lite (verb
+    /// DSL), minion tasks, mojo-events (`->on`). This is what a user
+    /// actually sees in `<leader>o` — each plugin-emitted entry carries
+    /// a leading kind word ("helper"/"route"/"task"/"event") and
+    /// non-invocant params so stacked registrations (GET vs POST on
+    /// the same path, three events on one emitter) are distinguishable
+    /// in clients that render only `name` (nvim's builtin
+    /// document_symbol handler does).
+    ///
+    /// Internal plumbing — mojo-helpers' synthetic proxy classes and
+    /// their `[proxy]` namespaces, the intermediate segment Methods
+    /// that chain dotted helpers — must NOT show up. It's invisible
+    /// to the user but pins the no-duplicate-`helper users` invariant
+    /// that was the motivating bug.
+    #[test]
+    fn plugin_mojo_demo_outline_pinned() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_files/plugin_mojo_demo.pl");
+        let src = std::fs::read_to_string(&path)
+            .expect("plugin_mojo_demo.pl is checked into the repo");
+        let fa = build_fa_from_source(&src);
+        let rendered = render_outline(&fa.document_symbols());
+        let expected = "\
+[NAMESPACE] MyApp @L34
+[MODULE] use strict @L35
+[MODULE] use warnings @L36
+[MODULE] use Mojolicious::Lite @L37
+[MODULE] use Mojolicious @L38
+[VARIABLE] $app @L44
+[FUNCTION] <helper> current_user ($fallback) @L45
+[FUNCTION] <helper> users.create ($name, $email) @L52
+[FUNCTION] <helper> users.delete ($id) @L56
+[FUNCTION] <helper> admin.users.purge ($force) @L62
+[VARIABLE] $r @L70
+[FUNCTION] <action> Users#list @L71
+[FUNCTION] <action> Users#create @L72
+[FUNCTION] <action> Admin::Dashboard#index @L73
+[FUNCTION] <route> GET /users/profile @L79
+[FUNCTION] <route> POST /users/profile ($form_data) @L84
+[FUNCTION] <route> ANY /fallback @L90
+[MODULE] use Minion @L104
+[VARIABLE] $minion @L105
+[FUNCTION] <task> send_email ($to, $subject, $body) @L107
+[FUNCTION] <task> resize_image ($path, $width, $height) @L113
+[NAMESPACE] MyApp::Progress @L131
+[MODULE] use parent @L132
+[FUNCTION] <sub> new @L134
+  [VARIABLE] $class @L135
+  [VARIABLE] $self @L136
+  [EVENT] <event> ready ($ctx) @L137
+  [EVENT] <event> step ($n, $total) @L138
+  [EVENT] <event> done ($result) @L139
+[FUNCTION] <sub> tick ($n) @L143
+  [VARIABLE] $self @L144
+  [VARIABLE] $n @L144
+";
+        assert_eq!(
+            rendered, expected,
+            "\n---- ACTUAL ----\n{}\n---- EXPECTED ----\n{}",
+            rendered, expected,
+        );
+    }
+
+    /// Serialize an outline tree to the `[LSP_KIND] name @L<line>`
+    /// form the pin test compares against. Indent = two spaces per
+    /// depth. LSP kind uses the same path symbols.rs takes for the
+    /// real documentSymbol response (`outline_lsp_kind`), so the
+    /// snapshot reflects what clients actually receive.
+    fn render_outline(items: &[OutlineSymbol]) -> String {
+        fn walk(o: &OutlineSymbol, depth: usize, buf: &mut String) {
+            let kind = crate::symbols::outline_lsp_kind(o);
+            // lsp_types SymbolKind's Debug is verbose ("SymbolKind(12)");
+            // map the handful of kinds we actually emit by hand.
+            let name = lsp_kind_name(kind);
+            let pad = "  ".repeat(depth);
+            buf.push_str(&format!(
+                "{}[{}] {} @L{}\n",
+                pad, name, o.name, o.span.start.row + 1,
+            ));
+            for c in &o.children { walk(c, depth + 1, buf); }
+        }
+        let mut buf = String::new();
+        for o in items { walk(o, 0, &mut buf); }
+        buf
+    }
+
+    fn lsp_kind_name(k: tower_lsp::lsp_types::SymbolKind) -> &'static str {
+        use tower_lsp::lsp_types::SymbolKind as K;
+        match k {
+            K::FUNCTION => "FUNCTION",
+            K::METHOD => "METHOD",
+            K::CLASS => "CLASS",
+            K::NAMESPACE => "NAMESPACE",
+            K::MODULE => "MODULE",
+            K::VARIABLE => "VARIABLE",
+            K::EVENT => "EVENT",
+            K::FIELD => "FIELD",
+            K::PROPERTY => "PROPERTY",
+            K::CONSTANT => "CONSTANT",
+            K::KEY => "KEY",
+            _ => "OTHER",
+        }
+    }
+
     #[test]
     fn test_phase5_refs_by_target_index_populated_for_variables() {
         let fa = build_fa_from_source(r#"

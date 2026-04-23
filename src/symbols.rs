@@ -63,11 +63,11 @@ fn handler_display_to_symbol_kind(d: &crate::file_analysis::HandlerDisplay) -> S
         H::Field => SymbolKind::FIELD,
         H::Property => SymbolKind::PROPERTY,
         H::Constant => SymbolKind::CONSTANT,
-        // Helper / Route / Task → FUNCTION. LSP's `SymbolKind` enum
-        // is frozen; the distinguishing word lives in `detail` so
-        // client configs (or built-in rendering) can surface
-        // `helper` / `route` / `task` without protocol extension.
-        H::Helper | H::Route | H::Task => SymbolKind::FUNCTION,
+        // Helper / Route / Task / Dispatch → FUNCTION. LSP's
+        // `SymbolKind` enum is frozen; the distinguishing word lives
+        // in `detail` / baked into `name` so client configs can
+        // surface it without protocol extension.
+        H::Helper | H::Route | H::Task | H::Action => SymbolKind::FUNCTION,
     }
 }
 
@@ -80,7 +80,7 @@ fn handler_display_to_completion_kind(d: &crate::file_analysis::HandlerDisplay) 
         H::Field => CompletionItemKind::FIELD,
         H::Property => CompletionItemKind::PROPERTY,
         H::Constant => CompletionItemKind::CONSTANT,
-        H::Helper | H::Route | H::Task => CompletionItemKind::FUNCTION,
+        H::Helper | H::Route | H::Task | H::Action => CompletionItemKind::FUNCTION,
     }
 }
 

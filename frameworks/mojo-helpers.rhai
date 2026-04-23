@@ -142,6 +142,15 @@ fn on_method_call(ctx) {
     //
     // First segment: ONE Method owned by Controller. The namespace's
     // bridge-union surfaces it from a Mojolicious query too.
+    //
+    // `hide_in_outline: true` on non-leaf segments — they're chain
+    // plumbing, not registrations the user wrote. Two helpers
+    // sharing a prefix (`users.create`, `users.delete`) would each
+    // surface an intermediate `users` entry; a three-segment
+    // (`admin.users.purge`) would show a second `users` further
+    // down. The leaf is the actual registration — give it the full
+    // dotted path as `outline_label` so the user sees
+    // `helper users.create` not a bare `helper create`.
     let n = segments.len();
     let proxy_base = "Mojolicious::Controller::_Helper";
     let first_seg = segments[0];
@@ -157,7 +166,7 @@ fn on_method_call(ctx) {
             doc: (),
             on_class: "Mojolicious::Controller",
             display: "Helper",
-            hide_in_outline: false,
+            hide_in_outline: true,
             opaque_return: true,
         }
     };
@@ -179,7 +188,7 @@ fn on_method_call(ctx) {
                 doc: (),
                 on_class: owner_class,
                 display: "Helper",
-                hide_in_outline: false,
+                hide_in_outline: true,
                 opaque_return: true,
             }
         };
@@ -201,6 +210,7 @@ fn on_method_call(ctx) {
             on_class: owner_class,
             display: "Helper",
             hide_in_outline: false,
+            outline_label: name,
         }
     };
 

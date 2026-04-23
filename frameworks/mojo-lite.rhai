@@ -179,11 +179,12 @@ fn on_function_call(ctx) {
         params = as_invocant_params(args[1].sub_params);
     }
 
-    // Lite routes are framework-synthesized URL callables. `display`
-    // still set (so when other surfaces DO render them the icon is
-    // right), but `hide_in_outline` keeps the user's outline focused
-    // on the actual Perl structure — routes exist at their call
-    // sites, not as standalone top-level symbols.
+    // Lite routes are framework-synthesized URL callables. The
+    // HTTP verb gets promoted into `outline_label` ("GET /path",
+    // "POST /path") so two handlers on the same URL (the common
+    // form+submit pair) don't collapse into two visually-identical
+    // outline entries. Dispatch still keys on `name: path` — url_for
+    // matches on path, not verb.
     out += #{
         Handler: #{
             name: path,
@@ -194,6 +195,7 @@ fn on_function_call(ctx) {
             selection_span: args[0].span,
             display: "Route",
             hide_in_outline: false,
+            outline_label: fname.to_upper() + " " + path,
         }
     };
 

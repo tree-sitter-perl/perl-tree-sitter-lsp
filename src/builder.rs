@@ -404,6 +404,7 @@ impl<'a> Builder<'a> {
             package: self.current_package.clone(),
             detail,
             namespace,
+            outline_label: None,
         });
         id
     }
@@ -880,6 +881,7 @@ impl<'a> Builder<'a> {
                 display,
                 hide_in_outline,
                 opaque_return,
+                outline_label,
             } => {
                 let detail = SymbolDetail::Sub {
                     params: params.into_iter().map(Into::into).collect(),
@@ -890,17 +892,8 @@ impl<'a> Builder<'a> {
                     hide_in_outline,
                     opaque_return,
                 };
-                // Target package for this emission: either the plugin's
-                // override or the current build state.
                 let target_pkg = on_class.clone().or_else(|| self.current_package.clone());
 
-                // Dedup: two plugin emissions for the same (name, package,
-                // namespace) collapse to the first. Comes up naturally
-                // with dotted-helper prefixes — `thing.hi` and
-                // `thing.there` both want to register `thing` as a
-                // namespace method; the second is a no-op. Dedup happens
-                // here (not in the plugin) so every plugin author gets
-                // it for free and can't accidentally double-emit.
                 let already_emitted = self.symbols.iter().any(|s| {
                     s.name == name
                         && s.kind == SymKind::Method
@@ -909,18 +902,23 @@ impl<'a> Builder<'a> {
                 });
                 if already_emitted { return; }
 
-                // `on_class` temporarily overrides current_package so the
-                // emitted Symbol lands with the requested `package`. The
-                // only sanctioned way for a plugin to attach a method to
-                // a class that isn't the one being built — kept narrow
-                // so plugins can't silently reparent other emissions.
-                if let Some(pkg) = on_class {
+                let sid = if let Some(pkg) = on_class {
                     let saved = self.current_package.take();
                     self.current_package = Some(pkg);
-                    self.add_symbol_ns(name, SymKind::Method, span, selection_span, detail, ns);
+                    let id = self.add_symbol_ns(name, SymKind::Method, span, selection_span, detail, ns);
                     self.current_package = saved;
+                    id
                 } else {
-                    self.add_symbol_ns(name, SymKind::Method, span, selection_span, detail, ns);
+                    self.add_symbol_ns(name, SymKind::Method, span, selection_span, detail, ns)
+                };
+                if outline_label.is_some() {
+                    // Apply to the symbol just pushed. Kept out of
+                    // `add_symbol_ns` since outline_label is only
+                    // meaningful on plugin-emitted callables; the core
+                    // constructor stays narrow.
+                    if let Some(s) = self.symbols.iter_mut().find(|s| s.id == sid) {
+                        s.outline_label = outline_label;
+                    }
                 }
             }
             plugin::EmitAction::HashKeyDef { name, owner, span, selection_span } => {
@@ -942,7 +940,7 @@ impl<'a> Builder<'a> {
             }
             plugin::EmitAction::Handler {
                 name, owner, dispatchers, params, span, selection_span, display,
-                hide_in_outline,
+                hide_in_outline, outline_label,
             } => {
                 let detail = SymbolDetail::Handler {
                     owner,
@@ -951,7 +949,12 @@ impl<'a> Builder<'a> {
                     display,
                     hide_in_outline,
                 };
-                self.add_symbol_ns(name, SymKind::Handler, span, selection_span, detail, ns);
+                let sid = self.add_symbol_ns(name, SymKind::Handler, span, selection_span, detail, ns);
+                if outline_label.is_some() {
+                    if let Some(s) = self.symbols.iter_mut().find(|s| s.id == sid) {
+                        s.outline_label = outline_label;
+                    }
+                }
             }
             plugin::EmitAction::MethodCallRef { method_name, invocant, span, invocant_span } => {
                 // Standard MethodCall ref — gd/gr/hover/rename route to
@@ -9449,9 +9452,12 @@ $app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
     // can't lie about internal function results passing while the LSP
     // experience breaks.
 
-    /// Test 1 — outline detail names the semantic kind, kind stays
-    /// FUNCTION (user config can map it). Helpers / routes / tasks
-    /// each get their domain word in `detail`; events stay as EVENT.
+    /// Outline detail names the semantic kind, LSP kind stays FUNCTION
+    /// (user config can render an icon for the domain word). Terminal
+    /// URL handlers (mojo-lite `get '/x' => sub {}`) are `<route>`;
+    /// routing hops (`->to('Users#list')`) are `<dispatch>` — those
+    /// two are semantically different and must not collapse. Tasks
+    /// stay `<task>`, helpers stay `<helper>`, events stay EVENT.
     #[test]
     fn outline_detail_names_the_semantic_kind() {
         use tower_lsp::lsp_types::SymbolKind;
@@ -9463,6 +9469,7 @@ $app->helper(current_user => sub { my ($c) = @_; });
 
 my $r = app->routes;
 $r->get('/x')->to('Users#list');
+get '/home' => sub { my $c = shift; };
 
 use Minion;
 my $minion = Minion->new;
@@ -9479,7 +9486,6 @@ sub new {
         let fa = build_fa(src);
         let outline = fa.document_symbols();
 
-        // Flatten outline tree for easy lookup.
         fn flatten<'a>(out: &'a [crate::file_analysis::OutlineSymbol], acc: &mut Vec<&'a crate::file_analysis::OutlineSymbol>) {
             for s in out {
                 acc.push(s);
@@ -9495,16 +9501,26 @@ sub new {
 
         let helper = all.iter().find(|s| s.name.contains("current_user"))
             .expect("helper must be in outline of its declaring file");
-        assert_eq!(lsp_kind(helper), SymbolKind::FUNCTION,
-            "helpers render as FUNCTION (user's nvim config handles label)");
+        assert_eq!(lsp_kind(helper), SymbolKind::FUNCTION);
         assert!(helper.detail.as_deref().unwrap_or("").contains("helper"),
             "helper outline detail must contain 'helper'; got: {:?}", helper.detail);
 
-        let route = all.iter().find(|s| s.name.contains("Users#list"))
-            .expect("route must be in outline of its declaring file");
-        assert_eq!(lsp_kind(route), SymbolKind::FUNCTION);
-        assert!(route.detail.as_deref().unwrap_or("").contains("route"),
-            "route outline detail must contain 'route'; got: {:?}", route.detail);
+        // Terminal route: body lives here, `<route>` word.
+        let term_route = all.iter().find(|s| s.name.contains("/home"))
+            .expect("mojo-lite terminal route must be in outline");
+        assert_eq!(lsp_kind(term_route), SymbolKind::FUNCTION);
+        assert_eq!(term_route.detail.as_deref(), Some("route"),
+            "terminal mojo-lite route word is 'route'; got: {:?}", term_route.detail);
+
+        // Controller action (`->to('Users#list')`): no body at this
+        // site, just a cross-reference into Users::list. Word must be
+        // `action`, not `route` — `<route> GET /x` and `<action>
+        // Users#list` are semantically different line items.
+        let action = all.iter().find(|s| s.name.contains("Users#list"))
+            .expect("->to('Users#list') action must be in outline");
+        assert_eq!(lsp_kind(action), SymbolKind::FUNCTION);
+        assert_eq!(action.detail.as_deref(), Some("action"),
+            "->to(...) word is 'action' (distinct from a terminal route); got: {:?}", action.detail);
 
         let task = all.iter().find(|s| s.name.contains("send_email"))
             .expect("task must be in outline of its declaring file");
@@ -10320,38 +10336,47 @@ $app->helper('users.create' => sub { my ($c) = @_; });
         assert_eq!(count, 1, "one namespace per app, not one per helper");
     }
 
-    /// Rule #8 follow-through: plugin_namespaces must be READ somewhere.
-    /// Outline surfaces them as NAMESPACE entries so "this file hosts a
-    /// mojo app / Minion instance / events emitter" is navigable. Also
-    /// proves document_symbols doesn't regress the flat entity listing.
+    /// Plugin namespaces are a structural concept (bridges into class
+    /// lookups via `for_each_entity_bridged_to`) — they are deliberately
+    /// NOT surfaced in the document outline. The entities inside (helpers,
+    /// routes, tasks) already render as individual entries with their
+    /// `<word>` kind prefix; a separate "this file hosts a mojo app" row
+    /// is noise the user can't act on. The namespace data still has to
+    /// be populated for cross-file bridge lookups to work — that's what
+    /// this test pins.
     #[test]
-    fn plugin_namespaces_appear_in_document_outline() {
+    fn plugin_namespaces_are_populated_but_not_in_outline() {
         let src = r#"package MyApp;
 use Mojolicious::Lite;
 app->helper(current_user => sub { my ($c) = @_; });
 get '/home' => sub { my $c = shift; };
 "#;
         let fa = build_fa(src);
+
+        // The namespace data is still there for bridge queries — that's
+        // how `$c->current_user` resolves to the helper across files.
+        assert!(
+            fa.plugin_namespaces.iter().any(|n| n.kind == "app"),
+            "app namespace should still exist in FileAnalysis; got: {:?}",
+            fa.plugin_namespaces.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        // Outline must NOT contain any Namespace kind entries from the
+        // plugin namespaces. Packages (`MyApp`) are Namespace-kind too
+        // but come from SymKind::Package symbols, which are fine.
         let outline = fa.document_symbols();
-
-        let ns_entries: Vec<&crate::file_analysis::OutlineSymbol> = outline.iter()
+        let plugin_ns_in_outline: Vec<&str> = outline.iter()
             .filter(|o| o.kind == SymKind::Namespace)
+            .map(|o| o.name.as_str())
+            .filter(|n| n.starts_with('['))
             .collect();
-        assert!(!ns_entries.is_empty(),
-            "outline must surface plugin_namespaces as Namespace entries; got: {:?}",
-            outline.iter().map(|o| (&o.name, &o.kind)).collect::<Vec<_>>());
+        assert!(
+            plugin_ns_in_outline.is_empty(),
+            "plugin namespaces must not surface in outline; leaked: {:?}",
+            plugin_ns_in_outline,
+        );
 
-        // Every namespace outline entry carries its kind in the name
-        // so users can distinguish `[app]` from `[routes]` from `[tasks]`.
-        for ns in &ns_entries {
-            assert!(ns.name.starts_with('['),
-                "namespace outline entries should show kind in brackets; got: {:?}", ns.name);
-        }
-
-        // Individual helpers + routes still show flat at file scope —
-        // the namespace entry doesn't hide them (user explicitly asked
-        // for flat [Helper] / [Route] entries). Find current_user and
-        // /home somewhere in the outline (possibly nested).
+        // The actual entries (helper, route) still show flat.
         fn walk<'a>(xs: &'a [crate::file_analysis::OutlineSymbol], out: &mut Vec<&'a str>) {
             for x in xs {
                 out.push(x.name.as_str());
@@ -10362,6 +10387,8 @@ get '/home' => sub { my $c = shift; };
         walk(&outline, &mut all);
         assert!(all.iter().any(|n| n.contains("current_user")),
             "helper must still appear flat in outline; got: {:?}", all);
+        assert!(all.iter().any(|n| n.contains("/home")),
+            "route must still appear flat in outline; got: {:?}", all);
     }
 
     /// mojo-events emits a PluginNamespace per emitter class. Bridges to

@@ -64,16 +64,15 @@ fn route_emissions(controller, action, span, current_package) {
         }
     };
 
-    // (b) route-as-thing Handler, owned by the declaring package
+    // (b) route-as-thing Handler, owned by the declaring package.
+    // Display is `Action`, not `Route` — this emission represents the
+    // controller action bound by `->to('Users#list')`, not the route
+    // itself. No request body lives at this source site; it's a
+    // cross-reference into Users::list. Surfacing as `<action>
+    // Users#list` in the outline keeps it visually distinct from
+    // `<route> GET /path` entries (mojo-lite terminal handlers),
+    // which DO carry a body.
     let owner_class = if current_package == () { "main" } else { current_package };
-    // Routes display as Methods in the outline — they dispatch to a
-    // controller action (a real method elsewhere). Event would be
-    // misleading; these aren't things you react to, they're things
-    // you *invoke* indirectly.
-    // Routes aren't methods — they're named URL patterns that dispatch
-    // to a controller action. Hidden from outline (the outline is for
-    // user-written Perl structure; routes are framework wiring), but
-    // the Handler symbol is still there for gd/gr/workspace-symbol.
     let handler_name = controller + "#" + action;
     items += #{
         Handler: #{
@@ -83,7 +82,7 @@ fn route_emissions(controller, action, span, current_package) {
             params: [],
             span: span,
             selection_span: span,
-            display: "Route",
+            display: "Action",
             hide_in_outline: false,
         }
     };
