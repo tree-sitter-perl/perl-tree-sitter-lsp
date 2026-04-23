@@ -3,7 +3,9 @@
 > Home for type-related architecture: what inference data lives in
 > `FileAnalysis`, how it propagates through bindings, and the next set of
 > modeling work (invocant mutations, hash-key unions, dynamic dispatch
-> over method lists, functional-operator invariants).
+> over method lists, functional-operator invariants, blessed/rep
+> product via observation IR, and fact witnesses as a cross-stack
+> primitive with plugin-registered reducers).
 >
 > Cross-refs:
 > - `docs/prompt-unification-spec.md` — refs_by_target, CachedModule, FileStore.
@@ -678,6 +680,315 @@ test suite per arity shape.
 
 ---
 
+## Part 7 — Fact witnesses
+
+### Motivation
+
+Across the stack we already carry "facts about values" but each one
+has its own struct, its own index, its own consumer:
+
+- `TypeConstraint` — a scoped type belief about a variable.
+- `CallBinding` / `MethodCallBinding` — "this variable was assigned
+  the return value of that call."
+- `HashKeyOwner` — who owns this hash key.
+- `package_parents` — inheritance edges.
+- `imported_hash_keys` — keys brought in via cross-file enrichment.
+- Provenance chains (rule 9 in CLAUDE.md) — the string `'Users#list'`
+  derives a method ref; renaming the method transports through.
+
+Each is ad-hoc. The first-class concept hiding across all of them is
+a **witness**: typed evidence that some proposition holds about a
+specific code location, tagged with its source so consumers can trace
+it back. The pieces above can migrate to this shape incrementally;
+and several blocked items elsewhere in this spec (chain-accumulated
+route facts, Part 6's framework-aware resolver, Part 5c's DBIC column
+inference, rename-through-equivalence in the provenance spec) all
+want the same primitive.
+
+The Part 7 driving task is chain-typed route aggregation — collapsing
+`$r->get('/users')->to('Users#list')->name('users_list')` into one
+`<route> GET /users → Users#list` outline entry. That task can't land
+until witnesses exist, so the mojo-routes rewrite is the first
+user-visible payoff. Several more fall out of the same plumbing.
+
+### Core abstraction
+
+```rust
+pub struct Witness {
+    pub attachment: WitnessAttachment,
+    pub source:     WitnessSource,
+    pub payload:    WitnessPayload,
+    /// Where the user can see why — rendered in hover, diagnostic
+    /// "because:" text, provenance traversal. Never None; empty
+    /// span means the core synthesized this with no source anchor.
+    pub span:       Span,
+}
+
+pub enum WitnessAttachment {
+    /// Traditional scope-indexed variable facts — what TypeConstraint
+    /// / CallBinding already index by.
+    Variable { name: String, scope: ScopeId },
+    /// An expression's result. Every method/function call in the
+    /// tree produces a `Ref`; facts about the returned value attach
+    /// here. This is what makes chain aggregation possible.
+    Expression(RefId),
+    /// A symbol property (e.g. "this sub is a dispatcher", "this
+    /// class is a ResultSet").
+    Symbol(SymbolId),
+    /// A specific call site — properties of the call, not its result
+    /// or its receiver.
+    CallSite(RefId),
+    /// Hash key metadata — provenance of keys, writes into them,
+    /// derivations from literal sources.
+    HashKey { owner: HashKeyOwner, name: String },
+    /// Package-level facts (isa edges, mode tags).
+    Package(String),
+}
+
+pub enum WitnessSource {
+    Builder(&'static str),      // pass identifier, e.g. "signature_extraction"
+    Plugin(String),             // plugin id, e.g. "mojo-routes"
+    Enrichment(&'static str),   // e.g. "imported_hash_keys"
+    DerivedFrom(RefId),         // a derivation edge — another witness produced this one
+}
+
+pub enum WitnessPayload {
+    /// Type belief (what Part 6 and TypeConstraint carry).
+    InferredType(InferredType),
+    /// Keyed typed fact. Keys are free-form within a (source, family)
+    /// scope — the reducer that consumes them is responsible for
+    /// knowing its own schema.
+    Fact { family: String, key: String, value: FactValue },
+    /// "This witness's subject is derived from that ref." Rename
+    /// transport walks these edges; provenance rendering traces them.
+    Derivation,
+    /// Plugin-defined payload that doesn't fit the above. Stored as
+    /// structured rhai Dynamic / serde Value, not opaque bytes, so
+    /// cross-plugin inspection is possible.
+    Custom { family: String, data: serde_json::Value },
+}
+
+pub enum FactValue {
+    Str(String),
+    List(Vec<String>),
+    Bool(bool),
+    Num(f64),
+    Map(BTreeMap<String, FactValue>),  // composite facts
+}
+```
+
+All witnesses live in a single bag on `FileAnalysis`, with indexes
+by attachment kind for cheap filtering. Existing structures can
+be reconstructed as typed views over the bag — no immediate forced
+migration; each existing struct gets a "project to witnesses" method
+and consumers choose when to cut over.
+
+### Callback-driven reduction
+
+A bag of raw witnesses isn't the consumable shape. Consumers want
+folded answers: "what's the type of this variable here?" "what
+route is being built by this chain?" "does this hash key exist?"
+
+Folding is **plugin-chosen**, not hardcoded. Last-write-wins is wrong
+for DBIC where-clauses (they append); list-append is wrong for a
+route's `target` (second `->to(...)` overrides); set-union is wrong
+for a scope-narrowed type (the narrower scope wins). Rather than
+bake a policy, register reducers:
+
+```rust
+pub trait WitnessReducer: Send + Sync {
+    /// Which witnesses does this reducer claim? Typically filters on
+    /// attachment kind + source + payload family — "Expression
+    /// witnesses from mojo-routes with family 'route'."
+    fn claims(&self, w: &Witness) -> bool;
+
+    /// Fold the claimed witnesses into a single value. Input is
+    /// already filtered (only witnesses this reducer claimed);
+    /// ordering is by `span` unless the reducer overrides. Output is
+    /// whatever shape the reducer's consumers need.
+    fn reduce(&self, ws: &[&Witness]) -> ReducedValue;
+
+    /// Emission trigger for reducers that produce side-effects
+    /// (synthesizing a Handler at chain completion, emitting a
+    /// diagnostic when a fact set is inconsistent). Default: none
+    /// — the reducer is pure projection.
+    fn on_complete(&self, ws: &[&Witness]) -> Vec<EmitAction> { vec![] }
+}
+
+pub enum ReducedValue {
+    Type(InferredType),
+    FactSet(BTreeMap<String, FactValue>),
+    Custom(serde_json::Value),
+    None,  // reducer declined / insufficient evidence
+}
+```
+
+Rhai plugins register reducers via the existing plugin trait:
+
+```rhai
+fn reducers() {
+    [
+        #{
+            claims: #{
+                attachment_kind: "Expression",
+                source_plugin:   "mojo-routes",
+                payload_family:  "route",
+            },
+            // Rhai fn that takes the witness slice and returns
+            // the folded fact map.
+            reduce: "route_reduce",
+            // Rhai fn that takes the slice and returns EmitActions.
+            // Called once per attachment when the reducer's
+            // `sufficient` predicate flips true.
+            on_complete: "route_emit_if_complete",
+            sufficient: "route_is_complete",
+        },
+    ]
+}
+```
+
+This gives plugins full control over fold semantics (LWW, append,
+max, custom merge) and emission timing (threshold-based, end-of-
+statement, end-of-file). The core provides the bag, the indexing,
+the reducer-dispatch loop, and a couple of common reducers for the
+cases that are genuinely universal (type-observation fold for
+Part 6, derivation walk for rename).
+
+### Consumers across the stack
+
+| Consumer | How witnesses / reducers are used |
+|---|---|
+| **Part 6 resolver** | Built-in reducer: claims `InferredType` payloads on `Variable` / `Expression` attachments, folds via framework-aware rules to one `InferredType`. Becomes the single impl of `inferred_type(var, point)`. |
+| **Completion** | Queries reducers per cursor target: "for this expression, give me the fact set." Mojo helpers, DBIC columns, route-by-URL — all come through the same fetch. |
+| **Diagnostics** | Pulls `span` from the witnesses that justified a type belief, renders as "because: …" secondary info on the diagnostic. |
+| **Rename** | Walks `WitnessSource::DerivedFrom` edges as a graph. Renaming a string literal transports through every derivation whose source is that literal. |
+| **Hover** | "Type derived from:" appends a list of justifying spans, taken straight from the witness bag. |
+| **Workspace symbol** | Named `Fact`s with well-known keys (e.g. `route.path`) can be searched alongside symbol names. |
+| **Plugins** | Read facts their own reducer produced for downstream plugin logic (mojo-routes' `->to` reading facts set by `->get`). Write new witnesses during their emit hooks. |
+
+### Applications
+
+**A — Chain-typed route aggregation (the driving case).**
+mojo-routes registers a `route` reducer claiming Expression
+witnesses with `family: "route"`. Each of `->get/post/…/under(PATH)`
+attaches `verb` / `path` facts to the call's result; `->name(X)`
+attaches `name`; `->to('Ctrl#act')` attaches `target`. The reducer's
+`sufficient` predicate fires when `verb ∧ path` holds; `on_complete`
+emits ONE Handler — `name: "GET /users"`,
+`outline_label: "GET /users → Users#list"`, `display: Route` —
+plus the existing MethodCallRef into `Users::list` and a url_for-keyed
+alias. Second `->to` on the same chain? LWW via the reducer (the
+reducer returns the last-span target). `under '/admin' => sub { … }`?
+The outer path fact inherits into the callback's observation scope
+and the reducer concatenates: inner `get '/users'` resolves to path
+`/admin/users`, as one witness-equivalence class. `<action>` retires.
+
+**B — DBIC search-chain accumulation (Part 5c customer).**
+dbic plugin registers a `where_clause` reducer claiming Expression
+witnesses with `family: "dbic.predicates"`. Each `->search({...})` /
+`->search_rs({...})` call appends its literal hash's keys + values
+to a list-valued fact. `cursor_context.rs` at `->find({...})` or
+`->first` queries the reducer for the accumulated predicate stack
+and offers column completion narrowed by Parametric type_arg. Rename
+on a column transports through every witness in the chain.
+
+**C — Part 6's framework-aware resolver as a built-in reducer.**
+Part 6's `TypeObservation` becomes the payload-less shape of a
+`Witness { payload: InferredType(_) | Fact { family: "repr", ... } }`.
+The framework-aware resolver is a reducer claiming those witnesses
+and applying Part 6's rules. No longer a bespoke pipeline — one
+reducer among many, with the framework context threaded in via a
+reducer-specific side table.
+
+**D — Rename / provenance transport.**
+Every time a plugin derives a ref from a source (string literal →
+method call, `has` → constructor hash key), it attaches a
+`DerivationWitness { source: DerivedFrom(origin_ref), payload:
+Derivation }` to the derived ref. The rename engine's transport step
+walks these as a DAG — renaming the origin chases the edges. Replaces
+the ad-hoc provenance tables mentioned in the ref-coverage-provenance
+spec with the same primitive everything else uses.
+
+**E — Sum-type narrowing (Part 5b).**
+The `if ($r->{ok})` narrowing constraint is a `Witness { attachment:
+Variable, payload: InferredType(narrowed), source: Builder("narrowing"),
+span: if_body_span }`. The type-fold reducer prefers the narrowest-
+span witness containing the query point. Absorbs the proposed
+`narrowing_scope` field into a property of the span itself.
+
+### HoTT / proof-theoretic framing
+
+Witnesses are proof terms inhabiting typed judgments. The judgment's
+subject is the `attachment`; the proposition is the `payload`; the
+`source` is the proof's origin (rule name / plugin id / derivation
+edge). A reducer is an eliminator — a recursor over an inductive
+family of witnesses that projects to a concrete value. Plugins
+registering reducers are defining their own elimination principles
+for their fact families.
+
+This is cleaner than making `InferredType` dependently-typed because
+reduction is explicit rather than definitional: different consumers
+can use different reducers over the same bag, and unhandled witness
+kinds simply don't participate in a given query. The one quotient
+we commit to is the `under` / path-concat equivalence — outline
+entries are stable under route-presentation refactoring — and we
+implement it as a reducer rule, not a typed equality.
+
+Skipped: first-class identity types, univalent transport, path
+induction. Derivation witnesses (the `DerivedFrom` source) carry
+exactly the rename-transport information without needing `≡` to be
+a type. The other HoTT-adjacent ideas either collapse to LWW or are
+out of scope for a static analyzer.
+
+### Phased implementation
+
+| Phase | Work | Exit criterion |
+|---|---|---|
+| 0 | `Witness` struct + bag + attachment-indexed lookup on `FileAnalysis`. Serde / bincode round-trip. No consumers yet. | Empty-feature landing: builder emits zero witnesses, all existing tests pass, the bag is present and queryable. |
+| 1 | Reducer trait + registry. Dispatch loop: given a query `(attachment, question)`, scan the bag, dispatch to claiming reducers, return fused value. Built-in `type_fold` reducer over `InferredType` payloads (subsumes the current closest-constraint-wins logic in `inferred_type`). | `inferred_type(var, point)` switched to go through the reducer for variable-attachment witnesses; all type-inference tests still pass. |
+| 2 | Rhai plugin API: `receiver_facts` in `CallContext`, plugin can both read and emit `Witness` values from `on_method_call`. Plugins can register reducers via a top-level `reducers()` fn. | Synthetic test plugin round-trips a fact across three chain links and reduces to a fact map; no production consumers yet. |
+| 3 | Deferred reducer emission: per-statement flush point, reducers whose `sufficient` predicate flips true inside a statement get `on_complete` called exactly once per attachment, EmitActions collected and applied. | Unit test: one `->get->name->to` chain, reducer's `on_complete` runs once, produces exactly one Handler regardless of chain order. |
+| 4 | **Application A** — mojo-routes rewrite. Replace the `<action>` Handler with the route reducer's aggregated `<route>` emission. Keep MethodCallRef emission (gd on `'Users#list'` still jumps). | Demo pin test shows one `<route> GET /users → Users#list` per chain; no `<action>` entries anywhere. |
+| 5 | **Application A cont'd** — `under` / `group` lexical binder + cross-variable chain split (`my $r1 = $r->get('/x'); $r1->to('Y#z')`). Facts inherit through assignment binding. | Pin tests cover both. |
+| 6 | **Application C** — migrate Part 6's resolver to a witness reducer. Part 6's `TypeObservation` enum collapses into the witness bag. | Part 6's blessed+hashref demo works through the witness layer; resolver is reducer-dispatched. |
+| 7 | **Applications B, D, E** — DBIC search accumulation, derivation-based rename transport, narrowing as scoped type witnesses. Each is additive, lands independently. | Per-application pin tests; no regression in rename / completion suites. |
+
+### Interplay with the rest of the spec
+
+- **Part 1 — Invocant mutations.** `HashKeyMutation` becomes a
+  `Witness { attachment: HashKey, payload: Fact { family: "mutation",
+  key: "rhs_type", value: … } }`. The mutation reducer unions over
+  all writes for a (class, key) pair.
+- **Part 2 — Hash key unions.** `HashKeyOwner::Union` becomes a
+  derivation witness pattern — the Union is a reducer output over
+  multiple owner witnesses on the same HashKey attachment.
+- **Part 5a — Value-indexed returns.** `keyed_returns` is just a
+  CallSite-attached witness family indexed by first-arg literal; the
+  reducer projects to the matching return type.
+- **Part 5c — Parametric types.** Application B above; the DBIC
+  search-chain reducer is how Part 5c actually gets its column facts.
+- **Part 6 — Observation IR.** Application C; Part 6 is reframed
+  as a specific reducer, not a parallel pipeline.
+
+### Non-goals
+
+- **Full migration of existing structs on day one.** Old structures
+  keep working; they expose "project to witnesses" adapters so
+  reducer-based consumers can see them, but the storage doesn't
+  have to move until a case benefits.
+- **Cross-file witness transport.** A fact set that ends at a file
+  boundary (partially-configured route returned from a sub for the
+  caller to finish) is rare enough to punt; enrichment already
+  covers the common cross-file cases via the existing structures.
+- **Effect facts.** Whether a block mutates state, throws, or
+  performs I/O — out of scope; the fact model is for static type/
+  structure/derivation only.
+- **Cycles in derivation.** The DAG assumption is load-bearing for
+  transport. Detection + break on insertion, consistent with what
+  the builder already does for sub-return delegation.
+
+---
+
 ## Implementation ordering
 
 All parts are mostly independent and can land separately.
@@ -693,6 +1004,7 @@ All parts are mostly independent and can land separately.
 | 5c — Parametric types (DBIC) | large; new `Parametric` variant + cursor-context wiring | DBIC column completion inside search/update/find; rename on columns | 1, 2 ideally |
 | 6 — Observation IR + framework-aware resolver | large; constraint bag + projection fn, migrate existing sites | blessed-vs-hashref refinement without flips; uniform bless-rep handling across Mojo/5.38-class/DBIC/legacy | ternary descent first |
 | 6b — Arity multidispatch from procedural bodies | large; arity-gating conditional detector + per-branch return types | `sub name { $self->{k} unless @_; … return $self }` pairs type correctly | 6 |
+| 7 — Fact witnesses (bag + reducers) | large; unified witness bag, reducer registry, plugin-registered fold semantics, then incremental migration of existing structs | cross-stack primitive for type beliefs, chain facts, derivation edges, narrowing, framework rules; enables route aggregation (App A), DBIC search chains (B), Part 6 as a reducer (C), provenance rename (D), sum-type narrowing (E) | none, but lands in phases (Phase 0–3 core, 4+ applications) |
 
 Land each behind a pin-the-fix test pair (one showing the previously-
 broken behavior, one showing the now-correct one). This matches the
