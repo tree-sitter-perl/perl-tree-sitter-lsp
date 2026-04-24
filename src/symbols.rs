@@ -3777,6 +3777,237 @@ sub fire {
         }
     }
 
+    // ---- witness-bag chain typing: pin-the-fix on the real demo ----
+
+    /// Pin against the actual demo file. Loads
+    /// `test_files/plugin_mojo_demo.pl` + stubs of the Mojolicious
+    /// hierarchy registered into the module index, then asserts:
+    /// (a) `$r` at line 71 resolves to a known class.
+    /// (b) `->to` on line 71 is a MethodCall ref.
+    /// (c) `->to`'s invocant resolves to a class via
+    ///     `resolve_method_invocant_public` (the path nvim hover/gd
+    ///     uses internally).
+    ///
+    /// Two possible failure modes the test distinguishes:
+    ///   - `$r` is typed but `->to`'s invocant fails → crossfile
+    ///     chain hop is the gap (find_method_return_type's CrossFile
+    ///     branch).
+    ///   - `$r` isn't typed at all → earlier hop broken first.
+    #[test]
+    fn test_demo_file_chain_to_resolves_on_line_71() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        // Project root: the worktree (= CARGO_MANIFEST_DIR).
+        let root: PathBuf = env!("CARGO_MANIFEST_DIR").into();
+        let demo = root.join("test_files/plugin_mojo_demo.pl");
+        let demo_source = fs::read_to_string(&demo).expect("demo file present");
+
+        // Index the project's test_files/ as the workspace.
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(Some(root.to_str().unwrap()));
+        let files = crate::file_store::FileStore::new();
+        let _indexed = crate::module_resolver::index_workspace_with_index(
+            &root.join("test_files"),
+            &files,
+            Some(&idx),
+        );
+
+        // Nvim resolves Mojolicious from @INC. In the test env we
+        // don't rely on @INC — we synthesize minimal analyses and
+        // register them into the module index the same way the
+        // resolver thread does. Uses real Mojo-shaped sources so
+        // framework synthesis fires through the builder.
+        let insert_module = |name: &str, path: &str, source: &str| {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&ts_parser_perl::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let analysis = crate::builder::build(&tree, source.as_bytes());
+            let cached = std::sync::Arc::new(crate::module_index::CachedModule {
+                path: PathBuf::from(path),
+                analysis: std::sync::Arc::new(analysis),
+            });
+            idx.insert_cache(name, Some(cached));
+        };
+        insert_module(
+            "Mojolicious",
+            "/stub/Mojolicious.pm",
+            "package Mojolicious;\n\
+             use Mojo::Base -base;\n\
+             has routes => sub { Mojolicious::Routes->new };\n\
+             1;\n",
+        );
+        insert_module(
+            "Mojolicious::Routes",
+            "/stub/Mojolicious/Routes.pm",
+            "package Mojolicious::Routes;\n\
+             use Mojo::Base 'Mojolicious::Routes::Route';\n\
+             1;\n",
+        );
+        insert_module(
+            "Mojolicious::Routes::Route",
+            "/stub/Mojolicious/Routes/Route.pm",
+            "package Mojolicious::Routes::Route;\n\
+             use Mojo::Base -base;\n\
+             sub get  { my $self = shift; $self->{pat} = shift; return $self }\n\
+             sub post { my $self = shift; $self->{pat} = shift; return $self }\n\
+             sub to   { my $self = shift; $self->{tgt} = shift; return $self }\n\
+             sub name { my $self = shift; $self->{nam} = shift; return $self }\n\
+             1;\n",
+        );
+        insert_module(
+            "Mojolicious::Lite",
+            "/stub/Mojolicious/Lite.pm",
+            "package Mojolicious::Lite;\n\
+             1;\n",
+        );
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&ts_parser_perl::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&demo_source, None).unwrap();
+        let mut analysis = crate::builder::build(&tree, demo_source.as_bytes());
+
+        // Cross-file enrichment — same step the backend runs on open.
+        // Resolves MethodCallBindings against the module_index so
+        // `my $r = $app->routes;` becomes a TypeConstraint. Without
+        // this, the backend's `enrich_analysis(uri)` hasn't fired
+        // yet and the whole chain is un-typed.
+        let (imported_returns, imported_keys) =
+            crate::backend::build_imported_return_types_for_test(&analysis, &idx);
+        analysis.enrich_imported_types_with_keys(imported_returns, imported_keys, Some(&idx));
+
+        // Find line 71 ($r->get('/users')->to('Users#list');).
+        let (line_idx, chain_line) = demo_source
+            .lines()
+            .enumerate()
+            .find(|(_, l)| {
+                l.contains("$r->get('/users')") && l.contains("->to('Users#list')")
+            })
+            .expect("chain line present in demo");
+
+        // Position on `to` — the 't' character.
+        let to_col = chain_line.find("->to(").unwrap() + 2;
+        let r_col = chain_line.find("$r").unwrap();
+        let get_col = chain_line.find("->get(").unwrap() + 2;
+
+        let pt = |col: usize| tree_sitter::Point {
+            row: line_idx,
+            column: col,
+        };
+
+        // Diagnostics — what does the analysis actually see?
+        let r_ty_bag = analysis.inferred_type_via_bag("$r", pt(r_col));
+        let r_ty_legacy = analysis.inferred_type("$r", pt(r_col)).cloned();
+        let mcb_for_r: Vec<_> = analysis
+            .method_call_bindings
+            .iter()
+            .filter(|b| b.variable == "$r")
+            .collect();
+        let cb_for_r: Vec<_> = analysis
+            .call_bindings
+            .iter()
+            .filter(|b| b.variable == "$r")
+            .collect();
+        // Is `app` even known as a symbol/import?
+        let app_known = analysis.symbols.iter().any(|s| s.name == "app");
+        // Is Mojolicious in the module index?
+        let mojo_cached = idx.get_cached("Mojolicious").is_some();
+        let routes_cached = idx.get_cached("Mojolicious::Routes").is_some();
+        let route_cached = idx.get_cached("Mojolicious::Routes::Route").is_some();
+        eprintln!(
+            "DIAG: $r bag={:?}  legacy={:?}  mcbs={:?}  cbs={:?}  app_sym={}  \
+             mojo_cached={}  routes_cached={}  route_cached={}",
+            r_ty_bag,
+            r_ty_legacy,
+            mcb_for_r
+                .iter()
+                .map(|b| format!("{}.{}", b.invocant_var, b.method_name))
+                .collect::<Vec<_>>(),
+            cb_for_r.iter().map(|b| &b.func_name).collect::<Vec<_>>(),
+            app_known,
+            mojo_cached,
+            routes_cached,
+            route_cached,
+        );
+
+        // (a) `$r` is typed. This uses the EXACT path cursor_context
+        // uses to type an invocant — inferred_type_via_bag.
+        let r_ty = r_ty_bag;
+        let r_class = r_ty.as_ref().and_then(|t| t.class_name());
+        assert!(
+            r_class.is_some(),
+            "$r should be typed (any class) at {}:{}; got {:?}",
+            line_idx + 1,
+            r_col,
+            r_ty,
+        );
+
+        // (b) At `->get`'s 'g', there's a MethodCall ref. Its
+        // invocant is `$r`. Resolve it cross-file.
+        let get_ref = analysis.ref_at(pt(get_col)).expect("ref at ->get");
+        assert_eq!(get_ref.target_name, "get");
+        if let crate::file_analysis::RefKind::MethodCall {
+            invocant,
+            invocant_span,
+            ..
+        } = &get_ref.kind
+        {
+            let klass = analysis.resolve_method_invocant_public(
+                invocant,
+                invocant_span,
+                get_ref.scope,
+                pt(get_col),
+                Some(&tree),
+                Some(demo_source.as_bytes()),
+                Some(&idx),
+            );
+            assert!(
+                klass.is_some(),
+                "`->get`'s invocant (= $r) should resolve to SOME class; got {:?}",
+                klass,
+            );
+        }
+
+        // (c) The motivator. `->to`'s invocant is the whole
+        // `$r->get('/users')` expression — not a simple variable.
+        // Resolving that requires the crossfile chain hop: $r's
+        // type → Route::get's cached analysis → get's return type.
+        let to_ref = analysis.ref_at(pt(to_col)).expect("ref at ->to");
+        assert_eq!(to_ref.target_name, "to");
+        assert!(
+            matches!(to_ref.kind, crate::file_analysis::RefKind::MethodCall { .. }),
+            "ref at ->to is a MethodCall"
+        );
+        if let crate::file_analysis::RefKind::MethodCall {
+            invocant,
+            invocant_span,
+            ..
+        } = &to_ref.kind
+        {
+            let klass = analysis.resolve_method_invocant_public(
+                invocant,
+                invocant_span,
+                to_ref.scope,
+                pt(to_col),
+                Some(&tree),
+                Some(demo_source.as_bytes()),
+                Some(&idx),
+            );
+            assert!(
+                klass.is_some(),
+                "`->to`'s invocant (= $r->get('/users')) should resolve across \
+                 file boundaries — this is the motivator for the spike. \
+                 $r type was: {:?}; `->to` class resolved to: {:?}",
+                r_class,
+                klass,
+            );
+        }
+    }
+
     #[test]
     fn data_printer_use_line_options_completion_for_data_printer_module() {
         // Same flow, non-alias name. The plugin can't be DDP-specific.
