@@ -4010,6 +4010,163 @@ sub fire {
     }
     // ---- witness-driven chain completion (spike) ----
 
+    /// Decomposition: parse real Mojolicious/Routes/Route.pm
+    /// in-place (not via module index) and probe each hop of the
+    /// `$self->_route()->requires()->to()` chain separately. Plus
+    /// probe `$self->_generate_route(...)`. Reports what each
+    /// specific hop resolves to — so we know exactly which step
+    /// in the chain is actually dying.
+    #[test]
+    fn test_route_pm_chain_decomposition() {
+        use std::fs;
+        use std::path::PathBuf;
+        let inc = crate::module_resolver::discover_inc_paths();
+        let route_path = inc
+            .iter()
+            .map(|p| p.join("Mojolicious/Routes/Route.pm"))
+            .find(|p| p.exists());
+        let route_path: PathBuf = match route_path {
+            Some(p) => p,
+            None => { eprintln!("SKIP: Mojo not installed"); return; }
+        };
+        let src = fs::read_to_string(&route_path).unwrap();
+
+        // Parse Route.pm itself — `$self` inside = Route.
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+
+        // Probe: find the `_generate_route` sub body and report
+        // what we see on each hop.
+        let inspect_sym = |name: &str| {
+            for sym in &analysis.symbols {
+                if sym.name != name { continue; }
+                if !matches!(sym.kind, crate::file_analysis::SymKind::Sub | crate::file_analysis::SymKind::Method) { continue; }
+                if let crate::file_analysis::SymbolDetail::Sub {
+                    return_type, return_self_method, ..
+                } = &sym.detail {
+                    eprintln!(
+                        "  sym[{:24}] return_type={:?}  return_self_method={:?}",
+                        name, return_type, return_self_method);
+                    return;
+                }
+            }
+            eprintln!("  sym[{:24}] NOT FOUND", name);
+        };
+        eprintln!("======== symbol return types in Route.pm ========");
+        for name in ["get", "post", "any", "to", "name", "requires",
+                     "_generate_route", "_route", "add_child", "pattern",
+                     "is_reserved", "root"] {
+            inspect_sym(name);
+        }
+
+        // Find `_generate_route`'s body block. Its last statement
+        // is `return defined $name ? $route->name($name) : $route;`.
+        // Probe each subexpression type via resolve_expression_type.
+        fn find_sub_body<'t>(n: tree_sitter::Node<'t>, src: &[u8], name: &str) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "subroutine_declaration_statement" {
+                if let Some(nm) = n.child_by_field_name("name") {
+                    if nm.utf8_text(src).ok() == Some(name) {
+                        return n.child_by_field_name("body");
+                    }
+                }
+            }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i) {
+                    if let Some(r) = find_sub_body(c, src, name) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+        let body = find_sub_body(tree.root_node(), src.as_bytes(), "_generate_route")
+            .expect("_generate_route body");
+
+        // Inside _generate_route, find:
+        //   (a) the `my $route = CHAIN` assignment
+        //   (b) the final `return TERNARY` expression
+        fn find_var_decl_for<'t>(n: tree_sitter::Node<'t>, src: &[u8], var: &str) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "assignment_expression" {
+                if let Some(left) = n.child_by_field_name("left") {
+                    if left.utf8_text(src).map(|s| s.trim()).ok() == Some(&format!("my {}", var)) {
+                        return n.child_by_field_name("right");
+                    }
+                }
+            }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i) {
+                    if let Some(r) = find_var_decl_for(c, src, var) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+        let route_rhs = find_var_decl_for(body, src.as_bytes(), "$route")
+            .expect("my $route = ... RHS");
+
+        eprintln!();
+        eprintln!("======== `my $route = RHS` decomposition ========");
+        eprintln!("RHS shape: {}  kind={}",
+            route_rhs.utf8_text(src.as_bytes()).unwrap_or(""), route_rhs.kind());
+
+        // Probe chain hops from innermost outward. Each node in a
+        // chain a->b->c has: outer is c's method_call_expression,
+        // its invocant is the a->b method_call_expression, whose
+        // invocant is `$self`.
+        fn report_node_type(
+            label: &str,
+            n: tree_sitter::Node,
+            analysis: &crate::file_analysis::FileAnalysis,
+            src: &[u8],
+        ) {
+            let text = n.utf8_text(src).unwrap_or("").trim();
+            let ty = analysis.resolve_expression_type(n, src, None);
+            eprintln!("  [{label:>12}] `{text:.60}`\n                kind={} → ty={:?}",
+                n.kind(), ty);
+        }
+
+        // Walk the chain inside-out and report each level's type.
+        let mut cur = Some(route_rhs);
+        let mut depth = 0;
+        while let Some(n) = cur {
+            let label = match depth { 0 => "outer", 1 => "mid1", 2 => "mid2", 3 => "mid3", _ => "inner" };
+            report_node_type(label, n, &analysis, src.as_bytes());
+            if n.kind() == "method_call_expression" {
+                cur = n.child_by_field_name("invocant");
+                depth += 1;
+            } else {
+                break;
+            }
+        }
+
+        eprintln!();
+        eprintln!("======== return TERNARY probe ========");
+        // Find the return_expression in body.
+        fn find_return<'t>(n: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "return_expression" { return Some(n); }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i) {
+                    if let Some(r) = find_return(c) { return Some(r); }
+                }
+            }
+            None
+        }
+        let ret = find_return(body).expect("return in _generate_route");
+        let ternary = ret.named_child(0).expect("return child");
+        eprintln!("  return child kind = {}  text = `{}`",
+            ternary.kind(),
+            ternary.utf8_text(src.as_bytes()).unwrap_or("").trim());
+        if ternary.kind() == "conditional_expression" {
+            let consequent = ternary.child_by_field_name("consequent");
+            let alternative = ternary.child_by_field_name("alternative");
+            if let Some(a) = consequent { report_node_type("then-arm", a, &analysis, src.as_bytes()); }
+            if let Some(b) = alternative { report_node_type("else-arm", b, &analysis, src.as_bytes()); }
+        }
+    }
+
     /// Direct proof: enumerate each chain link's resolvability on
     /// the real demo + real Mojolicious. Prints a truth table;
     /// asserts specifically that `->to` does NOT resolve (the gap
@@ -4124,11 +4281,43 @@ sub fire {
             )
         } else { None };
 
+        // Also directly inspect the cached Route module's stored
+        // return types + self-method tails for each method on the
+        // chain's path.
+        let route_cached = idx.get_cached("Mojolicious::Routes::Route").unwrap();
+        let inspect = |name: &str| -> (Option<InferredType>, Option<String>) {
+            let mut rt = None;
+            let mut sm = None;
+            for sym in &route_cached.analysis.symbols {
+                if sym.name != name { continue; }
+                if !matches!(sym.kind, crate::file_analysis::SymKind::Sub | crate::file_analysis::SymKind::Method) { continue; }
+                if let crate::file_analysis::SymbolDetail::Sub {
+                    return_type, return_self_method, ..
+                } = &sym.detail {
+                    rt = return_type.clone();
+                    sm = return_self_method.clone();
+                    break;
+                }
+            }
+            (rt, sm)
+        };
+        let (gen_rt, gen_tail) = inspect("_generate_route");
+        let (get_rt, get_tail) = inspect("get");
+        let (to_rt, to_tail) = inspect("to");
+        let (requires_rt, requires_tail) = inspect("requires");
+        let (_route_rt, _route_tail) = inspect("_route");
+
         eprintln!("======== chain truth table ========");
         eprintln!("  $r              class = {:?}", r_class);
         eprintln!("  ->get invocant  class = {:?}", get_invocant_class);
         eprintln!("  ->get RETURN    type  = {:?}", get_return_ty);
         eprintln!("  ->to  invocant  class = {:?}", to_invocant_class);
+        eprintln!("  ---- cached Route symbols ----");
+        eprintln!("  get             rt={:?}  tail={:?}", get_rt, get_tail);
+        eprintln!("  _generate_route rt={:?}  tail={:?}", gen_rt, gen_tail);
+        eprintln!("  requires        rt={:?}  tail={:?}", requires_rt, requires_tail);
+        eprintln!("  to              rt={:?}  tail={:?}", to_rt, to_tail);
+        eprintln!("  _route          rt={:?}  tail={:?}", _route_rt, _route_tail);
         eprintln!("====================================");
 
         // The user's claim: `$r` + `->get` resolve; `->to` is the gap.

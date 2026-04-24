@@ -6227,6 +6227,75 @@ sub name {
         );
     }
 
+    /// Ternary RETURN: `sub f { return $c ? $self : $self }` —
+    /// both arms agree on `$self` (FirstParam), so `f`'s return
+    /// type collapses to that class. Same reduction as the RHS-
+    /// ternary + explicit-if/else-return paths, just emitted from
+    /// the return-expression visit on a Symbol attachment.
+    #[test]
+    fn test_witnesses_ternary_return_on_sub_symbol() {
+        let fa = build_fa_from_source(
+            r#"
+package MyApp::Widget;
+
+sub choose {
+    my $self = shift;
+    my $flag = shift;
+    return $flag ? $self : $self;
+}
+
+sub literal_mix {
+    my ($flag) = @_;
+    return $flag ? 1 : 2;
+}
+
+sub disagree {
+    my ($flag) = @_;
+    return $flag ? 1 : "two";
+}
+        "#,
+        );
+
+        let choose = fa
+            .symbols
+            .iter()
+            .find(|s| s.name == "choose" && matches!(s.kind, SymKind::Sub))
+            .expect("sub choose");
+        if let SymbolDetail::Sub { return_type, .. } = &choose.detail {
+            assert!(
+                matches!(return_type, Some(InferredType::FirstParam { package }) if package == "MyApp::Widget")
+                    || matches!(return_type, Some(InferredType::ClassName(n)) if n == "MyApp::Widget"),
+                "choose's return: ternary arms both $self → class; got {:?}",
+                return_type
+            );
+        }
+
+        let literal = fa
+            .symbols
+            .iter()
+            .find(|s| s.name == "literal_mix" && matches!(s.kind, SymKind::Sub))
+            .expect("sub literal_mix");
+        if let SymbolDetail::Sub { return_type, .. } = &literal.detail {
+            assert_eq!(
+                return_type,
+                &Some(InferredType::Numeric),
+                "literal_mix: both arms Numeric"
+            );
+        }
+
+        let disagree = fa
+            .symbols
+            .iter()
+            .find(|s| s.name == "disagree" && matches!(s.kind, SymKind::Sub))
+            .expect("sub disagree");
+        if let SymbolDetail::Sub { return_type, .. } = &disagree.detail {
+            assert_eq!(
+                return_type, &None,
+                "disagree: arms Numeric vs String → None"
+            );
+        }
+    }
+
     /// Ternary: `my $n = $c ? 1 : 2;` → both arms are Numeric, so
     /// the fold via the bag yields Numeric.
     #[test]

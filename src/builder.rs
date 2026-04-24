@@ -1628,12 +1628,25 @@ impl<'a> Builder<'a> {
                     // `return X if @_` / bare `return X` and emit an
                     // ArityReturn observation on the sub symbol.
                     self.emit_arity_return_if_applicable(node, scope, ret_type.clone());
-                    // If-arm BranchArm: if this return is inside a
-                    // `conditional_statement` (an `if`/`elsif`/`else`
-                    // arm), emit a BranchArm observation on the sub's
-                    // Symbol. Ternary into a variable uses the same
-                    // reducer via the assignment path.
+                    // If-arm BranchArm: return inside `if { … } else { … }`.
                     self.emit_branch_arm_for_if_arm_return(node, scope, ret_type);
+                    // Ternary-return BranchArm: `return $c ? A : B;` —
+                    // emit a BranchArm observation per arm on the
+                    // enclosing sub's Symbol, same reducer as RHS-
+                    // ternary and if-else-arm paths.
+                    if let Some(child) = node.named_child(0) {
+                        if child.kind() == "conditional_expression" {
+                            if let Some(sub_name) = self.enclosing_sub_name() {
+                                if let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) {
+                                    self.emit_branch_arm_witnesses(
+                                        child,
+                                        crate::witnesses::WitnessAttachment::Symbol(sym_id),
+                                        node,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 self.visit_children(node);
             }
@@ -1641,21 +1654,43 @@ impl<'a> Builder<'a> {
             // Expression statements inside sub bodies → track last
             // expression type. Perl returns the last statement's
             // value, so this IS the sub's implicit return.
+            //
+            // IMPORTANT: only statements at the sub body's TOP
+            // level count. A `$self->M(...)` call buried inside a
+            // `grep { … }` or an `if`-block is not the sub's
+            // return. Both `last_expr_type` and `self_method_tails`
+            // are gated on this — the outer block must be the
+            // sub/method's direct body.
             "expression_statement" => {
                 self.visit_children(node);
                 if let Some(scope) = self.enclosing_sub_scope() {
-                    // Primary inference: same path as explicit
-                    // `return EXPR`. Covers literals, constructors,
-                    // arithmetic, string ops, scalar-via-constraints.
-                    let child = node.named_child(0);
-                    let expr_type = child.and_then(|c| self.infer_returned_value_type(c));
-                    self.last_expr_type.insert(scope, expr_type);
-                    // Record `shift->M(...)` / `$self->M(...)`
-                    // shape for the return-type post-pass, which
-                    // chains M's resolved return into this sub.
-                    if let Some(c) = child {
-                        if let Some(method_name) = self.self_method_call_name(c) {
-                            self.self_method_tails.insert(scope, method_name);
+                    let is_body_top_level = node
+                        .parent()
+                        .filter(|p| p.kind() == "block")
+                        .and_then(|b| b.parent())
+                        .map(|gp| {
+                            matches!(
+                                gp.kind(),
+                                "subroutine_declaration_statement"
+                                    | "method_declaration_statement"
+                                    | "anonymous_subroutine_expression"
+                            )
+                        })
+                        .unwrap_or(false);
+                    if is_body_top_level {
+                        let child = node.named_child(0);
+                        let expr_type = child.and_then(|c| self.infer_returned_value_type(c));
+                        self.last_expr_type.insert(scope, expr_type);
+                        if let Some(c) = child {
+                            if let Some(method_name) = self.self_method_call_name(c) {
+                                self.self_method_tails.insert(scope, method_name);
+                            } else {
+                                // A non-self-method-tail top-level
+                                // expression overrides any prior
+                                // self-method tail we may have
+                                // recorded (defensive).
+                                self.self_method_tails.remove(&scope);
+                            }
                         }
                     }
                 }
@@ -3189,56 +3224,56 @@ impl<'a> Builder<'a> {
         None
     }
 
-    /// Ternary-arm emission (Part 6 / Part 5b). Walks the consequent
-    /// and alternative of a `conditional_expression`, pushes one
-    /// `BranchArm` observation per arm onto the binding variable's
-    /// attachment. The reducer handles agreement / disagreement.
-    ///
-    /// Reused idiom: explicit if/else return arms follow the same
-    /// shape — see `emit_branch_arm_witnesses_for_return_branches`
-    /// (called from the return-type resolution pass).
+    /// Generic branch-arm emission. Walks both arms of a
+    /// `conditional_expression`, infers each arm's type, and pushes
+    /// `BranchArm` observations onto `attachment`. Use for:
+    ///   - `my $x = $c ? A : B;`        → Variable($x)
+    ///   - `if ($c) { return A } else { return B }` → Symbol(sub)
+    ///   - `return $c ? A : B;`         → Symbol(sub)
+    ///   - any chained ternary that feeds into an attachment-able
+    ///     consumer.
+    /// The reducer handles the agreement/disagreement policy — this
+    /// just emits evidence.
+    fn emit_branch_arm_witnesses(
+        &mut self,
+        cond_expr: Node<'a>,
+        attachment: crate::witnesses::WitnessAttachment,
+        context: Node<'a>,
+    ) {
+        use crate::witnesses::{TypeObservation, Witness, WitnessPayload, WitnessSource};
+        let consequent = cond_expr.child_by_field_name("consequent");
+        let alternative = cond_expr.child_by_field_name("alternative");
+        let span = node_to_span(context);
+        for arm in [consequent, alternative].into_iter().flatten() {
+            let ty = self.infer_returned_value_type(arm);
+            if let Some(t) = ty {
+                self.pending_witnesses.push(Witness {
+                    attachment: attachment.clone(),
+                    source: WitnessSource::Builder("branch_arm".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::BranchArm(t)),
+                    span,
+                });
+            }
+        }
+    }
+
+    /// RHS-ternary convenience wrapper: `my $x = $c ? A : B` →
+    /// BranchArm on Variable($x).
     fn emit_branch_arm_witnesses_for_ternary(
         &mut self,
         lhs_var: &str,
         cond_expr: Node<'a>,
         context: Node<'a>,
     ) {
-        let consequent = cond_expr.child_by_field_name("consequent");
-        let alternative = cond_expr.child_by_field_name("alternative");
         let scope = self.current_scope();
-        let span = node_to_span(context);
-        for arm in [consequent, alternative].into_iter().flatten() {
-            // Infer the arm's type; if we can't, emit an Unknown
-            // observation isn't useful — just skip. This matches how
-            // the legacy path handles "I don't know" (no constraint).
-            let ty = self
-                .infer_expression_type(arm, false)
-                .or_else(|| self.infer_expression_result_type(arm));
-            if let Some(t) = ty {
-                self.push_branch_arm_witness(lhs_var, scope, span, t);
-            }
-        }
-    }
-
-    fn push_branch_arm_witness(
-        &mut self,
-        lhs_var: &str,
-        scope: ScopeId,
-        span: Span,
-        ty: InferredType,
-    ) {
-        use crate::witnesses::{
-            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
-        };
-        self.pending_witnesses.push(Witness {
-            attachment: WitnessAttachment::Variable {
+        self.emit_branch_arm_witnesses(
+            cond_expr,
+            crate::witnesses::WitnessAttachment::Variable {
                 name: lhs_var.to_string(),
                 scope,
             },
-            source: WitnessSource::Builder("branch_arm".into()),
-            payload: WitnessPayload::Observation(TypeObservation::BranchArm(ty)),
-            span,
-        });
+            context,
+        );
     }
 
     fn infer_expression_type(&self, node: Node<'a>, unwrap_sub_body: bool) -> Option<InferredType> {
@@ -3335,6 +3370,22 @@ impl<'a> Builder<'a> {
     ) -> Option<InferredType> {
         if child.kind() == "undef" {
             return None;
+        }
+        // Ternary: `return $cond ? A : B;` — recurse into both
+        // arms and agree-or-None. Same reduction the
+        // RHS-ternary / if-else-arm paths use; no reason to
+        // limit it artificially to any one syntactic shape.
+        if child.kind() == "conditional_expression" {
+            let consequent = child.child_by_field_name("consequent");
+            let alternative = child.child_by_field_name("alternative");
+            if let (Some(c), Some(a)) = (consequent, alternative) {
+                let ct = self.infer_returned_value_type_seen(c, seen);
+                let at = self.infer_returned_value_type_seen(a, seen);
+                match (ct, at) {
+                    (Some(t1), Some(t2)) if t1 == t2 => return Some(t1),
+                    _ => return None,
+                }
+            }
         }
         // Try expression type (literals, constructors)
         if let Some(t) = self.infer_expression_type(child, false) {
