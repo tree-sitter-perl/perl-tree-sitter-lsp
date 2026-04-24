@@ -4010,6 +4010,146 @@ sub fire {
     }
     // ---- witness-driven chain completion (spike) ----
 
+    /// Direct proof: enumerate each chain link's resolvability on
+    /// the real demo + real Mojolicious. Prints a truth table;
+    /// asserts specifically that `->to` does NOT resolve (the gap
+    /// the user flagged) so this test becomes a tripwire: if a
+    /// future fix makes `->to` resolve, this test will fail and
+    /// force us to promote it to a "works" assertion.
+    #[test]
+    fn test_demo_chain_empirical_truth_table() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let root: PathBuf = env!("CARGO_MANIFEST_DIR").into();
+        let demo = root.join("test_files/plugin_mojo_demo.pl");
+        let demo_source = fs::read_to_string(&demo).expect("demo file");
+
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(Some(root.to_str().unwrap()));
+        let files = crate::file_store::FileStore::new();
+        let _ = crate::module_resolver::index_workspace_with_index(
+            &root.join("test_files"),
+            &files,
+            Some(&idx),
+        );
+
+        let inc = crate::module_resolver::discover_inc_paths();
+        let install = |name: &str| -> bool {
+            let mut p = crate::module_resolver::create_parser();
+            match crate::module_resolver::resolve_and_parse(&inc, name, &mut p) {
+                Some(c) => { idx.insert_cache(name, Some(c)); true }
+                None => false,
+            }
+        };
+        if !(install("Mojolicious")
+            && install("Mojolicious::Routes")
+            && install("Mojolicious::Routes::Route")
+            && install("Mojolicious::Lite"))
+        {
+            eprintln!("SKIP: Mojolicious not installed");
+            return;
+        }
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&demo_source, None).unwrap();
+        let mut analysis = crate::builder::build(&tree, demo_source.as_bytes());
+        let (ir, ik) =
+            crate::backend::build_imported_return_types_for_test(&analysis, &idx);
+        analysis.enrich_imported_types_with_keys(ir, ik, Some(&idx));
+
+        let (line_idx, chain_line) = demo_source
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("$r->get('/users')") && l.contains("->to('Users#list')"))
+            .expect("demo chain line present");
+
+        let r_col = chain_line.find("$r").unwrap();
+        let get_col = chain_line.find("->get(").unwrap() + 2;
+        let to_col = chain_line.find("->to(").unwrap() + 2;
+        let pt = |c: usize| tree_sitter::Point { row: line_idx, column: c };
+
+        // --- Link 1: $r's type ---
+        let r_ty = analysis.inferred_type_via_bag("$r", pt(r_col));
+        let r_class = r_ty.as_ref().and_then(|t| t.class_name()).map(|s| s.to_string());
+
+        // --- Link 2: ->get's invocant class (= $r's class) ---
+        let get_ref = analysis.ref_at(pt(get_col)).expect("ref at ->get");
+        let get_invocant_class = if let crate::file_analysis::RefKind::MethodCall {
+            invocant, invocant_span, ..
+        } = &get_ref.kind
+        {
+            analysis.resolve_method_invocant_public(
+                invocant, invocant_span, get_ref.scope, pt(get_col),
+                Some(&tree), Some(demo_source.as_bytes()), Some(&idx),
+            )
+        } else { None };
+
+        // --- Link 3: ->get's RETURN type (what `$r->get(...)` evaluates to) ---
+        // Find the method_call_expression node for `$r->get('/users')`.
+        let mcall_node = {
+            fn find_getcall<'a>(n: tree_sitter::Node<'a>, src: &[u8]) -> Option<tree_sitter::Node<'a>> {
+                if n.kind() == "method_call_expression" {
+                    if let Some(m) = n.child_by_field_name("method") {
+                        if m.utf8_text(src).ok() == Some("get") {
+                            return Some(n);
+                        }
+                    }
+                }
+                for i in 0..n.named_child_count() {
+                    if let Some(c) = n.named_child(i) {
+                        if let Some(r) = find_getcall(c, src) {
+                            return Some(r);
+                        }
+                    }
+                }
+                None
+            }
+            find_getcall(tree.root_node(), demo_source.as_bytes()).expect("->get node")
+        };
+        let get_return_ty = analysis.resolve_expression_type(
+            mcall_node, demo_source.as_bytes(), Some(&idx),
+        );
+
+        // --- Link 4: ->to's invocant class (= ->get's return class) ---
+        let to_ref = analysis.ref_at(pt(to_col)).expect("ref at ->to");
+        let to_invocant_class = if let crate::file_analysis::RefKind::MethodCall {
+            invocant, invocant_span, ..
+        } = &to_ref.kind
+        {
+            analysis.resolve_method_invocant_public(
+                invocant, invocant_span, to_ref.scope, pt(to_col),
+                Some(&tree), Some(demo_source.as_bytes()), Some(&idx),
+            )
+        } else { None };
+
+        eprintln!("======== chain truth table ========");
+        eprintln!("  $r              class = {:?}", r_class);
+        eprintln!("  ->get invocant  class = {:?}", get_invocant_class);
+        eprintln!("  ->get RETURN    type  = {:?}", get_return_ty);
+        eprintln!("  ->to  invocant  class = {:?}", to_invocant_class);
+        eprintln!("====================================");
+
+        // The user's claim: `$r` + `->get` resolve; `->to` is the gap.
+        // Pin those facts here. If any of this flips, the test
+        // breaks and we know the chain state changed.
+        assert!(r_class.is_some(),
+            "(link 1) $r must resolve; got None");
+        assert!(get_invocant_class.is_some(),
+            "(link 2) ->get's invocant class must resolve; got None");
+        // Link 3+4: these are the gaps. If they start resolving,
+        // promote to positive assertions.
+        if get_return_ty.is_some() || to_invocant_class.is_some() {
+            panic!(
+                "TRIPWIRE: chain started resolving further than expected. \
+                 ->get return = {:?}; ->to invocant = {:?}. \
+                 Promote these to positive assertions.",
+                get_return_ty, to_invocant_class,
+            );
+        }
+    }
+
     /// E2E: the motivator. `$r->get('/x')->|` at the cursor — the
     /// public `completion_items` API must offer methods from the
     /// route class (Route::to, Route::name, etc.), proving the
