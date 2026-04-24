@@ -54,6 +54,7 @@ pub fn build_with_plugins(
         imports: Vec::new(),
         return_infos: Vec::new(),
         last_expr_type: std::collections::HashMap::new(),
+        self_method_tails: std::collections::HashMap::new(),
         call_bindings: Vec::new(),
         method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
@@ -690,6 +691,14 @@ struct Builder<'a> {
     return_infos: Vec<ReturnInfo>,
     /// For each Sub/Method scope, the type of the last expression (implicit return).
     last_expr_type: std::collections::HashMap<ScopeId, Option<InferredType>>,
+    /// For each Sub/Method scope whose last body statement is
+    /// `shift->M(...)` or `$self->M(...)`: the method name M.
+    /// Perl's last statement returns, so if M is another method on
+    /// the same class, this sub's return type IS M's return type.
+    /// Resolved in the return-type post-pass via fixed-point
+    /// iteration — captures the Mojo `sub get { shift->_generate_route(...) }`
+    /// shape without hardcoding any framework knowledge.
+    self_method_tails: std::collections::HashMap<ScopeId, String>,
     /// Assignments where RHS is a function call — resolved in return-type post-pass.
     call_bindings: Vec<CallBinding>,
     /// Assignments where RHS is a method call — resolved in FileAnalysis post-pass.
@@ -1295,6 +1304,7 @@ impl<'a> Builder<'a> {
                     display,
                     hide_in_outline,
                     opaque_return,
+                    return_self_method: None,
                 };
                 let target_pkg = on_class.clone().or_else(|| self.current_package.clone());
 
@@ -1628,15 +1638,26 @@ impl<'a> Builder<'a> {
                 self.visit_children(node);
             }
 
-            // Expression statements inside sub bodies → track last expression type
+            // Expression statements inside sub bodies → track last
+            // expression type. Perl returns the last statement's
+            // value, so this IS the sub's implicit return.
             "expression_statement" => {
                 self.visit_children(node);
-                // Track the type of the last expression in the innermost sub/method scope
                 if let Some(scope) = self.enclosing_sub_scope() {
-                    let expr_type = node.named_child(0).and_then(|child| {
-                        self.infer_expression_type(child, false)
-                    });
+                    // Primary inference: same path as explicit
+                    // `return EXPR`. Covers literals, constructors,
+                    // arithmetic, string ops, scalar-via-constraints.
+                    let child = node.named_child(0);
+                    let expr_type = child.and_then(|c| self.infer_returned_value_type(c));
                     self.last_expr_type.insert(scope, expr_type);
+                    // Record `shift->M(...)` / `$self->M(...)`
+                    // shape for the return-type post-pass, which
+                    // chains M's resolved return into this sub.
+                    if let Some(c) = child {
+                        if let Some(method_name) = self.self_method_call_name(c) {
+                            self.self_method_tails.insert(scope, method_name);
+                        }
+                    }
                 }
             }
 
@@ -1957,7 +1978,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc, display: None, hide_in_outline: false, opaque_return: false },
+            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc, display: None, hide_in_outline: false, opaque_return: false, return_self_method: None },
         );
 
         // Push sub scope
@@ -2305,7 +2326,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None, display: None, hide_in_outline: false, opaque_return: false },
+                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None, display: None, hide_in_outline: false, opaque_return: false, return_self_method: None },
                     );
                 }
                 if has_writer {
@@ -2328,6 +2349,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                 }
@@ -3280,12 +3302,37 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Infer the type of a return expression's value.
+    /// Infer the type of a return expression's value (explicit
+    /// `return EXPR`). Delegates to `infer_returned_value_type`.
     fn infer_return_value_type(&self, return_node: Node<'a>) -> Option<InferredType> {
         let child = match return_node.named_child(0) {
             Some(c) => c,
             None => return None, // bare `return` — skip signal
         };
+        self.infer_returned_value_type(child)
+    }
+
+    /// Infer the type of a value being returned — explicit
+    /// `return EXPR` OR an implicit last-expression-statement in a
+    /// sub body. Perl's last statement returns, so both shapes feed
+    /// here. Handles:
+    ///   - `undef` → None
+    ///   - literal/constructor expressions (via infer_expression_type)
+    ///   - arithmetic / string result types (infer_expression_result_type)
+    ///   - `$var` scalar returns resolved against type_constraints
+    ///     (prefers class-identity over rep constraints; see Part 6)
+    ///   - `shift->M(...)` / `$self->M(...)` → recurse via the
+    ///     locally-defined M's return type (same-package method
+    ///     lookup). Cycle-broken by a `seen` set on the recursion.
+    fn infer_returned_value_type(&self, child: Node<'a>) -> Option<InferredType> {
+        self.infer_returned_value_type_seen(child, &mut std::collections::HashSet::new())
+    }
+
+    fn infer_returned_value_type_seen(
+        &self,
+        child: Node<'a>,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Option<InferredType> {
         if child.kind() == "undef" {
             return None;
         }
@@ -3296,6 +3343,19 @@ impl<'a> Builder<'a> {
         // Try expression result type: return $a + $b → Numeric
         if let Some(t) = self.infer_expression_result_type(child) {
             return Some(t);
+        }
+        // Implicit-return shape: `shift->METHOD(...)` or
+        // `$self->METHOD(...)`. The invocant is the enclosing class's
+        // instance; the return type is whatever METHOD returns when
+        // it's locally defined in the same package. Recurses through
+        // the LOCAL return_infos (we can see them because they're
+        // collected during the walk; we look up via current symbol
+        // state). Cross-file chains fall through to query-time
+        // resolution via `find_method_return_type`.
+        if child.kind() == "method_call_expression" {
+            if let Some(rt) = self.infer_self_method_call_return(child, seen) {
+                return Some(rt);
+            }
         }
         // Try variable lookup: return $self, return $var
         if child.kind() == "scalar" {
@@ -3341,6 +3401,48 @@ impl<'a> Builder<'a> {
                 return latest_class.or(latest_any);
             }
         }
+        None
+    }
+
+    /// Does `node` look like `shift->M(...)` or `$self->M(...)`?
+    /// Used both during the walk (to record an implicit self-method
+    /// return shape) and in the return-type post-pass (to resolve
+    /// the sub's return once M's own return is known).
+    fn self_method_call_name(&self, node: Node<'a>) -> Option<String> {
+        if node.kind() != "method_call_expression" {
+            return None;
+        }
+        let invocant = node.child_by_field_name("invocant")?;
+        let is_self = match invocant.kind() {
+            "func0op_call_expression" | "func1op_call_expression" => {
+                invocant
+                    .child(0)
+                    .and_then(|c| c.utf8_text(self.source).ok())
+                    == Some("shift")
+            }
+            "scalar" => invocant.utf8_text(self.source).ok() == Some("$self"),
+            _ => false,
+        };
+        if !is_self {
+            return None;
+        }
+        let method_node = node.child_by_field_name("method")?;
+        method_node
+            .utf8_text(self.source)
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    /// Called from the recursive return-type inference. Not yet
+    /// usable during the walk (sub return_types aren't populated
+    /// until resolve_return_types). Placeholder that always returns
+    /// None — the real chaining happens in resolve_return_types via
+    /// `self_method_tails`.
+    fn infer_self_method_call_return(
+        &self,
+        _node: Node<'a>,
+        _seen: &mut std::collections::HashSet<String>,
+    ) -> Option<InferredType> {
         None
     }
 
@@ -3972,6 +4074,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                     // Setter for rw
@@ -3994,6 +4097,7 @@ impl<'a> Builder<'a> {
                                 display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                             },
                         );
                     }
@@ -4018,6 +4122,7 @@ impl<'a> Builder<'a> {
                                 display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                             },
                         );
                     }
@@ -4044,6 +4149,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                     // Setter: fluent, returns $self for chaining
@@ -4066,6 +4172,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                 }
@@ -4475,6 +4582,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                 },
             );
         }
@@ -4563,6 +4671,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                 },
             );
         }
@@ -5296,12 +5405,98 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Set return_type on matching Sub/Method symbols
+        // Self-method-tail propagation. Perl's last statement
+        // returns, so `sub get { shift->_generate_route(GET => @_) }`
+        // returns whatever `_generate_route` returns. Fixed-point
+        // iterate: if sub X's body-tail is `shift->M(...)` /
+        // `$self->M(...)` and M's return_type is now known, X
+        // inherits it.
+        //
+        // Build a scope_id → sub_name map for lookups.
+        let scope_to_sub: std::collections::HashMap<ScopeId, String> = self
+            .scopes
+            .iter()
+            .filter_map(|s| match &s.kind {
+                ScopeKind::Sub { name } | ScopeKind::Method { name } => {
+                    Some((s.id, name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut changed = true;
+        let mut iters = 0;
+        while changed && iters < 20 {
+            changed = false;
+            iters += 1;
+            let tails: Vec<(ScopeId, String)> = self
+                .self_method_tails
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            for (scope_id, tail_method) in tails {
+                let sub_name = match scope_to_sub.get(&scope_id) {
+                    Some(n) => n.clone(),
+                    None => continue,
+                };
+                if return_types.contains_key(&sub_name) {
+                    continue; // already resolved
+                }
+                if sub_name == tail_method {
+                    continue; // direct self-recursion — can't infer
+                }
+                if let Some(t) = return_types.get(&tail_method).cloned() {
+                    return_types.insert(sub_name, t);
+                    changed = true;
+                }
+            }
+        }
+
+        // Set return_type on matching Sub/Method symbols, and
+        // record the self-method tail shape for subs whose return
+        // type couldn't be collapsed in-file. Consumer side chains
+        // through `return_self_method` when `return_type` is None.
+        // Look up each sub's scope by matching the symbol's span
+        // against the sub scope's span.
+        let scope_by_sub_span: std::collections::HashMap<(Point, Point), ScopeId> = self
+            .scopes
+            .iter()
+            .filter(|s| matches!(s.kind, ScopeKind::Sub { .. } | ScopeKind::Method { .. }))
+            .map(|s| ((s.span.start, s.span.end), s.id))
+            .collect();
         for sym in &mut self.symbols {
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                if let SymbolDetail::Sub { ref mut return_type, .. } = sym.detail {
+                if let SymbolDetail::Sub {
+                    ref mut return_type,
+                    ref mut return_self_method,
+                    ..
+                } = sym.detail
+                {
                     if let Some(rt) = return_types.get(&sym.name) {
                         *return_type = Some(rt.clone());
+                    } else {
+                        // Couldn't resolve in-file. If the body
+                        // tails on `shift->M(...)` / `$self->M(...)`,
+                        // record M so cross-file resolution can chain
+                        // through at query time.
+                        let sub_scope = self
+                            .scopes
+                            .iter()
+                            .find(|s| {
+                                matches!(
+                                    &s.kind,
+                                    ScopeKind::Sub { name } | ScopeKind::Method { name }
+                                        if name == &sym.name
+                                )
+                                    && s.span.start >= sym.span.start
+                                    && s.span.end <= sym.span.end
+                            })
+                            .map(|s| s.id);
+                        if let Some(sid) = sub_scope {
+                            if let Some(m) = self.self_method_tails.get(&sid) {
+                                *return_self_method = Some(m.clone());
+                            }
+                        }
+                        let _ = &scope_by_sub_span;
                     }
                 }
             }

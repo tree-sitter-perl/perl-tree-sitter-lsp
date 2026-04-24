@@ -269,6 +269,19 @@ pub enum SymbolDetail {
         /// no core heuristic on the type name.
         #[serde(default)]
         opaque_return: bool,
+        /// Structural capture of the sub's implicit-last-statement
+        /// return when our in-file inference can't collapse it to a
+        /// concrete `InferredType`. Perl's last statement returns —
+        /// so `sub get { shift->_generate_route(GET => @_) }` has a
+        /// return equal to whatever `_generate_route` returns. We
+        /// can't compute that at walk time (cross-file return chains
+        /// aren't yet resolvable), but recording the method name lets
+        /// the consumer-side `find_method_return_type` chase it when
+        /// module_index IS available. Small, orthogonal to
+        /// `return_type` — populated only when `return_type` is None
+        /// after the walk.
+        #[serde(default)]
+        return_self_method: Option<String>,
     },
     Class {
         parent: Option<String>,
@@ -1687,32 +1700,7 @@ impl FileAnalysis {
                     return Some(InferredType::ClassName(class_name.to_string()));
                 }
                 let arg_count = self.count_call_args(node);
-                if let Some(rt) = self.find_method_return_type(
-                    class_name, method_text, module_index, Some(arg_count),
-                ) {
-                    return Some(rt);
-                }
-                // Fluent-chain fallback: if the method exists
-                // somewhere in the invocant's class hierarchy but
-                // its return type isn't inferable (common for
-                // `sub get { shift->_generate_route(GET => @_) }`
-                // in Mojolicious::Routes::Route — the body
-                // chains through several calls that our type
-                // inference can't trace), assume the return type
-                // is the same as the invocant's class. This is
-                // the builder-pattern convention — Mojo::Routes,
-                // Moo chainable setters, jQuery-style APIs, etc.
-                //
-                // Scoped: only fires when the method IS defined
-                // somewhere in the hierarchy, so random
-                // name-collisions don't poison unrelated chains.
-                if self
-                    .resolve_method_in_ancestors(class_name, method_text, module_index)
-                    .is_some()
-                {
-                    return Some(InferredType::ClassName(class_name.to_string()));
-                }
-                None
+                self.find_method_return_type(class_name, method_text, module_index, Some(arg_count))
             }
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 let func_node = node.child_by_field_name("function")?;
@@ -1825,6 +1813,98 @@ impl FileAnalysis {
 
     /// Find a method's return type within a class/package, walking inheritance.
     pub(crate) fn find_method_return_type(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+        arg_count: Option<usize>,
+    ) -> Option<InferredType> {
+        self.find_method_return_type_seen(
+            class_name,
+            method_name,
+            module_index,
+            arg_count,
+            &mut std::collections::HashSet::new(),
+        )
+    }
+
+    fn find_method_return_type_seen(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+        arg_count: Option<usize>,
+        seen: &mut std::collections::HashSet<(String, String)>,
+    ) -> Option<InferredType> {
+        // Cycle break: `sub a { shift->b(...) }` + `sub b { shift->a(...) }`
+        // would loop forever otherwise.
+        if !seen.insert((class_name.to_string(), method_name.to_string())) {
+            return None;
+        }
+        // Concrete branch (either Local or CrossFile). If it returns
+        // a type, done. Otherwise chase `return_self_method` on the
+        // method's Sub symbol — Perl-last-statement implicit return
+        // of `shift->M(...)` means this sub's return type IS M's
+        // return type, resolved against the same class.
+        if let Some(t) = self.find_method_return_type_raw(
+            class_name,
+            method_name,
+            module_index,
+            arg_count,
+        ) {
+            return Some(t);
+        }
+        // Fetch the self-method tail for this (class, method) across
+        // local + cross-file.
+        let tail = self.self_method_tail(class_name, method_name, module_index)?;
+        self.find_method_return_type_seen(
+            class_name,
+            &tail,
+            module_index,
+            None,
+            seen,
+        )
+    }
+
+    fn self_method_tail(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<String> {
+        match self.resolve_method_in_ancestors(class_name, method_name, module_index) {
+            Some(MethodResolution::Local { sym_id, .. }) => {
+                if let SymbolDetail::Sub { return_self_method, .. } =
+                    &self.symbol(sym_id).detail
+                {
+                    return return_self_method.clone();
+                }
+                None
+            }
+            Some(MethodResolution::CrossFile { ref class }) => {
+                let idx = module_index?;
+                let cached = idx.get_cached(class)?;
+                // Scan cached module's symbols for a matching method.
+                for sym in &cached.analysis.symbols {
+                    if sym.name != method_name {
+                        continue;
+                    }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                        continue;
+                    }
+                    if let SymbolDetail::Sub { return_self_method, .. } = &sym.detail {
+                        return return_self_method.clone();
+                    }
+                }
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// The original `find_method_return_type` body — renamed to make
+    /// room for the self-method-tail wrapper above.
+    fn find_method_return_type_raw(
         &self,
         class_name: &str,
         method_name: &str,
@@ -5298,6 +5378,7 @@ mod tests {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                 },
                 namespace: Namespace::Language,
                 outline_label: None,
