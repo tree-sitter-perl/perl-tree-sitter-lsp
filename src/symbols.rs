@@ -3799,4 +3799,69 @@ sub fire {
             labels,
         );
     }
+    // ---- witness-driven chain completion (spike) ----
+
+    /// E2E: the motivator. `$r->get('/x')->|` at the cursor — the
+    /// public `completion_items` API must offer methods from the
+    /// route class (Route::to, Route::name, etc.), proving the
+    /// witness-bag-driven chain typing works all the way through
+    /// CursorContext → resolve_node_type → resolve_expression_type →
+    /// find_method_return_type → complete_methods_for_class.
+    ///
+    /// No special casing. Zero hardcoded chain rules. If this
+    /// passes, the mojo-demo `$r->get('/x')->to(...)` gets
+    /// "intellismarts" on `->to` through witness flow.
+    #[test]
+    fn test_e2e_mojo_style_chain_completion_offers_chained_class_methods() {
+        let src = r#"package MyApp::Route;
+sub new { my $c = shift; bless {}, $c }
+sub get {
+    my $self = shift;
+    $self->{_path} = shift;
+    return $self;
+}
+sub to {
+    my $self = shift;
+    $self->{_target} = shift;
+    return $self;
+}
+sub name {
+    my $self = shift;
+    $self->{_name} = shift;
+    return $self;
+}
+
+package main;
+my $r = MyApp::Route->new;
+$r->get('/users')->
+"#;
+        let analysis = parse_analysis(src);
+        let tree = crate::document::Document::new(src.to_string()).unwrap().tree;
+        let idx = ModuleIndex::new_for_test();
+
+        // Cursor right after the trailing `->` on the chain line.
+        let (line_idx, line) = src
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("$r->get('/users')->"))
+            .unwrap();
+        let col = line.rfind("->").unwrap() + 2;
+        let pos = Position {
+            line: line_idx as u32,
+            character: col as u32,
+        };
+
+        let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        for expected in &["to", "name", "get"] {
+            assert!(
+                labels.contains(expected),
+                "expected `{}` in completion after `$r->get('/users')->`, \
+                 got {} items: {:?}",
+                expected,
+                labels.len(),
+                labels
+            );
+        }
+    }
 }

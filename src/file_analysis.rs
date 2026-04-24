@@ -2281,9 +2281,8 @@ impl FileAnalysis {
             // Method completion on the same `$c` already uses this
             // accessor; routing through it here keeps the two paths in
             // sync. Rule #3.
-            return self.inferred_type(text, point)
-                .and_then(|t| t.class_name())
-                .map(str::to_string);
+            return self.inferred_type_via_bag(text, point)
+                .and_then(|t| t.class_name().map(str::to_string));
         }
         if text.starts_with('@') || text.starts_with('%') {
             return None;
@@ -3685,10 +3684,11 @@ impl FileAnalysis {
         let line = source_line_at(source, sym.span.start.row);
         let mut text = format!("```perl\n{}\n```", line.trim());
 
-        // Append inferred type for variables/fields
+        // Append inferred type for variables/fields (bag-routed so
+        // framework / branch / arity rules refine the answer).
         if matches!(sym.kind, SymKind::Variable | SymKind::Field) {
-            if let Some(it) = self.inferred_type(&sym.name, at) {
-                text.push_str(&format!("\n\n*type: {}*", format_inferred_type(it)));
+            if let Some(it) = self.inferred_type_via_bag(&sym.name, at) {
+                text.push_str(&format!("\n\n*type: {}*", format_inferred_type(&it)));
             }
         }
 
@@ -4744,8 +4744,8 @@ impl FileAnalysis {
             var_text
         };
 
-        // Try type inference → class owner
-        if let Some(it) = self.inferred_type(var_text, point) {
+        // Try type inference → class owner (bag-routed).
+        if let Some(it) = self.inferred_type_via_bag(var_text, point) {
             if let Some(cn) = it.class_name() {
                 return Some(HashKeyOwner::Class(cn.to_string()));
             }
@@ -6211,6 +6211,80 @@ sub mix {
             reg.query(&fa.witnesses, &q_m),
             ReducedValue::None,
             "mix: disagreement (Numeric vs String) → None"
+        );
+    }
+
+    /// Extended arity idioms (Part C): exact-N matching.
+    #[test]
+    fn test_witnesses_arity_exact_n_variants() {
+        let fa = build_fa_from_source(
+            r#"
+sub postfix_eq {
+    return "zero" unless @_;
+    return "one"  if @_ == 1;
+    return "two"  if @_ == 2;
+    return "many";
+}
+
+sub postfix_scalar {
+    return "zero" if !@_;
+    return "one"  if scalar(@_) == 1;
+    return "dflt";
+}
+
+sub explicit_if {
+    my ($self) = @_;
+    if (@_ == 1) { return "alpha" }
+    if (@_ == 2) { return "beta"  }
+    return "gamma";
+}
+        "#,
+        );
+
+        // postfix_eq: arity-indexed returns.
+        assert_eq!(
+            fa.sub_return_type_at_arity("postfix_eq", Some(0)),
+            Some(InferredType::String),
+            "postfix: arity 0 via `unless @_`"
+        );
+        assert_eq!(
+            fa.sub_return_type_at_arity("postfix_eq", Some(1)),
+            Some(InferredType::String),
+            "postfix: arity 1 via `if @_ == 1`"
+        );
+        assert_eq!(
+            fa.sub_return_type_at_arity("postfix_eq", Some(2)),
+            Some(InferredType::String),
+            "postfix: arity 2 via `if @_ == 2`"
+        );
+        assert_eq!(
+            fa.sub_return_type_at_arity("postfix_eq", Some(3)),
+            Some(InferredType::String),
+            "postfix: arity 3 → default"
+        );
+
+        // postfix_scalar: `!@_` and `scalar(@_) == 1` variants.
+        assert_eq!(
+            fa.sub_return_type_at_arity("postfix_scalar", Some(0)),
+            Some(InferredType::String),
+            "postfix: arity 0 via `if !@_`"
+        );
+        assert_eq!(
+            fa.sub_return_type_at_arity("postfix_scalar", Some(1)),
+            Some(InferredType::String),
+            "postfix: arity 1 via `if scalar(@_) == 1`"
+        );
+
+        // explicit_if: `if (@_ == N) { return … }`.
+        assert_eq!(
+            fa.sub_return_type_at_arity("explicit_if", Some(1)),
+            Some(InferredType::String),
+            "explicit: arity 1 via if (@_ == 1) return arm"
+        );
+        assert_eq!(
+            fa.sub_return_type_at_arity("explicit_if", Some(2)),
+            Some(InferredType::String),
+            "explicit: arity 2"
         );
     }
 

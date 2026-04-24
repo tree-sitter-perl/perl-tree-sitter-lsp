@@ -358,6 +358,17 @@ impl WitnessReducer for FrameworkAwareTypeFold {
         let mut plain_type: Option<InferredType> = None;
 
         for w in ws {
+            // Temporal ordering: a witness's span.start is the
+            // location where the fact was emitted (for zero-span
+            // seeds) or the narrowing-scope start (for scoped ones).
+            // Only consider witnesses whose point-of-emission is at
+            // or before the query point — a later reassignment
+            // shouldn't influence a lookup at an earlier line.
+            if let Some(point) = q.point {
+                if w.span.start > point {
+                    continue;
+                }
+            }
             // Skip scoped InferredType witnesses that don't contain
             // the query point — they're narrowing facts for a
             // different slice of the variable's lifetime.
@@ -449,7 +460,16 @@ impl WitnessReducer for FrameworkAwareTypeFold {
             }
         }
 
-        // No class evidence — project rep observations directly.
+        // Explicit `InferredType` assignments dominate rep
+        // observations — `my $x = []` overrides earlier `$x->{k}`
+        // access inferences because reassignment breaks the binding.
+        // We picked the latest (by iteration order; seeds are in
+        // source order) during the fold.
+        if let Some(t) = plain_type {
+            return ReducedValue::Type(t);
+        }
+
+        // No class evidence, no plain type — project rep observations.
         if let Some(r) = rep_obs.or(bless_rep) {
             return ReducedValue::Type(match r {
                 Rep::Hash => InferredType::HashRef,
@@ -470,10 +490,6 @@ impl WitnessReducer for FrameworkAwareTypeFold {
             return ReducedValue::Type(InferredType::String);
         }
 
-        // Fall back to any plain type witness we saw.
-        if let Some(t) = plain_type {
-            return ReducedValue::Type(t);
-        }
         ReducedValue::None
     }
 }

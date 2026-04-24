@@ -332,9 +332,12 @@ fn seed_witnesses_from_analysis(fa: &mut FileAnalysis) {
 /// from the shape of the return's parent in the CST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArityBranch {
-    /// `return X unless @_;` — fires when the caller passed zero
-    /// additional args.
+    /// `return X unless @_;` / `return X if !@_;` — fires when the
+    /// caller passed zero additional args.
     Zero,
+    /// `return X if @_ == N;` / `if scalar(@_) == N;` / explicit
+    /// `if (@_ == N) { return X }`. Exact-N match.
+    Exact(u32),
     /// Fall-through `return X;` with no condition wrapper — fires
     /// when no earlier arity-gated branch matched.
     Default,
@@ -356,48 +359,185 @@ enum ArityBranch {
 fn classify_arity_branch(return_node: tree_sitter::Node, source: &[u8]) -> Option<ArityBranch> {
     let Some(parent) = return_node.parent() else { return None };
     match parent.kind() {
-        "expression_statement" => {
-            // Only count returns at the sub body's top level as
-            // Default arity. A return inside `if { return X }` is a
-            // branch arm (handled by BranchArm), not a default-branch
-            // arity fact.
-            let Some(grandparent) = parent.parent() else { return None };
-            if grandparent.kind() != "block" {
-                return None;
-            }
-            if let Some(ggp) = grandparent.parent() {
-                match ggp.kind() {
-                    "subroutine_declaration_statement"
-                    | "method_declaration_statement"
-                    | "anonymous_subroutine_expression" => Some(ArityBranch::Default),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        }
+        "expression_statement" => classify_bare_return_or_if_arm(parent, source),
         "postfix_conditional_expression" => {
             let cond = parent.child_by_field_name("condition")?;
-            let cond_text = cond.utf8_text(source).ok()?.trim();
-            if cond_text != "@_" {
-                return None;
-            }
-            // Read the raw tokens between the return and the
-            // condition to distinguish `if` vs `unless`.
-            let between_start = return_node.end_byte();
-            let between_end = cond.start_byte();
-            if between_end <= between_start {
-                return None;
-            }
-            let between = std::str::from_utf8(&source[between_start..between_end]).ok()?;
-            if between.contains("unless") {
-                Some(ArityBranch::Zero)
-            } else {
-                None
-            }
+            let keyword = connector_keyword_between(return_node, cond, source)?;
+            classify_arity_condition(cond, source, &keyword)
         }
         _ => None,
     }
+}
+
+/// `expression_statement` parent → either a bare `return X` at sub
+/// body level (Default), OR inside an `if (@_ == N) { return X }` arm
+/// where the conditional_statement's condition is an arity test (Exact).
+fn classify_bare_return_or_if_arm(
+    expr_stmt: tree_sitter::Node,
+    source: &[u8],
+) -> Option<ArityBranch> {
+    let Some(block) = expr_stmt.parent() else { return None };
+    if block.kind() != "block" {
+        return None;
+    }
+    let Some(outer) = block.parent() else { return None };
+    match outer.kind() {
+        "subroutine_declaration_statement"
+        | "method_declaration_statement"
+        | "anonymous_subroutine_expression" => Some(ArityBranch::Default),
+        "conditional_statement" => {
+            // `if (condition) { return X }` — classify by condition.
+            let cond = outer.child_by_field_name("condition")?;
+            classify_arity_condition(cond, source, "if")
+        }
+        _ => None,
+    }
+}
+
+/// Classify an arity condition node. `keyword` is "if" or "unless".
+fn classify_arity_condition(
+    cond: tree_sitter::Node,
+    source: &[u8],
+    keyword: &str,
+) -> Option<ArityBranch> {
+    // Shape 1: bare `@_`.
+    if cond.kind() == "array" {
+        let text = cond.utf8_text(source).ok()?.trim();
+        if text == "@_" {
+            return match keyword {
+                "unless" => Some(ArityBranch::Zero),
+                _ => None, // `if @_` is "arity >= 1" — not expressible as Exact yet.
+            };
+        }
+        return None;
+    }
+    // Shape 2: `!@_` → unary_expression with operand @_.
+    if cond.kind() == "unary_expression" {
+        let op_text = raw_leading_op(cond, source);
+        if op_text == "!" {
+            if let Some(operand) = cond.child_by_field_name("operand") {
+                if operand.kind() == "array" {
+                    let text = operand.utf8_text(source).ok()?.trim();
+                    if text == "@_" {
+                        return match keyword {
+                            "if" => Some(ArityBranch::Zero),
+                            "unless" => None, // `unless !@_` → arity >= 1, skip
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    // Shape 3: `@_ == N` / `scalar(@_) == N` → equality_expression.
+    if cond.kind() == "equality_expression" {
+        let op = raw_mid_op(cond, source);
+        if op != "==" && op != "!=" {
+            return None;
+        }
+        let left = cond.child_by_field_name("left")?;
+        let right = cond.child_by_field_name("right")?;
+        let n = extract_numeric(right, source)?;
+        let counts_args = node_is_arity_magnitude(left, source);
+        if !counts_args {
+            return None;
+        }
+        match (keyword, op.as_str()) {
+            ("if", "==") => Some(ArityBranch::Exact(n)),
+            ("unless", "!=") => Some(ArityBranch::Exact(n)),
+            _ => None, // != / >= / etc. — not a single Exact fact.
+        }
+    } else {
+        None
+    }
+}
+
+/// True if `node` evaluates to the length of `@_` — either `@_`
+/// itself (scalar context in an equality) or `scalar(@_)`.
+fn node_is_arity_magnitude(node: tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() == "array" {
+        return node.utf8_text(source).map(|s| s.trim() == "@_").unwrap_or(false);
+    }
+    if node.kind() == "func1op_call_expression" {
+        let Some(kw) = node.child(0) else { return false };
+        let Ok(name) = kw.utf8_text(source) else { return false };
+        if name != "scalar" {
+            return false;
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i) {
+                if c.kind() == "array" {
+                    return c.utf8_text(source).map(|s| s.trim() == "@_").unwrap_or(false);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract a small unsigned numeric literal from a `number` node.
+fn extract_numeric(node: tree_sitter::Node, source: &[u8]) -> Option<u32> {
+    if node.kind() != "number" {
+        return None;
+    }
+    node.utf8_text(source).ok()?.trim().parse::<u32>().ok()
+}
+
+/// Read the raw bytes between two sibling nodes to recover the
+/// postfix keyword (`if` / `unless` / `while` / …). Used because
+/// tree-sitter-perl shares one node kind for both `if` and `unless`.
+fn connector_keyword_between(
+    left: tree_sitter::Node,
+    right: tree_sitter::Node,
+    source: &[u8],
+) -> Option<String> {
+    let start = left.end_byte();
+    let end = right.start_byte();
+    if end <= start {
+        return None;
+    }
+    let between = std::str::from_utf8(&source[start..end]).ok()?.trim();
+    // Expect exactly one keyword in between.
+    for kw in ["unless", "if", "while", "until"] {
+        if between == kw || between.starts_with(kw) && between.trim() == kw {
+            return Some(kw.to_string());
+        }
+        // tolerate extra whitespace (e.g. newlines)
+        if between.split_whitespace().next() == Some(kw) {
+            return Some(kw.to_string());
+        }
+    }
+    None
+}
+
+fn raw_leading_op(node: tree_sitter::Node, source: &[u8]) -> String {
+    // Operator is an anonymous child between start and the first named
+    // child (operand). Read the bytes before the operand node.
+    let Some(operand) = node.child_by_field_name("operand") else {
+        return String::new();
+    };
+    let start = node.start_byte();
+    let end = operand.start_byte();
+    std::str::from_utf8(&source[start..end])
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn raw_mid_op(node: tree_sitter::Node, source: &[u8]) -> String {
+    let Some(left) = node.child_by_field_name("left") else {
+        return String::new();
+    };
+    let Some(right) = node.child_by_field_name("right") else {
+        return String::new();
+    };
+    let start = left.end_byte();
+    let end = right.start_byte();
+    std::str::from_utf8(&source[start..end])
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// A return value type collected during the walk, before post-pass resolution.
@@ -2981,6 +3121,7 @@ impl<'a> Builder<'a> {
 
         let arg_count = match arity_kind {
             ArityBranch::Zero => Some(0u32),
+            ArityBranch::Exact(n) => Some(n),
             ArityBranch::Default => None,
         };
         self.pending_witnesses.push(Witness {

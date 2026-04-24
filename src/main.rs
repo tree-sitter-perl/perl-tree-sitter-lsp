@@ -410,17 +410,18 @@ fn cli_type_at(file: &str, line_str: &str, col_str: &str) {
     let (_source, _tree, analysis) = parse_file(file);
     let point = parse_point(line_str, col_str);
 
-    // Check refs for inferred type
+    // Check refs for inferred type — route through the witness bag
+    // so framework / branch / arity rules refine the answer.
     if let Some(r) = analysis.ref_at(point) {
-        if let Some(ty) = analysis.inferred_type(&r.target_name, point) {
-            println!("{}", file_analysis::format_inferred_type(ty));
+        if let Some(ty) = analysis.inferred_type_via_bag(&r.target_name, point) {
+            println!("{}", file_analysis::format_inferred_type(&ty));
             return;
         }
     }
     // Check symbols
     if let Some(sym) = analysis.symbol_at(point) {
-        if let Some(ty) = analysis.inferred_type(&sym.name, point) {
-            println!("{}", file_analysis::format_inferred_type(ty));
+        if let Some(ty) = analysis.inferred_type_via_bag(&sym.name, point) {
+            println!("{}", file_analysis::format_inferred_type(&ty));
             return;
         }
     }
