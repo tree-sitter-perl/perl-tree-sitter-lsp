@@ -3277,17 +3277,15 @@ impl FileAnalysis {
             self.inferred_type_via_bag(invocant, point)
                 .and_then(|t| t.class_name().map(|s| s.to_string()))
                 .or_else(|| {
-                    // Enclosing-class fallback ONLY applies to
-                    // `$self` — every other variable invocant whose
-                    // type we don't know must stay None, not poison
-                    // method resolution with the surrounding
-                    // package. Otherwise `$r->to(...)` with `$r`
-                    // un-typed would pretend `to` is a method on
-                    // MyApp and goto-def on the method name would
-                    // jump to `package MyApp;`. That was a silent
-                    // wrong-answer sink — the comment here
-                    // described this guard but the code didn't
-                    // actually check.
+                    // Enclosing-class fallback only applies to
+                    // `$self` — other variable invocants whose type
+                    // we don't know stay None, not poisoned with the
+                    // surrounding package. Otherwise `$r->to(...)`
+                    // with `$r` un-typed would pretend `to` is a
+                    // method on the enclosing package (MyApp), and
+                    // goto-def on the method name lands on
+                    // `package MyApp;`. The comment here described
+                    // this guard but the code didn't actually check.
                     if invocant != "$self" {
                         return None;
                     }

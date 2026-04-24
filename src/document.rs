@@ -18,10 +18,6 @@ pub struct Document {
     pub tree: Tree,
     pub analysis: FileAnalysis,
     pub stable_outline: StableOutline,
-    /// ModuleIndex revision that last enriched this doc's analysis.
-    /// Request handlers compare against the live revision to decide
-    /// whether to re-run enrichment. 0 = never enriched.
-    pub last_enriched_revision: u64,
 }
 
 impl Document {
@@ -35,7 +31,7 @@ impl Document {
         }
         let analysis = builder::build(&tree, text.as_bytes());
         let stable_outline = StableOutline::from_analysis(&analysis);
-        Some(Document { text, tree, analysis, stable_outline, last_enriched_revision: 0 })
+        Some(Document { text, tree, analysis, stable_outline })
     }
 
     pub fn update(&mut self, new_text: String) {
@@ -92,9 +88,6 @@ impl Document {
         self.text = new_text;
         self.analysis = builder::build(&self.tree, self.text.as_bytes());
         self.stable_outline.update(&self.analysis, &self.text);
-        // Rebuilt analysis — reset so enrichment re-runs against
-        // the current module_index on the next request.
-        self.last_enriched_revision = 0;
     }
 }
 
