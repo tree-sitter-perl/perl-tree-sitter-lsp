@@ -1,0 +1,797 @@
+//! Witness bag + reducers — Part 7 of the type-inference spec.
+//!
+//! A **witness** is typed evidence that some proposition holds about a
+//! specific code location (variable, expression, symbol, hash key...),
+//! tagged with its source (which builder pass / plugin emitted it). A
+//! bag of witnesses is folded into concrete answers by **reducers** —
+//! pure projections claiming the witnesses they care about.
+//!
+//! Spike goals (not the full Phase 0-7 plan):
+//! - Data types (Witness, attachments, sources, payloads).
+//! - Attachment-indexed bag on `FileAnalysis`.
+//! - Reducer trait + a built-in framework-aware type-fold reducer
+//!   (Part 6 from the spec).
+
+use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+
+use crate::file_analysis::{
+    HashKeyOwner, InferredType, ScopeId, Span, SymbolId,
+};
+
+// ---- Core witness types ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Witness {
+    pub attachment: WitnessAttachment,
+    pub source: WitnessSource,
+    pub payload: WitnessPayload,
+    /// Where the user can see why — rendered as "because: …" in hovers
+    /// and diagnostics. Zero-extent span means core-synthesized.
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WitnessAttachment {
+    /// Traditional variable-in-scope facts — what `TypeConstraint` /
+    /// `CallBinding` indexes by today.
+    Variable { name: String, scope: ScopeId },
+    /// An expression-result fact. Every method call is an index into
+    /// `FileAnalysis::refs` via `RefIdx`; facts about the returned
+    /// value attach here. Chain aggregation lives on this axis.
+    Expression(RefIdx),
+    /// A symbol property ("this sub is a dispatcher").
+    Symbol(SymbolId),
+    /// A specific call site — property of the call, not of its result
+    /// or its receiver.
+    CallSite(RefIdx),
+    /// Hash key metadata (writes, mutations, derivations).
+    HashKey { owner: HashKeyOwner, name: String },
+    /// Package-level facts (isa edges, framework mode).
+    Package(String),
+}
+
+/// Index into `FileAnalysis::refs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RefIdx(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WitnessSource {
+    /// Named builder pass — "signature_extraction", "narrowing", …
+    Builder(String),
+    /// Plugin id.
+    Plugin(String),
+    /// Post-build enrichment source.
+    Enrichment(String),
+    /// This witness was derived from another ref — rename transport
+    /// chases these as a DAG.
+    DerivedFrom(RefIdx),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WitnessPayload {
+    /// Final-form type belief — what legacy `TypeConstraint` carries.
+    InferredType(InferredType),
+    /// An **observation** — raw evidence about a value's use, to be
+    /// folded by the framework-aware resolver (Part 6).
+    Observation(TypeObservation),
+    /// Keyed fact. Family + key + value schema is the reducer's
+    /// responsibility.
+    Fact { family: String, key: String, value: FactValue },
+    /// "This witness's subject derives from another ref." Rename
+    /// transport walks these.
+    Derivation,
+    /// Escape hatch for plugin-defined payloads that don't fit above.
+    Custom { family: String, json: String },
+}
+
+/// Part 6 — raw observations about a value's use, consumed by the
+/// framework-aware resolver. These do NOT commit to a concrete type;
+/// the resolver projects them to `InferredType` using framework
+/// context.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TypeObservation {
+    /// `my $x = Foo->new` or direct `InferredType::ClassName(_)` assertion.
+    ClassAssertion(String),
+    /// `my $self = shift` / `$_[0]` at the head of a method body.
+    FirstParamInMethod { package: String },
+    /// `$v->{k}`, `%$v`, `@$v{...}` — hashref-like access.
+    HashRefAccess,
+    /// `$v->[i]`, `@$v`.
+    ArrayRefAccess,
+    /// `$v->()`, `&$v`.
+    CodeRefInvocation,
+    NumericUse,
+    StringUse,
+    RegexpUse,
+    /// `bless [], $c` pins the representation axis to Array.
+    BlessTarget(Rep),
+    /// Fluent-chain binding target: the value is the return of this sub.
+    ReturnOf(SymbolId),
+    /// Same as ReturnOf but by name — handy before symbol resolution
+    /// runs or for cross-file.
+    ReturnOfName(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Rep {
+    Hash,
+    Array,
+    Scalar,
+    Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FactValue {
+    Str(String),
+    List(Vec<FactValue>),
+    Bool(bool),
+    Num(f64),
+    Map(Vec<(String, FactValue)>),
+}
+
+// ---- Framework-mode mirror (plain enum; builder's FrameworkMode is
+// private to builder.rs, so we duplicate a small view for the resolver) ----
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub enum FrameworkFact {
+    Moo,
+    Moose,
+    /// Mojo::Base — hashref-backed, fluent-by-default.
+    MojoBase,
+    /// Perl 5.38 `class` — opaque / inside-out.
+    CoreClass,
+    /// No framework detected.
+    Plain,
+}
+
+impl FrameworkFact {
+    /// Which representation does this framework's instances back onto?
+    /// `None` = rep-agnostic.
+    pub fn backing_rep(self) -> Option<Rep> {
+        match self {
+            FrameworkFact::Moo | FrameworkFact::Moose | FrameworkFact::MojoBase => Some(Rep::Hash),
+            FrameworkFact::CoreClass => None, // opaque
+            FrameworkFact::Plain => None,
+        }
+    }
+}
+
+// ---- Witness bag ----
+
+/// Lightweight attachment-indexed bag. Kept separate from the raw
+/// witness vec so callers can iterate all witnesses for one attachment
+/// without scanning. Indexes are rebuilt on demand.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct WitnessBag {
+    witnesses: Vec<Witness>,
+    #[serde(skip, default)]
+    index: HashMap<WitnessAttachment, Vec<usize>>,
+}
+
+impl WitnessBag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, w: Witness) -> usize {
+        let idx = self.witnesses.len();
+        self.index.entry(w.attachment.clone()).or_default().push(idx);
+        self.witnesses.push(w);
+        idx
+    }
+
+    pub fn all(&self) -> &[Witness] {
+        &self.witnesses
+    }
+
+    pub fn for_attachment(&self, att: &WitnessAttachment) -> Vec<&Witness> {
+        self.index
+            .get(att)
+            .map(|ixs| ixs.iter().map(|&i| &self.witnesses[i]).collect())
+            .unwrap_or_default()
+    }
+
+    /// Iterate witnesses that match a predicate on attachment. O(n).
+    pub fn filter<P: Fn(&Witness) -> bool>(&self, pred: P) -> Vec<&Witness> {
+        self.witnesses.iter().filter(|w| pred(w)).collect()
+    }
+
+    pub fn rebuild_index(&mut self) {
+        self.index.clear();
+        for (i, w) in self.witnesses.iter().enumerate() {
+            self.index.entry(w.attachment.clone()).or_default().push(i);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.witnesses.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.witnesses.is_empty()
+    }
+}
+
+// ---- Reducers ----
+
+/// Input to a reducer query: the attachment and an optional "point of
+/// interest" span (so narrowing-scoped reducers can pick the closest
+/// containing witness).
+#[derive(Clone)]
+pub struct ReducerQuery<'a> {
+    pub attachment: &'a WitnessAttachment,
+    pub point: Option<tree_sitter::Point>,
+    pub framework: FrameworkFact,
+    /// Resolve a sub/method symbol's return type — closure the core
+    /// installs so chain-fold can follow `ReturnOf`. `None` means the
+    /// resolver is running without an index (unit tests).
+    pub return_of: Option<&'a dyn Fn(&ReturnOfKey) -> Option<InferredType>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReturnOfKey {
+    Symbol(SymbolId),
+    Name(String),
+    /// Method on a known receiver class — the chain reducer uses this
+    /// to look up "the return of class.method" via the registry.
+    MethodOnClass { class: String, method: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReducedValue {
+    Type(InferredType),
+    FactMap(Vec<(String, FactValue)>),
+    None,
+}
+
+pub trait WitnessReducer: Send + Sync {
+    fn name(&self) -> &str;
+
+    fn claims(&self, w: &Witness) -> bool;
+
+    fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue;
+}
+
+// ---- Built-in: framework-aware type-fold reducer (Part 6) ----
+
+/// Resolver that implements Part 6's rules:
+///
+/// 1. `ClassAssertion(Foo)` dominates.
+/// 2. `FirstParamInMethod { package }` under a matching framework's
+///    backing rep is NOT dethroned by rep observations that match the
+///    backing rep (the Mojo `sub name` bug fix).
+/// 3. `BlessTarget(Rep)` pins the rep axis.
+/// 4. Rep observations with no class evidence project to the flat
+///    `HashRef` / `ArrayRef` / `CodeRef`.
+/// 5. `NumericUse` / `StringUse` / `RegexpUse` project to their types.
+pub struct FrameworkAwareTypeFold;
+
+impl WitnessReducer for FrameworkAwareTypeFold {
+    fn name(&self) -> &str {
+        "framework_aware_type_fold"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(
+            w.attachment,
+            WitnessAttachment::Variable { .. } | WitnessAttachment::Expression(_)
+        ) && matches!(
+            w.payload,
+            WitnessPayload::InferredType(_) | WitnessPayload::Observation(_)
+        )
+    }
+
+    fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
+        // Part 5b — narrowing. If the query has a `point`, pick the
+        // narrowest-span InferredType witness whose span *contains*
+        // that point; if any exists, return it directly (it already
+        // represents the post-narrowing type). Falls through to the
+        // full fold otherwise.
+        if let Some(point) = q.point {
+            let mut narrow: Option<(&Witness, u64)> = None;
+            for w in ws {
+                if let WitnessPayload::InferredType(_) = w.payload {
+                    if span_contains(&w.span, point) && !span_is_zero(&w.span) {
+                        let area = span_area(&w.span);
+                        if narrow.map(|(_, a)| area < a).unwrap_or(true) {
+                            narrow = Some((*w, area));
+                        }
+                    }
+                }
+            }
+            if let Some((w, _)) = narrow {
+                if let WitnessPayload::InferredType(t) = &w.payload {
+                    return ReducedValue::Type(t.clone());
+                }
+            }
+        }
+
+        let mut class_assertion: Option<String> = None;
+        let mut first_param_class: Option<String> = None;
+        let mut rep_obs: Option<Rep> = None;
+        let mut bless_rep: Option<Rep> = None;
+        let mut num = false;
+        let mut str_ = false;
+        let mut re = false;
+        let mut plain_type: Option<InferredType> = None;
+
+        for w in ws {
+            // Skip scoped InferredType witnesses that don't contain
+            // the query point — they're narrowing facts for a
+            // different slice of the variable's lifetime.
+            if let (Some(point), WitnessPayload::InferredType(_)) = (q.point, &w.payload) {
+                if !span_is_zero(&w.span) && !span_contains(&w.span, point) {
+                    continue;
+                }
+            }
+            match &w.payload {
+                WitnessPayload::InferredType(t) => match t {
+                    InferredType::ClassName(name) => class_assertion = Some(name.clone()),
+                    InferredType::FirstParam { package } => {
+                        first_param_class = Some(package.clone())
+                    }
+                    other => plain_type = Some(other.clone()),
+                },
+                WitnessPayload::Observation(obs) => match obs {
+                    TypeObservation::ClassAssertion(name) => class_assertion = Some(name.clone()),
+                    TypeObservation::FirstParamInMethod { package } => {
+                        first_param_class = Some(package.clone())
+                    }
+                    TypeObservation::HashRefAccess => rep_obs = merge_rep(rep_obs, Rep::Hash),
+                    TypeObservation::ArrayRefAccess => rep_obs = merge_rep(rep_obs, Rep::Array),
+                    TypeObservation::CodeRefInvocation => rep_obs = merge_rep(rep_obs, Rep::Code),
+                    TypeObservation::BlessTarget(r) => bless_rep = Some(*r),
+                    TypeObservation::NumericUse => num = true,
+                    TypeObservation::StringUse => str_ = true,
+                    TypeObservation::RegexpUse => re = true,
+                    TypeObservation::ReturnOf(sym) => {
+                        if let Some(f) = q.return_of {
+                            if let Some(t) = f(&ReturnOfKey::Symbol(*sym)) {
+                                if let InferredType::ClassName(n) = t {
+                                    class_assertion = Some(n);
+                                } else {
+                                    plain_type = Some(t);
+                                }
+                            }
+                        }
+                    }
+                    TypeObservation::ReturnOfName(n) => {
+                        if let Some(f) = q.return_of {
+                            if let Some(t) = f(&ReturnOfKey::Name(n.clone())) {
+                                if let InferredType::ClassName(nm) = t {
+                                    class_assertion = Some(nm);
+                                } else {
+                                    plain_type = Some(t);
+                                }
+                            }
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+
+        // Class axis wins when it's consistent with the rep axis.
+        if let Some(name) = class_assertion.clone().or(first_param_class.clone()) {
+            let backing = bless_rep.or_else(|| q.framework.backing_rep());
+            match (rep_obs, backing) {
+                (None, _) => return ReducedValue::Type(InferredType::ClassName(name)),
+                (Some(obs), Some(b)) if obs == b => {
+                    return ReducedValue::Type(InferredType::ClassName(name));
+                }
+                (Some(obs), None) => {
+                    // Framework says "unknown rep" (CoreClass). Rep
+                    // observation is probably wrong — warn later; keep
+                    // class.
+                    let _ = obs;
+                    return ReducedValue::Type(InferredType::ClassName(name));
+                }
+                (Some(obs), Some(b)) => {
+                    // Contradiction: class says rep is `b`, but we saw
+                    // an access as `obs`. For the spike: still return
+                    // the class — the user's intent is object-typed
+                    // use, and the rep contradiction would be a
+                    // separate diagnostic.
+                    let _ = (obs, b);
+                    return ReducedValue::Type(InferredType::ClassName(name));
+                }
+            }
+        }
+
+        // No class evidence — project rep observations directly.
+        if let Some(r) = rep_obs.or(bless_rep) {
+            return ReducedValue::Type(match r {
+                Rep::Hash => InferredType::HashRef,
+                Rep::Array => InferredType::ArrayRef,
+                Rep::Code => InferredType::CodeRef,
+                Rep::Scalar => InferredType::String,
+            });
+        }
+
+        // Scalar-context observations.
+        if re {
+            return ReducedValue::Type(InferredType::Regexp);
+        }
+        if num {
+            return ReducedValue::Type(InferredType::Numeric);
+        }
+        if str_ {
+            return ReducedValue::Type(InferredType::String);
+        }
+
+        // Fall back to any plain type witness we saw.
+        if let Some(t) = plain_type {
+            return ReducedValue::Type(t);
+        }
+        ReducedValue::None
+    }
+}
+
+fn span_contains(span: &Span, point: tree_sitter::Point) -> bool {
+    span.start <= point && point <= span.end
+}
+
+fn span_is_zero(span: &Span) -> bool {
+    span.start == span.end
+}
+
+/// "Area" measure — rows * many + cols. Used only for picking the
+/// narrowest span; overflow isn't a concern for Perl source.
+fn span_area(span: &Span) -> u64 {
+    let rows = span.end.row.saturating_sub(span.start.row) as u64;
+    if rows == 0 {
+        span.end.column.saturating_sub(span.start.column) as u64
+    } else {
+        rows * 10_000 + (span.end.column as u64)
+    }
+}
+
+fn merge_rep(existing: Option<Rep>, new: Rep) -> Option<Rep> {
+    match existing {
+        None => Some(new),
+        Some(r) if r == new => Some(r),
+        // Conflict: prefer Hash (most common). The rule shouldn't
+        // really fire; leave as an observation for later diagnostic.
+        Some(_) => Some(new),
+    }
+}
+
+// ---- Reducer registry ----
+
+#[derive(Default)]
+pub struct ReducerRegistry {
+    reducers: Vec<Box<dyn WitnessReducer>>,
+}
+
+impl ReducerRegistry {
+    pub fn new() -> Self {
+        Self { reducers: Vec::new() }
+    }
+
+    pub fn with_defaults() -> Self {
+        let mut r = Self::new();
+        r.register(Box::new(FrameworkAwareTypeFold));
+        r
+    }
+
+    pub fn register(&mut self, r: Box<dyn WitnessReducer>) {
+        self.reducers.push(r);
+    }
+
+    /// Query the registry for the first reducer that returns a
+    /// non-`None` value. For the type-fold there's only one claimant;
+    /// for fact families you'd scan all.
+    pub fn query(&self, bag: &WitnessBag, q: &ReducerQuery) -> ReducedValue {
+        for r in &self.reducers {
+            let claimed: Vec<&Witness> = bag
+                .for_attachment(q.attachment)
+                .into_iter()
+                .filter(|w| r.claims(w))
+                .collect();
+            if claimed.is_empty() {
+                continue;
+            }
+            let v = r.reduce(&claimed, q);
+            if v != ReducedValue::None {
+                return v;
+            }
+        }
+        ReducedValue::None
+    }
+}
+
+// ---------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Point;
+
+    fn p(row: usize, col: usize) -> Point {
+        Point { row, column: col }
+    }
+
+    fn span(r0: usize, c0: usize, r1: usize, c1: usize) -> Span {
+        Span { start: p(r0, c0), end: p(r1, c1) }
+    }
+
+    fn wvar(name: &str, scope: u32, payload: WitnessPayload) -> Witness {
+        Witness {
+            attachment: WitnessAttachment::Variable {
+                name: name.to_string(),
+                scope: ScopeId(scope),
+            },
+            source: WitnessSource::Builder("test".into()),
+            payload,
+            span: span(0, 0, 0, 0),
+        }
+    }
+
+    // ---- Phase 0: bag stores and retrieves ----
+
+    #[test]
+    fn witness_bag_stores_and_retrieves_by_attachment() {
+        let mut bag = WitnessBag::new();
+        bag.push(wvar(
+            "$self",
+            0,
+            WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+                package: "Foo".into(),
+            }),
+        ));
+        bag.push(wvar("$self", 0, WitnessPayload::Observation(TypeObservation::HashRefAccess)));
+        bag.push(wvar("$other", 0, WitnessPayload::Observation(TypeObservation::ArrayRefAccess)));
+
+        let att = WitnessAttachment::Variable { name: "$self".into(), scope: ScopeId(0) };
+        let hits = bag.for_attachment(&att);
+        assert_eq!(hits.len(), 2);
+    }
+
+    // ---- Part 6 core bug: Mojo sub name, blessed-hashref ----
+
+    #[test]
+    fn mojo_sub_name_does_not_flip_type_to_hashref() {
+        // `sub name { my $self = shift; return $self->{name} unless @_; … }`
+        // inside a Mojo::Base class — `$self` is blessed, and the
+        // hashref access is *backing-rep consistent* with Mojo::Base.
+        // The old flat-enum inference would overwrite ClassName with
+        // HashRef. The resolver must keep the class.
+        let mut bag = WitnessBag::new();
+        bag.push(wvar(
+            "$self",
+            0,
+            WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+                package: "Mojolicious::Routes::Route".into(),
+            }),
+        ));
+        bag.push(wvar(
+            "$self",
+            0,
+            WitnessPayload::Observation(TypeObservation::HashRefAccess),
+        ));
+
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Variable { name: "$self".into(), scope: ScopeId(0) };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::MojoBase,
+            return_of: None,
+        };
+        let v = reg.query(&bag, &q);
+        assert_eq!(
+            v,
+            ReducedValue::Type(InferredType::ClassName(
+                "Mojolicious::Routes::Route".into()
+            ))
+        );
+    }
+
+    // ---- Sanity: no class evidence — plain hash access folds to HashRef ----
+
+    #[test]
+    fn plain_hashref_access_without_class_evidence() {
+        let mut bag = WitnessBag::new();
+        bag.push(wvar(
+            "$cfg",
+            1,
+            WitnessPayload::Observation(TypeObservation::HashRefAccess),
+        ));
+
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Variable { name: "$cfg".into(), scope: ScopeId(1) };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+        };
+        assert_eq!(reg.query(&bag, &q), ReducedValue::Type(InferredType::HashRef));
+    }
+
+    // ---- Arrayref-backed class via bless target ----
+
+    #[test]
+    fn bless_target_array_with_class_assertion_keeps_class() {
+        // `bless [], $c` in scope + `$x = Foo->new` → $x is ClassName,
+        // rep is Array. Access as `$x->[0]` matches rep; class wins.
+        let mut bag = WitnessBag::new();
+        bag.push(wvar(
+            "$x",
+            2,
+            WitnessPayload::Observation(TypeObservation::ClassAssertion("Arr::Foo".into())),
+        ));
+        bag.push(wvar(
+            "$x",
+            2,
+            WitnessPayload::Observation(TypeObservation::BlessTarget(Rep::Array)),
+        ));
+        bag.push(wvar(
+            "$x",
+            2,
+            WitnessPayload::Observation(TypeObservation::ArrayRefAccess),
+        ));
+
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Variable { name: "$x".into(), scope: ScopeId(2) };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+        };
+        assert_eq!(
+            reg.query(&bag, &q),
+            ReducedValue::Type(InferredType::ClassName("Arr::Foo".into()))
+        );
+    }
+
+    // ---- CoreClass (Perl 5.38) — hashref access is a contradiction ----
+
+    #[test]
+    fn core_class_still_holds_class_against_hashref_access() {
+        // Perl 5.38 `class` uses opaque fields — `$self->{k}` inside
+        // is really a bug, but the type should stay ClassName so the
+        // rest of the chain types correctly. A separate diagnostic
+        // pass would warn.
+        let mut bag = WitnessBag::new();
+        bag.push(wvar(
+            "$self",
+            0,
+            WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+                package: "MyApp::Thing".into(),
+            }),
+        ));
+        bag.push(wvar(
+            "$self",
+            0,
+            WitnessPayload::Observation(TypeObservation::HashRefAccess),
+        ));
+
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Variable { name: "$self".into(), scope: ScopeId(0) };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::CoreClass,
+            return_of: None,
+        };
+        assert_eq!(
+            reg.query(&bag, &q),
+            ReducedValue::Type(InferredType::ClassName("MyApp::Thing".into()))
+        );
+    }
+
+    // ---- Context observations ----
+
+    // ---- Part 6 + 7 together: fluent chain via Expression-attached ReturnOf ----
+
+    #[test]
+    fn fluent_chain_get_to_resolves_via_return_of() {
+        // `$r->get('/x')->to('Y#z')` — the RefIdx for `->get(...)`'s
+        // result carries Observation::ReturnOfName("get"). The
+        // resolver walks `return_of` and finds Route.
+        let mut bag = WitnessBag::new();
+        let get_ref = RefIdx(42);
+        bag.push(Witness {
+            attachment: WitnessAttachment::Expression(get_ref),
+            source: WitnessSource::Builder("chain".into()),
+            payload: WitnessPayload::Observation(TypeObservation::ReturnOfName(
+                "get".into(),
+            )),
+            span: span(0, 0, 0, 0),
+        });
+        // Simulate the receiver of `->to`: the core resolves the
+        // invocant expression to RefIdx(42) (the `->get` call), and
+        // queries the bag for that RefIdx's type.
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Expression(get_ref);
+        let return_of = |k: &ReturnOfKey| -> Option<InferredType> {
+            match k {
+                ReturnOfKey::Name(n) if n == "get" => Some(InferredType::ClassName(
+                    "Mojolicious::Routes::Route".into(),
+                )),
+                _ => None,
+            }
+        };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: Some(&return_of),
+        };
+        assert_eq!(
+            reg.query(&bag, &q),
+            ReducedValue::Type(InferredType::ClassName(
+                "Mojolicious::Routes::Route".into()
+            ))
+        );
+    }
+
+    // ---- Part 5b — narrowing via scoped-span InferredType witnesses ----
+
+    #[test]
+    fn narrowed_span_wins_over_outer_witness_at_inside_point() {
+        // Outer scope says $v: HashRef. An `if (ref $v eq 'ARRAY')`
+        // body at rows 4..8 narrows $v to ArrayRef. A query at
+        // row=5 (inside the body) must see ArrayRef; a query at
+        // row=2 (before the if) must see HashRef.
+        let mut bag = WitnessBag::new();
+        bag.push(Witness {
+            attachment: WitnessAttachment::Variable {
+                name: "$v".into(),
+                scope: ScopeId(0),
+            },
+            source: WitnessSource::Builder("outer".into()),
+            payload: WitnessPayload::InferredType(InferredType::HashRef),
+            span: span(0, 0, 0, 0), // zero = outer / unconstrained
+        });
+        bag.push(Witness {
+            attachment: WitnessAttachment::Variable {
+                name: "$v".into(),
+                scope: ScopeId(0),
+            },
+            source: WitnessSource::Builder("narrowing".into()),
+            payload: WitnessPayload::InferredType(InferredType::ArrayRef),
+            span: span(4, 0, 8, 0),
+        });
+
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Variable { name: "$v".into(), scope: ScopeId(0) };
+
+        let inside = ReducerQuery {
+            attachment: &att,
+            point: Some(p(5, 4)),
+            framework: FrameworkFact::Plain,
+            return_of: None,
+        };
+        assert_eq!(reg.query(&bag, &inside), ReducedValue::Type(InferredType::ArrayRef));
+
+        let outside = ReducerQuery {
+            attachment: &att,
+            point: Some(p(2, 0)),
+            framework: FrameworkFact::Plain,
+            return_of: None,
+        };
+        assert_eq!(reg.query(&bag, &outside), ReducedValue::Type(InferredType::HashRef));
+    }
+
+    #[test]
+    fn numeric_then_string_prefers_numeric_noop_when_class_set() {
+        let mut bag = WitnessBag::new();
+        bag.push(wvar("$n", 0, WitnessPayload::Observation(TypeObservation::NumericUse)));
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Variable { name: "$n".into(), scope: ScopeId(0) };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+        };
+        assert_eq!(reg.query(&bag, &q), ReducedValue::Type(InferredType::Numeric));
+    }
+}

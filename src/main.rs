@@ -13,6 +13,7 @@ mod pod;
 mod query_cache;
 mod resolve;
 mod symbols;
+mod witnesses;
 
 use backend::Backend;
 use tower_lsp::{LspService, Server};

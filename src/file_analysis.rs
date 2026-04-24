@@ -893,15 +893,29 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub plugin_namespaces: Vec<PluginNamespace>,
 
-    /// Per-symbol provenance for return types. Only populated when a
-    /// type came from somewhere other than inference — in practice,
-    /// from a plugin's `overrides()` manifest. Read-only debugging
-    /// aid: features like hover/completion don't branch on it; it
-    /// exists so a future inspector can answer "why does the LSP
-    /// think this returns X?" without re-running the build.
-    /// Missing entry == `TypeProvenance::Inferred`.
+    /// Per-symbol provenance for return types. Populated for plugin
+    /// `overrides()` and (with this spike) for reducer-driven folds
+    /// over the witness bag. Missing entry == `TypeProvenance::Inferred`.
+    /// Read-only debugging aid: features like hover/completion don't
+    /// branch on it; it exists so `--dump-package` and a future
+    /// inspector can answer "why does the LSP think this returns X?"
+    /// without re-running the build.
     #[serde(default)]
     pub type_provenance: HashMap<SymbolId, TypeProvenance>,
+
+    /// Detected framework mode per package (for Part 6's resolver).
+    /// Populated by the builder when `use Moo` / `use Mojo::Base` /
+    /// `use Moose` etc. is observed. Additive: the existing framework
+    /// accessor synthesis keeps running the same code paths.
+    #[serde(default)]
+    pub package_framework: HashMap<String, crate::witnesses::FrameworkFact>,
+
+    /// Part 7 — typed-evidence bag. Additive: `type_constraints`,
+    /// `call_bindings`, `method_call_bindings` all still flow the
+    /// existing paths. Witnesses are pushed by the builder in parallel
+    /// (where useful) and consumed by `FileAnalysis::inferred_type_via_bag`.
+    #[serde(default)]
+    pub witnesses: crate::witnesses::WitnessBag,
 
     // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
     #[serde(default)]
@@ -966,6 +980,8 @@ impl FileAnalysis {
             export_ok,
             plugin_namespaces,
             type_provenance,
+            witnesses: crate::witnesses::WitnessBag::new(),
+            package_framework: HashMap::new(),
             base_type_constraint_count: 0,
             base_symbol_count: 0,
             scope_starts: Vec::new(),
@@ -1197,6 +1213,140 @@ impl FileAnalysis {
             }
         }
         best.map(|tc| &tc.inferred_type)
+    }
+
+    /// Part 6/7 — query the witness bag via the reducer registry for
+    /// a variable at a point, falling back to the legacy
+    /// `inferred_type()` when the bag has nothing. Returns owned
+    /// `InferredType` because the reducer may synthesize a value not
+    /// stored anywhere.
+    ///
+    /// Additive by design: every existing flow (`type_constraints`,
+    /// `call_bindings`, framework accessor synthesis, cross-file
+    /// enrichment) keeps writing its usual structures. Witnesses push
+    /// *additional* observations on top; if none are present the
+    /// result is identical to `inferred_type()`.
+    pub fn inferred_type_via_bag(&self, var_name: &str, point: Point) -> Option<InferredType> {
+        use crate::witnesses::{
+            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, WitnessAttachment,
+        };
+
+        // Lookup package-framework for the scope containing the point.
+        let framework = self
+            .scope_at(point)
+            .and_then(|sc| self.scopes[sc.0 as usize].package.as_ref())
+            .and_then(|pkg| self.package_framework.get(pkg).copied())
+            .unwrap_or(FrameworkFact::Plain);
+
+        // Walk up the scope chain and try each as an attachment key.
+        let scope = self.scope_at(point);
+        if let Some(start) = scope {
+            let chain = self.scope_chain(start);
+            let reg = ReducerRegistry::with_defaults();
+            for scope_id in chain {
+                let att = WitnessAttachment::Variable {
+                    name: var_name.to_string(),
+                    scope: scope_id,
+                };
+                let q = ReducerQuery {
+                    attachment: &att,
+                    point: Some(point),
+                    framework,
+                    return_of: None,
+                };
+                if let ReducedValue::Type(t) = reg.query(&self.witnesses, &q) {
+                    return Some(t);
+                }
+            }
+        }
+
+        self.inferred_type(var_name, point).cloned()
+    }
+
+    /// Part 6/7 — resolve the inferred return type of a method call
+    /// by its ref index (from `refs`). Uses the Expression-attached
+    /// witnesses seeded by the builder; the `return_of` closure looks
+    /// up `sub_return_type` by name, resolving a `FirstParam`
+    /// invocant to the method's enclosing class.
+    ///
+    /// This is the piece that makes `$r->get('/x')->to(...)` fold
+    /// across chain hops without needing an intermediate variable.
+    pub fn method_call_return_type_via_bag(&self, ref_idx: usize) -> Option<InferredType> {
+        use crate::witnesses::{
+            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, ReturnOfKey,
+            WitnessAttachment,
+        };
+
+        let att = WitnessAttachment::Expression(crate::witnesses::RefIdx(ref_idx as u32));
+        let return_of = |k: &ReturnOfKey| -> Option<InferredType> {
+            match k {
+                ReturnOfKey::Name(n) => self.sub_return_type(n).cloned(),
+                ReturnOfKey::Symbol(sym) => {
+                    self.symbols.get(sym.0 as usize).and_then(|s| {
+                        if let SymbolDetail::Sub { return_type, .. } = &s.detail {
+                            return_type.clone()
+                        } else {
+                            None
+                        }
+                    })
+                }
+                ReturnOfKey::MethodOnClass { class: _, method } => {
+                    // For the spike: name-only lookup. A follow-up
+                    // pass will thread the receiver class through
+                    // inherited resolution.
+                    self.sub_return_type(method).cloned()
+                }
+            }
+        };
+        let reg = ReducerRegistry::with_defaults();
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: Some(&return_of),
+        };
+        match reg.query(&self.witnesses, &q) {
+            ReducedValue::Type(t) => {
+                // If the return is FirstParam, surface it as the
+                // ClassName of the enclosing package — callers chain
+                // against a concrete class, not a role.
+                if let InferredType::FirstParam { package } = t {
+                    Some(InferredType::ClassName(package))
+                } else {
+                    Some(t)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Part 1 — list hash keys that have been written to on instances
+    /// of `class`. Powers dynamic-key completion: `$self->{` completes
+    /// with both `has`-declared keys and keys observed as write
+    /// targets across the class's methods.
+    pub fn mutated_keys_on_class(&self, class: &str) -> Vec<String> {
+        use crate::witnesses::{WitnessAttachment, WitnessPayload};
+        let mut out: Vec<String> = Vec::new();
+        for w in self.witnesses.all() {
+            if let WitnessAttachment::HashKey { owner, name } = &w.attachment {
+                let matches_class = match owner {
+                    HashKeyOwner::Class(c) if c == class => true,
+                    HashKeyOwner::Sub { package: Some(p), .. } if p == class => true,
+                    _ => false,
+                };
+                if !matches_class {
+                    continue;
+                }
+                if matches!(
+                    &w.payload,
+                    WitnessPayload::Fact { family, .. } if family == "mutation"
+                ) && !out.contains(name)
+                {
+                    out.push(name.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Get the return type of a named sub/method (local definitions only).
@@ -5604,6 +5754,178 @@ mod tests {
             "expected >= 2 refs to $x via refs_by_target, got {}: {:?}",
             indexed.len(),
             indexed,
+        );
+    }
+
+    // ---- Part 6/7 witness-bag integration ----
+
+    /// The spike's driving case: a Mojo::Base class whose method
+    /// reads `$self->{k}` (blessed-hashref). The legacy
+    /// `inferred_type` may flip to HashRef; the witness-based
+    /// `inferred_type_via_bag` must keep the class.
+    #[test]
+    fn test_witnesses_mojo_self_stays_class_on_hashref_access() {
+        let fa = build_fa_from_source(
+            r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+
+sub name {
+    my $self = shift;
+    return $self->{name} unless @_;
+    $self->{name} = shift;
+    $self;
+}
+        "#,
+        );
+
+        // Framework mode was detected.
+        assert_eq!(
+            fa.package_framework.get("Mojolicious::Routes::Route"),
+            Some(&crate::witnesses::FrameworkFact::MojoBase),
+            "Mojo::Base package should record MojoBase framework"
+        );
+
+        // Witness bag has entries for $self.
+        let self_wits: Vec<_> = fa
+            .witnesses
+            .all()
+            .iter()
+            .filter(|w| matches!(&w.attachment,
+                crate::witnesses::WitnessAttachment::Variable { name, .. } if name == "$self"))
+            .collect();
+        assert!(
+            !self_wits.is_empty(),
+            "expected witnesses for $self, got none (bag size: {})",
+            fa.witnesses.len()
+        );
+
+        // Find the body of `sub name` and pick a point inside it.
+        // The `$self->{name} unless @_;` line is row 5 (0-indexed).
+        let point_in_body = Point { row: 5, column: 15 };
+        let t = fa.inferred_type_via_bag("$self", point_in_body);
+        assert!(
+            matches!(t, Some(InferredType::ClassName(ref n)) if n == "Mojolicious::Routes::Route"),
+            "via-bag type at body point should be ClassName(Route), got {:?}",
+            t
+        );
+    }
+
+    /// Part 7 fluent-chain: `$r->get('/x')->to('Y#z')` — the `->to`
+    /// call has an invocant expression that's itself a method call.
+    /// The bag lets us ask "what's the return type of ref[i]?" without
+    /// needing a named intermediate variable. Verifies the seed is
+    /// present and chains name-lookup via the `return_of` hook.
+    #[test]
+    fn test_witnesses_fluent_chain_seeds_expression_witnesses() {
+        let fa = build_fa_from_source(
+            r#"
+package MyApp::Route;
+sub get  { my $self = shift; return $self; }
+sub to   { my $self = shift; return $self; }
+
+package main;
+my $r = MyApp::Route->new;
+$r->get('/x')->to('Y#z');
+        "#,
+        );
+
+        // Expected: Expression-attached witnesses for each method
+        // call. At minimum: one for `->new`, one for `->get`, one for
+        // `->to`.
+        let expr_wits: Vec<_> = fa
+            .witnesses
+            .all()
+            .iter()
+            .filter(|w| matches!(w.attachment, crate::witnesses::WitnessAttachment::Expression(_)))
+            .collect();
+        assert!(
+            expr_wits.len() >= 3,
+            "expected >= 3 Expression witnesses (new, get, to), got {}",
+            expr_wits.len()
+        );
+
+        // Find the `->get` ref by name.
+        let get_ref_idx = fa
+            .refs
+            .iter()
+            .position(|r| {
+                matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "get"
+            })
+            .expect("->get ref should exist");
+
+        // Querying the bag for the get-call's return should yield
+        // MyApp::Route (since its return is `return $self`, which is
+        // FirstParam → ClassName projection).
+        let t = fa.method_call_return_type_via_bag(get_ref_idx);
+        assert!(
+            matches!(t, Some(InferredType::ClassName(ref n)) if n == "MyApp::Route"),
+            "->get's return type via bag should be ClassName(MyApp::Route), got {:?}",
+            t
+        );
+    }
+
+    /// Part 1 — mutated keys on the class. Write-access HashKeyAccess
+    /// refs push mutation facts; the helper returns them for dynamic-
+    /// key completion.
+    #[test]
+    fn test_witnesses_mutated_keys_on_mojo_class() {
+        let fa = build_fa_from_source(
+            r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+
+sub boot {
+    my $self = shift;
+    $self->{name}    = 'root';
+    $self->{custom}  = 42;
+    $self->{counter} = 0;
+    return $self;
+}
+        "#,
+        );
+
+        let mut keys = fa.mutated_keys_on_class("Mojolicious::Routes::Route");
+        keys.sort();
+        // Depending on how owners resolve (Class vs Sub), we expect at
+        // least two of the three writes to surface. Exact set is a
+        // function of HashKeyOwner resolution, which isn't in scope
+        // for this spike — just assert the helper plumbs through and
+        // something lands.
+        assert!(
+            !keys.is_empty(),
+            "expected some mutated keys for Mojolicious::Routes::Route, got {:?} \
+             (hash-key witnesses in bag: {})",
+            keys,
+            fa.witnesses
+                .all()
+                .iter()
+                .filter(|w| matches!(
+                    &w.attachment,
+                    crate::witnesses::WitnessAttachment::HashKey { .. }
+                ))
+                .count(),
+        );
+    }
+
+    /// Non-Mojo class without any framework mode: hashref-only access
+    /// with no class assertion should still fold to HashRef (the bag
+    /// mirror of the current flat behavior).
+    #[test]
+    fn test_witnesses_plain_hashref_without_class_evidence() {
+        let fa = build_fa_from_source(
+            r#"
+my $cfg = { host => 'localhost' };
+my $host = $cfg->{host};
+        "#,
+        );
+
+        let point = Point { row: 2, column: 20 };
+        let t = fa.inferred_type_via_bag("$cfg", point);
+        assert_eq!(
+            t,
+            Some(InferredType::HashRef),
+            "without class evidence, $cfg is plain HashRef"
         );
     }
 }

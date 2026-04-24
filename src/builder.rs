@@ -134,7 +134,24 @@ pub fn build_with_plugins(
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
     b.resolve_tail_pod_docs();
 
-    FileAnalysis::new(
+    // Part 6/7 — publish framework-mode facts for the witness-based
+    // resolver. Additive: the existing framework accessor synthesis
+    // already consumed `framework_modes` above; this just exposes the
+    // same decision to the query layer.
+    let package_framework: std::collections::HashMap<String, crate::witnesses::FrameworkFact> = b
+        .framework_modes
+        .iter()
+        .map(|(pkg, mode)| {
+            let ff = match mode {
+                FrameworkMode::Moo => crate::witnesses::FrameworkFact::Moo,
+                FrameworkMode::Moose => crate::witnesses::FrameworkFact::Moose,
+                FrameworkMode::MojoBase => crate::witnesses::FrameworkFact::MojoBase,
+            };
+            (pkg.clone(), ff)
+        })
+        .collect();
+
+    let mut fa = FileAnalysis::new(
         b.scopes,
         b.symbols,
         b.refs,
@@ -150,7 +167,155 @@ pub fn build_with_plugins(
         b.plugin_namespaces,
         b.package_uses,
         b.type_provenance,
-    )
+    );
+    fa.package_framework = package_framework;
+
+    // Part 7 — seed witnesses from the existing analysis. Additive: we
+    // just mirror the already-computed TypeConstraints into the bag so
+    // reducer-based queries have something to fold. Future builder
+    // passes will emit richer observations (HashRefAccess, ReturnOf,
+    // narrowing) directly.
+    seed_witnesses_from_analysis(&mut fa);
+    fa
+}
+
+/// Mirror existing `type_constraints` as `InferredType`-payload
+/// witnesses so `FileAnalysis::inferred_type_via_bag` can answer
+/// queries. This is the minimal bootstrap — it doesn't add any facts
+/// the flat path didn't already have.
+fn seed_witnesses_from_analysis(fa: &mut FileAnalysis) {
+    use crate::witnesses::{
+        TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+    };
+
+    for tc in fa.type_constraints.clone() {
+        // Seed witnesses carry a zero-span so the narrowing filter
+        // doesn't drop them — they apply throughout the scope from
+        // the declaration onward, same as the legacy `inferred_type`
+        // path. Narrowing witnesses (future) will use real spans.
+        fa.witnesses.push(Witness {
+            attachment: WitnessAttachment::Variable {
+                name: tc.variable.clone(),
+                scope: tc.scope,
+            },
+            source: WitnessSource::Builder("type_constraint".into()),
+            payload: WitnessPayload::InferredType(tc.inferred_type.clone()),
+            span: Span { start: tc.constraint_span.start, end: tc.constraint_span.start },
+        });
+
+        // When a constraint says "this variable is an instance of a
+        // known class", also emit a ClassAssertion observation so the
+        // framework-aware resolver's `class_assertion` branch fires.
+        match tc.inferred_type {
+            InferredType::ClassName(ref n) => {
+                fa.witnesses.push(Witness {
+                    attachment: WitnessAttachment::Variable {
+                        name: tc.variable.clone(),
+                        scope: tc.scope,
+                    },
+                    source: WitnessSource::Builder("type_constraint".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(
+                        n.clone(),
+                    )),
+                    span: tc.constraint_span,
+                });
+            }
+            InferredType::FirstParam { ref package } => {
+                fa.witnesses.push(Witness {
+                    attachment: WitnessAttachment::Variable {
+                        name: tc.variable.clone(),
+                        scope: tc.scope,
+                    },
+                    source: WitnessSource::Builder("type_constraint".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+                        package: package.clone(),
+                    }),
+                    span: tc.constraint_span,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Scan refs for HashRefAccess observations against their container
+    // variable. This is the Part 6 "we saw $self->{k}" fact.
+    let mut hash_obs: Vec<(String, ScopeId, Span)> = Vec::new();
+    // Scan refs for method calls to emit Expression-attached witnesses
+    // so fluent chains (`$r->get('/x')->to('Y#z')`) can resolve
+    // `->to`'s receiver via the bag — the case that procedural
+    // multi-dispatch + ternary descent blocked today.
+    let mut method_exprs: Vec<(usize, String, Span)> = Vec::new();
+    for (i, r) in fa.refs.iter().enumerate() {
+        match &r.kind {
+            RefKind::HashKeyAccess { var_text, .. } => {
+                if var_text.starts_with('$') {
+                    hash_obs.push((var_text.clone(), r.scope, r.span));
+                }
+            }
+            RefKind::MethodCall { .. } => {
+                method_exprs.push((i, r.target_name.clone(), r.span));
+            }
+            _ => {}
+        }
+    }
+    for (var, scope, span) in hash_obs {
+        fa.witnesses.push(Witness {
+            attachment: WitnessAttachment::Variable { name: var, scope },
+            source: WitnessSource::Builder("hash_ref_access".into()),
+            payload: WitnessPayload::Observation(TypeObservation::HashRefAccess),
+            span,
+        });
+    }
+    for (idx, method, span) in method_exprs {
+        fa.witnesses.push(Witness {
+            attachment: WitnessAttachment::Expression(crate::witnesses::RefIdx(idx as u32)),
+            source: WitnessSource::Builder("method_call_return".into()),
+            payload: WitnessPayload::Observation(TypeObservation::ReturnOfName(method)),
+            span,
+        });
+    }
+
+    // Part 1 — invocant mutations. For every HashKeyAccess ref whose
+    // access kind is Write and whose owner is a Class or Sub, attach a
+    // `mutation` fact witness to that HashKey. Powers dynamic-key
+    // completion for `$self->{` and narrow-type inference for writes.
+    let mut mutations: Vec<(HashKeyOwner, String, Span)> = Vec::new();
+    for r in &fa.refs {
+        if let (RefKind::HashKeyAccess { owner, var_text }, AccessKind::Write) =
+            (&r.kind, r.access)
+        {
+            let resolved_owner = match owner {
+                Some(o @ (HashKeyOwner::Class(_) | HashKeyOwner::Sub { .. })) => Some(o.clone()),
+                _ => {
+                    // Fallback: if the access is on `$self` inside a
+                    // package scope, attribute the mutation to that
+                    // class. This is the common "no `has` declared,
+                    // just assigned" case.
+                    if var_text == "$self" {
+                        let scope = &fa.scopes[r.scope.0 as usize];
+                        scope.package.clone().map(HashKeyOwner::Class)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(o) = resolved_owner {
+                mutations.push((o, r.target_name.clone(), r.span));
+            }
+        }
+    }
+    for (owner, key, span) in mutations {
+        fa.witnesses.push(Witness {
+            attachment: WitnessAttachment::HashKey { owner, name: key.clone() },
+            source: WitnessSource::Builder("invocant_mutation".into()),
+            payload: WitnessPayload::Fact {
+                family: "mutation".into(),
+                key: "written_at".into(),
+                value: crate::witnesses::FactValue::Str(key),
+            },
+            span,
+        });
+    }
 }
 
 /// A return value type collected during the walk, before post-pass resolution.
@@ -3990,6 +4155,12 @@ impl<'a> Builder<'a> {
         // Record the hash variable access
         let var_text = self.get_hash_var_from_element(node);
 
+        // Distinguish read vs write by asking determine_access on the
+        // element node itself — `$self->{k} = ...` has this element as
+        // the LHS of an assignment, so the grandparent check returns
+        // Write. Needed for Part 1 (invocant mutations).
+        let element_access = self.determine_access(node);
+
         // Record the key access
         if let Some(key_node) = node.child_by_field_name("key") {
             if let Some((key_text, is_dynamic)) = self.extract_key_text(key_node) {
@@ -4001,7 +4172,7 @@ impl<'a> Builder<'a> {
                         },
                         node_to_span(key_node),
                         key_text,
-                        AccessKind::Read,
+                        element_access,
                     );
                 }
             }
