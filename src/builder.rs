@@ -67,6 +67,7 @@ pub fn build_with_plugins(
         export_ok: Vec::new(),
         plugin_namespaces: Vec::new(),
         type_provenance: std::collections::HashMap::new(),
+        pending_witnesses: Vec::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -151,6 +152,7 @@ pub fn build_with_plugins(
         })
         .collect();
 
+    let pending_witnesses = std::mem::take(&mut b.pending_witnesses);
     let mut fa = FileAnalysis::new(
         b.scopes,
         b.symbols,
@@ -176,6 +178,14 @@ pub fn build_with_plugins(
     // passes will emit richer observations (HashRefAccess, ReturnOf,
     // narrowing) directly.
     seed_witnesses_from_analysis(&mut fa);
+
+    // Drain witnesses emitted during the walk by idiom detectors
+    // (branch arms, arity gating, …). These need the CST, so they
+    // can't live in the seed pass.
+    for w in pending_witnesses {
+        fa.witnesses.push(w);
+    }
+
     fa
 }
 
@@ -315,6 +325,78 @@ fn seed_witnesses_from_analysis(fa: &mut FileAnalysis) {
             },
             span,
         });
+    }
+}
+
+/// Which arity branch a `return_expression` represents. Computed
+/// from the shape of the return's parent in the CST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArityBranch {
+    /// `return X unless @_;` — fires when the caller passed zero
+    /// additional args.
+    Zero,
+    /// Fall-through `return X;` with no condition wrapper — fires
+    /// when no earlier arity-gated branch matched.
+    Default,
+}
+
+/// Inspect the `return_expression`'s parent. If it's a
+/// `postfix_conditional_expression` with `@_` as the condition, we
+/// look at the connector keyword (`if` vs `unless`) to decide. If
+/// it's a bare expression_statement, this is a default branch.
+///
+/// Known idioms (spike shortlist):
+///   - `return X unless @_;`       → Zero
+///   - `return X;`                  → Default
+///
+/// Unknowns (return None and punt):
+///   - `return X if @_;`            (arity >= 1 narrowing)
+///   - `return X if @_ == N;`       (exact N)
+///   - `return X if scalar @_ …;`   (scalar wrapper)
+fn classify_arity_branch(return_node: tree_sitter::Node, source: &[u8]) -> Option<ArityBranch> {
+    let Some(parent) = return_node.parent() else { return None };
+    match parent.kind() {
+        "expression_statement" => {
+            // Only count returns at the sub body's top level as
+            // Default arity. A return inside `if { return X }` is a
+            // branch arm (handled by BranchArm), not a default-branch
+            // arity fact.
+            let Some(grandparent) = parent.parent() else { return None };
+            if grandparent.kind() != "block" {
+                return None;
+            }
+            if let Some(ggp) = grandparent.parent() {
+                match ggp.kind() {
+                    "subroutine_declaration_statement"
+                    | "method_declaration_statement"
+                    | "anonymous_subroutine_expression" => Some(ArityBranch::Default),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        "postfix_conditional_expression" => {
+            let cond = parent.child_by_field_name("condition")?;
+            let cond_text = cond.utf8_text(source).ok()?.trim();
+            if cond_text != "@_" {
+                return None;
+            }
+            // Read the raw tokens between the return and the
+            // condition to distinguish `if` vs `unless`.
+            let between_start = return_node.end_byte();
+            let between_end = cond.start_byte();
+            if between_end <= between_start {
+                return None;
+            }
+            let between = std::str::from_utf8(&source[between_start..between_end]).ok()?;
+            if between.contains("unless") {
+                Some(ArityBranch::Zero)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -499,10 +581,15 @@ struct Builder<'a> {
     /// `EmitAction::PluginNamespace`. Flushed into the final
     /// `FileAnalysis.plugin_namespaces`.
     plugin_namespaces: Vec<crate::file_analysis::PluginNamespace>,
-    /// Per-symbol provenance for return types — empty unless an
-    /// `overrides()` manifest patched a Sub/Method's return type.
+    /// Per-symbol provenance for return types. Populated by plugin
+    /// `overrides()` (PluginOverride) and by reducer-driven folds
+    /// (ReducerFold). Empty entry == `TypeProvenance::Inferred`.
     /// Flushed into `FileAnalysis.type_provenance` at construction.
     type_provenance: std::collections::HashMap<SymbolId, TypeProvenance>,
+    /// Witnesses emitted during the walk — drained into
+    /// `FileAnalysis.witnesses` at finalization. Populated by idiom
+    /// detectors (branch arms, arity gating, …) that need the CST.
+    pending_witnesses: Vec<crate::witnesses::Witness>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -1377,7 +1464,7 @@ impl<'a> Builder<'a> {
                     let ret_type = self.infer_return_value_type(node);
                     self.return_infos.push(ReturnInfo {
                         scope,
-                        inferred_type: ret_type,
+                        inferred_type: ret_type.clone(),
                     });
                     // If the return body is `return other()` (a direct call),
                     // record the delegation so hash-key ownership can walk
@@ -1387,6 +1474,16 @@ impl<'a> Builder<'a> {
                             self.sub_return_delegations.insert(sub_name, delegated);
                         }
                     }
+                    // Arity dispatch: detect `return X unless @_` /
+                    // `return X if @_` / bare `return X` and emit an
+                    // ArityReturn observation on the sub symbol.
+                    self.emit_arity_return_if_applicable(node, scope, ret_type.clone());
+                    // If-arm BranchArm: if this return is inside a
+                    // `conditional_statement` (an `if`/`elsif`/`else`
+                    // arm), emit a BranchArm observation on the sub's
+                    // Symbol. Ternary into a variable uses the same
+                    // reducer via the assignment path.
+                    self.emit_branch_arm_for_if_arm_return(node, scope, ret_type);
                 }
                 self.visit_children(node);
             }
@@ -2725,6 +2822,17 @@ impl<'a> Builder<'a> {
                 self.visit_variable_decl(left);
             }
             if let Some(right) = node.child_by_field_name("right") {
+                // Branch-arm detection: if RHS is a ternary, emit one
+                // BranchArm witness per arm on the LHS variable. The
+                // reducer folds them (agreement → type; disagreement
+                // → None — future: Union). Same reduction works for
+                // explicit if/else return arms (see resolve_return_types).
+                if right.kind() == "conditional_expression" {
+                    if let Some(vt) = self.get_var_text_from_lhs(left) {
+                        self.emit_branch_arm_witnesses_for_ternary(&vt, right, node);
+                    }
+                }
+
                 // Try constructor class first, then literal types, then expression type
                 let inferred = self.infer_expression_type(right, false)
                     .or_else(|| self.infer_expression_result_type(right));
@@ -2797,6 +2905,179 @@ impl<'a> Builder<'a> {
     /// Infer type from an expression node: literals, constructors, sub-body last expr.
     /// When `unwrap_sub_body` is true (Mojo default context), recurses into sub bodies.
     /// When false (literal/return context), anonymous subs return CodeRef.
+    /// Emit a BranchArm observation on the enclosing sub's Symbol
+    /// when this `return_expression` is inside a
+    /// `conditional_statement` arm (if / elsif / else). Reuses the
+    /// same reduction as ternary descent — agreement → type;
+    /// disagreement → None.
+    fn emit_branch_arm_for_if_arm_return(
+        &mut self,
+        return_node: Node<'a>,
+        scope: ScopeId,
+        ret_type: Option<InferredType>,
+    ) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        let Some(ty) = ret_type else { return };
+        // Walk up: expression_statement → block → conditional_statement.
+        let mut cur = return_node;
+        let mut seen_conditional = false;
+        for _ in 0..4 {
+            match cur.parent() {
+                Some(p) => {
+                    if p.kind() == "conditional_statement" || p.kind() == "else" {
+                        seen_conditional = true;
+                        break;
+                    }
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        if !seen_conditional {
+            return;
+        }
+        let Some(sub_name) = self.enclosing_sub_name() else { return };
+        let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) else { return };
+        self.pending_witnesses.push(Witness {
+            attachment: WitnessAttachment::Symbol(sym_id),
+            source: WitnessSource::Builder("branch_arm".into()),
+            payload: WitnessPayload::Observation(TypeObservation::BranchArm(ty)),
+            span: node_to_span(return_node),
+        });
+    }
+
+    /// Arity-dispatch emission (Part 6b). Inspects `return_expression`'s
+    /// parent for a `postfix_conditional_expression` wrapping it. If
+    /// the condition is `@_` and the keyword is `unless`, this is the
+    /// arity-0 branch. If the return is bare (no wrapper), this is
+    /// the fall-through / default branch.
+    ///
+    /// Emits `ArityReturn` observations on the enclosing sub's
+    /// SymbolId. Resolution: the sub's symbol is created at
+    /// declaration time — we scan `self.symbols` by name + scope.
+    fn emit_arity_return_if_applicable(
+        &mut self,
+        return_node: Node<'a>,
+        scope: ScopeId,
+        ret_type: Option<InferredType>,
+    ) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+
+        let Some(ty) = ret_type else { return };
+
+        let arity = classify_arity_branch(return_node, self.source);
+        let Some(arity_kind) = arity else { return };
+
+        let Some(sub_name) = self.enclosing_sub_name() else { return };
+        // Scope containing the return is a nested block or sub scope;
+        // walk up to find the Sub scope itself, whose parent is where
+        // the Sub Symbol was declared.
+        let sub_sym_id = self.find_sub_symbol_for(&sub_name, scope);
+        let Some(sym_id) = sub_sym_id else { return };
+
+        let arg_count = match arity_kind {
+            ArityBranch::Zero => Some(0u32),
+            ArityBranch::Default => None,
+        };
+        self.pending_witnesses.push(Witness {
+            attachment: WitnessAttachment::Symbol(sym_id),
+            source: WitnessSource::Builder("arity_detection".into()),
+            payload: WitnessPayload::Observation(TypeObservation::ArityReturn {
+                arg_count,
+                return_type: ty,
+            }),
+            span: node_to_span(return_node),
+        });
+    }
+
+    /// Locate the SymbolId for a Sub/Method named `name` whose body's
+    /// inner scope is (an ancestor of) `body_scope`. Scans
+    /// `self.symbols` for a matching Sub symbol.
+    fn find_sub_symbol_for(&self, name: &str, body_scope: ScopeId) -> Option<SymbolId> {
+        // Walk up the scope chain; the Sub scope's own span contains
+        // the return. We need the symbol whose selection_span matches
+        // the sub name.
+        let mut cursor = Some(body_scope);
+        while let Some(sid) = cursor {
+            let s = &self.scopes[sid.0 as usize];
+            if let ScopeKind::Sub { name: n } | ScopeKind::Method { name: n } = &s.kind {
+                if n == name {
+                    // Find the symbol whose enclosing-scope parent
+                    // declared it (sym.scope == s.parent) OR the
+                    // symbol's scope equals this one.
+                    for sym in &self.symbols {
+                        if sym.name == name
+                            && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                            && sym.span.start <= s.span.start
+                            && s.span.end <= sym.span.end
+                        {
+                            return Some(sym.id);
+                        }
+                    }
+                    return None;
+                }
+            }
+            cursor = s.parent;
+        }
+        None
+    }
+
+    /// Ternary-arm emission (Part 6 / Part 5b). Walks the consequent
+    /// and alternative of a `conditional_expression`, pushes one
+    /// `BranchArm` observation per arm onto the binding variable's
+    /// attachment. The reducer handles agreement / disagreement.
+    ///
+    /// Reused idiom: explicit if/else return arms follow the same
+    /// shape — see `emit_branch_arm_witnesses_for_return_branches`
+    /// (called from the return-type resolution pass).
+    fn emit_branch_arm_witnesses_for_ternary(
+        &mut self,
+        lhs_var: &str,
+        cond_expr: Node<'a>,
+        context: Node<'a>,
+    ) {
+        let consequent = cond_expr.child_by_field_name("consequent");
+        let alternative = cond_expr.child_by_field_name("alternative");
+        let scope = self.current_scope();
+        let span = node_to_span(context);
+        for arm in [consequent, alternative].into_iter().flatten() {
+            // Infer the arm's type; if we can't, emit an Unknown
+            // observation isn't useful — just skip. This matches how
+            // the legacy path handles "I don't know" (no constraint).
+            let ty = self
+                .infer_expression_type(arm, false)
+                .or_else(|| self.infer_expression_result_type(arm));
+            if let Some(t) = ty {
+                self.push_branch_arm_witness(lhs_var, scope, span, t);
+            }
+        }
+    }
+
+    fn push_branch_arm_witness(
+        &mut self,
+        lhs_var: &str,
+        scope: ScopeId,
+        span: Span,
+        ty: InferredType,
+    ) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        self.pending_witnesses.push(Witness {
+            attachment: WitnessAttachment::Variable {
+                name: lhs_var.to_string(),
+                scope,
+            },
+            source: WitnessSource::Builder("branch_arm".into()),
+            payload: WitnessPayload::Observation(TypeObservation::BranchArm(ty)),
+            span,
+        });
+    }
+
     fn infer_expression_type(&self, node: Node<'a>, unwrap_sub_body: bool) -> Option<InferredType> {
         match node.kind() {
             "string_literal" | "interpolated_string_literal" => Some(InferredType::String),

@@ -1253,6 +1253,7 @@ impl FileAnalysis {
                     point: Some(point),
                     framework,
                     return_of: None,
+            arity_hint: None,
                 };
                 if let ReducedValue::Type(t) = reg.query(&self.witnesses, &q) {
                     return Some(t);
@@ -1304,6 +1305,7 @@ impl FileAnalysis {
             point: None,
             framework: FrameworkFact::Plain,
             return_of: Some(&return_of),
+            arity_hint: None,
         };
         match reg.query(&self.witnesses, &q) {
             ReducedValue::Type(t) => {
@@ -1318,6 +1320,46 @@ impl FileAnalysis {
             }
             _ => None,
         }
+    }
+
+    /// Part 6b — resolve a sub's return type at a call site given
+    /// the caller's arg count. Queries the arity-dispatch reducer; if
+    /// no arity fact exists, falls back to the declared /
+    /// inferred-from-returns `sub_return_type`.
+    ///
+    /// `arity` is the number of *additional* args passed after the
+    /// invocant on methods (or simply the arg count for plain subs).
+    pub fn sub_return_type_at_arity(
+        &self,
+        sub_name: &str,
+        arity: Option<u32>,
+    ) -> Option<InferredType> {
+        use crate::witnesses::{
+            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, WitnessAttachment,
+        };
+
+        // Find the sub's SymbolId.
+        let sym_id = self
+            .symbols
+            .iter()
+            .find(|s| {
+                s.name == sub_name && matches!(s.kind, SymKind::Sub | SymKind::Method)
+            })
+            .map(|s| s.id)?;
+
+        let att = WitnessAttachment::Symbol(sym_id);
+        let reg = ReducerRegistry::with_defaults();
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+            arity_hint: arity,
+        };
+        if let ReducedValue::Type(t) = reg.query(&self.witnesses, &q) {
+            return Some(t);
+        }
+        self.sub_return_type(sub_name).cloned()
     }
 
     /// Part 1 — list hash keys that have been written to on instances
@@ -5905,6 +5947,148 @@ sub boot {
                     crate::witnesses::WitnessAttachment::HashKey { .. }
                 ))
                 .count(),
+        );
+    }
+
+    /// Ternary: `my $n = $c ? 1 : 2;` → both arms are Numeric, so
+    /// the fold via the bag yields Numeric.
+    #[test]
+    fn test_witnesses_ternary_agreeing_arms_yield_type() {
+        let fa = build_fa_from_source(
+            r#"
+my $c = 1;
+my $n = $c ? 10 : 20;
+my $s = $c ? "a" : "b";
+my $x = $c ? 10 : "oops";
+        "#,
+        );
+
+        // $n: both arms Numeric.
+        let p_n = Point { row: 2, column: 22 };
+        let t_n = fa.inferred_type_via_bag("$n", p_n);
+        assert_eq!(t_n, Some(InferredType::Numeric), "agreeing numeric arms");
+
+        // $s: both arms String.
+        let p_s = Point { row: 3, column: 22 };
+        let t_s = fa.inferred_type_via_bag("$s", p_s);
+        assert_eq!(t_s, Some(InferredType::String), "agreeing string arms");
+
+        // $x: disagreeing — reducer returns None. The legacy
+        // fallback doesn't handle ternaries either, so overall None.
+        let p_x = Point { row: 4, column: 22 };
+        let t_x = fa.inferred_type_via_bag("$x", p_x);
+        assert_eq!(
+            t_x, None,
+            "disagreeing arms: bag returns None, legacy has no answer"
+        );
+    }
+
+    /// Explicit if/else return arms use the same BranchArm reduction
+    /// as ternary. `sub pick { if ($c) { return 10 } else { return 20 } }`
+    /// — both arms Numeric, so the reducer returns Numeric for the
+    /// sub's return type.
+    #[test]
+    fn test_witnesses_if_else_branch_arm_on_sub() {
+        let fa = build_fa_from_source(
+            r#"
+sub pick {
+    my $c = shift;
+    if ($c) { return 10 }
+    else    { return 20 }
+}
+
+sub mix {
+    my $c = shift;
+    if ($c) { return 10 }
+    else    { return "nope" }
+}
+        "#,
+        );
+
+        // Find the `pick` sub's symbol.
+        let pick_sym = fa
+            .symbols
+            .iter()
+            .find(|s| s.name == "pick" && matches!(s.kind, SymKind::Sub))
+            .expect("sub pick");
+        let mix_sym = fa
+            .symbols
+            .iter()
+            .find(|s| s.name == "mix" && matches!(s.kind, SymKind::Sub))
+            .expect("sub mix");
+
+        // Query the bag for the sub's Symbol attachment, expect the
+        // BranchArmFold to produce Numeric for `pick` and None for
+        // `mix` (disagreement).
+        use crate::witnesses::{
+            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, WitnessAttachment,
+        };
+        let reg = ReducerRegistry::with_defaults();
+
+        let att_p = WitnessAttachment::Symbol(pick_sym.id);
+        let q_p = ReducerQuery {
+            attachment: &att_p,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+            arity_hint: None,
+        };
+        assert_eq!(
+            reg.query(&fa.witnesses, &q_p),
+            ReducedValue::Type(InferredType::Numeric),
+            "pick: both arms Numeric → Numeric"
+        );
+
+        let att_m = WitnessAttachment::Symbol(mix_sym.id);
+        let q_m = ReducerQuery {
+            attachment: &att_m,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+            arity_hint: None,
+        };
+        assert_eq!(
+            reg.query(&fa.witnesses, &q_m),
+            ReducedValue::None,
+            "mix: disagreement (Numeric vs String) → None"
+        );
+    }
+
+    /// Part 6b — fluent arity dispatch. Two unambiguous return
+    /// types on either side of `unless @_` — arity 0 vs default
+    /// return different types. Verifies the reducer picks correctly.
+    #[test]
+    fn test_witnesses_fluent_arity_dispatch_literal_returns() {
+        let fa = build_fa_from_source(
+            r#"
+package MyApp::Route;
+
+sub name {
+    my $self = shift;
+    return "configured" unless @_;
+    return 42;
+}
+        "#,
+        );
+
+        let t0 = fa.sub_return_type_at_arity("name", Some(0));
+        let t1 = fa.sub_return_type_at_arity("name", Some(1));
+        let td = fa.sub_return_type_at_arity("name", None);
+
+        assert_eq!(
+            t0,
+            Some(InferredType::String),
+            "arity=0 fires the `unless @_` branch (String return)"
+        );
+        assert_eq!(
+            t1,
+            Some(InferredType::Numeric),
+            "arity=1 falls through to default branch (Numeric return)"
+        );
+        assert_eq!(
+            td,
+            Some(InferredType::Numeric),
+            "no arity hint also falls through to default"
         );
     }
 

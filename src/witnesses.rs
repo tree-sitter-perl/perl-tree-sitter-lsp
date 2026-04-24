@@ -89,7 +89,13 @@ pub enum WitnessPayload {
 /// framework-aware resolver. These do NOT commit to a concrete type;
 /// the resolver projects them to `InferredType` using framework
 /// context.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Hash/Eq are intentionally NOT derived here — `InferredType` is
+/// `PartialEq` but not `Hash`, and `TypeObservation::BranchArm`
+/// needs to carry one. Attachment-keyed indexing uses
+/// `WitnessAttachment`, not the payload, so Hash on the observation
+/// itself isn't needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeObservation {
     /// `my $x = Foo->new` or direct `InferredType::ClassName(_)` assertion.
     ClassAssertion(String),
@@ -111,6 +117,16 @@ pub enum TypeObservation {
     /// Same as ReturnOf but by name — handy before symbol resolution
     /// runs or for cross-file.
     ReturnOfName(String),
+    /// One arm of a branching expression whose result flows into the
+    /// attached subject. Both ternary `A ? B : C` and explicit
+    /// `if/unless/elsif/else` return branches use this — the builder
+    /// emits one observation per arm. The branch reducer folds them:
+    /// agreement → that type; disagreement → None (future: Union).
+    BranchArm(InferredType),
+    /// A single arity-dispatch fact: for arity `arg_count`, the sub
+    /// returns `return_type`. `None` for `arg_count` means the
+    /// fall-through / default branch. Attached to a `Symbol(sub_id)`.
+    ArityReturn { arg_count: Option<u32>, return_type: InferredType },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -228,6 +244,10 @@ pub struct ReducerQuery<'a> {
     /// installs so chain-fold can follow `ReturnOf`. `None` means the
     /// resolver is running without an index (unit tests).
     pub return_of: Option<&'a dyn Fn(&ReturnOfKey) -> Option<InferredType>>,
+    /// Arity hint for arity-dispatch reducers. `Some(N)` = caller
+    /// passed exactly N additional arguments to the sub; `None` =
+    /// unknown — the reducer should return the default branch's type.
+    pub arity_hint: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +304,26 @@ impl WitnessReducer for FrameworkAwareTypeFold {
     }
 
     fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
+        // Ternary descent: if any BranchArm observations are present
+        // on this attachment, collect them. Agreement → that type.
+        // Disagreement → None (lets the caller surface it as ambiguous
+        // rather than silently picking an arm).
+        let ternary_arms: Vec<&InferredType> = ws
+            .iter()
+            .filter_map(|w| match &w.payload {
+                WitnessPayload::Observation(TypeObservation::BranchArm(t)) => Some(t),
+                _ => None,
+            })
+            .collect();
+        if !ternary_arms.is_empty() {
+            let first = ternary_arms[0];
+            if ternary_arms.iter().all(|t| *t == first) {
+                return ReducedValue::Type(first.clone());
+            }
+            // Disagreement — Union support is a separate reducer.
+            return ReducedValue::None;
+        }
+
         // Part 5b — narrowing. If the query has a `point`, pick the
         // narrowest-span InferredType witness whose span *contains*
         // that point; if any exists, return it directly (it already
@@ -356,6 +396,15 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                                 }
                             }
                         }
+                    }
+                    TypeObservation::BranchArm(_) => {
+                        // Handled above in the ternary-descent block;
+                        // if we reach here, the ternary path was
+                        // skipped (no arms detected), so just fall
+                        // through as a plain InferredType.
+                    }
+                    TypeObservation::ArityReturn { .. } => {
+                        // Arity dispatch is a separate reducer.
                     }
                     TypeObservation::ReturnOfName(n) => {
                         if let Some(f) = q.return_of {
@@ -458,6 +507,100 @@ fn merge_rep(existing: Option<Rep>, new: Rep) -> Option<Rep> {
     }
 }
 
+// ---- Branch-arm fold reducer (ternary + explicit if/else arms) ----
+
+/// Generic branch-arm reduction: collects `BranchArm` observations
+/// across any attachment kind (Variable, Symbol, Expression). Same
+/// semantics as the ternary fold inside FrameworkAwareTypeFold —
+/// agreement → that type; disagreement → None.
+///
+/// Registered alongside FrameworkAwareTypeFold so *any* attachment
+/// can carry branch-arm witnesses — ternary into a variable, if/else
+/// returns on a Symbol (sub), chain-collapsing expressions on an
+/// Expression, etc.
+pub struct BranchArmFold;
+
+impl WitnessReducer for BranchArmFold {
+    fn name(&self) -> &str {
+        "branch_arm_fold"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(
+            w.payload,
+            WitnessPayload::Observation(TypeObservation::BranchArm(_))
+        )
+    }
+
+    fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
+        let arms: Vec<&InferredType> = ws
+            .iter()
+            .filter_map(|w| match &w.payload {
+                WitnessPayload::Observation(TypeObservation::BranchArm(t)) => Some(t),
+                _ => None,
+            })
+            .collect();
+        if arms.is_empty() {
+            return ReducedValue::None;
+        }
+        let first = arms[0];
+        if arms.iter().all(|t| *t == first) {
+            return ReducedValue::Type(first.clone());
+        }
+        ReducedValue::None
+    }
+}
+
+// ---- Fluent arity dispatch reducer ----
+
+/// Picks an `InferredType` from a bag of `ArityReturn` witnesses
+/// attached to a `Symbol(sub_id)`, using the query's `arity_hint`.
+/// Shapes it knows:
+///
+/// - `arg_count: Some(N)` + query arity N → that return type.
+/// - `arg_count: None` (default branch) → fallback when no N matches.
+///
+/// "Fluent arity dispatch" — the `sub name { return $self->{name} unless @_; … return $self }`
+/// pattern — emits `ArityReturn { arg_count: Some(0), return_type: String }`
+/// and `ArityReturn { arg_count: None, return_type: ClassName(Self) }`.
+pub struct FluentArityDispatch;
+
+impl WitnessReducer for FluentArityDispatch {
+    fn name(&self) -> &str {
+        "fluent_arity_dispatch"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::Symbol(_))
+            && matches!(
+                w.payload,
+                WitnessPayload::Observation(TypeObservation::ArityReturn { .. })
+            )
+    }
+
+    fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
+        let mut exact: Option<InferredType> = None;
+        let mut default: Option<InferredType> = None;
+        for w in ws {
+            if let WitnessPayload::Observation(TypeObservation::ArityReturn {
+                arg_count,
+                return_type,
+            }) = &w.payload
+            {
+                match (arg_count, q.arity_hint) {
+                    (Some(a), Some(h)) if *a == h => exact = Some(return_type.clone()),
+                    (None, _) => default = Some(return_type.clone()),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(t) = exact.or(default) {
+            return ReducedValue::Type(t);
+        }
+        ReducedValue::None
+    }
+}
+
 // ---- Reducer registry ----
 
 #[derive(Default)]
@@ -473,6 +616,8 @@ impl ReducerRegistry {
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register(Box::new(FrameworkAwareTypeFold));
+        r.register(Box::new(BranchArmFold));
+        r.register(Box::new(FluentArityDispatch));
         r
     }
 
@@ -581,6 +726,7 @@ mod tests {
             point: None,
             framework: FrameworkFact::MojoBase,
             return_of: None,
+            arity_hint: None,
         };
         let v = reg.query(&bag, &q);
         assert_eq!(
@@ -609,6 +755,7 @@ mod tests {
             point: None,
             framework: FrameworkFact::Plain,
             return_of: None,
+            arity_hint: None,
         };
         assert_eq!(reg.query(&bag, &q), ReducedValue::Type(InferredType::HashRef));
     }
@@ -643,6 +790,7 @@ mod tests {
             point: None,
             framework: FrameworkFact::Plain,
             return_of: None,
+            arity_hint: None,
         };
         assert_eq!(
             reg.query(&bag, &q),
@@ -679,6 +827,7 @@ mod tests {
             point: None,
             framework: FrameworkFact::CoreClass,
             return_of: None,
+            arity_hint: None,
         };
         assert_eq!(
             reg.query(&bag, &q),
@@ -723,6 +872,7 @@ mod tests {
             point: None,
             framework: FrameworkFact::Plain,
             return_of: Some(&return_of),
+            arity_hint: None,
         };
         assert_eq!(
             reg.query(&bag, &q),
@@ -768,6 +918,7 @@ mod tests {
             point: Some(p(5, 4)),
             framework: FrameworkFact::Plain,
             return_of: None,
+            arity_hint: None,
         };
         assert_eq!(reg.query(&bag, &inside), ReducedValue::Type(InferredType::ArrayRef));
 
@@ -776,8 +927,134 @@ mod tests {
             point: Some(p(2, 0)),
             framework: FrameworkFact::Plain,
             return_of: None,
+            arity_hint: None,
         };
         assert_eq!(reg.query(&bag, &outside), ReducedValue::Type(InferredType::HashRef));
+    }
+
+    // ---- BranchArm reduction (ternary + explicit if/else) ----
+
+    #[test]
+    fn branch_arms_agree_folds_to_that_type() {
+        let mut bag = WitnessBag::new();
+        bag.push(wvar(
+            "$x",
+            0,
+            WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::Numeric)),
+        ));
+        bag.push(wvar(
+            "$x",
+            0,
+            WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::Numeric)),
+        ));
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Variable { name: "$x".into(), scope: ScopeId(0) };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+            arity_hint: None,
+        };
+        assert_eq!(reg.query(&bag, &q), ReducedValue::Type(InferredType::Numeric));
+    }
+
+    #[test]
+    fn branch_arms_disagree_folds_to_none() {
+        let mut bag = WitnessBag::new();
+        bag.push(wvar(
+            "$x",
+            0,
+            WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::Numeric)),
+        ));
+        bag.push(wvar(
+            "$x",
+            0,
+            WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::String)),
+        ));
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Variable { name: "$x".into(), scope: ScopeId(0) };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+            arity_hint: None,
+        };
+        assert_eq!(reg.query(&bag, &q), ReducedValue::None);
+    }
+
+    // ---- Fluent arity dispatch reducer ----
+
+    fn wsym(sym_id: u32, payload: WitnessPayload) -> Witness {
+        Witness {
+            attachment: WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id)),
+            source: WitnessSource::Builder("arity_detection".into()),
+            payload,
+            span: span(0, 0, 0, 0),
+        }
+    }
+
+    #[test]
+    fn arity_zero_returns_string_default_returns_self() {
+        // `sub name { my $self = shift; return $self->{name} unless @_; ...; $self }`
+        // — arity 0 → String; default → ClassName(MojoRoute).
+        let sub_id = 42;
+        let mut bag = WitnessBag::new();
+        bag.push(wsym(
+            sub_id,
+            WitnessPayload::Observation(TypeObservation::ArityReturn {
+                arg_count: Some(0),
+                return_type: InferredType::String,
+            }),
+        ));
+        bag.push(wsym(
+            sub_id,
+            WitnessPayload::Observation(TypeObservation::ArityReturn {
+                arg_count: None,
+                return_type: InferredType::ClassName("MojoRoute".into()),
+            }),
+        ));
+
+        let reg = ReducerRegistry::with_defaults();
+        let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sub_id));
+
+        // Caller passes no args: `$r->name` — arity 0.
+        let q0 = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+            arity_hint: Some(0),
+        };
+        assert_eq!(reg.query(&bag, &q0), ReducedValue::Type(InferredType::String));
+
+        // Caller passes one arg: `$r->name('x')` — arity 1 matches no
+        // exact; fall back to default.
+        let q1 = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+            arity_hint: Some(1),
+        };
+        assert_eq!(
+            reg.query(&bag, &q1),
+            ReducedValue::Type(InferredType::ClassName("MojoRoute".into()))
+        );
+
+        // Arity unknown (not at a call site) — also falls back to default.
+        let qn = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+            arity_hint: None,
+        };
+        assert_eq!(
+            reg.query(&bag, &qn),
+            ReducedValue::Type(InferredType::ClassName("MojoRoute".into()))
+        );
     }
 
     #[test]
@@ -791,6 +1068,7 @@ mod tests {
             point: None,
             framework: FrameworkFact::Plain,
             return_of: None,
+            arity_hint: None,
         };
         assert_eq!(reg.query(&bag, &q), ReducedValue::Type(InferredType::Numeric));
     }
