@@ -1623,9 +1623,11 @@ pub fn signature_help(
                     }
                     return base;
                 }
-                // Local: look up inferred type at end of sub body
-                if let Some(ty) = analysis.inferred_type(&p.name, sig_info.body_end) {
-                    format!("{}: {}", base, format_inferred_type(ty))
+                // Local: look up inferred type at end of sub body —
+                // route through the witness bag so framework + branch
+                // + arity rules refine the answer.
+                if let Some(ty) = analysis.inferred_type_via_bag(&p.name, sig_info.body_end) {
+                    format!("{}: {}", base, format_inferred_type(&ty))
                 } else {
                     base
                 }
@@ -1712,14 +1714,14 @@ pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
                 if sym.name == "$self" {
                     continue;
                 }
-                if let Some(ty) = analysis.inferred_type(&sym.name, sym.span.start) {
+                if let Some(ty) = analysis.inferred_type_via_bag(&sym.name, sym.span.start) {
                     // Only show Object/HashRef/ArrayRef/CodeRef/Regexp — not Numeric/String
                     if matches!(ty, InferredType::Numeric | InferredType::String) {
                         continue;
                     }
                     hints.push(InlayHint {
                         position: point_to_position(decl_point),
-                        label: InlayHintLabel::String(format!(": {}", format_inferred_type(ty))),
+                        label: InlayHintLabel::String(format!(": {}", format_inferred_type(&ty))),
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
                         tooltip: None,
@@ -2253,7 +2255,7 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
         {
             Some(invocant.clone())
         } else {
-            analysis.inferred_type(invocant, r.span.start)
+            analysis.inferred_type_via_bag(invocant, r.span.start)
                 .and_then(|ty| ty.class_name().map(|s| s.to_string()))
         };
         let class_name = match class_name {

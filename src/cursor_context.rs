@@ -159,7 +159,11 @@ fn resolve_text_invocant(text: &str, point: Point, analysis: Option<&FileAnalysi
         // Bareword — treat as class name
         Some(InferredType::ClassName(text.to_string()))
     } else if let Some(a) = analysis {
-        a.inferred_type(text, point).cloned()
+        // Route through the witness-bag path so framework-aware
+        // resolution (Mojo `sub name`, blessed-hashref, branch arms,
+        // arity) refines the answer. Falls back to legacy
+        // `inferred_type` when the bag has nothing.
+        a.inferred_type_via_bag(text, point)
     } else {
         None
     }
@@ -400,7 +404,7 @@ fn resolve_node_type(
     match node.kind() {
         "scalar" | "array" | "hash" => {
             let text = node.utf8_text(source).ok()?;
-            analysis.inferred_type(text, point).cloned()
+            analysis.inferred_type_via_bag(text, point)
         }
         "bareword" | "package" => {
             let text = node.utf8_text(source).ok()?;

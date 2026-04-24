@@ -1666,7 +1666,10 @@ impl FileAnalysis {
         match node.kind() {
             "scalar" => {
                 let text = node.utf8_text(source).ok()?;
-                self.inferred_type(text, point).cloned()
+                // Route scalar-type resolution through the witness
+                // bag so framework / branch / arity rules refine the
+                // answer. Legacy `inferred_type` is used as fallback.
+                self.inferred_type_via_bag(text, point)
             }
             "package" | "bareword" => {
                 // Bareword = class name
@@ -1689,7 +1692,11 @@ impl FileAnalysis {
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 let func_node = node.child_by_field_name("function")?;
                 let name = func_node.utf8_text(source).ok()?;
-                self.sub_return_type(name).cloned()
+                // Route through the arity-aware helper so fluent
+                // arity dispatch (`return X unless @_`) can pick the
+                // right branch when the caller's arg count is known.
+                let arg_count = self.count_call_args(node) as u32;
+                self.sub_return_type_at_arity(name, Some(arg_count))
                     .or_else(|| builtin_return_type(name))
             }
             "func1op_call_expression" | "func0op_call_expression" => {
@@ -3251,11 +3258,24 @@ impl FileAnalysis {
         self.resolve_invocant_class(invocant, scope, point)
     }
 
+    /// Test-only wrapper over the private `resolve_invocant_class`.
+    #[cfg(test)]
+    pub(crate) fn resolve_invocant_class_test(
+        &self,
+        invocant: &str,
+        scope: ScopeId,
+        point: Point,
+    ) -> Option<String> {
+        self.resolve_invocant_class(invocant, scope, point)
+    }
+
     /// Resolve an invocant string to a class name.
     fn resolve_invocant_class(&self, invocant: &str, scope: ScopeId, point: Point) -> Option<String> {
         if invocant.starts_with('$') || invocant.starts_with('@') || invocant.starts_with('%') {
-            // Variable invocant → infer type
-            self.inferred_type(invocant, point)
+            // Variable invocant → infer type via the witness bag so
+            // framework/branch/arity rules refine the answer (falls
+            // back to legacy `inferred_type` internally).
+            self.inferred_type_via_bag(invocant, point)
                 .and_then(|t| t.class_name().map(|s| s.to_string()))
                 .or_else(|| {
                     // Check if we're inside a class and $self is the invocant
@@ -5947,6 +5967,47 @@ sub boot {
                     crate::witnesses::WitnessAttachment::HashKey { .. }
                 ))
                 .count(),
+        );
+    }
+
+    /// End-to-end wiring check: the public path
+    /// `resolve_invocant_class` now goes through the witness bag, so
+    /// the Mojo `$self->{k}` access inside a Mojo::Base method no
+    /// longer flips `$self` to HashRef — method chains downstream
+    /// still see the class.
+    #[test]
+    fn test_wiring_mojo_self_invocant_class_via_public_api() {
+        let fa = build_fa_from_source(
+            r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+
+sub name {
+    my $self = shift;
+    return $self->{name} unless @_;
+    $self->{name} = shift;
+    $self;
+}
+        "#,
+        );
+
+        // At a point inside the method body where `$self` has been
+        // assigned via `shift`, the flat `inferred_type` returns
+        // HashRef (because the access flipped it). The witness-based
+        // path — which is what `resolve_invocant_class` now calls —
+        // should return the class.
+        let point = Point { row: 5, column: 15 };
+
+        // Walk up the scope chain to find the sub's scope.
+        let scope = fa.scope_at(point).expect("scope");
+
+        let resolved = fa.resolve_invocant_class_test("$self", scope, point);
+        assert_eq!(
+            resolved.as_deref(),
+            Some("Mojolicious::Routes::Route"),
+            "resolve_invocant_class (public path) should see $self as the class, \
+             not HashRef — got {:?}",
+            resolved
         );
     }
 
