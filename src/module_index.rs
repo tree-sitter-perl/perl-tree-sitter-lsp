@@ -223,6 +223,13 @@ pub struct ModuleIndex {
     workspace_root: Arc<WorkspaceRootChannel>,
     /// Callback to trigger diagnostic re-publish after module resolution.
     refresh_diagnostics: Arc<dyn Fn() + Send + Sync>,
+    /// Monotonic counter bumped every time the cache changes (resolver
+    /// thread inserts, workspace re-index, stale-entry re-resolve).
+    /// Used by on-demand enrichment in request handlers: if the per-
+    /// document last-enriched version matches this, skip the re-run.
+    /// Makes per-keystroke completion enrichment effectively free
+    /// after the first one in a quiet window.
+    revision: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ModuleIndex {
@@ -269,7 +276,21 @@ impl ModuleIndex {
             resolved,
             workspace_root,
             refresh_diagnostics: refresh,
+            revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Current module-index revision. Request handlers compare this
+    /// against their last-enriched snapshot to decide whether to re-
+    /// run enrichment.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bump the revision — called from every cache-mutating operation.
+    pub(crate) fn bump_revision(&self) {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Notify the resolver thread of the workspace root (from LSP initialize).
@@ -436,6 +457,7 @@ impl ModuleIndex {
                 condvar: Condvar::new(),
             }),
             refresh_diagnostics: Arc::new(|| {}),
+            revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -480,6 +502,7 @@ impl ModuleIndex {
             resolved,
             workspace_root,
             refresh_diagnostics: Arc::new(|| {}),
+            revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -500,6 +523,7 @@ impl ModuleIndex {
             }
         }
         self.cache.insert(module_name.to_string(), cached);
+        self.bump_revision();
     }
 
     /// Register a workspace-indexed file under its primary package name
@@ -555,6 +579,7 @@ impl ModuleIndex {
             }
         }
         self.cache.insert(module_name, Some(cached));
+        self.bump_revision();
     }
 
     /// Remove `module_name` from every `reverse_index` and `bridges_index`

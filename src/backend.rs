@@ -44,9 +44,14 @@ impl Backend {
                     Some(idx) => idx,
                     None => return,
                 };
+                // Bump the revision so on-demand enrichment in
+                // request handlers knows to re-run (otherwise they
+                // skip because their per-doc snapshot is current).
+                module_index.bump_revision();
                 // Collect (uri, diagnostics) first without holding the store lock
                 // across the await — publishing is async and could deadlock.
                 let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
+                let live_rev = module_index.revision();
                 files.for_each_open_mut(|uri, doc| {
                     let (imported_returns, imported_keys) =
                         build_imported_return_types(&doc.analysis, module_index);
@@ -55,6 +60,7 @@ impl Backend {
                         imported_keys,
                         Some(module_index),
                     );
+                    doc.last_enriched_revision = live_rev;
                     let diagnostics = symbols::collect_diagnostics(&doc.analysis, module_index);
                     pending.push((uri.clone(), diagnostics));
                 });
@@ -75,7 +81,15 @@ impl Backend {
     }
 
     fn enrich_analysis(&self, uri: &Url) {
+        let live_rev = self.module_index.revision();
         if let Some(mut doc) = self.files.get_open_mut(uri) {
+            // Skip if we've already enriched against this exact
+            // module-index snapshot. Cheap path for the common case:
+            // user navigates inside a file while no new modules have
+            // been resolved since the last enrich.
+            if doc.last_enriched_revision == live_rev && live_rev != 0 {
+                return;
+            }
             let (imported_returns, imported_keys) =
                 build_imported_return_types(&doc.analysis, &self.module_index);
             doc.analysis.enrich_imported_types_with_keys(
@@ -83,6 +97,7 @@ impl Backend {
                 imported_keys,
                 Some(&self.module_index),
             );
+            doc.last_enriched_revision = live_rev;
         }
     }
 
@@ -409,6 +424,15 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+        // On-demand enrichment. The resolver thread's on_resolved
+        // callback re-enriches whenever a module arrives, but that
+        // loses a race on first-open of a file whose imports hadn't
+        // yet been resolved. Enriching here (idempotent: truncates
+        // to baseline then re-runs with the current module_index)
+        // means a hover/gd/completion on an open file always sees
+        // the latest cross-file type info without needing the user
+        // to edit the buffer.
+        self.enrich_analysis(uri);
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -648,6 +672,9 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+        // See goto_definition: idempotent re-enrichment so the
+        // hover sees the latest cross-file types.
+        self.enrich_analysis(uri);
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -667,6 +694,8 @@ impl LanguageServer for Backend {
     ) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
+        // Same reason as hover/goto: idempotent re-enrichment.
+        self.enrich_analysis(uri);
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
