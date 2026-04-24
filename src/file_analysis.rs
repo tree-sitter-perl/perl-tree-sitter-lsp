@@ -5970,6 +5970,105 @@ sub boot {
         );
     }
 
+    /// Fluent chain through `resolve_expression_type` public path:
+    /// `$r->get('/x')->to('Y#z')` — `to`'s invocant is a
+    /// method_call_expression. We walk the tree, recursively resolve
+    /// `$r->get('/x')`'s type; for that to work, `get`'s return type
+    /// must resolve. Inside `get`, `return $self` (where $self =
+    /// shift inside `sub get` of a class) is FirstParam → ClassName.
+    ///
+    /// The witness wiring doesn't change this path's logic — it just
+    /// makes sure the `$self` inside `get` doesn't get flipped to
+    /// HashRef by intervening `$self->{k}` accesses (the Mojo bug).
+    #[test]
+    fn test_wiring_fluent_chain_resolves_through_expression_type() {
+        let source = r#"
+package MyApp::Route;
+use Mojo::Base -base;
+
+sub get {
+    my $self = shift;
+    $self->{_pattern} = shift;
+    return $self;
+}
+
+sub to {
+    my $self = shift;
+    $self->{_target} = shift;
+    return $self;
+}
+
+package main;
+my $r = MyApp::Route->new;
+$r->get('/x')->to('Y#z');
+"#;
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let fa = crate::builder::build(&tree, source.as_bytes());
+
+        // Find the `->to` method call node by walking the tree.
+        fn find_to_node<'a>(node: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+            if node.kind() == "method_call_expression" {
+                if let Some(m) = node.child_by_field_name("method") {
+                    if m.utf8_text(&[]).ok() == Some("to") {
+                        return Some(node);
+                    }
+                }
+            }
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    if let Some(r) = find_to_node(c) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+
+        // The `->to`'s invocant is `$r->get('/x')`, a
+        // method_call_expression. Grab its type — should be
+        // ClassName(MyApp::Route) because `get` returns $self.
+        //
+        // We walk the tree looking for the method_call_expression
+        // whose *invocant* is itself a method_call_expression — that's
+        // our fluent chain site.
+        let source_bytes = source.as_bytes();
+        let to_node = {
+            let mut stack: Vec<tree_sitter::Node> = vec![tree.root_node()];
+            let mut found: Option<tree_sitter::Node> = None;
+            while let Some(n) = stack.pop() {
+                if n.kind() == "method_call_expression" {
+                    if let Some(m) = n.child_by_field_name("method") {
+                        if m.utf8_text(source_bytes).ok() == Some("to") {
+                            found = Some(n);
+                            break;
+                        }
+                    }
+                }
+                for i in 0..n.named_child_count() {
+                    if let Some(c) = n.named_child(i) {
+                        stack.push(c);
+                    }
+                }
+            }
+            found.expect("found ->to node")
+        };
+
+        let invocant = to_node.child_by_field_name("invocant").expect("invocant");
+        let ty = fa.resolve_expression_type(invocant, source_bytes, None);
+        let class = ty.as_ref().and_then(|t| t.class_name());
+        assert_eq!(
+            class,
+            Some("MyApp::Route"),
+            "fluent chain: invocant type of `->to` should resolve to \
+             MyApp::Route (ClassName or FirstParam), got {:?}",
+            ty
+        );
+        let _ = find_to_node; // silence unused warning in case we refactor
+    }
+
     /// End-to-end wiring check: the public path
     /// `resolve_invocant_class` now goes through the witness bag, so
     /// the Mojo `$self->{k}` access inside a Mojo::Base method no

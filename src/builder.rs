@@ -3160,14 +3160,44 @@ impl<'a> Builder<'a> {
         if child.kind() == "scalar" {
             if let Ok(var_text) = child.utf8_text(self.source) {
                 let point = child.start_position();
-                for tc in self.type_constraints.iter().rev() {
-                    if tc.variable == var_text && tc.constraint_span.start <= point {
-                        let scope = &self.scopes[tc.scope.0 as usize];
-                        if contains_point(&scope.span, point) {
-                            return Some(tc.inferred_type.clone());
-                        }
+                // Collect ALL constraints for this variable in scope
+                // before the return point. Prefer class-identity
+                // constraints (FirstParam / ClassName) over
+                // representation-only constraints (HashRef / ArrayRef
+                // / CodeRef), because the hash access
+                // `$self->{k}` pushed HashRef later but the sub's
+                // return of `$self` should carry the object identity,
+                // not the access-site rep. This is the in-builder
+                // mirror of Part 6's framework-aware resolver — it
+                // fixes the Mojo `sub name`-style fluent chain at
+                // return-type collection time so downstream
+                // `find_method_return_type` sees the class.
+                let mut latest_class: Option<InferredType> = None;
+                let mut latest_class_at = Point { row: 0, column: 0 };
+                let mut latest_any: Option<InferredType> = None;
+                let mut latest_any_at = Point { row: 0, column: 0 };
+                for tc in &self.type_constraints {
+                    if tc.variable != var_text || tc.constraint_span.start > point {
+                        continue;
+                    }
+                    let scope = &self.scopes[tc.scope.0 as usize];
+                    if !contains_point(&scope.span, point) {
+                        continue;
+                    }
+                    let is_class = matches!(
+                        tc.inferred_type,
+                        InferredType::FirstParam { .. } | InferredType::ClassName(_)
+                    );
+                    if is_class && tc.constraint_span.start >= latest_class_at {
+                        latest_class = Some(tc.inferred_type.clone());
+                        latest_class_at = tc.constraint_span.start;
+                    }
+                    if tc.constraint_span.start >= latest_any_at {
+                        latest_any = Some(tc.inferred_type.clone());
+                        latest_any_at = tc.constraint_span.start;
                     }
                 }
+                return latest_class.or(latest_any);
             }
         }
         None
