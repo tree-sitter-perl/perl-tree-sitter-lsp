@@ -3813,56 +3813,29 @@ sub fire {
             Some(&idx),
         );
 
-        // Nvim resolves Mojolicious from @INC. In the test env we
-        // don't rely on @INC — we synthesize minimal analyses and
-        // register them into the module index the same way the
-        // resolver thread does. Uses real Mojo-shaped sources so
-        // framework synthesis fires through the builder.
-        let insert_module = |name: &str, path: &str, source: &str| {
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&ts_parser_perl::LANGUAGE.into())
-                .unwrap();
-            let tree = parser.parse(source, None).unwrap();
-            let analysis = crate::builder::build(&tree, source.as_bytes());
-            let cached = std::sync::Arc::new(crate::module_index::CachedModule {
-                path: PathBuf::from(path),
-                analysis: std::sync::Arc::new(analysis),
-            });
-            idx.insert_cache(name, Some(cached));
+        // Use the ACTUAL Mojolicious library from @INC — the same
+        // code nvim analyzes. If Mojo isn't installed, skip cleanly
+        // so CI on bare systems doesn't break.
+        let inc_paths = crate::module_resolver::discover_inc_paths();
+        let insert_real = |name: &str| -> bool {
+            let mut p = crate::module_resolver::create_parser();
+            match crate::module_resolver::resolve_and_parse(&inc_paths, name, &mut p) {
+                Some(cached) => {
+                    idx.insert_cache(name, Some(cached));
+                    true
+                }
+                None => false,
+            }
         };
-        insert_module(
-            "Mojolicious",
-            "/stub/Mojolicious.pm",
-            "package Mojolicious;\n\
-             use Mojo::Base -base;\n\
-             has routes => sub { Mojolicious::Routes->new };\n\
-             1;\n",
-        );
-        insert_module(
-            "Mojolicious::Routes",
-            "/stub/Mojolicious/Routes.pm",
-            "package Mojolicious::Routes;\n\
-             use Mojo::Base 'Mojolicious::Routes::Route';\n\
-             1;\n",
-        );
-        insert_module(
-            "Mojolicious::Routes::Route",
-            "/stub/Mojolicious/Routes/Route.pm",
-            "package Mojolicious::Routes::Route;\n\
-             use Mojo::Base -base;\n\
-             sub get  { my $self = shift; $self->{pat} = shift; return $self }\n\
-             sub post { my $self = shift; $self->{pat} = shift; return $self }\n\
-             sub to   { my $self = shift; $self->{tgt} = shift; return $self }\n\
-             sub name { my $self = shift; $self->{nam} = shift; return $self }\n\
-             1;\n",
-        );
-        insert_module(
-            "Mojolicious::Lite",
-            "/stub/Mojolicious/Lite.pm",
-            "package Mojolicious::Lite;\n\
-             1;\n",
-        );
+        let have_mojo = insert_real("Mojolicious")
+            && insert_real("Mojolicious::Routes")
+            && insert_real("Mojolicious::Routes::Route")
+            && insert_real("Mojolicious::Lite");
+        if !have_mojo {
+            eprintln!("SKIP: Mojolicious not installed in @INC");
+            return;
+        }
+        let _ = PathBuf::new(); // keep the import used in both branches
 
         let mut parser = tree_sitter::Parser::new();
         parser

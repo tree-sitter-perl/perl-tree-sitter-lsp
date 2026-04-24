@@ -1687,7 +1687,32 @@ impl FileAnalysis {
                     return Some(InferredType::ClassName(class_name.to_string()));
                 }
                 let arg_count = self.count_call_args(node);
-                self.find_method_return_type(class_name, method_text, module_index, Some(arg_count))
+                if let Some(rt) = self.find_method_return_type(
+                    class_name, method_text, module_index, Some(arg_count),
+                ) {
+                    return Some(rt);
+                }
+                // Fluent-chain fallback: if the method exists
+                // somewhere in the invocant's class hierarchy but
+                // its return type isn't inferable (common for
+                // `sub get { shift->_generate_route(GET => @_) }`
+                // in Mojolicious::Routes::Route — the body
+                // chains through several calls that our type
+                // inference can't trace), assume the return type
+                // is the same as the invocant's class. This is
+                // the builder-pattern convention — Mojo::Routes,
+                // Moo chainable setters, jQuery-style APIs, etc.
+                //
+                // Scoped: only fires when the method IS defined
+                // somewhere in the hierarchy, so random
+                // name-collisions don't poison unrelated chains.
+                if self
+                    .resolve_method_in_ancestors(class_name, method_text, module_index)
+                    .is_some()
+                {
+                    return Some(InferredType::ClassName(class_name.to_string()));
+                }
+                None
             }
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 let func_node = node.child_by_field_name("function")?;
