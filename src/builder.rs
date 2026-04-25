@@ -11276,4 +11276,85 @@ sub _route {
             _ => unreachable!(),
         }
     }
+
+    // ---- data-printer plugin ----
+    //
+    // Data::Printer monkey-patches `&p` and `&np` into the caller's
+    // symbol table from inside its custom `import` sub — no
+    // `@EXPORT` / `@EXPORT_OK`, so the cross-file extractor sees them
+    // as plain Subs but no caller's import list claims them. The
+    // plugin's job is to declare the imports plugin-side so call
+    // sites resolve.
+    //
+    // `use DDP` is a literal alias for `use Data::Printer` (DDP.pm
+    // just `push our @ISA, 'Data::Printer'` and re-uses the import).
+    // The plugin pins the synthetic Import at Data::Printer (the real
+    // module) regardless of which name the user typed, so cross-file
+    // hover/gd/sig-help on `p`/`np` always flow to the real source.
+
+    #[test]
+    fn plugin_data_printer_synthesizes_p_np_on_use_data_printer() {
+        // `use Data::Printer;` — empty native qw list. Plugin must
+        // emit an additional Import that lists `p` and `np` so
+        // resolve_call_package finds them and routes cross-file
+        // lookups to Data::Printer.
+        let src = "\
+use Data::Printer;
+p $foo;
+np \\%bar;
+";
+        let fa = build_fa(src);
+        let dp_import = fa.imports.iter().find(|i|
+            i.module_name == "Data::Printer"
+            && i.imported_symbols.iter().any(|s| s.local_name == "p")
+        );
+        assert!(
+            dp_import.is_some(),
+            "plugin must emit Import for Data::Printer carrying `p`; got: {:?}",
+            fa.imports
+        );
+        let names: Vec<&str> = dp_import.unwrap()
+            .imported_symbols.iter().map(|s| s.local_name.as_str()).collect();
+        assert!(names.contains(&"p"));
+        assert!(names.contains(&"np"));
+    }
+
+    #[test]
+    fn plugin_data_printer_aliases_ddp_to_data_printer() {
+        // `use DDP;` — the alias case. Plugin must still emit a
+        // synthetic Import keyed on Data::Printer (NOT DDP) so
+        // cross-file `p`/`np` lookups route to the real source
+        // module. Otherwise the user gets nothing on hover/gd
+        // when they typed `use DDP` instead of `use Data::Printer`.
+        let src = "\
+use DDP;
+p $foo;
+";
+        let fa = build_fa(src);
+        let dp_import = fa.imports.iter().find(|i|
+            i.module_name == "Data::Printer"
+            && i.imported_symbols.iter().any(|s| s.local_name == "p")
+        );
+        assert!(
+            dp_import.is_some(),
+            "use DDP must produce an Import for Data::Printer (alias resolution); got: {:?}",
+            fa.imports.iter().map(|i| (
+                i.module_name.clone(),
+                i.imported_symbols.iter().map(|s| s.local_name.clone()).collect::<Vec<_>>(),
+            )).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn plugin_data_printer_skips_unrelated_use_statements() {
+        // Sanity check: an unrelated `use` doesn't pull a synthetic
+        // Data::Printer import into the file. Otherwise the plugin
+        // would be silently claiming every use statement.
+        let src = "use List::Util qw(max);";
+        let fa = build_fa(src);
+        assert!(
+            fa.imports.iter().find(|i| i.module_name == "Data::Printer").is_none(),
+            "plugin must not synthesize a Data::Printer import unless DDP/Data::Printer was used"
+        );
+    }
 }

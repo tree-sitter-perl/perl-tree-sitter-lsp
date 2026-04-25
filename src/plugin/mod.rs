@@ -495,6 +495,15 @@ pub struct SigHelpQueryContext {
     /// `ctx.current_package` at the cursor — helps plugins pick the
     /// right app/instance namespace when more than one exists.
     pub current_package: Option<String>,
+    /// When the cursor sits inside the args of `use M ...`, the
+    /// module name `M`. Plugins use this to claim use-line option
+    /// completion (`use DDP { caller_info => 1 }`) without the core
+    /// hard-coding any specific module's option list. Pairs with
+    /// `cursor_inside` — a `Hash`-kind container plus this field
+    /// gives a plugin everything it needs to return option keys.
+    /// `None` when the cursor isn't inside a use statement's args.
+    #[serde(default)]
+    pub current_use_module: Option<String>,
 }
 
 pub type CompletionQueryContext = SigHelpQueryContext;
@@ -744,7 +753,12 @@ mod tests {
     }
 
     fn empty_qctx() -> SigHelpQueryContext {
-        SigHelpQueryContext { call: None, cursor_inside: None, current_package: None }
+        SigHelpQueryContext {
+            call: None,
+            cursor_inside: None,
+            current_package: None,
+            current_use_module: None,
+        }
     }
 
     #[test]

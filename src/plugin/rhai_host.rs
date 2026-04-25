@@ -324,6 +324,7 @@ const BUNDLED: &[(&str, &str)] = &[
     ("mojo-routes", include_str!("../../frameworks/mojo-routes.rhai")),
     ("mojo-lite", include_str!("../../frameworks/mojo-lite.rhai")),
     ("minion", include_str!("../../frameworks/minion.rhai")),
+    ("data-printer", include_str!("../../frameworks/data-printer.rhai")),
 ];
 
 pub fn load_bundled(engine: Arc<Engine>) -> Vec<Box<dyn FrameworkPlugin>> {
@@ -452,6 +453,7 @@ mod tests {
             ("mojo-routes", include_str!("../../frameworks/mojo-routes.rhai")),
             ("mojo-lite", include_str!("../../frameworks/mojo-lite.rhai")),
             ("minion", include_str!("../../frameworks/minion.rhai")),
+            ("data-printer", include_str!("../../frameworks/data-printer.rhai")),
         ] {
             RhaiPlugin::from_source(src, engine.clone())
                 .unwrap_or_else(|e| panic!("{}.rhai failed to compile: {e}", id));

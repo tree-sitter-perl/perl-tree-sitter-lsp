@@ -964,10 +964,15 @@ pub fn build_plugin_query_context(
 
     // Innermost nested container: walk up from cursor to find the
     // first anonymous_array_expression or anonymous_hash_expression
-    // before we exit the enclosing call.
-    let container = {
+    // before we exit the enclosing call. Returned alongside an
+    // optional `use M ...` module name when the matched container
+    // is the args of a use statement — lets plugins claim use-line
+    // option-key completion (`use DDP { caller_info => 1 }`) without
+    // the core hard-coding any specific module.
+    let (container, current_use_module) = {
         let mut n = tree.root_node().descendant_for_point_range(point, point);
         let mut found: Option<ContainerFrame> = None;
+        let mut found_node: Option<Node> = None;
         while let Some(node) = n {
             match node.kind() {
                 "anonymous_array_expression" => {
@@ -976,6 +981,7 @@ pub fn build_plugin_query_context(
                         active_slot: active_slot_in_node(node, point),
                         existing_keys: Vec::new(),
                     });
+                    found_node = Some(node);
                     break;
                 }
                 "anonymous_hash_expression" => {
@@ -985,6 +991,7 @@ pub fn build_plugin_query_context(
                         active_slot: active_slot_in_node(node, point),
                         existing_keys: used.into_iter().collect(),
                     });
+                    found_node = Some(node);
                     break;
                 }
                 "method_call_expression" | "function_call_expression"
@@ -993,13 +1000,30 @@ pub fn build_plugin_query_context(
             }
             n = node.parent();
         }
-        found
+        // If the matched container is a direct child of a use_statement,
+        // surface the module name. Walking only one level up is correct:
+        // the parser shape is `use_statement → anonymous_hash_expression`
+        // (no list_expression intermediary at the args level for the
+        // hash form). Bail on anything more nested — that's not a
+        // use-line args slot.
+        let use_module = found_node.and_then(|hash| {
+            let parent = hash.parent()?;
+            if parent.kind() != "use_statement" { return None; }
+            let module = parent.child_by_field_name("module")?;
+            module.utf8_text(source).ok().map(|s| s.to_string())
+        });
+        (found, use_module)
     };
 
     let current_package = analysis.package_at(point).map(|s| s.to_string());
 
     if call.is_none() && container.is_none() { return None; }
-    Some(SigHelpQueryContext { call, cursor_inside: container, current_package })
+    Some(SigHelpQueryContext {
+        call,
+        cursor_inside: container,
+        current_package,
+        current_use_module,
+    })
 }
 
 // ---- Selection ranges (tree-based) ----

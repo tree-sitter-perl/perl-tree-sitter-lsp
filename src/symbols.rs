@@ -3658,4 +3658,143 @@ sub fire {
         assert!(sig.is_none(),
             "no handler_params → no string-dispatch sig; also no local ->emit def");
     }
+
+    // ---- data-printer plugin: full intelligence ----
+
+    /// Build a CachedModule under the real package name we want, with
+    /// arbitrary source. `fake_cached` always synthesizes a `package
+    /// Fake;` source — useless when the caller needs the cached
+    /// module to expose subs under a specific name like `Data::Printer`.
+    fn cached_under(name: &str, source: &str) -> std::sync::Arc<crate::module_index::CachedModule> {
+        let analysis = parse_analysis(source);
+        std::sync::Arc::new(crate::module_index::CachedModule::new(
+            std::path::PathBuf::from(format!("/fake/{}.pm", name.replace("::", "/"))),
+            std::sync::Arc::new(analysis),
+        ))
+    }
+
+    #[test]
+    fn data_printer_use_ddp_resolves_p_to_data_printer() {
+        // The end-to-end intelligence pin. `use DDP` is a literal alias
+        // for `use Data::Printer` (DDP.pm just `push our @ISA, 'Data::Printer'`).
+        // Hover/K, gd, and sig-help on `p` must reach Data::Printer's
+        // real `sub p` — not DDP. The plugin's synthetic Import
+        // (module_name: "Data::Printer", imported_symbols: [p, np]) is
+        // what carries this; resolve_imported_function is the seam every
+        // intelligence feature routes through.
+        let source = "use DDP;\np $foo;\n";
+        let analysis = parse_analysis(source);
+        let module_index = crate::module_index::ModuleIndex::new_for_test();
+
+        // Stub Data::Printer.pm. The real module has a custom `import`
+        // (no @EXPORT), but `sub p` is a normal sub the builder picks
+        // up — exactly what users get from cpan.
+        module_index.insert_cache(
+            "Data::Printer",
+            Some(cached_under(
+                "Data::Printer",
+                "package Data::Printer;\nsub p { my (undef, %props) = @_; }\nsub np { my (undef, %props) = @_; }\n1;\n",
+            )),
+        );
+
+        let resolved = resolve_imported_function(&analysis, "p", &module_index);
+        assert!(
+            resolved.is_some(),
+            "use DDP must alias to Data::Printer; resolve_imported_function for `p` returned None — \
+             imports were: {:?}",
+            analysis.imports.iter().map(|i| (
+                i.module_name.clone(),
+                i.imported_symbols.iter().map(|s| s.local_name.clone()).collect::<Vec<_>>(),
+            )).collect::<Vec<_>>()
+        );
+        let (import, _path, remote) = resolved.unwrap();
+        assert_eq!(import.module_name, "Data::Printer",
+            "alias must route to Data::Printer, not DDP");
+        assert_eq!(remote, "p", "local `p` maps to remote `p`");
+
+        // np too — both DDP-installed names.
+        let np = resolve_imported_function(&analysis, "np", &module_index);
+        assert!(np.is_some(), "use DDP must also resolve `np` to Data::Printer");
+        assert_eq!(np.unwrap().0.module_name, "Data::Printer");
+    }
+
+    #[test]
+    fn data_printer_use_data_printer_resolves_p_to_data_printer() {
+        // Same test for the non-alias case. `use Data::Printer;` with no
+        // qw list — the plugin's synthetic Import claims `p`/`np` so
+        // resolve_imported_function pairs them with the real sub.
+        let source = "use Data::Printer;\np $foo;\n";
+        let analysis = parse_analysis(source);
+        let module_index = crate::module_index::ModuleIndex::new_for_test();
+        module_index.insert_cache(
+            "Data::Printer",
+            Some(cached_under(
+                "Data::Printer",
+                "package Data::Printer;\nsub p { my (undef, %props) = @_; }\nsub np { my (undef, %props) = @_; }\n1;\n",
+            )),
+        );
+
+        let resolved = resolve_imported_function(&analysis, "p", &module_index);
+        assert!(resolved.is_some(),
+            "use Data::Printer (no qw list) must still let resolve_imported_function find p");
+        assert_eq!(resolved.unwrap().0.module_name, "Data::Printer");
+    }
+
+    #[test]
+    fn data_printer_use_line_options_completion() {
+        // `use DDP { | }` — cursor inside the options hashref. The
+        // plugin's on_completion hook recognizes "current_use_module
+        // matches DDP/Data::Printer and cursor_inside is a Hash" and
+        // returns the documented option keys (caller_info, colored,
+        // class_method, output, ...). No core hard-codes the option
+        // list — it lives in the plugin.
+        let source = "use DDP { };\n";
+        let analysis = parse_analysis(source);
+        let module_index = crate::module_index::ModuleIndex::new_for_test();
+
+        // Cursor between the braces. Source: "use DDP { };" → col 10
+        // is one past the opening brace (which lives at col 9).
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let pos = Position { line: 0, character: 10 };
+        let items = completion_items(&analysis, &tree, source, pos, &module_index, None);
+
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Sample of keys from Data::Printer's actual options. If the
+        // plugin doesn't ship these specific names, swap to whichever
+        // ones the plugin advertises — the contract is "DDP options
+        // surface here", not "this exact list".
+        for key in &["caller_info", "colored", "class_method", "output"] {
+            assert!(
+                labels.iter().any(|l| l == key),
+                "use DDP {{ }} option completion must offer `{}`; got: {:?}",
+                key, labels,
+            );
+        }
+    }
+
+    #[test]
+    fn data_printer_use_line_options_completion_for_data_printer_module() {
+        // Same flow, non-alias name. The plugin can't be DDP-specific.
+        let source = "use Data::Printer { };\n";
+        let analysis = parse_analysis(source);
+        let module_index = crate::module_index::ModuleIndex::new_for_test();
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        // "use Data::Printer { };" — col 20 sits between the braces.
+        let pos = Position { line: 0, character: 20 };
+        let items = completion_items(&analysis, &tree, source, pos, &module_index, None);
+
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| *l == "caller_info"),
+            "use Data::Printer {{ }} must surface options too; got: {:?}",
+            labels,
+        );
+    }
 }
