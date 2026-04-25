@@ -28,6 +28,7 @@ Listing them here so future specs don't reinvent the wheel.
 | `HashKeyOwner::Variable { name, def_scope }` | Fallback when a literal `%h` is just accessed directly — owner is the variable itself. |
 | `sub_return_delegations: HashMap<String, String>` (builder-only) | `sub chain { return other() }` — the return-type pass and HashKey owner fixup walk this to the sub that actually owns the keys. |
 | `refs_by_target: HashMap<SymbolId, Vec<RefId>>` | O(1) reverse index. Every HashKeyAccess whose owner resolves is linked here to its HashKeyDef symbol, so `references` / `rename` work without tree access. |
+| `type_provenance: HashMap<SymbolId, TypeProvenance>` | Sidecar map. Default `Inferred` (never stored — missing == inferred); `PluginOverride { plugin_id, reason }` for return types asserted by a plugin's `overrides()` manifest. Lets debug introspection answer "why does the LSP think `_route` returns X?" without re-running the build. See `docs/prompt-plugin-system.md` for the override surface. |
 
 Landed behaviors:
 

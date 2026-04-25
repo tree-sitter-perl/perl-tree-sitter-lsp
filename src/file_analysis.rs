@@ -488,6 +488,25 @@ impl InferredType {
     }
 }
 
+/// Where a type judgement came from. Lets debugging surface "the
+/// analyzer worked this out from your code" vs "a plugin override
+/// said so" without changing the shape of `InferredType` at every
+/// callsite. Stored in a sidecar map keyed by SymbolId — entries
+/// only exist for non-default provenances, so the common case (an
+/// inferred type) costs nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TypeProvenance {
+    /// Derived from the analyzed source — return statements,
+    /// last-expression inference, framework synthesis, constructor
+    /// patterns. The default; never stored explicitly.
+    Inferred,
+    /// Asserted by a plugin's `overrides()` manifest because
+    /// inference can't (or shouldn't) reach the right answer here.
+    /// Carries the asserting plugin's id and a free-form reason for
+    /// the debugger.
+    PluginOverride { plugin_id: String, reason: String },
+}
+
 /// Resolve a return type from a list of inferred types (one per return statement).
 ///
 /// Rules (from spec):
@@ -874,6 +893,16 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub plugin_namespaces: Vec<PluginNamespace>,
 
+    /// Per-symbol provenance for return types. Only populated when a
+    /// type came from somewhere other than inference — in practice,
+    /// from a plugin's `overrides()` manifest. Read-only debugging
+    /// aid: features like hover/completion don't branch on it; it
+    /// exists so a future inspector can answer "why does the LSP
+    /// think this returns X?" without re-running the build.
+    /// Missing entry == `TypeProvenance::Inferred`.
+    #[serde(default)]
+    pub type_provenance: HashMap<SymbolId, TypeProvenance>,
+
     // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
     #[serde(default)]
     base_type_constraint_count: usize,
@@ -918,6 +947,7 @@ impl FileAnalysis {
         export_ok: Vec<String>,
         plugin_namespaces: Vec<PluginNamespace>,
         package_uses: HashMap<String, Vec<String>>,
+        type_provenance: HashMap<SymbolId, TypeProvenance>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -935,6 +965,7 @@ impl FileAnalysis {
             export,
             export_ok,
             plugin_namespaces,
+            type_provenance,
             base_type_constraint_count: 0,
             base_symbol_count: 0,
             scope_starts: Vec::new(),
@@ -1187,6 +1218,18 @@ impl FileAnalysis {
     pub fn sub_return_type(&self, name: &str) -> Option<&InferredType> {
         self.sub_return_type_local(name)
             .or_else(|| self.imported_return_types.get(name))
+    }
+
+    /// Provenance of a symbol's return type — `Inferred` by default,
+    /// `PluginOverride` for plugin-declared overrides. Always returns
+    /// a value (never `None`) so debug tooling can ask "where did this
+    /// come from?" without branching on missingness.
+    #[allow(dead_code)] // debug-introspection accessor; consumed by tests
+    pub fn return_type_provenance(&self, sym_id: SymbolId) -> TypeProvenance {
+        self.type_provenance
+            .get(&sym_id)
+            .cloned()
+            .unwrap_or(TypeProvenance::Inferred)
     }
 
     /// Convenience wrapper: enrich with return types only (no hash keys).
@@ -4919,6 +4962,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            HashMap::new(),
         )
     }
 
@@ -5021,6 +5065,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
             HashMap::new(),
         );
         assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
@@ -5146,6 +5191,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
             HashMap::new(),
         );
 

@@ -381,9 +381,52 @@ pub enum Trigger {
     Always,
 }
 
+/// A plugin-asserted return type for a known sub/method. Plugins ship
+/// these as a static manifest (`overrides()` on the trait, `fn
+/// overrides()` at the top of a `.rhai` script) for cases where
+/// inference can't, or shouldn't, reach the right answer — Mojolicious'
+/// `_route` returns `$self` via an array slice the inference engine
+/// doesn't model, for example.
+///
+/// Overrides are NOT gated by triggers. They're consulted during every
+/// build's post-pass; if a local symbol matches the target, the
+/// override wins over whatever inference produced (with provenance
+/// recorded in `FileAnalysis.type_provenance` for debugging).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeOverride {
+    pub target: OverrideTarget,
+    pub return_type: InferredType,
+    /// Free-form prose surfacing in `TypeProvenance::PluginOverride.reason`.
+    /// Read by humans only — keep it explanatory ("returns $self via
+    /// the @_-shift / array-slice idiom that inference doesn't model").
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OverrideTarget {
+    /// Method `name` defined on the package `class`. Match is by exact
+    /// package name on the symbol — does NOT walk the inheritance chain
+    /// (override the home class, not its callers).
+    Method { class: String, name: String },
+    /// Free-standing sub `name` in `package`. `package: None` matches
+    /// top-level/script subs (symbols without an enclosing package).
+    Sub {
+        #[serde(default)]
+        package: Option<String>,
+        name: String,
+    },
+}
+
 pub trait FrameworkPlugin: Send + Sync {
     fn id(&self) -> &str;
     fn triggers(&self) -> &[Trigger];
+
+    /// Static type-override manifest. Read once at plugin load and
+    /// applied at the end of every build — see `TypeOverride`. Default
+    /// is no overrides; only plugins that need them implement this.
+    fn overrides(&self) -> &[TypeOverride] {
+        &[]
+    }
 
     // ---- Emit hooks (parse time) ----
     //
@@ -622,6 +665,17 @@ impl PluginRegistry {
     /// Plugins that use `on_use` should filter on `ctx.module_name`.
     pub fn all(&self) -> impl Iterator<Item = &dyn FrameworkPlugin> {
         self.plugins.iter().map(|p| p.as_ref())
+    }
+
+    /// Yield every (plugin_id, override) pair across the registry.
+    /// Trigger-independent: the builder applies overrides whenever a
+    /// local symbol matches their target, regardless of which packages
+    /// the file uses. Cheap to call — overrides are static `&[..]`
+    /// borrows from each plugin.
+    pub fn overrides<'a>(&'a self) -> impl Iterator<Item = (&'a str, &'a TypeOverride)> + 'a {
+        self.plugins
+            .iter()
+            .flat_map(|p| p.overrides().iter().map(move |o| (p.id(), o)))
     }
 
     /// Return plugins whose triggers match the current package context.

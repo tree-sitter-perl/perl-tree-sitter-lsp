@@ -66,6 +66,7 @@ pub fn build_with_plugins(
         export: Vec::new(),
         export_ok: Vec::new(),
         plugin_namespaces: Vec::new(),
+        type_provenance: std::collections::HashMap::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -116,6 +117,12 @@ pub fn build_with_plugins(
     // Post-pass 3: infer return types for subs/methods
     b.resolve_return_types();
 
+    // Post-pass 3b: apply plugin `overrides()` manifests. Runs AFTER
+    // inference so the override always wins — that's the whole point
+    // ("inference fails here, so override it"). Records provenance in
+    // `type_provenance` so debugging can tell inferred from asserted.
+    b.apply_type_overrides();
+
     // Post-pass 4: re-resolve invocant classes on MethodCall refs now
     // that sub return types are known. Function-call chains like
     // `get_foo()->bar()` need `get_foo`'s return type to pin the
@@ -142,6 +149,7 @@ pub fn build_with_plugins(
         b.export_ok,
         b.plugin_namespaces,
         b.package_uses,
+        b.type_provenance,
     )
 }
 
@@ -326,6 +334,10 @@ struct Builder<'a> {
     /// `EmitAction::PluginNamespace`. Flushed into the final
     /// `FileAnalysis.plugin_namespaces`.
     plugin_namespaces: Vec<crate::file_analysis::PluginNamespace>,
+    /// Per-symbol provenance for return types — empty unless an
+    /// `overrides()` manifest patched a Sub/Method's return type.
+    /// Flushed into `FileAnalysis.type_provenance` at construction.
+    type_provenance: std::collections::HashMap<SymbolId, TypeProvenance>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -4764,6 +4776,54 @@ impl<'a> Builder<'a> {
                             name: resolved,
                         });
                     }
+                }
+            }
+        }
+    }
+
+    /// Apply every `TypeOverride` in the registry to local Sub/Method
+    /// symbols. Plugin-asserted return types win over inference; the
+    /// override carries a `reason` that we record in
+    /// `type_provenance` so a debugger can later answer "why does the
+    /// LSP think `_route` returns `Mojolicious::Routes::Route`?"
+    /// without re-running the build.
+    ///
+    /// Targets are matched on (name, package). Methods require an
+    /// exact package match — overrides describe the home class, not
+    /// the inheritance chain (a base class's override wins for that
+    /// base's symbol; subclasses get it via the existing cross-file
+    /// resolution path).
+    fn apply_type_overrides(&mut self) {
+        // Snapshot first — can't borrow self.plugins while mutating
+        // self.symbols + self.type_provenance below.
+        let pairs: Vec<(String, plugin::TypeOverride)> = self.plugins
+            .overrides()
+            .map(|(id, o)| (id.to_string(), o.clone()))
+            .collect();
+        if pairs.is_empty() {
+            return;
+        }
+        for (plugin_id, ov) in pairs {
+            for sym in &mut self.symbols {
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                let target_matches = match &ov.target {
+                    plugin::OverrideTarget::Method { class, name } => {
+                        sym.name == *name && sym.package.as_deref() == Some(class.as_str())
+                    }
+                    plugin::OverrideTarget::Sub { package, name } => {
+                        sym.name == *name && sym.package == *package
+                    }
+                };
+                if !target_matches { continue; }
+                if let SymbolDetail::Sub { ref mut return_type, .. } = sym.detail {
+                    *return_type = Some(ov.return_type.clone());
+                    self.type_provenance.insert(
+                        sym.id,
+                        TypeProvenance::PluginOverride {
+                            plugin_id: plugin_id.clone(),
+                            reason: ov.reason.clone(),
+                        },
+                    );
                 }
             }
         }
@@ -11045,6 +11105,175 @@ $minion->enqueue(task_x => ['arg'] => { });
             assert!(labels.contains(expected),
                 "enqueue option `{}` must complete; got: {:?}",
                 expected, labels);
+        }
+    }
+
+    // ---- Plugin type overrides ----
+    //
+    // Tests pin the contract: a plugin's `overrides()` manifest patches
+    // local Sub/Method return types AFTER inference, with provenance
+    // recorded so debugging can tell asserted from inferred. The
+    // bundled `mojo-routes` plugin overrides `Mojolicious::Routes::Route::_route`
+    // to return `$self` because the upstream impl uses an `@_`-shift /
+    // array-slice idiom inference doesn't model.
+    //
+    // Targeting is by exact (class, method) — the override fires on the
+    // home class only; subclasses still get the type via the existing
+    // cross-file resolution path.
+
+    #[test]
+    fn plugin_override_patches_return_type_on_matching_method() {
+        let src = "\
+package Mojolicious::Routes::Route;
+
+sub _route {
+    my $self = shift;
+    # Real impl uses an array slice that inference can't model.
+    return $self;
+}
+
+1;
+";
+        let fa = build_fa(src);
+        let route_sym = fa.symbols.iter()
+            .find(|s| s.name == "_route" && matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .expect("_route must be parsed as a sub");
+        match &route_sym.detail {
+            SymbolDetail::Sub { return_type, .. } => {
+                assert_eq!(
+                    return_type.as_ref(),
+                    Some(&InferredType::ClassName("Mojolicious::Routes::Route".into())),
+                    "override must rewrite return_type to ClassName(Mojolicious::Routes::Route)",
+                );
+            }
+            other => panic!("_route must be a Sub detail; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plugin_override_records_provenance_with_plugin_id_and_reason() {
+        // The point of provenance is debug-time introspection: a
+        // future inspector should be able to ask "why does the LSP
+        // think `_route` returns Mojolicious::Routes::Route?" and
+        // get back "because mojo-routes' overrides() said so". We pin
+        // the plugin id and assert the reason isn't empty so a future
+        // refactor that drops the reason field surfaces here.
+        let src = "\
+package Mojolicious::Routes::Route;
+sub _route { my $self = shift; $self }
+1;
+";
+        let fa = build_fa(src);
+        let route_id = fa.symbols.iter()
+            .find(|s| s.name == "_route")
+            .expect("_route present")
+            .id;
+        match fa.return_type_provenance(route_id) {
+            TypeProvenance::PluginOverride { plugin_id, reason } => {
+                assert_eq!(plugin_id, "mojo-routes");
+                assert!(!reason.is_empty(), "reason must explain why override exists");
+            }
+            other => panic!("expected PluginOverride provenance; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plugin_override_does_not_touch_unrelated_subs() {
+        // Same method NAME, different class → override must NOT apply.
+        // The match is (class, method); a same-named method on an
+        // unrelated package keeps whatever inference produced.
+        let src = "\
+package Some::Other::Package;
+sub _route { my ($x) = @_; { id => $x } }
+1;
+";
+        let fa = build_fa(src);
+        let id = fa.symbols.iter()
+            .find(|s| s.name == "_route")
+            .expect("_route present")
+            .id;
+        // Provenance MUST be Inferred — the override is class-scoped.
+        assert!(
+            matches!(fa.return_type_provenance(id), TypeProvenance::Inferred),
+            "override must not bleed across packages; provenance: {:?}",
+            fa.return_type_provenance(id),
+        );
+    }
+
+    #[test]
+    fn plugin_override_does_not_touch_other_methods_in_target_class() {
+        // Same class, different method name → not the target.
+        let src = "\
+package Mojolicious::Routes::Route;
+sub other_method { my $self = shift; { ok => 1 } }
+1;
+";
+        let fa = build_fa(src);
+        let id = fa.symbols.iter()
+            .find(|s| s.name == "other_method")
+            .expect("other_method present")
+            .id;
+        assert!(
+            matches!(fa.return_type_provenance(id), TypeProvenance::Inferred),
+            "override must not bleed across method names",
+        );
+    }
+
+    #[test]
+    fn plugin_override_visible_via_find_method_return_type() {
+        // The user-visible payoff: any code path that asks "what does
+        // calling `_route` on a Mojolicious::Routes::Route return?"
+        // gets the override answer. find_method_return_type is the
+        // primary API every chain-resolver / hover / completion path
+        // routes through, so pinning it here covers the downstream
+        // features without coupling to their specific internals.
+        let src = "\
+package Mojolicious::Routes::Route;
+sub _route { my $self = shift; $self }
+1;
+";
+        let fa = build_fa(src);
+        let rt = fa.find_method_return_type(
+            "Mojolicious::Routes::Route",
+            "_route",
+            None,
+            None,
+        );
+        assert_eq!(
+            rt,
+            Some(InferredType::ClassName("Mojolicious::Routes::Route".into())),
+            "find_method_return_type must surface the override-supplied type",
+        );
+    }
+
+    #[test]
+    fn plugin_override_wins_over_inferred_return_type() {
+        // Even if inference DID produce a (different) return type, the
+        // override replaces it — the whole point is "inference reaches
+        // the wrong answer here". The body explicitly returns a hashref
+        // so inference would say HashRef without the override.
+        let src = "\
+package Mojolicious::Routes::Route;
+
+sub _route {
+    return { stub => 1 };
+}
+
+1;
+";
+        let fa = build_fa(src);
+        let sym = fa.symbols.iter()
+            .find(|s| s.name == "_route")
+            .expect("_route present");
+        match &sym.detail {
+            SymbolDetail::Sub { return_type, .. } => {
+                assert_eq!(
+                    return_type.as_ref(),
+                    Some(&InferredType::ClassName("Mojolicious::Routes::Route".into())),
+                    "override must replace inferred HashRef, not be skipped",
+                );
+            }
+            _ => unreachable!(),
         }
     }
 }

@@ -21,7 +21,7 @@ use tree_sitter::Point;
 
 use super::{
     CallContext, CompletionQueryContext, EmitAction, FrameworkPlugin, PluginCompletionAnswer,
-    PluginSigHelpAnswer, SigHelpQueryContext, Trigger, UseContext,
+    PluginSigHelpAnswer, SigHelpQueryContext, Trigger, TypeOverride, UseContext,
 };
 
 /// An engine built with our helpers and type registrations. Engines are
@@ -115,6 +115,7 @@ pub fn make_engine() -> Engine {
 pub struct RhaiPlugin {
     id: String,
     triggers: Vec<Trigger>,
+    overrides: Vec<TypeOverride>,
     engine: Arc<Engine>,
     ast: Arc<AST>,
     has_on_function_call: bool,
@@ -155,6 +156,29 @@ impl RhaiPlugin {
             .map(|f| f.name.to_string())
             .collect();
 
+        // `overrides()` is optional. Read once at compile time; missing
+        // function == no overrides. A bad return shape logs and treats
+        // as empty — same fail-safe as the emit hooks (a broken plugin
+        // shouldn't break the build).
+        let mut overrides: Vec<TypeOverride> = Vec::new();
+        if signatures.iter().any(|n| n == "overrides") {
+            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "overrides", ()) {
+                Ok(arr) => {
+                    for d in arr {
+                        match from_dynamic::<TypeOverride>(&d) {
+                            Ok(o) => overrides.push(o),
+                            Err(e) => log::error!(
+                                "plugin `{}` overrides() bad entry: {}",
+                                id,
+                                e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => log::error!("plugin `{}` overrides() failed: {}", id, e),
+            }
+        }
+
         Ok(Self {
             has_on_function_call: signatures.iter().any(|n| n == "on_function_call"),
             has_on_method_call: signatures.iter().any(|n| n == "on_method_call"),
@@ -163,6 +187,7 @@ impl RhaiPlugin {
             has_on_completion: signatures.iter().any(|n| n == "on_completion"),
             id,
             triggers,
+            overrides,
             engine,
             ast: Arc::new(ast),
         })
@@ -231,6 +256,10 @@ impl FrameworkPlugin for RhaiPlugin {
 
     fn triggers(&self) -> &[Trigger] {
         &self.triggers
+    }
+
+    fn overrides(&self) -> &[TypeOverride] {
+        &self.overrides
     }
 
     fn on_function_call(&self, ctx: &CallContext) -> Vec<EmitAction> {
@@ -540,6 +569,59 @@ mod tests {
 
         let emissions = plugin.on_method_call(&ctx);
         assert!(emissions.is_empty(), "dynamic name must not emit");
+    }
+
+    #[test]
+    fn rhai_overrides_function_is_read_at_compile_time() {
+        // A plugin that defines a top-level `overrides()` function:
+        // the host reads it once at load and exposes the list via
+        // FrameworkPlugin::overrides — no runtime call cost. This
+        // pins the static-manifest contract; if a future refactor
+        // moves overrides() to a per-build hook, this test breaks
+        // and forces a rethink.
+        let src = r#"
+            fn id() { "demo-overrides" }
+            fn triggers() { [] }
+            fn overrides() {
+                [
+                    #{
+                        target: #{ Method: #{ class: "Foo", name: "bar" } },
+                        return_type: #{ ClassName: "Foo" },
+                        reason: "test",
+                    }
+                ]
+            }
+        "#;
+        let engine = Arc::new(make_engine());
+        let plugin = RhaiPlugin::from_source(src, engine).expect("compiles");
+        let ovs = plugin.overrides();
+        assert_eq!(ovs.len(), 1);
+        match &ovs[0].target {
+            crate::plugin::OverrideTarget::Method { class, name } => {
+                assert_eq!(class, "Foo");
+                assert_eq!(name, "bar");
+            }
+            other => panic!("expected Method target, got {:?}", other),
+        }
+        assert_eq!(
+            ovs[0].return_type,
+            InferredType::ClassName("Foo".into())
+        );
+        assert_eq!(ovs[0].reason, "test");
+    }
+
+    #[test]
+    fn rhai_overrides_missing_function_yields_empty() {
+        // Plugins without an `overrides()` function must still load.
+        // The default registry uses this default for every plugin
+        // that doesn't ship overrides — silent absence, not error.
+        let src = r#"
+            fn id() { "no-overrides" }
+            fn triggers() { [] }
+        "#;
+        let engine = Arc::new(make_engine());
+        let plugin = RhaiPlugin::from_source(src, engine).expect("compiles");
+        assert!(plugin.overrides().is_empty());
     }
 
     #[test]

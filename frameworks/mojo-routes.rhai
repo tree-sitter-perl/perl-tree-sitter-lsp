@@ -26,6 +26,31 @@ fn triggers() {
     ]
 }
 
+// Static return-type assertions for sub/methods inference can't reach.
+// Read once at plugin load, applied at every build's post-pass — see
+// `Builder::apply_type_overrides`. Trigger-independent: the override
+// for `Mojolicious::Routes::Route::_route` fires whenever the home
+// module is built, even though `_route` doesn't appear inside a
+// triggered package.
+//
+// Why `_route`: it returns `$self` via an `@_`-shift / array-slice
+// pattern that the inference engine doesn't model. Without this, every
+// chained route builder (`$r->_route('GET')->to('...')->name('...')`)
+// loses its receiver type after the first hop and the rest of the
+// chain stops resolving.
+fn overrides() {
+    [
+        #{
+            target: #{ Method: #{
+                class: "Mojolicious::Routes::Route",
+                name: "_route",
+            }},
+            return_type: #{ ClassName: "Mojolicious::Routes::Route" },
+            reason: "_route returns $self via @_-shift; inference doesn't model array-slice returns",
+        }
+    ]
+}
+
 // A route is a first-class thing — it has identity (the `Controller#action`
 // pair), an owning app/package, and a target method. Emitting only the
 // MethodCallRef would make routes "just a ref into Users.pm" which is

@@ -62,12 +62,95 @@ A plugin is a Rhai file that defines:
 ```rhai
 fn id() { "my-plugin" }               // identifier, stamped on Namespace
 fn triggers() { [ ... ] }             // array of Trigger object-maps
+fn overrides() { [ ... ] }            // optional — static type-override manifest
 fn on_method_call(ctx) { [ ... ] }    // optional — returns EmitAction array
 fn on_function_call(ctx) { [ ... ] }  // optional
 fn on_use(ctx) { [ ... ] }            // optional — reserved for future
 ```
 
 Each callback returns an *array* of emissions (possibly empty). Object-map shape matches the `EmitAction` enum's serde representation; helpers like `owner_class(name)`, `owner_sub(pkg, name)`, and `type_class("Foo")` are registered on the engine so scripts don't have to hand-craft enum discriminants.
+
+## Type overrides — `overrides()` manifest
+
+Some idioms inference can't (or shouldn't) reach: Mojolicious'
+`Mojolicious::Routes::Route::_route` returns `$self` via an `@_`-shift
+followed by an array slice; modeling that requires array inference we
+haven't built. Plugins assert the right answer via a static
+`overrides()` manifest:
+
+```rhai
+fn overrides() {
+    [
+        #{
+            target: #{ Method: #{
+                class: "Mojolicious::Routes::Route",
+                name: "_route",
+            }},
+            return_type: #{ ClassName: "Mojolicious::Routes::Route" },
+            reason: "_route returns $self via @_-shift; inference doesn't model array-slice returns",
+        }
+    ]
+}
+```
+
+**Targets** are `Method { class, name }` (matched by exact home-class
+package name on the symbol — no inheritance walk; the override is
+about where the sub is *defined*, subclasses inherit it through the
+existing cross-file path) or `Sub { package, name }` (`package: ()`
+matches top-level/script subs).
+
+**Return type** is any `InferredType` shape — `ClassName(...)`,
+`HashRef`, `ArrayRef`, etc. Use `ClassName` over `FirstParam` when you
+can: same downstream semantics (both flow through `is_object()` /
+`class_name()` and pin chain receivers identically) but flatter Rhai
+syntax with no reserved-keyword bracket-insert workaround.
+
+**Reason** is free-form prose. It surfaces in
+`TypeProvenance::PluginOverride.reason` for debug introspection — keep
+it explanatory, this is how a future reader answers "why does the LSP
+think `_route` returns `Mojolicious::Routes::Route`?" without
+re-running the build.
+
+### Application semantics
+
+- **Trigger-independent.** Overrides are *not* gated by `triggers()`.
+  They apply at every build's post-pass regardless of which packages
+  the file uses, so `Mojolicious::Routes::Route.pm`'s build picks up
+  the `_route` override even though that module doesn't itself
+  `use Mojolicious`.
+- **Read once at plugin compile time.** No runtime call cost — the
+  host calls `overrides()` once during `RhaiPlugin::from_source` and
+  caches the list on the plugin struct.
+- **Wins over inference.** Application runs as builder post-pass 3b,
+  *after* `resolve_return_types` — overriding an existing inferred
+  type is the whole point ("inference reaches the wrong answer
+  here"). Provenance is recorded in `FileAnalysis.type_provenance` so
+  the inferred answer isn't lost to the debugger.
+- **Cross-file falls out for free.** When the resolver builds the
+  home module, the override patches the cached symbol's
+  `return_type`. User code's `find_method_return_type(class, name)`
+  reads the patched cached symbol — no changes to lookup logic, no
+  separate override table consulted at query time.
+
+### Provenance — `FileAnalysis.type_provenance`
+
+Sidecar map `HashMap<SymbolId, TypeProvenance>` keyed by symbol id.
+Two variants:
+
+- `Inferred` — the default. Never stored; missing entry == inferred.
+- `PluginOverride { plugin_id, reason }` — the override fired here.
+
+Read via `fa.return_type_provenance(sym_id)` (always returns a value,
+never `None`). Round-trips through bincode along with the rest of
+`FileAnalysis`. Consumers today are tests + future debug inspectors;
+nothing on the hot path branches on provenance, so keeping the common
+case zero-cost matters.
+
+The map is modeled this way deliberately: an alternative was wrapping
+`InferredType` in a `Typed { ty, provenance }` struct, but provenance
+is interesting only for the small minority of types that came from
+overrides — wrapping the type itself would have rippled through every
+return-type callsite for a feature only debug introspection consumes.
 
 ### Loading
 
