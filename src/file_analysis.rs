@@ -935,6 +935,11 @@ pub struct FileAnalysis {
     base_type_constraint_count: usize,
     #[serde(default)]
     base_symbol_count: usize,
+    /// Witness-bag baseline, parallel to the constraint baseline.
+    /// Enrichment truncates back to this length before re-deriving so
+    /// repeat calls stay idempotent.
+    #[serde(default)]
+    base_witness_count: usize,
 
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
@@ -997,6 +1002,7 @@ impl FileAnalysis {
             package_framework: HashMap::new(),
             base_type_constraint_count: 0,
             base_symbol_count: 0,
+            base_witness_count: 0,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -1004,10 +1010,84 @@ impl FileAnalysis {
             refs_by_target: HashMap::new(),
         };
         fa.build_indices();
-        fa.resolve_method_call_types(None); // local post-pass
-        fa.base_type_constraint_count = fa.type_constraints.len();
-        fa.base_symbol_count = fa.symbols.len();
+        // Seed the bag from type_constraints so direct constructions
+        // (tests, deserialised analyses without a bag, ad-hoc fa
+        // assembly) get a working witness pipeline. The builder path
+        // overwrites this with its own already-populated bag — so
+        // the seeding is redundant on that path, but it's the
+        // architectural invariant: every FileAnalysis ALWAYS has a
+        // bag in sync with `type_constraints` when it returns from a
+        // constructor.
+        fa.seed_bag_from_constraints();
+        // NB: the local `resolve_method_call_types(None)` post-pass and
+        // baseline-count seal moved out to `finalize_post_walk()` so
+        // they run AFTER `build()` injects the witness bag. Bag and
+        // type_constraints stay in sync because the post-pass goes
+        // through `push_type_constraint`.
         fa
+    }
+
+    /// Mirror every existing `TypeConstraint` into the witness bag as
+    /// a `Variable` witness (with class-assertion / FirstParam
+    /// observations for class-identity types). The Builder runs an
+    /// equivalent pass via `populate_witness_bag`; this method is the
+    /// fa-construction-time counterpart for code that builds a
+    /// FileAnalysis without going through `builder::build`. Called
+    /// from `FileAnalysis::new` and `after_deserialize` to keep the
+    /// invariant: bag and `type_constraints` are always in sync.
+    pub(crate) fn seed_bag_from_constraints(&mut self) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        for tc in self.type_constraints.clone() {
+            self.witnesses.push(Witness {
+                attachment: WitnessAttachment::Variable {
+                    name: tc.variable.clone(),
+                    scope: tc.scope,
+                },
+                source: WitnessSource::Builder("type_constraint".into()),
+                payload: WitnessPayload::InferredType(tc.inferred_type.clone()),
+                span: Span { start: tc.constraint_span.start, end: tc.constraint_span.start },
+            });
+            match tc.inferred_type {
+                InferredType::ClassName(n) => {
+                    self.witnesses.push(Witness {
+                        attachment: WitnessAttachment::Variable {
+                            name: tc.variable,
+                            scope: tc.scope,
+                        },
+                        source: WitnessSource::Builder("type_constraint".into()),
+                        payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(n)),
+                        span: tc.constraint_span,
+                    });
+                }
+                InferredType::FirstParam { package } => {
+                    self.witnesses.push(Witness {
+                        attachment: WitnessAttachment::Variable {
+                            name: tc.variable,
+                            scope: tc.scope,
+                        },
+                        source: WitnessSource::Builder("type_constraint".into()),
+                        payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+                            package,
+                        }),
+                        span: tc.constraint_span,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Run the local-only method-call-binding resolution and seal
+    /// baseline counts. Called by `builder::build` after the witness
+    /// bag has been moved in. Keeps the bag canonical: every new
+    /// `TypeConstraint` pushed here lands as a `Witness` too.
+    pub(crate) fn finalize_post_walk(&mut self) {
+        self.resolve_method_call_types(None);
+        self.base_type_constraint_count = self.type_constraints.len();
+        self.base_symbol_count = self.symbols.len();
+        self.base_witness_count = self.witnesses.len();
     }
 
     /// Rebuild all derived indices after deserialization.
@@ -1206,14 +1286,23 @@ impl FileAnalysis {
         None
     }
 
-    /// Get the inferred type of a variable at a point.
+    /// Raw `type_constraints` lookup — returns the latest in-scope
+    /// constraint for `var_name` before `point`, with no framework
+    /// rules, no branch fold, no narrowing.
     ///
-    /// Linear scan of `type_constraints`. The previous by-var index
-    /// map kept crashing the LSP whenever enrichment truncated the
-    /// vector without resyncing the indices — a whole class of bug
-    /// that Rust can't prevent when you maintain parallel data
-    /// structures by hand. On real files this vector is in the
-    /// hundreds at worst; the scan doesn't show up in profiles.
+    /// **NOT the canonical type query.** Use `inferred_type_via_bag`
+    /// for any consumer that wants the answer the rest of the LSP
+    /// uses — this method exists for two narrow purposes:
+    ///
+    /// 1. Internal "did we explicitly assign a type to this variable
+    ///    yet?" checks (e.g. `resolve_method_call_types` early-out)
+    ///    that need the bare constraint state, not the bag's reduced
+    ///    answer (which can be non-`None` from rep observations alone).
+    /// 2. Tests that assert on raw constraint state.
+    ///
+    /// If you find a third use case, prefer `inferred_type_via_bag`
+    /// and only fall back here if you have a concrete reason that
+    /// would survive a code review.
     pub fn inferred_type(&self, var_name: &str, point: Point) -> Option<&InferredType> {
         let mut best: Option<&TypeConstraint> = None;
         for tc in &self.type_constraints {
@@ -1240,41 +1329,15 @@ impl FileAnalysis {
     /// *additional* observations on top; if none are present the
     /// result is identical to `inferred_type()`.
     pub fn inferred_type_via_bag(&self, var_name: &str, point: Point) -> Option<InferredType> {
-        use crate::witnesses::{
-            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, WitnessAttachment,
-        };
-
-        // Lookup package-framework for the scope containing the point.
-        let framework = self
-            .scope_at(point)
-            .and_then(|sc| self.scopes[sc.0 as usize].package.as_ref())
-            .and_then(|pkg| self.package_framework.get(pkg).copied())
-            .unwrap_or(FrameworkFact::Plain);
-
-        // Walk up the scope chain and try each as an attachment key.
-        let scope = self.scope_at(point);
-        if let Some(start) = scope {
-            let chain = self.scope_chain(start);
-            let reg = ReducerRegistry::with_defaults();
-            for scope_id in chain {
-                let att = WitnessAttachment::Variable {
-                    name: var_name.to_string(),
-                    scope: scope_id,
-                };
-                let q = ReducerQuery {
-                    attachment: &att,
-                    point: Some(point),
-                    framework,
-                    return_of: None,
-            arity_hint: None,
-                };
-                if let ReducedValue::Type(t) = reg.query(&self.witnesses, &q) {
-                    return Some(t);
-                }
-            }
-        }
-
-        self.inferred_type(var_name, point).cloned()
+        let scope = self.scope_at(point)?;
+        crate::witnesses::query_variable_type(
+            &self.witnesses,
+            &self.scopes,
+            &self.package_framework,
+            var_name,
+            scope,
+            point,
+        )
     }
 
     /// Part 6/7 — resolve the inferred return type of a method call
@@ -1347,32 +1410,12 @@ impl FileAnalysis {
         sub_name: &str,
         arity: Option<u32>,
     ) -> Option<InferredType> {
-        use crate::witnesses::{
-            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, WitnessAttachment,
-        };
-
-        // Find the sub's SymbolId.
-        let sym_id = self
-            .symbols
-            .iter()
-            .find(|s| {
-                s.name == sub_name && matches!(s.kind, SymKind::Sub | SymKind::Method)
-            })
-            .map(|s| s.id)?;
-
-        let att = WitnessAttachment::Symbol(sym_id);
-        let reg = ReducerRegistry::with_defaults();
-        let q = ReducerQuery {
-            attachment: &att,
-            point: None,
-            framework: FrameworkFact::Plain,
-            return_of: None,
-            arity_hint: arity,
-        };
-        if let ReducedValue::Type(t) = reg.query(&self.witnesses, &q) {
-            return Some(t);
-        }
-        self.sub_return_type(sub_name).cloned()
+        crate::witnesses::query_sub_return_type(
+            &self.witnesses,
+            &self.symbols,
+            sub_name,
+            arity,
+        )
     }
 
     /// Part 1 — list hash keys that have been written to on instances
@@ -1452,10 +1495,14 @@ impl FileAnalysis {
         module_index: Option<&ModuleIndex>,
     ) {
         // Truncate back to baseline so repeated enrichment doesn't accumulate duplicates.
+        // Same idea applies to the bag — enrichment pushes new
+        // witnesses via `push_type_constraint`, so we truncate back
+        // to the build-time baseline witness count first.
         self.type_constraints.truncate(self.base_type_constraint_count);
         self.symbols.truncate(self.base_symbol_count);
+        self.witnesses.truncate(self.base_witness_count);
 
-        let mut new_constraints = Vec::new();
+        let mut to_push: Vec<TypeConstraint> = Vec::new();
         for binding in &self.call_bindings {
             // Skip if already resolved (local sub or builtin)
             if self.sub_return_type_local(&binding.func_name).is_some()
@@ -1464,7 +1511,7 @@ impl FileAnalysis {
                 continue;
             }
             if let Some(rt) = imported_returns.get(&binding.func_name) {
-                new_constraints.push(TypeConstraint {
+                to_push.push(TypeConstraint {
                     variable: binding.variable.clone(),
                     scope: binding.scope,
                     constraint_span: binding.span,
@@ -1472,7 +1519,28 @@ impl FileAnalysis {
                 });
             }
         }
-        self.type_constraints.extend(new_constraints);
+        for tc in to_push {
+            self.push_type_constraint(tc);
+        }
+        // Mirror every imported return type into the bag as a
+        // `NamedSub` witness so `query_sub_return_type` resolves
+        // imports through the same path it uses for locals. Keep the
+        // legacy `imported_return_types` map for now — it's the
+        // source the bag is mirrored from. Fully removing it is a
+        // separate cleanup; the user-facing query already routes
+        // through the bag.
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+        for (name, ty) in &imported_returns {
+            self.witnesses.push(Witness {
+                attachment: WitnessAttachment::NamedSub(name.clone()),
+                source: WitnessSource::Enrichment("imported_return".to_string()),
+                payload: WitnessPayload::InferredType(ty.clone()),
+                span: Span {
+                    start: Point { row: 0, column: 0 },
+                    end: Point { row: 0, column: 0 },
+                },
+            });
+        }
         self.imported_return_types = imported_returns;
 
         // Inject synthetic HashKeyDef symbols for imported functions' hash keys.
@@ -1583,17 +1651,63 @@ impl FileAnalysis {
 
             if let Some(cn) = class_name {
                 if let Some(rt) = self.find_method_return_type(&cn, &binding.method_name, module_index, None) {
-                    self.type_constraints.push(TypeConstraint {
+                    self.push_type_constraint(TypeConstraint {
                         variable: binding.variable.clone(),
                         scope: binding.scope,
                         constraint_span: binding.span,
                         inferred_type: rt,
                     });
-                    // NB: the NEXT binding sees this constraint via the
-                    // linear scan in `inferred_type` — no parallel index
-                    // to keep in sync.
                 }
             }
+        }
+    }
+
+    /// Push a `TypeConstraint` and mirror it into the witness bag in
+    /// one step. The bag is the source of truth; every code path that
+    /// adds a constraint must call this so subsequent
+    /// `inferred_type` / `inferred_type_via_bag` queries see it. New
+    /// callers in the resolve / enrich path go through here. The walk
+    /// (Builder) seeds the bag in bulk via `populate_witness_bag` and
+    /// pushes call-binding constraints through its own helper —
+    /// equivalent semantics, different phase.
+    pub(crate) fn push_type_constraint(&mut self, tc: TypeConstraint) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        let var = tc.variable.clone();
+        let scope = tc.scope;
+        let span = tc.constraint_span;
+        let ty = tc.inferred_type.clone();
+        self.type_constraints.push(tc);
+        self.witnesses.push(Witness {
+            attachment: WitnessAttachment::Variable {
+                name: var.clone(),
+                scope,
+            },
+            source: WitnessSource::Builder("type_constraint".into()),
+            payload: WitnessPayload::InferredType(ty.clone()),
+            span: Span { start: span.start, end: span.start },
+        });
+        match ty {
+            InferredType::ClassName(n) => {
+                self.witnesses.push(Witness {
+                    attachment: WitnessAttachment::Variable { name: var, scope },
+                    source: WitnessSource::Builder("type_constraint".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(n)),
+                    span,
+                });
+            }
+            InferredType::FirstParam { package } => {
+                self.witnesses.push(Witness {
+                    attachment: WitnessAttachment::Variable { name: var, scope },
+                    source: WitnessSource::Builder("type_constraint".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+                        package,
+                    }),
+                    span,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -5239,7 +5353,7 @@ fn cross_file_resolved(sub_info: &crate::module_index::SubInfo<'_>) -> ResolvedS
     let params: Vec<ParamInfo> = sub_info.params().to_vec();
     let param_types: Vec<Option<InferredType>> = params
         .iter()
-        .map(|p| sub_info.param_inferred_type(&p.name).cloned())
+        .map(|p| sub_info.param_inferred_type(&p.name))
         .collect();
     ResolvedSub::CrossFile {
         params,
@@ -5308,37 +5422,37 @@ mod tests {
     #[test]
     fn test_resolve_hashref_type() {
         let fa = fa_with_constraints(vec![constraint("$href", 0, InferredType::HashRef)]);
-        assert_eq!(fa.inferred_type("$href", Point::new(1, 0)), Some(&InferredType::HashRef));
+        assert_eq!(fa.inferred_type_via_bag("$href", Point::new(1, 0)), Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_resolve_arrayref_type() {
         let fa = fa_with_constraints(vec![constraint("$aref", 0, InferredType::ArrayRef)]);
-        assert_eq!(fa.inferred_type("$aref", Point::new(1, 0)), Some(&InferredType::ArrayRef));
+        assert_eq!(fa.inferred_type_via_bag("$aref", Point::new(1, 0)), Some(InferredType::ArrayRef));
     }
 
     #[test]
     fn test_resolve_coderef_type() {
         let fa = fa_with_constraints(vec![constraint("$cref", 0, InferredType::CodeRef)]);
-        assert_eq!(fa.inferred_type("$cref", Point::new(1, 0)), Some(&InferredType::CodeRef));
+        assert_eq!(fa.inferred_type_via_bag("$cref", Point::new(1, 0)), Some(InferredType::CodeRef));
     }
 
     #[test]
     fn test_resolve_regexp_type() {
         let fa = fa_with_constraints(vec![constraint("$re", 0, InferredType::Regexp)]);
-        assert_eq!(fa.inferred_type("$re", Point::new(1, 0)), Some(&InferredType::Regexp));
+        assert_eq!(fa.inferred_type_via_bag("$re", Point::new(1, 0)), Some(InferredType::Regexp));
     }
 
     #[test]
     fn test_resolve_numeric_type() {
         let fa = fa_with_constraints(vec![constraint("$n", 0, InferredType::Numeric)]);
-        assert_eq!(fa.inferred_type("$n", Point::new(1, 0)), Some(&InferredType::Numeric));
+        assert_eq!(fa.inferred_type_via_bag("$n", Point::new(1, 0)), Some(InferredType::Numeric));
     }
 
     #[test]
     fn test_resolve_string_type() {
         let fa = fa_with_constraints(vec![constraint("$s", 0, InferredType::String)]);
-        assert_eq!(fa.inferred_type("$s", Point::new(1, 0)), Some(&InferredType::String));
+        assert_eq!(fa.inferred_type_via_bag("$s", Point::new(1, 0)), Some(InferredType::String));
     }
 
     #[test]
@@ -5347,8 +5461,8 @@ mod tests {
             constraint("$x", 0, InferredType::HashRef),
             constraint("$x", 3, InferredType::ArrayRef),
         ]);
-        assert_eq!(fa.inferred_type("$x", Point::new(1, 0)), Some(&InferredType::HashRef));
-        assert_eq!(fa.inferred_type("$x", Point::new(4, 0)), Some(&InferredType::ArrayRef));
+        assert_eq!(fa.inferred_type_via_bag("$x", Point::new(1, 0)), Some(InferredType::HashRef));
+        assert_eq!(fa.inferred_type_via_bag("$x", Point::new(4, 0)), Some(InferredType::ArrayRef));
     }
 
     #[test]
@@ -5397,8 +5511,8 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
-        assert_eq!(fa.sub_return_type("nonexistent"), None);
+        assert_eq!(fa.sub_return_type_at_arity("get_config", None), Some(InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("nonexistent", None), None);
     }
 
     // ---- Return type resolution tests (decoupled, pure function) ----
@@ -5485,9 +5599,9 @@ mod tests {
         imported.insert("get_config".to_string(), InferredType::HashRef);
         fa.enrich_imported_types(imported);
 
-        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_config", None), Some(InferredType::HashRef));
         // Local subs should still return None
-        assert_eq!(fa.sub_return_type("nonexistent"), None);
+        assert_eq!(fa.sub_return_type_at_arity("nonexistent", None), None);
     }
 
     // ---- enrich_imported_types tests ----
@@ -5530,8 +5644,8 @@ mod tests {
 
         // Should have pushed a type constraint for $cfg
         assert_eq!(
-            fa.inferred_type("$cfg", Point::new(3, 0)),
-            Some(&InferredType::HashRef),
+            fa.inferred_type_via_bag("$cfg", Point::new(3, 0)),
+            Some(InferredType::HashRef),
             "Enrichment should propagate imported return type to call binding variable"
         );
     }

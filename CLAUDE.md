@@ -38,7 +38,7 @@ Unification refactor status: phases 2, 3, 4, 5 landed.
 
 Phases 1 (Namespace) and 6–7 still pending; see `docs/prompt-unification-spec.md`.
 
-Type inference + invariant derivation: `docs/prompt-type-inference-spec.md` captures what's landed and the next four modeling directions (invocant mutations, hash-key unions, method-loop dispatch analysis, map/grep/reduce invariants).
+Type inference + invariant derivation: `docs/prompt-type-inference-spec.md` captures what's landed and the next set of modeling directions. Spec parts 6 (framework-aware resolver) and 7 (fact-witness bag + reducers) are now landed in code — see "Witness bag + reducers" below.
 
 **Rules:**
 
@@ -87,7 +87,7 @@ Type inference + invariant derivation: `docs/prompt-type-inference-spec.md` capt
 
 ### File map
 
-- `src/main.rs` — Entry point, stdio transport, CLI modes (`--rename`, `--workspace-symbol`, `--version`)
+- `src/main.rs` — Entry point, stdio transport, CLI modes (`--rename`, `--workspace-symbol`, `--dump-package`, `--version`). `cli_full_startup(root)` is the shared "act like the LSP server just started" helper used by every cross-file CLI command.
 - `src/backend.rs` — `LanguageServer` trait implementation (tower-lsp), request routing. Open + workspace files live in the shared `FileStore`.
 - `src/document.rs` — `Document` (tree + text + analysis + stable_outline) for open files
 - `src/file_store.rs` — Unified store for open + workspace FileAnalyses (role-tagged, dedup'd by path)
@@ -101,6 +101,7 @@ Type inference + invariant derivation: `docs/prompt-type-inference-spec.md` capt
 - `src/module_resolver.rs` — Background resolver thread, in-process parsing, workspace indexing (Rayon) into FileStore
 - `src/module_cache.rs` — SQLite persistence (schema v9, bincode+zstd of FileAnalysis), mtime validation
 - `src/cpanfile.rs` — cpanfile parsing via tree-sitter queries
+- `src/witnesses.rs` — Two-phase type inference: (1) typed witnesses attached to variables/expressions/symbols/hash-keys, (2) reducer registry that folds the bag into a single `InferredType`. See "Witness bag + reducers" below.
 
 ## Key Dependencies
 
@@ -148,6 +149,53 @@ E2e tests use Neovim headless mode. They exercise the full LSP protocol over std
 - **Plugin fingerprint** (`plugin::rhai_host::plugin_fingerprint`) hashes bundled plugin sources + every `.rhai` in `$PERL_LSP_PLUGIN_DIR`. Stored in the `meta` table; mismatch on startup hard-clears the modules table (same machinery as `validate_inc_paths`). Without this, editing a plugin and restarting the LSP would serve stale FileAnalysis blobs — making plugin QA impossible.
 - Async handlers only use `_cached` methods — zero I/O.
 - After resolution, diagnostics are refreshed for all open files (clears stale false positives).
+
+### Witness bag + reducers (type inference, two phases)
+
+`InferredType` is a flat sum (`HashRef | ArrayRef | ClassName(_) | …`) — fine for "what is this", terrible for "what do all these observations together say". The witness pipeline splits inference into two phases. **The split is strict.** Collection records raw, untyped-policy facts. Reduction applies framework rules and produces typed answers. There is no third "we already folded a bit at collection time" layer, and there are no escape hatches that bypass the bag.
+
+**Phase 1 — collect.** During the builder's single pass:
+
+- Every `TypeConstraint` is mirrored into `FileAnalysis.witnesses` (a `WitnessBag`) as a `Variable`-attachment witness. Class-identity constraints (`ClassName`, `FirstParam`) also push the corresponding `TypeObservation` so the framework-aware reducer can see them.
+- Every `$v->{k}` ref pushes a `HashRefAccess` observation against `$v`.
+- Every method call ref pushes a `ReturnOfName(method)` observation on the call's `Expression` attachment (powers fluent-chain receiver resolution).
+- Every write through a class- or sub-owned hash key pushes a `mutation` `Fact` on the `HashKey` attachment.
+- Walk-time idiom detectors (branch arms, arity gating) push directly via `Builder.pending_witnesses`, drained into the bag at the end of the walk.
+
+This happens once, in `Builder::populate_witness_bag()`. After that point the bag is the source of truth for the witness pipeline; nothing else seeds it.
+
+**Phase 2 — reduce.** Reduction goes through a `ReducerRegistry` (`src/witnesses.rs`). Each `WitnessReducer` claims a subset (attachment kind + source + payload family) and folds into a `ReducedValue`. Built-in reducers:
+
+- **`FrameworkAwareTypeFold`** — Part 6. Folds `TypeObservation` payloads using the enclosing package's `FrameworkFact` (Moo / Moose / MojoBase / Plain). Class-identity dominates rep observations when the framework's backing rep agrees — so `sub name { … $self->{name} = … ; return $self }` inside a Mojo::Base class keeps `$self` as `ClassName(Foo)`. `BlessTarget(Rep)` pins the rep axis (arrayref-backed classes). Temporal ordering: witnesses past the query point are skipped, so a later `$x = Foo->new` can't poison an earlier `$x->[0]` site.
+- **`BranchArmFold`** — Part 5b. `BranchArm(InferredType)` per arm; agreement → that type, disagreement → `None`. Claims `Variable` (`my $x = $c ? A : B`), `Symbol` (`if/else { return A } else { return B }` and `return $c ? A : B`), and `Expression` attachments uniformly. Builder emits via the attachment-agnostic `emit_branch_arm_witnesses(cond_expr, attachment, ctx)`.
+- **`FluentArityDispatch`** — Part 6b. `ArityReturn { arg_count, return_type }` per arity-gated return branch. The walk *classifies* each `return_expression`'s arity branch (Zero / Exact(N) / Default) but does NOT bake a type into the witness — the type comes from the bag-aware fold in `Builder::resolve_return_types`, same phase as `Symbol.return_type` reduction. Witnesses are emitted only for subs with at least one Zero/Exact arm (genuinely arity-discriminated); plain subs leave their default to `Symbol.return_type` so agreement across arms isn't bypassed. The reducer matches exact-arity, falls back to agreement-folded Default.
+- **`NamedSubReturn`** — Plain `InferredType` payload on `NamedSub(name)` attachments. Pushed by `enrich_imported_types_with_keys` for every cross-file return type. Lets `query_sub_return_type` resolve imports through the SAME bag path it uses for locals — no parallel `imported_return_types` lookup at consumer sites.
+- **`BranchArmFold`** requires **two or more** arms to claim a result — a single `if (cond) { return X }` is not "agreement", and the reducer yields to the next path so `Symbol.return_type` (which sees ALL return arms) wins.
+
+**Single shared query path.** `witnesses::query_variable_type(bag, scopes, package_framework, var, scope, point)` is the *only* place the scope-chain walk + framework-fact lookup + reducer dispatch lives for variable lookups. `witnesses::query_sub_return_type(bag, symbols, sub_name, arity_hint)` is the parallel for sub returns — handles **local symbols** (via `Symbol` attachment) and **imported subs** (via `NamedSub` attachment, pushed by enrichment) through one path. Both `Builder::var_type_via_bag` (used during build for the return-arm fold) and `FileAnalysis::inferred_type_via_bag` / `sub_return_type_at_arity` (used at query time) are thin wrappers over these helpers. Identical rules in both places by construction. No "if no local symbol, take a different path" escape hatches.
+
+**Single point of reduction for `Symbol.return_type`.** `Builder::resolve_return_types` runs *after* `populate_witness_bag()`. Per `return $var` site it asks the bag (one query, framework-aware). Per literal/constructor return it uses the type the walk could read off directly. Then `resolve_return_type`'s agreement combinator yields the sub's return type. Delegation chains and `self_method_tails` propagate after that. Call-binding constraints (`my $cfg = get_config()`) are pushed in the same pass — both into `self.type_constraints` and into `self.bag` as a Variable witness, so the bag stays canonical.
+
+**Bag-and-`type_constraints` stay in sync — always.** Direct `self.type_constraints.push(...)` is no longer used outside the builder's seed step. `FileAnalysis::push_type_constraint(tc)` writes to both tables in lockstep. The local post-pass (`resolve_method_call_types(None)`) and cross-file enrichment (`enrich_imported_types_with_keys`) both go through it. `base_witness_count` is sealed alongside `base_type_constraint_count` after `finalize_post_walk()`, and enrichment truncates *both* before re-deriving — so repeat enrichment is fully idempotent.
+
+**Query entry points on `FileAnalysis`** (the canonical names — internal helpers exist but consumers should call these):
+
+- `inferred_type_via_bag(var, point)` — variable type at a point. Returns owned `InferredType`. Goes through `query_variable_type`. The bag is canonical (every constraint flows through `push_type_constraint`); no fallback to a legacy linear scan in production.
+- `sub_return_type_at_arity(name, arity)` — sub return type. Goes through `query_sub_return_type`, which dispatches to `Symbol` attachment for locals and `NamedSub` for imports through the same reducer registry.
+- `method_call_return_type_via_bag(ref_idx)` — Expression-attached `ReturnOfName` fold. Lets `$r->get('/x')->to('Y#z')` resolve the receiver of `->to` without an intermediate variable.
+- `mutated_keys_on_class(class)` — Part 1 hook for dynamic-key completion on `$self->{`. Reads `mutation` facts on `HashKey` attachments.
+
+**Legacy holdouts (use only for raw-state introspection, NOT type queries):**
+
+- `FileAnalysis::inferred_type(var, point) -> Option<&InferredType>` — raw linear scan of `type_constraints` with no framework / branch / arity rules. Doc-flagged as "not a type query." Two narrow legitimate uses: the `resolve_method_call_types` early-out (`.is_some()` check on raw constraint state), and tests asserting on what the builder pushed. Anything else should call `inferred_type_via_bag`.
+
+**Cache durability.** Both `WitnessBag` and `package_framework` are `#[serde(default)]` and ride the existing bincode + zstd module-cache blob. `EXTRACT_VERSION` bumps when the bag's shape or fold rules change, so stale cache entries re-resolve with priority instead of serving empty bags.
+
+The bag is **additive**: `TypeConstraint` / `CallBinding` / `MethodCallBinding` / framework synthesis / cross-file enrichment all keep working. Witnesses layer on top for cases the flat sum couldn't express; new behavior lands as new reducers, not new variants on `InferredType`.
+
+### Debugging the inference pipeline
+
+`perl-lsp --dump-package <root> <package>` runs the same startup as the LSP server (workspace index, SQLite cache warm, on-demand @INC resolve, post-build enrichment), then dumps every sub in `<package>` as JSON: name, params with bag-resolved types, raw `return_type`, `sub_return_type_at_arity` projections at arity 0/1/2/None, `return_self_method` tail, witness count on the sub's symbol, framework, parents, doc summary. Use it to inspect what the reducers are folding and where chains die. Workspace packages are found by symbol scan; external @INC packages come from `module_index.get_cached(name)` populated by the startup pass.
 
 ### Cross-file type enrichment
 

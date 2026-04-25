@@ -16,8 +16,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::file_analysis::{
-    HashKeyOwner, InferredType, ScopeId, Span, SymbolId,
+    HashKeyOwner, InferredType, Scope, ScopeId, Span, SymbolId,
 };
+
+use tree_sitter::Point;
 
 // ---- Core witness types ----
 
@@ -42,6 +44,13 @@ pub enum WitnessAttachment {
     Expression(RefIdx),
     /// A symbol property ("this sub is a dispatcher").
     Symbol(SymbolId),
+    /// A symbol referenced by name without a local `SymbolId` — i.e.
+    /// imported from another module. The bag carries the imported
+    /// return type here so the bag-query path is uniform across
+    /// local and cross-file callees. Without this attachment kind
+    /// imported subs would need a separate lookup (the old
+    /// `imported_return_types` map), reintroducing parallel paths.
+    NamedSub(String),
     /// A specific call site — property of the call, not of its result
     /// or its receiver.
     CallSite(RefIdx),
@@ -219,6 +228,18 @@ impl WitnessBag {
         for (i, w) in self.witnesses.iter().enumerate() {
             self.index.entry(w.attachment.clone()).or_default().push(i);
         }
+    }
+
+    /// Drop every witness past `baseline` and rebuild the index.
+    /// Used by enrichment to revert post-build additions before
+    /// re-deriving them — keeps the bag idempotent across repeat
+    /// enrichment calls without accumulating duplicates.
+    pub fn truncate(&mut self, baseline: usize) {
+        if baseline >= self.witnesses.len() {
+            return;
+        }
+        self.witnesses.truncate(baseline);
+        self.rebuild_index();
     }
 
     pub fn len(&self) -> usize {
@@ -556,7 +577,13 @@ impl WitnessReducer for BranchArmFold {
                 _ => None,
             })
             .collect();
-        if arms.is_empty() {
+        // A single arm is not "agreement" — `if (cond) { return X }`
+        // alone leaves the alternative undetermined. The fold only
+        // produces a type when at least two arms exist AND they all
+        // agree. Otherwise yield to the next reducer / fallback (e.g.
+        // `Symbol.return_type` carries the agreement across every
+        // return arm via `resolve_return_type`).
+        if arms.len() < 2 {
             return ReducedValue::None;
         }
         let first = arms[0];
@@ -596,7 +623,13 @@ impl WitnessReducer for FluentArityDispatch {
 
     fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
         let mut exact: Option<InferredType> = None;
-        let mut default: Option<InferredType> = None;
+        // Default is the agreement across every non-arity-gated arm.
+        // We collect each Default's type and call resolve_return_type
+        // (the existing combinator that returns None on disagreement)
+        // to decide. Without this, two conflicting bare returns —
+        // e.g. `if (cond) { return {} } return [];` — would silently
+        // surface the last-emitted arm and lose the disagreement.
+        let mut default_arms: Vec<InferredType> = Vec::new();
         for w in ws {
             if let WitnessPayload::Observation(TypeObservation::ArityReturn {
                 arg_count,
@@ -605,13 +638,47 @@ impl WitnessReducer for FluentArityDispatch {
             {
                 match (arg_count, q.arity_hint) {
                     (Some(a), Some(h)) if *a == h => exact = Some(return_type.clone()),
-                    (None, _) => default = Some(return_type.clone()),
+                    (None, _) => default_arms.push(return_type.clone()),
                     _ => {}
                 }
             }
         }
+        let default = crate::file_analysis::resolve_return_type(&default_arms);
         if let Some(t) = exact.or(default) {
             return ReducedValue::Type(t);
+        }
+        ReducedValue::None
+    }
+}
+
+// ---- Named-sub return reducer ----
+//
+// Claims plain `InferredType` payloads on `NamedSub` attachments —
+// the import-side equivalent of `Symbol.return_type` for local subs.
+// Produced by `FileAnalysis::enrich_imported_types_with_keys` so
+// imports flow through the SAME bag-query path as locals; no
+// separate `imported_return_types` lookup at consumer sites.
+
+pub struct NamedSubReturn;
+
+impl WitnessReducer for NamedSubReturn {
+    fn name(&self) -> &str {
+        "named_sub_return"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::NamedSub(_))
+            && matches!(w.payload, WitnessPayload::InferredType(_))
+    }
+
+    fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
+        // One witness per import — the latest one wins (enrichment
+        // truncates back to baseline before re-deriving, so there's
+        // never accumulated stale state).
+        for w in ws.iter().rev() {
+            if let WitnessPayload::InferredType(t) = &w.payload {
+                return ReducedValue::Type(t.clone());
+            }
         }
         ReducedValue::None
     }
@@ -634,6 +701,7 @@ impl ReducerRegistry {
         r.register(Box::new(FrameworkAwareTypeFold));
         r.register(Box::new(BranchArmFold));
         r.register(Box::new(FluentArityDispatch));
+        r.register(Box::new(NamedSubReturn));
         r
     }
 
@@ -661,6 +729,119 @@ impl ReducerRegistry {
         }
         ReducedValue::None
     }
+}
+
+// ---- Single shared query entrypoint ----
+//
+// Both the in-builder return-arm fold and `FileAnalysis`'s public
+// `inferred_type` go through this helper. Callers that already have a
+// `FileAnalysis` use the convenience method on it; the builder calls
+// this directly because its bag is in-progress and not yet wrapped in
+// a `FileAnalysis`. There is exactly ONE place where the scope-chain
+// walk + framework-fact lookup + reducer dispatch lives.
+
+/// Single canonical query for "what does this sub return?". Handles
+/// both local subs (resolved via the `symbols` table to a `Symbol`
+/// attachment) and imported / cross-file subs (`NamedSub` attachment,
+/// pushed by enrichment) through one path. Callers don't need to
+/// branch on "is this local"; the bag has the right witnesses either
+/// way and the reducer registry produces an answer if one exists.
+pub fn query_sub_return_type(
+    bag: &WitnessBag,
+    symbols: &[crate::file_analysis::Symbol],
+    sub_name: &str,
+    arity_hint: Option<u32>,
+) -> Option<InferredType> {
+    // Local-symbol bag query first — picks up arity-discriminated
+    // dispatch via FluentArityDispatch.
+    let reg = ReducerRegistry::with_defaults();
+    let local_sym = symbols.iter().find(|s| {
+        s.name == sub_name
+            && matches!(
+                s.kind,
+                crate::file_analysis::SymKind::Sub | crate::file_analysis::SymKind::Method
+            )
+    });
+    if let Some(sym) = local_sym {
+        let att = WitnessAttachment::Symbol(sym.id);
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            return_of: None,
+            arity_hint,
+        };
+        if let ReducedValue::Type(t) = reg.query(bag, &q) {
+            return Some(t);
+        }
+        // Fall back to the symbol's stored `return_type` — written
+        // by the bag-aware fold during build, so this is consistent.
+        if let crate::file_analysis::SymbolDetail::Sub { return_type, .. } = &sym.detail {
+            if let Some(t) = return_type {
+                return Some(t.clone());
+            }
+        }
+    }
+    // Imported / cross-file: NamedSub attachment carries the type
+    // pushed by `enrich_imported_types_with_keys`. Same registry,
+    // same reducers — no parallel lookup.
+    let att = WitnessAttachment::NamedSub(sub_name.to_string());
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint,
+    };
+    if let ReducedValue::Type(t) = reg.query(bag, &q) {
+        return Some(t);
+    }
+    None
+}
+
+/// Walk the scope chain from `scope` upward, asking the reducer
+/// registry to fold every Variable witness for `var`. Returns the
+/// first scope that produces a typed answer; `None` if no scope on
+/// the chain has any matching witness or the reducer rejects them all.
+pub fn query_variable_type(
+    bag: &WitnessBag,
+    scopes: &[Scope],
+    package_framework: &HashMap<String, FrameworkFact>,
+    var: &str,
+    scope: ScopeId,
+    point: Point,
+) -> Option<InferredType> {
+    let mut chain: Vec<ScopeId> = Vec::new();
+    let mut cur = Some(scope);
+    while let Some(sid) = cur {
+        chain.push(sid);
+        cur = scopes[sid.0 as usize].parent;
+    }
+
+    let framework = chain
+        .iter()
+        .find_map(|sid| scopes[sid.0 as usize].package.as_ref())
+        .and_then(|pkg| package_framework.get(pkg).copied())
+        .unwrap_or(FrameworkFact::Plain);
+
+    let reg = ReducerRegistry::with_defaults();
+    for sid in chain {
+        let att = WitnessAttachment::Variable {
+            name: var.to_string(),
+            scope: sid,
+        };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: Some(point),
+            framework,
+            return_of: None,
+            arity_hint: None,
+        };
+        if let ReducedValue::Type(t) = reg.query(bag, &q) {
+            return Some(t);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------

@@ -131,7 +131,7 @@ pub fn build_imported_return_types_for_test(
     build_imported_return_types(analysis, module_index)
 }
 
-fn build_imported_return_types(
+pub(crate) fn build_imported_return_types(
     analysis: &crate::file_analysis::FileAnalysis,
     module_index: &ModuleIndex,
 ) -> (HashMap<String, InferredType>, HashMap<String, Vec<String>>) {

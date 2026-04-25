@@ -12,6 +12,41 @@
 > - `docs/prompt-ref-coverage-provenance.md` — ref emission + derivation
 >   chains (rule 7 + 8 from CLAUDE.md).
 
+## Status snapshot — `worktree-spike-witnesses`
+
+The witness/reducer split (Parts 6 + 7) landed on this branch. Two phases now: builder collects typed witnesses into a single `WitnessBag` on `FileAnalysis`, query time runs them through a `ReducerRegistry` that folds them per consumer. `InferredType` stayed flat — the bag is the place where products / unions / framework rules live.
+
+Landed:
+
+- **Part 6 — Observation IR + framework-aware resolver.** `src/witnesses.rs` ships `FrameworkAwareTypeFold`. Class-identity beats rep when the framework's backing rep agrees, `BlessTarget(Rep)` pins the rep axis, temporal ordering kills the "later assignment poisons earlier site" failure mode. The `sub name { … $self->{name} = … ; return $self }` Mojo bug is fixed end-to-end through the Symbol attachment path — the bag-resolved `$self` keeps `ClassName(Foo)` even after the hash-write witness lands.
+- **Part 6b — Arity multidispatch from procedural bodies.** `FluentArityDispatch` reducer + `TypeObservation::ArityReturn`. Builder classifies arity-gated returns: `unless @_`, `if @_ == N`, `if scalar @_ == N`, bare `if !@_`, conditional-statement arms — all become exact-arity / zero-arity / default branches. `FileAnalysis::sub_return_type_at_arity(name, arity)` is the public entry point; the legacy `sub_return_type` is a thin wrapper.
+- **Part 5b — Sum-type narrowing (the branch-arm half).** `BranchArmFold` reducer + `TypeObservation::BranchArm(InferredType)`. Builder emits per arm via `emit_branch_arm_witnesses(cond_expr, attachment, ctx)` — attachment-agnostic helper, same fold for `my $x = $c ? A : B` (Variable), `if/else { return … }` and `return $c ? A : B` (Symbol on the enclosing sub), and method-call results (Expression). Agreement → that type, disagreement → `None`. The narrowing-by-`ref`/`defined` half is **not yet wired** — see "Remaining gaps" below.
+- **Part 7 — Fact-witness bag.** `Witness { attachment, source, payload, span }` + `WitnessBag` with attachment-indexed lookup, both serde-derived and serialized into the SQLite module-cache blob (`#[serde(default)]` for back-compat). `WitnessReducer` trait + `ReducerRegistry::with_defaults()` returns the three reducers above. `seed_witnesses_from_analysis` mirrors existing `TypeConstraint` / hash-access / method-call data into the bag so existing flows feed the new fold for free. Plugin-registered reducers (the spec's "rhai reducers" idea) are **not yet exposed** — the trait exists in Rust, the rhai surface doesn't.
+- **Wiring.** `inferred_type_via_bag(var, point)` is the variable-attachment entry point. Wired through `cursor_context::resolve_text_invocant`, `resolve_node_type`, sig-help param types, inlay hints, package-call invocant class resolution, `resolve_invocant_class`, `resolve_expression_type` (scalar + function-call arity-aware), and the CLI `--type-at` and `--dump-package`. Every method/function-call receiver resolution routes through the bag. `function_call_expression` uses `sub_return_type_at_arity` with the caller's arg count, so fluent arity dispatch fires automatically — no special-casing.
+- **One bag, one reduction.** Walk pushes raw observations + `pending_witnesses` (branch arms / arity gates). After the walk, `Builder::populate_witness_bag()` mirrors `type_constraints`, refs (HashRefAccess / `ReturnOfName` / mutation facts), and drains `pending_witnesses`. Then — and only then — `resolve_return_types` queries the bag (via the single shared `witnesses::query_variable_type`) for each `return $var` arm, agrees via `resolve_return_type`, writes `Symbol.return_type`. Call-binding constraints get pushed in the same pass *and* mirrored into the bag, so `find_method_return_type` reading `Symbol.return_type` directly sees the framework-correct answer because the field is bag-derived in the first place. No double-write, no escape route, no collection-time fold rule.
+- **Single shared query helper.** `witnesses::query_variable_type` (in `src/witnesses.rs`) is the only place the scope-chain walk + framework-fact lookup + reducer dispatch lives. Both `Builder::var_type_via_bag` (used during build) and `FileAnalysis::inferred_type_via_bag` (used at query time) are thin pass-throughs.
+- **Bag-and-`type_constraints` sync at every push site.** `FileAnalysis::push_type_constraint(tc)` writes to both tables; the local post-pass and cross-file enrichment both use it. `base_witness_count` is sealed alongside `base_type_constraint_count` so repeat enrichment is idempotent across the bag too.
+- **Implicit returns + structural tails.** Perl's last-statement-returns is now witnessed identically to explicit `return EXPR`. When the implicit return is `shift->M(…)` or `$self->M(…)` and `M`'s in-file return type isn't known yet, the sub records `return_self_method = Some("M")`; `find_method_return_type` walks this across local + `CrossFile` resolutions. Self-method tails within a file chain transitively in `resolve_return_types`'s fixed-point pass.
+- **Debug aid.** `perl-lsp --dump-package <root> <package>` dumps every sub in a package with its raw `return_type`, the bag-resolved type at arity 0/1/2/None, `return_self_method` tail, params with bag-inferred types, witness count, framework, parents. Same startup as the LSP server. Used for manual inspection of inference state.
+
+Tests: 466 passing, 0 regressions across the spike. Pin-the-fix tests live in `witnesses::tests::*`, `file_analysis::tests::test_witness_*`, and `symbols::tests::test_demo_*` (the real-Mojolicious truth-table tests).
+
+### Remaining gaps (deferred to a separate branch)
+
+- **Chain-hop through methods whose body chains through array-element access.** Real `Mojolicious::Routes::Route::_route` builds a new Route via `$self->add_child(…)->children->[-1]`. Our inference can't type array-element access, so `_route`'s `return_type` stays `None`. That breaks every downstream chain that goes through `_route` (`_generate_route`, then `get`/`post`/`any`, then `->to('…')`). The truth-table pin test `test_demo_chain_empirical_truth_table` documents the empirical state. A previous spike (`b71c002`, since dropped) tried a chain-internal fluent tiebreaker — unprincipled. The right fix is type-resolving array-element access (probably as a generic-element witness on the array variable), not a fluent fallback. Out of scope for this branch.
+- **Sum-type narrowing — the `if (ref $v eq 'ARRAY') { … }` half.** The branch-arm reducer handles agreement across both arms. Scope-narrowed type beliefs (`if (defined $v)`, `if (ref $v eq 'ARRAY')`, `if (blessed $v)`) — the part of Part 5b that produces a scope-bounded `Witness` — isn't wired yet. Spec section 5b describes the shape; emit point is the `if`/`unless` condition walk; payload is `InferredType` with a narrowing-bounded `span`.
+- **Plugin-registered reducers.** Trait exists in Rust; rhai surface doesn't. The architecture is ready (witnesses + reducer registry), the plugin loader hook + Dynamic round-trip aren't.
+- **Parts 1, 2, 3, 4, 5a, 5c.** All still pending — invocant mutations, hash-key unions, dynamic-dispatch loops, map/grep/reduce invariants, value-indexed returns, parametric types (DBIC). The witness/reducer infrastructure unblocks all of them: each becomes a new reducer + emitter pair without expanding `InferredType` further.
+
+### Direction
+
+Two paths forward, not mutually exclusive:
+
+1. **Close the chain-hop gap that broke `_route`.** Add an `ArrayElementAccess { array: WitnessAttachment }` observation; reducer projects it to "element type of the array's content type." Combined with map/grep/reduce invariants from Part 4, this would type `$arr->[-1]` → element type → resolve `_route`'s return → fix the whole Mojo Routes chain without any fluent fallback. Right level: typed array contents, not a class-identity assumption.
+2. **Land Part 5b's narrowing half + plugin-registered reducers.** Both compose with the existing infrastructure. Narrowing closes the spec's sum-type story. Plugin reducers unlock the route-aggregation case (App A in Part 7) — that's where the cross-stack primitive starts paying for itself for non-type-inference consumers.
+
+The branch is intended to merge back into the plugin branch once the squad agrees the witness/reducer split has earned its keep. The merge is **purely additive** for the existing data model — every legacy structure still works the same way; the bag is what new behavior lives in.
+
 ## Part 0 — What already lives in the data model
 
 The type system today is a handful of small pieces on `FileAnalysis`.
@@ -51,6 +86,8 @@ What's in tests (`file_analysis::tests::test_phase5_*`):
 ---
 
 ## Part 1 — Invocant mutations
+
+> **Status:** Partial. `mutated_keys_on_class(class)` reads `Fact { family: "mutation", … }` witnesses on `HashKey` attachments — populated from existing `HashKeyAccess` refs with `AccessKind::Write` (with scope-package fallback for `$self` writes). The Moo-reader-violation diagnostic + dynamic-key completion on `$self->{` aren't wired yet.
 
 ### Motivation
 
@@ -347,6 +384,8 @@ the framework-synthesis pattern from the unification spec.
 
 ## Part 5 — Dependent-type patterns
 
+> **Status:** 5b is partly landed (branch-arm fold; narrowing-by-condition not yet). 5a + 5c are pending — both are clean reducer additions on top of the bag.
+
 The earlier parts handle "static types about values." This part covers
 **types parameterised by values** — the chunk of the HoTT conversation
 that actually transfers to a Perl static analyzer. Three patterns, all
@@ -524,6 +563,8 @@ the unification refactor applied to FrameworkEntity.
 ---
 
 ## Part 6 — Observation IR + framework-aware resolution
+
+> **Status:** Landed. `FrameworkAwareTypeFold` in `src/witnesses.rs` implements the rules below, with one twist relative to the original spec: rather than a parallel "constraint bag" that projects to `InferredType`, the bag became Part 7's general-purpose `WitnessBag` and Part 6 is one reducer among several. Part 6b (procedural arity multidispatch) also landed via the `FluentArityDispatch` reducer.
 
 ### Motivation
 
