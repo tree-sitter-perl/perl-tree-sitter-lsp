@@ -145,6 +145,7 @@ E2e tests use Neovim headless mode. They exercise the full LSP protocol over std
 - Export extraction runs in-process (no subprocess isolation — tree-sitter-perl grammar is stable).
 - cpanfile parsed with tree-sitter queries at startup, deps pre-resolved with progress reporting.
 - SQLite cache per project (`~/.cache/perl-lsp/<hash>/modules.db`), **schema v9** with a single `analysis BLOB` column containing `zstd(bincode(FileAnalysis))`. `EXTRACT_VERSION` still bumps on builder changes to trigger priority re-resolution without dropping the table.
+- **Plugin fingerprint** (`plugin::rhai_host::plugin_fingerprint`) hashes bundled plugin sources + every `.rhai` in `$PERL_LSP_PLUGIN_DIR`. Stored in the `meta` table; mismatch on startup hard-clears the modules table (same machinery as `validate_inc_paths`). Without this, editing a plugin and restarting the LSP would serve stale FileAnalysis blobs — making plugin QA impossible.
 - Async handlers only use `_cached` methods — zero I/O.
 - After resolution, diagnostics are refreshed for all open files (clears stale false positives).
 

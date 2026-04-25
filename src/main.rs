@@ -65,6 +65,18 @@ async fn main() {
             cli_workspace_symbol(&args[2], &args[3]);
             return;
         }
+        Some("--plugin-check") => {
+            plugin::cli::cli_plugin_check(&args[2..]);
+            return;
+        }
+        Some("--plugin-run") => {
+            plugin::cli::cli_plugin_run(&args[2..]);
+            return;
+        }
+        Some("--plugin-test") => {
+            plugin::cli::cli_plugin_test(&args[2..]);
+            return;
+        }
         _ => {}
     }
 
@@ -96,6 +108,11 @@ fn print_usage() {
     eprintln!("REFACTORING:");
     eprintln!("  perl-lsp --rename <root> <file> <line> <col> <new>     Cross-file rename");
     eprintln!("  perl-lsp --workspace-symbol <root> <query>             Search symbols");
+    eprintln!();
+    eprintln!("PLUGIN AUTHORING:");
+    eprintln!("  perl-lsp --plugin-check <file.rhai>                    Lint a Rhai plugin");
+    eprintln!("  perl-lsp --plugin-run <file.rhai> --on <fixture.pl>    Run plugin on one Perl file");
+    eprintln!("  perl-lsp --plugin-test <plugin-dir> [--update]         Snapshot-test a plugin dir");
     eprintln!();
     eprintln!("  perl-lsp --version                                     Print version");
 }
@@ -193,6 +210,10 @@ fn cli_check(args: &[String]) {
         let mut stale_set: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(ref conn) = db {
             let _ = module_cache::validate_inc_paths(conn, &inc_paths);
+            let _ = module_cache::validate_plugin_fingerprint(
+                conn,
+                &plugin::rhai_host::plugin_fingerprint(),
+            );
             let (warmed, stale) = module_cache::warm_cache(conn, &module_index.cache_raw());
             if warmed > 0 {
                 eprintln!("Cache: {} modules loaded from disk", warmed);

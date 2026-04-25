@@ -16,6 +16,7 @@ use crate::file_analysis::{
     SymKind, SymbolDetail,
 };
 
+pub mod cli;
 pub mod rhai_host;
 
 // ---- Context snapshots passed to plugins ----

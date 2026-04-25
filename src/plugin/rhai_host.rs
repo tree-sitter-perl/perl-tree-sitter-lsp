@@ -343,6 +343,56 @@ pub fn load_bundled(engine: Arc<Engine>) -> Vec<Box<dyn FrameworkPlugin>> {
     out
 }
 
+/// Stable hash of the plugin set the next `build()` will load. Used by the
+/// SQLite module cache to invalidate stored FileAnalysis blobs when the
+/// plugins that produced them have changed — without this, editing a
+/// `.rhai` and restarting the LSP serves stale cross-file analyses.
+///
+/// Inputs:
+///   * Every bundled plugin's `(id, source)` pair — catches binary
+///     rebuilds whose only change was a `frameworks/*.rhai` edit.
+///   * Every `.rhai` file in `$PERL_LSP_PLUGIN_DIR`, with its path —
+///     catches user-plugin add / remove / rename / edit across LSP
+///     restarts.
+///
+/// Read-only: no compile, no side effects, no log spam. Fails open
+/// (returns the bundled-only hash) if the user dir can't be read,
+/// matching the rest of the loader's silently-tolerant behavior.
+pub fn plugin_fingerprint() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+
+    for (id, src) in BUNDLED {
+        id.hash(&mut hasher);
+        src.hash(&mut hasher);
+    }
+
+    if let Ok(dir) = std::env::var("PERL_LSP_PLUGIN_DIR") {
+        let path = std::path::PathBuf::from(&dir);
+        // Sort entries by path so the hash is independent of readdir order.
+        let mut entries: Vec<std::path::PathBuf> = match std::fs::read_dir(&path) {
+            Ok(read) => read
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rhai"))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        entries.sort();
+        for p in entries {
+            // Path is part of the hash so a rename invalidates.
+            p.to_string_lossy().hash(&mut hasher);
+            if let Ok(src) = std::fs::read_to_string(&p) {
+                src.hash(&mut hasher);
+            }
+        }
+    }
+
+    format!("{:016x}", hasher.finish())
+}
+
 /// Load all `*.rhai` files from a directory. Used for user-installed plugins.
 pub fn load_plugin_dir(
     dir: &std::path::Path,
@@ -439,6 +489,52 @@ mod tests {
             }
             other => panic!("unexpected emission: {:?}", other),
         }
+    }
+
+    #[test]
+    fn plugin_fingerprint_invariants() {
+        // Two contracts in one test (env var is process-global, so
+        // splitting these into parallel-safe tests would race):
+        //
+        //   1. Stability — identical inputs must produce identical
+        //      hashes, otherwise we'd nuke the SQLite cache on every
+        //      LSP startup.
+        //   2. Sensitivity — editing a `.rhai` in the user plugin dir
+        //      must change the fingerprint, so the cache invalidates
+        //      on the next LSP restart and the author can QA their
+        //      changes.
+        let dir = std::env::temp_dir().join(format!(
+            "perl-lsp-fp-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plugin_path = dir.join("test.rhai");
+
+        let saved = std::env::var("PERL_LSP_PLUGIN_DIR").ok();
+        std::env::set_var("PERL_LSP_PLUGIN_DIR", &dir);
+
+        std::fs::write(&plugin_path, r#"fn id() { "v1" } fn triggers() { [] }"#).unwrap();
+        let v1a = plugin_fingerprint();
+        let v1b = plugin_fingerprint();
+
+        std::fs::write(&plugin_path, r#"fn id() { "v2" } fn triggers() { [] }"#).unwrap();
+        let v2 = plugin_fingerprint();
+
+        // Restore env BEFORE asserting so a panic doesn't leak the override.
+        match saved {
+            Some(v) => std::env::set_var("PERL_LSP_PLUGIN_DIR", v),
+            None => std::env::remove_var("PERL_LSP_PLUGIN_DIR"),
+        }
+        let _ = std::fs::remove_file(&plugin_path);
+        let _ = std::fs::remove_dir(&dir);
+
+        assert!(!v1a.is_empty(), "fingerprint should never be empty");
+        assert_eq!(v1a, v1b, "fingerprint must be deterministic");
+        assert_ne!(v1a, v2, "fingerprint must change when a user plugin's source changes");
     }
 
     #[test]

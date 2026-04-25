@@ -61,6 +61,10 @@ pub fn spawn_resolver(
             let db = module_cache::open_cache_db(ws_root.as_deref());
             if let Some(ref conn) = db {
                 let _ = module_cache::validate_inc_paths(conn, &inc_paths);
+                let _ = module_cache::validate_plugin_fingerprint(
+                    conn,
+                    &crate::plugin::rhai_host::plugin_fingerprint(),
+                );
                 let (n, stale_names) = module_cache::warm_cache(conn, &cache);
                 log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
                 // Queue stale modules for priority re-resolution.
@@ -313,6 +317,10 @@ pub fn spawn_test_resolver(
             let db = module_cache::open_cache_db(ws_root.as_deref());
             if let Some(ref conn) = db {
                 let _ = module_cache::validate_inc_paths(conn, &inc_paths);
+                let _ = module_cache::validate_plugin_fingerprint(
+                    conn,
+                    &crate::plugin::rhai_host::plugin_fingerprint(),
+                );
                 let (_, stale_names) = module_cache::warm_cache(conn, &cache);
                 for name in stale_names {
                     stale_modules.insert(name, ());
