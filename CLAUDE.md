@@ -154,6 +154,8 @@ E2e tests use Neovim headless mode. They exercise the full LSP protocol over std
 
 ### Witness bag + reducers (type inference, two phases)
 
+**The bag is the single source of truth for every type query in the codebase — variables, sub returns, method-call receivers, framework-folded class identity, branch arms, arity dispatch, imports. There is no second path.** `TypeConstraint`, call bindings, framework synthesis, and cross-file enrichment are *feeders* — they push witnesses into the bag during build, and queries read from the bag through reducers. The flat-sum cases (literal HashRef / ArrayRef / ClassName) and the "more interesting" cases (branch agreement, arity-gated returns, fluent-chain receivers, framework rep-vs-identity reconciliation) are the same path; the only difference is which reducer claims the witnesses.
+
 `InferredType` is a flat sum (`HashRef | ArrayRef | ClassName(_) | …`) — fine for "what is this", terrible for "what do all these observations together say". The witness pipeline splits inference into two phases. **The split is strict.** Collection records raw, untyped-policy facts. Reduction applies framework rules and produces typed answers. There is no third "we already folded a bit at collection time" layer, and there are no escape hatches that bypass the bag.
 
 **Phase 1 — collect.** During the builder's single pass:
@@ -195,7 +197,7 @@ The reducer is the same on both passes; the second run is what closes the chicke
 
 **Cache durability.** Both `WitnessBag` and `package_framework` are `#[serde(default)]` and ride the existing bincode + zstd module-cache blob. `EXTRACT_VERSION` bumps when the bag's shape or fold rules change, so stale cache entries re-resolve with priority instead of serving empty bags.
 
-The bag is **additive**: `TypeConstraint` / `CallBinding` / `MethodCallBinding` / framework synthesis / cross-file enrichment all keep working. Witnesses layer on top for cases the flat sum couldn't express; new behavior lands as new reducers, not new variants on `InferredType`.
+**Adding new type behavior = adding a reducer.** Every type-derivation rule lives as a reducer over the bag. A new framework, a new idiom, a new disambiguation rule — none of them ever bypass the bag by writing directly to `InferredType` or shipping a parallel query helper. If the rule needs a fact the walk can observe, push a witness; if it needs a fold the existing reducers can't do, write a new reducer. `TypeConstraint` / `CallBinding` / `MethodCallBinding` / framework synthesis / cross-file enrichment still exist as collection mechanics, but they all funnel into the same bag and the same reducer registry.
 
 ### Build pipeline phases
 
