@@ -134,6 +134,13 @@ pub fn build_with_plugins(
         })
         .collect();
 
+    // Plugin `overrides()` manifests run first. They pin return
+    // types inference can't reach (`Mojolicious::Routes::Route::_route`
+    // returning $self via an array-slice idiom). Provenance is
+    // recorded in `type_provenance` (PluginOverride) so
+    // `--dump-package` can answer "why does this return X?".
+    b.apply_type_overrides();
+
     // Single bag-population pass: mirror walk-time data
     // (`type_constraints`, refs producing rep observations + method
     // call return witnesses, write-mutations on hash keys) plus drain
@@ -141,17 +148,41 @@ pub fn build_with_plugins(
     // this point the bag is the source of truth for the witness pipeline.
     b.populate_witness_bag();
 
-    // Post-pass 3: derive sub return types FROM THE BAG. This is the
-    // single reduction phase — the same reducer rules used by every
-    // query consumer apply here, once, with full evidence.
+    // First fold: derive sub return types from the bag. Every reducer
+    // rule (framework / branch / arity) participates here. After this
+    // pass, return-shaped methods like `requires`, `to`, `name` are
+    // typed via the framework-aware fold; `_route` keeps its override.
     b.resolve_return_types();
 
-    // Post-pass 3b: apply plugin `overrides()` manifests. Runs AFTER
-    // inference so the override always wins — that's the whole point
-    // ("inference fails here, so override it"). Records provenance in
-    // `type_provenance` (PluginOverride) so debugging can tell
-    // asserted from inferred without re-running the build.
-    b.apply_type_overrides();
+    // Symbolically execute every `my $X = <expr>` and push the result
+    // into the bag. ONE recursive typer (`resolve_invocant_class_tree`)
+    // handles whatever shape the rhs is — scalar, method-call chain,
+    // bareword, shift idiom, function call. No "is it a chain" branch.
+    // The result lands as both a `TypeConstraint` and a `Variable`
+    // witness, so the bag sees it like any other observation.
+    //
+    // Why now: the rhs of an assignment may walk through other subs'
+    // return types (`my $route = $self->_route(...)->requires(...)->to(...)`).
+    // Those return types only exist after the first fold above plus
+    // the override pass, so the typer must run AFTER both.
+    b.type_assignments_into_bag(tree);
+
+    // Refresh walk-time return-arm typings. `ReturnInfo.inferred_type`
+    // was computed during the walk against an empty `type_constraints`
+    // table — `return $route->name(...)` couldn't be typed because
+    // `$route` had no TC yet. Now that the chain pass has populated
+    // every assigned variable, re-walk each return expression with
+    // the same typer the walk used; whatever resolves now resolves
+    // for keeps. Same code path as walk-time typing — just rerun
+    // against the richer state.
+    b.refresh_return_arm_types(tree);
+
+    // Second fold: now that chain-assigned variables (`$route`) have
+    // typed bag entries AND return arms have been re-typed against
+    // the chain-populated TCs, subs whose return is `return …$route…` —
+    // most prominently `_generate_route` — fold correctly, and the
+    // tail-delegation propagation cascades to `get`/`post`/`put`/etc.
+    b.resolve_return_types();
 
     // Post-pass 4: re-resolve invocant classes on MethodCall refs now
     // that sub return types are known. Function-call chains like
@@ -186,11 +217,10 @@ pub fn build_with_plugins(
     fa.package_framework = package_framework;
     fa.witnesses = bag;
     fa.witnesses.rebuild_index();
-    // Finalize: run the local method-call-binding resolution NOW that
-    // the bag is in place, so any constraints it pushes go through
-    // `push_type_constraint` and land in the bag too. Then seal the
-    // baseline counts (constraints, symbols, witnesses) for
-    // enrichment idempotency.
+    // Finalize: run the legacy text-based MCB resolver as a fallback.
+    // For every assignment the unified typer (run before
+    // `resolve_return_types` above) couldn't handle, MCB fills in.
+    // Cross-file enrichment also reuses MCB resolution without a tree.
     fa.finalize_post_walk();
 
     fa
@@ -1079,17 +1109,27 @@ impl<'a> Builder<'a> {
             }
             "scalar" => {
                 let text = node.utf8_text(self.source).ok()?;
-                if text == "$self" {
-                    return self.current_package.clone();
-                }
-                // Variable with a ClassName type constraint.
-                self.type_constraints.iter().rev().find_map(|tc| {
+                // Variable's type from a TypeConstraint. Accept both
+                // ClassName (explicit assertion) and FirstParam (the
+                // `my $self = shift` idiom) — both pin a class. Without
+                // FirstParam here, post-pass chain typing can't see
+                // through `$self->_route(...)->...` because $self's TC
+                // is FirstParam, not ClassName.
+                let from_tc = self.type_constraints.iter().rev().find_map(|tc| {
                     if tc.variable != text { return None; }
-                    if let InferredType::ClassName(c) = &tc.inferred_type {
-                        Some(c.clone())
-                    } else {
-                        None
+                    match &tc.inferred_type {
+                        InferredType::ClassName(c) => Some(c.clone()),
+                        InferredType::FirstParam { package } => Some(package.clone()),
+                        _ => None,
                     }
+                });
+                from_tc.or_else(|| {
+                    // Fall back to walk-state `current_package` for
+                    // `$self` in case TC seeding is incomplete (e.g.
+                    // `my $self = shift` not yet processed). Live-walk
+                    // callers depend on this; post-walk callers
+                    // generally hit the TC path above.
+                    if text == "$self" { self.current_package.clone() } else { None }
                 })
             }
             "bareword" | "package" => {
@@ -3450,8 +3490,33 @@ impl<'a> Builder<'a> {
         // state). Cross-file chains fall through to query-time
         // resolution via `find_method_return_type`.
         if child.kind() == "method_call_expression" {
+            // Self-method shortcut first (cycle-safe via `seen`).
             if let Some(rt) = self.infer_self_method_call_return(child, seen) {
                 return Some(rt);
+            }
+            // General chain typing — same recursion every chain
+            // consumer uses. Type the receiver via
+            // `resolve_invocant_class_tree`, then look up the
+            // method's return type on that class. No special case
+            // for "self vs $var": the typer descends into whatever
+            // it gets.
+            if let (Some(invocant), Some(method_node)) = (
+                child.child_by_field_name("invocant"),
+                child.child_by_field_name("method"),
+            ) {
+                if let (Some(class), Ok(method_name)) = (
+                    self.resolve_invocant_class_tree(invocant),
+                    method_node.utf8_text(self.source),
+                ) {
+                    for sym in &self.symbols {
+                        if sym.name != method_name { continue; }
+                        if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                        if sym.package.as_deref() != Some(class.as_str()) { continue; }
+                        if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
+                            return Some(rt.clone());
+                        }
+                    }
+                }
             }
         }
         // Try variable lookup: return $self, return $var. Collection
@@ -5426,6 +5491,205 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Symbolically execute the rhs of every `my $X = <expr>` and
+    /// push the resulting class type into the bag (and
+    /// `type_constraints`). ONE recursive typer
+    /// (`resolve_invocant_class_tree`) handles every expression shape
+    /// it knows — scalar lookup, method-call chain, bareword, shift
+    /// idiom, function call. No "is it a chain" branch. Whatever the
+    /// rhs is, the typer descends.
+    ///
+    /// Idempotent: skips an assignment if a TC for `$X` already
+    /// exists at the assignment's start point. Walk-time inference
+    /// covers literals/constructors via the existing path; this pass
+    /// fills in anything that was unresolvable at walk time
+    /// (specifically chains whose links' return types only became
+    /// known after the first `resolve_return_types`).
+    ///
+    /// Provenance: each pushed witness carries
+    /// `WitnessSource::Builder("chain_assignment")` so a future debug
+    /// dump can answer "why does $X have this type?" without
+    /// re-running the typer.
+    fn type_assignments_into_bag(&mut self, tree: &'a Tree) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        // Two-pass: collect first, then push. The collector borrows
+        // &self (so the recursive class typer can read symbols /
+        // type_constraints); push goes through the same shape as
+        // `populate_witness_bag` (TC + bag witness in lockstep) so the
+        // bag stays the single source of truth.
+        //
+        // What counts as "an assignment to a variable":
+        //   - `my $X = …` (variable_declaration lhs)
+        //   - `my ($x) = …` (paren-list — first var)
+        //   - `$X = …` / `@X = …` / `%X = …` (no `my`)
+        // No filter on the rhs shape — whatever it is, the recursive
+        // typer either resolves it to a class or doesn't. No "is it a
+        // chain" branch.
+        //
+        // The recursive typer (`resolve_invocant_class_tree`) uses
+        // `self.current_package` for the `$self` / `shift` / `$_[0]`
+        // fallback. After the live walk, `current_package` is stale
+        // (= last package opened in the file). To make the typer
+        // package-correct at every assignment site, we set
+        // `self.current_package` to the enclosing scope's package
+        // (a stored field — `Scope.package`) around each call.
+        //
+        // Why scope.package and not "track package_statement nodes":
+        // `package X;` is a SIBLING of the subs that follow it in the
+        // AST, not a parent — its scope extends forward through
+        // siblings until the next `package`. Walking the AST and
+        // saving/restoring on package_statement entry/exit doesn't
+        // model that. The walk-time recorder already correctly
+        // attributes the right package to each scope; reading
+        // `scope.package` at post-walk time inherits that.
+        let mut to_push: Vec<(String, ScopeId, Span, InferredType)> = Vec::new();
+
+        // Recurse the AST. For each assignment, find its enclosing
+        // scope, set `self.current_package` to that scope's package,
+        // type the rhs, push the result.
+        fn walk<'b, 'a: 'b>(
+            b: &'b mut Builder<'a>,
+            node: Node<'a>,
+            out: &mut Vec<(String, ScopeId, Span, InferredType)>,
+        ) {
+            if node.kind() == "assignment_expression" {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if let Some(var) = b.get_var_text_from_lhs(left) {
+                        let span = node_to_span(node);
+                        let already_typed = b.type_constraints.iter().any(|tc| {
+                            tc.variable == var && tc.constraint_span.start == span.start
+                        });
+                        if !already_typed {
+                            // Find the innermost scope containing this assignment.
+                            let scope_idx = b
+                                .scopes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, s)| crate::file_analysis::contains_point(&s.span, span.start))
+                                .min_by_key(|(_, s)| {
+                                    let r = (s.span.end.row.saturating_sub(s.span.start.row)) as u64;
+                                    let c = if s.span.start.row == s.span.end.row {
+                                        s.span.end.column.saturating_sub(s.span.start.column) as u64
+                                    } else { 0 };
+                                    r * 1_000_000 + c
+                                })
+                                .map(|(i, _)| i);
+
+                            // Walk scope chain to find the nearest enclosing package.
+                            let scope_pkg = scope_idx.and_then(|si| {
+                                let mut cur = Some(si);
+                                while let Some(i) = cur {
+                                    let s = &b.scopes[i];
+                                    if let Some(ref p) = s.package {
+                                        return Some(p.clone());
+                                    }
+                                    cur = s.parent.map(|pid| pid.0 as usize);
+                                }
+                                None
+                            });
+
+                            let saved_pkg = b.current_package.clone();
+                            if scope_pkg.is_some() {
+                                b.current_package = scope_pkg;
+                            }
+                            let class_opt = b.resolve_invocant_class_tree(right);
+                            b.current_package = saved_pkg;
+
+                            if let Some(class) = class_opt {
+                                let sid = scope_idx
+                                    .map(|i| b.scopes[i].id)
+                                    .unwrap_or(ScopeId(0));
+                                out.push((var, sid, span, InferredType::ClassName(class)));
+                            }
+                        }
+                    }
+                }
+            }
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    walk(b, c, out);
+                }
+            }
+        }
+        walk(self, tree.root_node(), &mut to_push);
+
+        for (variable, scope, constraint_span, ty) in to_push {
+            self.type_constraints.push(TypeConstraint {
+                variable: variable.clone(),
+                scope,
+                constraint_span,
+                inferred_type: ty.clone(),
+            });
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Variable {
+                    name: variable.clone(),
+                    scope,
+                },
+                source: WitnessSource::Builder("chain_assignment".into()),
+                payload: WitnessPayload::InferredType(ty.clone()),
+                span: Span { start: constraint_span.start, end: constraint_span.start },
+            });
+            if let InferredType::ClassName(ref n) = ty {
+                self.bag.push(Witness {
+                    attachment: WitnessAttachment::Variable {
+                        name: variable,
+                        scope,
+                    },
+                    source: WitnessSource::Builder("chain_assignment".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(
+                        n.clone(),
+                    )),
+                    span: constraint_span,
+                });
+            }
+        }
+    }
+
+    /// Re-evaluate `ReturnInfo.inferred_type` for every return
+    /// expression against the current `type_constraints` /
+    /// `Symbol.return_type` state. Walk-time inference runs against
+    /// an empty world — `return $route->name(...)` can't be typed
+    /// when `$route` doesn't yet have a TC and `name`'s return type
+    /// hasn't been folded. After the chain pass + first fold, both
+    /// hold; running the same typer again upgrades stale `None`
+    /// entries to the now-correct type.
+    ///
+    /// Only upgrades `None` → `Some` — never downgrades. The walk
+    /// already pinned literal/constructor/agree-arm cases; we don't
+    /// want a partial second-pass result to overwrite them.
+    fn refresh_return_arm_types(&mut self, tree: &Tree) {
+        use std::collections::HashMap;
+        let mut nodes_by_span: HashMap<(Point, Point), Node<'_>> = HashMap::new();
+        fn walk<'t>(node: Node<'t>, out: &mut HashMap<(Point, Point), Node<'t>>) {
+            if node.kind() == "return_expression" {
+                out.insert((node.start_position(), node.end_position()), node);
+            }
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(tree.root_node(), &mut nodes_by_span);
+
+        let mut infos = std::mem::take(&mut self.return_infos);
+        for ri in &mut infos {
+            if ri.inferred_type.is_some() { continue; }
+            if let Some(node) = nodes_by_span.get(&(ri.span.start, ri.span.end)) {
+                let new_type = self.infer_return_value_type(*node);
+                if new_type.is_some() {
+                    ri.inferred_type = new_type;
+                }
+            }
+        }
+        self.return_infos = infos;
+    }
+
     fn resolve_return_types(&mut self) {
         use crate::witnesses::{
             TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
@@ -5512,6 +5776,14 @@ impl<'a> Builder<'a> {
         // For each Sub/Method scope, agree-or-None across arms.
         let mut return_types: std::collections::HashMap<String, InferredType> =
             std::collections::HashMap::new();
+        // Per-sub provenance recorded as we derive types — surfaces
+        // in `--dump-package` so debugging answers "why does this
+        // return X?" without re-running the build. Keyed by sub name
+        // (matching `return_types`); flushed onto SymbolId in the
+        // write loop below. Plugin overrides keep their existing
+        // PluginOverride provenance — we don't touch overridden subs.
+        let mut return_provenance: std::collections::HashMap<String, crate::file_analysis::TypeProvenance> =
+            std::collections::HashMap::new();
 
         for scope in &self.scopes {
             let sub_name = match &scope.kind {
@@ -5519,13 +5791,30 @@ impl<'a> Builder<'a> {
                 _ => continue,
             };
 
-            let resolved = match returns_by_scope.get(&scope.id) {
-                Some(arms) if !arms.is_empty() => resolve_return_type(arms),
-                _ => self.last_expr_type.get(&scope.id).and_then(|t| t.clone()),
+            let (resolved, evidence) = match returns_by_scope.get(&scope.id) {
+                Some(arms) if !arms.is_empty() => {
+                    let r = resolve_return_type(arms);
+                    let ev = vec![format!("return_arms={}", arms.len())];
+                    (r, ev)
+                }
+                _ => {
+                    let r = self.last_expr_type.get(&scope.id).and_then(|t| t.clone());
+                    let ev = if r.is_some() {
+                        vec!["last_expr".into()]
+                    } else { Vec::new() };
+                    (r, ev)
+                }
             };
 
             if let Some(rt) = resolved {
-                return_types.insert(sub_name, rt);
+                return_types.insert(sub_name.clone(), rt);
+                return_provenance.insert(
+                    sub_name,
+                    crate::file_analysis::TypeProvenance::ReducerFold {
+                        reducer: "return_arms".into(),
+                        evidence,
+                    },
+                );
             }
         }
 
@@ -5546,7 +5835,14 @@ impl<'a> Builder<'a> {
                     continue;
                 }
                 if let Some(t) = return_types.get(&delegate).cloned() {
-                    return_types.insert(delegator, t);
+                    return_types.insert(delegator.clone(), t);
+                    return_provenance.insert(
+                        delegator,
+                        crate::file_analysis::TypeProvenance::Delegation {
+                            kind: "sub_return".into(),
+                            via: delegate,
+                        },
+                    );
                     changed = true;
                 }
             }
@@ -5592,7 +5888,14 @@ impl<'a> Builder<'a> {
                     continue; // direct self-recursion — can't infer
                 }
                 if let Some(t) = return_types.get(&tail_method).cloned() {
-                    return_types.insert(sub_name, t);
+                    return_types.insert(sub_name.clone(), t);
+                    return_provenance.insert(
+                        sub_name,
+                        crate::file_analysis::TypeProvenance::Delegation {
+                            kind: "self_method_tail".into(),
+                            via: tail_method,
+                        },
+                    );
                     changed = true;
                 }
             }
@@ -5612,6 +5915,16 @@ impl<'a> Builder<'a> {
             .collect();
         for sym in &mut self.symbols {
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                // Plugin override pinned this symbol — DON'T overwrite
+                // it with the inferred fold. The whole point of an
+                // override is "inference reaches the wrong answer
+                // here". Provenance is recorded as `PluginOverride`
+                // in `type_provenance`; we use that as the signal.
+                let is_overridden = matches!(
+                    self.type_provenance.get(&sym.id),
+                    Some(crate::file_analysis::TypeProvenance::PluginOverride { .. }),
+                );
+                if is_overridden { continue; }
                 if let SymbolDetail::Sub {
                     ref mut return_type,
                     ref mut return_self_method,
@@ -5620,6 +5933,14 @@ impl<'a> Builder<'a> {
                 {
                     if let Some(rt) = return_types.get(&sym.name) {
                         *return_type = Some(rt.clone());
+                        // Flush provenance to the SymbolId-keyed map
+                        // so debug introspection (--dump-package) can
+                        // surface the inference chain. Only writes
+                        // for non-Inferred provenances; the default
+                        // (Inferred) is implicit via missing entry.
+                        if let Some(prov) = return_provenance.get(&sym.name) {
+                            self.type_provenance.insert(sym.id, prov.clone());
+                        }
                     } else {
                         // Couldn't resolve in-file. If the body
                         // tails on `shift->M(...)` / `$self->M(...)`,
@@ -12178,9 +12499,11 @@ sub _route { my ($x) = @_; { id => $x } }
             .find(|s| s.name == "_route")
             .expect("_route present")
             .id;
-        // Provenance MUST be Inferred — the override is class-scoped.
+        // Override must not apply — provenance can be Inferred or
+        // ReducerFold (inference produced the type via the witness
+        // fold), but NOT PluginOverride.
         assert!(
-            matches!(fa.return_type_provenance(id), TypeProvenance::Inferred),
+            !matches!(fa.return_type_provenance(id), TypeProvenance::PluginOverride { .. }),
             "override must not bleed across packages; provenance: {:?}",
             fa.return_type_provenance(id),
         );
@@ -12200,8 +12523,9 @@ sub other_method { my $self = shift; { ok => 1 } }
             .expect("other_method present")
             .id;
         assert!(
-            matches!(fa.return_type_provenance(id), TypeProvenance::Inferred),
-            "override must not bleed across method names",
+            !matches!(fa.return_type_provenance(id), TypeProvenance::PluginOverride { .. }),
+            "override must not bleed across method names; got {:?}",
+            fa.return_type_provenance(id),
         );
     }
 

@@ -782,6 +782,67 @@ fn cli_dump_package(root: &str, package_name: &str) {
             .for_attachment(&witnesses::WitnessAttachment::Symbol(sym.id))
             .len();
 
+        // Provenance: where did this return type come from? Default
+        // (Inferred) is implicit; surfaced explicitly only when
+        // something else (plugin override / reducer / delegation)
+        // contributed. Critical debugging aid when inference grows
+        // complex enough that "the LSP says X" needs to come with
+        // "because Y" — without re-running the build.
+        let provenance = match analysis.return_type_provenance(sym.id) {
+            file_analysis::TypeProvenance::Inferred => None,
+            file_analysis::TypeProvenance::PluginOverride { plugin_id, reason } => {
+                Some(serde_json::json!({
+                    "kind": "PluginOverride",
+                    "plugin_id": plugin_id,
+                    "reason": reason,
+                }))
+            }
+            file_analysis::TypeProvenance::ReducerFold { reducer, evidence } => {
+                Some(serde_json::json!({
+                    "kind": "ReducerFold",
+                    "reducer": reducer,
+                    "evidence": evidence,
+                }))
+            }
+            file_analysis::TypeProvenance::Delegation { kind, via } => {
+                Some(serde_json::json!({
+                    "kind": "Delegation",
+                    "delegation_kind": kind,
+                    "via": via,
+                }))
+            }
+        };
+
+        // Variables typed inside this sub's scope. Surfaces chain
+        // assignments like `my $route = $self->_route(...)->...->to(...)`
+        // — when `$route` shows up here with a class type, the chain
+        // typer worked. When it doesn't, the chain died at some link.
+        // The same dump that answers "why is `_generate_route`'s
+        // return type None" answers "is `$route` typed at all".
+        let sub_scope_id = analysis
+            .scopes
+            .iter()
+            .find(|s| {
+                matches!(
+                    &s.kind,
+                    file_analysis::ScopeKind::Sub { name } | file_analysis::ScopeKind::Method { name }
+                        if name == &sym.name
+                ) && s.span.start == sym.span.start
+            })
+            .map(|s| s.id);
+        let mut vars_in_scope: Vec<serde_json::Value> = Vec::new();
+        if let Some(sid) = sub_scope_id {
+            for tc in &analysis.type_constraints {
+                if tc.scope == sid {
+                    vars_in_scope.push(serde_json::json!({
+                        "var": tc.variable,
+                        "type": file_analysis::format_inferred_type(&tc.inferred_type),
+                        "line": tc.constraint_span.start.row,
+                    }));
+                }
+            }
+        }
+
         let mut entry = serde_json::json!({
             "name": sym.name,
             "kind": format!("{:?}", sym.kind),
@@ -793,7 +854,11 @@ fn cli_dump_package(root: &str, package_name: &str) {
             "bag_return_type_at_arity": serde_json::Value::Object(by_arity),
             "return_self_method": return_self_method,
             "symbol_witness_count": symbol_witness_count,
+            "vars_in_scope": vars_in_scope,
         });
+        if let Some(prov) = provenance {
+            entry["return_type_provenance"] = prov;
+        }
         if let Some(d) = display {
             entry["display"] = serde_json::json!(format!("{:?}", d));
         }

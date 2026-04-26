@@ -4320,23 +4320,58 @@ sub fire {
         eprintln!("  _route          rt={:?}  tail={:?}", _route_rt, _route_tail);
         eprintln!("====================================");
 
-        // The user's claim: `$r` + `->get` resolve; `->to` is the gap.
-        // Pin those facts here. If any of this flips, the test
-        // breaks and we know the chain state changed.
+        // The chain pin. With:
+        //   - mojo-routes plugin's `_route` override pinning the
+        //     return type inference can't reach, AND
+        //   - the unified post-walk `type_assignments_into_bag` pass
+        //     symbolically executing every `my $X = <expr>` rhs (no
+        //     "is it a chain" branch — same recursion every consumer
+        //     uses), AND
+        //   - a refresh of return-arm types before the second
+        //     fold so `_generate_route`'s ternary return picks up
+        //     the now-typed `$route`,
+        // the full `$r->get(...)->to(...)` chain resolves end-to-end.
+        // Each link is pinned individually so a regression localizes
+        // to a specific hop instead of "the chain broke".
         assert!(r_class.is_some(),
-            "(link 1) $r must resolve; got None");
+            "(link 1) $r must resolve to a class; got None");
+        assert_eq!(r_class.as_deref(), Some("Mojolicious::Routes"));
         assert!(get_invocant_class.is_some(),
             "(link 2) ->get's invocant class must resolve; got None");
-        // Link 3+4: these are the gaps. If they start resolving,
-        // promote to positive assertions.
-        if get_return_ty.is_some() || to_invocant_class.is_some() {
-            panic!(
-                "TRIPWIRE: chain started resolving further than expected. \
-                 ->get return = {:?}; ->to invocant = {:?}. \
-                 Promote these to positive assertions.",
-                get_return_ty, to_invocant_class,
-            );
-        }
+        assert!(get_return_ty.is_some(),
+            "(link 3) ->get's RETURN type must resolve through \
+             _generate_route → _route's plugin override");
+        assert_eq!(get_return_ty.as_ref().and_then(|t| t.class_name()),
+                   Some("Mojolicious::Routes::Route"),
+                   "->get returns the Route class so ->to can chain off it");
+        assert!(to_invocant_class.is_some(),
+            "(link 4) ->to's invocant class must resolve — THIS is \
+             the chain hop the spike was unblocking");
+        assert_eq!(to_invocant_class.as_deref(),
+                   Some("Mojolicious::Routes::Route"),
+                   "->to is invoked on a Route, so cursor-on-`to` \
+                    completion / hover / goto-def all reach \
+                    Mojolicious::Routes::Route::to");
+
+        // Cross-check the cached symbols: every verb method
+        // (get/post/put/etc.) tail-delegates through _generate_route,
+        // and _generate_route's body folds via the chain typer +
+        // refreshed return-arm typing.
+        assert_eq!(
+            _route_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "_route is the override anchor",
+        );
+        assert_eq!(
+            gen_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "_generate_route folds because $route is now typed",
+        );
+        assert_eq!(
+            get_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "get tail-delegates to _generate_route which has a type",
+        );
     }
 
     /// E2E: the motivator. `$r->get('/x')->|` at the cursor — the

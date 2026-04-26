@@ -73,6 +73,7 @@ pub(crate) fn node_to_span(node: tree_sitter::Node) -> Span {
     }
 }
 
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoldRange {
     pub start_line: usize,
@@ -518,6 +519,23 @@ pub enum TypeProvenance {
     /// Carries the asserting plugin's id and a free-form reason for
     /// the debugger.
     PluginOverride { plugin_id: String, reason: String },
+    /// Produced by a witness-bag reducer at type-resolution time.
+    /// `reducer` names the rule that fired (`framework_aware`,
+    /// `branch_arm`, `arity_dispatch`, `named_sub_return`, …);
+    /// `evidence` is a short list of human-readable facts the
+    /// reducer leaned on ("framework=MojoBase", "arms=2 agree",
+    /// "arity=Default"). Read-only debugging aid surfaced by
+    /// `--dump-package`. Empty `evidence` is fine — the reducer
+    /// name alone often answers "why".
+    ReducerFold { reducer: String, evidence: Vec<String> },
+    /// Tail-delegation: the sub's body ends in `shift->M(...)` /
+    /// `$self->M(...)` / `return Y()` and inherits the tail's
+    /// return type. `via` is the delegate's name; `kind` is
+    /// "self_method_tail" or "sub_return". Lets `--dump-package`
+    /// answer "get returns ClassName(Route) — because it tails on
+    /// _generate_route which the framework-aware reducer typed as
+    /// ClassName(Route)".
+    Delegation { kind: String, via: String },
 }
 
 /// Resolve a return type from a list of inferred types (one per return statement).
@@ -1089,6 +1107,7 @@ impl FileAnalysis {
         self.base_symbol_count = self.symbols.len();
         self.base_witness_count = self.witnesses.len();
     }
+
 
     /// Rebuild all derived indices after deserialization.
     /// Idempotent: safe to call on a freshly deserialized `FileAnalysis` whose
