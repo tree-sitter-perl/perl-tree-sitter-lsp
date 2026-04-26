@@ -42,7 +42,9 @@ Type inference + invariant derivation: `docs/prompt-type-inference-spec.md` capt
 
 **Rules:**
 
-1. **All tree-sitter CST traversal happens inside `build()`.** No other file should walk tree-sitter nodes, call `child_by_field_name`, iterate children, or use `TreeCursor`. The `build()` function in `builder.rs` is the single entry point that takes a `Tree` and returns a `FileAnalysis` — everything that needs the CST lives inside that call. **To add new CST-derived data:** add extraction to the relevant `visit_*` method in `builder.rs` and store the result in `FileAnalysis` (as a field on `Symbol`, a new map, etc.). The builder already visits every sub, package, class, and variable node — use that pass, don't create a second one. Builder plugins (separate modules called from `build()` that take `&mut FileAnalysis` + `&Tree` + `&[u8]`) can decouple framework-specific concerns while preserving the single-entry-point invariant.
+1. **All tree-sitter CST traversal happens inside `build()`.** No other file should walk tree-sitter nodes, call `child_by_field_name`, iterate children, or use `TreeCursor`. The `build()` function in `builder.rs` is the single entry point that takes a `Tree` and returns a `FileAnalysis` — everything that needs the CST lives inside that call. **To add new CST-derived data:** add extraction to the relevant `visit_*` method in `builder.rs` and store the result in `FileAnalysis` (as a field on `Symbol`, a new map, etc.). The builder already visits every sub, package, class, and variable node — prefer that single live walk for plain data extraction. Builder plugins (separate modules called from `build()` that take `&mut FileAnalysis` + `&Tree` + `&[u8]`) can decouple framework-specific concerns while preserving the single-entry-point invariant.
+
+   **Multiple post-walk passes are allowed and named.** A handful of post-walk tree re-walks live inside `build()` for cases that need state the live walk doesn't have yet (resolved return types, applied overrides, freshly-typed chain variables): `resolve_invocant_classes_post_pass(tree)`, `type_assignments_into_bag(tree)`, `refresh_return_arm_types(tree)`. They re-walk the same `Tree` the live walk used; they do NOT re-parse, do NOT mutate scope state, and do NOT live outside `build()`. See "Build pipeline phases" below for the full order. If you need data the live walk can compute on its own, add it to `visit_*`. If you need data that depends on resolved sub return types or chain-typed variables, add it as a post-walk pass after the relevant fold.
 
 2. **`file_analysis.rs` is the single source of truth.** All analysis results — symbols, refs, scopes, types, documentation, parameters — live in `FileAnalysis`. Query methods belong here. No `tree_sitter` imports allowed in this file.
 
@@ -92,7 +94,7 @@ Type inference + invariant derivation: `docs/prompt-type-inference-spec.md` capt
 - `src/document.rs` — `Document` (tree + text + analysis + stable_outline) for open files
 - `src/file_store.rs` — Unified store for open + workspace FileAnalyses (role-tagged, dedup'd by path)
 - `src/file_analysis.rs` — Data model: scopes, symbols, refs, imports, type inference, priority constants. Serde-derived.
-- `src/builder.rs` — Single-pass CST → FileAnalysis builder (the ONLY tree-sitter consumer)
+- `src/builder.rs` — CST → FileAnalysis builder (the ONLY tree-sitter consumer). One live walk + a fixed sequence of named post-walk passes; see "Build pipeline phases" below.
 - `src/pod.rs` — POD→markdown converter (tree-sitter-pod AST walk, handles nested formatting/lists/data regions)
 - `src/cursor_context.rs` — Cursor position analysis: completion/signature/selection context
 - `src/symbols.rs` — LSP adapter layer (converts FileAnalysis types to LSP types)
@@ -174,7 +176,9 @@ This happens once, in `Builder::populate_witness_bag()`. After that point the ba
 
 **Single shared query path.** `witnesses::query_variable_type(bag, scopes, package_framework, var, scope, point)` is the *only* place the scope-chain walk + framework-fact lookup + reducer dispatch lives for variable lookups. `witnesses::query_sub_return_type(bag, symbols, sub_name, arity_hint)` is the parallel for sub returns — handles **local symbols** (via `Symbol` attachment) and **imported subs** (via `NamedSub` attachment, pushed by enrichment) through one path. Both `Builder::var_type_via_bag` (used during build for the return-arm fold) and `FileAnalysis::inferred_type_via_bag` / `sub_return_type_at_arity` (used at query time) are thin wrappers over these helpers. Identical rules in both places by construction. No "if no local symbol, take a different path" escape hatches.
 
-**Single point of reduction for `Symbol.return_type`.** `Builder::resolve_return_types` runs *after* `populate_witness_bag()`. Per `return $var` site it asks the bag (one query, framework-aware). Per literal/constructor return it uses the type the walk could read off directly. Then `resolve_return_type`'s agreement combinator yields the sub's return type. Delegation chains and `self_method_tails` propagate after that. Call-binding constraints (`my $cfg = get_config()`) are pushed in the same pass — both into `self.type_constraints` and into `self.bag` as a Variable witness, so the bag stays canonical.
+**Single reducer for `Symbol.return_type`, run twice in fixed-point order.** `Builder::resolve_return_types` runs *after* `populate_witness_bag()` — and again after the chain typing pass (see "Build pipeline phases" below). Per `return $var` site it asks the bag (one query, framework-aware). Per literal/constructor return it uses the type the walk could read off directly. Then `resolve_return_type`'s agreement combinator yields the sub's return type. Delegation chains and `self_method_tails` propagate after that. Call-binding constraints (`my $cfg = get_config()`) are pushed in the same pass — both into `self.type_constraints` and into `self.bag` as a Variable witness, so the bag stays canonical.
+
+The reducer is the same on both passes; the second run is what closes the chicken-and-egg between sub-return-type resolution and chain-variable typing (`my $route = $self->_route(...)->requires(...)->to(...)` types `$route` only once `_route` / `requires` / `to` have return types; `_generate_route` folds only once `$route` is typed). Subs whose `type_provenance` is `PluginOverride` are skipped on the write step so the override always wins over inferred — that's the whole point of an override.
 
 **Bag-and-`type_constraints` stay in sync — always.** Direct `self.type_constraints.push(...)` is no longer used outside the builder's seed step. `FileAnalysis::push_type_constraint(tc)` writes to both tables in lockstep. The local post-pass (`resolve_method_call_types(None)`) and cross-file enrichment (`enrich_imported_types_with_keys`) both go through it. `base_witness_count` is sealed alongside `base_type_constraint_count` after `finalize_post_walk()`, and enrichment truncates *both* before re-deriving — so repeat enrichment is fully idempotent.
 
@@ -193,9 +197,134 @@ This happens once, in `Builder::populate_witness_bag()`. After that point the ba
 
 The bag is **additive**: `TypeConstraint` / `CallBinding` / `MethodCallBinding` / framework synthesis / cross-file enrichment all keep working. Witnesses layer on top for cases the flat sum couldn't express; new behavior lands as new reducers, not new variants on `InferredType`.
 
+### Build pipeline phases
+
+`build_with_plugins()` in `builder.rs` runs a fixed sequence. The order matters: each pass consumes state the previous passes produced. Names below match the actual method names — grep for them.
+
+```
+1. live walk                    visit_*() over the whole tree
+                                emits Symbols, Refs, Scopes, TypeConstraints
+                                for cases the walk can resolve on its own
+                                (literals, constructors, $self = shift FirstParam,
+                                framework synthesis), records ReturnInfos with
+                                walk-time-typed return values, queues plugin
+                                emissions (deferred_var_types, return_infos,
+                                self_method_tails, sub_return_delegations,
+                                pending_witnesses).
+
+2. resolve_variable_refs()      resolve scalar refs → resolves_to SymbolId
+3. resolve_hash_key_owners()    HashKeyAccess refs → HashKeyOwner via TC types
+
+4. apply_type_overrides()       Plugin `overrides()` manifests pin Sub return
+                                types inference can't reach (e.g.
+                                Mojolicious::Routes::Route::_route → $self via
+                                @_-shift / array-slice idiom). Records
+                                TypeProvenance::PluginOverride. Runs BEFORE
+                                the witness fold so dependent inference sees
+                                the asserted type.
+
+5. populate_witness_bag()       One-shot bag seed: mirror every TypeConstraint
+                                as a Variable-attachment InferredType witness,
+                                emit HashRefAccess / ReturnOfName observations
+                                from refs, drain pending_witnesses, attach
+                                mutation facts to write-access HashKey refs.
+                                After this point the bag is canonical.
+
+6. resolve_return_types()       FOLD PASS 1. Per Sub/Method, the witness fold
+                                yields a return type from return arms (the
+                                bag answers `return $var` framework-aware,
+                                walk-time pre-types literals/constructors).
+                                resolve_return_type's agreement combinator
+                                produces the sub's return. Delegation
+                                (sub_return_delegations) and self-method tails
+                                (self_method_tails) propagate to fixed-point.
+                                Records TypeProvenance::ReducerFold /
+                                Delegation per sub. SKIPS subs flagged as
+                                PluginOverride so step 4's override is
+                                preserved through the write loop.
+
+7. type_assignments_into_bag(tree)
+                                THE chain-typing pass. Walks every
+                                `assignment_expression` whose lhs yields a
+                                variable name (`my $X = …`, `$X = …`, paren
+                                lists). The single recursive expression typer
+                                (`resolve_invocant_class_tree`) handles
+                                whatever shape the rhs is — scalar, method-call
+                                chain, bareword, shift / $_[0], function call.
+                                No "is it a chain" branch. Each result lands
+                                via TC + Variable bag witness in lockstep
+                                (same shape populate_witness_bag uses), so
+                                downstream queries see chain types through
+                                the same path everything else uses. Sets
+                                self.current_package per assignment from the
+                                enclosing scope's package so the typer
+                                resolves shift / $self correctly post-walk.
+
+                                Why HERE: the rhs of an assignment may walk
+                                through other subs' return types
+                                (`my $route = $self->_route(...)->requires(...)
+                                ->to(...)`). Those return types only exist
+                                after the override pass + first fold above,
+                                so this typer must run AFTER both.
+
+8. refresh_return_arm_types(tree)
+                                Re-evaluate ReturnInfo.inferred_type for
+                                every return expression against the now-
+                                populated TCs. Same typer
+                                (infer_return_value_type) the live walk
+                                used — just rerun against richer state.
+                                Only upgrades None → Some; never downgrades.
+                                Walk-time None for `return $route->name(...)`
+                                becomes ClassName(Route) here.
+
+9. resolve_return_types()       FOLD PASS 2. Same reducer. Now subs whose
+                                returns dereferenced chain-typed variables
+                                — most prominently Mojo's _generate_route —
+                                fold correctly, and tail-delegation cascades
+                                through every verb method
+                                (get/post/put/delete/any/under/...).
+
+10. resolve_invocant_classes_post_pass(tree)
+                                Re-walk the tree to fill in invocant_class
+                                on MethodCall refs that the live walk left
+                                empty (function-call chains like
+                                `get_foo()->bar()` need get_foo's now-known
+                                return type). Reuses the same recursive
+                                typer.
+
+11. resolve_tail_pod_docs()     POD docs for subs lacking a preceding doc.
+
+12. FileAnalysis::new(...)      Construct FA from builder data; build
+                                indices; calls resolve_method_call_types(None)
+                                for the legacy text-based MCB resolver as a
+                                FALLBACK for anything step 7 couldn't handle
+                                (cross-file enrichment also reuses this
+                                tree-less path).
+
+13. fa.finalize_post_walk()     Seal base_type_constraint_count /
+                                base_symbol_count / base_witness_count for
+                                idempotent re-enrichment.
+```
+
+The recursive expression typer (`Builder::resolve_invocant_class_tree`) is the **single** symbolic-execution function. It's used by step 7 (chain assignment typing), step 8 (return-arm refresh, indirectly via `infer_returned_value_type`), and step 10 (invocant class on method-call refs). Adding a second chain typer is the wrong fix; adding cases to the existing one is the right one. `FileAnalysis::resolve_expression_type` is the FA-side mirror used at query time (cursor context, hover, completion) — it does the same recursion against the now-built FA. If you need a behavior in both build-time and query-time chain typing, add it to BOTH and add a test.
+
 ### Debugging the inference pipeline
 
-`perl-lsp --dump-package <root> <package>` runs the same startup as the LSP server (workspace index, SQLite cache warm, on-demand @INC resolve, post-build enrichment), then dumps every sub in `<package>` as JSON: name, params with bag-resolved types, raw `return_type`, `sub_return_type_at_arity` projections at arity 0/1/2/None, `return_self_method` tail, witness count on the sub's symbol, framework, parents, doc summary. Use it to inspect what the reducers are folding and where chains die. Workspace packages are found by symbol scan; external @INC packages come from `module_index.get_cached(name)` populated by the startup pass.
+`perl-lsp --dump-package <root> <package>` runs the same startup as the LSP server (workspace index, SQLite cache warm, on-demand @INC resolve, post-build enrichment), then dumps every sub in `<package>` as JSON. Use it to inspect what the reducers are folding and where chains die. Workspace packages are found by symbol scan; external @INC packages come from `module_index.get_cached(name)` populated by the startup pass.
+
+Per sub: `name`, `params` with bag-resolved types, raw `return_type`, `sub_return_type_at_arity` projections at arity 0/1/2/None, `return_self_method` tail, witness count on the sub's symbol, framework, parents, doc summary. Plus two debugging-specific fields:
+
+- **`return_type_provenance`** — present whenever the return type is non-default. `{kind: "PluginOverride", plugin_id, reason}` when a plugin's `overrides()` manifest pinned the type. `{kind: "ReducerFold", reducer, evidence: [...]}` when the witness-bag fold produced it (`reducer="return_arms"` / `"last_expr"`). `{kind: "Delegation", delegation_kind, via}` when `sub_return_delegations` or `self_method_tails` propagated from another sub. Default (Inferred) is implicit via field-absent. Lets you trace any return type back to its source without re-running the build:
+
+  ```
+  _route          → ClassName(Route) via PluginOverride[mojo-routes: …]
+  _generate_route → ClassName(Route) via ReducerFold[return_arms]
+  get             → ClassName(Route) via Delegation[self_method_tail via _generate_route]
+  ```
+
+- **`vars_in_scope`** — every TypeConstraint whose scope is the sub's body. Surfaces chain assignments: when `$route` shows up here typed as `Mojolicious::Routes::Route`, the chain typer worked. When it doesn't, the chain died at some link upstream; combine with `return_type_provenance` on the methods in the chain to find which hop broke.
+
+Provenance is recorded at every site that derives a return type — `apply_type_overrides`, `resolve_return_types` (both fold + delegation + tail propagation paths). Wiring a new derivation path means writing to `Builder.type_provenance` keyed by `SymbolId`. The map flushes into `FileAnalysis.type_provenance` at construction; queries go through `FileAnalysis::return_type_provenance(sym_id)` which returns `TypeProvenance::Inferred` for missing entries. Variants live in `file_analysis.rs::TypeProvenance` — add new ones there as new derivation kinds appear.
 
 ### Cross-file type enrichment
 
