@@ -156,8 +156,11 @@ impl<'a> SubInfo<'a> {
     }
 
     /// Inferred type for a param by name (if the analysis resolved one).
-    pub fn param_inferred_type(&self, param_name: &str) -> Option<&'a InferredType> {
-        self.analysis.inferred_type(param_name, self.primary.span.end)
+    /// Goes through the canonical bag-aware query so framework rules
+    /// (Mojo `$self` etc.) apply consistently across every consumer.
+    pub fn param_inferred_type(&self, param_name: &str) -> Option<InferredType> {
+        self.analysis
+            .inferred_type_via_bag(param_name, self.primary.span.end)
     }
 }
 

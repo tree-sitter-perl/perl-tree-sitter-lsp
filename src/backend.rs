@@ -123,7 +123,15 @@ fn refs_to_locations(results: Vec<crate::resolve::RefLocation>) -> Option<Vec<Lo
     Some(locations)
 }
 
-fn build_imported_return_types(
+#[cfg(test)]
+pub fn build_imported_return_types_for_test(
+    analysis: &crate::file_analysis::FileAnalysis,
+    module_index: &ModuleIndex,
+) -> (HashMap<String, InferredType>, HashMap<String, Vec<String>>) {
+    build_imported_return_types(analysis, module_index)
+}
+
+pub(crate) fn build_imported_return_types(
     analysis: &crate::file_analysis::FileAnalysis,
     module_index: &ModuleIndex,
 ) -> (HashMap<String, InferredType>, HashMap<String, Vec<String>>) {

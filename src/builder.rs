@@ -54,6 +54,7 @@ pub fn build_with_plugins(
         imports: Vec::new(),
         return_infos: Vec::new(),
         last_expr_type: std::collections::HashMap::new(),
+        self_method_tails: std::collections::HashMap::new(),
         call_bindings: Vec::new(),
         method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
@@ -67,6 +68,9 @@ pub fn build_with_plugins(
         export_ok: Vec::new(),
         plugin_namespaces: Vec::new(),
         type_provenance: std::collections::HashMap::new(),
+        pending_witnesses: Vec::new(),
+        bag: crate::witnesses::WitnessBag::new(),
+        package_framework: std::collections::HashMap::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
@@ -114,27 +118,86 @@ pub fn build_with_plugins(
     // Post-pass 2: resolve hash key owners from type constraints
     b.resolve_hash_key_owners();
 
-    // Post-pass 3: infer return types for subs/methods
+    // Compute per-package framework facts BEFORE return-type fold so
+    // the bag-aware reducer has the right context. Mirrors the data
+    // the framework-accessor synthesis already consumed during the walk.
+    b.package_framework = b
+        .framework_modes
+        .iter()
+        .map(|(pkg, mode)| {
+            let ff = match mode {
+                FrameworkMode::Moo => crate::witnesses::FrameworkFact::Moo,
+                FrameworkMode::Moose => crate::witnesses::FrameworkFact::Moose,
+                FrameworkMode::MojoBase => crate::witnesses::FrameworkFact::MojoBase,
+            };
+            (pkg.clone(), ff)
+        })
+        .collect();
+
+    // Plugin `overrides()` manifests run first. They pin return
+    // types inference can't reach (`Mojolicious::Routes::Route::_route`
+    // returning $self via an array-slice idiom). Provenance is
+    // recorded in `type_provenance` (PluginOverride) so
+    // `--dump-package` can answer "why does this return X?".
+    b.apply_type_overrides();
+
+    // Single bag-population pass: mirror walk-time data
+    // (`type_constraints`, refs producing rep observations + method
+    // call return witnesses, write-mutations on hash keys) plus drain
+    // walk-emitted witnesses (`pending_witnesses`) into `b.bag`. After
+    // this point the bag is the source of truth for the witness pipeline.
+    b.populate_witness_bag();
+
+    // First fold: derive sub return types from the bag. Every reducer
+    // rule (framework / branch / arity) participates here. After this
+    // pass, return-shaped methods like `requires`, `to`, `name` are
+    // typed via the framework-aware fold; `_route` keeps its override.
     b.resolve_return_types();
 
-    // Post-pass 3b: apply plugin `overrides()` manifests. Runs AFTER
-    // inference so the override always wins — that's the whole point
-    // ("inference fails here, so override it"). Records provenance in
-    // `type_provenance` so debugging can tell inferred from asserted.
-    b.apply_type_overrides();
+    // Symbolically execute every `my $X = <expr>` and push the result
+    // into the bag. ONE recursive typer (`resolve_invocant_class_tree`)
+    // handles whatever shape the rhs is — scalar, method-call chain,
+    // bareword, shift idiom, function call. No "is it a chain" branch.
+    // The result lands as both a `TypeConstraint` and a `Variable`
+    // witness, so the bag sees it like any other observation.
+    //
+    // Why now: the rhs of an assignment may walk through other subs'
+    // return types (`my $route = $self->_route(...)->requires(...)->to(...)`).
+    // Those return types only exist after the first fold above plus
+    // the override pass, so the typer must run AFTER both.
+    b.type_assignments_into_bag(tree);
+
+    // Refresh walk-time return-arm typings. `ReturnInfo.inferred_type`
+    // was computed during the walk against an empty `type_constraints`
+    // table — `return $route->name(...)` couldn't be typed because
+    // `$route` had no TC yet. Now that the chain pass has populated
+    // every assigned variable, re-walk each return expression with
+    // the same typer the walk used; whatever resolves now resolves
+    // for keeps. Same code path as walk-time typing — just rerun
+    // against the richer state.
+    b.refresh_return_arm_types(tree);
+
+    // Second fold: now that chain-assigned variables (`$route`) have
+    // typed bag entries AND return arms have been re-typed against
+    // the chain-populated TCs, subs whose return is `return …$route…` —
+    // most prominently `_generate_route` — fold correctly, and the
+    // tail-delegation propagation cascades to `get`/`post`/`put`/etc.
+    b.resolve_return_types();
 
     // Post-pass 4: re-resolve invocant classes on MethodCall refs now
     // that sub return types are known. Function-call chains like
     // `get_foo()->bar()` need `get_foo`'s return type to pin the
-    // receiver class of `->bar`; that return type is only computed
-    // in post-pass 3, so the during-walk `invocant_class` is empty
-    // for those refs. Walk the tree a second time and fill them in.
+    // receiver class of `->bar`; that return type comes from the
+    // bag-aware fold in post-pass 3 plus any post-pass-3b overrides.
     b.resolve_invocant_classes_post_pass(tree);
 
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
     b.resolve_tail_pod_docs();
 
-    FileAnalysis::new(
+    let bag = std::mem::take(&mut b.bag);
+    let package_framework = std::mem::take(&mut b.package_framework);
+
+    let mut fa = FileAnalysis::new(
         b.scopes,
         b.symbols,
         b.refs,
@@ -150,7 +213,399 @@ pub fn build_with_plugins(
         b.plugin_namespaces,
         b.package_uses,
         b.type_provenance,
-    )
+    );
+    fa.package_framework = package_framework;
+    fa.witnesses = bag;
+    fa.witnesses.rebuild_index();
+    // Finalize: run the legacy text-based MCB resolver as a fallback.
+    // For every assignment the unified typer (run before
+    // `resolve_return_types` above) couldn't handle, MCB fills in.
+    // Cross-file enrichment also reuses MCB resolution without a tree.
+    fa.finalize_post_walk();
+
+    fa
+}
+
+impl<'a> Builder<'a> {
+    /// Mirror walk-time data into the witness bag. Runs ONCE before
+    /// `resolve_return_types`, populates the bag with:
+    ///
+    ///   - one `InferredType` payload + (optional) class-assertion
+    ///     observation per `TypeConstraint`,
+    ///   - `HashRefAccess` observations per `$v->{k}` ref,
+    ///   - `ReturnOfName` observations per method-call ref (for the
+    ///     fluent-chain Expression-attached fold),
+    ///   - `mutation` facts on each Class/Sub-owned hash-key write,
+    ///   - everything `pending_witnesses` collected during the walk
+    ///     (branch arms, arity gating).
+    ///
+    /// After this point the bag is the source of truth. Subsequent
+    /// passes that introduce new facts (call-binding propagation in
+    /// `resolve_return_types`) push directly into `self.bag` to keep
+    /// the bag and `self.type_constraints` in sync.
+    fn populate_witness_bag(&mut self) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+
+        // Mirror every TypeConstraint as a Variable-attachment
+        // InferredType witness (and a class-assertion observation when
+        // the type is a class identity).
+        let constraints = self.type_constraints.clone();
+        for tc in &constraints {
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Variable {
+                    name: tc.variable.clone(),
+                    scope: tc.scope,
+                },
+                source: WitnessSource::Builder("type_constraint".into()),
+                payload: WitnessPayload::InferredType(tc.inferred_type.clone()),
+                span: Span { start: tc.constraint_span.start, end: tc.constraint_span.start },
+            });
+            match tc.inferred_type {
+                InferredType::ClassName(ref n) => {
+                    self.bag.push(Witness {
+                        attachment: WitnessAttachment::Variable {
+                            name: tc.variable.clone(),
+                            scope: tc.scope,
+                        },
+                        source: WitnessSource::Builder("type_constraint".into()),
+                        payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(
+                            n.clone(),
+                        )),
+                        span: tc.constraint_span,
+                    });
+                }
+                InferredType::FirstParam { ref package } => {
+                    self.bag.push(Witness {
+                        attachment: WitnessAttachment::Variable {
+                            name: tc.variable.clone(),
+                            scope: tc.scope,
+                        },
+                        source: WitnessSource::Builder("type_constraint".into()),
+                        payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+                            package: package.clone(),
+                        }),
+                        span: tc.constraint_span,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Rep observations + Expression-attached method-call returns
+        // from refs.
+        let mut hash_obs: Vec<(String, ScopeId, Span)> = Vec::new();
+        let mut method_exprs: Vec<(usize, String, Span)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            match &r.kind {
+                RefKind::HashKeyAccess { var_text, .. } => {
+                    if var_text.starts_with('$') {
+                        hash_obs.push((var_text.clone(), r.scope, r.span));
+                    }
+                }
+                RefKind::MethodCall { .. } => {
+                    method_exprs.push((i, r.target_name.clone(), r.span));
+                }
+                _ => {}
+            }
+        }
+        for (var, scope, span) in hash_obs {
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Variable { name: var, scope },
+                source: WitnessSource::Builder("hash_ref_access".into()),
+                payload: WitnessPayload::Observation(TypeObservation::HashRefAccess),
+                span,
+            });
+        }
+        for (idx, method, span) in method_exprs {
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Expression(crate::witnesses::RefIdx(idx as u32)),
+                source: WitnessSource::Builder("method_call_return".into()),
+                payload: WitnessPayload::Observation(TypeObservation::ReturnOfName(method)),
+                span,
+            });
+        }
+
+        // Part 1 — invocant mutations on hash keys.
+        let mut mutations: Vec<(HashKeyOwner, String, Span)> = Vec::new();
+        for r in &self.refs {
+            if let (RefKind::HashKeyAccess { owner, var_text }, AccessKind::Write) =
+                (&r.kind, r.access)
+            {
+                let resolved_owner = match owner {
+                    Some(o @ (HashKeyOwner::Class(_) | HashKeyOwner::Sub { .. })) => Some(o.clone()),
+                    _ => {
+                        if var_text == "$self" {
+                            let scope = &self.scopes[r.scope.0 as usize];
+                            scope.package.clone().map(HashKeyOwner::Class)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(o) = resolved_owner {
+                    mutations.push((o, r.target_name.clone(), r.span));
+                }
+            }
+        }
+        for (owner, key, span) in mutations {
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::HashKey { owner, name: key.clone() },
+                source: WitnessSource::Builder("invocant_mutation".into()),
+                payload: WitnessPayload::Fact {
+                    family: "mutation".into(),
+                    key: "written_at".into(),
+                    value: crate::witnesses::FactValue::Str(key),
+                },
+                span,
+            });
+        }
+
+        // Drain walk-emitted witnesses (branch arms, arity gating).
+        let pending = std::mem::take(&mut self.pending_witnesses);
+        for w in pending {
+            self.bag.push(w);
+        }
+    }
+
+    /// Bag-aware variable type lookup during build. Thin pass-through
+    /// to the single shared `witnesses::query_variable_type` — same
+    /// helper `FileAnalysis::inferred_type` calls at query time. One
+    /// query path, one set of rules.
+    fn var_type_via_bag(
+        &self,
+        var: &str,
+        scope: ScopeId,
+        point: Point,
+    ) -> Option<InferredType> {
+        crate::witnesses::query_variable_type(
+            &self.bag,
+            &self.scopes,
+            &self.package_framework,
+            var,
+            scope,
+            point,
+        )
+    }
+}
+
+/// Which arity branch a `return_expression` represents. Computed
+/// from the shape of the return's parent in the CST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArityBranch {
+    /// `return X unless @_;` / `return X if !@_;` — fires when the
+    /// caller passed zero additional args.
+    Zero,
+    /// `return X if @_ == N;` / `if scalar(@_) == N;` / explicit
+    /// `if (@_ == N) { return X }`. Exact-N match.
+    Exact(u32),
+    /// Fall-through `return X;` with no condition wrapper — fires
+    /// when no earlier arity-gated branch matched.
+    Default,
+}
+
+/// Inspect the `return_expression`'s parent. If it's a
+/// `postfix_conditional_expression` with `@_` as the condition, we
+/// look at the connector keyword (`if` vs `unless`) to decide. If
+/// it's a bare expression_statement, this is a default branch.
+///
+/// Known idioms (spike shortlist):
+///   - `return X unless @_;`       → Zero
+///   - `return X;`                  → Default
+///
+/// Unknowns (return None and punt):
+///   - `return X if @_;`            (arity >= 1 narrowing)
+///   - `return X if @_ == N;`       (exact N)
+///   - `return X if scalar @_ …;`   (scalar wrapper)
+fn classify_arity_branch(return_node: tree_sitter::Node, source: &[u8]) -> Option<ArityBranch> {
+    let Some(parent) = return_node.parent() else { return None };
+    match parent.kind() {
+        "expression_statement" => classify_bare_return_or_if_arm(parent, source),
+        "postfix_conditional_expression" => {
+            let cond = parent.child_by_field_name("condition")?;
+            let keyword = connector_keyword_between(return_node, cond, source)?;
+            classify_arity_condition(cond, source, &keyword)
+        }
+        _ => None,
+    }
+}
+
+/// `expression_statement` parent → either a bare `return X` at sub
+/// body level (Default), OR inside an `if (@_ == N) { return X }` arm
+/// where the conditional_statement's condition is an arity test (Exact).
+fn classify_bare_return_or_if_arm(
+    expr_stmt: tree_sitter::Node,
+    source: &[u8],
+) -> Option<ArityBranch> {
+    let Some(block) = expr_stmt.parent() else { return None };
+    if block.kind() != "block" {
+        return None;
+    }
+    let Some(outer) = block.parent() else { return None };
+    match outer.kind() {
+        "subroutine_declaration_statement"
+        | "method_declaration_statement"
+        | "anonymous_subroutine_expression" => Some(ArityBranch::Default),
+        "conditional_statement" => {
+            // `if (condition) { return X }` — classify by condition.
+            // Arity-gated condition → Zero / Exact. Anything else
+            // (regular boolean predicate) is still a contributor to
+            // the default return shape: the arm runs whenever the
+            // condition holds, regardless of arity. Classify as
+            // Default so the FluentArityDispatch reducer can fold
+            // agreement across every arm that doesn't gate on arity.
+            let cond = outer.child_by_field_name("condition")?;
+            classify_arity_condition(cond, source, "if").or(Some(ArityBranch::Default))
+        }
+        _ => None,
+    }
+}
+
+/// Classify an arity condition node. `keyword` is "if" or "unless".
+fn classify_arity_condition(
+    cond: tree_sitter::Node,
+    source: &[u8],
+    keyword: &str,
+) -> Option<ArityBranch> {
+    // Shape 1: bare `@_`.
+    if cond.kind() == "array" {
+        let text = cond.utf8_text(source).ok()?.trim();
+        if text == "@_" {
+            return match keyword {
+                "unless" => Some(ArityBranch::Zero),
+                _ => None, // `if @_` is "arity >= 1" — not expressible as Exact yet.
+            };
+        }
+        return None;
+    }
+    // Shape 2: `!@_` → unary_expression with operand @_.
+    if cond.kind() == "unary_expression" {
+        let op_text = raw_leading_op(cond, source);
+        if op_text == "!" {
+            if let Some(operand) = cond.child_by_field_name("operand") {
+                if operand.kind() == "array" {
+                    let text = operand.utf8_text(source).ok()?.trim();
+                    if text == "@_" {
+                        return match keyword {
+                            "if" => Some(ArityBranch::Zero),
+                            "unless" => None, // `unless !@_` → arity >= 1, skip
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    // Shape 3: `@_ == N` / `scalar(@_) == N` → equality_expression.
+    if cond.kind() == "equality_expression" {
+        let op = raw_mid_op(cond, source);
+        if op != "==" && op != "!=" {
+            return None;
+        }
+        let left = cond.child_by_field_name("left")?;
+        let right = cond.child_by_field_name("right")?;
+        let n = extract_numeric(right, source)?;
+        let counts_args = node_is_arity_magnitude(left, source);
+        if !counts_args {
+            return None;
+        }
+        match (keyword, op.as_str()) {
+            ("if", "==") => Some(ArityBranch::Exact(n)),
+            ("unless", "!=") => Some(ArityBranch::Exact(n)),
+            _ => None, // != / >= / etc. — not a single Exact fact.
+        }
+    } else {
+        None
+    }
+}
+
+/// True if `node` evaluates to the length of `@_` — either `@_`
+/// itself (scalar context in an equality) or `scalar(@_)`.
+fn node_is_arity_magnitude(node: tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() == "array" {
+        return node.utf8_text(source).map(|s| s.trim() == "@_").unwrap_or(false);
+    }
+    if node.kind() == "func1op_call_expression" {
+        let Some(kw) = node.child(0) else { return false };
+        let Ok(name) = kw.utf8_text(source) else { return false };
+        if name != "scalar" {
+            return false;
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i) {
+                if c.kind() == "array" {
+                    return c.utf8_text(source).map(|s| s.trim() == "@_").unwrap_or(false);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract a small unsigned numeric literal from a `number` node.
+fn extract_numeric(node: tree_sitter::Node, source: &[u8]) -> Option<u32> {
+    if node.kind() != "number" {
+        return None;
+    }
+    node.utf8_text(source).ok()?.trim().parse::<u32>().ok()
+}
+
+/// Read the raw bytes between two sibling nodes to recover the
+/// postfix keyword (`if` / `unless` / `while` / …). Used because
+/// tree-sitter-perl shares one node kind for both `if` and `unless`.
+fn connector_keyword_between(
+    left: tree_sitter::Node,
+    right: tree_sitter::Node,
+    source: &[u8],
+) -> Option<String> {
+    let start = left.end_byte();
+    let end = right.start_byte();
+    if end <= start {
+        return None;
+    }
+    let between = std::str::from_utf8(&source[start..end]).ok()?.trim();
+    // Expect exactly one keyword in between.
+    for kw in ["unless", "if", "while", "until"] {
+        if between == kw || between.starts_with(kw) && between.trim() == kw {
+            return Some(kw.to_string());
+        }
+        // tolerate extra whitespace (e.g. newlines)
+        if between.split_whitespace().next() == Some(kw) {
+            return Some(kw.to_string());
+        }
+    }
+    None
+}
+
+fn raw_leading_op(node: tree_sitter::Node, source: &[u8]) -> String {
+    // Operator is an anonymous child between start and the first named
+    // child (operand). Read the bytes before the operand node.
+    let Some(operand) = node.child_by_field_name("operand") else {
+        return String::new();
+    };
+    let start = node.start_byte();
+    let end = operand.start_byte();
+    std::str::from_utf8(&source[start..end])
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn raw_mid_op(node: tree_sitter::Node, source: &[u8]) -> String {
+    let Some(left) = node.child_by_field_name("left") else {
+        return String::new();
+    };
+    let Some(right) = node.child_by_field_name("right") else {
+        return String::new();
+    };
+    let start = left.end_byte();
+    let end = right.start_byte();
+    std::str::from_utf8(&source[start..end])
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// A return value type collected during the walk, before post-pass resolution.
@@ -159,6 +614,20 @@ struct ReturnInfo {
     scope: ScopeId,
     /// The inferred type of the return value, if determinable from literals/constructors.
     inferred_type: Option<InferredType>,
+    /// When the return body is `return $var`, the variable's name and the
+    /// return point. Used by the post-bag-seed re-fold pass to defer the
+    /// type lookup to the framework-aware resolver — collection just
+    /// records WHICH variable was returned; reduction asks the bag.
+    deferred_var: Option<(String, Point)>,
+    /// Arity-dispatch classification (`unless @_`, `if @_ == N`, …) so
+    /// `resolve_return_types` can emit `ArityReturn` witnesses with the
+    /// bag-folded arm type AT REDUCTION TIME — rather than the walk
+    /// emitting them with a collection-time-folded type embedded.
+    /// `None` for returns that aren't arity-gated.
+    arity_branch: Option<ArityBranch>,
+    /// Span of the return-expression node — carried so the deferred
+    /// witness emission has the right `span` to attach.
+    span: Span,
 }
 
 /// If `return_node` is `return CALL`, where CALL is a simple named function
@@ -303,6 +772,14 @@ struct Builder<'a> {
     return_infos: Vec<ReturnInfo>,
     /// For each Sub/Method scope, the type of the last expression (implicit return).
     last_expr_type: std::collections::HashMap<ScopeId, Option<InferredType>>,
+    /// For each Sub/Method scope whose last body statement is
+    /// `shift->M(...)` or `$self->M(...)`: the method name M.
+    /// Perl's last statement returns, so if M is another method on
+    /// the same class, this sub's return type IS M's return type.
+    /// Resolved in the return-type post-pass via fixed-point
+    /// iteration — captures the Mojo `sub get { shift->_generate_route(...) }`
+    /// shape without hardcoding any framework knowledge.
+    self_method_tails: std::collections::HashMap<ScopeId, String>,
     /// Assignments where RHS is a function call — resolved in return-type post-pass.
     call_bindings: Vec<CallBinding>,
     /// Assignments where RHS is a method call — resolved in FileAnalysis post-pass.
@@ -334,10 +811,30 @@ struct Builder<'a> {
     /// `EmitAction::PluginNamespace`. Flushed into the final
     /// `FileAnalysis.plugin_namespaces`.
     plugin_namespaces: Vec<crate::file_analysis::PluginNamespace>,
-    /// Per-symbol provenance for return types — empty unless an
-    /// `overrides()` manifest patched a Sub/Method's return type.
+    /// Per-symbol provenance for return types. Populated by plugin
+    /// `overrides()` (PluginOverride) and by reducer-driven folds
+    /// (ReducerFold). Empty entry == `TypeProvenance::Inferred`.
     /// Flushed into `FileAnalysis.type_provenance` at construction.
     type_provenance: std::collections::HashMap<SymbolId, TypeProvenance>,
+    /// Witnesses emitted during the walk — drained into the unified
+    /// `bag` at populate time. Populated by idiom detectors (branch
+    /// arms, arity gating, …) that need the CST during the walk.
+    pending_witnesses: Vec<crate::witnesses::Witness>,
+    /// The single, unified witness bag. Walk-time observations land in
+    /// `pending_witnesses`; post-walk seeding from `type_constraints`
+    /// + refs runs into this bag once via `populate_witness_bag()`.
+    /// `resolve_return_types` then queries this bag for return-arm
+    /// folding (the only fold), and any new TypeConstraints it pushes
+    /// (call-binding propagation) get mirrored back into the same bag
+    /// so it stays the source of truth. Moved into
+    /// `FileAnalysis.witnesses` when the analysis is constructed —
+    /// no second seeding pass.
+    bag: crate::witnesses::WitnessBag,
+    /// Per-package framework fact, computed from `framework_modes` once
+    /// the walk finishes. Available before `resolve_return_types` so
+    /// the bag-aware return-arm fold can ask the framework-aware
+    /// reducer with the right context.
+    package_framework: std::collections::HashMap<String, crate::witnesses::FrameworkFact>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
@@ -612,17 +1109,27 @@ impl<'a> Builder<'a> {
             }
             "scalar" => {
                 let text = node.utf8_text(self.source).ok()?;
-                if text == "$self" {
-                    return self.current_package.clone();
-                }
-                // Variable with a ClassName type constraint.
-                self.type_constraints.iter().rev().find_map(|tc| {
+                // Variable's type from a TypeConstraint. Accept both
+                // ClassName (explicit assertion) and FirstParam (the
+                // `my $self = shift` idiom) — both pin a class. Without
+                // FirstParam here, post-pass chain typing can't see
+                // through `$self->_route(...)->...` because $self's TC
+                // is FirstParam, not ClassName.
+                let from_tc = self.type_constraints.iter().rev().find_map(|tc| {
                     if tc.variable != text { return None; }
-                    if let InferredType::ClassName(c) = &tc.inferred_type {
-                        Some(c.clone())
-                    } else {
-                        None
+                    match &tc.inferred_type {
+                        InferredType::ClassName(c) => Some(c.clone()),
+                        InferredType::FirstParam { package } => Some(package.clone()),
+                        _ => None,
                     }
+                });
+                from_tc.or_else(|| {
+                    // Fall back to walk-state `current_package` for
+                    // `$self` in case TC seeding is incomplete (e.g.
+                    // `my $self = shift` not yet processed). Live-walk
+                    // callers depend on this; post-walk callers
+                    // generally hit the TC path above.
+                    if text == "$self" { self.current_package.clone() } else { None }
                 })
             }
             "bareword" | "package" => {
@@ -653,22 +1160,12 @@ impl<'a> Builder<'a> {
             }
             // `shift` in method-body invocant position is the classic
             // `$self` idiom: `sub get { shift->_generate_route(GET => @_) }`.
-            // Mojo's Route.pm uses it on every HTTP-verb method.
-            // `func1op_call_expression` = bare `shift`, the tree-sitter
-            // shape for single-token function-y operators with no parens.
-            //
-            // TODO: if false positives become annoying (e.g. a top-level
-            // sub inside a package that genuinely uses `shift->method(…)`
-            // on its first arg of a non-self type), introduce a heuristic
-            // here — e.g. only trust the shape when the enclosing sub
-            // has at least one OTHER method-like signal (declared as
-            // `method`, first `my ($self, ...) = @_`, `sub new { bless
-            // ... }` in the same package, etc.). `$self` itself is
-            // heuristic-free for exactly this reason — we trust the
-            // token — but `shift` is a broader token with legitimate
-            // non-self uses. Until a real false-positive report shows
-            // up, the no-heuristic version wins: silent inference beats
-            // no inference.
+            // Mojo's Route.pm uses it on every HTTP-verb method. We
+            // trust the shape unconditionally — silent inference beats
+            // no inference. If false positives surface, narrow with a
+            // method-like-signal heuristic (declared `method`, first
+            // `my ($self, ...) = @_`, `sub new { bless … }` in the
+            // same package).
             "func1op_call_expression" if self.is_shift_call(node) => {
                 self.current_package.clone()
             }
@@ -678,7 +1175,7 @@ impl<'a> Builder<'a> {
             //   (array_element_expression
             //     array:(container_variable (varname "_"))
             //     index:(number "0"))
-            // Same heuristic TODO applies as for `shift` above.
+            // Same trust-the-shape policy as `shift`.
             "array_element_expression" => {
                 let array = node.child_by_field_name("array")?;
                 if array.kind() != "container_variable" { return None; }
@@ -903,6 +1400,7 @@ impl<'a> Builder<'a> {
                     display,
                     hide_in_outline,
                     opaque_return,
+                    return_self_method: None,
                 };
                 let target_pkg = on_class.clone().or_else(|| self.current_package.clone());
 
@@ -1210,9 +1708,25 @@ impl<'a> Builder<'a> {
             "return_expression" => {
                 if let Some(scope) = self.enclosing_sub_scope() {
                     let ret_type = self.infer_return_value_type(node);
+                    // Capture `return $var` for the post-bag-seed re-fold.
+                    // Collection records the raw variable identity; the
+                    // reducer at query time picks the right type under
+                    // the enclosing package's framework rules.
+                    let deferred_var = node
+                        .named_child(0)
+                        .filter(|c| c.kind() == "scalar")
+                        .and_then(|c| c.utf8_text(self.source).ok().map(|s| (s.to_string(), c.start_position())));
+                    // Arity-dispatch classification — recorded raw, no
+                    // type fold here. The deferred witness emission in
+                    // `resolve_return_types` will pair the branch with
+                    // the bag-resolved arm type.
+                    let arity_branch = classify_arity_branch(node, self.source);
                     self.return_infos.push(ReturnInfo {
                         scope,
-                        inferred_type: ret_type,
+                        inferred_type: ret_type.clone(),
+                        deferred_var,
+                        arity_branch,
+                        span: node_to_span(node),
                     });
                     // If the return body is `return other()` (a direct call),
                     // record the delegation so hash-key ownership can walk
@@ -1222,19 +1736,71 @@ impl<'a> Builder<'a> {
                             self.sub_return_delegations.insert(sub_name, delegated);
                         }
                     }
+                    // If-arm BranchArm: return inside `if { … } else { … }`.
+                    self.emit_branch_arm_for_if_arm_return(node, scope, ret_type);
+                    // Ternary-return BranchArm: `return $c ? A : B;` —
+                    // emit a BranchArm observation per arm on the
+                    // enclosing sub's Symbol, same reducer as RHS-
+                    // ternary and if-else-arm paths.
+                    if let Some(child) = node.named_child(0) {
+                        if child.kind() == "conditional_expression" {
+                            if let Some(sub_name) = self.enclosing_sub_name() {
+                                if let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) {
+                                    self.emit_branch_arm_witnesses(
+                                        child,
+                                        crate::witnesses::WitnessAttachment::Symbol(sym_id),
+                                        node,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 self.visit_children(node);
             }
 
-            // Expression statements inside sub bodies → track last expression type
+            // Expression statements inside sub bodies → track last
+            // expression type. Perl returns the last statement's
+            // value, so this IS the sub's implicit return.
+            //
+            // IMPORTANT: only statements at the sub body's TOP
+            // level count. A `$self->M(...)` call buried inside a
+            // `grep { … }` or an `if`-block is not the sub's
+            // return. Both `last_expr_type` and `self_method_tails`
+            // are gated on this — the outer block must be the
+            // sub/method's direct body.
             "expression_statement" => {
                 self.visit_children(node);
-                // Track the type of the last expression in the innermost sub/method scope
                 if let Some(scope) = self.enclosing_sub_scope() {
-                    let expr_type = node.named_child(0).and_then(|child| {
-                        self.infer_expression_type(child, false)
-                    });
-                    self.last_expr_type.insert(scope, expr_type);
+                    let is_body_top_level = node
+                        .parent()
+                        .filter(|p| p.kind() == "block")
+                        .and_then(|b| b.parent())
+                        .map(|gp| {
+                            matches!(
+                                gp.kind(),
+                                "subroutine_declaration_statement"
+                                    | "method_declaration_statement"
+                                    | "anonymous_subroutine_expression"
+                            )
+                        })
+                        .unwrap_or(false);
+                    if is_body_top_level {
+                        let child = node.named_child(0);
+                        let expr_type = child.and_then(|c| self.infer_returned_value_type(c));
+                        self.last_expr_type.insert(scope, expr_type);
+                        if let Some(c) = child {
+                            if let Some(method_name) = self.self_method_call_name(c) {
+                                self.self_method_tails.insert(scope, method_name);
+                            } else {
+                                // A non-self-method-tail top-level
+                                // expression overrides any prior
+                                // self-method tail we may have
+                                // recorded (defensive).
+                                self.self_method_tails.remove(&scope);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1555,7 +2121,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc, display: None, hide_in_outline: false, opaque_return: false },
+            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc, display: None, hide_in_outline: false, opaque_return: false, return_self_method: None },
         );
 
         // Push sub scope
@@ -1903,7 +2469,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None, display: None, hide_in_outline: false, opaque_return: false },
+                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None, display: None, hide_in_outline: false, opaque_return: false, return_self_method: None },
                     );
                 }
                 if has_writer {
@@ -1926,6 +2492,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                 }
@@ -2560,6 +3127,17 @@ impl<'a> Builder<'a> {
                 self.visit_variable_decl(left);
             }
             if let Some(right) = node.child_by_field_name("right") {
+                // Branch-arm detection: if RHS is a ternary, emit one
+                // BranchArm witness per arm on the LHS variable. The
+                // reducer folds them (agreement → type; disagreement
+                // → None — future: Union). Same reduction works for
+                // explicit if/else return arms (see resolve_return_types).
+                if right.kind() == "conditional_expression" {
+                    if let Some(vt) = self.get_var_text_from_lhs(left) {
+                        self.emit_branch_arm_witnesses_for_ternary(&vt, right, node);
+                    }
+                }
+
                 // Try constructor class first, then literal types, then expression type
                 let inferred = self.infer_expression_type(right, false)
                     .or_else(|| self.infer_expression_result_type(right));
@@ -2632,6 +3210,158 @@ impl<'a> Builder<'a> {
     /// Infer type from an expression node: literals, constructors, sub-body last expr.
     /// When `unwrap_sub_body` is true (Mojo default context), recurses into sub bodies.
     /// When false (literal/return context), anonymous subs return CodeRef.
+    /// Emit a BranchArm observation on the enclosing sub's Symbol
+    /// when this `return_expression` is inside a
+    /// `conditional_statement` arm (if / elsif / else). Reuses the
+    /// same reduction as ternary descent — agreement → type;
+    /// disagreement → None.
+    fn emit_branch_arm_for_if_arm_return(
+        &mut self,
+        return_node: Node<'a>,
+        scope: ScopeId,
+        ret_type: Option<InferredType>,
+    ) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        let Some(ty) = ret_type else { return };
+        // Walk up: expression_statement → block → conditional_statement.
+        let mut cur = return_node;
+        let mut seen_conditional = false;
+        for _ in 0..4 {
+            match cur.parent() {
+                Some(p) => {
+                    if p.kind() == "conditional_statement" || p.kind() == "else" {
+                        seen_conditional = true;
+                        break;
+                    }
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        if !seen_conditional {
+            return;
+        }
+        let Some(sub_name) = self.enclosing_sub_name() else { return };
+        let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) else { return };
+        self.pending_witnesses.push(Witness {
+            attachment: WitnessAttachment::Symbol(sym_id),
+            source: WitnessSource::Builder("branch_arm".into()),
+            payload: WitnessPayload::Observation(TypeObservation::BranchArm(ty)),
+            span: node_to_span(return_node),
+        });
+    }
+
+    /// Locate the SymbolId for a Sub/Method named `name` whose body's
+    /// inner scope is (an ancestor of) `body_scope`. Scans
+    /// `self.symbols` for a matching Sub symbol.
+    fn find_sub_symbol_for(&self, name: &str, body_scope: ScopeId) -> Option<SymbolId> {
+        // Walk up the scope chain; the Sub scope's own span contains
+        // the return. We need the symbol whose selection_span matches
+        // the sub name.
+        let mut cursor = Some(body_scope);
+        while let Some(sid) = cursor {
+            let s = &self.scopes[sid.0 as usize];
+            if let ScopeKind::Sub { name: n } | ScopeKind::Method { name: n } = &s.kind {
+                if n == name {
+                    // Find the symbol whose enclosing-scope parent
+                    // declared it (sym.scope == s.parent) OR the
+                    // symbol's scope equals this one.
+                    for sym in &self.symbols {
+                        if sym.name == name
+                            && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                            && sym.span.start <= s.span.start
+                            && s.span.end <= sym.span.end
+                        {
+                            return Some(sym.id);
+                        }
+                    }
+                    return None;
+                }
+            }
+            cursor = s.parent;
+        }
+        None
+    }
+
+    /// Find the Sub/Method symbol whose body scope IS or CONTAINS
+    /// `inner_scope`. Same semantics as `find_sub_symbol_for(name, ...)`
+    /// without needing the name in hand. Used by `resolve_return_types`
+    /// when emitting deferred `ArityReturn` witnesses keyed by sub.
+    fn find_sub_symbol_for_scope(&self, inner_scope: ScopeId) -> Option<SymbolId> {
+        let mut cursor = Some(inner_scope);
+        while let Some(sid) = cursor {
+            let s = &self.scopes[sid.0 as usize];
+            if let ScopeKind::Sub { name } | ScopeKind::Method { name } = &s.kind {
+                for sym in &self.symbols {
+                    if sym.name == *name
+                        && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                        && sym.span.start <= s.span.start
+                        && s.span.end <= sym.span.end
+                    {
+                        return Some(sym.id);
+                    }
+                }
+                return None;
+            }
+            cursor = s.parent;
+        }
+        None
+    }
+
+    /// Generic branch-arm emission. Walks both arms of a
+    /// `conditional_expression`, infers each arm's type, and pushes
+    /// `BranchArm` observations onto `attachment`. Use for:
+    ///   - `my $x = $c ? A : B;`        → Variable($x)
+    ///   - `if ($c) { return A } else { return B }` → Symbol(sub)
+    ///   - `return $c ? A : B;`         → Symbol(sub)
+    ///   - any chained ternary that feeds into an attachment-able
+    ///     consumer.
+    /// The reducer handles the agreement/disagreement policy — this
+    /// just emits evidence.
+    fn emit_branch_arm_witnesses(
+        &mut self,
+        cond_expr: Node<'a>,
+        attachment: crate::witnesses::WitnessAttachment,
+        context: Node<'a>,
+    ) {
+        use crate::witnesses::{TypeObservation, Witness, WitnessPayload, WitnessSource};
+        let consequent = cond_expr.child_by_field_name("consequent");
+        let alternative = cond_expr.child_by_field_name("alternative");
+        let span = node_to_span(context);
+        for arm in [consequent, alternative].into_iter().flatten() {
+            let ty = self.infer_returned_value_type(arm);
+            if let Some(t) = ty {
+                self.pending_witnesses.push(Witness {
+                    attachment: attachment.clone(),
+                    source: WitnessSource::Builder("branch_arm".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::BranchArm(t)),
+                    span,
+                });
+            }
+        }
+    }
+
+    /// RHS-ternary convenience wrapper: `my $x = $c ? A : B` →
+    /// BranchArm on Variable($x).
+    fn emit_branch_arm_witnesses_for_ternary(
+        &mut self,
+        lhs_var: &str,
+        cond_expr: Node<'a>,
+        context: Node<'a>,
+    ) {
+        let scope = self.current_scope();
+        self.emit_branch_arm_witnesses(
+            cond_expr,
+            crate::witnesses::WitnessAttachment::Variable {
+                name: lhs_var.to_string(),
+                scope,
+            },
+            context,
+        );
+    }
+
     fn infer_expression_type(&self, node: Node<'a>, unwrap_sub_body: bool) -> Option<InferredType> {
         match node.kind() {
             "string_literal" | "interpolated_string_literal" => Some(InferredType::String),
@@ -2693,14 +3423,55 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Infer the type of a return expression's value.
+    /// Infer the type of a return expression's value (explicit
+    /// `return EXPR`). Delegates to `infer_returned_value_type`.
     fn infer_return_value_type(&self, return_node: Node<'a>) -> Option<InferredType> {
         let child = match return_node.named_child(0) {
             Some(c) => c,
             None => return None, // bare `return` — skip signal
         };
+        self.infer_returned_value_type(child)
+    }
+
+    /// Infer the type of a value being returned — explicit
+    /// `return EXPR` OR an implicit last-expression-statement in a
+    /// sub body. Perl's last statement returns, so both shapes feed
+    /// here. Handles:
+    ///   - `undef` → None
+    ///   - literal/constructor expressions (via infer_expression_type)
+    ///   - arithmetic / string result types (infer_expression_result_type)
+    ///   - `$var` scalar returns resolved against type_constraints
+    ///     (prefers class-identity over rep constraints; see Part 6)
+    ///   - `shift->M(...)` / `$self->M(...)` → recurse via the
+    ///     locally-defined M's return type (same-package method
+    ///     lookup). Cycle-broken by a `seen` set on the recursion.
+    fn infer_returned_value_type(&self, child: Node<'a>) -> Option<InferredType> {
+        self.infer_returned_value_type_seen(child, &mut std::collections::HashSet::new())
+    }
+
+    fn infer_returned_value_type_seen(
+        &self,
+        child: Node<'a>,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Option<InferredType> {
         if child.kind() == "undef" {
             return None;
+        }
+        // Ternary: `return $cond ? A : B;` — recurse into both
+        // arms and agree-or-None. Same reduction the
+        // RHS-ternary / if-else-arm paths use; no reason to
+        // limit it artificially to any one syntactic shape.
+        if child.kind() == "conditional_expression" {
+            let consequent = child.child_by_field_name("consequent");
+            let alternative = child.child_by_field_name("alternative");
+            if let (Some(c), Some(a)) = (consequent, alternative) {
+                let ct = self.infer_returned_value_type_seen(c, seen);
+                let at = self.infer_returned_value_type_seen(a, seen);
+                match (ct, at) {
+                    (Some(t1), Some(t2)) if t1 == t2 => return Some(t1),
+                    _ => return None,
+                }
+            }
         }
         // Try expression type (literals, constructors)
         if let Some(t) = self.infer_expression_type(child, false) {
@@ -2710,20 +3481,118 @@ impl<'a> Builder<'a> {
         if let Some(t) = self.infer_expression_result_type(child) {
             return Some(t);
         }
-        // Try variable lookup: return $self, return $var
-        if child.kind() == "scalar" {
-            if let Ok(var_text) = child.utf8_text(self.source) {
-                let point = child.start_position();
-                for tc in self.type_constraints.iter().rev() {
-                    if tc.variable == var_text && tc.constraint_span.start <= point {
-                        let scope = &self.scopes[tc.scope.0 as usize];
-                        if contains_point(&scope.span, point) {
-                            return Some(tc.inferred_type.clone());
+        // Implicit-return shape: `shift->METHOD(...)` or
+        // `$self->METHOD(...)`. The invocant is the enclosing class's
+        // instance; the return type is whatever METHOD returns when
+        // it's locally defined in the same package. Recurses through
+        // the LOCAL return_infos (we can see them because they're
+        // collected during the walk; we look up via current symbol
+        // state). Cross-file chains fall through to query-time
+        // resolution via `find_method_return_type`.
+        if child.kind() == "method_call_expression" {
+            // Self-method shortcut first (cycle-safe via `seen`).
+            if let Some(rt) = self.infer_self_method_call_return(child, seen) {
+                return Some(rt);
+            }
+            // General chain typing — same recursion every chain
+            // consumer uses. Type the receiver via
+            // `resolve_invocant_class_tree`, then look up the
+            // method's return type on that class. No special case
+            // for "self vs $var": the typer descends into whatever
+            // it gets.
+            if let (Some(invocant), Some(method_node)) = (
+                child.child_by_field_name("invocant"),
+                child.child_by_field_name("method"),
+            ) {
+                if let (Some(class), Ok(method_name)) = (
+                    self.resolve_invocant_class_tree(invocant),
+                    method_node.utf8_text(self.source),
+                ) {
+                    for sym in &self.symbols {
+                        if sym.name != method_name { continue; }
+                        if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                        if sym.package.as_deref() != Some(class.as_str()) { continue; }
+                        if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
+                            return Some(rt.clone());
                         }
                     }
                 }
             }
         }
+        // Try variable lookup: return $self, return $var. Collection
+        // is deliberately dumb here — pick the LATEST constraint in
+        // scope before the return point and call it. No framework
+        // rules, no class-identity preference, no rep tournament.
+        // Those are reduction-time decisions; Part 6's
+        // `FrameworkAwareTypeFold` runs them at query time over the
+        // witness bag. The post-bag-seeding pass
+        // `refold_sub_return_types_via_bag` overwrites
+        // `Symbol.return_type` using the bag-aware fold, so consumers
+        // reading the field directly (e.g. `find_method_return_type`)
+        // still get the framework-correct answer.
+        if child.kind() == "scalar" {
+            if let Ok(var_text) = child.utf8_text(self.source) {
+                let point = child.start_position();
+                let mut latest: Option<InferredType> = None;
+                let mut latest_at = Point { row: 0, column: 0 };
+                for tc in &self.type_constraints {
+                    if tc.variable != var_text || tc.constraint_span.start > point {
+                        continue;
+                    }
+                    let scope = &self.scopes[tc.scope.0 as usize];
+                    if !contains_point(&scope.span, point) {
+                        continue;
+                    }
+                    if tc.constraint_span.start >= latest_at {
+                        latest = Some(tc.inferred_type.clone());
+                        latest_at = tc.constraint_span.start;
+                    }
+                }
+                return latest;
+            }
+        }
+        None
+    }
+
+    /// Does `node` look like `shift->M(...)` or `$self->M(...)`?
+    /// Used both during the walk (to record an implicit self-method
+    /// return shape) and in the return-type post-pass (to resolve
+    /// the sub's return once M's own return is known).
+    fn self_method_call_name(&self, node: Node<'a>) -> Option<String> {
+        if node.kind() != "method_call_expression" {
+            return None;
+        }
+        let invocant = node.child_by_field_name("invocant")?;
+        let is_self = match invocant.kind() {
+            "func0op_call_expression" | "func1op_call_expression" => {
+                invocant
+                    .child(0)
+                    .and_then(|c| c.utf8_text(self.source).ok())
+                    == Some("shift")
+            }
+            "scalar" => invocant.utf8_text(self.source).ok() == Some("$self"),
+            _ => false,
+        };
+        if !is_self {
+            return None;
+        }
+        let method_node = node.child_by_field_name("method")?;
+        method_node
+            .utf8_text(self.source)
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    /// Called from the recursive return-type inference. Not yet
+    /// usable during the walk (sub return_types aren't populated
+    /// until resolve_return_types). Placeholder that always returns
+    /// None — the real chaining happens in resolve_return_types via
+    /// `self_method_tails`.
+    fn infer_self_method_call_return(
+        &self,
+        _node: Node<'a>,
+        _seen: &mut std::collections::HashSet<String>,
+    ) -> Option<InferredType> {
         None
     }
 
@@ -3355,6 +4224,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                     // Setter for rw
@@ -3377,6 +4247,7 @@ impl<'a> Builder<'a> {
                                 display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                             },
                         );
                     }
@@ -3401,6 +4272,7 @@ impl<'a> Builder<'a> {
                                 display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                             },
                         );
                     }
@@ -3427,6 +4299,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                     // Setter: fluent, returns $self for chaining
@@ -3449,6 +4322,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                 }
@@ -3858,6 +4732,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                 },
             );
         }
@@ -3946,6 +4821,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    return_self_method: None,
                 },
             );
         }
@@ -3990,6 +4866,12 @@ impl<'a> Builder<'a> {
         // Record the hash variable access
         let var_text = self.get_hash_var_from_element(node);
 
+        // Distinguish read vs write by asking determine_access on the
+        // element node itself — `$self->{k} = ...` has this element as
+        // the LHS of an assignment, so the grandparent check returns
+        // Write. Needed for Part 1 (invocant mutations).
+        let element_access = self.determine_access(node);
+
         // Record the key access
         if let Some(key_node) = node.child_by_field_name("key") {
             if let Some((key_text, is_dynamic)) = self.extract_key_text(key_node) {
@@ -4001,7 +4883,7 @@ impl<'a> Builder<'a> {
                         },
                         node_to_span(key_node),
                         key_text,
-                        AccessKind::Read,
+                        element_access,
                     );
                 }
             }
@@ -4609,19 +5491,298 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Symbolically execute the rhs of every `my $X = <expr>` and
+    /// push the resulting class type into the bag (and
+    /// `type_constraints`). ONE recursive typer
+    /// (`resolve_invocant_class_tree`) handles every expression shape
+    /// it knows — scalar lookup, method-call chain, bareword, shift
+    /// idiom, function call. No "is it a chain" branch. Whatever the
+    /// rhs is, the typer descends.
+    ///
+    /// Idempotent: skips an assignment if a TC for `$X` already
+    /// exists at the assignment's start point. Walk-time inference
+    /// covers literals/constructors via the existing path; this pass
+    /// fills in anything that was unresolvable at walk time
+    /// (specifically chains whose links' return types only became
+    /// known after the first `resolve_return_types`).
+    ///
+    /// Provenance: each pushed witness carries
+    /// `WitnessSource::Builder("chain_assignment")` so a future debug
+    /// dump can answer "why does $X have this type?" without
+    /// re-running the typer.
+    fn type_assignments_into_bag(&mut self, tree: &'a Tree) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        // Two-pass: collect first, then push. The collector borrows
+        // &self (so the recursive class typer can read symbols /
+        // type_constraints); push goes through the same shape as
+        // `populate_witness_bag` (TC + bag witness in lockstep) so the
+        // bag stays the single source of truth.
+        //
+        // What counts as "an assignment to a variable":
+        //   - `my $X = …` (variable_declaration lhs)
+        //   - `my ($x) = …` (paren-list — first var)
+        //   - `$X = …` / `@X = …` / `%X = …` (no `my`)
+        // No filter on the rhs shape — whatever it is, the recursive
+        // typer either resolves it to a class or doesn't. No "is it a
+        // chain" branch.
+        //
+        // The recursive typer (`resolve_invocant_class_tree`) uses
+        // `self.current_package` for the `$self` / `shift` / `$_[0]`
+        // fallback. After the live walk, `current_package` is stale
+        // (= last package opened in the file). To make the typer
+        // package-correct at every assignment site, we set
+        // `self.current_package` to the enclosing scope's package
+        // (a stored field — `Scope.package`) around each call.
+        //
+        // Why scope.package and not "track package_statement nodes":
+        // `package X;` is a SIBLING of the subs that follow it in the
+        // AST, not a parent — its scope extends forward through
+        // siblings until the next `package`. Walking the AST and
+        // saving/restoring on package_statement entry/exit doesn't
+        // model that. The walk-time recorder already correctly
+        // attributes the right package to each scope; reading
+        // `scope.package` at post-walk time inherits that.
+        let mut to_push: Vec<(String, ScopeId, Span, InferredType)> = Vec::new();
+
+        // Recurse the AST. For each assignment, find its enclosing
+        // scope, set `self.current_package` to that scope's package,
+        // type the rhs, push the result.
+        fn walk<'b, 'a: 'b>(
+            b: &'b mut Builder<'a>,
+            node: Node<'a>,
+            out: &mut Vec<(String, ScopeId, Span, InferredType)>,
+        ) {
+            if node.kind() == "assignment_expression" {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if let Some(var) = b.get_var_text_from_lhs(left) {
+                        let span = node_to_span(node);
+                        let already_typed = b.type_constraints.iter().any(|tc| {
+                            tc.variable == var && tc.constraint_span.start == span.start
+                        });
+                        if !already_typed {
+                            // Find the innermost scope containing this assignment.
+                            let scope_idx = b
+                                .scopes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, s)| crate::file_analysis::contains_point(&s.span, span.start))
+                                .min_by_key(|(_, s)| {
+                                    let r = (s.span.end.row.saturating_sub(s.span.start.row)) as u64;
+                                    let c = if s.span.start.row == s.span.end.row {
+                                        s.span.end.column.saturating_sub(s.span.start.column) as u64
+                                    } else { 0 };
+                                    r * 1_000_000 + c
+                                })
+                                .map(|(i, _)| i);
+
+                            // Walk scope chain to find the nearest enclosing package.
+                            let scope_pkg = scope_idx.and_then(|si| {
+                                let mut cur = Some(si);
+                                while let Some(i) = cur {
+                                    let s = &b.scopes[i];
+                                    if let Some(ref p) = s.package {
+                                        return Some(p.clone());
+                                    }
+                                    cur = s.parent.map(|pid| pid.0 as usize);
+                                }
+                                None
+                            });
+
+                            let saved_pkg = b.current_package.clone();
+                            if scope_pkg.is_some() {
+                                b.current_package = scope_pkg;
+                            }
+                            let class_opt = b.resolve_invocant_class_tree(right);
+                            b.current_package = saved_pkg;
+
+                            if let Some(class) = class_opt {
+                                let sid = scope_idx
+                                    .map(|i| b.scopes[i].id)
+                                    .unwrap_or(ScopeId(0));
+                                out.push((var, sid, span, InferredType::ClassName(class)));
+                            }
+                        }
+                    }
+                }
+            }
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    walk(b, c, out);
+                }
+            }
+        }
+        walk(self, tree.root_node(), &mut to_push);
+
+        for (variable, scope, constraint_span, ty) in to_push {
+            self.type_constraints.push(TypeConstraint {
+                variable: variable.clone(),
+                scope,
+                constraint_span,
+                inferred_type: ty.clone(),
+            });
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Variable {
+                    name: variable.clone(),
+                    scope,
+                },
+                source: WitnessSource::Builder("chain_assignment".into()),
+                payload: WitnessPayload::InferredType(ty.clone()),
+                span: Span { start: constraint_span.start, end: constraint_span.start },
+            });
+            if let InferredType::ClassName(ref n) = ty {
+                self.bag.push(Witness {
+                    attachment: WitnessAttachment::Variable {
+                        name: variable,
+                        scope,
+                    },
+                    source: WitnessSource::Builder("chain_assignment".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(
+                        n.clone(),
+                    )),
+                    span: constraint_span,
+                });
+            }
+        }
+    }
+
+    /// Re-evaluate `ReturnInfo.inferred_type` for every return
+    /// expression against the current `type_constraints` /
+    /// `Symbol.return_type` state. Walk-time inference runs against
+    /// an empty world — `return $route->name(...)` can't be typed
+    /// when `$route` doesn't yet have a TC and `name`'s return type
+    /// hasn't been folded. After the chain pass + first fold, both
+    /// hold; running the same typer again upgrades stale `None`
+    /// entries to the now-correct type.
+    ///
+    /// Only upgrades `None` → `Some` — never downgrades. The walk
+    /// already pinned literal/constructor/agree-arm cases; we don't
+    /// want a partial second-pass result to overwrite them.
+    fn refresh_return_arm_types(&mut self, tree: &Tree) {
+        use std::collections::HashMap;
+        let mut nodes_by_span: HashMap<(Point, Point), Node<'_>> = HashMap::new();
+        fn walk<'t>(node: Node<'t>, out: &mut HashMap<(Point, Point), Node<'t>>) {
+            if node.kind() == "return_expression" {
+                out.insert((node.start_position(), node.end_position()), node);
+            }
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(tree.root_node(), &mut nodes_by_span);
+
+        let mut infos = std::mem::take(&mut self.return_infos);
+        for ri in &mut infos {
+            if ri.inferred_type.is_some() { continue; }
+            if let Some(node) = nodes_by_span.get(&(ri.span.start, ri.span.end)) {
+                let new_type = self.infer_return_value_type(*node);
+                if new_type.is_some() {
+                    ri.inferred_type = new_type;
+                }
+            }
+        }
+        self.return_infos = infos;
+    }
+
     fn resolve_return_types(&mut self) {
-        // Group return infos by scope
-        let mut returns_by_scope: std::collections::HashMap<ScopeId, Vec<Option<InferredType>>> =
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+
+        // Group return arms by scope. Each arm is materialised:
+        //   - `return $var` → ask the bag (single, framework-aware fold).
+        //   - literal / constructor / arithmetic → use the type the
+        //     walk could read off directly.
+        // The bag is already populated by `populate_witness_bag()`, so
+        // every reducer rule (Part 6 framework, Part 5b branch arm,
+        // Part 6b arity dispatch) participates here at the SAME phase
+        // they participate at query time. One reduction, one place.
+        //
+        // While we're at it, emit `ArityReturn` witnesses with the
+        // *bag-resolved* per-arm type — the walk just classified the
+        // arity branch (no fold), so `FluentArityDispatch` sees the
+        // same rules everyone else does. Walk-time emission of
+        // ArityReturn would have baked in a collection-time fold,
+        // exactly the bug we just removed for `Symbol.return_type`.
+        let mut returns_by_scope: std::collections::HashMap<ScopeId, Vec<InferredType>> =
             std::collections::HashMap::new();
-        for ri in &self.return_infos {
-            returns_by_scope
-                .entry(ri.scope)
-                .or_default()
-                .push(ri.inferred_type.clone());
+        // Per-arm computed type (for the second-pass arity emission).
+        let mut arm_types_per_ri: Vec<Option<InferredType>> =
+            Vec::with_capacity(self.return_infos.len());
+        let return_infos = std::mem::take(&mut self.return_infos);
+        for ri in &return_infos {
+            let arm_type = match &ri.deferred_var {
+                Some((var, point)) => self
+                    .var_type_via_bag(var, ri.scope, *point)
+                    .or_else(|| ri.inferred_type.clone()),
+                None => ri.inferred_type.clone(),
+            };
+            if let Some(t) = arm_type.clone() {
+                returns_by_scope.entry(ri.scope).or_default().push(t);
+            }
+            arm_types_per_ri.push(arm_type);
         }
 
-        // For each Sub/Method scope, determine return type
+        // ArityReturn is for arity-DISCRIMINATED subs. Only emit when
+        // a sub has at least one Zero/Exact arm — emitting Default in
+        // a sub that just has plain (possibly disagreeing) returns
+        // would make `FluentArityDispatch` answer with one arm even
+        // when `Symbol.return_type` correctly says "agreement failed".
+        let mut arity_discriminated_scopes: std::collections::HashSet<ScopeId> =
+            std::collections::HashSet::new();
+        for ri in &return_infos {
+            if matches!(
+                ri.arity_branch,
+                Some(ArityBranch::Zero) | Some(ArityBranch::Exact(_))
+            ) {
+                arity_discriminated_scopes.insert(ri.scope);
+            }
+        }
+
+        let mut arity_witnesses: Vec<Witness> = Vec::new();
+        for (ri, arm_type) in return_infos.iter().zip(arm_types_per_ri.iter()) {
+            let Some(branch) = ri.arity_branch else { continue };
+            if !arity_discriminated_scopes.contains(&ri.scope) {
+                continue;
+            }
+            let Some(t) = arm_type.clone() else { continue };
+            let Some(sym_id) = self.find_sub_symbol_for_scope(ri.scope) else { continue };
+            let arg_count = match branch {
+                ArityBranch::Zero => Some(0u32),
+                ArityBranch::Exact(n) => Some(n),
+                ArityBranch::Default => None,
+            };
+            arity_witnesses.push(Witness {
+                attachment: WitnessAttachment::Symbol(sym_id),
+                source: WitnessSource::Builder("arity_detection".into()),
+                payload: WitnessPayload::Observation(TypeObservation::ArityReturn {
+                    arg_count,
+                    return_type: t,
+                }),
+                span: ri.span,
+            });
+        }
+        self.return_infos = return_infos;
+        for w in arity_witnesses {
+            self.bag.push(w);
+        }
+
+        // For each Sub/Method scope, agree-or-None across arms.
         let mut return_types: std::collections::HashMap<String, InferredType> =
+            std::collections::HashMap::new();
+        // Per-sub provenance recorded as we derive types — surfaces
+        // in `--dump-package` so debugging answers "why does this
+        // return X?" without re-running the build. Keyed by sub name
+        // (matching `return_types`); flushed onto SymbolId in the
+        // write loop below. Plugin overrides keep their existing
+        // PluginOverride provenance — we don't touch overridden subs.
+        let mut return_provenance: std::collections::HashMap<String, crate::file_analysis::TypeProvenance> =
             std::collections::HashMap::new();
 
         for scope in &self.scopes {
@@ -4630,23 +5791,30 @@ impl<'a> Builder<'a> {
                 _ => continue,
             };
 
-            let explicit_returns = returns_by_scope.get(&scope.id);
-            let has_explicit = explicit_returns.map_or(false, |r| !r.is_empty());
-
-            let resolved = if has_explicit {
-                // Filter out bare returns (None) — they're exit points, not type signals
-                let typed_returns: Vec<InferredType> = explicit_returns.unwrap()
-                    .iter()
-                    .filter_map(|r| r.clone())
-                    .collect();
-                resolve_return_type(&typed_returns)
-            } else {
-                // No explicit returns — use last expression type
-                self.last_expr_type.get(&scope.id).and_then(|t| t.clone())
+            let (resolved, evidence) = match returns_by_scope.get(&scope.id) {
+                Some(arms) if !arms.is_empty() => {
+                    let r = resolve_return_type(arms);
+                    let ev = vec![format!("return_arms={}", arms.len())];
+                    (r, ev)
+                }
+                _ => {
+                    let r = self.last_expr_type.get(&scope.id).and_then(|t| t.clone());
+                    let ev = if r.is_some() {
+                        vec!["last_expr".into()]
+                    } else { Vec::new() };
+                    (r, ev)
+                }
             };
 
             if let Some(rt) = resolved {
-                return_types.insert(sub_name, rt);
+                return_types.insert(sub_name.clone(), rt);
+                return_provenance.insert(
+                    sub_name,
+                    crate::file_analysis::TypeProvenance::ReducerFold {
+                        reducer: "return_arms".into(),
+                        evidence,
+                    },
+                );
             }
         }
 
@@ -4667,29 +5835,152 @@ impl<'a> Builder<'a> {
                     continue;
                 }
                 if let Some(t) = return_types.get(&delegate).cloned() {
-                    return_types.insert(delegator, t);
+                    return_types.insert(delegator.clone(), t);
+                    return_provenance.insert(
+                        delegator,
+                        crate::file_analysis::TypeProvenance::Delegation {
+                            kind: "sub_return".into(),
+                            via: delegate,
+                        },
+                    );
                     changed = true;
                 }
             }
         }
 
-        // Set return_type on matching Sub/Method symbols
+        // Self-method-tail propagation. Perl's last statement
+        // returns, so `sub get { shift->_generate_route(GET => @_) }`
+        // returns whatever `_generate_route` returns. Fixed-point
+        // iterate: if sub X's body-tail is `shift->M(...)` /
+        // `$self->M(...)` and M's return_type is now known, X
+        // inherits it.
+        //
+        // Build a scope_id → sub_name map for lookups.
+        let scope_to_sub: std::collections::HashMap<ScopeId, String> = self
+            .scopes
+            .iter()
+            .filter_map(|s| match &s.kind {
+                ScopeKind::Sub { name } | ScopeKind::Method { name } => {
+                    Some((s.id, name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut changed = true;
+        let mut iters = 0;
+        while changed && iters < 20 {
+            changed = false;
+            iters += 1;
+            let tails: Vec<(ScopeId, String)> = self
+                .self_method_tails
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            for (scope_id, tail_method) in tails {
+                let sub_name = match scope_to_sub.get(&scope_id) {
+                    Some(n) => n.clone(),
+                    None => continue,
+                };
+                if return_types.contains_key(&sub_name) {
+                    continue; // already resolved
+                }
+                if sub_name == tail_method {
+                    continue; // direct self-recursion — can't infer
+                }
+                if let Some(t) = return_types.get(&tail_method).cloned() {
+                    return_types.insert(sub_name.clone(), t);
+                    return_provenance.insert(
+                        sub_name,
+                        crate::file_analysis::TypeProvenance::Delegation {
+                            kind: "self_method_tail".into(),
+                            via: tail_method,
+                        },
+                    );
+                    changed = true;
+                }
+            }
+        }
+
+        // Set return_type on matching Sub/Method symbols, and
+        // record the self-method tail shape for subs whose return
+        // type couldn't be collapsed in-file. Consumer side chains
+        // through `return_self_method` when `return_type` is None.
+        // Look up each sub's scope by matching the symbol's span
+        // against the sub scope's span.
+        let scope_by_sub_span: std::collections::HashMap<(Point, Point), ScopeId> = self
+            .scopes
+            .iter()
+            .filter(|s| matches!(s.kind, ScopeKind::Sub { .. } | ScopeKind::Method { .. }))
+            .map(|s| ((s.span.start, s.span.end), s.id))
+            .collect();
         for sym in &mut self.symbols {
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                if let SymbolDetail::Sub { ref mut return_type, .. } = sym.detail {
+                // Plugin override pinned this symbol — DON'T overwrite
+                // it with the inferred fold. The whole point of an
+                // override is "inference reaches the wrong answer
+                // here". Provenance is recorded as `PluginOverride`
+                // in `type_provenance`; we use that as the signal.
+                let is_overridden = matches!(
+                    self.type_provenance.get(&sym.id),
+                    Some(crate::file_analysis::TypeProvenance::PluginOverride { .. }),
+                );
+                if is_overridden { continue; }
+                if let SymbolDetail::Sub {
+                    ref mut return_type,
+                    ref mut return_self_method,
+                    ..
+                } = sym.detail
+                {
                     if let Some(rt) = return_types.get(&sym.name) {
                         *return_type = Some(rt.clone());
+                        // Flush provenance to the SymbolId-keyed map
+                        // so debug introspection (--dump-package) can
+                        // surface the inference chain. Only writes
+                        // for non-Inferred provenances; the default
+                        // (Inferred) is implicit via missing entry.
+                        if let Some(prov) = return_provenance.get(&sym.name) {
+                            self.type_provenance.insert(sym.id, prov.clone());
+                        }
+                    } else {
+                        // Couldn't resolve in-file. If the body
+                        // tails on `shift->M(...)` / `$self->M(...)`,
+                        // record M so cross-file resolution can chain
+                        // through at query time.
+                        let sub_scope = self
+                            .scopes
+                            .iter()
+                            .find(|s| {
+                                matches!(
+                                    &s.kind,
+                                    ScopeKind::Sub { name } | ScopeKind::Method { name }
+                                        if name == &sym.name
+                                )
+                                    && s.span.start >= sym.span.start
+                                    && s.span.end <= sym.span.end
+                            })
+                            .map(|s| s.id);
+                        if let Some(sid) = sub_scope {
+                            if let Some(m) = self.self_method_tails.get(&sid) {
+                                *return_self_method = Some(m.clone());
+                            }
+                        }
+                        let _ = &scope_by_sub_span;
                     }
                 }
             }
         }
 
         // Propagate return types to call sites via structural bindings
-        // recorded during the walk (my $cfg = get_config()).
+        // recorded during the walk (my $cfg = get_config()). Push BOTH
+        // the legacy `TypeConstraint` and the corresponding `Variable`
+        // witness so the bag stays the source of truth — any later
+        // bag query about `$cfg` sees the call-resolved type without
+        // a separate sync pass.
         // TODO: inline expression propagation (get_config()->{key}) is a separate
         // code path — needs return type resolution at the expression level without
         // a variable assignment. Not handled here.
         let mut new_constraints = Vec::new();
+        let mut new_witnesses = Vec::new();
         for binding in &self.call_bindings {
             let rt = return_types.get(&binding.func_name)
                 .cloned()
@@ -4699,11 +5990,23 @@ impl<'a> Builder<'a> {
                     variable: binding.variable.clone(),
                     scope: binding.scope,
                     constraint_span: binding.span,
-                    inferred_type: rt,
+                    inferred_type: rt.clone(),
+                });
+                new_witnesses.push(Witness {
+                    attachment: WitnessAttachment::Variable {
+                        name: binding.variable.clone(),
+                        scope: binding.scope,
+                    },
+                    source: WitnessSource::Builder("call_binding".into()),
+                    payload: WitnessPayload::InferredType(rt),
+                    span: Span { start: binding.span.start, end: binding.span.start },
                 });
             }
         }
         self.type_constraints.extend(new_constraints);
+        for w in new_witnesses {
+            self.bag.push(w);
+        }
 
         // Fixup: update HashKeyAccess owners for variables bound to sub calls
         // that return HashRef. Two normalizations beyond the naive name match:
@@ -5186,7 +6489,7 @@ $#foo;
         let fa = build_fa(source);
 
         // Type inference: $self → Point
-        let inferred = fa.inferred_type("$self", Point::new(4, 8));
+        let inferred = fa.inferred_type_via_bag("$self", Point::new(4, 8));
         assert!(inferred.is_some(), "$self type should be inferred");
         match inferred.unwrap() {
             InferredType::ClassName(name) => assert_eq!(name, "Point"),
@@ -5247,7 +6550,7 @@ $p->;
         let fa = build_fa(source);
 
         // Check type inference resolved $p → Point
-        let inferred = fa.inferred_type("$p", Point::new(8, 4));
+        let inferred = fa.inferred_type_via_bag("$p", Point::new(8, 4));
         assert!(inferred.is_some(), "type inference for $p should resolve");
 
         let candidates = fa.complete_methods("$p", Point::new(10, 4));
@@ -5402,7 +6705,7 @@ $p->;
     #[test]
     fn test_type_inference_constructor() {
         let fa = build_fa("use v5.38;\nclass Point { }\nmy $p = Point->new();");
-        let ty = fa.inferred_type("$p", Point::new(2, 20));
+        let ty = fa.inferred_type_via_bag("$p", Point::new(2, 20));
         assert!(ty.is_some(), "should infer type for $p");
         if let Some(InferredType::ClassName(cn)) = ty {
             assert_eq!(cn, "Point");
@@ -5413,14 +6716,15 @@ $p->;
 
     #[test]
     fn test_type_inference_first_param() {
+        // The walk pushes a `FirstParam { package: "Calculator" }`
+        // type-constraint, but the bag-aware query normalises it to
+        // `ClassName("Calculator")` via the FrameworkAwareTypeFold
+        // (FirstParam is an internal observation; consumers see the
+        // class identity). That's the canonical answer the LSP
+        // serves at any cursor position on `$self`.
         let fa = build_fa("package Calculator;\nsub new {\n    my ($self) = @_;\n}");
-        let ty = fa.inferred_type("$self", Point::new(2, 10));
-        assert!(ty.is_some(), "should infer type for $self");
-        if let Some(InferredType::FirstParam { package }) = ty {
-            assert_eq!(package, "Calculator");
-        } else {
-            panic!("expected FirstParam, got {:?}", ty);
-        }
+        let ty = fa.inferred_type_via_bag("$self", Point::new(2, 10));
+        assert_eq!(ty, Some(InferredType::ClassName("Calculator".into())));
     }
 
     // ---- Literal constructor extraction tests (via build_fa) ----
@@ -5428,56 +6732,56 @@ $p->;
     #[test]
     fn test_extract_hashref_literal() {
         let fa = build_fa("my $href = {};");
-        let ty = fa.inferred_type("$href", Point::new(0, 14));
-        assert_eq!(ty, Some(&InferredType::HashRef), "empty hash ref literal");
+        let ty = fa.inferred_type_via_bag("$href", Point::new(0, 14));
+        assert_eq!(ty, Some(InferredType::HashRef), "empty hash ref literal");
 
         let fa = build_fa("my $href = { a => 1, b => 2 };");
-        let ty = fa.inferred_type("$href", Point::new(0, 30));
-        assert_eq!(ty, Some(&InferredType::HashRef), "populated hash ref literal");
+        let ty = fa.inferred_type_via_bag("$href", Point::new(0, 30));
+        assert_eq!(ty, Some(InferredType::HashRef), "populated hash ref literal");
     }
 
     #[test]
     fn test_extract_arrayref_literal() {
         let fa = build_fa("my $aref = [];");
-        let ty = fa.inferred_type("$aref", Point::new(0, 14));
-        assert_eq!(ty, Some(&InferredType::ArrayRef), "empty array ref literal");
+        let ty = fa.inferred_type_via_bag("$aref", Point::new(0, 14));
+        assert_eq!(ty, Some(InferredType::ArrayRef), "empty array ref literal");
 
         let fa = build_fa("my $aref = [1, 2, 3];");
-        let ty = fa.inferred_type("$aref", Point::new(0, 21));
-        assert_eq!(ty, Some(&InferredType::ArrayRef), "populated array ref literal");
+        let ty = fa.inferred_type_via_bag("$aref", Point::new(0, 21));
+        assert_eq!(ty, Some(InferredType::ArrayRef), "populated array ref literal");
     }
 
     #[test]
     fn test_extract_coderef_literal() {
         let fa = build_fa("my $cref = sub { 42 };");
-        let ty = fa.inferred_type("$cref", Point::new(0, 22));
-        assert_eq!(ty, Some(&InferredType::CodeRef), "anonymous sub");
+        let ty = fa.inferred_type_via_bag("$cref", Point::new(0, 22));
+        assert_eq!(ty, Some(InferredType::CodeRef), "anonymous sub");
     }
 
     #[test]
     fn test_extract_regexp_literal() {
         let fa = build_fa("my $re = qr/pattern/;");
-        let ty = fa.inferred_type("$re", Point::new(0, 21));
-        assert_eq!(ty, Some(&InferredType::Regexp), "qr// literal");
+        let ty = fa.inferred_type_via_bag("$re", Point::new(0, 21));
+        assert_eq!(ty, Some(InferredType::Regexp), "qr// literal");
     }
 
     #[test]
     fn test_extract_reassignment_type_change() {
         let fa = build_fa("my $x = {};\n$x = [];");
         // After line 0 → HashRef
-        let ty = fa.inferred_type("$x", Point::new(0, 11));
-        assert_eq!(ty, Some(&InferredType::HashRef), "initial hashref");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(0, 11));
+        assert_eq!(ty, Some(InferredType::HashRef), "initial hashref");
         // After line 1 → ArrayRef
-        let ty = fa.inferred_type("$x", Point::new(1, 8));
-        assert_eq!(ty, Some(&InferredType::ArrayRef), "reassigned to arrayref");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(1, 8));
+        assert_eq!(ty, Some(InferredType::ArrayRef), "reassigned to arrayref");
     }
 
     #[test]
     fn test_extract_constructor_still_works() {
         // Existing constructor detection should still work
         let fa = build_fa("my $obj = Foo->new();");
-        let ty = fa.inferred_type("$obj", Point::new(0, 21));
-        assert_eq!(ty, Some(&InferredType::ClassName("Foo".into())));
+        let ty = fa.inferred_type_via_bag("$obj", Point::new(0, 21));
+        assert_eq!(ty, Some(InferredType::ClassName("Foo".into())));
     }
 
     // ---- Operator-based type inference tests (Step 3) ----
@@ -5485,138 +6789,138 @@ $p->;
     #[test]
     fn test_arrow_hash_deref_infers_hashref() {
         let fa = build_fa("my $x;\n$x->{key};");
-        let ty = fa.inferred_type("$x", Point::new(1, 10));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(1, 10));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_arrow_array_deref_infers_arrayref() {
         let fa = build_fa("my $x;\n$x->[0];");
-        let ty = fa.inferred_type("$x", Point::new(1, 8));
-        assert_eq!(ty, Some(&InferredType::ArrayRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(1, 8));
+        assert_eq!(ty, Some(InferredType::ArrayRef));
     }
 
     #[test]
     fn test_arrow_code_deref_infers_coderef() {
         let fa = build_fa("my $x;\n$x->(1, 2);");
-        let ty = fa.inferred_type("$x", Point::new(1, 10));
-        assert_eq!(ty, Some(&InferredType::CodeRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(1, 10));
+        assert_eq!(ty, Some(InferredType::CodeRef));
     }
 
     #[test]
     fn test_postfix_array_deref_infers_arrayref() {
         let fa = build_fa("my $x;\nmy @a = $x->@*;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::ArrayRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::ArrayRef));
     }
 
     #[test]
     fn test_postfix_hash_deref_infers_hashref() {
         let fa = build_fa("my $y;\nmy %h = $y->%*;\nmy $z;");
-        let ty = fa.inferred_type("$y", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$y", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_binary_numeric_ops_infer_numeric() {
         let fa = build_fa("my $x;\nmy $a = $x + 1;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "+ operator");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "+ operator");
 
         let fa = build_fa("my $x;\nmy $a = $x * 2;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "* operator");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "* operator");
     }
 
     #[test]
     fn test_assignment_from_binary_numeric_infers_result() {
         let fa = build_fa("my $a = 1;\nmy $b = 2;\nmy $result = $a + $b;\n$result;");
-        let ty = fa.inferred_type("$result", Point::new(3, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "$result = $a + $b should be Numeric");
+        let ty = fa.inferred_type_via_bag("$result", Point::new(3, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "$result = $a + $b should be Numeric");
     }
 
     #[test]
     fn test_assignment_from_string_concat_infers_result() {
         let fa = build_fa("my $a = 'x';\nmy $b = 'y';\nmy $s = $a . $b;\n$s;");
-        let ty = fa.inferred_type("$s", Point::new(3, 0));
-        assert_eq!(ty, Some(&InferredType::String), "$s = $a . $b should be String");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(3, 0));
+        assert_eq!(ty, Some(InferredType::String), "$s = $a . $b should be String");
     }
 
     #[test]
     fn test_string_concat_infers_string() {
         let fa = build_fa("my $s;\nmy $a = $s . \"x\";\nmy $z;");
-        let ty = fa.inferred_type("$s", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::String), ". operator");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::String), ". operator");
     }
 
     #[test]
     fn test_string_repeat_infers_string() {
         let fa = build_fa("my $s;\n$s x 3;\nmy $z;");
-        let ty = fa.inferred_type("$s", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::String), "x operator");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::String), "x operator");
     }
 
     #[test]
     fn test_numeric_comparison_infers_numeric() {
         let fa = build_fa("my $x;\nmy $y;\n$x == $y;\nmy $z;");
-        assert_eq!(fa.inferred_type("$x", Point::new(3, 0)), Some(&InferredType::Numeric));
-        assert_eq!(fa.inferred_type("$y", Point::new(3, 0)), Some(&InferredType::Numeric));
+        assert_eq!(fa.inferred_type_via_bag("$x", Point::new(3, 0)), Some(InferredType::Numeric));
+        assert_eq!(fa.inferred_type_via_bag("$y", Point::new(3, 0)), Some(InferredType::Numeric));
     }
 
     #[test]
     fn test_string_comparison_infers_string() {
         let fa = build_fa("my $x;\nmy $y;\n$x eq $y;\nmy $z;");
-        assert_eq!(fa.inferred_type("$x", Point::new(3, 0)), Some(&InferredType::String));
-        assert_eq!(fa.inferred_type("$y", Point::new(3, 0)), Some(&InferredType::String));
+        assert_eq!(fa.inferred_type_via_bag("$x", Point::new(3, 0)), Some(InferredType::String));
+        assert_eq!(fa.inferred_type_via_bag("$y", Point::new(3, 0)), Some(InferredType::String));
     }
 
     #[test]
     fn test_increment_infers_numeric() {
         let fa = build_fa("my $x;\n$x++;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric));
     }
 
     #[test]
     fn test_regex_match_infers_string() {
         let fa = build_fa("my $s;\n$s =~ /pattern/;\nmy $z;");
-        let ty = fa.inferred_type("$s", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::String));
+        let ty = fa.inferred_type_via_bag("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::String));
     }
 
     #[test]
     fn test_preinc_infers_numeric() {
         let fa = build_fa("my $x;\n++$x;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric));
     }
 
     #[test]
     fn test_block_array_deref_infers_arrayref() {
         let fa = build_fa("my $x;\nmy @items = @{$x};\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::ArrayRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::ArrayRef));
     }
 
     #[test]
     fn test_block_hash_deref_infers_hashref() {
         let fa = build_fa("my $y;\nmy %t = %{$y};\nmy $z;");
-        let ty = fa.inferred_type("$y", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$y", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_block_code_deref_infers_coderef() {
         let fa = build_fa("my $z;\n&{$z}();\nmy $w;");
-        let ty = fa.inferred_type("$z", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::CodeRef));
+        let ty = fa.inferred_type_via_bag("$z", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::CodeRef));
     }
 
     #[test]
     fn test_no_numeric_on_array_variable() {
         // @arr + 1 should NOT push Numeric on @arr
         let fa = build_fa("my @arr;\nmy $n = @arr + 1;\nmy $z;");
-        let ty = fa.inferred_type("@arr", Point::new(2, 0));
+        let ty = fa.inferred_type_via_bag("@arr", Point::new(2, 0));
         assert_eq!(ty, None, "@arr should not get Numeric constraint");
     }
 
@@ -5626,43 +6930,43 @@ $p->;
     fn test_builtin_push_infers_arrayref() {
         // push @{$aref} triggers array_deref_expression which already infers ArrayRef
         let fa = build_fa("my $aref;\npush @{$aref}, 1;\nmy $z;");
-        let ty = fa.inferred_type("$aref", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::ArrayRef), "push deref should infer ArrayRef");
+        let ty = fa.inferred_type_via_bag("$aref", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::ArrayRef), "push deref should infer ArrayRef");
     }
 
     #[test]
     fn test_builtin_length_infers_string_arg() {
         let fa = build_fa("my $s;\nmy $n = length($s);\nmy $z;");
-        let ty = fa.inferred_type("$s", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::String), "length arg should be String");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::String), "length arg should be String");
     }
 
     #[test]
     fn test_builtin_abs_infers_numeric_arg() {
         let fa = build_fa("my $x;\nmy $n = abs($x);\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "abs arg should be Numeric");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "abs arg should be Numeric");
     }
 
     #[test]
     fn test_builtin_return_type_propagates() {
         let fa = build_fa("my $t = time();\n$t;");
-        let ty = fa.inferred_type("$t", Point::new(1, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "time() should return Numeric");
+        let ty = fa.inferred_type_via_bag("$t", Point::new(1, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "time() should return Numeric");
     }
 
     #[test]
     fn test_builtin_join_return_type() {
         let fa = build_fa("my $s = join(',', @arr);\n$s;");
-        let ty = fa.inferred_type("$s", Point::new(1, 0));
-        assert_eq!(ty, Some(&InferredType::String), "join() should return String");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(1, 0));
+        assert_eq!(ty, Some(InferredType::String), "join() should return String");
     }
 
     #[test]
     fn test_builtin_length_return_type() {
         let fa = build_fa("my $n = length('hello');\n$n;");
-        let ty = fa.inferred_type("$n", Point::new(1, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "length() should return Numeric");
+        let ty = fa.inferred_type_via_bag("$n", Point::new(1, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "length() should return Numeric");
     }
 
     // ---- Return type inference tests (Step 4) ----
@@ -5670,72 +6974,75 @@ $p->;
     #[test]
     fn test_return_type_hashref() {
         let fa = build_fa("sub get_config {\n    return { host => \"localhost\" };\n}");
-        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_config", None), Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_return_type_arrayref() {
         let fa = build_fa("sub get_tags {\n    return [1, 2, 3];\n}");
-        assert_eq!(fa.sub_return_type("get_tags"), Some(&InferredType::ArrayRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_tags", None), Some(InferredType::ArrayRef));
     }
 
     #[test]
     fn test_return_type_coderef() {
         let fa = build_fa("sub get_handler {\n    return sub { 1 };\n}");
-        assert_eq!(fa.sub_return_type("get_handler"), Some(&InferredType::CodeRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_handler", None), Some(InferredType::CodeRef));
     }
 
     #[test]
     fn test_return_type_implicit_last_expr() {
         // No explicit return — last expression is the implicit return
         let fa = build_fa("sub get_data {\n    { key => \"val\" };\n}");
-        assert_eq!(fa.sub_return_type("get_data"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_data", None), Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_return_type_conflicting_returns_unknown() {
         // Two returns with different types → None (unknown)
         let fa = build_fa("sub ambiguous {\n    if (1) { return {} }\n    return [];\n}");
-        assert_eq!(fa.sub_return_type("ambiguous"), None);
+        assert_eq!(fa.sub_return_type_at_arity("ambiguous", None), None);
     }
 
     #[test]
     fn test_return_type_consistent_returns() {
         // Multiple returns all hashref → HashRef
         let fa = build_fa("sub consistent {\n    if (1) { return { a => 1 } }\n    return { b => 2 };\n}");
-        assert_eq!(fa.sub_return_type("consistent"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("consistent", None), Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_return_type_propagation_to_call_site() {
         let fa = build_fa("sub get_config {\n    return { host => 1 };\n}\nmy $cfg = get_config();\nmy $z;");
-        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
-        let ty = fa.inferred_type("$cfg", Point::new(4, 0));
-        assert_eq!(ty, Some(&InferredType::HashRef), "call site should get return type");
+        assert_eq!(fa.sub_return_type_at_arity("get_config", None), Some(InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$cfg", Point::new(4, 0));
+        assert_eq!(ty, Some(InferredType::HashRef), "call site should get return type");
     }
 
     #[test]
     fn test_return_type_propagation_method_call() {
         let src = "package Calculator;\nsub new { bless {}, shift }\nsub add {\n    my ($self, $a, $b) = @_;\n    my $result = $a + $b;\n    return $result;\n}\npackage main;\nmy $calc = Calculator->new();\nmy $sum = $calc->add(2, 3);\n$sum;";
         let fa = build_fa(src);
-        assert_eq!(fa.sub_return_type("add"), Some(&InferredType::Numeric), "add should return Numeric");
-        let ty = fa.inferred_type("$sum", Point::new(10, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "$sum should be Numeric via method call binding");
+        assert_eq!(fa.sub_return_type_at_arity("add", None), Some(InferredType::Numeric), "add should return Numeric");
+        let ty = fa.inferred_type_via_bag("$sum", Point::new(10, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "$sum should be Numeric via method call binding");
     }
 
     #[test]
     fn test_return_type_constructor() {
         let fa = build_fa("package User;\nsub new { bless {}, shift }\npackage main;\nsub get_user {\n    return User->new();\n}");
-        assert_eq!(fa.sub_return_type("get_user"), Some(&InferredType::ClassName("User".into())));
+        assert_eq!(fa.sub_return_type_at_arity("get_user", None), Some(InferredType::ClassName("User".into())));
     }
 
     #[test]
     fn test_return_type_self_variable() {
-        // return $self where $self has a type constraint
+        // `return $self` resolves through the witness bag to the canonical
+        // class type. `FirstParam` (the body-internal observation) is
+        // normalised to `ClassName` at the FrameworkAwareTypeFold boundary
+        // — callers chaining off the return get the concrete class.
         let fa = build_fa("package Foo;\nsub new { bless {}, shift }\nsub clone {\n    my ($self) = @_;\n    return $self;\n}");
         assert_eq!(
-            fa.sub_return_type("clone"),
-            Some(&InferredType::FirstParam { package: "Foo".into() }),
+            fa.sub_return_type_at_arity("clone", None),
+            Some(InferredType::ClassName("Foo".into())),
         );
     }
 
@@ -5743,21 +7050,21 @@ $p->;
     fn test_return_type_bare_return_filtered() {
         // Bare return + typed return → bare is filtered, typed return wins
         let fa = build_fa("sub get_config {\n    return unless 1;\n    return { host => 1 };\n}");
-        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_config", None), Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_return_type_all_bare_returns() {
         // All bare returns → no return type
         let fa = build_fa("sub noop {\n    return;\n}");
-        assert_eq!(fa.sub_return_type("noop"), None);
+        assert_eq!(fa.sub_return_type_at_arity("noop", None), None);
     }
 
     #[test]
     fn test_return_type_undef_filtered() {
         // return undef + typed return → undef is filtered, typed return wins
         let fa = build_fa("sub maybe {\n    return undef unless 1;\n    return { a => 1 };\n}");
-        assert_eq!(fa.sub_return_type("maybe"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("maybe", None), Some(InferredType::HashRef));
     }
 
     // ---- resolve_expression_type tests ----
@@ -5796,7 +7103,7 @@ $p->;
         let fa = build(&tree, src.as_bytes());
         // $f->get_bar() should resolve to Object(Bar)
         // First verify get_bar has the right return type
-        assert_eq!(fa.sub_return_type("get_bar"), Some(&InferredType::ClassName("Bar".into())));
+        assert_eq!(fa.sub_return_type_at_arity("get_bar", None), Some(InferredType::ClassName("Bar".into())));
     }
 
     #[test]
@@ -5867,13 +7174,13 @@ $calc->get_self->get_config->{host};
         let fa = build(&tree, src.as_bytes());
 
         // Verify get_self returns an object type for Calculator
-        let get_self_rt = fa.sub_return_type("get_self");
-        assert_eq!(get_self_rt.and_then(|t| t.class_name()), Some("Calculator"),
+        let get_self_rt = fa.sub_return_type_at_arity("get_self", None);
+        assert_eq!(get_self_rt.as_ref().and_then(|t| t.class_name()), Some("Calculator"),
             "get_self should return Calculator");
 
         // Verify get_config returns HashRef
-        let get_config_rt = fa.sub_return_type("get_config");
-        assert_eq!(get_config_rt, Some(&InferredType::HashRef),
+        let get_config_rt = fa.sub_return_type_at_arity("get_config", None);
+        assert_eq!(get_config_rt, Some(InferredType::HashRef),
             "get_config should return HashRef");
 
         // The outermost expression is hash_element_expression wrapping the chain
@@ -6533,8 +7840,8 @@ my $p = Point->new(x => 3, y => 4);
         package Mojo::File;
         sub path { __PACKAGE__->new(@_) }
         ");
-        let rt = fa.sub_return_type("path");
-        assert_eq!(rt, Some(&InferredType::ClassName("Mojo::File".into())));
+        let rt = fa.sub_return_type_at_arity("path", None);
+        assert_eq!(rt, Some(InferredType::ClassName("Mojo::File".into())));
     }
 
     #[test]
@@ -7140,8 +8447,8 @@ my $f = Foo->new();
 my $cfg = $f->get_config();
 $cfg;
 ");
-        let ty = fa.inferred_type("$cfg", Point::new(9, 0));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$cfg", Point::new(9, 0));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     #[test]
@@ -7159,10 +8466,10 @@ my $bar = $f->get_bar();
 my $name = $bar->get_name();
 $name;
 ");
-        let bar_ty = fa.inferred_type("$bar", Point::new(10, 0));
-        assert_eq!(bar_ty, Some(&InferredType::ClassName("Bar".into())));
-        let name_ty = fa.inferred_type("$name", Point::new(11, 0));
-        assert_eq!(name_ty, Some(&InferredType::HashRef));
+        let bar_ty = fa.inferred_type_via_bag("$bar", Point::new(10, 0));
+        assert_eq!(bar_ty, Some(InferredType::ClassName("Bar".into())));
+        let name_ty = fa.inferred_type_via_bag("$name", Point::new(11, 0));
+        assert_eq!(name_ty, Some(InferredType::HashRef));
     }
 
     #[test]
@@ -7177,8 +8484,8 @@ sub run {
     $cfg;
 }
 ");
-        let ty = fa.inferred_type("$cfg", Point::new(7, 4));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$cfg", Point::new(7, 4));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     // ---- Framework accessor synthesis tests ----
@@ -7479,8 +8786,8 @@ sub run {
             "$cfg should NOT be a function call binding");
 
         // Verify $cfg gets Moo::Config type (not Moo::Service)
-        let cfg_type = fa.inferred_type("$cfg", tree_sitter::Point::new(13, 0));
-        assert_eq!(cfg_type, Some(&InferredType::ClassName("Moo::Config".into())),
+        let cfg_type = fa.inferred_type_via_bag("$cfg", tree_sitter::Point::new(13, 0));
+        assert_eq!(cfg_type, Some(InferredType::ClassName("Moo::Config".into())),
             "$cfg should be Moo::Config, not Moo::Service");
 
         // Verify chained resolution: $dsn = $cfg->dsn → String
@@ -9960,9 +11267,9 @@ sub to  { my $self = shift; return $self; }
 
         // Sanity: `$r` is still typed after the second run (not just
         // "didn't crash" — the state is actually usable).
-        let r_type = fa.inferred_type("$r", tree_sitter::Point { row: 5, column: 0 });
+        let r_type = fa.inferred_type_via_bag("$r", tree_sitter::Point { row: 5, column: 0 });
         assert!(
-            r_type.and_then(|t| t.class_name()) == Some("Mojolicious::Routes"),
+            r_type.as_ref().and_then(|t| t.class_name()) == Some("Mojolicious::Routes"),
             "after two enrichments, $$r should still be typed as Mojolicious::Routes; got: {:?}",
             r_type,
         );
@@ -10174,9 +11481,9 @@ sub to { my $self = shift; return $self; }
         // resolve_invocant_class uses for method resolution, so if
         // this says None, nothing on line 71 can work.
         let r_point = probe(row_r_get_to, col_of(line_r_get_to, "$r"));
-        let r_type = fa.inferred_type("$r", r_point);
+        let r_type = fa.inferred_type_via_bag("$r", r_point);
         assert_eq!(
-            r_type.and_then(|t| t.class_name()),
+            r_type.as_ref().and_then(|t| t.class_name()),
             Some("Mojolicious::Routes"),
             "`$$r` must be typed as Mojolicious::Routes at the `$$r->get` \
              call site. Without this, the rest of line 71 is dead. got: {:?}",
@@ -11192,9 +12499,11 @@ sub _route { my ($x) = @_; { id => $x } }
             .find(|s| s.name == "_route")
             .expect("_route present")
             .id;
-        // Provenance MUST be Inferred — the override is class-scoped.
+        // Override must not apply — provenance can be Inferred or
+        // ReducerFold (inference produced the type via the witness
+        // fold), but NOT PluginOverride.
         assert!(
-            matches!(fa.return_type_provenance(id), TypeProvenance::Inferred),
+            !matches!(fa.return_type_provenance(id), TypeProvenance::PluginOverride { .. }),
             "override must not bleed across packages; provenance: {:?}",
             fa.return_type_provenance(id),
         );
@@ -11214,8 +12523,9 @@ sub other_method { my $self = shift; { ok => 1 } }
             .expect("other_method present")
             .id;
         assert!(
-            matches!(fa.return_type_provenance(id), TypeProvenance::Inferred),
-            "override must not bleed across method names",
+            !matches!(fa.return_type_provenance(id), TypeProvenance::PluginOverride { .. }),
+            "override must not bleed across method names; got {:?}",
+            fa.return_type_provenance(id),
         );
     }
 

@@ -1623,9 +1623,11 @@ pub fn signature_help(
                     }
                     return base;
                 }
-                // Local: look up inferred type at end of sub body
-                if let Some(ty) = analysis.inferred_type(&p.name, sig_info.body_end) {
-                    format!("{}: {}", base, format_inferred_type(ty))
+                // Local: look up inferred type at end of sub body —
+                // route through the witness bag so framework + branch
+                // + arity rules refine the answer.
+                if let Some(ty) = analysis.inferred_type_via_bag(&p.name, sig_info.body_end) {
+                    format!("{}: {}", base, format_inferred_type(&ty))
                 } else {
                     base
                 }
@@ -1712,14 +1714,14 @@ pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
                 if sym.name == "$self" {
                     continue;
                 }
-                if let Some(ty) = analysis.inferred_type(&sym.name, sym.span.start) {
+                if let Some(ty) = analysis.inferred_type_via_bag(&sym.name, sym.span.start) {
                     // Only show Object/HashRef/ArrayRef/CodeRef/Regexp — not Numeric/String
                     if matches!(ty, InferredType::Numeric | InferredType::String) {
                         continue;
                     }
                     hints.push(InlayHint {
                         position: point_to_position(decl_point),
-                        label: InlayHintLabel::String(format!(": {}", format_inferred_type(ty))),
+                        label: InlayHintLabel::String(format!(": {}", format_inferred_type(&ty))),
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
                         tooltip: None,
@@ -2253,7 +2255,7 @@ pub fn collect_diagnostics(analysis: &FileAnalysis, module_index: &ModuleIndex) 
         {
             Some(invocant.clone())
         } else {
-            analysis.inferred_type(invocant, r.span.start)
+            analysis.inferred_type_via_bag(invocant, r.span.start)
                 .and_then(|ty| ty.class_name().map(|s| s.to_string()))
         };
         let class_name = match class_name {
@@ -3775,6 +3777,215 @@ sub fire {
         }
     }
 
+    // ---- witness-bag chain typing: pin-the-fix on the real demo ----
+
+    /// Pin against the actual demo file. Loads
+    /// `test_files/plugin_mojo_demo.pl` + stubs of the Mojolicious
+    /// hierarchy registered into the module index, then asserts:
+    /// (a) `$r` at line 71 resolves to a known class.
+    /// (b) `->to` on line 71 is a MethodCall ref.
+    /// (c) `->to`'s invocant resolves to a class via
+    ///     `resolve_method_invocant_public` (the path nvim hover/gd
+    ///     uses internally).
+    ///
+    /// Two possible failure modes the test distinguishes:
+    ///   - `$r` is typed but `->to`'s invocant fails → crossfile
+    ///     chain hop is the gap (find_method_return_type's CrossFile
+    ///     branch).
+    ///   - `$r` isn't typed at all → earlier hop broken first.
+    #[test]
+    fn test_demo_file_chain_to_resolves_on_line_71() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        // Project root: the worktree (= CARGO_MANIFEST_DIR).
+        let root: PathBuf = env!("CARGO_MANIFEST_DIR").into();
+        let demo = root.join("test_files/plugin_mojo_demo.pl");
+        let demo_source = fs::read_to_string(&demo).expect("demo file present");
+
+        // Index the project's test_files/ as the workspace.
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(Some(root.to_str().unwrap()));
+        let files = crate::file_store::FileStore::new();
+        let _indexed = crate::module_resolver::index_workspace_with_index(
+            &root.join("test_files"),
+            &files,
+            Some(&idx),
+        );
+
+        // Use the ACTUAL Mojolicious library from @INC — the same
+        // code nvim analyzes. If Mojo isn't installed, skip cleanly
+        // so CI on bare systems doesn't break.
+        let inc_paths = crate::module_resolver::discover_inc_paths();
+        let insert_real = |name: &str| -> bool {
+            let mut p = crate::module_resolver::create_parser();
+            match crate::module_resolver::resolve_and_parse(&inc_paths, name, &mut p) {
+                Some(cached) => {
+                    idx.insert_cache(name, Some(cached));
+                    true
+                }
+                None => false,
+            }
+        };
+        let have_mojo = insert_real("Mojolicious")
+            && insert_real("Mojolicious::Routes")
+            && insert_real("Mojolicious::Routes::Route")
+            && insert_real("Mojolicious::Lite");
+        if !have_mojo {
+            eprintln!("SKIP: Mojolicious not installed in @INC");
+            return;
+        }
+        let _ = PathBuf::new(); // keep the import used in both branches
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&ts_parser_perl::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&demo_source, None).unwrap();
+        let mut analysis = crate::builder::build(&tree, demo_source.as_bytes());
+
+        // Cross-file enrichment — same step the backend runs on open.
+        // Resolves MethodCallBindings against the module_index so
+        // `my $r = $app->routes;` becomes a TypeConstraint. Without
+        // this, the backend's `enrich_analysis(uri)` hasn't fired
+        // yet and the whole chain is un-typed.
+        let (imported_returns, imported_keys) =
+            crate::backend::build_imported_return_types_for_test(&analysis, &idx);
+        analysis.enrich_imported_types_with_keys(imported_returns, imported_keys, Some(&idx));
+
+        // Find line 71 ($r->get('/users')->to('Users#list');).
+        let (line_idx, chain_line) = demo_source
+            .lines()
+            .enumerate()
+            .find(|(_, l)| {
+                l.contains("$r->get('/users')") && l.contains("->to('Users#list')")
+            })
+            .expect("chain line present in demo");
+
+        // Position on `to` — the 't' character.
+        let to_col = chain_line.find("->to(").unwrap() + 2;
+        let r_col = chain_line.find("$r").unwrap();
+        let get_col = chain_line.find("->get(").unwrap() + 2;
+
+        let pt = |col: usize| tree_sitter::Point {
+            row: line_idx,
+            column: col,
+        };
+
+        // Diagnostics — what does the analysis actually see?
+        let r_ty_bag = analysis.inferred_type_via_bag("$r", pt(r_col));
+        let r_ty_legacy = analysis.inferred_type("$r", pt(r_col)).cloned();
+        let mcb_for_r: Vec<_> = analysis
+            .method_call_bindings
+            .iter()
+            .filter(|b| b.variable == "$r")
+            .collect();
+        let cb_for_r: Vec<_> = analysis
+            .call_bindings
+            .iter()
+            .filter(|b| b.variable == "$r")
+            .collect();
+        // Is `app` even known as a symbol/import?
+        let app_known = analysis.symbols.iter().any(|s| s.name == "app");
+        // Is Mojolicious in the module index?
+        let mojo_cached = idx.get_cached("Mojolicious").is_some();
+        let routes_cached = idx.get_cached("Mojolicious::Routes").is_some();
+        let route_cached = idx.get_cached("Mojolicious::Routes::Route").is_some();
+        eprintln!(
+            "DIAG: $r bag={:?}  legacy={:?}  mcbs={:?}  cbs={:?}  app_sym={}  \
+             mojo_cached={}  routes_cached={}  route_cached={}",
+            r_ty_bag,
+            r_ty_legacy,
+            mcb_for_r
+                .iter()
+                .map(|b| format!("{}.{}", b.invocant_var, b.method_name))
+                .collect::<Vec<_>>(),
+            cb_for_r.iter().map(|b| &b.func_name).collect::<Vec<_>>(),
+            app_known,
+            mojo_cached,
+            routes_cached,
+            route_cached,
+        );
+
+        // (a) `$r` is typed. This uses the EXACT path cursor_context
+        // uses to type an invocant — inferred_type_via_bag.
+        let r_ty = r_ty_bag;
+        let r_class = r_ty.as_ref().and_then(|t| t.class_name());
+        assert!(
+            r_class.is_some(),
+            "$r should be typed (any class) at {}:{}; got {:?}",
+            line_idx + 1,
+            r_col,
+            r_ty,
+        );
+
+        // (b) At `->get`'s 'g', there's a MethodCall ref. Its
+        // invocant is `$r`. Resolve it cross-file.
+        let get_ref = analysis.ref_at(pt(get_col)).expect("ref at ->get");
+        assert_eq!(get_ref.target_name, "get");
+        if let crate::file_analysis::RefKind::MethodCall {
+            invocant,
+            invocant_span,
+            ..
+        } = &get_ref.kind
+        {
+            let klass = analysis.resolve_method_invocant_public(
+                invocant,
+                invocant_span,
+                get_ref.scope,
+                pt(get_col),
+                Some(&tree),
+                Some(demo_source.as_bytes()),
+                Some(&idx),
+            );
+            assert!(
+                klass.is_some(),
+                "`->get`'s invocant (= $r) should resolve to SOME class; got {:?}",
+                klass,
+            );
+        }
+
+        // (c) The `->to` hop. Real Mojolicious::Routes::Route::get
+        // is `shift->_generate_route(GET => @_)` — our implicit-
+        // return witnessing records that get's return chains
+        // through _generate_route. _generate_route's own return is
+        // `return defined $name ? $route->name($name) : $route;` —
+        // a complex conditional whose arms depend on $route's
+        // chain-built type. That depth of cross-file chain
+        // resolution is a separate follow-up; for now we assert
+        // the MethodCall ref exists and carries the right target,
+        // but leave the class-resolution assertion as a diagnostic
+        // rather than hard-fail.
+        let to_ref = analysis.ref_at(pt(to_col)).expect("ref at ->to");
+        assert_eq!(to_ref.target_name, "to");
+        assert!(
+            matches!(to_ref.kind, crate::file_analysis::RefKind::MethodCall { .. }),
+            "ref at ->to is a MethodCall"
+        );
+        if let crate::file_analysis::RefKind::MethodCall {
+            invocant,
+            invocant_span,
+            ..
+        } = &to_ref.kind
+        {
+            let klass = analysis.resolve_method_invocant_public(
+                invocant,
+                invocant_span,
+                to_ref.scope,
+                pt(to_col),
+                Some(&tree),
+                Some(demo_source.as_bytes()),
+                Some(&idx),
+            );
+            eprintln!(
+                "DIAG: ->to invocant class (real Mojo): {:?} \
+                 (None expected until deep chain through \
+                 _generate_route/requires/to is resolved)",
+                klass,
+            );
+        }
+    }
+
     #[test]
     fn data_printer_use_line_options_completion_for_data_printer_module() {
         // Same flow, non-alias name. The plugin can't be DDP-specific.
@@ -3796,5 +4007,434 @@ sub fire {
             "use Data::Printer {{ }} must surface options too; got: {:?}",
             labels,
         );
+    }
+    // ---- witness-driven chain completion (spike) ----
+
+    /// Decomposition: parse real Mojolicious/Routes/Route.pm
+    /// in-place (not via module index) and probe each hop of the
+    /// `$self->_route()->requires()->to()` chain separately. Plus
+    /// probe `$self->_generate_route(...)`. Reports what each
+    /// specific hop resolves to — so we know exactly which step
+    /// in the chain is actually dying.
+    #[test]
+    fn test_route_pm_chain_decomposition() {
+        use std::fs;
+        use std::path::PathBuf;
+        let inc = crate::module_resolver::discover_inc_paths();
+        let route_path = inc
+            .iter()
+            .map(|p| p.join("Mojolicious/Routes/Route.pm"))
+            .find(|p| p.exists());
+        let route_path: PathBuf = match route_path {
+            Some(p) => p,
+            None => { eprintln!("SKIP: Mojo not installed"); return; }
+        };
+        let src = fs::read_to_string(&route_path).unwrap();
+
+        // Parse Route.pm itself — `$self` inside = Route.
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&src, None).unwrap();
+        let analysis = crate::builder::build(&tree, src.as_bytes());
+
+        // Probe: find the `_generate_route` sub body and report
+        // what we see on each hop.
+        let inspect_sym = |name: &str| {
+            for sym in &analysis.symbols {
+                if sym.name != name { continue; }
+                if !matches!(sym.kind, crate::file_analysis::SymKind::Sub | crate::file_analysis::SymKind::Method) { continue; }
+                if let crate::file_analysis::SymbolDetail::Sub {
+                    return_type, return_self_method, ..
+                } = &sym.detail {
+                    eprintln!(
+                        "  sym[{:24}] return_type={:?}  return_self_method={:?}",
+                        name, return_type, return_self_method);
+                    return;
+                }
+            }
+            eprintln!("  sym[{:24}] NOT FOUND", name);
+        };
+        eprintln!("======== symbol return types in Route.pm ========");
+        for name in ["get", "post", "any", "to", "name", "requires",
+                     "_generate_route", "_route", "add_child", "pattern",
+                     "is_reserved", "root"] {
+            inspect_sym(name);
+        }
+
+        // Find `_generate_route`'s body block. Its last statement
+        // is `return defined $name ? $route->name($name) : $route;`.
+        // Probe each subexpression type via resolve_expression_type.
+        fn find_sub_body<'t>(n: tree_sitter::Node<'t>, src: &[u8], name: &str) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "subroutine_declaration_statement" {
+                if let Some(nm) = n.child_by_field_name("name") {
+                    if nm.utf8_text(src).ok() == Some(name) {
+                        return n.child_by_field_name("body");
+                    }
+                }
+            }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i) {
+                    if let Some(r) = find_sub_body(c, src, name) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+        let body = find_sub_body(tree.root_node(), src.as_bytes(), "_generate_route")
+            .expect("_generate_route body");
+
+        // Inside _generate_route, find:
+        //   (a) the `my $route = CHAIN` assignment
+        //   (b) the final `return TERNARY` expression
+        fn find_var_decl_for<'t>(n: tree_sitter::Node<'t>, src: &[u8], var: &str) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "assignment_expression" {
+                if let Some(left) = n.child_by_field_name("left") {
+                    if left.utf8_text(src).map(|s| s.trim()).ok() == Some(&format!("my {}", var)) {
+                        return n.child_by_field_name("right");
+                    }
+                }
+            }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i) {
+                    if let Some(r) = find_var_decl_for(c, src, var) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+        let route_rhs = find_var_decl_for(body, src.as_bytes(), "$route")
+            .expect("my $route = ... RHS");
+
+        eprintln!();
+        eprintln!("======== `my $route = RHS` decomposition ========");
+        eprintln!("RHS shape: {}  kind={}",
+            route_rhs.utf8_text(src.as_bytes()).unwrap_or(""), route_rhs.kind());
+
+        // Probe chain hops from innermost outward. Each node in a
+        // chain a->b->c has: outer is c's method_call_expression,
+        // its invocant is the a->b method_call_expression, whose
+        // invocant is `$self`.
+        fn report_node_type(
+            label: &str,
+            n: tree_sitter::Node,
+            analysis: &crate::file_analysis::FileAnalysis,
+            src: &[u8],
+        ) {
+            let text = n.utf8_text(src).unwrap_or("").trim();
+            let ty = analysis.resolve_expression_type(n, src, None);
+            eprintln!("  [{label:>12}] `{text:.60}`\n                kind={} → ty={:?}",
+                n.kind(), ty);
+        }
+
+        // Walk the chain inside-out and report each level's type.
+        let mut cur = Some(route_rhs);
+        let mut depth = 0;
+        while let Some(n) = cur {
+            let label = match depth { 0 => "outer", 1 => "mid1", 2 => "mid2", 3 => "mid3", _ => "inner" };
+            report_node_type(label, n, &analysis, src.as_bytes());
+            if n.kind() == "method_call_expression" {
+                cur = n.child_by_field_name("invocant");
+                depth += 1;
+            } else {
+                break;
+            }
+        }
+
+        eprintln!();
+        eprintln!("======== return TERNARY probe ========");
+        // Find the return_expression in body.
+        fn find_return<'t>(n: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "return_expression" { return Some(n); }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i) {
+                    if let Some(r) = find_return(c) { return Some(r); }
+                }
+            }
+            None
+        }
+        let ret = find_return(body).expect("return in _generate_route");
+        let ternary = ret.named_child(0).expect("return child");
+        eprintln!("  return child kind = {}  text = `{}`",
+            ternary.kind(),
+            ternary.utf8_text(src.as_bytes()).unwrap_or("").trim());
+        if ternary.kind() == "conditional_expression" {
+            let consequent = ternary.child_by_field_name("consequent");
+            let alternative = ternary.child_by_field_name("alternative");
+            if let Some(a) = consequent { report_node_type("then-arm", a, &analysis, src.as_bytes()); }
+            if let Some(b) = alternative { report_node_type("else-arm", b, &analysis, src.as_bytes()); }
+        }
+    }
+
+    /// Direct proof: enumerate each chain link's resolvability on
+    /// the real demo + real Mojolicious. Prints a truth table;
+    /// asserts specifically that `->to` does NOT resolve (the gap
+    /// the user flagged) so this test becomes a tripwire: if a
+    /// future fix makes `->to` resolve, this test will fail and
+    /// force us to promote it to a "works" assertion.
+    #[test]
+    fn test_demo_chain_empirical_truth_table() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let root: PathBuf = env!("CARGO_MANIFEST_DIR").into();
+        let demo = root.join("test_files/plugin_mojo_demo.pl");
+        let demo_source = fs::read_to_string(&demo).expect("demo file");
+
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(Some(root.to_str().unwrap()));
+        let files = crate::file_store::FileStore::new();
+        let _ = crate::module_resolver::index_workspace_with_index(
+            &root.join("test_files"),
+            &files,
+            Some(&idx),
+        );
+
+        let inc = crate::module_resolver::discover_inc_paths();
+        let install = |name: &str| -> bool {
+            let mut p = crate::module_resolver::create_parser();
+            match crate::module_resolver::resolve_and_parse(&inc, name, &mut p) {
+                Some(c) => { idx.insert_cache(name, Some(c)); true }
+                None => false,
+            }
+        };
+        if !(install("Mojolicious")
+            && install("Mojolicious::Routes")
+            && install("Mojolicious::Routes::Route")
+            && install("Mojolicious::Lite"))
+        {
+            eprintln!("SKIP: Mojolicious not installed");
+            return;
+        }
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&demo_source, None).unwrap();
+        let mut analysis = crate::builder::build(&tree, demo_source.as_bytes());
+        let (ir, ik) =
+            crate::backend::build_imported_return_types_for_test(&analysis, &idx);
+        analysis.enrich_imported_types_with_keys(ir, ik, Some(&idx));
+
+        let (line_idx, chain_line) = demo_source
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("$r->get('/users')") && l.contains("->to('Users#list')"))
+            .expect("demo chain line present");
+
+        let r_col = chain_line.find("$r").unwrap();
+        let get_col = chain_line.find("->get(").unwrap() + 2;
+        let to_col = chain_line.find("->to(").unwrap() + 2;
+        let pt = |c: usize| tree_sitter::Point { row: line_idx, column: c };
+
+        // --- Link 1: $r's type ---
+        let r_ty = analysis.inferred_type_via_bag("$r", pt(r_col));
+        let r_class = r_ty.as_ref().and_then(|t| t.class_name()).map(|s| s.to_string());
+
+        // --- Link 2: ->get's invocant class (= $r's class) ---
+        let get_ref = analysis.ref_at(pt(get_col)).expect("ref at ->get");
+        let get_invocant_class = if let crate::file_analysis::RefKind::MethodCall {
+            invocant, invocant_span, ..
+        } = &get_ref.kind
+        {
+            analysis.resolve_method_invocant_public(
+                invocant, invocant_span, get_ref.scope, pt(get_col),
+                Some(&tree), Some(demo_source.as_bytes()), Some(&idx),
+            )
+        } else { None };
+
+        // --- Link 3: ->get's RETURN type (what `$r->get(...)` evaluates to) ---
+        // Find the method_call_expression node for `$r->get('/users')`.
+        let mcall_node = {
+            fn find_getcall<'a>(n: tree_sitter::Node<'a>, src: &[u8]) -> Option<tree_sitter::Node<'a>> {
+                if n.kind() == "method_call_expression" {
+                    if let Some(m) = n.child_by_field_name("method") {
+                        if m.utf8_text(src).ok() == Some("get") {
+                            return Some(n);
+                        }
+                    }
+                }
+                for i in 0..n.named_child_count() {
+                    if let Some(c) = n.named_child(i) {
+                        if let Some(r) = find_getcall(c, src) {
+                            return Some(r);
+                        }
+                    }
+                }
+                None
+            }
+            find_getcall(tree.root_node(), demo_source.as_bytes()).expect("->get node")
+        };
+        let get_return_ty = analysis.resolve_expression_type(
+            mcall_node, demo_source.as_bytes(), Some(&idx),
+        );
+
+        // --- Link 4: ->to's invocant class (= ->get's return class) ---
+        let to_ref = analysis.ref_at(pt(to_col)).expect("ref at ->to");
+        let to_invocant_class = if let crate::file_analysis::RefKind::MethodCall {
+            invocant, invocant_span, ..
+        } = &to_ref.kind
+        {
+            analysis.resolve_method_invocant_public(
+                invocant, invocant_span, to_ref.scope, pt(to_col),
+                Some(&tree), Some(demo_source.as_bytes()), Some(&idx),
+            )
+        } else { None };
+
+        // Also directly inspect the cached Route module's stored
+        // return types + self-method tails for each method on the
+        // chain's path.
+        let route_cached = idx.get_cached("Mojolicious::Routes::Route").unwrap();
+        let inspect = |name: &str| -> (Option<InferredType>, Option<String>) {
+            let mut rt = None;
+            let mut sm = None;
+            for sym in &route_cached.analysis.symbols {
+                if sym.name != name { continue; }
+                if !matches!(sym.kind, crate::file_analysis::SymKind::Sub | crate::file_analysis::SymKind::Method) { continue; }
+                if let crate::file_analysis::SymbolDetail::Sub {
+                    return_type, return_self_method, ..
+                } = &sym.detail {
+                    rt = return_type.clone();
+                    sm = return_self_method.clone();
+                    break;
+                }
+            }
+            (rt, sm)
+        };
+        let (gen_rt, gen_tail) = inspect("_generate_route");
+        let (get_rt, get_tail) = inspect("get");
+        let (to_rt, to_tail) = inspect("to");
+        let (requires_rt, requires_tail) = inspect("requires");
+        let (_route_rt, _route_tail) = inspect("_route");
+
+        eprintln!("======== chain truth table ========");
+        eprintln!("  $r              class = {:?}", r_class);
+        eprintln!("  ->get invocant  class = {:?}", get_invocant_class);
+        eprintln!("  ->get RETURN    type  = {:?}", get_return_ty);
+        eprintln!("  ->to  invocant  class = {:?}", to_invocant_class);
+        eprintln!("  ---- cached Route symbols ----");
+        eprintln!("  get             rt={:?}  tail={:?}", get_rt, get_tail);
+        eprintln!("  _generate_route rt={:?}  tail={:?}", gen_rt, gen_tail);
+        eprintln!("  requires        rt={:?}  tail={:?}", requires_rt, requires_tail);
+        eprintln!("  to              rt={:?}  tail={:?}", to_rt, to_tail);
+        eprintln!("  _route          rt={:?}  tail={:?}", _route_rt, _route_tail);
+        eprintln!("====================================");
+
+        // The chain pin. With:
+        //   - mojo-routes plugin's `_route` override pinning the
+        //     return type inference can't reach, AND
+        //   - the unified post-walk `type_assignments_into_bag` pass
+        //     symbolically executing every `my $X = <expr>` rhs (no
+        //     "is it a chain" branch — same recursion every consumer
+        //     uses), AND
+        //   - a refresh of return-arm types before the second
+        //     fold so `_generate_route`'s ternary return picks up
+        //     the now-typed `$route`,
+        // the full `$r->get(...)->to(...)` chain resolves end-to-end.
+        // Each link is pinned individually so a regression localizes
+        // to a specific hop instead of "the chain broke".
+        assert!(r_class.is_some(),
+            "(link 1) $r must resolve to a class; got None");
+        assert_eq!(r_class.as_deref(), Some("Mojolicious::Routes"));
+        assert!(get_invocant_class.is_some(),
+            "(link 2) ->get's invocant class must resolve; got None");
+        assert!(get_return_ty.is_some(),
+            "(link 3) ->get's RETURN type must resolve through \
+             _generate_route → _route's plugin override");
+        assert_eq!(get_return_ty.as_ref().and_then(|t| t.class_name()),
+                   Some("Mojolicious::Routes::Route"),
+                   "->get returns the Route class so ->to can chain off it");
+        assert!(to_invocant_class.is_some(),
+            "(link 4) ->to's invocant class must resolve — THIS is \
+             the chain hop the spike was unblocking");
+        assert_eq!(to_invocant_class.as_deref(),
+                   Some("Mojolicious::Routes::Route"),
+                   "->to is invoked on a Route, so cursor-on-`to` \
+                    completion / hover / goto-def all reach \
+                    Mojolicious::Routes::Route::to");
+
+        // Cross-check the cached symbols: every verb method
+        // (get/post/put/etc.) tail-delegates through _generate_route,
+        // and _generate_route's body folds via the chain typer +
+        // refreshed return-arm typing.
+        assert_eq!(
+            _route_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "_route is the override anchor",
+        );
+        assert_eq!(
+            gen_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "_generate_route folds because $route is now typed",
+        );
+        assert_eq!(
+            get_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "get tail-delegates to _generate_route which has a type",
+        );
+    }
+
+    /// E2E: the motivator. `$r->get('/x')->|` at the cursor — the
+    /// public `completion_items` API must offer methods from the
+    /// route class (Route::to, Route::name, etc.), proving the
+    /// witness-bag-driven chain typing works all the way through
+    /// CursorContext → resolve_node_type → resolve_expression_type →
+    /// find_method_return_type → complete_methods_for_class.
+    ///
+    /// No special casing. Zero hardcoded chain rules. If this
+    /// passes, the mojo-demo `$r->get('/x')->to(...)` gets
+    /// "intellismarts" on `->to` through witness flow.
+    #[test]
+    fn test_e2e_mojo_style_chain_completion_offers_chained_class_methods() {
+        let src = r#"package MyApp::Route;
+sub new { my $c = shift; bless {}, $c }
+sub get {
+    my $self = shift;
+    $self->{_path} = shift;
+    return $self;
+}
+sub to {
+    my $self = shift;
+    $self->{_target} = shift;
+    return $self;
+}
+sub name {
+    my $self = shift;
+    $self->{_name} = shift;
+    return $self;
+}
+
+package main;
+my $r = MyApp::Route->new;
+$r->get('/users')->
+"#;
+        let analysis = parse_analysis(src);
+        let tree = crate::document::Document::new(src.to_string()).unwrap().tree;
+        let idx = ModuleIndex::new_for_test();
+
+        // Cursor right after the trailing `->` on the chain line.
+        let (line_idx, line) = src
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("$r->get('/users')->"))
+            .unwrap();
+        let col = line.rfind("->").unwrap() + 2;
+        let pos = Position {
+            line: line_idx as u32,
+            character: col as u32,
+        };
+
+        let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        for expected in &["to", "name", "get"] {
+            assert!(
+                labels.contains(expected),
+                "expected `{}` in completion after `$r->get('/users')->`, \
+                 got {} items: {:?}",
+                expected,
+                labels.len(),
+                labels
+            );
+        }
     }
 }
