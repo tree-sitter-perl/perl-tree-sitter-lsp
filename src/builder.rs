@@ -12934,4 +12934,108 @@ my $p = Plain->run(count => 1);
             "MooApp has no `count` HashKeyDef → no HashKeyAccess emission expected",
         );
     }
+
+    /// `=>` is autoquoting sugar for `,` — `f(name => 'alice')` and
+    /// `f('name', 'alice')` are the same call. The HashKeyAccess
+    /// emission must be position-based (every odd-indexed stringy
+    /// arg is a key), NOT keyed off the `=>` token. Pinning this
+    /// because the original draft of the helper walked siblings
+    /// looking for `=>` and would have missed the bare-comma form
+    /// — letting cursor-on-key in the bare-comma shape land on
+    /// the broad MethodCall ref, which renames the wrong token.
+    #[test]
+    fn red_pin_hash_key_access_emission_is_position_based() {
+        // Same `has`-emitted def, two call shapes. Both should land
+        // a HashKeyAccess at `name`, with the same owner.
+        let fat_comma_src = "\
+package MooApp;
+use Moo;
+has name => (is => 'ro');
+
+package main;
+my $a = MooApp->new(name => 'alice');
+";
+        let bare_comma_src = "\
+package MooApp;
+use Moo;
+has name => (is => 'ro');
+
+package main;
+my $a = MooApp->new('name', 'alice');
+";
+        let fa_fat = build_fa(fat_comma_src);
+        let fa_bare = build_fa(bare_comma_src);
+
+        // Constructor call site only — the `has name` declaration
+        // synthesizes its own internal-key refs that we're not
+        // asserting on here.
+        fn name_access_at_call<'a>(fa: &'a FileAnalysis) -> Vec<&'a Ref> {
+            fa.refs.iter()
+                .filter(|r| r.target_name == "name"
+                    && matches!(r.kind, RefKind::HashKeyAccess { .. })
+                    && r.span.start.row == 5)
+                .collect()
+        }
+
+        let fat_refs = name_access_at_call(&fa_fat);
+        let bare_refs = name_access_at_call(&fa_bare);
+
+        assert_eq!(
+            fat_refs.len(), 1,
+            "fat-comma form should emit exactly one HashKeyAccess at the call site",
+        );
+        assert_eq!(
+            bare_refs.len(), 1,
+            "bare-comma form (`'name', 'alice'`) must emit the same HashKeyAccess — \
+             `=>` is autoquoting sugar, not a structural marker",
+        );
+
+        let owner_of = |r: &Ref| match &r.kind {
+            RefKind::HashKeyAccess { owner: Some(o), .. } => o.clone(),
+            _ => panic!("expected HashKeyAccess with owner"),
+        };
+        assert_eq!(
+            owner_of(fat_refs[0]),
+            owner_of(bare_refs[0]),
+            "both forms must produce the same Sub{{MooApp, new}} owner",
+        );
+
+        // Even-indexed args ARE keys; odd-indexed (values) must
+        // NOT get a HashKeyAccess regardless of whether they happen
+        // to look like a key string. `'alice'` at idx 1 stays a value.
+        for fa in [&fa_fat, &fa_bare] {
+            let alice_access: Vec<_> = fa.refs.iter()
+                .filter(|r| r.target_name == "alice"
+                    && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+                .collect();
+            assert!(
+                alice_access.is_empty(),
+                "value-position arg must never become a HashKeyAccess",
+            );
+        }
+
+        // Multi-pair, all bare commas — `('a', 1, 'b', 2)`. Both
+        // `a` and `b` are keys (idx 0 and 2); `1` and `2` aren't
+        // stringy so they don't even tempt the helper. Need a def
+        // for each so emission isn't gated out.
+        let multi_src = "\
+package MooApp;
+use Moo;
+has a => (is => 'ro');
+has b => (is => 'ro');
+
+package main;
+my $m = MooApp->new('a', 1, 'b', 2);
+";
+        let fa_multi = build_fa(multi_src);
+        let call_keys: Vec<&Ref> = fa_multi.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::HashKeyAccess { .. })
+                && r.span.start.row == 6
+                && (r.target_name == "a" || r.target_name == "b"))
+            .collect();
+        assert_eq!(
+            call_keys.len(), 2,
+            "both even-position args (`'a'`, `'b'`) must emit HashKeyAccess",
+        );
+    }
 }
