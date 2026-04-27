@@ -599,8 +599,26 @@ impl LanguageServer for Backend {
                         (name.clone(), Box::new(move |fa, old, new| fa.rename_sub_in_package(old, &p, new)))
                     }
                     crate::file_analysis::RenameKind::Method { name, class } => {
-                        let c = class.clone();
-                        (name.clone(), Box::new(move |fa, old, new| fa.rename_method_in_class(old, &c, new)))
+                        // Walk MyWorker → ... → BaseWorker (the actual
+                        // defining class). Each link is needed: the
+                        // call-site invocant_class on `$worker->process`
+                        // is "MyWorker" (the static type), while the
+                        // `sub process` definition lives in BaseWorker.
+                        // `rename_method_in_class` matches strict
+                        // `invocant_class == scope`, so without the
+                        // chain we'd pick up only one of the two ends.
+                        let chain = doc.analysis.method_rename_chain(
+                            class,
+                            name,
+                            Some(&self.module_index),
+                        );
+                        (name.clone(), Box::new(move |fa, old, new| {
+                            let mut all = Vec::new();
+                            for c in &chain {
+                                all.extend(fa.rename_method_in_class(old, c, new));
+                            }
+                            all
+                        }))
                     }
                     crate::file_analysis::RenameKind::Package(n) =>
                         (n.clone(), Box::new(FileAnalysis::rename_package)),

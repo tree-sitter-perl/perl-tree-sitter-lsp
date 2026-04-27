@@ -903,19 +903,65 @@ impl<'a> Builder<'a> {
     ) -> SymbolId {
         let id = SymbolId(self.next_symbol_id);
         self.next_symbol_id += 1;
+        // Lexical decls (`my`, `state`, `field`) cross statement-form
+        // `package Foo;` boundaries — they're tied to the enclosing
+        // real lexical scope (file / block / sub / method / class
+        // block / for-loop), not to package context. Sibling Package
+        // scopes are a package-lookup mechanism (subs, `package_at`,
+        // namespace grouping); attaching lexicals to them hides
+        // decls from later `package X;` sections of the same file.
+        //
+        // `our` is the exception — it's a *package-global* with a
+        // lexical alias. The variable lives in `$Package::name`, so
+        // it stays attached to the current Package scope and is
+        // *not* visible from a sibling `package main;` section as a
+        // bare `$name`.
+        //
+        // TODO(scope-separation): once lexical-vs-package scopes are
+        // split (see `docs/prompt-scope-separation.md`), this Lift
+        // becomes unnecessary — `add_symbol_ns` uses the lexical
+        // tree directly and `our` is recorded with package context
+        // separately.
+        let is_lexical = match (&kind, &detail) {
+            (SymKind::Field, _) => true,
+            (SymKind::Variable, SymbolDetail::Variable { decl_kind, .. }) => *decl_kind != DeclKind::Our,
+            (SymKind::Variable, _) => true,
+            _ => false,
+        };
+        let scope = if is_lexical {
+            self.nearest_lexical_scope()
+        } else {
+            self.current_scope()
+        };
         self.symbols.push(Symbol {
             id,
             name,
             kind,
             span,
             selection_span,
-            scope: self.current_scope(),
+            scope,
             package: self.current_package.clone(),
             detail,
             namespace,
             outline_label: None,
         });
         id
+    }
+
+    /// Walk up `current_scope()` past any `ScopeKind::Package` sibling
+    /// scopes — those track package context, not lexical scope.
+    fn nearest_lexical_scope(&self) -> ScopeId {
+        let mut id = self.current_scope();
+        loop {
+            let scope = &self.scopes[id.0 as usize];
+            if !matches!(scope.kind, ScopeKind::Package) {
+                return id;
+            }
+            match scope.parent {
+                Some(p) => id = p,
+                None => return id,
+            }
+        }
     }
 
     fn add_ref(&mut self, kind: RefKind, span: Span, target_name: String, access: AccessKind) {
@@ -3845,11 +3891,23 @@ impl<'a> Builder<'a> {
             if let Ok(name) = func_node.utf8_text(self.source) {
                 let resolved_package = self.resolve_call_package(name);
                 self.add_ref(
-                    RefKind::FunctionCall { resolved_package },
+                    RefKind::FunctionCall { resolved_package: resolved_package.clone() },
                     node_to_span(func_node),
                     name.to_string(),
                     AccessKind::Read,
                 );
+                // Even-position stringy args → HashKeyAccess refs
+                // owned by `Sub{resolved_package, name}`. Same
+                // mechanism as method-call args; covers
+                // `Foo::new(key => val)` and helpers like
+                // `connect(timeout => 30)`.
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    let owner = HashKeyOwner::Sub {
+                        package: resolved_package.clone(),
+                        name: name.to_string(),
+                    };
+                    self.emit_call_arg_key_accesses(args, &owner);
+                }
                 // Push type constraints on arguments of known builtins
                 if let Some(arg_type) = crate::file_analysis::builtin_first_arg_type(name) {
                     if let Some(first_arg) = self.first_call_arg(node) {
@@ -4643,6 +4701,22 @@ impl<'a> Builder<'a> {
             }
         }
 
+        // Even-position stringy args become HashKeyAccess refs owned
+        // by `Sub{invocant_class, method_name}`. Pairs with the
+        // HashKeyDef symbols `has`/`bless { … }` synthesize on the
+        // callee side. Without these refs, `ref_at` on a constructor
+        // arg only finds the broad MethodCall ref and rename clobbers
+        // the wrong token.
+        if let (Some(cls), Some(method)) = (invocant_class.as_ref(), method_name.as_ref()) {
+            if let Some(args) = node.child_by_field_name("arguments") {
+                let owner = HashKeyOwner::Sub {
+                    package: Some(cls.clone()),
+                    name: method.clone(),
+                };
+                self.emit_call_arg_key_accesses(args, &owner);
+            }
+        }
+
         // Framework plugin dispatch. Runs after native handlers so plugin
         // emissions are purely additive — a third-party plugin targeting
         // `->on()` can't accidentally break DBIC `->add_columns()`.
@@ -5187,12 +5261,21 @@ impl<'a> Builder<'a> {
         for _ in 0..5 {
             // Check if this is inside a bless call
             if self.is_bless_call(ancestor) {
-                if let Some(ref pkg) = self.current_package {
-                    return Some(HashKeyOwner::Class(pkg.clone()));
-                }
-                let scope = self.current_scope();
-                if let Some(ref pkg) = self.scopes[scope.0 as usize].package {
-                    return Some(HashKeyOwner::Class(pkg.clone()));
+                let pkg = self.current_package.clone()
+                    .or_else(|| self.scopes[self.current_scope().0 as usize].package.clone());
+                if let Some(pkg) = pkg {
+                    // Inside a sub: register to `Sub{C, sub_name}` —
+                    // that's the actual constructor (or whatever sub
+                    // does the blessing). `has`-emitted HashKeyDefs
+                    // use the same shape, so a single owner encoding
+                    // covers both registration paths and call-site
+                    // HashKeyAccess refs (Sub{C, method}) match
+                    // strict. Top-level blesses (rare) keep the
+                    // coarse `Class(C)` form.
+                    return Some(match self.enclosing_sub_name() {
+                        Some(name) => HashKeyOwner::Sub { package: Some(pkg), name },
+                        None => HashKeyOwner::Class(pkg),
+                    });
                 }
             }
             // Check if this is inside a return expression of a sub
@@ -5228,6 +5311,68 @@ impl<'a> Builder<'a> {
             }
         }
         false
+    }
+
+    /// Emit a `HashKeyAccess` ref at every odd-indexed (1st, 3rd, …)
+    /// stringy arg inside a call's args node, owned by `owner`. In
+    /// Perl, `foo(a => 1, "b", 2, c => 3)` is `foo("a", 1, "b", 2,
+    /// "c", 3)` — `=>` is just an autoquoting comma. The keys are
+    /// the even-position named args, regardless of which separator
+    /// comes after them. Mirrors `collect_fat_comma_keys` (callee
+    /// side, emits HashKeyDef symbols); this is the caller side, so
+    /// `ref_at` on the key token picks the narrow span over the
+    /// broad MethodCall/FunctionCall ref. Without this, cursor on
+    /// the key in `MooApp->new(name => 'alice')` lands on the
+    /// method ref and rename clobbers the wrong token.
+    ///
+    /// Gated on a matching HashKeyDef already being registered for
+    /// `owner`. Otherwise we'd shadow the broader MethodCall ref
+    /// for cases the caller-side has no def to anchor on (`class
+    /// Foo { field $x :param }` — Point->new(x => 3, …) needs the
+    /// MethodCall ref's `find_param_field` fallback in
+    /// `find_definition`).
+    fn emit_call_arg_key_accesses(&mut self, args_node: Node<'a>, owner: &HashKeyOwner) {
+        let named: Vec<Node<'a>> = (0..args_node.named_child_count())
+            .filter_map(|i| args_node.named_child(i))
+            .collect();
+        // Single-arg calls present the arg directly (no list_expression
+        // wrapper). One arg can't be a key/value pair.
+        if named.len() < 2 && args_node.kind() != "list_expression" && args_node.kind() != "parenthesized_expression" {
+            return;
+        }
+        for (idx, child) in named.iter().enumerate() {
+            if idx % 2 == 0
+                && matches!(child.kind(), "bareword" | "autoquoted_bareword" | "string_literal" | "interpolated_string_literal")
+            {
+                if let Some((key, is_dynamic)) = self.extract_key_text(*child) {
+                    if !is_dynamic && self.has_hash_key_def(&key, owner) {
+                        let access = self.determine_access(*child);
+                        self.add_ref(
+                            RefKind::HashKeyAccess {
+                                var_text: String::new(),
+                                owner: Some(owner.clone()),
+                            },
+                            node_to_span(*child),
+                            key,
+                            access,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Strict (no `found_by` broadening) check: is a HashKeyDef
+    /// registered with this exact `owner` and `name`? Used by
+    /// `emit_call_arg_key_accesses` to gate emission — broadening
+    /// would let `Foo::bar(name => 1)` latch onto `name` keys
+    /// registered to `Sub{Foo, new}`, which they don't logically
+    /// belong to.
+    fn has_hash_key_def(&self, name: &str, owner: &HashKeyOwner) -> bool {
+        self.symbols.iter().any(|s| {
+            if s.name != name { return false; }
+            matches!(&s.detail, SymbolDetail::HashKeyDef { owner: o, .. } if o == owner)
+        })
     }
 
     fn collect_fat_comma_keys(&mut self, node: Node<'a>, owner: &HashKeyOwner) {
@@ -6220,6 +6365,24 @@ mod tests {
     fn build_fa(source: &str) -> FileAnalysis {
         let tree = parse(source);
         build(&tree, source.as_bytes())
+    }
+
+    #[test]
+    fn debug_moo_name_refs() {
+        let src = std::fs::read_to_string("test_files/frameworks.pl").unwrap();
+        let fa = build_fa(&src);
+        for r in &fa.refs {
+            if r.target_name == "name" || r.target_name == "new" {
+                eprintln!("REF: target={} kind={:?} span={:?} resolves_to={:?}",
+                    r.target_name, r.kind, r.span, r.resolves_to);
+            }
+        }
+        for s in &fa.symbols {
+            if s.name == "name" || (matches!(s.kind, SymKind::HashKeyDef) && s.span.start.row > 5 && s.span.start.row < 25) {
+                eprintln!("SYM: name={} kind={:?} span={:?} sel_span={:?} detail={:?}",
+                    s.name, s.kind, s.span, s.selection_span, s.detail);
+            }
+        }
     }
 
     // ---- varname-based extraction ----
@@ -12665,6 +12828,110 @@ p $foo;
         assert!(
             fa.imports.iter().find(|i| i.module_name == "Data::Printer").is_none(),
             "plugin must not synthesize a Data::Printer import unless DDP/Data::Printer was used"
+        );
+    }
+
+    // ---- Red-pin: regressions caught against the rhai-plugins branch ----
+
+    /// `my` is lexical and crosses statement-form `package X;`
+    /// boundaries. The branch's sibling `ScopeKind::Package` was
+    /// originally swallowing `my` decls, so a use site under
+    /// `package main;` couldn't resolve a `my` declared under
+    /// `package Calculator;` earlier in the same file. e2e
+    /// `rename: $pi → $tau` turned red on the interpolated-string
+    /// occurrence (the only `$pi` use under `package main;`); this
+    /// pins the underlying `resolves_to` linkage so the regression
+    /// can't sneak back in if the scope tree is reshuffled.
+    #[test]
+    fn red_pin_my_resolves_across_statement_packages() {
+        let src = "\
+package Calculator;
+my $pi = 3.14159;
+sub circumference { my ($self, $r) = @_; return 2 * $pi * $r }
+
+package main;
+print \"pi is $pi\\n\";
+";
+        let fa = build_fa(src);
+        let pi_sym = fa.symbols.iter()
+            .find(|s| s.name == "$pi" && s.kind == SymKind::Variable)
+            .expect("$pi Variable symbol");
+        let pi_refs: Vec<_> = fa.refs.iter().filter(|r| r.target_name == "$pi").collect();
+        assert_eq!(pi_refs.len(), 3, "decl + body use + interpolation = 3 refs");
+        for r in &pi_refs {
+            assert_eq!(
+                r.resolves_to,
+                Some(pi_sym.id),
+                "ref at {:?} (scope {:?}) didn't resolve to the lexical decl — \
+                 sibling Package scopes are leaking into variable lookup",
+                r.span.start, r.scope,
+            );
+        }
+    }
+
+    /// Caller-side `HashKeyAccess` for a method/function call's
+    /// even-position stringy args. `MooApp->new(name => 'alice')`
+    /// must emit a HashKeyAccess at the `name` token so
+    /// cursor-on-key resolves to the `has`-emitted HashKeyDef
+    /// instead of the broad MethodCall ref. Gated on a matching
+    /// HashKeyDef existing — emission would otherwise shadow the
+    /// `class Foo { field $x :param }` `find_param_field`
+    /// fallback. e2e `rename: 'name' constructor arg` was the
+    /// surfacing failure.
+    #[test]
+    fn red_pin_call_arg_emits_hash_key_access_when_def_exists() {
+        let src = "\
+package MooApp;
+use Moo;
+has name => (is => 'ro');
+
+package main;
+my $m = MooApp->new(name => 'alice');
+";
+        let fa = build_fa(src);
+        let name_access: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "name"
+                && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        assert!(
+            !name_access.is_empty(),
+            "no HashKeyAccess emitted for `name` in MooApp->new(name => 'alice')",
+        );
+        let RefKind::HashKeyAccess { owner: Some(owner), .. } = &name_access[0].kind else {
+            panic!("HashKeyAccess emitted with no owner");
+        };
+        assert_eq!(
+            *owner,
+            HashKeyOwner::Sub { package: Some("MooApp".to_string()), name: "new".to_string() },
+            "constructor-key owner should be Sub{{class, method}}, matching the has-emitted def",
+        );
+
+        // No matching HashKeyDef for `count` → no shadow ref.
+        let count_access: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "count"
+                && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        let src_no_def = "\
+package Plain;
+sub run {}
+
+package main;
+my $p = Plain->run(count => 1);
+";
+        let fa2 = build_fa(src_no_def);
+        let no_emit: Vec<_> = fa2.refs.iter()
+            .filter(|r| r.target_name == "count"
+                && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        assert!(
+            no_emit.is_empty(),
+            "no HashKeyDef registered for Plain::run/count → \
+             must not emit a phantom HashKeyAccess (would shadow other resolution paths)",
+        );
+        // `count` accesses on MooApp (which DOESN'T define count) — should not emit either.
+        assert!(
+            count_access.is_empty(),
+            "MooApp has no `count` HashKeyDef → no HashKeyAccess emission expected",
         );
     }
 }

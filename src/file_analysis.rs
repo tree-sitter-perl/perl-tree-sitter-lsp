@@ -114,6 +114,17 @@ pub struct Scope {
 #[allow(dead_code)]
 pub enum ScopeKind {
     File,
+    // TODO(scope-separation): `Package` here is a sibling-scope
+    // grouping for *package* lookup (subs, `package_at`,
+    // outline-by-namespace) — it is NOT a lexical boundary. `my`
+    // is file-lexical and must be lifted past these in
+    // `add_symbol_ns` (see `nearest_lexical_scope`); the document
+    // outline has to merge file-scope and Package-sibling-scope
+    // children by source position. Both are smells from
+    // overloading one `ScopeKind` for two unrelated concepts.
+    // Follow-up: split lexical scope (the tree) from package
+    // context (a flat `Vec<(Span, String)>` for `package_at`).
+    // Spec: `docs/prompt-scope-separation.md`.
     /// Region after `package Foo;` until next package statement or EOF.
     Package,
     /// `class Foo { ... }` block.
@@ -713,6 +724,27 @@ pub enum HashKeyOwner {
     /// in scope). Without this, two different packages each defining
     /// `sub get_config { ... host ... }` would collide at query time.
     Sub { package: Option<String>, name: String },
+}
+
+impl HashKeyOwner {
+    /// Directional match: would a lookup with `lookup` owner reach a
+    /// def with `self` owner? Strict equality, plus the broadening
+    /// rule that a `Class(C)` lookup picks up `Sub{Some(C), _}` defs.
+    ///
+    /// Why: bless-inside-a-sub registers HashKeyDefs as `Sub{C,
+    /// sub_name}` (the constructor sub). `has` does the same. But
+    /// `$obj->{key}` deref refs and `complete_hash_keys_for_class`
+    /// callers carry `Class(C)` — that's the "any key for objects of
+    /// C" lookup. The asymmetry keeps strict `Sub{C, M}` lookups
+    /// from accidentally finding keys registered to a *different*
+    /// method on the same class.
+    pub fn found_by(&self, lookup: &HashKeyOwner) -> bool {
+        if self == lookup { return true; }
+        match (self, lookup) {
+            (HashKeyOwner::Sub { package: Some(c1), .. }, HashKeyOwner::Class(c2)) => c1 == c2,
+            _ => false,
+        }
+    }
 }
 
 
@@ -1367,6 +1399,7 @@ impl FileAnalysis {
     ///
     /// This is the piece that makes `$r->get('/x')->to(...)` fold
     /// across chain hops without needing an intermediate variable.
+    #[allow(dead_code)] // documented type-query entry point; CLAUDE.md
     pub fn method_call_return_type_via_bag(&self, ref_idx: usize) -> Option<InferredType> {
         use crate::witnesses::{
             FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, ReturnOfKey,
@@ -1441,6 +1474,7 @@ impl FileAnalysis {
     /// of `class`. Powers dynamic-key completion: `$self->{` completes
     /// with both `has`-declared keys and keys observed as write
     /// targets across the class's methods.
+    #[allow(dead_code)] // documented type-query entry point; CLAUDE.md
     pub fn mutated_keys_on_class(&self, class: &str) -> Vec<String> {
         use crate::witnesses::{WitnessAttachment, WitnessPayload};
         let mut out: Vec<String> = Vec::new();
@@ -1482,6 +1516,7 @@ impl FileAnalysis {
 
     /// Get the return type of a named sub/method.
     /// Checks local definitions first, then falls back to imported return types.
+    #[allow(dead_code)] // public type-query API; used by tooling/tests
     pub fn sub_return_type(&self, name: &str) -> Option<&InferredType> {
         self.sub_return_type_local(name)
             .or_else(|| self.imported_return_types.get(name))
@@ -2574,7 +2609,7 @@ impl FileAnalysis {
         self.symbols.iter()
             .filter(|s| {
                 if let SymbolDetail::HashKeyDef { owner: ref o, .. } = s.detail {
-                    o == owner
+                    o.found_by(owner)
                 } else {
                     false
                 }
@@ -2884,12 +2919,12 @@ impl FileAnalysis {
                         continue;
                     }
                     let matches = match ro {
-                        Some(ref ro) => ro == owner,
+                        Some(ref ro) => owner.found_by(ro),
                         None => {
                             if let (Some(t), Some(s)) = (tree, source_bytes) {
                                 self.resolve_hash_owner_from_tree(t, s, r.span.start, None)
                                     .as_ref()
-                                    .map_or(false, |resolved| resolved == owner)
+                                    .map_or(false, |resolved| owner.found_by(resolved))
                             } else {
                                 false
                             }
@@ -3623,6 +3658,44 @@ impl FileAnalysis {
         }
     }
 
+    /// Inheritance chain for a method rename: `[class, ..., defining_class]`.
+    ///
+    /// Cross-class method rename has to touch two distinct things:
+    ///   * the `sub M` definition in whichever ancestor actually
+    ///     defines the method, and
+    ///   * every `$obj->M(...)` call site whose static `invocant_class`
+    ///     is the rename target *or* an intermediate ancestor that
+    ///     inherited (didn't override) the method.
+    ///
+    /// `rename_method_in_class` is per-class — so callers iterate this
+    /// chain. Stops at the first ancestor that defines the method
+    /// (inclusive); intermediate ancestors that *override* are
+    /// skipped because they're a different method from the
+    /// inheritance perspective.
+    pub fn method_rename_chain(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Vec<String> {
+        let defining = match self.resolve_method_in_ancestors(class_name, method_name, module_index) {
+            Some(MethodResolution::Local { class, .. })
+            | Some(MethodResolution::CrossFile { class }) => class,
+            None => return vec![class_name.to_string()],
+        };
+        let mut chain = Vec::new();
+        self.for_each_ancestor_class(class_name, module_index, |cls| {
+            chain.push(cls.to_string());
+            if cls == defining {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        if chain.is_empty() { chain.push(class_name.to_string()); }
+        chain
+    }
+
     /// Walk the inheritance chain to find a method (DFS, matches Perl's default MRO).
     pub fn resolve_method_in_ancestors(
         &self,
@@ -3982,6 +4055,11 @@ impl FileAnalysis {
                 out.extend(self.outline_children_of(scope.id));
             }
         }
+        // File-scope symbols (incl. lexical `my` / `our` lifted past
+        // sibling Package scopes) and Package-sibling-scope symbols
+        // come from separate buckets — sort by source position so the
+        // outline reflects code order, not bucket order.
+        out.sort_by_key(|o| (o.span.start.row, o.span.start.column));
 
         // Plugin namespaces are NOT surfaced in the document outline.
         // They exist for cross-file bridge lookups
@@ -6664,5 +6742,61 @@ my $host = $cfg->{host};
             Some(InferredType::HashRef),
             "without class evidence, $cfg is plain HashRef"
         );
+    }
+
+    /// Inherited-method rename — pin the chain that the LSP rename
+    /// path walks. e2e `rename: process → execute` was the surface
+    /// failure: `rename_method_in_class` strict-matches both the
+    /// def's `package` and the call site's `invocant_class`, so a
+    /// rename starting on `$worker->process()` (invocant=MyWorker)
+    /// only catches the call sites in the child class — never
+    /// reaches `sub process` in `BaseWorker.pm`. The chain is
+    /// `[child, …, defining ancestor]`; backend renames in every
+    /// link and merges. Stops at the first defining ancestor so
+    /// overrides in unrelated branches aren't lumped in.
+    #[test]
+    fn red_pin_method_rename_chain_walks_to_defining_ancestor() {
+        // Same-file inheritance — keeps the test free of the
+        // module_index, which still gets exercised end-to-end via the
+        // e2e suite.
+        let src = "\
+package Animal;
+sub speak { return '...' }
+sub breathe { return 1 }
+
+package Dog;
+our @ISA = ('Animal');
+sub speak { return 'Woof!' }
+# `breathe` inherited; no override
+
+package main;
+my $dog = bless {}, 'Dog';
+$dog->breathe();
+$dog->speak();
+";
+        let fa = build_fa_from_source(src);
+
+        // Inherited (defined in Animal, not in Dog) — chain runs
+        // child → defining ancestor and stops.
+        let chain = fa.method_rename_chain("Dog", "breathe", None);
+        assert_eq!(
+            chain, vec!["Dog".to_string(), "Animal".to_string()],
+            "inherited method: chain must reach the defining ancestor",
+        );
+
+        // Override (Dog defines `speak` itself) — chain stops at
+        // child. Walking past the override into Animal would lump
+        // two semantically distinct methods together in one rename.
+        let chain = fa.method_rename_chain("Dog", "speak", None);
+        assert_eq!(
+            chain, vec!["Dog".to_string()],
+            "overridden method: chain must stop at the defining (= child) class, \
+             not include the parent's same-named method",
+        );
+
+        // Unknown method: degrade to the original class so the
+        // backend's per-class rename still runs (no edits, no harm).
+        let chain = fa.method_rename_chain("Dog", "nonexistent", None);
+        assert_eq!(chain, vec!["Dog".to_string()]);
     }
 }

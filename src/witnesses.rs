@@ -11,6 +11,14 @@
 //! - Attachment-indexed bag on `FileAnalysis`.
 //! - Reducer trait + a built-in framework-aware type-fold reducer
 //!   (Part 6 from the spec).
+//!
+//! `#[allow(dead_code)]` on a few API surfaces (`WitnessBag::all`,
+//! `filter`, `is_empty`; `ReturnOfKey::{Symbol, Name, MethodOnClass}`
+//! payloads; `ReducedValue::FactMap`; `WitnessReducer::name`) — these
+//! are part of the bag's stable contract for plugins and future
+//! reducers (e.g. dispatch chain folding via `MethodOnClass`,
+//! payload-bearing reductions via `FactMap`). They're held in the
+//! public surface deliberately rather than chased dead.
 
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
@@ -207,6 +215,7 @@ impl WitnessBag {
         idx
     }
 
+    #[allow(dead_code)]
     pub fn all(&self) -> &[Witness] {
         &self.witnesses
     }
@@ -219,6 +228,7 @@ impl WitnessBag {
     }
 
     /// Iterate witnesses that match a predicate on attachment. O(n).
+    #[allow(dead_code)]
     pub fn filter<P: Fn(&Witness) -> bool>(&self, pred: P) -> Vec<&Witness> {
         self.witnesses.iter().filter(|w| pred(w)).collect()
     }
@@ -246,6 +256,7 @@ impl WitnessBag {
         self.witnesses.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.witnesses.is_empty()
     }
@@ -272,6 +283,7 @@ pub struct ReducerQuery<'a> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // payloads + MethodOnClass — see module-level note
 pub enum ReturnOfKey {
     Symbol(SymbolId),
     Name(String),
@@ -281,6 +293,7 @@ pub enum ReturnOfKey {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // FactMap reserved for payload-bearing reducers
 pub enum ReducedValue {
     Type(InferredType),
     FactMap(Vec<(String, FactValue)>),
@@ -288,6 +301,7 @@ pub enum ReducedValue {
 }
 
 pub trait WitnessReducer: Send + Sync {
+    #[allow(dead_code)] // identity for tracing/debug; see module-level note
     fn name(&self) -> &str;
 
     fn claims(&self, w: &Witness) -> bool;
