@@ -114,19 +114,6 @@ pub struct Scope {
 #[allow(dead_code)]
 pub enum ScopeKind {
     File,
-    // TODO(scope-separation): `Package` here is a sibling-scope
-    // grouping for *package* lookup (subs, `package_at`,
-    // outline-by-namespace) — it is NOT a lexical boundary. `my`
-    // is file-lexical and must be lifted past these in
-    // `add_symbol_ns` (see `nearest_lexical_scope`); the document
-    // outline has to merge file-scope and Package-sibling-scope
-    // children by source position. Both are smells from
-    // overloading one `ScopeKind` for two unrelated concepts.
-    // Follow-up: split lexical scope (the tree) from package
-    // context (a flat `Vec<(Span, String)>` for `package_at`).
-    // Spec: `docs/prompt-scope-separation.md`.
-    /// Region after `package Foo;` until next package statement or EOF.
-    Package,
     /// `class Foo { ... }` block.
     Class { name: String },
     /// `sub foo { ... }` block.
@@ -137,6 +124,32 @@ pub enum ScopeKind {
     Block,
     /// `for my $x (...) { }` — loop variable scoped to block.
     ForLoop { var: String },
+}
+
+// ---- Package context ----
+
+/// Flat per-file record of which `package`/`class` declaration governs a
+/// byte range. Independent of the lexical scope tree — `package Foo;` is
+/// not a lexical boundary in Perl, so collapsing the two concepts forces
+/// shims (lift `my` past the package "scope", merge buckets in the
+/// outline). See `docs/prompt-scope-separation.md`.
+///
+/// Query via `FileAnalysis::package_at(point)` — innermost (latest-starting)
+/// containing range wins for nested `package Foo { … package Bar; … }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageRange {
+    pub package: String,
+    pub span: Span,
+    pub kind: PackageKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PackageKind {
+    /// `package Foo;` / `class Foo;` — flows until the next sibling
+    /// declaration or end of file/block.
+    Statement,
+    /// `package Foo { … }` / `class Foo { … }` — span equals the block.
+    Block,
 }
 
 // ---- Namespace ----
@@ -926,6 +939,13 @@ pub struct FileAnalysis {
     pub call_bindings: Vec<CallBinding>,
     pub method_call_bindings: Vec<MethodCallBinding>,
 
+    /// Flat list of `package`/`class` declarations and the byte ranges
+    /// they govern. Replaces `Scope::package` walks for `package_at`.
+    /// `#[serde(default)]` so older cache blobs deserialize as empty
+    /// (`package_at` falls back to the legacy scope walk in that case).
+    #[serde(default)]
+    pub package_ranges: Vec<PackageRange>,
+
     /// Parent classes for each package in this file.
     /// Populated by the builder from use parent/base, @ISA, and class :isa.
     pub package_parents: HashMap<String, Vec<String>>,
@@ -1030,6 +1050,7 @@ impl FileAnalysis {
         plugin_namespaces: Vec<PluginNamespace>,
         package_uses: HashMap<String, Vec<String>>,
         type_provenance: HashMap<SymbolId, TypeProvenance>,
+        package_ranges: Vec<PackageRange>,
     ) -> Self {
         let mut fa = FileAnalysis {
             scopes,
@@ -1040,6 +1061,7 @@ impl FileAnalysis {
             imports,
             call_bindings,
             method_call_bindings,
+            package_ranges,
             package_parents,
             package_uses,
             imported_return_types: HashMap::new(),
@@ -2466,8 +2488,35 @@ impl FileAnalysis {
     }
 
     /// Get the enclosing package name at a point.
+    ///
+    /// Resolves via `package_ranges` (innermost — latest-starting —
+    /// containing range wins). Falls back to a scope walk for older
+    /// cache blobs deserialised before `package_ranges` existed.
     #[allow(dead_code)]
     pub fn package_at(&self, point: Point) -> Option<&str> {
+        if !self.package_ranges.is_empty() {
+            let mut best: Option<&PackageRange> = None;
+            for r in &self.package_ranges {
+                if !contains_point(&r.span, point) {
+                    continue;
+                }
+                let win = match best {
+                    None => true,
+                    Some(prev) => {
+                        // Latest-starting wins; on a tie, narrower span wins.
+                        let cur_start = (r.span.start.row, r.span.start.column);
+                        let prev_start = (prev.span.start.row, prev.span.start.column);
+                        cur_start > prev_start
+                            || (cur_start == prev_start && span_size(&r.span) < span_size(&prev.span))
+                    }
+                };
+                if win {
+                    best = Some(r);
+                }
+            }
+            return best.map(|r| r.package.as_str());
+        }
+        // Fallback: legacy cache blob with no package_ranges.
         let scope = self.scope_at(point)?;
         let chain = self.scope_chain(scope);
         for scope_id in &chain {
@@ -4041,34 +4090,20 @@ impl FileAnalysis {
     /// Build document outline as a nested symbol tree.
     /// Returns (name, detail, kind, span, selection_span, children) tuples.
     pub fn document_symbols(&self) -> Vec<OutlineSymbol> {
-        // Find the file scope (ScopeId(0))
-        let file_scope = ScopeId(0);
-        let mut out = self.outline_children_of(file_scope);
-        // Non-block `package X;` / `class X;` sibling scopes are
-        // tagged `ScopeKind::Package` and flatten into the file-level
-        // outline (each entity — helper, route, task — sits directly
-        // under the file, not nested under a package entry).
-        for scope in &self.scopes {
-            if scope.parent == Some(file_scope)
-                && matches!(scope.kind, ScopeKind::Package)
-            {
-                out.extend(self.outline_children_of(scope.id));
-            }
-        }
-        // File-scope symbols (incl. lexical `my` / `our` lifted past
-        // sibling Package scopes) and Package-sibling-scope symbols
-        // come from separate buckets — sort by source position so the
-        // outline reflects code order, not bucket order.
-        out.sort_by_key(|o| (o.span.start.row, o.span.start.column));
-
-        // Plugin namespaces are NOT surfaced in the document outline.
-        // They exist for cross-file bridge lookups
-        // (`for_each_entity_bridged_to`), not as navigation targets —
-        // users look for the helpers/routes/tasks themselves, which
-        // already render flat with their `<word>` kind prefix.
-        // Surfacing the namespace as a separate entry adds a row with
-        // no unique information you can act on.
-        out
+        // All top-level entities (subs/methods declared after
+        // `package X;`, `my`/`our` decls, `use` imports, …) attach
+        // to the file scope directly. Statement-form `package X;`
+        // is package context, not a lexical boundary, so it doesn't
+        // create an intermediate scope. The bucket-merge + post-sort
+        // shim that used to live here is gone — children come out in
+        // declaration order from the symbols vector.
+        //
+        // Plugin namespaces are NOT surfaced. They exist for
+        // cross-file bridge lookups (`for_each_entity_bridged_to`),
+        // not as navigation targets — users look for the
+        // helpers/routes/tasks themselves, which already render flat
+        // with their `<word>` kind prefix.
+        self.outline_children_of(ScopeId(0))
     }
 
     fn outline_children_of(&self, parent_scope: ScopeId) -> Vec<OutlineSymbol> {
@@ -5502,6 +5537,7 @@ mod tests {
             vec![],
             HashMap::new(),
             HashMap::new(),
+            vec![],
         )
     }
 
@@ -5607,6 +5643,7 @@ mod tests {
             vec![],
             HashMap::new(),
             HashMap::new(),
+            vec![],
         );
         assert_eq!(fa.sub_return_type_at_arity("get_config", None), Some(InferredType::HashRef));
         assert_eq!(fa.sub_return_type_at_arity("nonexistent", None), None);
@@ -5733,6 +5770,7 @@ mod tests {
             vec![],
             HashMap::new(),
             HashMap::new(),
+            vec![],
         );
 
         let mut imported = HashMap::new();
