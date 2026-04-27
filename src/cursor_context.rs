@@ -51,6 +51,11 @@ pub struct CallContext {
     pub at_key_position: bool,
     /// Keys already typed at the call site (barewords/strings before `=>`).
     pub used_keys: HashSet<String>,
+    /// The first argument as a constant string when it folds to a literal.
+    /// Used by string-dispatch signature help (`$x->emit('ready', CURSOR)`
+    /// looks this up against HashKeyDefs to surface handler params). `None`
+    /// when the first arg is a variable/expression.
+    pub first_arg_string: Option<String>,
 }
 
 // ---- Cursor context detection (text-only, no tree) ----
@@ -154,7 +159,11 @@ fn resolve_text_invocant(text: &str, point: Point, analysis: Option<&FileAnalysi
         // Bareword — treat as class name
         Some(InferredType::ClassName(text.to_string()))
     } else if let Some(a) = analysis {
-        a.inferred_type(text, point).cloned()
+        // Route through the witness-bag path so framework-aware
+        // resolution (Mojo `sub name`, blessed-hashref, branch arms,
+        // arity) refines the answer. Falls back to legacy
+        // `inferred_type` when the bag has nothing.
+        a.inferred_type_via_bag(text, point)
     } else {
         None
     }
@@ -242,11 +251,28 @@ fn extract_invocant_from_prefix(prefix: &str) -> &str {
 ///
 /// Returns `None` if no expression-based context is detected (caller should
 /// fall back to text-based detection).
+#[cfg(test)]
 pub fn detect_cursor_context_tree(
     tree: &Tree,
     source: &[u8],
     point: Point,
     analysis: &FileAnalysis,
+) -> Option<CursorContext> {
+    detect_cursor_context_tree_with_index(tree, source, point, analysis, None)
+}
+
+/// Variant that threads a module index through for cross-file type
+/// resolution. Callers that have an index (the LSP completion path)
+/// use this so chained calls like `$c->helper_root->...` see methods
+/// declared in other files — without the index, `$c->users` can't
+/// resolve to the helper's synthetic return type and completion
+/// falls through to the untyped path.
+pub fn detect_cursor_context_tree_with_index(
+    tree: &Tree,
+    source: &[u8],
+    point: Point,
+    analysis: &FileAnalysis,
+    module_index: Option<&crate::module_index::ModuleIndex>,
 ) -> Option<CursorContext> {
     // Find the node at/just before the cursor
     let check_point = if point.column > 0 {
@@ -273,13 +299,13 @@ pub fn detect_cursor_context_tree(
                                     || parent.kind() == "function_call_expression"
                                 {
                                     let invocant_text = parent.utf8_text(source).unwrap_or("").to_string();
-                                    let invocant_type = resolve_node_type(parent, source, analysis, point);
+                                    let invocant_type = resolve_node_type(parent, source, analysis, point, module_index);
                                     return Some(CursorContext::Method { invocant_type, invocant_text });
                                 }
                             }
                         }
                         let invocant_text = invocant_node.utf8_text(source).unwrap_or("").to_string();
-                        let invocant_type = resolve_node_type(invocant_node, source, analysis, point);
+                        let invocant_type = resolve_node_type(invocant_node, source, analysis, point, module_index);
                         return Some(CursorContext::Method { invocant_type, invocant_text });
                     }
                 }
@@ -289,16 +315,33 @@ pub fn detect_cursor_context_tree(
                 if let Some(base) = current.named_child(0) {
                     if base.end_position() < point {
                         let var_text = base.utf8_text(source).unwrap_or("").to_string();
-                        let owner_type = resolve_node_type(base, source, analysis, point);
+                        let owner_type = resolve_node_type(base, source, analysis, point, module_index);
                         let source_sub = extract_call_name(base, source);
                         return Some(CursorContext::HashKey { owner_type, var_text, source_sub });
+                    }
+                }
+            }
+            "anonymous_hash_expression" => {
+                // `{ key => ... }` literal. If it lives as a positional
+                // argument to a method/function call, the hash's owner
+                // is the called sub — mirror of "inside ->{…}" detection
+                // so `foo($x, { | })` completes against foo()'s final
+                // hashref-arg keys. Only trigger when the cursor is at
+                // a key position inside the literal (even-comma count).
+                if let Some(call_name) = enclosing_call_for_hash_arg(current, source) {
+                    if cursor_at_hash_key_slot(current, point) {
+                        return Some(CursorContext::HashKey {
+                            owner_type: None,
+                            var_text: String::new(),
+                            source_sub: Some(call_name),
+                        });
                     }
                 }
             }
             "ERROR" => {
                 // Incomplete expression: look for `expr->{` or `expr->` patterns
                 // in error recovery
-                if let Some(ctx) = detect_from_error_node(current, source, point, analysis) {
+                if let Some(ctx) = detect_from_error_node(current, source, point, analysis, module_index) {
                     return Some(ctx);
                 }
             }
@@ -309,19 +352,65 @@ pub fn detect_cursor_context_tree(
     None
 }
 
+/// For an `anonymous_hash_expression` node, find the enclosing
+/// method/function call whose argument list contains it. Returns the
+/// callee name; None when the hash literal lives outside any call
+/// (e.g. `my $cfg = { ... }` — a pure constructor, no caller context).
+/// Used by cursor-context detection to route `foo($x, { | })` to the
+/// callee's HashKey completions without touching the core's hash-
+/// ownership model.
+fn enclosing_call_for_hash_arg(hash_node: Node, source: &[u8]) -> Option<String> {
+    // Walk up until we find the call whose args include this hash.
+    // Stop at a sub-scope boundary (block/sub-body) so we don't
+    // leak across function boundaries.
+    let mut n = hash_node;
+    for _ in 0..16 {
+        let parent = n.parent()?;
+        match parent.kind() {
+            "method_call_expression" => {
+                let method = parent.child_by_field_name("method")?;
+                return method.utf8_text(source).ok().map(|s| s.to_string());
+            }
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                let func = parent.child_by_field_name("function")?;
+                return func.utf8_text(source).ok().map(|s| s.to_string());
+            }
+            "block" | "subroutine_declaration_statement"
+            | "method_declaration_statement" | "anonymous_subroutine_expression"
+            | "class_statement" | "package_statement" => return None,
+            _ => {}
+        }
+        n = parent;
+    }
+    None
+}
+
+/// Inside an `anonymous_hash_expression`, determine whether the cursor
+/// sits at a key slot (even number of `,`/`=>` separators since the
+/// opening `{`). Matches the call-arg key-vs-value counting.
+fn cursor_at_hash_key_slot(hash_node: Node, point: Point) -> bool {
+    count_separators_before(hash_node, point) % 2 == 0
+}
+
 /// Resolve the type of a tree-sitter node used as an invocant or hash owner.
 /// Handles both simple variables (via `inferred_type`) and complex expressions.
-fn resolve_node_type(node: Node, source: &[u8], analysis: &FileAnalysis, point: Point) -> Option<InferredType> {
+fn resolve_node_type(
+    node: Node,
+    source: &[u8],
+    analysis: &FileAnalysis,
+    point: Point,
+    module_index: Option<&crate::module_index::ModuleIndex>,
+) -> Option<InferredType> {
     match node.kind() {
         "scalar" | "array" | "hash" => {
             let text = node.utf8_text(source).ok()?;
-            analysis.inferred_type(text, point).cloned()
+            analysis.inferred_type_via_bag(text, point)
         }
         "bareword" | "package" => {
             let text = node.utf8_text(source).ok()?;
             Some(InferredType::ClassName(text.to_string()))
         }
-        _ => analysis.resolve_expression_type(node, source, None),
+        _ => analysis.resolve_expression_type(node, source, module_index),
     }
 }
 
@@ -336,6 +425,7 @@ fn detect_from_error_node(
     source: &[u8],
     point: Point,
     analysis: &FileAnalysis,
+    module_index: Option<&crate::module_index::ModuleIndex>,
 ) -> Option<CursorContext> {
     let mut last_expr: Option<Node> = None;
     let mut saw_arrow = false;
@@ -372,7 +462,7 @@ fn detect_from_error_node(
 
     if let Some(expr) = last_expr {
         let text = expr.utf8_text(source).unwrap_or("").to_string();
-        let resolved_type = resolve_node_type(expr, source, analysis, point);
+        let resolved_type = resolve_node_type(expr, source, analysis, point, module_index);
         if saw_brace {
             let source_sub = extract_call_name(expr, source);
             return Some(CursorContext::HashKey { owner_type: resolved_type, var_text: text, source_sub });
@@ -392,7 +482,7 @@ pub fn find_call_context(tree: &Tree, source: &[u8], point: Point) -> Option<Cal
     let (name, is_method, invocant, args_node) = find_call_at_cursor(tree, source, point)?;
 
     let active_param = match args_node {
-        Some(args) => count_commas_before(args, point),
+        Some(args) => active_slot_in_node(args, point),
         None => 0,
     };
 
@@ -406,6 +496,8 @@ pub fn find_call_context(tree: &Tree, source: &[u8], point: Point) -> Option<Cal
         None => HashSet::new(),
     };
 
+    let first_arg_string = args_node.and_then(|args| first_arg_as_string(args, source));
+
     Some(CallContext {
         name,
         is_method,
@@ -413,7 +505,37 @@ pub fn find_call_context(tree: &Tree, source: &[u8], point: Point) -> Option<Cal
         active_param,
         at_key_position,
         used_keys,
+        first_arg_string,
     })
+}
+
+/// If the first argument of a call is a string literal or bareword, return
+/// its content. Used for string-dispatch signature help.
+fn first_arg_as_string(args: Node, source: &[u8]) -> Option<String> {
+    let first = if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
+        args.named_child(0)?
+    } else {
+        args
+    };
+    match first.kind() {
+        "string_literal" | "interpolated_string_literal" => {
+            // Pull the `string_content` child — quote-flavor-agnostic
+            // (q{}, qq{}, heredocs, '' vs "") and avoids the
+            // trim-delimiters brittleness.
+            for i in 0..first.named_child_count() {
+                if let Some(child) = first.named_child(i) {
+                    if child.kind() == "string_content" {
+                        return child.utf8_text(source).ok().map(|s| s.to_string());
+                    }
+                }
+            }
+            Some(String::new())
+        }
+        "bareword" | "autoquoted_bareword" => {
+            first.utf8_text(source).ok().map(|s| s.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Find call context at cursor — walks up from cursor to find enclosing call.
@@ -636,28 +758,63 @@ fn parse_call_from_error<'a>(
 
 // ---- Counting helpers ----
 
-/// Count top-level commas before cursor → active parameter index.
-fn count_commas_before(node: Node, cursor: Point) -> usize {
+/// Index of the positional-argument slot the cursor is sitting in,
+/// scoped to a single call-args / container node. Tree-based: counts
+/// the NAMED children (which are the positional arguments) whose end
+/// lies at-or-before the cursor. Counts fat-commas and literal commas
+/// the same way, because they're both just separators between named
+/// children in the parser — there's no text matching here.
+///
+///   `enqueue('t', [a], {})` cursor inside `[a]` → 1 named child
+///     (the string_literal `'t'`) has ended before cursor → slot 1.
+///
+///   `enqueue(t => [a], {})` cursor inside `[a]` → 1 named child
+///     (the autoquoted_bareword `t`) has ended → slot 1. Same answer.
+pub fn active_slot_in_node(node: Node, cursor: Point) -> usize {
+    let scope = item_scope(node);
+    // Only `list_expression` carries comma-separated slots. Single-arg
+    // calls like `url_for('Users#list')` pass the argument NODE
+    // directly as `arguments` (per the tree-sitter-perl CLAUDE.md
+    // note), so `scope` is the `string_literal` itself — iterating
+    // its named children counts INTERNAL structure (the lone
+    // `string_content`) and double-trips the "past this slot"
+    // boundary when the cursor reaches the content's end. That makes
+    // dispatch completion flip to `active_param=1` at the exact
+    // closing-quote cursor position the user lands on with `i` to
+    // edit inside the string.
+    if scope.kind() != "list_expression" {
+        return 0;
+    }
     let mut count = 0;
-    let mut depth = 0;
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            if child.start_position() >= cursor {
-                break;
-            }
-            match child.kind() {
-                "(" | "[" | "{" => depth += 1,
-                ")" | "]" | "}" => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
-                }
-                "," if depth == 0 => count += 1,
-                _ => {}
-            }
+    let c_pos = (cursor.row, cursor.column);
+    let mut walker = scope.walk();
+    for child in scope.named_children(&mut walker) {
+        let e = child.end_position();
+        if (e.row, e.column) <= c_pos {
+            // Child has ended at-or-before the cursor — cursor is
+            // past this slot.
+            count += 1;
+        } else {
+            // Cursor is inside this child (or before it). Either way,
+            // this is the slot the cursor is currently in; stop.
+            break;
         }
     }
     count
+}
+
+/// tree-sitter-perl wraps multi-item container contents in an inner
+/// `list_expression`, so `[a, b, c]` parses as an
+/// `anonymous_array_expression` whose only named child is a
+/// `list_expression` holding the items. Callers want to iterate the
+/// items directly — descend through that single-child wrapper.
+fn item_scope(node: Node) -> Node {
+    let mut walker = node.walk();
+    let named: Vec<_> = node.named_children(&mut walker).collect();
+    if named.len() == 1 && named[0].kind() == "list_expression" {
+        return named[0];
+    }
+    node
 }
 
 /// Count both `,` and `=>` separators before cursor at top-level depth.
@@ -686,6 +843,41 @@ fn count_separators_before(node: Node, cursor: Point) -> usize {
 }
 
 /// Collect keys already used at the call site (barewords/strings before `=>`).
+/// Collect keys already present in the innermost hash literal at
+/// the cursor position. Returns an empty set when the cursor isn't
+/// inside one. Completion uses this to avoid re-offering a key the
+/// user has already written.
+pub fn used_keys_in_enclosing_hash(tree: &Tree, source: &[u8], point: Point) -> HashSet<String> {
+    let check_point = if point.column > 0 {
+        Point::new(point.row, point.column - 1)
+    } else {
+        point
+    };
+    let Some(mut node) = tree.root_node().descendant_for_point_range(check_point, check_point)
+        else { return HashSet::new() };
+    for _ in 0..16 {
+        if node.kind() == "anonymous_hash_expression" {
+            // Child layout varies: sometimes the pairs are direct
+            // children of the hash node (`{ x => 1 }`); sometimes
+            // they're wrapped in a list_expression (`{ x => 1, y
+            // => 2 }`). Probe both — the pair-detector is the same
+            // shape regardless.
+            let mut used = collect_used_keys_at_callsite(node, source);
+            for i in 0..node.named_child_count() {
+                if let Some(inner) = node.named_child(i) {
+                    if inner.kind() == "list_expression" {
+                        used.extend(collect_used_keys_at_callsite(inner, source));
+                    }
+                }
+            }
+            return used;
+        }
+        let Some(parent) = node.parent() else { break };
+        node = parent;
+    }
+    HashSet::new()
+}
+
 fn collect_used_keys_at_callsite(args: Node, source: &[u8]) -> HashSet<String> {
     let mut used = HashSet::new();
     for i in 0..args.child_count() {
@@ -719,6 +911,123 @@ fn extract_key_text(node: Node, source: &[u8]) -> Option<String> {
         "string_content" => node.utf8_text(source).ok().map(|s| s.to_string()),
         _ => None, // dynamic keys — don't include
     }
+}
+
+// ---- Plugin query-hook context ----
+
+/// Build the `SigHelpQueryContext` / `CompletionQueryContext` a plugin
+/// query hook consumes. Extracts the innermost call at the cursor, the
+/// innermost nested container (array/hash), and the enclosing package.
+/// Returns `None` when no enclosing call exists and no plugin could
+/// plausibly claim the slot.
+///
+/// Lives in cursor_context.rs (rule #6 — this is cursor-position
+/// analysis) so the plugin hook wiring in symbols.rs stays an adapter
+/// and doesn't walk the tree directly (rule #3).
+pub fn build_plugin_query_context(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &[u8],
+    point: Point,
+) -> Option<crate::plugin::SigHelpQueryContext> {
+    use crate::plugin::{CallFrame, ContainerFrame, ContainerKind, SigHelpQueryContext};
+
+    let call_ctx = find_call_context(tree, source, point);
+    let call = call_ctx.as_ref().map(|c| {
+        // Minimal arg list: just the first positional as a folded string
+        // when available. Dispatcher plugins (Minion, mojo-events) need
+        // the task / event name to look up the right Handler. We don't
+        // walk the full arg list here — that would duplicate the
+        // builder's extraction at cursor time, and plugins that need
+        // more can request richer context via a future extension.
+        let args = match c.first_arg_string.as_ref() {
+            Some(s) => vec![crate::plugin::ArgInfo {
+                text: s.clone(),
+                string_value: Some(s.clone()),
+                span: crate::file_analysis::Span {
+                    start: point,
+                    end: point,
+                },
+                content_span: None,
+                inferred_type: Some(InferredType::String),
+                sub_params: Vec::new(),
+            }],
+            None => Vec::new(),
+        };
+        CallFrame {
+            is_method: c.is_method,
+            name: c.name.clone(),
+            receiver_text: c.invocant.clone(),
+            receiver_type: c.invocant.as_deref()
+                .and_then(|inv| analysis.invocant_text_to_class(Some(inv), point))
+                .map(InferredType::ClassName),
+            args,
+            cursor_arg_index: c.active_param,
+        }
+    });
+
+    // Innermost nested container: walk up from cursor to find the
+    // first anonymous_array_expression or anonymous_hash_expression
+    // before we exit the enclosing call. Returned alongside an
+    // optional `use M ...` module name when the matched container
+    // is the args of a use statement — lets plugins claim use-line
+    // option-key completion (`use DDP { caller_info => 1 }`) without
+    // the core hard-coding any specific module.
+    let (container, current_use_module) = {
+        let mut n = tree.root_node().descendant_for_point_range(point, point);
+        let mut found: Option<ContainerFrame> = None;
+        let mut found_node: Option<Node> = None;
+        while let Some(node) = n {
+            match node.kind() {
+                "anonymous_array_expression" => {
+                    found = Some(ContainerFrame {
+                        kind: ContainerKind::Array,
+                        active_slot: active_slot_in_node(node, point),
+                        existing_keys: Vec::new(),
+                    });
+                    found_node = Some(node);
+                    break;
+                }
+                "anonymous_hash_expression" => {
+                    let used = used_keys_in_enclosing_hash(tree, source, point);
+                    found = Some(ContainerFrame {
+                        kind: ContainerKind::Hash,
+                        active_slot: active_slot_in_node(node, point),
+                        existing_keys: used.into_iter().collect(),
+                    });
+                    found_node = Some(node);
+                    break;
+                }
+                "method_call_expression" | "function_call_expression"
+                | "ambiguous_function_call_expression" => break,
+                _ => {}
+            }
+            n = node.parent();
+        }
+        // If the matched container is a direct child of a use_statement,
+        // surface the module name. Walking only one level up is correct:
+        // the parser shape is `use_statement → anonymous_hash_expression`
+        // (no list_expression intermediary at the args level for the
+        // hash form). Bail on anything more nested — that's not a
+        // use-line args slot.
+        let use_module = found_node.and_then(|hash| {
+            let parent = hash.parent()?;
+            if parent.kind() != "use_statement" { return None; }
+            let module = parent.child_by_field_name("module")?;
+            module.utf8_text(source).ok().map(|s| s.to_string())
+        });
+        (found, use_module)
+    };
+
+    let current_package = analysis.package_at(point).map(|s| s.to_string());
+
+    if call.is_none() && container.is_none() { return None; }
+    Some(SigHelpQueryContext {
+        call,
+        cursor_inside: container,
+        current_package,
+        current_use_module,
+    })
 }
 
 // ---- Selection ranges (tree-based) ----
@@ -896,6 +1205,32 @@ mod tests {
             find_call_context(&tree, source.as_bytes(), Point::new(1, 10)).unwrap();
         assert_eq!(ctx.name, "foo");
         assert_eq!(ctx.active_param, 2);
+    }
+
+    /// Regression: cursor inside a single-arg call's string literal
+    /// (e.g. `url_for('Users#list')` with cursor on the `s` of `Users`)
+    /// must report `active_param = 0`. Before the fix, `active_slot_in_node`
+    /// iterated the string_literal's INTERNAL children (the lone
+    /// `string_content`) and counted it as a slot once the cursor
+    /// reached its end boundary — making dispatch completion die at
+    /// exactly the boundary where users expect it to narrow by the
+    /// typed content. Live symptom: in nvim, typing inside the
+    /// quotes randomly flipped the completion on/off (vs the stable
+    /// `active_param = 0` needed to surface handlers).
+    #[test]
+    fn test_call_context_cursor_inside_single_string_arg() {
+        let source = "$c->url_for('Users#list');";
+        let tree = parse(source);
+        for col in 12..=23 {
+            let ctx =
+                find_call_context(&tree, source.as_bytes(), Point::new(0, col)).unwrap();
+            assert_eq!(
+                ctx.active_param, 0,
+                "cursor at col {} inside `url_for('Users#list')` must be active_param=0; \
+                 got {}",
+                col, ctx.active_param,
+            );
+        }
     }
 
     #[test]

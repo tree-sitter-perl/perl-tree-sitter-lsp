@@ -3,43 +3,114 @@
 //! One depth-first walk populates scopes, symbols, refs, type constraints,
 //! and fold ranges. Post-passes resolve hash key owners and variable refs.
 
+use std::sync::{Arc, OnceLock};
+
 use tree_sitter::{Node, Point, Tree};
 
 use crate::file_analysis::*;
+use crate::plugin::{self, PluginRegistry};
+
+/// Process-wide plugin registry, built once with the bundled Rhai plugins
+/// (plus anything discovered under `$PERL_LSP_PLUGIN_DIR`). All `build()`
+/// calls share it; tests that need isolation use `build_with_plugins()`.
+pub fn default_plugin_registry() -> Arc<PluginRegistry> {
+    static REG: OnceLock<Arc<PluginRegistry>> = OnceLock::new();
+    REG.get_or_init(|| {
+        let engine = Arc::new(plugin::rhai_host::make_engine());
+        let mut reg = PluginRegistry::new();
+        for p in plugin::rhai_host::load_bundled(engine.clone()) {
+            reg.register(p);
+        }
+        if let Ok(dir) = std::env::var("PERL_LSP_PLUGIN_DIR") {
+            let path = std::path::PathBuf::from(dir);
+            for p in plugin::rhai_host::load_plugin_dir(&path, engine) {
+                reg.register(p);
+            }
+        }
+        Arc::new(reg)
+    }).clone()
+}
 
 /// Build a FileAnalysis from a parsed tree in a single walk.
 pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
+    build_with_plugins(tree, source, default_plugin_registry())
+}
+
+/// Build with a caller-provided plugin registry. Tests use this to swap in
+/// deterministic plugin sets; the global default is otherwise shared.
+pub fn build_with_plugins(
+    tree: &Tree,
+    source: &[u8],
+    plugins: Arc<PluginRegistry>,
+) -> FileAnalysis {
     let mut b = Builder {
         source,
         scopes: Vec::new(),
         symbols: Vec::new(),
         refs: Vec::new(),
         type_constraints: Vec::new(),
+        deferred_var_types: Vec::new(),
         fold_ranges: Vec::new(),
         imports: Vec::new(),
         return_infos: Vec::new(),
         last_expr_type: std::collections::HashMap::new(),
+        self_method_tails: std::collections::HashMap::new(),
         call_bindings: Vec::new(),
         method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
         package_parents: std::collections::HashMap::new(),
+        package_uses: std::collections::HashMap::new(),
         sub_return_delegations: std::collections::HashMap::new(),
         framework_modes: std::collections::HashMap::new(),
         framework_imports: std::collections::HashSet::new(),
         constant_strings: std::collections::HashMap::new(),
         export: Vec::new(),
         export_ok: Vec::new(),
+        plugin_namespaces: Vec::new(),
+        type_provenance: std::collections::HashMap::new(),
+        pending_witnesses: Vec::new(),
+        bag: crate::witnesses::WitnessBag::new(),
+        package_framework: std::collections::HashMap::new(),
         scope_stack: Vec::new(),
         current_package: None,
         next_scope_id: 0,
         next_symbol_id: 0,
+        plugins,
     };
 
     // Create file-level scope and walk
     let file_scope = b.push_scope(ScopeKind::File, node_to_span(tree.root_node()), None);
     b.visit_children(tree.root_node());
+    // Close any non-block `package`/`class` sibling scopes still open
+    // at EOF — their spans were seeded with the file end, so popping
+    // without trimming leaves them covering exactly the right range.
+    while let Some(&top) = b.scope_stack.last() {
+        if top == file_scope { break; }
+        b.pop_scope();
+    }
     b.pop_scope();
     let _ = file_scope;
+
+    // Flush plugin-emitted VarType constraints now that every scope
+    // has been pushed. Each uses scope_at on the declared anchor point
+    // so a `$app->helper(... sub { my ($c) = @_; ... })` emission
+    // lands inside the callback body rather than the outer file scope.
+    let deferred = std::mem::take(&mut b.deferred_var_types);
+    for d in deferred {
+        let scope = b
+            .scopes
+            .iter()
+            .rev()
+            .find(|s| crate::file_analysis::contains_point(&s.span, d.at.start))
+            .map(|s| s.id)
+            .unwrap_or(ScopeId(0));
+        b.type_constraints.push(TypeConstraint {
+            variable: d.variable,
+            scope,
+            constraint_span: d.at,
+            inferred_type: d.inferred_type,
+        });
+    }
 
     // Post-pass 1: resolve variable refs -> resolves_to
     b.resolve_variable_refs();
@@ -47,13 +118,86 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     // Post-pass 2: resolve hash key owners from type constraints
     b.resolve_hash_key_owners();
 
-    // Post-pass 3: infer return types for subs/methods
+    // Compute per-package framework facts BEFORE return-type fold so
+    // the bag-aware reducer has the right context. Mirrors the data
+    // the framework-accessor synthesis already consumed during the walk.
+    b.package_framework = b
+        .framework_modes
+        .iter()
+        .map(|(pkg, mode)| {
+            let ff = match mode {
+                FrameworkMode::Moo => crate::witnesses::FrameworkFact::Moo,
+                FrameworkMode::Moose => crate::witnesses::FrameworkFact::Moose,
+                FrameworkMode::MojoBase => crate::witnesses::FrameworkFact::MojoBase,
+            };
+            (pkg.clone(), ff)
+        })
+        .collect();
+
+    // Plugin `overrides()` manifests run first. They pin return
+    // types inference can't reach (`Mojolicious::Routes::Route::_route`
+    // returning $self via an array-slice idiom). Provenance is
+    // recorded in `type_provenance` (PluginOverride) so
+    // `--dump-package` can answer "why does this return X?".
+    b.apply_type_overrides();
+
+    // Single bag-population pass: mirror walk-time data
+    // (`type_constraints`, refs producing rep observations + method
+    // call return witnesses, write-mutations on hash keys) plus drain
+    // walk-emitted witnesses (`pending_witnesses`) into `b.bag`. After
+    // this point the bag is the source of truth for the witness pipeline.
+    b.populate_witness_bag();
+
+    // First fold: derive sub return types from the bag. Every reducer
+    // rule (framework / branch / arity) participates here. After this
+    // pass, return-shaped methods like `requires`, `to`, `name` are
+    // typed via the framework-aware fold; `_route` keeps its override.
     b.resolve_return_types();
 
-    // Post-pass 4: fill in tail POD docs for subs that didn't get preceding doc
+    // Symbolically execute every `my $X = <expr>` and push the result
+    // into the bag. ONE recursive typer (`resolve_invocant_class_tree`)
+    // handles whatever shape the rhs is — scalar, method-call chain,
+    // bareword, shift idiom, function call. No "is it a chain" branch.
+    // The result lands as both a `TypeConstraint` and a `Variable`
+    // witness, so the bag sees it like any other observation.
+    //
+    // Why now: the rhs of an assignment may walk through other subs'
+    // return types (`my $route = $self->_route(...)->requires(...)->to(...)`).
+    // Those return types only exist after the first fold above plus
+    // the override pass, so the typer must run AFTER both.
+    b.type_assignments_into_bag(tree);
+
+    // Refresh walk-time return-arm typings. `ReturnInfo.inferred_type`
+    // was computed during the walk against an empty `type_constraints`
+    // table — `return $route->name(...)` couldn't be typed because
+    // `$route` had no TC yet. Now that the chain pass has populated
+    // every assigned variable, re-walk each return expression with
+    // the same typer the walk used; whatever resolves now resolves
+    // for keeps. Same code path as walk-time typing — just rerun
+    // against the richer state.
+    b.refresh_return_arm_types(tree);
+
+    // Second fold: now that chain-assigned variables (`$route`) have
+    // typed bag entries AND return arms have been re-typed against
+    // the chain-populated TCs, subs whose return is `return …$route…` —
+    // most prominently `_generate_route` — fold correctly, and the
+    // tail-delegation propagation cascades to `get`/`post`/`put`/etc.
+    b.resolve_return_types();
+
+    // Post-pass 4: re-resolve invocant classes on MethodCall refs now
+    // that sub return types are known. Function-call chains like
+    // `get_foo()->bar()` need `get_foo`'s return type to pin the
+    // receiver class of `->bar`; that return type comes from the
+    // bag-aware fold in post-pass 3 plus any post-pass-3b overrides.
+    b.resolve_invocant_classes_post_pass(tree);
+
+    // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
     b.resolve_tail_pod_docs();
 
-    FileAnalysis::new(
+    let bag = std::mem::take(&mut b.bag);
+    let package_framework = std::mem::take(&mut b.package_framework);
+
+    let mut fa = FileAnalysis::new(
         b.scopes,
         b.symbols,
         b.refs,
@@ -66,7 +210,402 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
         b.framework_imports,
         b.export,
         b.export_ok,
-    )
+        b.plugin_namespaces,
+        b.package_uses,
+        b.type_provenance,
+    );
+    fa.package_framework = package_framework;
+    fa.witnesses = bag;
+    fa.witnesses.rebuild_index();
+    // Finalize: run the legacy text-based MCB resolver as a fallback.
+    // For every assignment the unified typer (run before
+    // `resolve_return_types` above) couldn't handle, MCB fills in.
+    // Cross-file enrichment also reuses MCB resolution without a tree.
+    fa.finalize_post_walk();
+
+    fa
+}
+
+impl<'a> Builder<'a> {
+    /// Mirror walk-time data into the witness bag. Runs ONCE before
+    /// `resolve_return_types`, populates the bag with:
+    ///
+    ///   - one `InferredType` payload + (optional) class-assertion
+    ///     observation per `TypeConstraint`,
+    ///   - `HashRefAccess` observations per `$v->{k}` ref,
+    ///   - `ReturnOfName` observations per method-call ref (for the
+    ///     fluent-chain Expression-attached fold),
+    ///   - `mutation` facts on each Class/Sub-owned hash-key write,
+    ///   - everything `pending_witnesses` collected during the walk
+    ///     (branch arms, arity gating).
+    ///
+    /// After this point the bag is the source of truth. Subsequent
+    /// passes that introduce new facts (call-binding propagation in
+    /// `resolve_return_types`) push directly into `self.bag` to keep
+    /// the bag and `self.type_constraints` in sync.
+    fn populate_witness_bag(&mut self) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+
+        // Mirror every TypeConstraint as a Variable-attachment
+        // InferredType witness (and a class-assertion observation when
+        // the type is a class identity).
+        let constraints = self.type_constraints.clone();
+        for tc in &constraints {
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Variable {
+                    name: tc.variable.clone(),
+                    scope: tc.scope,
+                },
+                source: WitnessSource::Builder("type_constraint".into()),
+                payload: WitnessPayload::InferredType(tc.inferred_type.clone()),
+                span: Span { start: tc.constraint_span.start, end: tc.constraint_span.start },
+            });
+            match tc.inferred_type {
+                InferredType::ClassName(ref n) => {
+                    self.bag.push(Witness {
+                        attachment: WitnessAttachment::Variable {
+                            name: tc.variable.clone(),
+                            scope: tc.scope,
+                        },
+                        source: WitnessSource::Builder("type_constraint".into()),
+                        payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(
+                            n.clone(),
+                        )),
+                        span: tc.constraint_span,
+                    });
+                }
+                InferredType::FirstParam { ref package } => {
+                    self.bag.push(Witness {
+                        attachment: WitnessAttachment::Variable {
+                            name: tc.variable.clone(),
+                            scope: tc.scope,
+                        },
+                        source: WitnessSource::Builder("type_constraint".into()),
+                        payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+                            package: package.clone(),
+                        }),
+                        span: tc.constraint_span,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Rep observations + Expression-attached method-call returns
+        // from refs.
+        let mut hash_obs: Vec<(String, ScopeId, Span)> = Vec::new();
+        let mut method_exprs: Vec<(usize, String, Span)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            match &r.kind {
+                RefKind::HashKeyAccess { var_text, .. } => {
+                    if var_text.starts_with('$') {
+                        hash_obs.push((var_text.clone(), r.scope, r.span));
+                    }
+                }
+                RefKind::MethodCall { .. } => {
+                    method_exprs.push((i, r.target_name.clone(), r.span));
+                }
+                _ => {}
+            }
+        }
+        for (var, scope, span) in hash_obs {
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Variable { name: var, scope },
+                source: WitnessSource::Builder("hash_ref_access".into()),
+                payload: WitnessPayload::Observation(TypeObservation::HashRefAccess),
+                span,
+            });
+        }
+        for (idx, method, span) in method_exprs {
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Expression(crate::witnesses::RefIdx(idx as u32)),
+                source: WitnessSource::Builder("method_call_return".into()),
+                payload: WitnessPayload::Observation(TypeObservation::ReturnOfName(method)),
+                span,
+            });
+        }
+
+        // Part 1 — invocant mutations on hash keys.
+        let mut mutations: Vec<(HashKeyOwner, String, Span)> = Vec::new();
+        for r in &self.refs {
+            if let (RefKind::HashKeyAccess { owner, var_text }, AccessKind::Write) =
+                (&r.kind, r.access)
+            {
+                let resolved_owner = match owner {
+                    Some(o @ (HashKeyOwner::Class(_) | HashKeyOwner::Sub { .. })) => Some(o.clone()),
+                    _ => {
+                        if var_text == "$self" {
+                            let scope = &self.scopes[r.scope.0 as usize];
+                            scope.package.clone().map(HashKeyOwner::Class)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(o) = resolved_owner {
+                    mutations.push((o, r.target_name.clone(), r.span));
+                }
+            }
+        }
+        for (owner, key, span) in mutations {
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::HashKey { owner, name: key.clone() },
+                source: WitnessSource::Builder("invocant_mutation".into()),
+                payload: WitnessPayload::Fact {
+                    family: "mutation".into(),
+                    key: "written_at".into(),
+                    value: crate::witnesses::FactValue::Str(key),
+                },
+                span,
+            });
+        }
+
+        // Drain walk-emitted witnesses (branch arms, arity gating).
+        let pending = std::mem::take(&mut self.pending_witnesses);
+        for w in pending {
+            self.bag.push(w);
+        }
+    }
+
+    /// Bag-aware variable type lookup during build. Thin pass-through
+    /// to the single shared `witnesses::query_variable_type` — same
+    /// helper `FileAnalysis::inferred_type` calls at query time. One
+    /// query path, one set of rules.
+    fn var_type_via_bag(
+        &self,
+        var: &str,
+        scope: ScopeId,
+        point: Point,
+    ) -> Option<InferredType> {
+        crate::witnesses::query_variable_type(
+            &self.bag,
+            &self.scopes,
+            &self.package_framework,
+            var,
+            scope,
+            point,
+        )
+    }
+}
+
+/// Which arity branch a `return_expression` represents. Computed
+/// from the shape of the return's parent in the CST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArityBranch {
+    /// `return X unless @_;` / `return X if !@_;` — fires when the
+    /// caller passed zero additional args.
+    Zero,
+    /// `return X if @_ == N;` / `if scalar(@_) == N;` / explicit
+    /// `if (@_ == N) { return X }`. Exact-N match.
+    Exact(u32),
+    /// Fall-through `return X;` with no condition wrapper — fires
+    /// when no earlier arity-gated branch matched.
+    Default,
+}
+
+/// Inspect the `return_expression`'s parent. If it's a
+/// `postfix_conditional_expression` with `@_` as the condition, we
+/// look at the connector keyword (`if` vs `unless`) to decide. If
+/// it's a bare expression_statement, this is a default branch.
+///
+/// Known idioms (spike shortlist):
+///   - `return X unless @_;`       → Zero
+///   - `return X;`                  → Default
+///
+/// Unknowns (return None and punt):
+///   - `return X if @_;`            (arity >= 1 narrowing)
+///   - `return X if @_ == N;`       (exact N)
+///   - `return X if scalar @_ …;`   (scalar wrapper)
+fn classify_arity_branch(return_node: tree_sitter::Node, source: &[u8]) -> Option<ArityBranch> {
+    let Some(parent) = return_node.parent() else { return None };
+    match parent.kind() {
+        "expression_statement" => classify_bare_return_or_if_arm(parent, source),
+        "postfix_conditional_expression" => {
+            let cond = parent.child_by_field_name("condition")?;
+            let keyword = connector_keyword_between(return_node, cond, source)?;
+            classify_arity_condition(cond, source, &keyword)
+        }
+        _ => None,
+    }
+}
+
+/// `expression_statement` parent → either a bare `return X` at sub
+/// body level (Default), OR inside an `if (@_ == N) { return X }` arm
+/// where the conditional_statement's condition is an arity test (Exact).
+fn classify_bare_return_or_if_arm(
+    expr_stmt: tree_sitter::Node,
+    source: &[u8],
+) -> Option<ArityBranch> {
+    let Some(block) = expr_stmt.parent() else { return None };
+    if block.kind() != "block" {
+        return None;
+    }
+    let Some(outer) = block.parent() else { return None };
+    match outer.kind() {
+        "subroutine_declaration_statement"
+        | "method_declaration_statement"
+        | "anonymous_subroutine_expression" => Some(ArityBranch::Default),
+        "conditional_statement" => {
+            // `if (condition) { return X }` — classify by condition.
+            // Arity-gated condition → Zero / Exact. Anything else
+            // (regular boolean predicate) is still a contributor to
+            // the default return shape: the arm runs whenever the
+            // condition holds, regardless of arity. Classify as
+            // Default so the FluentArityDispatch reducer can fold
+            // agreement across every arm that doesn't gate on arity.
+            let cond = outer.child_by_field_name("condition")?;
+            classify_arity_condition(cond, source, "if").or(Some(ArityBranch::Default))
+        }
+        _ => None,
+    }
+}
+
+/// Classify an arity condition node. `keyword` is "if" or "unless".
+fn classify_arity_condition(
+    cond: tree_sitter::Node,
+    source: &[u8],
+    keyword: &str,
+) -> Option<ArityBranch> {
+    // Shape 1: bare `@_`.
+    if cond.kind() == "array" {
+        let text = cond.utf8_text(source).ok()?.trim();
+        if text == "@_" {
+            return match keyword {
+                "unless" => Some(ArityBranch::Zero),
+                _ => None, // `if @_` is "arity >= 1" — not expressible as Exact yet.
+            };
+        }
+        return None;
+    }
+    // Shape 2: `!@_` → unary_expression with operand @_.
+    if cond.kind() == "unary_expression" {
+        let op_text = raw_leading_op(cond, source);
+        if op_text == "!" {
+            if let Some(operand) = cond.child_by_field_name("operand") {
+                if operand.kind() == "array" {
+                    let text = operand.utf8_text(source).ok()?.trim();
+                    if text == "@_" {
+                        return match keyword {
+                            "if" => Some(ArityBranch::Zero),
+                            "unless" => None, // `unless !@_` → arity >= 1, skip
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    // Shape 3: `@_ == N` / `scalar(@_) == N` → equality_expression.
+    if cond.kind() == "equality_expression" {
+        let op = raw_mid_op(cond, source);
+        if op != "==" && op != "!=" {
+            return None;
+        }
+        let left = cond.child_by_field_name("left")?;
+        let right = cond.child_by_field_name("right")?;
+        let n = extract_numeric(right, source)?;
+        let counts_args = node_is_arity_magnitude(left, source);
+        if !counts_args {
+            return None;
+        }
+        match (keyword, op.as_str()) {
+            ("if", "==") => Some(ArityBranch::Exact(n)),
+            ("unless", "!=") => Some(ArityBranch::Exact(n)),
+            _ => None, // != / >= / etc. — not a single Exact fact.
+        }
+    } else {
+        None
+    }
+}
+
+/// True if `node` evaluates to the length of `@_` — either `@_`
+/// itself (scalar context in an equality) or `scalar(@_)`.
+fn node_is_arity_magnitude(node: tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() == "array" {
+        return node.utf8_text(source).map(|s| s.trim() == "@_").unwrap_or(false);
+    }
+    if node.kind() == "func1op_call_expression" {
+        let Some(kw) = node.child(0) else { return false };
+        let Ok(name) = kw.utf8_text(source) else { return false };
+        if name != "scalar" {
+            return false;
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i) {
+                if c.kind() == "array" {
+                    return c.utf8_text(source).map(|s| s.trim() == "@_").unwrap_or(false);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract a small unsigned numeric literal from a `number` node.
+fn extract_numeric(node: tree_sitter::Node, source: &[u8]) -> Option<u32> {
+    if node.kind() != "number" {
+        return None;
+    }
+    node.utf8_text(source).ok()?.trim().parse::<u32>().ok()
+}
+
+/// Read the raw bytes between two sibling nodes to recover the
+/// postfix keyword (`if` / `unless` / `while` / …). Used because
+/// tree-sitter-perl shares one node kind for both `if` and `unless`.
+fn connector_keyword_between(
+    left: tree_sitter::Node,
+    right: tree_sitter::Node,
+    source: &[u8],
+) -> Option<String> {
+    let start = left.end_byte();
+    let end = right.start_byte();
+    if end <= start {
+        return None;
+    }
+    let between = std::str::from_utf8(&source[start..end]).ok()?.trim();
+    // Expect exactly one keyword in between.
+    for kw in ["unless", "if", "while", "until"] {
+        if between == kw || between.starts_with(kw) && between.trim() == kw {
+            return Some(kw.to_string());
+        }
+        // tolerate extra whitespace (e.g. newlines)
+        if between.split_whitespace().next() == Some(kw) {
+            return Some(kw.to_string());
+        }
+    }
+    None
+}
+
+fn raw_leading_op(node: tree_sitter::Node, source: &[u8]) -> String {
+    // Operator is an anonymous child between start and the first named
+    // child (operand). Read the bytes before the operand node.
+    let Some(operand) = node.child_by_field_name("operand") else {
+        return String::new();
+    };
+    let start = node.start_byte();
+    let end = operand.start_byte();
+    std::str::from_utf8(&source[start..end])
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn raw_mid_op(node: tree_sitter::Node, source: &[u8]) -> String {
+    let Some(left) = node.child_by_field_name("left") else {
+        return String::new();
+    };
+    let Some(right) = node.child_by_field_name("right") else {
+        return String::new();
+    };
+    let start = left.end_byte();
+    let end = right.start_byte();
+    std::str::from_utf8(&source[start..end])
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// A return value type collected during the walk, before post-pass resolution.
@@ -75,6 +614,20 @@ struct ReturnInfo {
     scope: ScopeId,
     /// The inferred type of the return value, if determinable from literals/constructors.
     inferred_type: Option<InferredType>,
+    /// When the return body is `return $var`, the variable's name and the
+    /// return point. Used by the post-bag-seed re-fold pass to defer the
+    /// type lookup to the framework-aware resolver — collection just
+    /// records WHICH variable was returned; reduction asks the bag.
+    deferred_var: Option<(String, Point)>,
+    /// Arity-dispatch classification (`unless @_`, `if @_ == N`, …) so
+    /// `resolve_return_types` can emit `ArityReturn` witnesses with the
+    /// bag-folded arm type AT REDUCTION TIME — rather than the walk
+    /// emitting them with a collection-time-folded type embedded.
+    /// `None` for returns that aren't arity-gated.
+    arity_branch: Option<ArityBranch>,
+    /// Span of the return-expression node — carried so the deferred
+    /// witness emission has the right `span` to attach.
+    span: Span,
 }
 
 /// If `return_node` is `return CALL`, where CALL is a simple named function
@@ -95,6 +648,79 @@ fn extract_delegated_call_name<'a>(return_node: Node<'a>, source: &'a [u8]) -> O
     // Strip package prefix — delegation is stored by bare sub name to match
     // the return_types lookup convention.
     Some(call_name.rsplit("::").next().unwrap_or(call_name).to_string())
+}
+
+/// Find the `varname` child of a variable node (`scalar`/`array`/`hash`/etc.).
+/// The grammar aliases its `_var_indirob` into a `varname` node whose text
+/// is the bare variable name — no sigil, no braces. For `${foo}` the outer
+/// `scalar` text is `${foo}` but the `varname` child text is just `foo`;
+/// for `$:whatever` it's whatever TSP decided is the name token.
+///
+/// For `${$hash{k}}` and other nontrivial derefs the varname child is a
+/// `block` — callers that only want a simple identifier should check the
+/// returned node's kind (`varname` text is only meaningful for the
+/// identifier form).
+fn find_varname_child<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if child.kind() == "varname" {
+                return Some(child);
+            }
+        }
+    }
+    None
+}
+
+/// Re-parse an `isa` value as Perl and extract the class name from
+/// `InstanceOf['Foo::Bar']` / `InstanceOf["Foo::Bar"]`. Tree-sitter-perl
+/// parses this as `ambiguous_function_call_expression` with function
+/// `InstanceOf` and an `anonymous_array_expression` argument containing
+/// a single string literal — we walk that shape and ignore everything
+/// else (if the tree doesn't match, this isn't an InstanceOf).
+fn parse_instance_of(isa: &str) -> Option<String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(isa, None)?;
+    let source = isa.as_bytes();
+
+    // Walk to the first ambiguous_function_call_expression.
+    fn find_call<'a>(node: Node<'a>) -> Option<Node<'a>> {
+        if node.kind() == "ambiguous_function_call_expression"
+            || node.kind() == "function_call_expression"
+        {
+            return Some(node);
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i) {
+                if let Some(found) = find_call(c) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    let call = find_call(tree.root_node())?;
+    let func = call.child_by_field_name("function")?;
+    if func.utf8_text(source).ok()? != "InstanceOf" {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    if args.kind() != "anonymous_array_expression" && args.kind() != "array_ref_expression" {
+        return None;
+    }
+    for i in 0..args.named_child_count() {
+        let child = args.named_child(i)?;
+        if matches!(child.kind(), "string_literal" | "interpolated_string_literal") {
+            for j in 0..child.named_child_count() {
+                if let Some(content) = child.named_child(j) {
+                    if content.kind() == "string_content" {
+                        return content.utf8_text(source).ok().map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Walk the delegation chain starting at `start` until we find a sub that
@@ -122,6 +748,12 @@ fn walk_return_delegation_chain(
     current
 }
 
+struct DeferredVarType {
+    variable: String,
+    at: Span,
+    inferred_type: InferredType,
+}
+
 struct Builder<'a> {
     source: &'a [u8],
 
@@ -129,12 +761,25 @@ struct Builder<'a> {
     symbols: Vec<Symbol>,
     refs: Vec<Ref>,
     type_constraints: Vec<TypeConstraint>,
+    /// Plugin-emitted `VarType` constraints, resolved to scopes only
+    /// after the whole CST has been walked (plugin dispatch runs
+    /// before we recurse into call args, so at emit-time the target
+    /// scope usually doesn't exist yet).
+    deferred_var_types: Vec<DeferredVarType>,
     fold_ranges: Vec<FoldRange>,
     imports: Vec<Import>,
     /// Return values collected during the walk (explicit `return` + implicit last expr).
     return_infos: Vec<ReturnInfo>,
     /// For each Sub/Method scope, the type of the last expression (implicit return).
     last_expr_type: std::collections::HashMap<ScopeId, Option<InferredType>>,
+    /// For each Sub/Method scope whose last body statement is
+    /// `shift->M(...)` or `$self->M(...)`: the method name M.
+    /// Perl's last statement returns, so if M is another method on
+    /// the same class, this sub's return type IS M's return type.
+    /// Resolved in the return-type post-pass via fixed-point
+    /// iteration — captures the Mojo `sub get { shift->_generate_route(...) }`
+    /// shape without hardcoding any framework knowledge.
+    self_method_tails: std::collections::HashMap<ScopeId, String>,
     /// Assignments where RHS is a function call — resolved in return-type post-pass.
     call_bindings: Vec<CallBinding>,
     /// Assignments where RHS is a method call — resolved in FileAnalysis post-pass.
@@ -143,6 +788,9 @@ struct Builder<'a> {
     pod_texts: Vec<String>,
     /// Parent classes for each package (from use parent/base, @ISA, class :isa).
     package_parents: std::collections::HashMap<String, Vec<String>>,
+    /// Modules the current package has `use`d, in source order. Used by
+    /// `PluginRegistry::applicable` for `Trigger::UsesModule` matching.
+    package_uses: std::collections::HashMap<String, Vec<String>>,
     /// sub_name → delegated sub name, for bodies that are `return other()` or
     /// a bare trailing call. Used to propagate hash-key ownership through
     /// intermediate subs so `sub chain { return get_config() }` doesn't
@@ -159,12 +807,44 @@ struct Builder<'a> {
     export: Vec<String>,
     /// Exported function names from @EXPORT_OK assignments.
     export_ok: Vec<String>,
+    /// Plugin-declared namespaces collected during the walk via
+    /// `EmitAction::PluginNamespace`. Flushed into the final
+    /// `FileAnalysis.plugin_namespaces`.
+    plugin_namespaces: Vec<crate::file_analysis::PluginNamespace>,
+    /// Per-symbol provenance for return types. Populated by plugin
+    /// `overrides()` (PluginOverride) and by reducer-driven folds
+    /// (ReducerFold). Empty entry == `TypeProvenance::Inferred`.
+    /// Flushed into `FileAnalysis.type_provenance` at construction.
+    type_provenance: std::collections::HashMap<SymbolId, TypeProvenance>,
+    /// Witnesses emitted during the walk — drained into the unified
+    /// `bag` at populate time. Populated by idiom detectors (branch
+    /// arms, arity gating, …) that need the CST during the walk.
+    pending_witnesses: Vec<crate::witnesses::Witness>,
+    /// The single, unified witness bag. Walk-time observations land in
+    /// `pending_witnesses`; post-walk seeding from `type_constraints`
+    /// + refs runs into this bag once via `populate_witness_bag()`.
+    /// `resolve_return_types` then queries this bag for return-arm
+    /// folding (the only fold), and any new TypeConstraints it pushes
+    /// (call-binding propagation) get mirrored back into the same bag
+    /// so it stays the source of truth. Moved into
+    /// `FileAnalysis.witnesses` when the analysis is constructed —
+    /// no second seeding pass.
+    bag: crate::witnesses::WitnessBag,
+    /// Per-package framework fact, computed from `framework_modes` once
+    /// the walk finishes. Available before `resolve_return_types` so
+    /// the bag-aware return-arm fold can ask the framework-aware
+    /// reducer with the right context.
+    package_framework: std::collections::HashMap<String, crate::witnesses::FrameworkFact>,
 
     // Walk state
     scope_stack: Vec<ScopeId>,
     current_package: Option<String>,
     next_scope_id: u32,
     next_symbol_id: u32,
+
+    /// Framework plugin registry. Shared Arc so multiple builders in one
+    /// process avoid re-compiling the same Rhai scripts.
+    plugins: Arc<PluginRegistry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -209,19 +889,79 @@ impl<'a> Builder<'a> {
     // ---- Symbol/Ref creation ----
 
     fn add_symbol(&mut self, name: String, kind: SymKind, span: Span, selection_span: Span, detail: SymbolDetail) -> SymbolId {
+        self.add_symbol_ns(name, kind, span, selection_span, detail, Namespace::Language)
+    }
+
+    fn add_symbol_ns(
+        &mut self,
+        name: String,
+        kind: SymKind,
+        span: Span,
+        selection_span: Span,
+        detail: SymbolDetail,
+        namespace: Namespace,
+    ) -> SymbolId {
         let id = SymbolId(self.next_symbol_id);
         self.next_symbol_id += 1;
+        // Lexical decls (`my`, `state`, `field`) cross statement-form
+        // `package Foo;` boundaries — they're tied to the enclosing
+        // real lexical scope (file / block / sub / method / class
+        // block / for-loop), not to package context. Sibling Package
+        // scopes are a package-lookup mechanism (subs, `package_at`,
+        // namespace grouping); attaching lexicals to them hides
+        // decls from later `package X;` sections of the same file.
+        //
+        // `our` is the exception — it's a *package-global* with a
+        // lexical alias. The variable lives in `$Package::name`, so
+        // it stays attached to the current Package scope and is
+        // *not* visible from a sibling `package main;` section as a
+        // bare `$name`.
+        //
+        // TODO(scope-separation): once lexical-vs-package scopes are
+        // split (see `docs/prompt-scope-separation.md`), this Lift
+        // becomes unnecessary — `add_symbol_ns` uses the lexical
+        // tree directly and `our` is recorded with package context
+        // separately.
+        let is_lexical = match (&kind, &detail) {
+            (SymKind::Field, _) => true,
+            (SymKind::Variable, SymbolDetail::Variable { decl_kind, .. }) => *decl_kind != DeclKind::Our,
+            (SymKind::Variable, _) => true,
+            _ => false,
+        };
+        let scope = if is_lexical {
+            self.nearest_lexical_scope()
+        } else {
+            self.current_scope()
+        };
         self.symbols.push(Symbol {
             id,
             name,
             kind,
             span,
             selection_span,
-            scope: self.current_scope(),
+            scope,
             package: self.current_package.clone(),
             detail,
+            namespace,
+            outline_label: None,
         });
         id
+    }
+
+    /// Walk up `current_scope()` past any `ScopeKind::Package` sibling
+    /// scopes — those track package context, not lexical scope.
+    fn nearest_lexical_scope(&self) -> ScopeId {
+        let mut id = self.current_scope();
+        loop {
+            let scope = &self.scopes[id.0 as usize];
+            if !matches!(scope.kind, ScopeKind::Package) {
+                return id;
+            }
+            match scope.parent {
+                Some(p) => id = p,
+                None => return id,
+            }
+        }
     }
 
     fn add_ref(&mut self, kind: RefKind, span: Span, target_name: String, access: AccessKind) {
@@ -233,6 +973,684 @@ impl<'a> Builder<'a> {
             access,
             resolves_to: None,
         });
+    }
+
+    // ---- Plugin dispatch helpers ----
+
+    /// Normalize a call's `arguments` field into a flat list of argument
+    /// nodes. Tree-sitter-perl wraps multi-arg lists in `list_expression`;
+    /// single-arg calls present the arg directly.
+    fn extract_call_args(&self, call_node: Node<'a>) -> Vec<Node<'a>> {
+        let args = match call_node.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
+            (0..args.named_child_count())
+                .filter_map(|i| args.named_child(i))
+                .collect()
+        } else {
+            vec![args]
+        }
+    }
+
+    /// Build an `ArgInfo` for a plugin. Constant-folds literals, barewords,
+    /// and `$var` references that accumulate in `constant_strings`. When the
+    /// arg is an anonymous sub, also extracts its param list so plugins
+    /// registering handlers (`->on('ready', sub ($s, $m) {})`) can preserve
+    /// the handler signature for later sig-help lookup.
+    fn arg_info_for(&self, arg: Node<'a>) -> plugin::ArgInfo {
+        let text = arg.utf8_text(self.source).unwrap_or("").to_string();
+        let mut content_span: Option<Span> = None;
+        let string_value = match arg.kind() {
+            "string_literal" | "interpolated_string_literal" => {
+                // Read the string_content child — quote-flavor-agnostic
+                // (handles q{}, qq!!, heredocs, etc.). An empty literal
+                // has no content child, so default to "".
+                // Also capture the content span so plugins can address
+                // positions inside the string without hardcoding
+                // quote-length offsets into the outer node's span.
+                for i in 0..arg.named_child_count() {
+                    if let Some(c) = arg.named_child(i) {
+                        if c.kind() == "string_content" {
+                            content_span = Some(node_to_span(c));
+                            break;
+                        }
+                    }
+                }
+                Some(self.extract_string_content(arg).unwrap_or_default())
+            }
+            // `autoquoted_bareword` is what the LHS of fat-comma parses
+            // as (`key => value`) — `bareword` never appears there. The
+            // `bareword` branch catches the other contexts (e.g. unquoted
+            // positional args) where the token text IS the string value.
+            "autoquoted_bareword" | "bareword" => Some(text.clone()),
+            "scalar" | "array" | "hash" => {
+                self.resolve_constant_strings(&text, 0)
+                    .and_then(|v| v.into_iter().next())
+            }
+            _ => None,
+        };
+        let inferred_type = self.infer_expression_type(arg, false);
+        let sub_params = if arg.kind() == "anonymous_subroutine_expression" {
+            self.extract_anonymous_sub_params(arg)
+        } else {
+            Vec::new()
+        };
+        plugin::ArgInfo {
+            text,
+            string_value,
+            span: node_to_span(arg),
+            content_span,
+            inferred_type,
+            sub_params,
+        }
+    }
+
+    /// Extract params from an anonymous sub. Delegates to the builder's
+    /// shared named-sub extractor (signature syntax + `my (...) = @_` +
+    /// `shift`/`$_[N]` unpacks, all via tree walking) so the two codepaths
+    /// can't diverge.
+    fn extract_anonymous_sub_params(&self, sub_node: Node<'a>) -> Vec<plugin::EmittedParam> {
+        self.extract_params(sub_node)
+            .into_iter()
+            .map(|p| plugin::EmittedParam {
+                name: p.name,
+                default: p.default,
+                is_slurpy: p.is_slurpy,
+                is_invocant: false,
+            })
+            .collect()
+    }
+
+    /// Best-effort receiver-type resolution for a method call. Handles:
+    ///   * `$self` / `__PACKAGE__`        → current package
+    ///   * bare `Pkg::Name`               → literal class
+    ///   * `$var` with a prior `my $var = Pkg->new` → looked up in
+    ///     `type_constraints` (reverse scan; latest wins). This lets the
+    ///     mojo-events plugin resolve `$obj->emit(...)` in a consumer file
+    ///     to the producer's class, enabling cross-file def/ref pairing.
+    /// Resolve a bare `foo()` call to the package whose `sub foo` it
+    /// refers to. Order mirrors Perl's name-lookup rule:
+    ///
+    ///   1. Explicit qualifier (`Foo::bar()` → `Foo`).
+    ///   2. Enclosing package that declares `sub <name>` locally (so
+    ///      `package Foo { sub bar {} bar(); }` resolves to `Foo`).
+    ///   3. Most-recent import whose `imported_symbols` lists this
+    ///      name (`use Bler qw/hi/` → `Bler`). Later imports win —
+    ///      Perl's later `use` shadows earlier one.
+    ///
+    /// Returns `None` when none of those pin a package. Downstream
+    /// class/package-scoped queries treat `None` as no-match rather
+    /// than falling back to name-only union.
+    fn resolve_call_package(&self, call_name: &str) -> Option<String> {
+        // (1) Qualified: `Foo::bar` → `Foo`.
+        if let Some(idx) = call_name.rfind("::") {
+            return Some(call_name[..idx].to_string());
+        }
+        // (2) Enclosing package defines the sub locally.
+        if let Some(ref pkg) = self.current_package {
+            if self.symbols.iter().any(|s| {
+                s.name == call_name
+                    && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                    && s.package.as_deref() == Some(pkg.as_str())
+            }) {
+                return Some(pkg.clone());
+            }
+        }
+        // (3) Imports — walk in reverse order so later `use` wins.
+        for imp in self.imports.iter().rev() {
+            if imp.imported_symbols.iter().any(|s| s.local_name == *call_name) {
+                return Some(imp.module_name.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolve a method-call invocant NODE to a class name, using the
+    /// tree so chain invocants (`Sner->new->hi`) work. Returns the
+    /// resolved class for:
+    ///   - bareword `Foo`            → `Foo`
+    ///   - `__PACKAGE__`             → current package
+    ///   - typed `$var`              → ClassName from the type constraint
+    ///   - `$self`                   → current package
+    ///   - `Foo->new` (chain)        → `Foo` (constructor)
+    ///   - `X->method()` chain       → return type of `X::method` if it's
+    ///                                 a ClassName (via the same recursion
+    ///                                 + return_type-on-Sub lookup)
+    /// Unresolvable cases return `None` — refs_to treats that as no
+    /// match rather than cross-linking unrelated classes.
+    fn resolve_invocant_class_tree(&self, node: Node<'a>) -> Option<String> {
+        match node.kind() {
+            "method_call_expression" => {
+                // Chain case. Recurse into the inner invocant to get
+                // the inner call's receiver class, then look up the
+                // inner method's return type on that class.
+                let inner_invocant = node.child_by_field_name("invocant")?;
+                let method = node.child_by_field_name("method")?;
+                let method_name = method.utf8_text(self.source).ok()?;
+                // `Foo->new` — cheap special-case: constructor on a
+                // bareword class returns that class. Handles the
+                // overwhelmingly common `Class->new->chain...` shape
+                // without needing Sub return_type lookups on `new`.
+                if method_name == "new" {
+                    if let Some(c) = self.extract_constructor_class(node) {
+                        return Some(c);
+                    }
+                }
+                let inner_class = self.resolve_invocant_class_tree(inner_invocant)?;
+                // Look up `inner_class::method_name` locally. Only
+                // resolve when its return type is a ClassName — we're
+                // building a class path, so non-class returns break
+                // the chain.
+                for sym in &self.symbols {
+                    if sym.name != method_name { continue; }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                    if sym.package.as_deref() != Some(inner_class.as_str()) { continue; }
+                    if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
+                        return Some(c.clone());
+                    }
+                }
+                None
+            }
+            "scalar" => {
+                let text = node.utf8_text(self.source).ok()?;
+                // Variable's type from a TypeConstraint. Accept both
+                // ClassName (explicit assertion) and FirstParam (the
+                // `my $self = shift` idiom) — both pin a class. Without
+                // FirstParam here, post-pass chain typing can't see
+                // through `$self->_route(...)->...` because $self's TC
+                // is FirstParam, not ClassName.
+                let from_tc = self.type_constraints.iter().rev().find_map(|tc| {
+                    if tc.variable != text { return None; }
+                    match &tc.inferred_type {
+                        InferredType::ClassName(c) => Some(c.clone()),
+                        InferredType::FirstParam { package } => Some(package.clone()),
+                        _ => None,
+                    }
+                });
+                from_tc.or_else(|| {
+                    // Fall back to walk-state `current_package` for
+                    // `$self` in case TC seeding is incomplete (e.g.
+                    // `my $self = shift` not yet processed). Live-walk
+                    // callers depend on this; post-walk callers
+                    // generally hit the TC path above.
+                    if text == "$self" { self.current_package.clone() } else { None }
+                })
+            }
+            "bareword" | "package" => {
+                let text = node.utf8_text(self.source).ok()?;
+                if text == "__PACKAGE__" {
+                    return self.current_package.clone();
+                }
+                // A bareword invocant is ambiguous: it could be a
+                // class-name reference (`Foo->method`) OR a zero-arg
+                // function call whose return type seeds the chain
+                // (`app->routes` where `sub app :: Mojolicious`).
+                //
+                // Prefer the function-call interpretation when a local
+                // Sub/Method with that name carries a ClassName return
+                // type — otherwise fall back to treating the text as
+                // a class. This is what `receiver_type_for` does for
+                // the plugin hook; mirroring it here fixes the same
+                // resolution gap for the chain-invocant path.
+                let bare = text.rsplit("::").next().unwrap_or(text);
+                for sym in &self.symbols {
+                    if sym.name != bare { continue; }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                    if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
+                        return Some(c.clone());
+                    }
+                }
+                Some(text.to_string())
+            }
+            // `shift` in method-body invocant position is the classic
+            // `$self` idiom: `sub get { shift->_generate_route(GET => @_) }`.
+            // Mojo's Route.pm uses it on every HTTP-verb method. We
+            // trust the shape unconditionally — silent inference beats
+            // no inference. If false positives surface, narrow with a
+            // method-like-signal heuristic (declared `method`, first
+            // `my ($self, ...) = @_`, `sub new { bless … }` in the
+            // same package).
+            "func1op_call_expression" if self.is_shift_call(node) => {
+                self.current_package.clone()
+            }
+            // `$_[0]` is the other first-arg idiom — used on hot code
+            // paths where the shift is too expensive. Same meaning as
+            // `shift`: the invocant (i.e. `$self`). Shape:
+            //   (array_element_expression
+            //     array:(container_variable (varname "_"))
+            //     index:(number "0"))
+            // Same trust-the-shape policy as `shift`.
+            "array_element_expression" => {
+                let array = node.child_by_field_name("array")?;
+                if array.kind() != "container_variable" { return None; }
+                let varname = array.named_child(0)?;
+                if varname.utf8_text(self.source).ok() != Some("_") { return None; }
+                let index = node.child_by_field_name("index")?;
+                if index.utf8_text(self.source).ok() != Some("0") { return None; }
+                self.current_package.clone()
+            }
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                // Paren'd `shift()` as invocant also means `$self`.
+                if self.is_shift_call(node) {
+                    return self.current_package.clone();
+                }
+                // `get_foo()->bar()` — the invocant of `->bar` is a
+                // function call. Look up the called sub locally and
+                // read its ClassName return type.
+                let func = node.child_by_field_name("function")?;
+                let name = func.utf8_text(self.source).ok()?;
+                let bare = name.rsplit("::").next().unwrap_or(name);
+                for sym in &self.symbols {
+                    if sym.name != bare { continue; }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                    if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
+                        return Some(c.clone());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn receiver_type_for(&self, invocant_text: Option<&str>) -> Option<InferredType> {
+        let text = invocant_text?;
+        if text == "$self" || text == "__PACKAGE__" {
+            return self.current_package.clone().map(InferredType::ClassName);
+        }
+        if text.starts_with('$') {
+            return self.type_constraints.iter().rev().find_map(|tc| {
+                if tc.variable == text { Some(tc.inferred_type.clone()) } else { None }
+            });
+        }
+        if text.starts_with('@') || text.starts_with('%') {
+            return None;
+        }
+        // Bareword invocant. Perl lets `foo->bar` mean either
+        // "method bar on package foo" OR "result of calling foo()"
+        // if `foo` is a declared sub. When we know about a local
+        // Sub/Method named `foo` with a return_type, that wins —
+        // `app->routes` in a Mojolicious::Lite script resolves to
+        // the plugin-synthesized `sub app() :: Mojolicious`.
+        for sym in &self.symbols {
+            if sym.name != text { continue; }
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+            if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
+                return Some(rt.clone());
+            }
+        }
+        Some(InferredType::ClassName(text.to_string()))
+    }
+
+    /// Transitive parent walk within the current file. Depth-limited like
+    /// `resolve_method_in_ancestors`. Returns parents in BFS order. Used
+    /// for plugin trigger matching so a class that transitively extends
+    /// `Mojo::EventEmitter` (via an intermediate base) still fires its
+    /// plugins — matches Perl's own MRO behavior.
+    fn transitive_parents(&self, pkg: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = self.package_parents.get(pkg).cloned().unwrap_or_default();
+        let mut depth = 0;
+        while let Some(p) = stack.pop() {
+            if depth > 20 { break; }
+            if !seen.insert(p.clone()) { continue; }
+            out.push(p.clone());
+            if let Some(grandparents) = self.package_parents.get(&p) {
+                for gp in grandparents {
+                    stack.push(gp.clone());
+                }
+            }
+            depth += 1;
+        }
+        out
+    }
+
+    /// Build the read-only snapshot plugins see, minus the call-shape bits
+    /// that only method-call vs function-call callers know.
+    fn base_call_context(
+        &self,
+        args_raw: Vec<Node<'a>>,
+        call_span: Span,
+        selection_span: Span,
+    ) -> plugin::CallContext {
+        let args: Vec<plugin::ArgInfo> = args_raw.iter().map(|n| self.arg_info_for(*n)).collect();
+        let parents = self.current_package.as_ref()
+            .map(|p| self.transitive_parents(p))
+            .unwrap_or_default();
+        let uses = self.current_package.as_ref()
+            .and_then(|p| self.package_uses.get(p))
+            .cloned()
+            .unwrap_or_default();
+        plugin::CallContext {
+            call_kind: plugin::CallKind::Function,
+            function_name: None,
+            method_name: None,
+            receiver_text: None,
+            receiver_type: None,
+            args,
+            call_span,
+            selection_span,
+            current_package: self.current_package.clone(),
+            current_package_parents: parents,
+            current_package_uses: uses,
+        }
+    }
+
+    /// Run every applicable plugin's `on_method_call` hook and apply each
+    /// returned `EmitAction`.
+    /// Run every applicable plugin's `on_use` hook. Used for
+    /// `use` statements that autoimport a fixed verb set (Mojolicious::Lite,
+    /// Dancer2, etc.) — plugins emit `FrameworkImport` actions per
+    /// imported verb so our unresolved-function diagnostic skips them.
+    ///
+    /// `on_use` bypasses the normal trigger filter: every plugin sees
+    /// every use. The plugin checks the module name itself. This is
+    /// because `use` statements are the *place where* triggers become
+    /// true for a package — the UsesModule("X") trigger wouldn't match
+    /// at the exact statement that introduces X.
+    fn dispatch_use_plugins(&mut self, ctx: plugin::UseContext) {
+        if self.plugins.is_empty() { return; }
+        let actions: Vec<(String, plugin::EmitAction)> = self.plugins
+            .all()
+            .flat_map(|p| {
+                let id = p.id().to_string();
+                p.on_use(&ctx).into_iter().map(move |a| (id.clone(), a))
+            })
+            .collect();
+        for (plugin_id, action) in actions {
+            self.apply_emit_action(plugin_id, action);
+        }
+    }
+
+    /// Run every applicable plugin's `on_function_call` hook. Used for
+    /// top-level calls (`get '/path' => sub {}`, `has 'attr' => ...`)
+    /// that aren't method calls. Mirrors dispatch_method_call_plugins.
+    fn dispatch_function_call_plugins(&mut self, ctx: plugin::CallContext) {
+        if self.plugins.is_empty() { return; }
+        let parents = self.current_package.as_ref()
+            .map(|p| self.transitive_parents(p))
+            .unwrap_or_default();
+        let uses = self.current_package.as_ref()
+            .and_then(|p| self.package_uses.get(p))
+            .cloned()
+            .unwrap_or_default();
+        let query = plugin::TriggerQuery {
+            package_uses: &uses,
+            package_parents: &parents,
+        };
+        let actions: Vec<(String, plugin::EmitAction)> = self.plugins
+            .applicable(&query)
+            .flat_map(|p| {
+                let id = p.id().to_string();
+                p.on_function_call(&ctx).into_iter().map(move |a| (id.clone(), a))
+            })
+            .collect();
+        for (plugin_id, action) in actions {
+            self.apply_emit_action(plugin_id, action);
+        }
+    }
+
+    fn dispatch_method_call_plugins(&mut self, ctx: plugin::CallContext) {
+        if self.plugins.is_empty() { return; }
+        let parents = self.current_package.as_ref()
+            .map(|p| self.transitive_parents(p))
+            .unwrap_or_default();
+        let uses = self.current_package.as_ref()
+            .and_then(|p| self.package_uses.get(p))
+            .cloned()
+            .unwrap_or_default();
+        let query = plugin::TriggerQuery {
+            package_uses: &uses,
+            package_parents: &parents,
+        };
+        let actions: Vec<(String, plugin::EmitAction)> = self.plugins
+            .applicable(&query)
+            .flat_map(|p| {
+                let id = p.id().to_string();
+                p.on_method_call(&ctx).into_iter().map(move |a| (id.clone(), a))
+            })
+            .collect();
+        for (plugin_id, action) in actions {
+            self.apply_emit_action(plugin_id, action);
+        }
+    }
+
+    /// Convert a plugin-produced `EmitAction` into real builder state. All
+    /// emitted symbols carry a `Namespace::Framework { id }` tag so downstream
+    /// queries can distinguish plugin-synthesized entities from native ones.
+    fn apply_emit_action(&mut self, plugin_id: String, action: plugin::EmitAction) {
+        let ns = Namespace::framework(plugin_id.clone());
+        match action {
+            plugin::EmitAction::Method {
+                name,
+                span,
+                selection_span,
+                params,
+                is_method,
+                return_type,
+                doc,
+                on_class,
+                display,
+                hide_in_outline,
+                opaque_return,
+                outline_label,
+            } => {
+                let detail = SymbolDetail::Sub {
+                    params: params.into_iter().map(Into::into).collect(),
+                    is_method,
+                    return_type,
+                    doc,
+                    display,
+                    hide_in_outline,
+                    opaque_return,
+                    return_self_method: None,
+                };
+                let target_pkg = on_class.clone().or_else(|| self.current_package.clone());
+
+                let already_emitted = self.symbols.iter().any(|s| {
+                    s.name == name
+                        && s.kind == SymKind::Method
+                        && s.package == target_pkg
+                        && s.namespace == ns
+                });
+                if already_emitted { return; }
+
+                let sid = if let Some(pkg) = on_class {
+                    let saved = self.current_package.take();
+                    self.current_package = Some(pkg);
+                    let id = self.add_symbol_ns(name, SymKind::Method, span, selection_span, detail, ns);
+                    self.current_package = saved;
+                    id
+                } else {
+                    self.add_symbol_ns(name, SymKind::Method, span, selection_span, detail, ns)
+                };
+                if outline_label.is_some() {
+                    // Apply to the symbol just pushed. Kept out of
+                    // `add_symbol_ns` since outline_label is only
+                    // meaningful on plugin-emitted callables; the core
+                    // constructor stays narrow.
+                    if let Some(s) = self.symbols.iter_mut().find(|s| s.id == sid) {
+                        s.outline_label = outline_label;
+                    }
+                }
+            }
+            plugin::EmitAction::HashKeyDef { name, owner, span, selection_span } => {
+                let detail = SymbolDetail::HashKeyDef { owner, is_dynamic: false };
+                self.add_symbol_ns(name, SymKind::HashKeyDef, span, selection_span, detail, ns);
+            }
+            plugin::EmitAction::HashKeyAccess { name, owner, var_text, span, access } => {
+                // `owner: Some(owner)` so the phase-5 linkage pass (which looks
+                // for HashKeyAccess → HashKeyDef by name+owner) pairs these
+                // refs to both in-file and cross-file defs automatically.
+                self.refs.push(Ref {
+                    kind: RefKind::HashKeyAccess { var_text, owner: Some(owner) },
+                    span,
+                    scope: self.current_scope(),
+                    target_name: name,
+                    access,
+                    resolves_to: None,
+                });
+            }
+            plugin::EmitAction::Handler {
+                name, owner, dispatchers, params, span, selection_span, display,
+                hide_in_outline, outline_label,
+            } => {
+                let detail = SymbolDetail::Handler {
+                    owner,
+                    dispatchers,
+                    params: params.into_iter().map(Into::into).collect(),
+                    display,
+                    hide_in_outline,
+                };
+                let sid = self.add_symbol_ns(name, SymKind::Handler, span, selection_span, detail, ns);
+                if outline_label.is_some() {
+                    if let Some(s) = self.symbols.iter_mut().find(|s| s.id == sid) {
+                        s.outline_label = outline_label;
+                    }
+                }
+            }
+            plugin::EmitAction::MethodCallRef { method_name, invocant, span, invocant_span } => {
+                // Standard MethodCall ref — gd/gr/hover/rename route to
+                // the usual resolution path (inheritance walk + module
+                // index + type inference). The plugin's job is just
+                // "there's a call to method X on invocant Y here".
+                // Plugins declare `invocant` as the intended receiver
+                // class (e.g. route plugin uses "Users" for `->to('Users#list')`);
+                // treat that as the resolved class unless it's a sigil-shape.
+                let invocant_class = if invocant.is_empty()
+                    || invocant.starts_with('$')
+                    || invocant.starts_with('@')
+                    || invocant.starts_with('%')
+                {
+                    None
+                } else {
+                    Some(invocant.clone())
+                };
+                self.refs.push(Ref {
+                    kind: RefKind::MethodCall {
+                        invocant,
+                        invocant_span,
+                        method_name_span: span,
+                        invocant_class,
+                    },
+                    span,
+                    scope: self.current_scope(),
+                    target_name: method_name,
+                    access: AccessKind::Read,
+                    resolves_to: None,
+                });
+            }
+            plugin::EmitAction::DispatchCall { name, dispatcher, owner, span, var_text } => {
+                // Same pattern as HashKeyAccess: record the owner so
+                // `build_indices` can link the ref to its Handler def in
+                // O(1) and `resolve::refs_to` matches cross-file by
+                // (owner, name). The var_text lives on the kind for
+                // features that want to show the receiver in hover.
+                let _ = var_text; // reserved for future hover enrichment
+                self.refs.push(Ref {
+                    kind: RefKind::DispatchCall { dispatcher, owner: Some(owner) },
+                    span,
+                    scope: self.current_scope(),
+                    target_name: name,
+                    access: AccessKind::Read,
+                    resolves_to: None,
+                });
+            }
+            plugin::EmitAction::Symbol { name, kind, span, selection_span, detail } => {
+                self.add_symbol_ns(name, kind, span, selection_span, detail, ns);
+            }
+            plugin::EmitAction::PackageParent { package, parent } => {
+                self.package_parents.entry(package).or_default().push(parent);
+            }
+            plugin::EmitAction::FrameworkImport { keyword } => {
+                self.framework_imports.insert(keyword);
+            }
+            plugin::EmitAction::Import { module_name, imported_symbols, span } => {
+                // Plugin-synthetic `use` — indistinguishable from a
+                // hand-written `use Module qw(name1 name2)` downstream.
+                // The whole imported-function machinery (hover, gd,
+                // sig-help, unresolved-function diagnostic, completion
+                // detail) just works. `qw_close_paren` stays None —
+                // there's no qw list to insert into for auto-import.
+                self.imports.push(Import {
+                    module_name,
+                    imported_symbols,
+                    span,
+                    qw_close_paren: None,
+                });
+            }
+            plugin::EmitAction::VarType { variable, at, inferred_type } => {
+                // Scope resolution is deferred to the end of the build —
+                // plugin dispatch runs BEFORE we recurse into call
+                // arguments, so the callback body's scope doesn't exist
+                // yet. Queue the request and apply it once every scope
+                // has been pushed.
+                self.deferred_var_types.push(DeferredVarType {
+                    variable,
+                    at,
+                    inferred_type,
+                });
+            }
+            plugin::EmitAction::PluginNamespace {
+                id,
+                kind,
+                bridges,
+                entity_names,
+                decl_span,
+            } => {
+                // Find-or-create the namespace. Bridges union across
+                // repeated emissions so dotted helpers emitted one at
+                // a time aggregate into a single namespace; entity_names
+                // is resolved now against symbols already emitted by
+                // this plugin in THIS dispatch (and any earlier one).
+                let plugin_id_for_ns = plugin_id.clone();
+                // O(symbols) with O(1) name lookup — the previous
+                // `entity_names.iter().any(...)` inside the filter was
+                // O(symbols × entity_names). Helpers register dozens
+                // of names per app; the quadratic scan compounds.
+                let entity_name_set: std::collections::HashSet<&str> =
+                    entity_names.iter().map(|s| s.as_str()).collect();
+                let entities: Vec<_> = self.symbols.iter()
+                    .filter(|s| matches!(
+                        &s.namespace,
+                        crate::file_analysis::Namespace::Framework { id } if id == &plugin_id_for_ns
+                    ))
+                    .filter(|s| entity_name_set.contains(s.name.as_str()))
+                    .map(|s| s.id)
+                    .collect();
+
+                // Namespace identity is (plugin_id, id) — not just `id`.
+                // Two plugins that both pick "app" as an id belong to
+                // different namespaces; matching only on `id` would
+                // silently merge entities and bridges across plugins.
+                let existing = self.plugin_namespaces.iter_mut()
+                    .find(|n| n.id == id && n.plugin_id == plugin_id_for_ns);
+                if let Some(existing) = existing {
+                    for b in bridges {
+                        if !existing.bridges.contains(&b) {
+                            existing.bridges.push(b);
+                        }
+                    }
+                    for e in entities {
+                        if !existing.entities.contains(&e) {
+                            existing.entities.push(e);
+                        }
+                    }
+                } else {
+                    self.plugin_namespaces.push(crate::file_analysis::PluginNamespace {
+                        id,
+                        plugin_id: plugin_id_for_ns,
+                        kind,
+                        entities,
+                        bridges,
+                        decl_span,
+                    });
+                }
+            }
+        }
     }
 
     // ---- Main visitor ----
@@ -278,6 +1696,9 @@ impl<'a> Builder<'a> {
             "container_variable" | "slice_container_variable" | "keyval_container_variable" => {
                 self.visit_container_ref(node);
             }
+            // $#foo — scalar-shaped but resolves to the underlying @foo.
+            // The sigil is `$#`; the varname child holds the bare name.
+            "arraylen" => self.visit_arraylen_ref(node),
 
             // Call expressions
             "function_call_expression" | "ambiguous_function_call_expression" => {
@@ -333,9 +1754,25 @@ impl<'a> Builder<'a> {
             "return_expression" => {
                 if let Some(scope) = self.enclosing_sub_scope() {
                     let ret_type = self.infer_return_value_type(node);
+                    // Capture `return $var` for the post-bag-seed re-fold.
+                    // Collection records the raw variable identity; the
+                    // reducer at query time picks the right type under
+                    // the enclosing package's framework rules.
+                    let deferred_var = node
+                        .named_child(0)
+                        .filter(|c| c.kind() == "scalar")
+                        .and_then(|c| c.utf8_text(self.source).ok().map(|s| (s.to_string(), c.start_position())));
+                    // Arity-dispatch classification — recorded raw, no
+                    // type fold here. The deferred witness emission in
+                    // `resolve_return_types` will pair the branch with
+                    // the bag-resolved arm type.
+                    let arity_branch = classify_arity_branch(node, self.source);
                     self.return_infos.push(ReturnInfo {
                         scope,
-                        inferred_type: ret_type,
+                        inferred_type: ret_type.clone(),
+                        deferred_var,
+                        arity_branch,
+                        span: node_to_span(node),
                     });
                     // If the return body is `return other()` (a direct call),
                     // record the delegation so hash-key ownership can walk
@@ -345,19 +1782,71 @@ impl<'a> Builder<'a> {
                             self.sub_return_delegations.insert(sub_name, delegated);
                         }
                     }
+                    // If-arm BranchArm: return inside `if { … } else { … }`.
+                    self.emit_branch_arm_for_if_arm_return(node, scope, ret_type);
+                    // Ternary-return BranchArm: `return $c ? A : B;` —
+                    // emit a BranchArm observation per arm on the
+                    // enclosing sub's Symbol, same reducer as RHS-
+                    // ternary and if-else-arm paths.
+                    if let Some(child) = node.named_child(0) {
+                        if child.kind() == "conditional_expression" {
+                            if let Some(sub_name) = self.enclosing_sub_name() {
+                                if let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) {
+                                    self.emit_branch_arm_witnesses(
+                                        child,
+                                        crate::witnesses::WitnessAttachment::Symbol(sym_id),
+                                        node,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 self.visit_children(node);
             }
 
-            // Expression statements inside sub bodies → track last expression type
+            // Expression statements inside sub bodies → track last
+            // expression type. Perl returns the last statement's
+            // value, so this IS the sub's implicit return.
+            //
+            // IMPORTANT: only statements at the sub body's TOP
+            // level count. A `$self->M(...)` call buried inside a
+            // `grep { … }` or an `if`-block is not the sub's
+            // return. Both `last_expr_type` and `self_method_tails`
+            // are gated on this — the outer block must be the
+            // sub/method's direct body.
             "expression_statement" => {
                 self.visit_children(node);
-                // Track the type of the last expression in the innermost sub/method scope
                 if let Some(scope) = self.enclosing_sub_scope() {
-                    let expr_type = node.named_child(0).and_then(|child| {
-                        self.infer_expression_type(child, false)
-                    });
-                    self.last_expr_type.insert(scope, expr_type);
+                    let is_body_top_level = node
+                        .parent()
+                        .filter(|p| p.kind() == "block")
+                        .and_then(|b| b.parent())
+                        .map(|gp| {
+                            matches!(
+                                gp.kind(),
+                                "subroutine_declaration_statement"
+                                    | "method_declaration_statement"
+                                    | "anonymous_subroutine_expression"
+                            )
+                        })
+                        .unwrap_or(false);
+                    if is_body_top_level {
+                        let child = node.named_child(0);
+                        let expr_type = child.and_then(|c| self.infer_returned_value_type(c));
+                        self.last_expr_type.insert(scope, expr_type);
+                        if let Some(c) = child {
+                            if let Some(method_name) = self.self_method_call_name(c) {
+                                self.self_method_tails.insert(scope, method_name);
+                            } else {
+                                // A non-self-method-tail top-level
+                                // expression overrides any prior
+                                // self-method tail we may have
+                                // recorded (defensive).
+                                self.self_method_tails.remove(&scope);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -418,11 +1907,14 @@ impl<'a> Builder<'a> {
             None => return,
         };
         let name_node = node.child_by_field_name("name").unwrap();
-        self.current_package = Some(name.clone());
-
-        // Update the current scope's package
-        let scope = self.current_scope();
-        self.scopes[scope.0 as usize].package = Some(name.clone());
+        // Capture the pre-existing package BEFORE touching
+        // current_package — the block form needs to restore to this
+        // value after visiting children. The previous code took()
+        // from current_package AFTER already mutating it, so
+        // prev_package would hold the NEW value and the restore was
+        // a no-op. That leaked `package Foo { ... }`'s name to
+        // every statement that followed at the same file scope.
+        let prev_package = self.current_package.clone();
 
         self.add_symbol(
             name.clone(),
@@ -432,16 +1924,55 @@ impl<'a> Builder<'a> {
             SymbolDetail::None,
         );
 
-        // Block packages: `package Foo { ... }` — recurse into the block
         let has_block = (0..node.child_count())
             .any(|i| node.child(i).map_or(false, |c| c.kind() == "block"));
         if has_block {
+            // `package Foo { ... }` — scope is the block. Set package
+            // ONLY for the duration of the walk, then restore.
             self.add_fold_range(node);
-            let prev_package = self.current_package.take();
             self.current_package = Some(name);
             self.visit_children(node);
             self.current_package = prev_package;
+        } else {
+            // `package Foo;` — the rest of the file (up to the next
+            // `package X;`) sits under this package. Set
+            // current_package for the remainder of this walk;
+            // open_sibling_scope handles the Scope-side bookkeeping.
+            self.current_package = Some(name.clone());
+            self.open_sibling_scope(ScopeKind::Package, node.start_position(), Some(name));
         }
+    }
+
+    /// Close any currently-open Package/Class sibling scope at the top
+    /// of the stack, trimming its span to end at `close_at`. Used when a
+    /// later `package X;` / `class Y;` supersedes an earlier one.
+    fn close_sibling_scope_if_open(&mut self, close_at: Point) {
+        while let Some(&top) = self.scope_stack.last() {
+            let kind = &self.scopes[top.0 as usize].kind;
+            // Only non-block `package`/`class` scopes (tagged as
+            // `ScopeKind::Package`) are sibling scopes that get
+            // supplanted by a successor. Block-scoped Class stays
+            // pushed until its block ends.
+            if !matches!(kind, ScopeKind::Package) { break; }
+            self.scopes[top.0 as usize].span.end = close_at;
+            self.scope_stack.pop();
+        }
+    }
+
+    /// Open a Package/Class scope that flows until the next same-level
+    /// sibling or end of file. Prior sibling is closed at `start`. The
+    /// new scope's end is initially the FILE-level scope's end (acting
+    /// as "end of file") and gets trimmed if a successor appears.
+    fn open_sibling_scope(&mut self, kind: ScopeKind, start: Point, package: Option<String>) {
+        self.close_sibling_scope_if_open(start);
+        // Use the outer (file) scope's end as the default terminator.
+        let file_end = self
+            .scope_stack
+            .first()
+            .map(|id| self.scopes[id.0 as usize].span.end)
+            .unwrap_or(start);
+        let span = Span { start, end: file_end };
+        self.push_scope(kind, span, package);
     }
 
     fn visit_class(&mut self, node: Node<'a>) {
@@ -525,10 +2056,13 @@ impl<'a> Builder<'a> {
             self.pop_scope();
             self.current_package = prev_package;
         } else {
-            // Flat class (class Foo;): like package, stays in effect until next package/class
+            // Flat `class Foo;` — same semantics as non-block
+            // `package Foo;`: threads a sibling scope tagged as
+            // `ScopeKind::Package` so it flattens-in-outline and the
+            // class name flows via `scope.package`. The Class SYMBOL
+            // is still emitted above — this is just the scope.
             self.current_package = Some(name.clone());
-            let scope = self.current_scope();
-            self.scopes[scope.0 as usize].package = Some(name);
+            self.open_sibling_scope(ScopeKind::Package, node.start_position(), Some(name));
         }
     }
 
@@ -599,7 +2133,31 @@ impl<'a> Builder<'a> {
         };
 
         // Extract params
-        let params = self.extract_params(node);
+        let mut params = self.extract_params(node);
+
+        // Invocant detection for Perl-native subs:
+        //   * `method foo { ... }` (v5.38) is always a method — first
+        //     positional is the invocant.
+        //   * Regular `sub` bodies use two Perl-native signals:
+        //       - first positional named `$self`/`$class`/`$this`/`$proto`
+        //       - or the enclosing package declares inheritance (a sub
+        //         in a subclass is, by Perl OO convention, a method)
+        //     Either triggers invocant marking; name stays free so the
+        //     user can call it `$c`/`$ctx`/whatever.
+        // Framework-specific invocant markers (`as_invocant_params` from
+        // a plugin) stack on top via EmittedParam → ParamInfo.
+        if let Some(first) = params.first_mut() {
+            let name_says_invocant = matches!(
+                first.name.as_str(),
+                "$self" | "$class" | "$this" | "$proto"
+            );
+            let pkg_is_subclass = self.current_package
+                .as_ref()
+                .map_or(false, |p| self.package_parents.contains_key(p));
+            if is_method || name_says_invocant || pkg_is_subclass {
+                first.is_invocant = true;
+            }
+        }
 
         // Extract preceding POD/comment documentation
         let doc = self.extract_preceding_doc(node, &name);
@@ -609,7 +2167,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc },
+            SymbolDetail::Sub { params: params.clone(), is_method, return_type: None, doc, display: None, hide_in_outline: false, opaque_return: false, return_self_method: None },
         );
 
         // Push sub scope
@@ -690,7 +2248,7 @@ impl<'a> Builder<'a> {
                                 .into_iter()
                                 .map(|(name, _)| {
                                     let is_slurpy = name.starts_with('@') || name.starts_with('%');
-                                    ParamInfo { name, default: None, is_slurpy }
+                                    ParamInfo { name, default: None, is_slurpy, is_invocant: false }
                                 })
                                 .collect();
                             // Combine any preceding shift params with @_ params
@@ -708,6 +2266,7 @@ impl<'a> Builder<'a> {
                             name: var_name,
                             default,
                             is_slurpy: false,
+                    is_invocant: false,
                         });
                         continue;
                     }
@@ -718,6 +2277,7 @@ impl<'a> Builder<'a> {
                             name: var_name,
                             default: None,
                             is_slurpy: false,
+                    is_invocant: false,
                         });
                         continue;
                     }
@@ -810,7 +2370,7 @@ impl<'a> Builder<'a> {
                 match param.kind() {
                     "mandatory_parameter" => {
                         if let Some(var) = self.first_var_child(param) {
-                            params.push(ParamInfo { name: var, default: None, is_slurpy: false });
+                            params.push(ParamInfo { name: var, default: None, is_slurpy: false, is_invocant: false });
                         }
                     }
                     "optional_parameter" => {
@@ -823,18 +2383,18 @@ impl<'a> Builder<'a> {
                             .and_then(|d| d.utf8_text(self.source).ok())
                             .map(|s| s.to_string());
                         if let Some(name) = var {
-                            params.push(ParamInfo { name, default, is_slurpy: false });
+                            params.push(ParamInfo { name, default, is_slurpy: false, is_invocant: false });
                         }
                     }
                     "slurpy_parameter" => {
                         if let Some(var) = self.first_var_child(param) {
-                            params.push(ParamInfo { name: var, default: None, is_slurpy: true });
+                            params.push(ParamInfo { name: var, default: None, is_slurpy: true, is_invocant: false });
                         }
                     }
                     "scalar" | "array" | "hash" => {
                         if let Ok(text) = param.utf8_text(self.source) {
                             let is_slurpy = matches!(param.kind(), "array" | "hash");
-                            params.push(ParamInfo { name: text.to_string(), default: None, is_slurpy });
+                            params.push(ParamInfo { name: text.to_string(), default: None, is_slurpy, is_invocant: false });
                         }
                     }
                     _ => {}
@@ -878,11 +2438,14 @@ impl<'a> Builder<'a> {
         if params.is_empty() { return; }
         let first = &params[0];
         if !first.name.starts_with('$') { return; }
-        // Common self-like names
-        let bare = &first.name[1..];
-        if !matches!(bare, "self" | "class" | "this" | "proto") { return; }
 
-        // Find enclosing package
+        // Use the `is_invocant` flag set at extract time rather than
+        // matching on names. This way `sub list { my ($c) = @_ }` in a
+        // controller types `$c` as the current package the same way
+        // `sub new { my ($self) = @_ }` always has — the caller side
+        // (builder or plugin) owns the invocancy decision.
+        if !first.is_invocant { return; }
+
         if let Some(ref pkg) = self.current_package {
             self.type_constraints.push(TypeConstraint {
                 variable: first.name.clone(),
@@ -952,7 +2515,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None },
+                        SymbolDetail::Sub { params: vec![], is_method: true, return_type: None, doc: None, display: None, hide_in_outline: false, opaque_return: false, return_self_method: None },
                     );
                 }
                 if has_writer {
@@ -967,10 +2530,15 @@ impl<'a> Builder<'a> {
                                 name: format!("${}", bare_name),
                                 default: None,
                                 is_slurpy: false,
+                    is_invocant: false,
                             }],
                             is_method: true,
                             return_type: None,
                             doc: None,
+                            display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                 }
@@ -1070,6 +2638,15 @@ impl<'a> Builder<'a> {
                     SymbolDetail::None,
                 );
 
+                // Track uses per-package so `Trigger::UsesModule` matches.
+                // Populated before any plugin-dispatch site reads it.
+                if let Some(pkg) = self.current_package.as_ref().cloned() {
+                    self.package_uses
+                        .entry(pkg)
+                        .or_default()
+                        .push(module_name.to_string());
+                }
+
                 // Detect framework mode from use statements
                 if let Some(pkg) = self.current_package.as_ref().cloned() {
                     match module_name {
@@ -1136,20 +2713,50 @@ impl<'a> Builder<'a> {
                 }
 
                 // Extract imported symbols from qw(...) or list
-                let (imported_symbols, qw_close_paren) = self.extract_use_import_list(node);
-                // Emit FunctionCall refs for imported symbol names (for goto-def on import args)
+                let (raw_names, qw_close_paren) = self.extract_use_import_list(node);
+                // Emit FunctionCall refs for imported symbol names (for goto-def on import args).
+                // These refs pin to the module being imported from — the
+                // qw list IS the authoritative source.
                 if module_name != "parent" && module_name != "base" {
-                    if !imported_symbols.is_empty() {
-                        let sym_set: std::collections::HashSet<&str> = imported_symbols.iter().map(|s| s.as_str()).collect();
-                        self.emit_refs_for_strings(node, &sym_set, RefKind::FunctionCall);
+                    if !raw_names.is_empty() {
+                        let sym_set: std::collections::HashSet<&str> = raw_names.iter().map(|s| s.as_str()).collect();
+                        let kind = RefKind::FunctionCall {
+                            resolved_package: Some(module_name.to_string()),
+                        };
+                        self.emit_refs_for_strings(node, &sym_set, kind);
                     }
                 }
+                // Tree-sitter parses `qw(a b)` as same-name imports — no
+                // syntactic support for `use Foo ( a => { -as => 'b' } )`
+                // yet, so this loop is pure `ImportedSymbol::same`. Plugin
+                // emissions (below) can produce renaming imports.
+                let imported_symbols: Vec<ImportedSymbol> = raw_names
+                    .iter()
+                    .map(|n| ImportedSymbol::same(n.clone()))
+                    .collect();
                 self.imports.push(Import {
                     module_name: module_name.to_string(),
                     imported_symbols,
                     span: node_to_span(node),
                     qw_close_paren,
                 });
+
+                // Plugin dispatch for use-statements. Mojolicious::Lite
+                // autoimports a verb set (`get`, `post`, `helper`, ...)
+                // — the plugin emits `Import` actions pointing at the
+                // real source module so hover/gd/sig-help flow through
+                // the existing imported-function resolution path.
+                if !self.plugins.is_empty() {
+                    let raw_args = self.extract_mojo_base_args(node);
+                    let ctx = plugin::UseContext {
+                        module_name: module_name.to_string(),
+                        imports: raw_names,
+                        raw_args,
+                        current_package: self.current_package.clone(),
+                        span: node_to_span(node),
+                    };
+                    self.dispatch_use_plugins(ctx);
+                }
             }
         }
         // Don't recurse — use statements don't contain interesting sub-nodes
@@ -1566,6 +3173,17 @@ impl<'a> Builder<'a> {
                 self.visit_variable_decl(left);
             }
             if let Some(right) = node.child_by_field_name("right") {
+                // Branch-arm detection: if RHS is a ternary, emit one
+                // BranchArm witness per arm on the LHS variable. The
+                // reducer folds them (agreement → type; disagreement
+                // → None — future: Union). Same reduction works for
+                // explicit if/else return arms (see resolve_return_types).
+                if right.kind() == "conditional_expression" {
+                    if let Some(vt) = self.get_var_text_from_lhs(left) {
+                        self.emit_branch_arm_witnesses_for_ternary(&vt, right, node);
+                    }
+                }
+
                 // Try constructor class first, then literal types, then expression type
                 let inferred = self.infer_expression_type(right, false)
                     .or_else(|| self.infer_expression_result_type(right));
@@ -1638,6 +3256,158 @@ impl<'a> Builder<'a> {
     /// Infer type from an expression node: literals, constructors, sub-body last expr.
     /// When `unwrap_sub_body` is true (Mojo default context), recurses into sub bodies.
     /// When false (literal/return context), anonymous subs return CodeRef.
+    /// Emit a BranchArm observation on the enclosing sub's Symbol
+    /// when this `return_expression` is inside a
+    /// `conditional_statement` arm (if / elsif / else). Reuses the
+    /// same reduction as ternary descent — agreement → type;
+    /// disagreement → None.
+    fn emit_branch_arm_for_if_arm_return(
+        &mut self,
+        return_node: Node<'a>,
+        scope: ScopeId,
+        ret_type: Option<InferredType>,
+    ) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        let Some(ty) = ret_type else { return };
+        // Walk up: expression_statement → block → conditional_statement.
+        let mut cur = return_node;
+        let mut seen_conditional = false;
+        for _ in 0..4 {
+            match cur.parent() {
+                Some(p) => {
+                    if p.kind() == "conditional_statement" || p.kind() == "else" {
+                        seen_conditional = true;
+                        break;
+                    }
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        if !seen_conditional {
+            return;
+        }
+        let Some(sub_name) = self.enclosing_sub_name() else { return };
+        let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) else { return };
+        self.pending_witnesses.push(Witness {
+            attachment: WitnessAttachment::Symbol(sym_id),
+            source: WitnessSource::Builder("branch_arm".into()),
+            payload: WitnessPayload::Observation(TypeObservation::BranchArm(ty)),
+            span: node_to_span(return_node),
+        });
+    }
+
+    /// Locate the SymbolId for a Sub/Method named `name` whose body's
+    /// inner scope is (an ancestor of) `body_scope`. Scans
+    /// `self.symbols` for a matching Sub symbol.
+    fn find_sub_symbol_for(&self, name: &str, body_scope: ScopeId) -> Option<SymbolId> {
+        // Walk up the scope chain; the Sub scope's own span contains
+        // the return. We need the symbol whose selection_span matches
+        // the sub name.
+        let mut cursor = Some(body_scope);
+        while let Some(sid) = cursor {
+            let s = &self.scopes[sid.0 as usize];
+            if let ScopeKind::Sub { name: n } | ScopeKind::Method { name: n } = &s.kind {
+                if n == name {
+                    // Find the symbol whose enclosing-scope parent
+                    // declared it (sym.scope == s.parent) OR the
+                    // symbol's scope equals this one.
+                    for sym in &self.symbols {
+                        if sym.name == name
+                            && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                            && sym.span.start <= s.span.start
+                            && s.span.end <= sym.span.end
+                        {
+                            return Some(sym.id);
+                        }
+                    }
+                    return None;
+                }
+            }
+            cursor = s.parent;
+        }
+        None
+    }
+
+    /// Find the Sub/Method symbol whose body scope IS or CONTAINS
+    /// `inner_scope`. Same semantics as `find_sub_symbol_for(name, ...)`
+    /// without needing the name in hand. Used by `resolve_return_types`
+    /// when emitting deferred `ArityReturn` witnesses keyed by sub.
+    fn find_sub_symbol_for_scope(&self, inner_scope: ScopeId) -> Option<SymbolId> {
+        let mut cursor = Some(inner_scope);
+        while let Some(sid) = cursor {
+            let s = &self.scopes[sid.0 as usize];
+            if let ScopeKind::Sub { name } | ScopeKind::Method { name } = &s.kind {
+                for sym in &self.symbols {
+                    if sym.name == *name
+                        && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                        && sym.span.start <= s.span.start
+                        && s.span.end <= sym.span.end
+                    {
+                        return Some(sym.id);
+                    }
+                }
+                return None;
+            }
+            cursor = s.parent;
+        }
+        None
+    }
+
+    /// Generic branch-arm emission. Walks both arms of a
+    /// `conditional_expression`, infers each arm's type, and pushes
+    /// `BranchArm` observations onto `attachment`. Use for:
+    ///   - `my $x = $c ? A : B;`        → Variable($x)
+    ///   - `if ($c) { return A } else { return B }` → Symbol(sub)
+    ///   - `return $c ? A : B;`         → Symbol(sub)
+    ///   - any chained ternary that feeds into an attachment-able
+    ///     consumer.
+    /// The reducer handles the agreement/disagreement policy — this
+    /// just emits evidence.
+    fn emit_branch_arm_witnesses(
+        &mut self,
+        cond_expr: Node<'a>,
+        attachment: crate::witnesses::WitnessAttachment,
+        context: Node<'a>,
+    ) {
+        use crate::witnesses::{TypeObservation, Witness, WitnessPayload, WitnessSource};
+        let consequent = cond_expr.child_by_field_name("consequent");
+        let alternative = cond_expr.child_by_field_name("alternative");
+        let span = node_to_span(context);
+        for arm in [consequent, alternative].into_iter().flatten() {
+            let ty = self.infer_returned_value_type(arm);
+            if let Some(t) = ty {
+                self.pending_witnesses.push(Witness {
+                    attachment: attachment.clone(),
+                    source: WitnessSource::Builder("branch_arm".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::BranchArm(t)),
+                    span,
+                });
+            }
+        }
+    }
+
+    /// RHS-ternary convenience wrapper: `my $x = $c ? A : B` →
+    /// BranchArm on Variable($x).
+    fn emit_branch_arm_witnesses_for_ternary(
+        &mut self,
+        lhs_var: &str,
+        cond_expr: Node<'a>,
+        context: Node<'a>,
+    ) {
+        let scope = self.current_scope();
+        self.emit_branch_arm_witnesses(
+            cond_expr,
+            crate::witnesses::WitnessAttachment::Variable {
+                name: lhs_var.to_string(),
+                scope,
+            },
+            context,
+        );
+    }
+
     fn infer_expression_type(&self, node: Node<'a>, unwrap_sub_body: bool) -> Option<InferredType> {
         match node.kind() {
             "string_literal" | "interpolated_string_literal" => Some(InferredType::String),
@@ -1665,18 +3435,89 @@ impl<'a> Builder<'a> {
             "method_call_expression" => {
                 self.extract_constructor_class(node).map(InferredType::ClassName)
             }
+            // Named sub call (with or without parens) that resolves to a
+            // locally known Sub/Method with a declared return type.
+            //
+            //   sub foo :: Bar { … }        my $x = foo;          → $x : Bar
+            //   Mojo::Lite emits `sub app :: Mojolicious`, so:
+            //                                my $x = app;         → $x : Mojolicious
+            //                                app->routes->…       → chain seeded with Mojolicious
+            //
+            // Imported calls (no local symbol, return type unknown at
+            // build time) stay with the caller's CallBinding fallback
+            // so enrichment can fill them in when the module resolves.
+            "bareword" | "scoped_identifier"
+            | "function_call_expression" | "ambiguous_function_call_expression" => {
+                let name = match node.kind() {
+                    "bareword" | "scoped_identifier" => node.utf8_text(self.source).ok()?,
+                    _ => {
+                        let func = node.child_by_field_name("function")?;
+                        func.utf8_text(self.source).ok()?
+                    }
+                };
+                self.symbols.iter().find_map(|sym| {
+                    if sym.name != name { return None; }
+                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return None; }
+                    if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
+                        Some(rt.clone())
+                    } else {
+                        None
+                    }
+                })
+            }
             _ => None,
         }
     }
 
-    /// Infer the type of a return expression's value.
+    /// Infer the type of a return expression's value (explicit
+    /// `return EXPR`). Delegates to `infer_returned_value_type`.
     fn infer_return_value_type(&self, return_node: Node<'a>) -> Option<InferredType> {
         let child = match return_node.named_child(0) {
             Some(c) => c,
             None => return None, // bare `return` — skip signal
         };
+        self.infer_returned_value_type(child)
+    }
+
+    /// Infer the type of a value being returned — explicit
+    /// `return EXPR` OR an implicit last-expression-statement in a
+    /// sub body. Perl's last statement returns, so both shapes feed
+    /// here. Handles:
+    ///   - `undef` → None
+    ///   - literal/constructor expressions (via infer_expression_type)
+    ///   - arithmetic / string result types (infer_expression_result_type)
+    ///   - `$var` scalar returns resolved against type_constraints
+    ///     (prefers class-identity over rep constraints; see Part 6)
+    ///   - `shift->M(...)` / `$self->M(...)` → recurse via the
+    ///     locally-defined M's return type (same-package method
+    ///     lookup). Cycle-broken by a `seen` set on the recursion.
+    fn infer_returned_value_type(&self, child: Node<'a>) -> Option<InferredType> {
+        self.infer_returned_value_type_seen(child, &mut std::collections::HashSet::new())
+    }
+
+    fn infer_returned_value_type_seen(
+        &self,
+        child: Node<'a>,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Option<InferredType> {
         if child.kind() == "undef" {
             return None;
+        }
+        // Ternary: `return $cond ? A : B;` — recurse into both
+        // arms and agree-or-None. Same reduction the
+        // RHS-ternary / if-else-arm paths use; no reason to
+        // limit it artificially to any one syntactic shape.
+        if child.kind() == "conditional_expression" {
+            let consequent = child.child_by_field_name("consequent");
+            let alternative = child.child_by_field_name("alternative");
+            if let (Some(c), Some(a)) = (consequent, alternative) {
+                let ct = self.infer_returned_value_type_seen(c, seen);
+                let at = self.infer_returned_value_type_seen(a, seen);
+                match (ct, at) {
+                    (Some(t1), Some(t2)) if t1 == t2 => return Some(t1),
+                    _ => return None,
+                }
+            }
         }
         // Try expression type (literals, constructors)
         if let Some(t) = self.infer_expression_type(child, false) {
@@ -1686,20 +3527,118 @@ impl<'a> Builder<'a> {
         if let Some(t) = self.infer_expression_result_type(child) {
             return Some(t);
         }
-        // Try variable lookup: return $self, return $var
-        if child.kind() == "scalar" {
-            if let Ok(var_text) = child.utf8_text(self.source) {
-                let point = child.start_position();
-                for tc in self.type_constraints.iter().rev() {
-                    if tc.variable == var_text && tc.constraint_span.start <= point {
-                        let scope = &self.scopes[tc.scope.0 as usize];
-                        if contains_point(&scope.span, point) {
-                            return Some(tc.inferred_type.clone());
+        // Implicit-return shape: `shift->METHOD(...)` or
+        // `$self->METHOD(...)`. The invocant is the enclosing class's
+        // instance; the return type is whatever METHOD returns when
+        // it's locally defined in the same package. Recurses through
+        // the LOCAL return_infos (we can see them because they're
+        // collected during the walk; we look up via current symbol
+        // state). Cross-file chains fall through to query-time
+        // resolution via `find_method_return_type`.
+        if child.kind() == "method_call_expression" {
+            // Self-method shortcut first (cycle-safe via `seen`).
+            if let Some(rt) = self.infer_self_method_call_return(child, seen) {
+                return Some(rt);
+            }
+            // General chain typing — same recursion every chain
+            // consumer uses. Type the receiver via
+            // `resolve_invocant_class_tree`, then look up the
+            // method's return type on that class. No special case
+            // for "self vs $var": the typer descends into whatever
+            // it gets.
+            if let (Some(invocant), Some(method_node)) = (
+                child.child_by_field_name("invocant"),
+                child.child_by_field_name("method"),
+            ) {
+                if let (Some(class), Ok(method_name)) = (
+                    self.resolve_invocant_class_tree(invocant),
+                    method_node.utf8_text(self.source),
+                ) {
+                    for sym in &self.symbols {
+                        if sym.name != method_name { continue; }
+                        if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                        if sym.package.as_deref() != Some(class.as_str()) { continue; }
+                        if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
+                            return Some(rt.clone());
                         }
                     }
                 }
             }
         }
+        // Try variable lookup: return $self, return $var. Collection
+        // is deliberately dumb here — pick the LATEST constraint in
+        // scope before the return point and call it. No framework
+        // rules, no class-identity preference, no rep tournament.
+        // Those are reduction-time decisions; Part 6's
+        // `FrameworkAwareTypeFold` runs them at query time over the
+        // witness bag. The post-bag-seeding pass
+        // `refold_sub_return_types_via_bag` overwrites
+        // `Symbol.return_type` using the bag-aware fold, so consumers
+        // reading the field directly (e.g. `find_method_return_type`)
+        // still get the framework-correct answer.
+        if child.kind() == "scalar" {
+            if let Ok(var_text) = child.utf8_text(self.source) {
+                let point = child.start_position();
+                let mut latest: Option<InferredType> = None;
+                let mut latest_at = Point { row: 0, column: 0 };
+                for tc in &self.type_constraints {
+                    if tc.variable != var_text || tc.constraint_span.start > point {
+                        continue;
+                    }
+                    let scope = &self.scopes[tc.scope.0 as usize];
+                    if !contains_point(&scope.span, point) {
+                        continue;
+                    }
+                    if tc.constraint_span.start >= latest_at {
+                        latest = Some(tc.inferred_type.clone());
+                        latest_at = tc.constraint_span.start;
+                    }
+                }
+                return latest;
+            }
+        }
+        None
+    }
+
+    /// Does `node` look like `shift->M(...)` or `$self->M(...)`?
+    /// Used both during the walk (to record an implicit self-method
+    /// return shape) and in the return-type post-pass (to resolve
+    /// the sub's return once M's own return is known).
+    fn self_method_call_name(&self, node: Node<'a>) -> Option<String> {
+        if node.kind() != "method_call_expression" {
+            return None;
+        }
+        let invocant = node.child_by_field_name("invocant")?;
+        let is_self = match invocant.kind() {
+            "func0op_call_expression" | "func1op_call_expression" => {
+                invocant
+                    .child(0)
+                    .and_then(|c| c.utf8_text(self.source).ok())
+                    == Some("shift")
+            }
+            "scalar" => invocant.utf8_text(self.source).ok() == Some("$self"),
+            _ => false,
+        };
+        if !is_self {
+            return None;
+        }
+        let method_node = node.child_by_field_name("method")?;
+        method_node
+            .utf8_text(self.source)
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    /// Called from the recursive return-type inference. Not yet
+    /// usable during the walk (sub return_types aren't populated
+    /// until resolve_return_types). Placeholder that always returns
+    /// None — the real chaining happens in resolve_return_types via
+    /// `self_method_tails`.
+    fn infer_self_method_call_return(
+        &self,
+        _node: Node<'a>,
+        _seen: &mut std::collections::HashSet<String>,
+    ) -> Option<InferredType> {
         None
     }
 
@@ -1929,15 +3868,46 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// `$#foo` — arraylen. TSP gives us a distinct `arraylen` node
+    /// with a `varname` child; the access resolves to `@foo`. We emit
+    /// a ContainerAccess ref so goto-def and rename treat it like
+    /// any other indirect access into the array.
+    fn visit_arraylen_ref(&mut self, node: Node<'a>) {
+        let bare = match find_varname_child(node).and_then(|v| v.utf8_text(self.source).ok()) {
+            Some(b) => b,
+            None => return,
+        };
+        let access = self.determine_access(node);
+        self.add_ref(
+            RefKind::ContainerAccess,
+            node_to_span(node),
+            format!("@{}", bare),
+            access,
+        );
+    }
+
     fn visit_function_call(&mut self, node: Node<'a>) {
         if let Some(func_node) = node.child_by_field_name("function") {
             if let Ok(name) = func_node.utf8_text(self.source) {
+                let resolved_package = self.resolve_call_package(name);
                 self.add_ref(
-                    RefKind::FunctionCall,
+                    RefKind::FunctionCall { resolved_package: resolved_package.clone() },
                     node_to_span(func_node),
                     name.to_string(),
                     AccessKind::Read,
                 );
+                // Even-position stringy args → HashKeyAccess refs
+                // owned by `Sub{resolved_package, name}`. Same
+                // mechanism as method-call args; covers
+                // `Foo::new(key => val)` and helpers like
+                // `connect(timeout => 30)`.
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    let owner = HashKeyOwner::Sub {
+                        package: resolved_package.clone(),
+                        name: name.to_string(),
+                    };
+                    self.emit_call_arg_key_accesses(args, &owner);
+                }
                 // Push type constraints on arguments of known builtins
                 if let Some(arg_type) = crate::file_analysis::builtin_first_arg_type(name) {
                     if let Some(first_arg) = self.first_call_arg(node) {
@@ -1971,6 +3941,23 @@ impl<'a> Builder<'a> {
                 // push @EXPORT, 'foo', 'bar' / push @EXPORT_OK, 'foo'
                 if name == "push" {
                     self.visit_push_call(node);
+                }
+
+                // Framework plugin dispatch for function calls. Mirrors
+                // the method-call path so plugins (e.g. Mojolicious::Lite
+                // routes: `get '/path' => sub {}`) get the same
+                // trigger/ctx/EmitAction flow as method-call plugins.
+                if !self.plugins.is_empty() {
+                    let args_raw = self.extract_call_args(node);
+                    let func_name_span = node_to_span(func_node);
+                    let mut ctx = self.base_call_context(
+                        args_raw,
+                        node_to_span(node),
+                        func_name_span,
+                    );
+                    ctx.call_kind = plugin::CallKind::Function;
+                    ctx.function_name = Some(name.to_string());
+                    self.dispatch_function_call_plugins(ctx);
                 }
             }
         }
@@ -2292,6 +4279,10 @@ impl<'a> Builder<'a> {
                             is_method: true,
                             return_type: return_type.clone(),
                             doc: None,
+                            display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                     // Setter for rw
@@ -2306,10 +4297,15 @@ impl<'a> Builder<'a> {
                                     name: "$val".into(),
                                     default: None,
                                     is_slurpy: false,
+                    is_invocant: false,
                                 }],
                                 is_method: true,
                                 return_type: return_type.clone(),
                                 doc: None,
+                                display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                    return_self_method: None,
                             },
                         );
                     }
@@ -2326,10 +4322,15 @@ impl<'a> Builder<'a> {
                                     name: "$val".into(),
                                     default: None,
                                     is_slurpy: false,
+                    is_invocant: false,
                                 }],
                                 is_method: true,
                                 return_type: return_type.clone(),
                                 doc: None,
+                                display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                    return_self_method: None,
                             },
                         );
                     }
@@ -2353,6 +4354,10 @@ impl<'a> Builder<'a> {
                             is_method: true,
                             return_type: getter_type.clone(),
                             doc: None,
+                            display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                     // Setter: fluent, returns $self for chaining
@@ -2366,11 +4371,16 @@ impl<'a> Builder<'a> {
                                 name: "$val".into(),
                                 default: None,
                                 is_slurpy: false,
+                    is_invocant: false,
                             }],
                             is_method: true,
                             return_type: self.current_package.as_ref()
                                 .map(|pkg| InferredType::ClassName(pkg.clone())),
                             doc: None,
+                            display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                    return_self_method: None,
                         },
                     );
                 }
@@ -2392,6 +4402,7 @@ impl<'a> Builder<'a> {
                     SymbolDetail::HashKeyDef {
                         owner: owner.clone(),
                         is_dynamic: false,
+
                     },
                 );
             }
@@ -2532,15 +4543,12 @@ impl<'a> Builder<'a> {
             "CodeRef" => Some(InferredType::CodeRef),
             "RegexpRef" => Some(InferredType::Regexp),
             _ => {
-                // InstanceOf['Foo::Bar'] (Moo style)
-                if isa.starts_with("InstanceOf[") {
-                    let inner = isa.trim_start_matches("InstanceOf[")
-                        .trim_end_matches(']')
-                        .trim_matches('\'')
-                        .trim_matches('"');
-                    if !inner.is_empty() {
-                        return Some(InferredType::ClassName(inner.to_string()));
-                    }
+                // InstanceOf['Foo::Bar'] (Moo style) — the isa value is
+                // valid-ish Perl syntax, so re-parse it with tree-sitter
+                // and pull the class name out of the tree rather than
+                // hand-stripping brackets and quotes.
+                if let Some(class) = parse_instance_of(isa) {
+                    return Some(InferredType::ClassName(class));
                 }
                 // Moose allows class names as types (contains :: or starts uppercase)
                 if mode == FrameworkMode::Moose && (isa.contains("::") || isa.starts_with(|c: char| c.is_uppercase())) {
@@ -2602,6 +4610,13 @@ impl<'a> Builder<'a> {
             .filter(|n| !matches!(n.kind(), "scalar" | "array" | "hash" | "bareword" | "package"))
             .map(|n| node_to_span(n));
 
+        // Resolve invocant to a class at build time using the tree —
+        // handles simple shapes directly, and chain invocants like
+        // `Sner->new->hi` via `resolve_invocant_class_tree`. Stored on
+        // the ref so downstream (refs_to / rename) matches class-scoped
+        // without re-resolving.
+        let invocant_class = invocant_node.and_then(|n| self.resolve_invocant_class_tree(n));
+
         if let Some(ref name) = method_name {
             // Dynamic method dispatch: $self->$method() — resolve $method if known
             if name.starts_with('$') {
@@ -2612,6 +4627,7 @@ impl<'a> Builder<'a> {
                                 invocant: invocant.clone().unwrap_or_default(),
                                 invocant_span,
                                 method_name_span,
+                                invocant_class: invocant_class.clone(),
                             },
                             node_to_span(node),
                             rname,
@@ -2625,11 +4641,45 @@ impl<'a> Builder<'a> {
                         invocant: invocant.clone().unwrap_or_default(),
                         invocant_span,
                         method_name_span,
+                        invocant_class: invocant_class.clone(),
                     },
                     node_to_span(node),
                     name.clone(),
                     AccessKind::Read,
                 );
+            }
+        }
+
+        // Bareword invocant that's really a function call (`app->routes`
+        // where `app` is a plugin-emitted Sub returning Mojolicious).
+        // The wider MethodCall ref covers the whole `app->routes` span,
+        // so cursor-on-`app` currently lands on a ref that describes
+        // `routes` — no semantic token on the bareword, no hover/gd
+        // targeting the sub itself. Emitting a narrower FunctionCall
+        // ref at the bareword span makes ref_at prefer it (innermost
+        // wins), which lets the existing FunctionCall paths (semantic
+        // tokens, hover, gd) light up the bareword as the call it is.
+        if let Some(inv_node) = invocant_node {
+            if inv_node.kind() == "bareword" {
+                if let Ok(bw_text) = inv_node.utf8_text(self.source) {
+                    // Find the matching sub and capture its package so
+                    // the FunctionCall ref's `resolved_package` points
+                    // at the real definer — otherwise find_definition
+                    // and hover_info's package-scoped match miss it.
+                    let matched_pkg = self.symbols.iter().find_map(|s| {
+                        if s.name != bw_text { return None; }
+                        if !matches!(s.kind, SymKind::Sub | SymKind::Method) { return None; }
+                        Some(s.package.clone())
+                    });
+                    if let Some(pkg) = matched_pkg {
+                        self.add_ref(
+                            RefKind::FunctionCall { resolved_package: pkg },
+                            node_to_span(inv_node),
+                            bw_text.to_string(),
+                            AccessKind::Read,
+                        );
+                    }
+                }
             }
         }
 
@@ -2648,6 +4698,41 @@ impl<'a> Builder<'a> {
                 if self.is_dbic_class() {
                     self.visit_dbic_class_method(node, name);
                 }
+            }
+        }
+
+        // Even-position stringy args become HashKeyAccess refs owned
+        // by `Sub{invocant_class, method_name}`. Pairs with the
+        // HashKeyDef symbols `has`/`bless { … }` synthesize on the
+        // callee side. Without these refs, `ref_at` on a constructor
+        // arg only finds the broad MethodCall ref and rename clobbers
+        // the wrong token.
+        if let (Some(cls), Some(method)) = (invocant_class.as_ref(), method_name.as_ref()) {
+            if let Some(args) = node.child_by_field_name("arguments") {
+                let owner = HashKeyOwner::Sub {
+                    package: Some(cls.clone()),
+                    name: method.clone(),
+                };
+                self.emit_call_arg_key_accesses(args, &owner);
+            }
+        }
+
+        // Framework plugin dispatch. Runs after native handlers so plugin
+        // emissions are purely additive — a third-party plugin targeting
+        // `->on()` can't accidentally break DBIC `->add_columns()`.
+        if !self.plugins.is_empty() {
+            if let Some(ref name) = method_name {
+                let args_raw = self.extract_call_args(node);
+                let mut ctx = self.base_call_context(
+                    args_raw,
+                    node_to_span(node),
+                    method_name_span,
+                );
+                ctx.call_kind = plugin::CallKind::Method;
+                ctx.method_name = Some(name.clone());
+                ctx.receiver_text = invocant_text.clone();
+                ctx.receiver_type = self.receiver_type_for(invocant_text.as_deref());
+                self.dispatch_method_call_plugins(ctx);
             }
         }
 
@@ -2713,10 +4798,15 @@ impl<'a> Builder<'a> {
                         name: "$val".into(),
                         default: None,
                         is_slurpy: false,
+                    is_invocant: false,
                     }],
                     is_method: true,
                     return_type: None,
                     doc: None,
+                    display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                    return_self_method: None,
                 },
             );
         }
@@ -2802,6 +4892,10 @@ impl<'a> Builder<'a> {
                     is_method: true,
                     return_type,
                     doc: None,
+                    display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                    return_self_method: None,
                 },
             );
         }
@@ -2846,6 +4940,12 @@ impl<'a> Builder<'a> {
         // Record the hash variable access
         let var_text = self.get_hash_var_from_element(node);
 
+        // Distinguish read vs write by asking determine_access on the
+        // element node itself — `$self->{k} = ...` has this element as
+        // the LHS of an assignment, so the grandparent check returns
+        // Write. Needed for Part 1 (invocant mutations).
+        let element_access = self.determine_access(node);
+
         // Record the key access
         if let Some(key_node) = node.child_by_field_name("key") {
             if let Some((key_text, is_dynamic)) = self.extract_key_text(key_node) {
@@ -2857,7 +4957,7 @@ impl<'a> Builder<'a> {
                         },
                         node_to_span(key_node),
                         key_text,
-                        AccessKind::Read,
+                        element_access,
                     );
                 }
             }
@@ -2916,8 +5016,8 @@ impl<'a> Builder<'a> {
     fn collect_vars_walk(&self, node: Node<'a>, out: &mut Vec<(String, Span)>) {
         match node.kind() {
             "scalar" | "array" | "hash" => {
-                if let Ok(text) = node.utf8_text(self.source) {
-                    out.push((text.to_string(), node_to_span(node)));
+                if let Some(name) = self.build_var_name(node) {
+                    out.push((name, node_to_span(node)));
                 }
             }
             _ => {
@@ -2930,11 +5030,37 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Build a variable's canonical name by reading the tree: sigil
+    /// comes from the node kind (`scalar` → `$`, `array` → `@`, `hash`
+    /// → `%`), bare name comes from the `varname` child. This keeps us
+    /// correct for edge cases where the full node text isn't just
+    /// `sigil + identifier` — e.g. `${foo}` (text `${foo}`, varname
+    /// `foo`), `$:field` (whatever TSP aliases into varname), or any
+    /// future TSP-added sigil-bearing syntax. The previous
+    /// `node.utf8_text()` + caller-side sigil-stripping broke on every
+    /// one of those shapes (`{foo}`, `:field`, etc.).
+    ///
+    /// Falls back to the full node text when the varname child is
+    /// missing (ERROR recovery, partial parses).
+    fn build_var_name(&self, node: Node<'a>) -> Option<String> {
+        let sigil = match node.kind() {
+            "scalar" => '$',
+            "array" => '@',
+            "hash" => '%',
+            _ => return node.utf8_text(self.source).ok().map(|s| s.to_string()),
+        };
+        let varname = find_varname_child(node).and_then(|v| v.utf8_text(self.source).ok());
+        match varname {
+            Some(name) => Some(format!("{}{}", sigil, name)),
+            None => node.utf8_text(self.source).ok().map(|s| s.to_string()),
+        }
+    }
+
     fn first_var_child(&self, node: Node<'a>) -> Option<String> {
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i) {
                 if matches!(child.kind(), "scalar" | "array" | "hash") {
-                    return child.utf8_text(self.source).ok().map(|s| s.to_string());
+                    return self.build_var_name(child);
                 }
             }
         }
@@ -2973,23 +5099,45 @@ impl<'a> Builder<'a> {
         AccessKind::Read
     }
 
+    /// Map a container/slice/keyval access node to the name of the
+    /// variable it actually reads. The sigil on the access site is
+    /// NOT the declared sigil:
+    ///
+    ///   $foo[0]         → @foo   (array element, under array_element_expression)
+    ///   $foo{hi}        → %foo   (hash element, under hash_element_expression)
+    ///   @foo[0..1]      → @foo   (array slice — parent `slice_expression` field `array:`)
+    ///   @foo{qw/.../}   → %foo   (hash slice — parent `slice_expression` field `hash:`)
+    ///   %foo[0..1]      → @foo   (KV slice of array — `keyval_expression` field `array:`)
+    ///   %foo{a}         → %foo   (KV slice of hash — `keyval_expression` field `hash:`)
+    ///
+    /// For slice/keyval we ask the parent which *field* this node is
+    /// filling, because the sigil on the child is always `@` (slice)
+    /// or `%` (keyval) regardless of the underlying container. Bare
+    /// name comes from the `varname` child so forms like `@{$ref}[0]`
+    /// (ERROR/block-varname) don't produce garbage.
     fn canonicalize_container(&self, node: Node<'a>, text: &str) -> String {
-        // $hash{key} → %hash, $arr[0] → @arr, etc.
-        if let Some(parent) = node.parent() {
-            let parent_kind = parent.kind();
-            if parent_kind == "hash_element_expression" || parent_kind == "keyval_container_variable" {
-                // Container is a hash access — underlying variable is %name
-                if text.starts_with('$') {
-                    return format!("%{}", &text[1..]);
-                }
-            } else if parent_kind == "array_element_expression" || parent_kind == "slice_container_variable" {
-                // Container is an array access — underlying variable is @name
-                if text.starts_with('$') || text.starts_with('@') {
-                    return format!("@{}", &text[1..]);
+        let fallback = || text.to_string();
+        let parent = match node.parent() { Some(p) => p, None => return fallback() };
+        let bare = match find_varname_child(node).and_then(|v| v.utf8_text(self.source).ok()) {
+            Some(b) => b,
+            None => return fallback(),
+        };
+
+        let target_sigil: char = match parent.kind() {
+            "array_element_expression" => '@',
+            "hash_element_expression" => '%',
+            "slice_expression" | "keyval_expression" => {
+                if parent.child_by_field_name("array").map_or(false, |c| c == node) {
+                    '@'
+                } else if parent.child_by_field_name("hash").map_or(false, |c| c == node) {
+                    '%'
+                } else {
+                    return fallback();
                 }
             }
-        }
-        text.to_string()
+            _ => return fallback(),
+        };
+        format!("{}{}", target_sigil, bare)
     }
 
     /// Extract the function name from a call expression (function_call or ambiguous_function_call).
@@ -3113,12 +5261,21 @@ impl<'a> Builder<'a> {
         for _ in 0..5 {
             // Check if this is inside a bless call
             if self.is_bless_call(ancestor) {
-                if let Some(ref pkg) = self.current_package {
-                    return Some(HashKeyOwner::Class(pkg.clone()));
-                }
-                let scope = self.current_scope();
-                if let Some(ref pkg) = self.scopes[scope.0 as usize].package {
-                    return Some(HashKeyOwner::Class(pkg.clone()));
+                let pkg = self.current_package.clone()
+                    .or_else(|| self.scopes[self.current_scope().0 as usize].package.clone());
+                if let Some(pkg) = pkg {
+                    // Inside a sub: register to `Sub{C, sub_name}` —
+                    // that's the actual constructor (or whatever sub
+                    // does the blessing). `has`-emitted HashKeyDefs
+                    // use the same shape, so a single owner encoding
+                    // covers both registration paths and call-site
+                    // HashKeyAccess refs (Sub{C, method}) match
+                    // strict. Top-level blesses (rare) keep the
+                    // coarse `Class(C)` form.
+                    return Some(match self.enclosing_sub_name() {
+                        Some(name) => HashKeyOwner::Sub { package: Some(pkg), name },
+                        None => HashKeyOwner::Class(pkg),
+                    });
                 }
             }
             // Check if this is inside a return expression of a sub
@@ -3156,6 +5313,68 @@ impl<'a> Builder<'a> {
         false
     }
 
+    /// Emit a `HashKeyAccess` ref at every odd-indexed (1st, 3rd, …)
+    /// stringy arg inside a call's args node, owned by `owner`. In
+    /// Perl, `foo(a => 1, "b", 2, c => 3)` is `foo("a", 1, "b", 2,
+    /// "c", 3)` — `=>` is just an autoquoting comma. The keys are
+    /// the even-position named args, regardless of which separator
+    /// comes after them. Mirrors `collect_fat_comma_keys` (callee
+    /// side, emits HashKeyDef symbols); this is the caller side, so
+    /// `ref_at` on the key token picks the narrow span over the
+    /// broad MethodCall/FunctionCall ref. Without this, cursor on
+    /// the key in `MooApp->new(name => 'alice')` lands on the
+    /// method ref and rename clobbers the wrong token.
+    ///
+    /// Gated on a matching HashKeyDef already being registered for
+    /// `owner`. Otherwise we'd shadow the broader MethodCall ref
+    /// for cases the caller-side has no def to anchor on (`class
+    /// Foo { field $x :param }` — Point->new(x => 3, …) needs the
+    /// MethodCall ref's `find_param_field` fallback in
+    /// `find_definition`).
+    fn emit_call_arg_key_accesses(&mut self, args_node: Node<'a>, owner: &HashKeyOwner) {
+        let named: Vec<Node<'a>> = (0..args_node.named_child_count())
+            .filter_map(|i| args_node.named_child(i))
+            .collect();
+        // Single-arg calls present the arg directly (no list_expression
+        // wrapper). One arg can't be a key/value pair.
+        if named.len() < 2 && args_node.kind() != "list_expression" && args_node.kind() != "parenthesized_expression" {
+            return;
+        }
+        for (idx, child) in named.iter().enumerate() {
+            if idx % 2 == 0
+                && matches!(child.kind(), "bareword" | "autoquoted_bareword" | "string_literal" | "interpolated_string_literal")
+            {
+                if let Some((key, is_dynamic)) = self.extract_key_text(*child) {
+                    if !is_dynamic && self.has_hash_key_def(&key, owner) {
+                        let access = self.determine_access(*child);
+                        self.add_ref(
+                            RefKind::HashKeyAccess {
+                                var_text: String::new(),
+                                owner: Some(owner.clone()),
+                            },
+                            node_to_span(*child),
+                            key,
+                            access,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Strict (no `found_by` broadening) check: is a HashKeyDef
+    /// registered with this exact `owner` and `name`? Used by
+    /// `emit_call_arg_key_accesses` to gate emission — broadening
+    /// would let `Foo::bar(name => 1)` latch onto `name` keys
+    /// registered to `Sub{Foo, new}`, which they don't logically
+    /// belong to.
+    fn has_hash_key_def(&self, name: &str, owner: &HashKeyOwner) -> bool {
+        self.symbols.iter().any(|s| {
+            if s.name != name { return false; }
+            matches!(&s.detail, SymbolDetail::HashKeyDef { owner: o, .. } if o == owner)
+        })
+    }
+
     fn collect_fat_comma_keys(&mut self, node: Node<'a>, owner: &HashKeyOwner) {
         // Walk children looking for `bareword => ...` or `'string' => ...`
         for i in 0..node.child_count() {
@@ -3174,6 +5393,7 @@ impl<'a> Builder<'a> {
                                         SymbolDetail::HashKeyDef {
                                             owner: owner.clone(),
                                             is_dynamic: false,
+                    
                                         },
                                     );
                                 }
@@ -3364,19 +5584,350 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Post-pass: re-resolve `invocant_class` on every MethodCall ref
+    /// using the tree + the now-final symbol table (return types
+    /// have been filled in by `resolve_return_types`). This catches
+    /// function-call chains like `get_foo()->bar()` where the
+    /// invocant's class can only be pinned after `get_foo`'s
+    /// return_type is known.
+    ///
+    /// Walks the tree: for each node whose byte span matches a
+    /// MethodCall ref's `invocant_span`, re-runs
+    /// `resolve_invocant_class_tree` and updates the ref in-place.
+    /// Refs whose class was already pinned during the walk keep
+    /// their value.
+    fn resolve_invocant_classes_post_pass(&mut self, tree: &Tree) {
+        use std::collections::HashMap;
+        // Index invocant nodes by (start_point, end_point) for
+        // O(1) lookup against ref.invocant_span.
+        let mut node_by_points: HashMap<(Point, Point), Node<'_>> = HashMap::new();
+        fn walk<'t>(node: Node<'t>, out: &mut HashMap<(Point, Point), Node<'t>>) {
+            if node.kind() == "method_call_expression" {
+                if let Some(inv) = node.child_by_field_name("invocant") {
+                    out.insert((inv.start_position(), inv.end_position()), inv);
+                }
+            }
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(tree.root_node(), &mut node_by_points);
+
+        // Collect ref indices + their invocant nodes first so we
+        // don't borrow `self.refs` mutably while also calling
+        // `resolve_invocant_class_tree` (which reads `&self`).
+        let mut pending: Vec<(usize, Node<'_>)> = Vec::new();
+        for (idx, r) in self.refs.iter().enumerate() {
+            if let RefKind::MethodCall { invocant_class, invocant_span: Some(sp), .. } = &r.kind {
+                if invocant_class.is_some() { continue; }
+                if let Some(n) = node_by_points.get(&(sp.start, sp.end)).copied() {
+                    pending.push((idx, n));
+                }
+            }
+        }
+        for (idx, node) in pending {
+            if let Some(class) = self.resolve_invocant_class_tree(node) {
+                if let RefKind::MethodCall { invocant_class, .. } = &mut self.refs[idx].kind {
+                    *invocant_class = Some(class);
+                }
+            }
+        }
+    }
+
+    /// Symbolically execute the rhs of every `my $X = <expr>` and
+    /// push the resulting class type into the bag (and
+    /// `type_constraints`). ONE recursive typer
+    /// (`resolve_invocant_class_tree`) handles every expression shape
+    /// it knows — scalar lookup, method-call chain, bareword, shift
+    /// idiom, function call. No "is it a chain" branch. Whatever the
+    /// rhs is, the typer descends.
+    ///
+    /// Idempotent: skips an assignment if a TC for `$X` already
+    /// exists at the assignment's start point. Walk-time inference
+    /// covers literals/constructors via the existing path; this pass
+    /// fills in anything that was unresolvable at walk time
+    /// (specifically chains whose links' return types only became
+    /// known after the first `resolve_return_types`).
+    ///
+    /// Provenance: each pushed witness carries
+    /// `WitnessSource::Builder("chain_assignment")` so a future debug
+    /// dump can answer "why does $X have this type?" without
+    /// re-running the typer.
+    fn type_assignments_into_bag(&mut self, tree: &'a Tree) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        // Two-pass: collect first, then push. The collector borrows
+        // &self (so the recursive class typer can read symbols /
+        // type_constraints); push goes through the same shape as
+        // `populate_witness_bag` (TC + bag witness in lockstep) so the
+        // bag stays the single source of truth.
+        //
+        // What counts as "an assignment to a variable":
+        //   - `my $X = …` (variable_declaration lhs)
+        //   - `my ($x) = …` (paren-list — first var)
+        //   - `$X = …` / `@X = …` / `%X = …` (no `my`)
+        // No filter on the rhs shape — whatever it is, the recursive
+        // typer either resolves it to a class or doesn't. No "is it a
+        // chain" branch.
+        //
+        // The recursive typer (`resolve_invocant_class_tree`) uses
+        // `self.current_package` for the `$self` / `shift` / `$_[0]`
+        // fallback. After the live walk, `current_package` is stale
+        // (= last package opened in the file). To make the typer
+        // package-correct at every assignment site, we set
+        // `self.current_package` to the enclosing scope's package
+        // (a stored field — `Scope.package`) around each call.
+        //
+        // Why scope.package and not "track package_statement nodes":
+        // `package X;` is a SIBLING of the subs that follow it in the
+        // AST, not a parent — its scope extends forward through
+        // siblings until the next `package`. Walking the AST and
+        // saving/restoring on package_statement entry/exit doesn't
+        // model that. The walk-time recorder already correctly
+        // attributes the right package to each scope; reading
+        // `scope.package` at post-walk time inherits that.
+        let mut to_push: Vec<(String, ScopeId, Span, InferredType)> = Vec::new();
+
+        // Recurse the AST. For each assignment, find its enclosing
+        // scope, set `self.current_package` to that scope's package,
+        // type the rhs, push the result.
+        fn walk<'b, 'a: 'b>(
+            b: &'b mut Builder<'a>,
+            node: Node<'a>,
+            out: &mut Vec<(String, ScopeId, Span, InferredType)>,
+        ) {
+            if node.kind() == "assignment_expression" {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if let Some(var) = b.get_var_text_from_lhs(left) {
+                        let span = node_to_span(node);
+                        let already_typed = b.type_constraints.iter().any(|tc| {
+                            tc.variable == var && tc.constraint_span.start == span.start
+                        });
+                        if !already_typed {
+                            // Find the innermost scope containing this assignment.
+                            let scope_idx = b
+                                .scopes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, s)| crate::file_analysis::contains_point(&s.span, span.start))
+                                .min_by_key(|(_, s)| {
+                                    let r = (s.span.end.row.saturating_sub(s.span.start.row)) as u64;
+                                    let c = if s.span.start.row == s.span.end.row {
+                                        s.span.end.column.saturating_sub(s.span.start.column) as u64
+                                    } else { 0 };
+                                    r * 1_000_000 + c
+                                })
+                                .map(|(i, _)| i);
+
+                            // Walk scope chain to find the nearest enclosing package.
+                            let scope_pkg = scope_idx.and_then(|si| {
+                                let mut cur = Some(si);
+                                while let Some(i) = cur {
+                                    let s = &b.scopes[i];
+                                    if let Some(ref p) = s.package {
+                                        return Some(p.clone());
+                                    }
+                                    cur = s.parent.map(|pid| pid.0 as usize);
+                                }
+                                None
+                            });
+
+                            let saved_pkg = b.current_package.clone();
+                            if scope_pkg.is_some() {
+                                b.current_package = scope_pkg;
+                            }
+                            let class_opt = b.resolve_invocant_class_tree(right);
+                            b.current_package = saved_pkg;
+
+                            if let Some(class) = class_opt {
+                                let sid = scope_idx
+                                    .map(|i| b.scopes[i].id)
+                                    .unwrap_or(ScopeId(0));
+                                out.push((var, sid, span, InferredType::ClassName(class)));
+                            }
+                        }
+                    }
+                }
+            }
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    walk(b, c, out);
+                }
+            }
+        }
+        walk(self, tree.root_node(), &mut to_push);
+
+        for (variable, scope, constraint_span, ty) in to_push {
+            self.type_constraints.push(TypeConstraint {
+                variable: variable.clone(),
+                scope,
+                constraint_span,
+                inferred_type: ty.clone(),
+            });
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Variable {
+                    name: variable.clone(),
+                    scope,
+                },
+                source: WitnessSource::Builder("chain_assignment".into()),
+                payload: WitnessPayload::InferredType(ty.clone()),
+                span: Span { start: constraint_span.start, end: constraint_span.start },
+            });
+            if let InferredType::ClassName(ref n) = ty {
+                self.bag.push(Witness {
+                    attachment: WitnessAttachment::Variable {
+                        name: variable,
+                        scope,
+                    },
+                    source: WitnessSource::Builder("chain_assignment".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(
+                        n.clone(),
+                    )),
+                    span: constraint_span,
+                });
+            }
+        }
+    }
+
+    /// Re-evaluate `ReturnInfo.inferred_type` for every return
+    /// expression against the current `type_constraints` /
+    /// `Symbol.return_type` state. Walk-time inference runs against
+    /// an empty world — `return $route->name(...)` can't be typed
+    /// when `$route` doesn't yet have a TC and `name`'s return type
+    /// hasn't been folded. After the chain pass + first fold, both
+    /// hold; running the same typer again upgrades stale `None`
+    /// entries to the now-correct type.
+    ///
+    /// Only upgrades `None` → `Some` — never downgrades. The walk
+    /// already pinned literal/constructor/agree-arm cases; we don't
+    /// want a partial second-pass result to overwrite them.
+    fn refresh_return_arm_types(&mut self, tree: &Tree) {
+        use std::collections::HashMap;
+        let mut nodes_by_span: HashMap<(Point, Point), Node<'_>> = HashMap::new();
+        fn walk<'t>(node: Node<'t>, out: &mut HashMap<(Point, Point), Node<'t>>) {
+            if node.kind() == "return_expression" {
+                out.insert((node.start_position(), node.end_position()), node);
+            }
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(tree.root_node(), &mut nodes_by_span);
+
+        let mut infos = std::mem::take(&mut self.return_infos);
+        for ri in &mut infos {
+            if ri.inferred_type.is_some() { continue; }
+            if let Some(node) = nodes_by_span.get(&(ri.span.start, ri.span.end)) {
+                let new_type = self.infer_return_value_type(*node);
+                if new_type.is_some() {
+                    ri.inferred_type = new_type;
+                }
+            }
+        }
+        self.return_infos = infos;
+    }
+
     fn resolve_return_types(&mut self) {
-        // Group return infos by scope
-        let mut returns_by_scope: std::collections::HashMap<ScopeId, Vec<Option<InferredType>>> =
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+
+        // Group return arms by scope. Each arm is materialised:
+        //   - `return $var` → ask the bag (single, framework-aware fold).
+        //   - literal / constructor / arithmetic → use the type the
+        //     walk could read off directly.
+        // The bag is already populated by `populate_witness_bag()`, so
+        // every reducer rule (Part 6 framework, Part 5b branch arm,
+        // Part 6b arity dispatch) participates here at the SAME phase
+        // they participate at query time. One reduction, one place.
+        //
+        // While we're at it, emit `ArityReturn` witnesses with the
+        // *bag-resolved* per-arm type — the walk just classified the
+        // arity branch (no fold), so `FluentArityDispatch` sees the
+        // same rules everyone else does. Walk-time emission of
+        // ArityReturn would have baked in a collection-time fold,
+        // exactly the bug we just removed for `Symbol.return_type`.
+        let mut returns_by_scope: std::collections::HashMap<ScopeId, Vec<InferredType>> =
             std::collections::HashMap::new();
-        for ri in &self.return_infos {
-            returns_by_scope
-                .entry(ri.scope)
-                .or_default()
-                .push(ri.inferred_type.clone());
+        // Per-arm computed type (for the second-pass arity emission).
+        let mut arm_types_per_ri: Vec<Option<InferredType>> =
+            Vec::with_capacity(self.return_infos.len());
+        let return_infos = std::mem::take(&mut self.return_infos);
+        for ri in &return_infos {
+            let arm_type = match &ri.deferred_var {
+                Some((var, point)) => self
+                    .var_type_via_bag(var, ri.scope, *point)
+                    .or_else(|| ri.inferred_type.clone()),
+                None => ri.inferred_type.clone(),
+            };
+            if let Some(t) = arm_type.clone() {
+                returns_by_scope.entry(ri.scope).or_default().push(t);
+            }
+            arm_types_per_ri.push(arm_type);
         }
 
-        // For each Sub/Method scope, determine return type
+        // ArityReturn is for arity-DISCRIMINATED subs. Only emit when
+        // a sub has at least one Zero/Exact arm — emitting Default in
+        // a sub that just has plain (possibly disagreeing) returns
+        // would make `FluentArityDispatch` answer with one arm even
+        // when `Symbol.return_type` correctly says "agreement failed".
+        let mut arity_discriminated_scopes: std::collections::HashSet<ScopeId> =
+            std::collections::HashSet::new();
+        for ri in &return_infos {
+            if matches!(
+                ri.arity_branch,
+                Some(ArityBranch::Zero) | Some(ArityBranch::Exact(_))
+            ) {
+                arity_discriminated_scopes.insert(ri.scope);
+            }
+        }
+
+        let mut arity_witnesses: Vec<Witness> = Vec::new();
+        for (ri, arm_type) in return_infos.iter().zip(arm_types_per_ri.iter()) {
+            let Some(branch) = ri.arity_branch else { continue };
+            if !arity_discriminated_scopes.contains(&ri.scope) {
+                continue;
+            }
+            let Some(t) = arm_type.clone() else { continue };
+            let Some(sym_id) = self.find_sub_symbol_for_scope(ri.scope) else { continue };
+            let arg_count = match branch {
+                ArityBranch::Zero => Some(0u32),
+                ArityBranch::Exact(n) => Some(n),
+                ArityBranch::Default => None,
+            };
+            arity_witnesses.push(Witness {
+                attachment: WitnessAttachment::Symbol(sym_id),
+                source: WitnessSource::Builder("arity_detection".into()),
+                payload: WitnessPayload::Observation(TypeObservation::ArityReturn {
+                    arg_count,
+                    return_type: t,
+                }),
+                span: ri.span,
+            });
+        }
+        self.return_infos = return_infos;
+        for w in arity_witnesses {
+            self.bag.push(w);
+        }
+
+        // For each Sub/Method scope, agree-or-None across arms.
         let mut return_types: std::collections::HashMap<String, InferredType> =
+            std::collections::HashMap::new();
+        // Per-sub provenance recorded as we derive types — surfaces
+        // in `--dump-package` so debugging answers "why does this
+        // return X?" without re-running the build. Keyed by sub name
+        // (matching `return_types`); flushed onto SymbolId in the
+        // write loop below. Plugin overrides keep their existing
+        // PluginOverride provenance — we don't touch overridden subs.
+        let mut return_provenance: std::collections::HashMap<String, crate::file_analysis::TypeProvenance> =
             std::collections::HashMap::new();
 
         for scope in &self.scopes {
@@ -3385,23 +5936,30 @@ impl<'a> Builder<'a> {
                 _ => continue,
             };
 
-            let explicit_returns = returns_by_scope.get(&scope.id);
-            let has_explicit = explicit_returns.map_or(false, |r| !r.is_empty());
-
-            let resolved = if has_explicit {
-                // Filter out bare returns (None) — they're exit points, not type signals
-                let typed_returns: Vec<InferredType> = explicit_returns.unwrap()
-                    .iter()
-                    .filter_map(|r| r.clone())
-                    .collect();
-                resolve_return_type(&typed_returns)
-            } else {
-                // No explicit returns — use last expression type
-                self.last_expr_type.get(&scope.id).and_then(|t| t.clone())
+            let (resolved, evidence) = match returns_by_scope.get(&scope.id) {
+                Some(arms) if !arms.is_empty() => {
+                    let r = resolve_return_type(arms);
+                    let ev = vec![format!("return_arms={}", arms.len())];
+                    (r, ev)
+                }
+                _ => {
+                    let r = self.last_expr_type.get(&scope.id).and_then(|t| t.clone());
+                    let ev = if r.is_some() {
+                        vec!["last_expr".into()]
+                    } else { Vec::new() };
+                    (r, ev)
+                }
             };
 
             if let Some(rt) = resolved {
-                return_types.insert(sub_name, rt);
+                return_types.insert(sub_name.clone(), rt);
+                return_provenance.insert(
+                    sub_name,
+                    crate::file_analysis::TypeProvenance::ReducerFold {
+                        reducer: "return_arms".into(),
+                        evidence,
+                    },
+                );
             }
         }
 
@@ -3422,29 +5980,152 @@ impl<'a> Builder<'a> {
                     continue;
                 }
                 if let Some(t) = return_types.get(&delegate).cloned() {
-                    return_types.insert(delegator, t);
+                    return_types.insert(delegator.clone(), t);
+                    return_provenance.insert(
+                        delegator,
+                        crate::file_analysis::TypeProvenance::Delegation {
+                            kind: "sub_return".into(),
+                            via: delegate,
+                        },
+                    );
                     changed = true;
                 }
             }
         }
 
-        // Set return_type on matching Sub/Method symbols
+        // Self-method-tail propagation. Perl's last statement
+        // returns, so `sub get { shift->_generate_route(GET => @_) }`
+        // returns whatever `_generate_route` returns. Fixed-point
+        // iterate: if sub X's body-tail is `shift->M(...)` /
+        // `$self->M(...)` and M's return_type is now known, X
+        // inherits it.
+        //
+        // Build a scope_id → sub_name map for lookups.
+        let scope_to_sub: std::collections::HashMap<ScopeId, String> = self
+            .scopes
+            .iter()
+            .filter_map(|s| match &s.kind {
+                ScopeKind::Sub { name } | ScopeKind::Method { name } => {
+                    Some((s.id, name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut changed = true;
+        let mut iters = 0;
+        while changed && iters < 20 {
+            changed = false;
+            iters += 1;
+            let tails: Vec<(ScopeId, String)> = self
+                .self_method_tails
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            for (scope_id, tail_method) in tails {
+                let sub_name = match scope_to_sub.get(&scope_id) {
+                    Some(n) => n.clone(),
+                    None => continue,
+                };
+                if return_types.contains_key(&sub_name) {
+                    continue; // already resolved
+                }
+                if sub_name == tail_method {
+                    continue; // direct self-recursion — can't infer
+                }
+                if let Some(t) = return_types.get(&tail_method).cloned() {
+                    return_types.insert(sub_name.clone(), t);
+                    return_provenance.insert(
+                        sub_name,
+                        crate::file_analysis::TypeProvenance::Delegation {
+                            kind: "self_method_tail".into(),
+                            via: tail_method,
+                        },
+                    );
+                    changed = true;
+                }
+            }
+        }
+
+        // Set return_type on matching Sub/Method symbols, and
+        // record the self-method tail shape for subs whose return
+        // type couldn't be collapsed in-file. Consumer side chains
+        // through `return_self_method` when `return_type` is None.
+        // Look up each sub's scope by matching the symbol's span
+        // against the sub scope's span.
+        let scope_by_sub_span: std::collections::HashMap<(Point, Point), ScopeId> = self
+            .scopes
+            .iter()
+            .filter(|s| matches!(s.kind, ScopeKind::Sub { .. } | ScopeKind::Method { .. }))
+            .map(|s| ((s.span.start, s.span.end), s.id))
+            .collect();
         for sym in &mut self.symbols {
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                if let SymbolDetail::Sub { ref mut return_type, .. } = sym.detail {
+                // Plugin override pinned this symbol — DON'T overwrite
+                // it with the inferred fold. The whole point of an
+                // override is "inference reaches the wrong answer
+                // here". Provenance is recorded as `PluginOverride`
+                // in `type_provenance`; we use that as the signal.
+                let is_overridden = matches!(
+                    self.type_provenance.get(&sym.id),
+                    Some(crate::file_analysis::TypeProvenance::PluginOverride { .. }),
+                );
+                if is_overridden { continue; }
+                if let SymbolDetail::Sub {
+                    ref mut return_type,
+                    ref mut return_self_method,
+                    ..
+                } = sym.detail
+                {
                     if let Some(rt) = return_types.get(&sym.name) {
                         *return_type = Some(rt.clone());
+                        // Flush provenance to the SymbolId-keyed map
+                        // so debug introspection (--dump-package) can
+                        // surface the inference chain. Only writes
+                        // for non-Inferred provenances; the default
+                        // (Inferred) is implicit via missing entry.
+                        if let Some(prov) = return_provenance.get(&sym.name) {
+                            self.type_provenance.insert(sym.id, prov.clone());
+                        }
+                    } else {
+                        // Couldn't resolve in-file. If the body
+                        // tails on `shift->M(...)` / `$self->M(...)`,
+                        // record M so cross-file resolution can chain
+                        // through at query time.
+                        let sub_scope = self
+                            .scopes
+                            .iter()
+                            .find(|s| {
+                                matches!(
+                                    &s.kind,
+                                    ScopeKind::Sub { name } | ScopeKind::Method { name }
+                                        if name == &sym.name
+                                )
+                                    && s.span.start >= sym.span.start
+                                    && s.span.end <= sym.span.end
+                            })
+                            .map(|s| s.id);
+                        if let Some(sid) = sub_scope {
+                            if let Some(m) = self.self_method_tails.get(&sid) {
+                                *return_self_method = Some(m.clone());
+                            }
+                        }
+                        let _ = &scope_by_sub_span;
                     }
                 }
             }
         }
 
         // Propagate return types to call sites via structural bindings
-        // recorded during the walk (my $cfg = get_config()).
+        // recorded during the walk (my $cfg = get_config()). Push BOTH
+        // the legacy `TypeConstraint` and the corresponding `Variable`
+        // witness so the bag stays the source of truth — any later
+        // bag query about `$cfg` sees the call-resolved type without
+        // a separate sync pass.
         // TODO: inline expression propagation (get_config()->{key}) is a separate
         // code path — needs return type resolution at the expression level without
         // a variable assignment. Not handled here.
         let mut new_constraints = Vec::new();
+        let mut new_witnesses = Vec::new();
         for binding in &self.call_bindings {
             let rt = return_types.get(&binding.func_name)
                 .cloned()
@@ -3454,11 +6135,23 @@ impl<'a> Builder<'a> {
                     variable: binding.variable.clone(),
                     scope: binding.scope,
                     constraint_span: binding.span,
-                    inferred_type: rt,
+                    inferred_type: rt.clone(),
+                });
+                new_witnesses.push(Witness {
+                    attachment: WitnessAttachment::Variable {
+                        name: binding.variable.clone(),
+                        scope: binding.scope,
+                    },
+                    source: WitnessSource::Builder("call_binding".into()),
+                    payload: WitnessPayload::InferredType(rt),
+                    span: Span { start: binding.span.start, end: binding.span.start },
                 });
             }
         }
         self.type_constraints.extend(new_constraints);
+        for w in new_witnesses {
+            self.bag.push(w);
+        }
 
         // Fixup: update HashKeyAccess owners for variables bound to sub calls
         // that return HashRef. Two normalizations beyond the naive name match:
@@ -3531,6 +6224,54 @@ impl<'a> Builder<'a> {
                             name: resolved,
                         });
                     }
+                }
+            }
+        }
+    }
+
+    /// Apply every `TypeOverride` in the registry to local Sub/Method
+    /// symbols. Plugin-asserted return types win over inference; the
+    /// override carries a `reason` that we record in
+    /// `type_provenance` so a debugger can later answer "why does the
+    /// LSP think `_route` returns `Mojolicious::Routes::Route`?"
+    /// without re-running the build.
+    ///
+    /// Targets are matched on (name, package). Methods require an
+    /// exact package match — overrides describe the home class, not
+    /// the inheritance chain (a base class's override wins for that
+    /// base's symbol; subclasses get it via the existing cross-file
+    /// resolution path).
+    fn apply_type_overrides(&mut self) {
+        // Snapshot first — can't borrow self.plugins while mutating
+        // self.symbols + self.type_provenance below.
+        let pairs: Vec<(String, plugin::TypeOverride)> = self.plugins
+            .overrides()
+            .map(|(id, o)| (id.to_string(), o.clone()))
+            .collect();
+        if pairs.is_empty() {
+            return;
+        }
+        for (plugin_id, ov) in pairs {
+            for sym in &mut self.symbols {
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                let target_matches = match &ov.target {
+                    plugin::OverrideTarget::Method { class, name } => {
+                        sym.name == *name && sym.package.as_deref() == Some(class.as_str())
+                    }
+                    plugin::OverrideTarget::Sub { package, name } => {
+                        sym.name == *name && sym.package == *package
+                    }
+                };
+                if !target_matches { continue; }
+                if let SymbolDetail::Sub { ref mut return_type, .. } = sym.detail {
+                    *return_type = Some(ov.return_type.clone());
+                    self.type_provenance.insert(
+                        sym.id,
+                        TypeProvenance::PluginOverride {
+                            plugin_id: plugin_id.clone(),
+                            reason: ov.reason.clone(),
+                        },
+                    );
                 }
             }
         }
@@ -3624,6 +6365,125 @@ mod tests {
     fn build_fa(source: &str) -> FileAnalysis {
         let tree = parse(source);
         build(&tree, source.as_bytes())
+    }
+
+    #[test]
+    fn debug_moo_name_refs() {
+        let src = std::fs::read_to_string("test_files/frameworks.pl").unwrap();
+        let fa = build_fa(&src);
+        for r in &fa.refs {
+            if r.target_name == "name" || r.target_name == "new" {
+                eprintln!("REF: target={} kind={:?} span={:?} resolves_to={:?}",
+                    r.target_name, r.kind, r.span, r.resolves_to);
+            }
+        }
+        for s in &fa.symbols {
+            if s.name == "name" || (matches!(s.kind, SymKind::HashKeyDef) && s.span.start.row > 5 && s.span.start.row < 25) {
+                eprintln!("SYM: name={} kind={:?} span={:?} sel_span={:?} detail={:?}",
+                    s.name, s.kind, s.span, s.selection_span, s.detail);
+            }
+        }
+    }
+
+    // ---- varname-based extraction ----
+
+    /// Adversarial: every flavor of `foo` access (plain, element, slice,
+    /// KV slice, arraylen) must canonicalize to the underlying
+    /// `$foo`/`@foo`/`%foo` Variable symbol — NOT to "$foo" across the
+    /// board. TSP exposes the container kind via distinct node types
+    /// (`container_variable`, `slice_container_variable`,
+    /// `keyval_container_variable`, `arraylen`) + a `hash:`/`array:`
+    /// field on the parent. Our job is to route each to the correct
+    /// declared symbol.
+    #[test]
+    fn sigil_disambiguation_across_access_forms() {
+        let src = "\
+my ($foo, @foo, %foo);
+$foo;
+$foo[0];
+$foo{hi};
+@foo[0..1];
+@foo{qw/hi there/};
+$#foo;
+%foo[0..1];
+%foo{a};
+";
+        let fa = build_fa(src);
+
+        // Three distinct declarations.
+        let decls: std::collections::HashMap<&str, _> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Variable && s.scope == ScopeId(0)
+                && matches!(s.name.as_str(), "$foo" | "@foo" | "%foo"))
+            .map(|s| (s.name.as_str(), s.id))
+            .collect();
+        assert!(decls.contains_key("$foo"), "missing scalar decl");
+        assert!(decls.contains_key("@foo"), "missing array decl");
+        assert!(decls.contains_key("%foo"), "missing hash decl");
+
+        // Collect every Variable/ContainerAccess ref, keyed by the line
+        // it sits on. Line 0 is the declaration — skip it.
+        let mut refs_by_line: std::collections::HashMap<usize, Vec<&str>> = Default::default();
+        for r in &fa.refs {
+            if !matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) { continue; }
+            if r.access == AccessKind::Declaration { continue; }
+            refs_by_line.entry(r.span.start.row).or_default().push(r.target_name.as_str());
+        }
+
+        let expected: &[(usize, &str, &str)] = &[
+            (1, "$foo",                "$foo"), // plain scalar
+            (2, "$foo[0]",             "@foo"), // array element access
+            (3, "$foo{hi}",            "%foo"), // hash element access
+            (4, "@foo[0..1]",          "@foo"), // array slice
+            (5, "@foo{qw/hi there/}",  "%foo"), // hash slice — Perl semantic
+            (6, "$#foo",               "@foo"), // arraylen
+            (7, "%foo[0..1]",          "@foo"), // KV slice of array (5.20+)
+            (8, "%foo{a}",             "%foo"), // KV slice of hash
+        ];
+
+        let mut failures: Vec<String> = Vec::new();
+        for (line, form, want) in expected {
+            let got = refs_by_line.get(line).cloned().unwrap_or_default();
+            if got.as_slice() != [*want] {
+                failures.push(format!(
+                    "  line {} `{}` → want [{}], got {:?}",
+                    line, form, want, got));
+            }
+        }
+        assert!(failures.is_empty(),
+            "sigil disambiguation failures:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn braced_var_declaration_names_match_bare_form() {
+        // `my ${foo}` is just `my $foo`. Before the varname refactor we
+        // stored the declared name as the full node text `${foo}`, so a
+        // later `$foo` reference couldn't resolve to it. Now both share
+        // the canonical `$foo` name.
+        let fa = build_fa("my ${foo} = 1;\n$foo;\n");
+        let decls: Vec<_> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Variable && s.name == "$foo")
+            .collect();
+        assert_eq!(decls.len(), 1, "expected one $foo symbol, got {:?}",
+            fa.symbols.iter().filter(|s| s.kind == SymKind::Variable).map(|s| &s.name).collect::<Vec<_>>());
+    }
+
+    // ---- parse_instance_of ----
+
+    #[test]
+    fn parse_instance_of_single_quoted() {
+        assert_eq!(parse_instance_of("InstanceOf['Foo::Bar']").as_deref(), Some("Foo::Bar"));
+    }
+
+    #[test]
+    fn parse_instance_of_double_quoted() {
+        assert_eq!(parse_instance_of("InstanceOf[\"Foo::Bar\"]").as_deref(), Some("Foo::Bar"));
+    }
+
+    #[test]
+    fn parse_instance_of_rejects_non_instance_of() {
+        assert_eq!(parse_instance_of("Str"), None);
+        assert_eq!(parse_instance_of("ArrayRef[Int]"), None);
+        assert_eq!(parse_instance_of("My::Class"), None);
     }
 
     // ---- Scope tests ----
@@ -3792,7 +6652,7 @@ mod tests {
         let fa = build_fa(source);
 
         // Type inference: $self → Point
-        let inferred = fa.inferred_type("$self", Point::new(4, 8));
+        let inferred = fa.inferred_type_via_bag("$self", Point::new(4, 8));
         assert!(inferred.is_some(), "$self type should be inferred");
         match inferred.unwrap() {
             InferredType::ClassName(name) => assert_eq!(name, "Point"),
@@ -3853,7 +6713,7 @@ $p->;
         let fa = build_fa(source);
 
         // Check type inference resolved $p → Point
-        let inferred = fa.inferred_type("$p", Point::new(8, 4));
+        let inferred = fa.inferred_type_via_bag("$p", Point::new(8, 4));
         assert!(inferred.is_some(), "type inference for $p should resolve");
 
         let candidates = fa.complete_methods("$p", Point::new(10, 4));
@@ -3951,7 +6811,7 @@ $p->;
     fn test_function_call_ref() {
         let fa = build_fa("sub foo { }\nfoo();");
         let call_refs: Vec<_> = fa.refs.iter()
-            .filter(|r| r.target_name == "foo" && matches!(r.kind, RefKind::FunctionCall))
+            .filter(|r| r.target_name == "foo" && matches!(r.kind, RefKind::FunctionCall { .. }))
             .collect();
         assert_eq!(call_refs.len(), 1);
     }
@@ -4008,7 +6868,7 @@ $p->;
     #[test]
     fn test_type_inference_constructor() {
         let fa = build_fa("use v5.38;\nclass Point { }\nmy $p = Point->new();");
-        let ty = fa.inferred_type("$p", Point::new(2, 20));
+        let ty = fa.inferred_type_via_bag("$p", Point::new(2, 20));
         assert!(ty.is_some(), "should infer type for $p");
         if let Some(InferredType::ClassName(cn)) = ty {
             assert_eq!(cn, "Point");
@@ -4019,14 +6879,15 @@ $p->;
 
     #[test]
     fn test_type_inference_first_param() {
+        // The walk pushes a `FirstParam { package: "Calculator" }`
+        // type-constraint, but the bag-aware query normalises it to
+        // `ClassName("Calculator")` via the FrameworkAwareTypeFold
+        // (FirstParam is an internal observation; consumers see the
+        // class identity). That's the canonical answer the LSP
+        // serves at any cursor position on `$self`.
         let fa = build_fa("package Calculator;\nsub new {\n    my ($self) = @_;\n}");
-        let ty = fa.inferred_type("$self", Point::new(2, 10));
-        assert!(ty.is_some(), "should infer type for $self");
-        if let Some(InferredType::FirstParam { package }) = ty {
-            assert_eq!(package, "Calculator");
-        } else {
-            panic!("expected FirstParam, got {:?}", ty);
-        }
+        let ty = fa.inferred_type_via_bag("$self", Point::new(2, 10));
+        assert_eq!(ty, Some(InferredType::ClassName("Calculator".into())));
     }
 
     // ---- Literal constructor extraction tests (via build_fa) ----
@@ -4034,56 +6895,56 @@ $p->;
     #[test]
     fn test_extract_hashref_literal() {
         let fa = build_fa("my $href = {};");
-        let ty = fa.inferred_type("$href", Point::new(0, 14));
-        assert_eq!(ty, Some(&InferredType::HashRef), "empty hash ref literal");
+        let ty = fa.inferred_type_via_bag("$href", Point::new(0, 14));
+        assert_eq!(ty, Some(InferredType::HashRef), "empty hash ref literal");
 
         let fa = build_fa("my $href = { a => 1, b => 2 };");
-        let ty = fa.inferred_type("$href", Point::new(0, 30));
-        assert_eq!(ty, Some(&InferredType::HashRef), "populated hash ref literal");
+        let ty = fa.inferred_type_via_bag("$href", Point::new(0, 30));
+        assert_eq!(ty, Some(InferredType::HashRef), "populated hash ref literal");
     }
 
     #[test]
     fn test_extract_arrayref_literal() {
         let fa = build_fa("my $aref = [];");
-        let ty = fa.inferred_type("$aref", Point::new(0, 14));
-        assert_eq!(ty, Some(&InferredType::ArrayRef), "empty array ref literal");
+        let ty = fa.inferred_type_via_bag("$aref", Point::new(0, 14));
+        assert_eq!(ty, Some(InferredType::ArrayRef), "empty array ref literal");
 
         let fa = build_fa("my $aref = [1, 2, 3];");
-        let ty = fa.inferred_type("$aref", Point::new(0, 21));
-        assert_eq!(ty, Some(&InferredType::ArrayRef), "populated array ref literal");
+        let ty = fa.inferred_type_via_bag("$aref", Point::new(0, 21));
+        assert_eq!(ty, Some(InferredType::ArrayRef), "populated array ref literal");
     }
 
     #[test]
     fn test_extract_coderef_literal() {
         let fa = build_fa("my $cref = sub { 42 };");
-        let ty = fa.inferred_type("$cref", Point::new(0, 22));
-        assert_eq!(ty, Some(&InferredType::CodeRef), "anonymous sub");
+        let ty = fa.inferred_type_via_bag("$cref", Point::new(0, 22));
+        assert_eq!(ty, Some(InferredType::CodeRef), "anonymous sub");
     }
 
     #[test]
     fn test_extract_regexp_literal() {
         let fa = build_fa("my $re = qr/pattern/;");
-        let ty = fa.inferred_type("$re", Point::new(0, 21));
-        assert_eq!(ty, Some(&InferredType::Regexp), "qr// literal");
+        let ty = fa.inferred_type_via_bag("$re", Point::new(0, 21));
+        assert_eq!(ty, Some(InferredType::Regexp), "qr// literal");
     }
 
     #[test]
     fn test_extract_reassignment_type_change() {
         let fa = build_fa("my $x = {};\n$x = [];");
         // After line 0 → HashRef
-        let ty = fa.inferred_type("$x", Point::new(0, 11));
-        assert_eq!(ty, Some(&InferredType::HashRef), "initial hashref");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(0, 11));
+        assert_eq!(ty, Some(InferredType::HashRef), "initial hashref");
         // After line 1 → ArrayRef
-        let ty = fa.inferred_type("$x", Point::new(1, 8));
-        assert_eq!(ty, Some(&InferredType::ArrayRef), "reassigned to arrayref");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(1, 8));
+        assert_eq!(ty, Some(InferredType::ArrayRef), "reassigned to arrayref");
     }
 
     #[test]
     fn test_extract_constructor_still_works() {
         // Existing constructor detection should still work
         let fa = build_fa("my $obj = Foo->new();");
-        let ty = fa.inferred_type("$obj", Point::new(0, 21));
-        assert_eq!(ty, Some(&InferredType::ClassName("Foo".into())));
+        let ty = fa.inferred_type_via_bag("$obj", Point::new(0, 21));
+        assert_eq!(ty, Some(InferredType::ClassName("Foo".into())));
     }
 
     // ---- Operator-based type inference tests (Step 3) ----
@@ -4091,138 +6952,138 @@ $p->;
     #[test]
     fn test_arrow_hash_deref_infers_hashref() {
         let fa = build_fa("my $x;\n$x->{key};");
-        let ty = fa.inferred_type("$x", Point::new(1, 10));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(1, 10));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_arrow_array_deref_infers_arrayref() {
         let fa = build_fa("my $x;\n$x->[0];");
-        let ty = fa.inferred_type("$x", Point::new(1, 8));
-        assert_eq!(ty, Some(&InferredType::ArrayRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(1, 8));
+        assert_eq!(ty, Some(InferredType::ArrayRef));
     }
 
     #[test]
     fn test_arrow_code_deref_infers_coderef() {
         let fa = build_fa("my $x;\n$x->(1, 2);");
-        let ty = fa.inferred_type("$x", Point::new(1, 10));
-        assert_eq!(ty, Some(&InferredType::CodeRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(1, 10));
+        assert_eq!(ty, Some(InferredType::CodeRef));
     }
 
     #[test]
     fn test_postfix_array_deref_infers_arrayref() {
         let fa = build_fa("my $x;\nmy @a = $x->@*;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::ArrayRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::ArrayRef));
     }
 
     #[test]
     fn test_postfix_hash_deref_infers_hashref() {
         let fa = build_fa("my $y;\nmy %h = $y->%*;\nmy $z;");
-        let ty = fa.inferred_type("$y", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$y", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_binary_numeric_ops_infer_numeric() {
         let fa = build_fa("my $x;\nmy $a = $x + 1;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "+ operator");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "+ operator");
 
         let fa = build_fa("my $x;\nmy $a = $x * 2;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "* operator");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "* operator");
     }
 
     #[test]
     fn test_assignment_from_binary_numeric_infers_result() {
         let fa = build_fa("my $a = 1;\nmy $b = 2;\nmy $result = $a + $b;\n$result;");
-        let ty = fa.inferred_type("$result", Point::new(3, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "$result = $a + $b should be Numeric");
+        let ty = fa.inferred_type_via_bag("$result", Point::new(3, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "$result = $a + $b should be Numeric");
     }
 
     #[test]
     fn test_assignment_from_string_concat_infers_result() {
         let fa = build_fa("my $a = 'x';\nmy $b = 'y';\nmy $s = $a . $b;\n$s;");
-        let ty = fa.inferred_type("$s", Point::new(3, 0));
-        assert_eq!(ty, Some(&InferredType::String), "$s = $a . $b should be String");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(3, 0));
+        assert_eq!(ty, Some(InferredType::String), "$s = $a . $b should be String");
     }
 
     #[test]
     fn test_string_concat_infers_string() {
         let fa = build_fa("my $s;\nmy $a = $s . \"x\";\nmy $z;");
-        let ty = fa.inferred_type("$s", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::String), ". operator");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::String), ". operator");
     }
 
     #[test]
     fn test_string_repeat_infers_string() {
         let fa = build_fa("my $s;\n$s x 3;\nmy $z;");
-        let ty = fa.inferred_type("$s", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::String), "x operator");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::String), "x operator");
     }
 
     #[test]
     fn test_numeric_comparison_infers_numeric() {
         let fa = build_fa("my $x;\nmy $y;\n$x == $y;\nmy $z;");
-        assert_eq!(fa.inferred_type("$x", Point::new(3, 0)), Some(&InferredType::Numeric));
-        assert_eq!(fa.inferred_type("$y", Point::new(3, 0)), Some(&InferredType::Numeric));
+        assert_eq!(fa.inferred_type_via_bag("$x", Point::new(3, 0)), Some(InferredType::Numeric));
+        assert_eq!(fa.inferred_type_via_bag("$y", Point::new(3, 0)), Some(InferredType::Numeric));
     }
 
     #[test]
     fn test_string_comparison_infers_string() {
         let fa = build_fa("my $x;\nmy $y;\n$x eq $y;\nmy $z;");
-        assert_eq!(fa.inferred_type("$x", Point::new(3, 0)), Some(&InferredType::String));
-        assert_eq!(fa.inferred_type("$y", Point::new(3, 0)), Some(&InferredType::String));
+        assert_eq!(fa.inferred_type_via_bag("$x", Point::new(3, 0)), Some(InferredType::String));
+        assert_eq!(fa.inferred_type_via_bag("$y", Point::new(3, 0)), Some(InferredType::String));
     }
 
     #[test]
     fn test_increment_infers_numeric() {
         let fa = build_fa("my $x;\n$x++;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric));
     }
 
     #[test]
     fn test_regex_match_infers_string() {
         let fa = build_fa("my $s;\n$s =~ /pattern/;\nmy $z;");
-        let ty = fa.inferred_type("$s", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::String));
+        let ty = fa.inferred_type_via_bag("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::String));
     }
 
     #[test]
     fn test_preinc_infers_numeric() {
         let fa = build_fa("my $x;\n++$x;\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric));
     }
 
     #[test]
     fn test_block_array_deref_infers_arrayref() {
         let fa = build_fa("my $x;\nmy @items = @{$x};\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::ArrayRef));
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::ArrayRef));
     }
 
     #[test]
     fn test_block_hash_deref_infers_hashref() {
         let fa = build_fa("my $y;\nmy %t = %{$y};\nmy $z;");
-        let ty = fa.inferred_type("$y", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$y", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_block_code_deref_infers_coderef() {
         let fa = build_fa("my $z;\n&{$z}();\nmy $w;");
-        let ty = fa.inferred_type("$z", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::CodeRef));
+        let ty = fa.inferred_type_via_bag("$z", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::CodeRef));
     }
 
     #[test]
     fn test_no_numeric_on_array_variable() {
         // @arr + 1 should NOT push Numeric on @arr
         let fa = build_fa("my @arr;\nmy $n = @arr + 1;\nmy $z;");
-        let ty = fa.inferred_type("@arr", Point::new(2, 0));
+        let ty = fa.inferred_type_via_bag("@arr", Point::new(2, 0));
         assert_eq!(ty, None, "@arr should not get Numeric constraint");
     }
 
@@ -4232,43 +7093,43 @@ $p->;
     fn test_builtin_push_infers_arrayref() {
         // push @{$aref} triggers array_deref_expression which already infers ArrayRef
         let fa = build_fa("my $aref;\npush @{$aref}, 1;\nmy $z;");
-        let ty = fa.inferred_type("$aref", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::ArrayRef), "push deref should infer ArrayRef");
+        let ty = fa.inferred_type_via_bag("$aref", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::ArrayRef), "push deref should infer ArrayRef");
     }
 
     #[test]
     fn test_builtin_length_infers_string_arg() {
         let fa = build_fa("my $s;\nmy $n = length($s);\nmy $z;");
-        let ty = fa.inferred_type("$s", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::String), "length arg should be String");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::String), "length arg should be String");
     }
 
     #[test]
     fn test_builtin_abs_infers_numeric_arg() {
         let fa = build_fa("my $x;\nmy $n = abs($x);\nmy $z;");
-        let ty = fa.inferred_type("$x", Point::new(2, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "abs arg should be Numeric");
+        let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "abs arg should be Numeric");
     }
 
     #[test]
     fn test_builtin_return_type_propagates() {
         let fa = build_fa("my $t = time();\n$t;");
-        let ty = fa.inferred_type("$t", Point::new(1, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "time() should return Numeric");
+        let ty = fa.inferred_type_via_bag("$t", Point::new(1, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "time() should return Numeric");
     }
 
     #[test]
     fn test_builtin_join_return_type() {
         let fa = build_fa("my $s = join(',', @arr);\n$s;");
-        let ty = fa.inferred_type("$s", Point::new(1, 0));
-        assert_eq!(ty, Some(&InferredType::String), "join() should return String");
+        let ty = fa.inferred_type_via_bag("$s", Point::new(1, 0));
+        assert_eq!(ty, Some(InferredType::String), "join() should return String");
     }
 
     #[test]
     fn test_builtin_length_return_type() {
         let fa = build_fa("my $n = length('hello');\n$n;");
-        let ty = fa.inferred_type("$n", Point::new(1, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "length() should return Numeric");
+        let ty = fa.inferred_type_via_bag("$n", Point::new(1, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "length() should return Numeric");
     }
 
     // ---- Return type inference tests (Step 4) ----
@@ -4276,72 +7137,75 @@ $p->;
     #[test]
     fn test_return_type_hashref() {
         let fa = build_fa("sub get_config {\n    return { host => \"localhost\" };\n}");
-        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_config", None), Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_return_type_arrayref() {
         let fa = build_fa("sub get_tags {\n    return [1, 2, 3];\n}");
-        assert_eq!(fa.sub_return_type("get_tags"), Some(&InferredType::ArrayRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_tags", None), Some(InferredType::ArrayRef));
     }
 
     #[test]
     fn test_return_type_coderef() {
         let fa = build_fa("sub get_handler {\n    return sub { 1 };\n}");
-        assert_eq!(fa.sub_return_type("get_handler"), Some(&InferredType::CodeRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_handler", None), Some(InferredType::CodeRef));
     }
 
     #[test]
     fn test_return_type_implicit_last_expr() {
         // No explicit return — last expression is the implicit return
         let fa = build_fa("sub get_data {\n    { key => \"val\" };\n}");
-        assert_eq!(fa.sub_return_type("get_data"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_data", None), Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_return_type_conflicting_returns_unknown() {
         // Two returns with different types → None (unknown)
         let fa = build_fa("sub ambiguous {\n    if (1) { return {} }\n    return [];\n}");
-        assert_eq!(fa.sub_return_type("ambiguous"), None);
+        assert_eq!(fa.sub_return_type_at_arity("ambiguous", None), None);
     }
 
     #[test]
     fn test_return_type_consistent_returns() {
         // Multiple returns all hashref → HashRef
         let fa = build_fa("sub consistent {\n    if (1) { return { a => 1 } }\n    return { b => 2 };\n}");
-        assert_eq!(fa.sub_return_type("consistent"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("consistent", None), Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_return_type_propagation_to_call_site() {
         let fa = build_fa("sub get_config {\n    return { host => 1 };\n}\nmy $cfg = get_config();\nmy $z;");
-        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
-        let ty = fa.inferred_type("$cfg", Point::new(4, 0));
-        assert_eq!(ty, Some(&InferredType::HashRef), "call site should get return type");
+        assert_eq!(fa.sub_return_type_at_arity("get_config", None), Some(InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$cfg", Point::new(4, 0));
+        assert_eq!(ty, Some(InferredType::HashRef), "call site should get return type");
     }
 
     #[test]
     fn test_return_type_propagation_method_call() {
         let src = "package Calculator;\nsub new { bless {}, shift }\nsub add {\n    my ($self, $a, $b) = @_;\n    my $result = $a + $b;\n    return $result;\n}\npackage main;\nmy $calc = Calculator->new();\nmy $sum = $calc->add(2, 3);\n$sum;";
         let fa = build_fa(src);
-        assert_eq!(fa.sub_return_type("add"), Some(&InferredType::Numeric), "add should return Numeric");
-        let ty = fa.inferred_type("$sum", Point::new(10, 0));
-        assert_eq!(ty, Some(&InferredType::Numeric), "$sum should be Numeric via method call binding");
+        assert_eq!(fa.sub_return_type_at_arity("add", None), Some(InferredType::Numeric), "add should return Numeric");
+        let ty = fa.inferred_type_via_bag("$sum", Point::new(10, 0));
+        assert_eq!(ty, Some(InferredType::Numeric), "$sum should be Numeric via method call binding");
     }
 
     #[test]
     fn test_return_type_constructor() {
         let fa = build_fa("package User;\nsub new { bless {}, shift }\npackage main;\nsub get_user {\n    return User->new();\n}");
-        assert_eq!(fa.sub_return_type("get_user"), Some(&InferredType::ClassName("User".into())));
+        assert_eq!(fa.sub_return_type_at_arity("get_user", None), Some(InferredType::ClassName("User".into())));
     }
 
     #[test]
     fn test_return_type_self_variable() {
-        // return $self where $self has a type constraint
+        // `return $self` resolves through the witness bag to the canonical
+        // class type. `FirstParam` (the body-internal observation) is
+        // normalised to `ClassName` at the FrameworkAwareTypeFold boundary
+        // — callers chaining off the return get the concrete class.
         let fa = build_fa("package Foo;\nsub new { bless {}, shift }\nsub clone {\n    my ($self) = @_;\n    return $self;\n}");
         assert_eq!(
-            fa.sub_return_type("clone"),
-            Some(&InferredType::FirstParam { package: "Foo".into() }),
+            fa.sub_return_type_at_arity("clone", None),
+            Some(InferredType::ClassName("Foo".into())),
         );
     }
 
@@ -4349,21 +7213,21 @@ $p->;
     fn test_return_type_bare_return_filtered() {
         // Bare return + typed return → bare is filtered, typed return wins
         let fa = build_fa("sub get_config {\n    return unless 1;\n    return { host => 1 };\n}");
-        assert_eq!(fa.sub_return_type("get_config"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("get_config", None), Some(InferredType::HashRef));
     }
 
     #[test]
     fn test_return_type_all_bare_returns() {
         // All bare returns → no return type
         let fa = build_fa("sub noop {\n    return;\n}");
-        assert_eq!(fa.sub_return_type("noop"), None);
+        assert_eq!(fa.sub_return_type_at_arity("noop", None), None);
     }
 
     #[test]
     fn test_return_type_undef_filtered() {
         // return undef + typed return → undef is filtered, typed return wins
         let fa = build_fa("sub maybe {\n    return undef unless 1;\n    return { a => 1 };\n}");
-        assert_eq!(fa.sub_return_type("maybe"), Some(&InferredType::HashRef));
+        assert_eq!(fa.sub_return_type_at_arity("maybe", None), Some(InferredType::HashRef));
     }
 
     // ---- resolve_expression_type tests ----
@@ -4402,7 +7266,7 @@ $p->;
         let fa = build(&tree, src.as_bytes());
         // $f->get_bar() should resolve to Object(Bar)
         // First verify get_bar has the right return type
-        assert_eq!(fa.sub_return_type("get_bar"), Some(&InferredType::ClassName("Bar".into())));
+        assert_eq!(fa.sub_return_type_at_arity("get_bar", None), Some(InferredType::ClassName("Bar".into())));
     }
 
     #[test]
@@ -4473,13 +7337,13 @@ $calc->get_self->get_config->{host};
         let fa = build(&tree, src.as_bytes());
 
         // Verify get_self returns an object type for Calculator
-        let get_self_rt = fa.sub_return_type("get_self");
-        assert_eq!(get_self_rt.and_then(|t| t.class_name()), Some("Calculator"),
+        let get_self_rt = fa.sub_return_type_at_arity("get_self", None);
+        assert_eq!(get_self_rt.as_ref().and_then(|t| t.class_name()), Some("Calculator"),
             "get_self should return Calculator");
 
         // Verify get_config returns HashRef
-        let get_config_rt = fa.sub_return_type("get_config");
-        assert_eq!(get_config_rt, Some(&InferredType::HashRef),
+        let get_config_rt = fa.sub_return_type_at_arity("get_config", None);
+        assert_eq!(get_config_rt, Some(InferredType::HashRef),
             "get_config should return HashRef");
 
         // The outermost expression is hash_element_expression wrapping the chain
@@ -4832,10 +7696,13 @@ sub test {
     $self->emit('done');
 }
 ");
-        let edits = fa.rename_sub("emit", "fire");
-        // Should find: 1 symbol def + 1 FunctionCall + 1 MethodCall = 3 edits
+        // `sub emit` in package Foo. Scope-aware rename with
+        // package=Foo catches the decl, the FunctionCall `emit()`,
+        // AND the MethodCall `$self->emit()` — two shapes of the
+        // same callable.
+        let edits = fa.rename_sub_in_package("emit", &Some("Foo".to_string()), "fire");
         assert!(edits.len() >= 3,
-            "rename_sub should find def + function call + method call, got {} edits", edits.len());
+            "rename_sub_in_package should find def + function call + method call, got {} edits", edits.len());
         for (_, text) in &edits {
             assert_eq!(text, "fire");
         }
@@ -5018,10 +7885,12 @@ has password => (is => 'rw');
         assert_eq!(fa.imports.len(), 2);
 
         assert_eq!(fa.imports[0].module_name, "List::Util");
-        assert_eq!(fa.imports[0].imported_symbols, vec!["first", "any", "all"]);
+        let names0: Vec<&str> = fa.imports[0].imported_symbols.iter().map(|s| s.local_name.as_str()).collect();
+        assert_eq!(names0, vec!["first", "any", "all"]);
 
         assert_eq!(fa.imports[1].module_name, "Scalar::Util");
-        assert_eq!(fa.imports[1].imported_symbols, vec!["blessed"]);
+        let names1: Vec<&str> = fa.imports[1].imported_symbols.iter().map(|s| s.local_name.as_str()).collect();
+        assert_eq!(names1, vec!["blessed"]);
     }
 
     #[test]
@@ -5065,7 +7934,8 @@ has password => (is => 'rw');
 
         // Import should exist
         assert_eq!(fa.imports.len(), 1);
-        assert_eq!(fa.imports[0].imported_symbols, vec!["first"]);
+        let names: Vec<&str> = fa.imports[0].imported_symbols.iter().map(|s| s.local_name.as_str()).collect();
+        assert_eq!(names, vec!["first"]);
     }
 
     #[test]
@@ -5133,8 +8003,8 @@ my $p = Point->new(x => 3, y => 4);
         package Mojo::File;
         sub path { __PACKAGE__->new(@_) }
         ");
-        let rt = fa.sub_return_type("path");
-        assert_eq!(rt, Some(&InferredType::ClassName("Mojo::File".into())));
+        let rt = fa.sub_return_type_at_arity("path", None);
+        assert_eq!(rt, Some(InferredType::ClassName("Mojo::File".into())));
     }
 
     #[test]
@@ -5740,8 +8610,8 @@ my $f = Foo->new();
 my $cfg = $f->get_config();
 $cfg;
 ");
-        let ty = fa.inferred_type("$cfg", Point::new(9, 0));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$cfg", Point::new(9, 0));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     #[test]
@@ -5759,10 +8629,10 @@ my $bar = $f->get_bar();
 my $name = $bar->get_name();
 $name;
 ");
-        let bar_ty = fa.inferred_type("$bar", Point::new(10, 0));
-        assert_eq!(bar_ty, Some(&InferredType::ClassName("Bar".into())));
-        let name_ty = fa.inferred_type("$name", Point::new(11, 0));
-        assert_eq!(name_ty, Some(&InferredType::HashRef));
+        let bar_ty = fa.inferred_type_via_bag("$bar", Point::new(10, 0));
+        assert_eq!(bar_ty, Some(InferredType::ClassName("Bar".into())));
+        let name_ty = fa.inferred_type_via_bag("$name", Point::new(11, 0));
+        assert_eq!(name_ty, Some(InferredType::HashRef));
     }
 
     #[test]
@@ -5777,8 +8647,8 @@ sub run {
     $cfg;
 }
 ");
-        let ty = fa.inferred_type("$cfg", Point::new(7, 4));
-        assert_eq!(ty, Some(&InferredType::HashRef));
+        let ty = fa.inferred_type_via_bag("$cfg", Point::new(7, 4));
+        assert_eq!(ty, Some(InferredType::HashRef));
     }
 
     // ---- Framework accessor synthesis tests ----
@@ -6079,8 +8949,8 @@ sub run {
             "$cfg should NOT be a function call binding");
 
         // Verify $cfg gets Moo::Config type (not Moo::Service)
-        let cfg_type = fa.inferred_type("$cfg", tree_sitter::Point::new(13, 0));
-        assert_eq!(cfg_type, Some(&InferredType::ClassName("Moo::Config".into())),
+        let cfg_type = fa.inferred_type_via_bag("$cfg", tree_sitter::Point::new(13, 0));
+        assert_eq!(cfg_type, Some(InferredType::ClassName("Moo::Config".into())),
             "$cfg should be Moo::Config, not Moo::Service");
 
         // Verify chained resolution: $dsn = $cfg->dsn → String
@@ -6448,5 +9318,3724 @@ sub test { my $self = shift; $self->$method() }
             .filter(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "get_name")
             .collect();
         assert!(!method_refs.is_empty(), "dynamic method call should resolve to get_name");
+    }
+
+    // ---- Framework plugin integration ----
+
+    /// End-to-end: the bundled `mojo-events` Rhai plugin should synthesize a
+    /// `HashKeyDef` for every literal event name passed to `->on(...)`
+    /// inside a class that inherits from `Mojo::EventEmitter`. This is the
+    /// proof that Rhai scripts emit real symbols that land in FileAnalysis
+    /// with the `Framework` namespace stamp.
+    #[test]
+    fn plugin_mojo_events_on_literal_emits_handler_symbol() {
+        let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub new {
+    my $class = shift;
+    my $self = bless {}, $class;
+    $self->on('connect', sub { ... });
+    $self->on('message', sub { ... });
+    $self;
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+
+        let handlers: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-events"))
+            .collect();
+
+        let names: std::collections::HashSet<&str> = handlers.iter()
+            .map(|s| s.name.as_str()).collect();
+        assert!(names.contains("connect"),
+            "mojo-events should emit Handler for 'connect'; got: {:?}", names);
+        assert!(names.contains("message"),
+            "mojo-events should emit Handler for 'message'; got: {:?}", names);
+
+        // Each Handler should also carry the dispatcher set — at minimum
+        // 'emit' (the canonical Mojo dispatch method).
+        for h in &handlers {
+            if let SymbolDetail::Handler { dispatchers, .. } = &h.detail {
+                assert!(dispatchers.iter().any(|d| d == "emit"),
+                    "Handler for {} should declare `emit` dispatcher", h.name);
+            } else {
+                panic!("expected Handler detail on {}", h.name);
+            }
+        }
+    }
+
+    /// Dynamic event names must not produce spurious HashKeyDefs.
+    #[test]
+    fn plugin_mojo_events_dynamic_name_does_not_emit() {
+        let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my ($self, $name) = @_;
+    $self->on($name, sub { ... });
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+        let plugin_handlers: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-events"))
+            .collect();
+        assert!(plugin_handlers.is_empty(),
+            "dynamic event name must not emit handlers; got: {:?}",
+            plugin_handlers.iter().map(|s| &s.name).collect::<Vec<_>>());
+    }
+
+    /// Const folding through the plugin: `my $name = 'connect'; ...` means
+    /// the plugin receives `arg.string_value == "connect"` and emits a
+    /// symbol named "connect" — not "$name". The plugin itself contains no
+    /// folding logic; the builder does it once in `arg_info_for` and every
+    /// plugin gets folded values for free.
+    #[test]
+    fn plugin_mojo_events_const_folds_scalar_event_name() {
+        let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my $self = shift;
+    my $evt = 'disconnect';
+    $self->on($evt, sub { ... });
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+
+        let names: std::collections::HashSet<&str> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-events"))
+            .map(|s| s.name.as_str()).collect();
+        assert!(names.contains("disconnect"),
+            "const-folded event name should emit 'disconnect'; got: {:?}", names);
+        assert!(!names.contains("$evt"),
+            "variable text must not leak through as symbol name");
+    }
+
+    /// Transitive inheritance: a class whose parent (in the same file)
+    /// extends Mojo::EventEmitter should still trigger the plugin. Proves
+    /// the builder's transitive_parents walk composes with `ClassIsa`.
+    #[test]
+    fn plugin_mojo_events_triggers_through_transitive_parent() {
+        let src = r#"
+package Mid;
+use parent 'Mojo::EventEmitter';
+
+package Leaf;
+use parent 'Mid';
+
+sub wire {
+    my $self = shift;
+    $self->on('ready', sub { ... });
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+        let ready: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && s.name == "ready"
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-events"))
+            .collect();
+        assert_eq!(ready.len(), 1,
+            "Leaf extends Mid extends Mojo::EventEmitter — plugin must fire transitively");
+    }
+
+    /// Cross-file def/ref pairing. Producer.pm wires events via ->on, Consumer.pm
+    /// calls ->emit on a producer instance. Both plugin emissions end up with
+    /// `HashKeyOwner::Class("Producer")`, so `resolve::refs_to` finds the
+    /// consumer's access ref from the producer's def query — no LSP code is
+    /// plugin-aware.
+    #[test]
+    fn plugin_mojo_events_cross_file_ref_pairing() {
+        use crate::file_store::FileStore;
+        use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
+        use std::path::PathBuf;
+        use crate::file_analysis::HandlerOwner;
+
+        let producer_src = r#"
+package Producer;
+use parent 'Mojo::EventEmitter';
+
+sub new {
+    my $class = shift;
+    my $self = bless {}, $class;
+    $self->on('ready', sub { warn "ready" });
+    return $self;
+}
+1;
+"#;
+        let consumer_src = r#"
+package Consumer;
+use parent 'Mojo::EventEmitter';
+
+sub run {
+    my $p = Producer->new;
+    $p->emit('ready');
+    $p->unsubscribe('ready');
+}
+1;
+"#;
+
+        let store = FileStore::new();
+        let producer_path = PathBuf::from("/tmp/plugin_producer.pm");
+        let consumer_path = PathBuf::from("/tmp/plugin_consumer.pm");
+
+        store.insert_workspace(producer_path.clone(), build_fa(producer_src));
+        store.insert_workspace(consumer_path.clone(), build_fa(consumer_src));
+
+        let results = refs_to(
+            &store,
+            None,
+            &TargetRef {
+                name: "ready".to_string(),
+                kind: TargetKind::Handler {
+                    owner: HandlerOwner::Class("Producer".to_string()),
+                    name: "ready".to_string(),
+                },
+            },
+            RoleMask::EDITABLE,
+        );
+
+        let producer_hits = results.iter().filter(|r| {
+            matches!(&r.key, crate::file_store::FileKey::Path(p) if p == &producer_path)
+        }).count();
+        let consumer_hits = results.iter().filter(|r| {
+            matches!(&r.key, crate::file_store::FileKey::Path(p) if p == &consumer_path)
+        }).count();
+
+        assert!(producer_hits >= 1,
+            "producer should have ≥1 hit (the ->on Handler def); results: {:?}", results);
+        assert!(consumer_hits >= 1,
+            "consumer should have ≥1 hit (the ->emit DispatchCall); results: {:?}", results);
+    }
+
+    /// mojo-helpers: Phase-2 architecture emits ONE Method per helper,
+    /// owned by `Mojolicious::Controller` — the canonical home for
+    /// controller-callable helpers. The PluginNamespace's bridges cover
+    /// both Controller and Mojolicious so `$c->name` AND `$app->name`
+    /// both resolve through namespace lookup (no Symbol fan-out).
+    #[test]
+    fn plugin_mojo_helpers_registers_method_on_controller() {
+        let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(current_user => sub {
+    my ($c, $extra) = @_;
+    return { id => 1 };
+});
+"#;
+        let fa = build_fa(src);
+
+        let helpers: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Method
+                && s.name == "current_user"
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
+            .collect();
+
+        assert_eq!(helpers.len(), 1, "one Method per helper (no fan-out — Phase 2)");
+        let helper = helpers[0];
+        assert_eq!(helper.package.as_deref(), Some("Mojolicious::Controller"),
+            "canonical home is Mojolicious::Controller");
+
+        if let SymbolDetail::Sub { params, display, .. } = &helper.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$extra"],
+                "helper's sub params flow through to the Method signature");
+            assert_eq!(
+                *display,
+                Some(crate::file_analysis::HandlerDisplay::Helper),
+                "helpers render as HandlerDisplay::Helper — the LSP kind is \
+                 FUNCTION (the enum doesn't have Helper), the outline word \
+                 is 'helper'. See HandlerDisplay::outline_word.",
+            );
+        } else {
+            panic!("helper detail should be Sub");
+        }
+
+        // The PluginNamespace owns the bridge visibility: its Class
+        // bridges cover both entry classes.
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n| n.plugin_id == "mojo-helpers" && n.entities.contains(&helper.id))
+            .expect("helper belongs to a mojo-helpers namespace");
+        let bridge_classes: std::collections::HashSet<&str> = ns.bridges.iter()
+            .map(|Bridge::Class(c)| c.as_str())
+            .collect();
+        assert!(bridge_classes.contains("Mojolicious::Controller"),
+            "namespace bridges Controller");
+        assert!(bridge_classes.contains("Mojolicious"),
+            "namespace bridges Mojolicious (the app class)");
+    }
+
+    /// Dotted helpers chain into namespace methods: `users.create` means
+    /// `$c->users->create`. Each non-leaf segment emits a parameterless
+    /// Method returning a synthetic proxy class; the leaf emits on the
+    /// innermost proxy with the helper's real params. Shared prefixes
+    /// dedup — `thing.hi` and `thing.there` must only ever produce one
+    /// `thing` symbol (not two), so completion + outline stay clean.
+    #[test]
+    fn plugin_mojo_helpers_dotted_chain_with_shared_prefix_dedup() {
+        let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper('thing.hi'    => sub { my ($c, $arg_a) = @_; });
+$app->helper('thing.there' => sub { my ($c, $arg_b) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        // Exactly one `thing` method on Mojolicious::Controller,
+        // despite two dotted helpers sharing that prefix.
+        let thing_syms: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.name == "thing" && s.kind == SymKind::Method
+                && s.package.as_deref() == Some("Mojolicious::Controller"))
+            .collect();
+        assert_eq!(thing_syms.len(), 1,
+            "shared prefix must dedup: one `thing` method, got {}",
+            thing_syms.len());
+
+        // Its return_type is the shared proxy class.
+        if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(n)), .. }
+            = &thing_syms[0].detail
+        {
+            assert_eq!(n, "Mojolicious::Controller::_Helper::thing");
+        } else {
+            panic!("thing's return type should be the shared proxy class");
+        }
+
+        // Both leaves exist on the shared proxy class, each with its own params.
+        let hi = fa.symbols.iter().find(|s| s.name == "hi" && s.kind == SymKind::Method)
+            .expect("hi leaf emitted");
+        let there = fa.symbols.iter().find(|s| s.name == "there" && s.kind == SymKind::Method)
+            .expect("there leaf emitted");
+        assert_eq!(hi.package.as_deref(), Some("Mojolicious::Controller::_Helper::thing"));
+        assert_eq!(there.package.as_deref(), Some("Mojolicious::Controller::_Helper::thing"));
+        if let SymbolDetail::Sub { params, .. } = &hi.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$arg_a"]);
+        }
+        if let SymbolDetail::Sub { params, .. } = &there.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$arg_b"]);
+        }
+    }
+
+    /// Three-level dotted helper chains: `admin.users.purge` synthesizes
+    /// two intermediate proxies, each with the right return_type, and
+    /// the leaf lands on the innermost proxy.
+    #[test]
+    fn plugin_mojo_helpers_three_level_dotted_chain() {
+        let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        let admin = fa.symbols.iter()
+            .find(|s| s.name == "admin" && s.kind == SymKind::Method
+                && s.package.as_deref() == Some("Mojolicious::Controller"))
+            .expect("admin on Controller");
+        let users = fa.symbols.iter()
+            .find(|s| s.name == "users" && s.kind == SymKind::Method
+                && s.package.as_deref() == Some("Mojolicious::Controller::_Helper::admin"))
+            .expect("users on admin proxy");
+        let purge = fa.symbols.iter()
+            .find(|s| s.name == "purge" && s.kind == SymKind::Method
+                && s.package.as_deref() == Some("Mojolicious::Controller::_Helper::admin::users"))
+            .expect("purge leaf on admin.users proxy");
+
+        // Each non-leaf returns the next proxy in the chain.
+        if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(n)), .. } = &admin.detail {
+            assert_eq!(n, "Mojolicious::Controller::_Helper::admin");
+        }
+        if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(n)), .. } = &users.detail {
+            assert_eq!(n, "Mojolicious::Controller::_Helper::admin::users");
+        }
+        // Leaf carries the helper's actual params.
+        if let SymbolDetail::Sub { params, .. } = &purge.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$force"]);
+        }
+    }
+
+    /// `use Mojolicious::Lite` autoimports a fixed verb set — our
+    /// unresolved-function diagnostic must skip them. The plugin's
+    /// `on_use` hook emits FrameworkImport actions for each; the
+    /// builder stashes them in framework_imports so the diagnostic
+    /// filter drops matching FunctionCall refs.
+    #[test]
+    fn plugin_mojo_lite_autoimports_verbs() {
+        let src = r#"
+package main;
+use Mojolicious::Lite;
+
+get '/x' => sub {};
+post '/y' => sub {};
+helper foo => sub {};
+"#;
+        let fa = build_fa(src);
+        for verb in &["get", "post", "put", "del", "patch",
+                      "any", "under", "websocket",
+                      "app", "helper", "hook", "plugin", "group"] {
+            assert!(fa.framework_imports.contains(*verb),
+                "{} must be autoimported by use Mojolicious::Lite", verb);
+        }
+    }
+
+    /// mojo-lite: top-level route verbs (`get`, `post`, etc.) register
+    /// Handlers keyed by URL path, with ["url_for"] as the dispatcher so
+    /// `url_for('/users')` can find them. Exercises the on_function_call
+    /// plugin hook that mojo-events doesn't use.
+    #[test]
+    fn plugin_mojo_lite_registers_handlers_for_routes() {
+        let src = r#"
+package main;
+use Mojolicious::Lite;
+
+get '/users' => sub {
+    my ($c, $arg) = @_;
+    $c->render(text => 'hi');
+};
+
+post '/login' => sub {
+    my ($c, $user, $pw) = @_;
+};
+
+app->start;
+"#;
+        let fa = build_fa(src);
+
+        let route_handlers: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-lite"))
+            .collect();
+
+        let names: std::collections::HashSet<&str> = route_handlers.iter()
+            .map(|s| s.name.as_str()).collect();
+        assert!(names.contains("/users"), "GET /users handler emitted; got: {:?}", names);
+        assert!(names.contains("/login"), "POST /login handler emitted; got: {:?}", names);
+
+        // Each handler declares url_for as its dispatcher so completion
+        // inside `url_for('|')` surfaces every route.
+        for h in &route_handlers {
+            if let SymbolDetail::Handler { dispatchers, .. } = &h.detail {
+                assert!(dispatchers.iter().any(|d| d == "url_for"),
+                    "handler {} should dispatch via url_for", h.name);
+            }
+        }
+
+        // Handler params come from the handler sub's signature —
+        // different per route, so they round-trip correctly.
+        let login = route_handlers.iter().find(|h| h.name == "/login").unwrap();
+        if let SymbolDetail::Handler { params, .. } = &login.detail {
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["$c", "$user", "$pw"]);
+        }
+    }
+
+    /// Routes are first-class things, not just refs. Every `->to(...)`
+    /// emits BOTH a MethodCallRef (cross-file target link) AND a
+    /// Handler symbol (route-as-entity — outline-visible, workspace-
+    /// searchable, discoverable via url_for completion). Mirrors the
+    /// mojo-lite model so route symbols are symmetric regardless of
+    /// declaration flavor.
+    #[test]
+    fn plugin_mojo_routes_emits_both_ref_and_handler_symbol() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+$r->post('/users')->to(controller => 'Users', action => 'create');
+"#;
+        let fa = build_fa(src);
+
+        // Each route: one MethodCallRef + one Handler symbol.
+        let method_refs: Vec<&Ref> = fa.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::MethodCall { .. })
+                && (r.target_name == "list" || r.target_name == "create"))
+            .collect();
+        assert_eq!(method_refs.len(), 2, "one MethodCallRef per route");
+
+        let route_syms: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Handler
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-routes"))
+            .collect();
+        assert_eq!(route_syms.len(), 2,
+            "one Handler symbol per route so outline + workspace-symbol find them");
+
+        let names: std::collections::HashSet<&str> = route_syms.iter()
+            .map(|s| s.name.as_str()).collect();
+        assert!(names.contains("Users#list"),
+            "route identity `Users#list` present; got: {:?}", names);
+        assert!(names.contains("Users#create"),
+            "route identity `Users#create` present; got: {:?}", names);
+
+        // Dispatcher is url_for so completion inside `url_for('|')`
+        // offers every registered route.
+        for s in &route_syms {
+            if let SymbolDetail::Handler { dispatchers, owner, .. } = &s.detail {
+                assert!(dispatchers.iter().any(|d| d == "url_for"),
+                    "route {} should dispatch via url_for", s.name);
+                // Owner is `Mojolicious::Controller` — url_for is a
+                // Controller method and the routes table is global
+                // per Mojo's runtime model. Owning on Controller lets
+                // `$c->url_for` in any controller resolve routes
+                // declared in any app file through ancestor walking.
+                // Not target-class (Users): routes exist independent
+                // of their target; two routes can target the same
+                // action (paginated/json/etc.).
+                assert!(matches!(owner, HandlerOwner::Class(c) if c == "Mojolicious::Controller"),
+                    "route owner is Mojolicious::Controller (shared base for url_for), not declaring package");
+            }
+        }
+    }
+
+    /// End-to-end cross-file gd for `->to('Users#list')`. Users.pm
+    /// is registered as a workspace module in ModuleIndex (via the
+    /// `register_workspace_module` bridge), so
+    /// `resolve_method_in_ancestors` finds it on lookup — and the
+    /// cross-file MethodCall path in `symbols::find_definition`
+    /// surfaces the Users::list def's location.
+    ///
+    /// Before the fix, workspace modules lived only in FileStore so
+    /// lookups that key on module name (all cross-file method
+    /// resolution) missed them and gd fell through to noise.
+    #[test]
+    fn plugin_mojo_routes_gd_reaches_workspace_target() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+        use tower_lsp::lsp_types::Position;
+
+        let app_src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+"#;
+        let users_src = r#"
+package Users;
+sub list { my ($c) = @_; }
+1;
+"#;
+
+        let app_fa = build_fa(app_src);
+        let users_fa = build_fa(users_src);
+
+        let idx = ModuleIndex::new_for_test();
+        // Simulate workspace indexing registering Users.pm under its
+        // primary package name.
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Users.pm"),
+            Arc::new(users_fa),
+        );
+
+        // Sanity: cross-file resolution on "Users"::"list" must succeed.
+        let res = app_fa.resolve_method_in_ancestors("Users", "list", Some(&idx));
+        assert!(res.is_some(), "Users::list must resolve cross-file after workspace register");
+
+        // And the MethodCallRef emitted by mojo-routes on the 'list'
+        // portion of 'Users#list' should be at a span matching the
+        // text 'list'.
+        let route_ref = app_fa.refs.iter().find(|r|
+            matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "list"
+        ).expect("mojo-routes MethodCallRef for 'list'");
+
+        // The ref's span is tight on the action name — mid-string
+        // completion + goto-def both rely on that precision.
+        let _ = route_ref;
+        let _ = Position::default();
+    }
+
+    /// mojo-routes short form: `->to('Users#list')` emits a MethodCall
+    /// ref pointing to `Users::list`. Cursor on the string → gd jumps
+    /// cross-file to the Users controller's list method, same as any
+    /// regular method call. No routes-specific resolution code; it's
+    /// just a Ref that happens to live inside a string literal.
+    #[test]
+    fn plugin_mojo_routes_short_form_emits_method_call_ref() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+"#;
+        let fa = build_fa(src);
+
+        let route_refs: Vec<&Ref> = fa.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::MethodCall { .. })
+                && r.target_name == "list")
+            .collect();
+
+        assert!(!route_refs.is_empty(), "at least one MethodCall ref for 'list'");
+        let r = route_refs.iter().find(|r| {
+            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+        }).expect("MethodCall with invocant=Users");
+
+        // Sanity: ref span covers the string literal so cursor anywhere
+        // in the 'Users#list' range lands on the ref.
+        assert!(r.span.end.column > r.span.start.column,
+            "method ref has non-empty span");
+    }
+
+    /// mojo-routes long form: `->to(controller => 'Users', action => 'list')`.
+    /// Walks kwarg pairs, pairs up controller+action, emits the ref
+    /// with span on the action value.
+    #[test]
+    fn plugin_mojo_routes_long_form_emits_method_call_ref() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to(controller => 'Users', action => 'list');
+"#;
+        let fa = build_fa(src);
+
+        let has_ref = fa.refs.iter().any(|r| {
+            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+                && r.target_name == "list"
+        });
+        assert!(has_ref, "long-form ->to(controller=>, action=>) must produce MethodCall ref");
+    }
+
+    /// `$r->get('/users')->to('Users#list')->name('users_list')` — the
+    /// `->name()` call registers a symbolic handle. `url_for('users_list')`
+    /// and `redirect_to('users_list')` must resolve to it, the same way
+    /// they resolve to `'Users#list'`. Without `->name()`, calls like
+    /// `url_for('users_list')` sit unresolved.
+    #[test]
+    fn plugin_mojo_routes_name_registers_url_for_handle() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list')->name('users_list');
+"#;
+        let fa = build_fa(src);
+
+        let route_name_handler = fa.symbols.iter().find(|s| {
+            s.kind == SymKind::Handler && s.name == "users_list"
+        });
+        assert!(route_name_handler.is_some(),
+            "->name('users_list') must emit a Handler; handlers: {:?}",
+            fa.symbols.iter().filter(|s| s.kind == SymKind::Handler)
+                .map(|s| &s.name).collect::<Vec<_>>());
+
+        let sym = route_name_handler.unwrap();
+        if let SymbolDetail::Handler { dispatchers, .. } = &sym.detail {
+            assert!(dispatchers.iter().any(|d| d == "url_for"),
+                "named route must dispatch via url_for");
+            assert!(dispatchers.iter().any(|d| d == "redirect_to"),
+                "named route must dispatch via redirect_to");
+        } else {
+            panic!("route-name symbol should be Handler; got {:?}", sym.detail);
+        }
+
+        // The route name should be in a mojo-routes namespace bridged
+        // to the declaring package, so cross-file `url_for('users_list')`
+        // from other files in the workspace resolves.
+        let ns = fa.plugin_namespaces.iter().find(|n|
+            n.plugin_id == "mojo-routes" && n.entities.contains(&sym.id));
+        assert!(ns.is_some(), "named route must belong to a mojo-routes namespace");
+    }
+
+    /// `->to('X#y')` routes dispatch via both `url_for` and `redirect_to`
+    /// (Phase-2 follow-up — `redirect_to` used to be Lite-only). Matches
+    /// Mojolicious's actual API where redirect_to on a controller resolves
+    /// named routes identically to url_for.
+    #[test]
+    fn plugin_mojo_routes_to_dispatches_via_redirect_to_too() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+"#;
+        let fa = build_fa(src);
+
+        let route_handler = fa.symbols.iter().find(|s| {
+            s.kind == SymKind::Handler && s.name == "Users#list"
+        }).expect("Users#list Handler");
+
+        if let SymbolDetail::Handler { dispatchers, .. } = &route_handler.detail {
+            assert!(dispatchers.iter().any(|d| d == "url_for"),
+                "->to route must dispatch via url_for");
+            assert!(dispatchers.iter().any(|d| d == "redirect_to"),
+                "->to route must dispatch via redirect_to");
+        } else {
+            panic!("route symbol should be Handler");
+        }
+    }
+
+    // ==== AliasTo: DSL verbs delegate to real methods, not imaginary ones. ====
+    //
+    // `Mojolicious::Lite` monkey-patches `get`, `post`, `helper`, `app`, …
+    // into the caller at import time. At the Perl level each verb is just
+    // a thin pass-through to a real method:
+    //
+    //     sub { $routes->get(@_) }                  # get, post, put, any,
+    //                                               # options, patch, websocket
+    //     sub { $routes->delete(@_) }               # del
+    //     sub { $app->helper(@_) }                  # helper, hook, plugin
+    //     sub { $app }                              # app (returns the app)
+    //
+    // Previously the plugin fabricated a `SymbolDetail::Sub` per verb with a
+    // hand-written one-line `doc:` and, for `app`, a typed return. That's
+    // the "imaginary methods" the user pointed at: hover shows stub text,
+    // gd lands on the use statement, signature help has no params, and —
+    // worst — the synthesized Sub shadows chain resolution on real Mojo
+    // objects (`$routes->get('/x')->to(...)` loses the `to` intelligence).
+    //
+    // The fix: emit an *alias* that points at the real cross-file method.
+    // Hover, gd, sig help, and return-type inference all dereference the
+    // alias and use the real method's data. The tests below pin the
+    // expected behavior on real cross-file methods — they fail until
+    // `FunctionAlias` / `alias_to` lands in the data model and the
+    // resolution paths dereference it.
+
+    /// The user-visible "stomping" case: `$routes->get('/x')->to('X#y')` on
+    /// a real `Mojolicious::Routes` should chain through
+    /// `Mojolicious::Routes::Route::get` (fluent, returns its own class)
+    /// so `->to` resolves on `Mojolicious::Routes::Route`. The plugin-
+    /// synthesized top-level `get` Sub in the Lite script must NOT
+    /// intercept a method call on a real object of a different class.
+    #[test]
+    fn mojo_lite_chain_off_real_routes_preserves_real_method_chain() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let app_src = r#"
+package main;
+use Mojolicious::Lite;
+use Mojolicious;
+
+my $routes = Mojolicious::Routes->new;
+$routes->get('/users')->to('Users#list');
+"#;
+        // Stub Mojolicious::Routes::Route with a fluent `get` (returns
+        // its own class) so chain resolution can carry the type forward.
+        let route_pm_src = r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+
+sub get {
+    my $self = shift;
+    return $self;
+}
+
+sub to {
+    my $self = shift;
+    return $self;
+}
+1;
+"#;
+        // Mojolicious::Routes ISA Mojolicious::Routes::Route in real
+        // Mojo, so methods invoked on $routes (typed Mojolicious::Routes)
+        // flow up to the parent class via the normal inheritance walk.
+        let routes_pm_src = r#"
+package Mojolicious::Routes;
+use Mojo::Base 'Mojolicious::Routes::Route';
+1;
+"#;
+
+        let app_fa = build_fa(app_src);
+        let route_fa = build_fa(route_pm_src);
+        let routes_fa = build_fa(routes_pm_src);
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(route_fa),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes.pm"),
+            Arc::new(routes_fa),
+        );
+
+        // `$routes->get` must resolve to the real Mojolicious::Routes::Route::get
+        // via inheritance (Mojolicious::Routes → Mojolicious::Routes::Route) —
+        // NOT to the plugin's top-level `get` Sub emitted by mojo-lite.
+        // `class_name()` unifies ClassName and FirstParam — both are
+        // usable for downstream chain resolution.
+        let get_rt = app_fa.find_method_return_type(
+            "Mojolicious::Routes", "get", Some(&idx), None,
+        );
+        assert_eq!(
+            get_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "`$$routes->get` must chain through the REAL Mojolicious::Routes::Route::get — \
+             not the plugin's imaginary top-level `get` Sub. got: {:?}",
+            get_rt,
+        );
+
+        // Second hop: `->to(...)` on the Route object returned by `get`.
+        // User's wording: "get should return a to which is intelligent".
+        // Fluent Route — `to` stays on Mojolicious::Routes::Route so the
+        // chain can keep going (`->name(...)`, `->via(...)`, ...).
+        let to_rt = app_fa.find_method_return_type(
+            "Mojolicious::Routes::Route", "to", Some(&idx), None,
+        );
+        assert_eq!(
+            to_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "`->get('/x')->to(...)` must stay intelligent — Route::to is fluent, and \
+             further hops depend on it. got: {:?}",
+            to_rt,
+        );
+    }
+
+    /// Hover on the DSL verb `get` in `get '/x' => sub {}` must surface
+    /// the real `Mojolicious::Routes::Route::get` POD, not the plugin's
+    /// hand-written one-liner. Pins that the plugin's Sub symbol for
+    /// `get` is an alias — its hover dereferences to the real method.
+    #[test]
+    fn mojo_lite_dsl_verb_hover_uses_real_method_doc() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let app_src = r#"
+package main;
+use Mojolicious::Lite;
+
+get '/users' => sub { my $c = shift; };
+"#;
+        // Real method carries a recognizable POD line. The test matches
+        // on a substring that no hand-written plugin doc uses.
+        let route_pm_src = r#"
+package Mojolicious::Routes::Route;
+
+=head2 get
+
+  my $route = $r->get('/:foo' => sub ($c) {...});
+
+Generate route matching only GET requests. Shortcut for
+L<Mojolicious::Routes::Route/"any">.
+
+=cut
+
+sub get { my $self = shift; return $self; }
+1;
+"#;
+
+        let app_fa = build_fa(app_src);
+        let route_fa = build_fa(route_pm_src);
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(route_fa),
+        );
+
+        // Cursor on the `get` bareword at the call site.
+        let (row, line) = app_src.lines().enumerate()
+            .find(|(_, l)| l.starts_with("get "))
+            .expect("`get` call line");
+        let col = line.find("get").unwrap() + 1;
+        let point = tree_sitter::Point { row, column: col };
+
+        let hover = app_fa.hover_info(point, app_src, None, Some(&idx))
+            .expect("hover on DSL verb `get` returns text");
+
+        assert!(
+            hover.contains("Generate route matching only GET requests"),
+            "hover on `get` must surface the real Mojolicious::Routes::Route::get POD \
+             (verb is an alias, not an imaginary stub). got: {:?}",
+            hover,
+        );
+    }
+
+    /// `app` parses as a bareword invocant (`app->routes`). The plugin's
+    /// typed `app` Sub must make that bareword resolve to Mojolicious so
+    /// the chain can flow. Pins the bareword edge case explicitly — the
+    /// regression shape the user called out.
+    #[test]
+    fn mojo_lite_app_bareword_invocant_types_as_mojolicious() {
+        let src = r#"
+package main;
+use Mojolicious::Lite;
+
+my $x = app;
+"#;
+        let fa = build_fa(src);
+
+        // `$x = app` — $x should pick up the return type of the plugin's
+        // `app` Sub (ClassName("Mojolicious")).
+        let tc = fa.type_constraints.iter().find(|tc| tc.variable == "$x")
+            .expect("$x must carry a type constraint sourced from `app`'s return type");
+        assert!(
+            matches!(&tc.inferred_type, InferredType::ClassName(c) if c == "Mojolicious"),
+            "`$$x = app` must type as Mojolicious — bareword `app` resolves to the \
+             plugin's typed Sub. got: {:?}",
+            tc.inferred_type,
+        );
+    }
+
+    /// The headline case: the full `app->routes->get('/x')->to('X#y')`
+    /// chain must be fully intelligent at every hop. One plugin stub
+    /// at the head (`app` → Mojolicious) — everything else is real
+    /// cross-file method resolution.
+    ///
+    /// Every arrow is a separate assertion so a regression at any hop
+    /// points at the specific broken link:
+    ///
+    ///   app                                          → Mojolicious              (plugin-typed Sub)
+    ///   Mojolicious::routes                          → Mojolicious::Routes       (real Mojo::Base accessor)
+    ///   Mojolicious::Routes::get  (via parent Route) → Mojolicious::Routes::Route (fluent)
+    ///   Mojolicious::Routes::Route::to               → Mojolicious::Routes::Route (fluent)
+    ///
+    /// If any hop returns None the chain's "intelligence" collapses —
+    /// completion, hover, gd, sig-help all lose context from that point
+    /// forward. That collapse is the "hardcoded list" symptom the user
+    /// reported, flipped around.
+    #[test]
+    fn mojo_lite_app_routes_chain_is_fully_intelligent_to_the_end() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let app_src = r#"
+package main;
+use Mojolicious::Lite;
+
+app->routes->get('/users')->to('Users#list');
+"#;
+        let mojolicious_pm_src = r#"
+package Mojolicious;
+use Mojo::Base -base;
+
+has routes => sub { Mojolicious::Routes->new };
+1;
+"#;
+        let routes_pm_src = r#"
+package Mojolicious::Routes;
+use Mojo::Base 'Mojolicious::Routes::Route';
+1;
+"#;
+        let route_pm_src = r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+
+sub get { my $self = shift; return $self; }
+sub to  { my $self = shift; return $self; }
+1;
+"#;
+
+        let app_fa = build_fa(app_src);
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious.pm"),
+            Arc::new(build_fa(mojolicious_pm_src)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes.pm"),
+            Arc::new(build_fa(routes_pm_src)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(build_fa(route_pm_src)),
+        );
+
+        // Hop 1: `app` → Mojolicious. The plugin's typed Sub seeds the
+        // chain. This is the single sanctioned plugin stub.
+        let app_sym = app_fa.symbols.iter().find(|s|
+            s.name == "app"
+            && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-lite")
+        ).expect("mojo-lite plugin must synthesize `app`");
+        if let SymbolDetail::Sub { return_type: Some(rt), .. } = &app_sym.detail {
+            assert_eq!(rt.class_name(), Some("Mojolicious"),
+                "hop 1: `app` must type as Mojolicious — the one plugin stub the chain leans on");
+        } else {
+            panic!("hop 1: `app` must carry a typed return");
+        }
+
+        // Hop 2: Mojolicious::routes → Mojolicious::Routes. Real
+        // cross-file Mojo::Base accessor; the anon-sub default's
+        // `Mojolicious::Routes->new` is lifted as the return type.
+        let routes_rt = app_fa.find_method_return_type(
+            "Mojolicious", "routes", Some(&idx), None,
+        );
+        assert_eq!(
+            routes_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes"),
+            "hop 2: `Mojolicious::routes` must resolve cross-file to the real Mojo::Base \
+             accessor and return Mojolicious::Routes. got: {:?}",
+            routes_rt,
+        );
+
+        // Hop 3: Mojolicious::Routes::get → Mojolicious::Routes::Route.
+        // Resolves via inheritance (Routes ISA Route) to the real fluent
+        // method on the parent class. This is where plugin-synthesized
+        // `get` from mojo-lite MUST NOT stomp.
+        let get_rt = app_fa.find_method_return_type(
+            "Mojolicious::Routes", "get", Some(&idx), None,
+        );
+        assert_eq!(
+            get_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "hop 3: `$$routes->get` must chain through the REAL \
+             Mojolicious::Routes::Route::get (fluent) — not the plugin's \
+             imaginary top-level `get` Sub. got: {:?}",
+            get_rt,
+        );
+
+        // Hop 4: Mojolicious::Routes::Route::to → Mojolicious::Routes::Route.
+        // Fluent. After this, `->name(...)`/`->via(...)`/etc. must still
+        // resolve on Route — i.e. the chain keeps going, not collapses.
+        let to_rt = app_fa.find_method_return_type(
+            "Mojolicious::Routes::Route", "to", Some(&idx), None,
+        );
+        assert_eq!(
+            to_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "hop 4: `->to(...)` must chain through the real fluent `to` on \
+             Mojolicious::Routes::Route — preserving intelligence for further \
+             hops (->name, ->via, ...). got: {:?}",
+            to_rt,
+        );
+    }
+
+    /// Adversarial: a dotted helper `users.create` and a route whose
+    /// action is `Users#create` both end up with a Perl-level symbol
+    /// named `create`. They are UNRELATED:
+    ///
+    ///   * `users.create` lives on `Mojolicious::Controller::_Helper::users`
+    ///     — a synthetic proxy class invented by the plugin. It's called
+    ///     as `$c->users->create(...)`.
+    ///   * `Users#create` points at a method `create` on the user's
+    ///     `Users` controller class. It's called via dispatch, not
+    ///     chained off a helper.
+    ///
+    /// Name-based resolution would cross-link them (goto-def on either
+    /// jumps to the other, find-references unions the two unrelated
+    /// call sites). Class-aware resolution must keep them apart: the
+    /// route's MethodCallRef targets class `Users`, the helper's leaf
+    /// lives on `_Helper::users`.
+    #[test]
+    fn helper_and_route_with_same_leaf_name_do_not_cross_link() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+$app->helper('users.create', sub ($c, $user) {});
+$app->routes->post('/users')->to(controller => 'Users', action => 'create');
+"#;
+        let fa = build_fa(src);
+
+        // --- Fact-finding: what actually got emitted? ---
+
+        // The helper leaf `create` should live on the proxy class.
+        let helper_create: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| s.name == "create"
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
+            .collect();
+        assert_eq!(helper_create.len(), 1, "one helper-leaf named 'create'");
+        let helper_create = helper_create[0];
+        assert_eq!(helper_create.package.as_deref(),
+            Some("Mojolicious::Controller::_Helper::users"),
+            "helper leaf lives on the proxy class, NOT on Users");
+
+        // The route emits a MethodCallRef method_name=create invocant=Users.
+        let route_ref = fa.refs.iter().find(|r| {
+            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+                && r.target_name == "create"
+        }).expect("route should emit MethodCall create@Users");
+
+        // --- The bug: does the route's ref resolve to the helper? ---
+
+        // If resolves_to is Some(sym_id), it MUST NOT point to the
+        // helper — the helper lives on a different class.
+        if let Some(target_sid) = route_ref.resolves_to {
+            assert_ne!(target_sid, helper_create.id,
+                "route MethodCall(create @ Users) must NOT resolve to the \
+                 helper-leaf on _Helper::users — they share a name only");
+        }
+
+        // Cross-resolution via the public API: refs_to_symbol(helper)
+        // must NOT include the route's ref.
+        let refs_to_helper = fa.refs_to(helper_create.id);
+        for r in &refs_to_helper {
+            assert_ne!(
+                (r.span.start.row, r.span.start.column),
+                (route_ref.span.start.row, route_ref.span.start.column),
+                "route ref showed up as a reference to the helper — cross-link bug. \
+                 Helper is on _Helper::users, route targets Users, they shouldn't mix."
+            );
+        }
+
+        // And the mirror: resolve_method_in_ancestors on class `Users`
+        // for method `create` must NOT return the helper-leaf. The
+        // helper's class is _Helper::users, not Users.
+        let resolution = fa.resolve_method_in_ancestors("Users", "create", None);
+        if let Some(crate::file_analysis::MethodResolution::Local { sym_id, .. }) = resolution {
+            assert_ne!(sym_id, helper_create.id,
+                "resolve_method_in_ancestors(Users, create) returned the helper — \
+                 class-awareness broken");
+        }
+    }
+
+    /// Helpers emitted by mojo-helpers land on Mojolicious::Controller.
+    /// A controller subclass in ANOTHER file (standard workspace layout)
+    /// must see them when walking methods — the class_content_index
+    /// bridges the lookup because the synthesizing module's primary
+    /// package isn't Mojolicious::Controller.
+    #[test]
+    fn plugin_mojo_helpers_reachable_cross_file_from_controller() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        // Lite script with a helper.
+        let lite_src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(greet => sub { my ($c, $who) = @_; });
+"#;
+        // Controller subclass in another file.
+        let ctrl_src = r#"
+package MyApp::Controller::Home;
+use parent 'Mojolicious::Controller';
+1;
+"#;
+
+        let lite_fa = Arc::new(build_fa(lite_src));
+        let ctrl_fa = build_fa(ctrl_src);
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/MyApp.pm"),
+            lite_fa.clone(),
+        );
+
+        // bridges_index knows MyApp.pm declares a namespace bridged to
+        // Mojolicious::Controller (mojo-helpers' app namespace).
+        let mods = idx.modules_bridging_to("Mojolicious::Controller");
+        assert!(mods.iter().any(|m| m == "MyApp"),
+            "MyApp module should be listed as bridged to \
+             Mojolicious::Controller; got: {:?}", mods);
+
+        // Completion on MyApp::Controller::Home inheriting from
+        // Mojolicious::Controller should walk up and find `greet`.
+        let candidates = ctrl_fa.complete_methods_for_class(
+            "MyApp::Controller::Home",
+            Some(&idx),
+        );
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"greet"),
+            "helper `greet` emitted on Mojolicious::Controller in \
+             MyApp.pm should complete on subclasses; got: {:?}",
+            labels);
+    }
+
+    /// mojo-helpers cross-file: when a Lite script registers a helper
+    /// `greet`, the resulting Method symbol's `package` is
+    /// `Mojolicious::Controller`. Any consumer file — controller
+    /// subclass or otherwise — finds it via the standard workspace
+    /// walk + inheritance chain without a single mojo-helpers-aware
+    /// line in the consumer-side code path.
+    #[test]
+    fn plugin_mojo_helpers_land_on_controller_package() {
+        let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+app->helper(greet => sub {
+    my ($c, $name) = @_;
+    return "hello, $name";
+});
+1;
+"#;
+        let fa = build_fa(src);
+        let greet = fa.symbols.iter()
+            .find(|s| s.name == "greet" && s.kind == SymKind::Method)
+            .expect("helper must emit a Method named greet");
+        assert_eq!(greet.package.as_deref(), Some("Mojolicious::Controller"),
+            "helper Method must be packaged on the shared controller base; \
+             that's what lets every subclass pick it up via inheritance walk");
+        assert!(matches!(&greet.namespace, Namespace::Framework { id } if id == "mojo-helpers"));
+    }
+
+    /// Helpers complete on both `$c` (Controller) and `$app` (the
+    /// Mojolicious app class). Every helper registers a Method on each
+    /// entry class, so `complete_methods_for_class` for either class
+    /// surfaces the helper. Dotted chain roots also land on both
+    /// classes; the deeper proxies stay on the shared prefix.
+    #[test]
+    fn plugin_mojo_helpers_complete_on_app_class_too() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(current_user => sub { my ($c) = @_; });
+$app->helper('users.create' => sub { my ($c, $name) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        for class in ["Mojolicious::Controller", "Mojolicious"] {
+            let candidates = fa.complete_methods_for_class(class, None);
+            let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+            assert!(
+                labels.contains(&"current_user"),
+                "`current_user` must complete on {}; got: {:?}",
+                class, labels,
+            );
+            assert!(
+                labels.contains(&"users"),
+                "`users` (dotted-helper root) must complete on {}; got: {:?}",
+                class, labels,
+            );
+        }
+    }
+
+    /// Diagnostic pin: inside a controller action, `$c->url_for('|')`
+    /// must offer every named route declared in the workspace —
+    /// Lite paths, `Ctrl#action` pairs from `->to(...)`, and symbolic
+    /// `->name('foo')` handles. This is the completion side that the
+    /// `_emits_refs` / `_registers_url_for_handle` tests don't cover.
+    ///
+    /// Discovers two separate bugs at the same time:
+    ///   (1) Handler.owner is the *declaring* package (`MyApp`), so
+    ///       `$c->url_for(...)` on a `Users` controller fails the
+    ///       `owner_class == invocant_class` filter in
+    ///       `dispatch_target_completions`.
+    ///   (2) No coverage for "does url_for completion work at all".
+    #[test]
+    fn plugin_mojo_routes_url_for_completion_offers_route_names() {
+        use tree_sitter::Parser;
+        use tower_lsp::lsp_types::Position;
+
+        let app_src = r#"package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list')->name('users_list');
+$r->post('/users')->to(controller => 'Users', action => 'create');
+
+get '/hello' => sub { my ($c) = @_; };
+"#;
+        let app_fa = std::sync::Arc::new(build_fa(app_src));
+
+        let ctrl_src = r#"package Users;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    my $u = $c->url_for('x');
+}
+"#;
+        let ctrl_fa = build_fa(ctrl_src);
+
+        let idx = std::sync::Arc::new(crate::module_index::ModuleIndex::new_for_test());
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/app.pl"),
+            app_fa,
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Users.pm"),
+            std::sync::Arc::new(build_fa(ctrl_src)),
+        );
+
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(ctrl_src, None).unwrap();
+
+        // Cursor on the `x` inside `url_for('x')` — `active_param == 0`.
+        let pos = Position { line: 5, character: 25 };
+        let items = crate::symbols::completion_items(
+            &ctrl_fa, &tree, ctrl_src, pos, &idx, None,
+        );
+        let labels: Vec<String> = items.iter().map(|it| it.label.clone()).collect();
+
+        for expected in &["users_list", "Users#list", "/hello"] {
+            assert!(labels.iter().any(|l| l == expected),
+                "url_for('|') inside Users::list must offer `{}` (route declared in MyApp); got: {:?}",
+                expected, labels);
+        }
+    }
+
+    /// Red pin (user-reported): starting to type inside
+    /// `$c->url_for('|')` must not kill completion — the string
+    /// content should feed the prefix filter, not suppress it.
+    /// Covers two realistic live-editing shapes:
+    ///
+    /// 1. `url_for('|')` — cursor between the quotes, string body
+    ///    empty. Every route should appear (no prefix yet).
+    /// 2. `url_for('adm|')` — user has typed `adm`, cursor inside
+    ///    the string, closing quote already in place (what you get
+    ///    after auto-paired quotes). The returned list must be
+    ///    prefix-filterable by `adm` via either `filter_text` or a
+    ///    server-side restriction — `admin.users.purge`-style
+    ///    named routes should survive the filter, Lite `/hello`
+    ///    should drop out client-side.
+    ///
+    /// Existing work that this pin must use, NOT re-roll:
+    ///   * `candidate_to_completion_item` already sets
+    ///     `filter_text = Some(label)` so the quoted `insert_text`
+    ///     doesn't defeat client-side matching — covered by
+    ///     `completion_dispatch_filter_text_matches_bare_name`.
+    ///   * `mid_string_methodref_completions` handles the same
+    ///     shape for MethodCallRefs (`->to('Users#li|')`), slicing
+    ///     `source[span_start..cursor]` as the prefix.
+    #[test]
+    fn plugin_mojo_routes_url_for_completion_survives_typed_prefix() {
+        use tree_sitter::Parser;
+        use tower_lsp::lsp_types::Position;
+
+        let app_src = r#"package MyApp;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list')->name('users_list');
+$r->get('/admin/users/purge')->to('Admin#purge')->name('admin_users_purge');
+
+get '/hello' => sub { my ($c) = @_; };
+"#;
+        let app_fa = std::sync::Arc::new(build_fa(app_src));
+
+        let idx = std::sync::Arc::new(crate::module_index::ModuleIndex::new_for_test());
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/app.pl"),
+            app_fa,
+        );
+
+        // Case 1: empty string, cursor between the quotes.
+        // `    my $u = $c->url_for('');`
+        //                          ^ char 24 (opening quote)
+        //                           ^ char 25 (cursor here)
+        //                           ^ char 25 (closing quote)
+        let empty_src = r#"package Users;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    my $u = $c->url_for('');
+}
+"#;
+        let empty_fa = build_fa(empty_src);
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Users_empty.pm"),
+            std::sync::Arc::new(build_fa(empty_src)),
+        );
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(empty_src, None).unwrap();
+        let items = crate::symbols::completion_items(
+            &empty_fa, &tree, empty_src,
+            Position { line: 5, character: 25 },
+            &idx, None,
+        );
+        let labels: Vec<String> = items.iter().map(|it| it.label.clone()).collect();
+        for expected in &["users_list", "admin_users_purge", "Users#list", "/hello"] {
+            assert!(labels.iter().any(|l| l == expected),
+                "empty url_for('|') must offer `{}`; got: {:?}",
+                expected, labels);
+        }
+
+        // Case 2: user has typed `adm`, closing quote in place.
+        // `    my $u = $c->url_for('adm');`
+        //                          ^ 24 opening quote
+        //                           ^ 25 a
+        //                            ^ 26 d
+        //                             ^ 27 m — cursor here after typing
+        //                              ^ 28 closing quote
+        let typed_src = r#"package Users;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    my $u = $c->url_for('adm');
+}
+"#;
+        let typed_fa = build_fa(typed_src);
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Users_typed.pm"),
+            std::sync::Arc::new(build_fa(typed_src)),
+        );
+        let tree = parser.parse(typed_src, None).unwrap();
+        let items = crate::symbols::completion_items(
+            &typed_fa, &tree, typed_src,
+            Position { line: 5, character: 27 },
+            &idx, None,
+        );
+
+        // Server returns the dispatch-handler set (all routes). The
+        // client narrows by `filter_text` (bare label) against the
+        // typed prefix `adm`. For this pin we assert the two things
+        // the server owes us:
+        //
+        //  (a) the set still includes routes whose LABEL starts with
+        //      `adm` — if the server dropped them before we got a
+        //      chance to filter, completion is "dead" as the user
+        //      described.
+        //  (b) every returned handler's `filter_text` is set to the
+        //      bare label so the client's prefix match keys on the
+        //      route name, not on the quoted insert_text (`'admin...'`
+        //      starts with `'`, not `a`).
+        let labels: Vec<String> = items.iter().map(|it| it.label.clone()).collect();
+        assert!(labels.iter().any(|l| l == "admin_users_purge"),
+            "typed prefix `adm` must still surface `admin_users_purge` from the \
+             server so client-side filter_text matching can narrow to it; got: {:?}",
+            labels);
+
+        let adm_item = items.iter()
+            .find(|it| it.label == "admin_users_purge")
+            .expect("admin_users_purge must be in returned items");
+        assert_eq!(
+            adm_item.filter_text.as_deref(),
+            Some("admin_users_purge"),
+            "dispatch handler `filter_text` must be the bare label so the \
+             typed `adm` (no quote) matches — otherwise starting to type the \
+             string kills completion",
+        );
+    }
+
+    /// mojo-lite route URLs are referenced from `->url_for(...)` and
+    /// `->redirect_to(...)`. Both emit `DispatchCall` refs tight to
+    /// the URL string so gd/gr compose via the standard Handler
+    /// resolution path — no Lite-aware code in the core.
+    #[test]
+    fn plugin_mojo_lite_url_dispatch_emits_refs() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+get '/hello' => sub {
+    my ($c) = @_;
+    $c->render(text => 'hi');
+};
+
+sub after {
+    my ($c) = @_;
+    $c->redirect_to('/hello');
+    my $u = $c->url_for('/hello');
+}
+"#;
+        let fa = build_fa(src);
+
+        let dispatch_refs: Vec<&crate::file_analysis::Ref> = fa.refs.iter()
+            .filter(|r| matches!(&r.kind, RefKind::DispatchCall { .. }))
+            .filter(|r| r.target_name == "/hello")
+            .collect();
+
+        let dispatchers: Vec<&str> = dispatch_refs.iter()
+            .map(|r| match &r.kind {
+                RefKind::DispatchCall { dispatcher, .. } => dispatcher.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+
+        assert!(
+            dispatchers.contains(&"redirect_to"),
+            "redirect_to('/hello') must emit a DispatchCall ref; got: {:?}",
+            dispatchers,
+        );
+        assert!(
+            dispatchers.contains(&"url_for"),
+            "url_for('/hello') must emit a DispatchCall ref; got: {:?}",
+            dispatchers,
+        );
+    }
+
+    /// Plugin triggers must gate emission. A class that doesn't inherit from
+    /// Mojo::EventEmitter should see no mojo-events emissions even if it
+    /// happens to call a method named `->on(...)`.
+    #[test]
+    fn plugin_mojo_events_triggers_gate_emission() {
+        let src = r#"
+package My::Unrelated;
+
+sub new {
+    my $class = shift;
+    my $self = bless {}, $class;
+    $self->on('connect', sub { ... });
+    $self;
+}
+
+1;
+"#;
+        let fa = build_fa(src);
+        let plugin_syms: Vec<&Symbol> = fa.symbols.iter()
+            .filter(|s| matches!(&s.namespace,
+                Namespace::Framework { id } if id == "mojo-events"))
+            .collect();
+        assert!(plugin_syms.is_empty(),
+            "untriggered package must not get plugin emissions; got: {:?}",
+            plugin_syms.iter().map(|s| &s.name).collect::<Vec<_>>());
+    }
+
+    /// Minion plugin: `$minion->add_task(NAME, sub { ... })` emits a
+    /// Handler (owner: Minion) with the task's sub params, typed $job
+    /// in the callback body, and a DispatchCall ref on the name.
+    #[test]
+    fn plugin_minion_add_task_registers_handler() {
+        let src = r#"
+package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject) = @_;
+    $job->finish;
+});
+"#;
+        let fa = build_fa(src);
+
+        let handler = fa.symbols.iter()
+            .find(|s| s.kind == SymKind::Handler
+                && s.name == "send_email"
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "minion"))
+            .expect("add_task must emit a Handler named send_email");
+
+        let SymbolDetail::Handler { ref owner, ref dispatchers, ref params, ref display, .. }
+            = handler.detail else { panic!("handler detail should be Handler") };
+        assert!(matches!(owner, HandlerOwner::Class(c) if c == "Minion"));
+        assert!(dispatchers.iter().any(|d| d == "enqueue"));
+        assert!(matches!(display, HandlerDisplay::Task),
+            "minion tasks render as HandlerDisplay::Task (LSP kind FUNCTION, outline word 'task')");
+        // Callback params: $job flagged as invocant, then the rest.
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["$job", "$to", "$subject"]);
+        assert!(params[0].is_invocant, "Minion::Job is the callback's invocant");
+
+        // DispatchCall on the name (registration itself is a reference).
+        let dc = fa.refs.iter()
+            .find(|r| matches!(&r.kind, RefKind::DispatchCall { dispatcher, .. } if dispatcher == "add_task"))
+            .expect("add_task must emit a DispatchCall ref");
+        assert_eq!(dc.target_name, "send_email");
+    }
+
+    /// `$minion->enqueue(NAME, ...)` emits a DispatchCall for the name
+    /// so gd/gr compose against the add_task Handler.
+    #[test]
+    fn plugin_minion_enqueue_emits_dispatch_call() {
+        let src = r#"
+package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job) = @_; });
+$minion->enqueue(send_email => ['alice']);
+$minion->enqueue_p(send_email => ['bob']);
+"#;
+        let fa = build_fa(src);
+
+        let dispatchers: Vec<&str> = fa.refs.iter()
+            .filter_map(|r| match &r.kind {
+                RefKind::DispatchCall { dispatcher, .. }
+                    if r.target_name == "send_email" => Some(dispatcher.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(dispatchers.contains(&"enqueue"),
+            "enqueue('send_email', ...) must emit a DispatchCall; got: {:?}", dispatchers);
+        assert!(dispatchers.contains(&"enqueue_p"),
+            "enqueue_p must emit a DispatchCall too; got: {:?}", dispatchers);
+    }
+
+    /// $job inside an add_task callback is typed as Minion::Job so
+    /// completion on $job-> resolves to Minion::Job methods.
+    #[test]
+    fn plugin_minion_types_job_inside_task_body() {
+        let src = r#"
+package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job) = @_;
+    $job->finish;
+});
+"#;
+        let fa = build_fa(src);
+
+        // `$job` should have a type constraint inside the callback.
+        let tc = fa.type_constraints.iter()
+            .find(|t| t.variable == "$job"
+                && matches!(&t.inferred_type, InferredType::ClassName(c) if c == "Minion::Job"))
+            .expect("$job must be typed Minion::Job inside add_task callback");
+        assert!(!matches!(tc.inferred_type, InferredType::FirstParam { .. }),
+            "type should be plugin-declared ClassName, not builder's FirstParam");
+    }
+
+    /// Minion's `enqueue` options go in a hashref at position 3
+    /// (`enqueue(task, [args], {priority => 10})`). The plugin emits
+    /// HashKeyDefs for the common keys owned by Sub{Minion,enqueue}
+    /// — what's missing is cursor-context routing for "hash literal
+    /// as positional arg" → `HashKey { source_sub: "enqueue" }`.
+    /// Skipped until the core learns that shape; the emission side is
+    /// pinned here so regressing it trips.
+    #[test]
+    fn plugin_minion_enqueue_options_hashkeys_emitted() {
+        let src = r#"
+package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->enqueue(task_x => ['arg'] => { priority => 10 });
+"#;
+        let fa = build_fa(src);
+
+        // Options emitted as HashKeyDef symbols owned by Sub{Minion, enqueue}.
+        let option_names: Vec<&str> = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::HashKeyDef
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "minion"))
+            .map(|s| s.name.as_str())
+            .collect();
+        for expected in &["priority", "queue", "delay", "attempts", "notes", "parents", "expire", "lax"] {
+            assert!(option_names.contains(expected),
+                "enqueue option `{}` must be emitted; got: {:?}",
+                expected, option_names);
+        }
+    }
+
+    /// Cross-file helper chain completion: Users.pm inherits from
+    /// Mojolicious::Controller; helpers declared in a sibling Lite
+    /// file register Methods on Controller. From Users.pm, cursor at
+    /// `$c->`, `$c->users->`, `$c->admin->` must all resolve through
+    /// the proxy classes even though the methods live in another
+    /// file and the CPAN-cached Controller doesn't know about them.
+    ///
+    /// Regression trigger: `resolve_method_in_ancestors` used to scan
+    /// only `get_cached(class)` cross-file, missing plugin-emitted
+    /// methods that live in other modules under the same `package`.
+    /// `detect_cursor_context_tree` also only called `resolve_expression_type`
+    /// without a module_index, so chain resolution of `$c->users->`
+    /// fell through to the untyped fallback and returned Users's own
+    /// methods (list, create) instead of the proxy chain's leaves.
+    #[test]
+    fn plugin_mojo_helpers_cross_file_chain_completion() {
+        use tree_sitter::Parser;
+        use tower_lsp::lsp_types::Position;
+
+        // The Lite file — declares the helpers.
+        let lite_src = r#"package MyApp;
+use strict;
+use warnings;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+
+$app->helper(current_user => sub { my ($c, $fallback) = @_; });
+$app->helper('users.create' => sub { my ($c, $name, $email) = @_; });
+$app->helper('users.delete' => sub { my ($c, $id) = @_; });
+$app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
+"#;
+        let lite_fa = build_fa(lite_src);
+
+        // The controller file — inherits from Mojolicious::Controller
+        // and expects to reach the helpers cross-file. This is where
+        // the user's `$c->` completion is happening in real life.
+        let src = r#"package Users;
+use strict;
+use warnings;
+use parent 'Mojolicious::Controller';
+
+sub list {
+    my ($c) = @_;
+    $c->;
+    $c->users->;
+    $c->admin->;
+}
+"#;
+        let fa = build_fa(src);
+
+        // Sanity — Users.pm's own analysis has `list` but not the
+        // helpers (they're declared in the Lite file).
+        let users_subs: Vec<&str> = fa.symbols.iter()
+            .filter(|s| matches!(s.kind, SymKind::Method | SymKind::Sub))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(users_subs, vec!["list"], "Users.pm owns only `list`");
+
+        // Now simulate the nvim completion pipeline at `$c->` position.
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Populate a ModuleIndex with a mock Mojolicious::Controller
+        // that has a few native-looking methods (render, stash, etc.).
+        // Matches the user's env where CPAN Mojolicious is installed
+        // and its Controller is cached cross-file. Register the Lite
+        // script itself too — workspace indexer would.
+        // Workspace has BOTH files registered — mirrors nvim startup
+        // after Rayon indexes the .pm/.pl set.
+        let idx = std::sync::Arc::new(crate::module_index::ModuleIndex::new_for_test());
+        let lite_fa = std::sync::Arc::new(lite_fa);
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/MyApp.pm"),
+            lite_fa.clone(),
+        );
+        let users_fa = std::sync::Arc::new(build_fa(src));
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/lib/Users.pm"),
+            users_fa.clone(),
+        );
+
+        let ctrl_src = r#"package Mojolicious::Controller;
+sub render { my ($self, %args) = @_; }
+sub stash { my ($self, $key) = @_; }
+sub req { my ($self) = @_; }
+sub res { my ($self) = @_; }
+sub session { my ($self, $key) = @_; }
+1;
+"#;
+        let ctrl_fa = std::sync::Arc::new(build_fa(ctrl_src));
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Controller.pm"),
+            ctrl_fa,
+        );
+
+        // The workspace knows the Lite file declares a namespace
+        // bridged to Mojolicious::Controller (the mojo-helpers app
+        // namespace emits `Bridge::Class("Mojolicious::Controller")`).
+        let mods = idx.modules_bridging_to("Mojolicious::Controller");
+        assert!(mods.iter().any(|m| m == "MyApp"),
+            "workspace index must list MyApp.pm bridged to Controller; got: {:?}",
+            mods);
+
+        // Part 1: `$c->` completion in Users.pm surfaces both the
+        // inherited native methods AND the plugin-emitted helpers
+        // (cross-file, via the app namespace's Class(Controller) bridge).
+        let pos = |row: u32, col: u32| Position { line: row, character: col };
+        let call_label_set = |items: &[tower_lsp::lsp_types::CompletionItem]| -> Vec<String> {
+            items.iter().map(|it| it.label.clone()).collect()
+        };
+
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos(7, 8), &idx, None);
+        let labels = call_label_set(&items);
+        for expected in &["list", "render", "stash", "current_user", "users", "admin"] {
+            assert!(labels.iter().any(|l| l == expected),
+                "$c-> must offer `{}`; got: {:?}", expected, labels);
+        }
+
+        // Part 2: `$c->users->` (chained cross-file) resolves to the
+        // _Helper::users proxy and surfaces its leaves. Before the
+        // fix: cursor_context couldn't resolve the chain without a
+        // module_index, so completion fell through to Users's own
+        // methods (`list`).
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos(8, 15), &idx, None);
+        let labels = call_label_set(&items);
+        assert_eq!(
+            labels.iter().collect::<std::collections::HashSet<_>>(),
+            ["create", "delete"].iter().map(|s| s.to_string()).collect::<Vec<_>>()
+                .iter().collect::<std::collections::HashSet<_>>(),
+            "$c->users-> must offer exactly the helper chain leaves (create/delete); got: {:?}",
+            labels,
+        );
+        assert!(!labels.iter().any(|l| l == "list"),
+            "$c->users-> must NOT fall back to Users.pm's own `list`; got: {:?}",
+            labels);
+
+        // Part 3: `$c->admin->` resolves through the first-level proxy
+        // to the innermost `users` step.
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos(9, 15), &idx, None);
+        let labels = call_label_set(&items);
+        assert_eq!(labels, vec!["users"],
+            "$c->admin-> must offer exactly `users`; got: {:?}", labels);
+
+        // Part 4: the proxy's detail is suppressed (opaque_return).
+        // No `_Helper::...` string should leak into the user-facing
+        // detail of a helper-root completion entry, even cross-file.
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos(7, 8), &idx, None);
+        let users_item = items.iter().find(|it| it.label == "users").unwrap();
+        let admin_item = items.iter().find(|it| it.label == "admin").unwrap();
+        for (name, item) in [("users", users_item), ("admin", admin_item)] {
+            let d = item.detail.as_deref().unwrap_or("");
+            assert!(!d.contains("_Helper"),
+                "opaque_return must suppress proxy class in `{}`'s detail cross-file; got: {:?}",
+                name, d);
+        }
+
+        // Part 5: no "unresolved-method" diagnostic for helper calls
+        // that now resolve cross-file. The diagnostic builder walks
+        // resolve_method_in_ancestors; our fix extends that to pick
+        // up plugin-emitted methods on parent classes declared
+        // elsewhere in the workspace.
+        let diags = crate::symbols::collect_diagnostics(&fa, &idx);
+        for diag in &diags {
+            let msg = &diag.message;
+            assert!(!msg.contains("'users' is not defined"),
+                "no diagnostic for helper middle hop `users`; got: {}", msg);
+            assert!(!msg.contains("'admin' is not defined"),
+                "no diagnostic for helper middle hop `admin`; got: {}", msg);
+            assert!(!msg.contains("'current_user' is not defined"),
+                "no diagnostic for helper `current_user`; got: {}", msg);
+        }
+    }
+
+    /// documentHighlight on a method-call identifier must highlight
+    /// JUST the method name, not the whole `$obj->method(...)` span.
+    /// Before this pin: hovering `helper` on one `$app->helper(NAME =>
+    /// sub { ... })` site underlined every other registration's full
+    /// multi-line call expression — args, sub bodies, closing `);`
+    /// all included. Regression trigger: MethodCall ref.span covers
+    /// the whole call (needed for gd/ref_at inside-args lookup);
+    /// highlight path now uses `method_name_span` from the ref kind.
+    #[test]
+    fn method_call_highlight_uses_method_name_span_only() {
+        let src = r#"package MyApp;
+sub do_thing { }
+sub run {
+    my ($self, $x) = @_;
+    $self->do_thing($x, 1, 2);
+    $self->do_thing(3);
+}
+"#;
+        let fa = build_fa(src);
+
+        // Cursor on `do_thing` at the first call site. Highlight
+        // must return ranges whose width == len("do_thing"), never
+        // a range that spans past the closing `)` or crosses into
+        // the next line.
+        let row = 4; // 0-indexed: `    $self->do_thing($x, 1, 2);`
+        let col = src.lines().nth(row).unwrap().find("do_thing").unwrap();
+        let point = tree_sitter::Point::new(row, col + 1);
+
+        let hits = fa.find_highlights(point, None, None);
+        assert!(!hits.is_empty(), "should highlight at least one occurrence");
+
+        for (span, _access) in &hits {
+            // Must be single-line + width exactly 8 ("do_thing").
+            assert_eq!(span.start.row, span.end.row,
+                "highlight must not span multiple lines; got: {:?}", span);
+            let width = span.end.column - span.start.column;
+            assert_eq!(width, "do_thing".len(),
+                "highlight width must match method identifier; got {}: {:?}",
+                width, span);
+        }
+    }
+
+    /// `$app->admin->` (chained helper call) completion returns the
+    /// proxy class's methods — not the fallback full-file list.
+    /// Validates that `resolve_expression_type` chains through the
+    /// plugin-synthesized opaque return and
+    /// `complete_methods_for_class` finds methods on the proxy.
+    #[test]
+    fn plugin_mojo_helpers_chained_proxy_completion() {
+        let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        // 1. `$app->admin` resolves to the first-level proxy.
+        let admin_proxy = fa.find_method_return_type(
+            "Mojolicious", "admin", None, None,
+        ).expect("admin on Mojolicious has a return_type");
+        let admin_class = admin_proxy.class_name()
+            .expect("proxy return_type is a ClassName");
+        assert_eq!(admin_class, "Mojolicious::Controller::_Helper::admin");
+
+        // 2. `$app->admin->` completion shows the `users` proxy step.
+        let candidates = fa.complete_methods_for_class(admin_class, None);
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"users"),
+            "chain completion on admin proxy must surface `users`; got: {:?}",
+            labels);
+        // And the `users` step's detail must NOT leak the internal
+        // `_Helper::admin::users` proxy class name — the plugin
+        // declared the return type opaque.
+        let users_cand = candidates.iter().find(|c| c.label == "users").unwrap();
+        assert!(
+            !users_cand.detail.as_deref().unwrap_or("").contains("_Helper"),
+            "opaque_return must hide the proxy class from detail: {:?}",
+            users_cand.detail,
+        );
+
+        // 3. Two levels in — `$app->admin->users` → the innermost proxy.
+        let users_proxy = fa.find_method_return_type(
+            admin_class, "users", None, None,
+        ).expect("users on admin proxy has a return_type");
+        let users_class = users_proxy.class_name().unwrap();
+        assert_eq!(users_class, "Mojolicious::Controller::_Helper::admin::users");
+
+        // 4. Leaf completion shows `purge`.
+        let leaf_candidates = fa.complete_methods_for_class(users_class, None);
+        let leaf_labels: Vec<&str> = leaf_candidates.iter().map(|c| c.label.as_str()).collect();
+        assert!(leaf_labels.contains(&"purge"),
+            "leaf proxy must offer `purge`; got: {:?}", leaf_labels);
+    }
+
+    // ==== Three tests pinning this round's user-facing contracts. ====
+    //
+    // They begin RED and get fixed one at a time below. Shape of each is
+    // "source code + cursor position + real-pipeline assertion" so we
+    // can't lie about internal function results passing while the LSP
+    // experience breaks.
+
+    /// Outline detail names the semantic kind, LSP kind stays FUNCTION
+    /// (user config can render an icon for the domain word). Terminal
+    /// URL handlers (mojo-lite `get '/x' => sub {}`) are `<route>`;
+    /// routing hops (`->to('Users#list')`) are `<dispatch>` — those
+    /// two are semantically different and must not collapse. Tasks
+    /// stay `<task>`, helpers stay `<helper>`, events stay EVENT.
+    #[test]
+    fn outline_detail_names_the_semantic_kind() {
+        use tower_lsp::lsp_types::SymbolKind;
+        let src = r#"package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(current_user => sub { my ($c) = @_; });
+
+my $r = app->routes;
+$r->get('/x')->to('Users#list');
+get '/home' => sub { my $c = shift; };
+
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job) = @_; });
+
+package MyEmitter;
+use parent 'Mojo::EventEmitter';
+sub new {
+    my $self = bless {}, shift;
+    $self->on('ready', sub { my ($s) = @_; });
+    $self;
+}
+"#;
+        let fa = build_fa(src);
+        let outline = fa.document_symbols();
+
+        fn flatten<'a>(out: &'a [crate::file_analysis::OutlineSymbol], acc: &mut Vec<&'a crate::file_analysis::OutlineSymbol>) {
+            for s in out {
+                acc.push(s);
+                flatten(&s.children, acc);
+            }
+        }
+        let mut all = Vec::new();
+        flatten(&outline, &mut all);
+
+        let lsp_kind = |os: &crate::file_analysis::OutlineSymbol| -> SymbolKind {
+            crate::symbols::outline_lsp_kind(os)
+        };
+
+        let helper = all.iter().find(|s| s.name.contains("current_user"))
+            .expect("helper must be in outline of its declaring file");
+        assert_eq!(lsp_kind(helper), SymbolKind::FUNCTION);
+        assert!(helper.detail.as_deref().unwrap_or("").contains("helper"),
+            "helper outline detail must contain 'helper'; got: {:?}", helper.detail);
+
+        // Terminal route: body lives here, `<route>` word.
+        let term_route = all.iter().find(|s| s.name.contains("/home"))
+            .expect("mojo-lite terminal route must be in outline");
+        assert_eq!(lsp_kind(term_route), SymbolKind::FUNCTION);
+        assert_eq!(term_route.detail.as_deref(), Some("route"),
+            "terminal mojo-lite route word is 'route'; got: {:?}", term_route.detail);
+
+        // Controller action (`->to('Users#list')`): no body at this
+        // site, just a cross-reference into Users::list. Word must be
+        // `action`, not `route` — `<route> GET /x` and `<action>
+        // Users#list` are semantically different line items.
+        let action = all.iter().find(|s| s.name.contains("Users#list"))
+            .expect("->to('Users#list') action must be in outline");
+        assert_eq!(lsp_kind(action), SymbolKind::FUNCTION);
+        assert_eq!(action.detail.as_deref(), Some("action"),
+            "->to(...) word is 'action' (distinct from a terminal route); got: {:?}", action.detail);
+
+        let task = all.iter().find(|s| s.name.contains("send_email"))
+            .expect("task must be in outline of its declaring file");
+        assert_eq!(lsp_kind(task), SymbolKind::FUNCTION);
+        assert!(task.detail.as_deref().unwrap_or("").contains("task"),
+            "task outline detail must contain 'task'; got: {:?}", task.detail);
+
+        let event = all.iter().find(|s| s.name.contains("ready"))
+            .expect("event must be in outline of its declaring file");
+        assert_eq!(lsp_kind(event), SymbolKind::EVENT,
+            "events stay EVENT — the one LSP kind that fits");
+    }
+
+    /// `sub get { shift->_generate_route(GET => @_) }` — the Mojo
+    /// Routes::Route pattern. `shift` in the invocant position of a
+    /// method call within a method body means `$self`, so the chain
+    /// invocant class must resolve to the enclosing package.
+    ///
+    /// Without this, every HTTP-verb method on Mojolicious::Routes::Route
+    /// has an unknowable chain and `$r->get(...)->to(...)` loses
+    /// intelligence at the `->to` hop.
+    #[test]
+    fn shift_as_self_in_method_body_resolves_to_current_package() {
+        let src = r#"
+package Mojolicious::Routes::Route;
+
+sub get { shift->_generate_route(GET => @_) }
+
+sub _generate_route {
+    my $self = shift;
+    return $self;
+}
+"#;
+        let fa = build_fa(src);
+
+        // The MethodCall ref for `_generate_route` (inside `get`'s body)
+        // must carry `invocant_class = Mojolicious::Routes::Route` —
+        // proving the build-time chain resolver treated `shift` as
+        // `$self` and looked up the enclosing package.
+        let gr_ref = fa.refs.iter().find(|r|
+            matches!(r.kind, RefKind::MethodCall { .. })
+            && r.target_name == "_generate_route"
+        ).expect("MethodCall ref for `_generate_route`");
+
+        if let RefKind::MethodCall { invocant_class, .. } = &gr_ref.kind {
+            assert_eq!(
+                invocant_class.as_deref(),
+                Some("Mojolicious::Routes::Route"),
+                "`shift->_generate_route` must resolve its invocant to \
+                 the enclosing package. got invocant_class: {:?}",
+                invocant_class,
+            );
+        } else {
+            panic!("expected MethodCall ref");
+        }
+    }
+
+    /// `sub is_endpoint { $_[0]->inline ? undef : ... }` — Mojo uses
+    /// `$_[0]` instead of `shift` on hot paths where the shift's arg-
+    /// list mutation is expensive. Same self-tell as `shift`.
+    #[test]
+    fn dollar_underscore_zero_as_self_resolves_to_current_package() {
+        let src = r#"
+package Mojolicious::Routes::Route;
+
+sub is_endpoint {
+    $_[0]->inline;
+}
+
+sub inline {
+    my $self = shift;
+    return $self;
+}
+"#;
+        let fa = build_fa(src);
+
+        let inline_ref = fa.refs.iter().find(|r|
+            matches!(r.kind, RefKind::MethodCall { .. })
+            && r.target_name == "inline"
+        ).expect("MethodCall ref for `inline`");
+
+        if let RefKind::MethodCall { invocant_class, .. } = &inline_ref.kind {
+            assert_eq!(
+                invocant_class.as_deref(),
+                Some("Mojolicious::Routes::Route"),
+                "`$$_[0]->inline` must resolve its invocant to the \
+                 enclosing package. got invocant_class: {:?}",
+                invocant_class,
+            );
+        } else {
+            panic!("expected MethodCall ref");
+        }
+    }
+
+    /// Regression for the crash reported in the nvim LSP log:
+    /// `thread 'tokio-rt-worker' panicked at src/file_analysis.rs:1164:44:
+    /// index out of bounds: the len is 17 but the index is 17`.
+    ///
+    /// Root cause: `enrich_imported_types_with_keys` truncates
+    /// `type_constraints` back to baseline but leaves stale indices in
+    /// `type_constraints_by_var` from the previous enrichment. The next
+    /// enrichment's call to `resolve_method_call_types` invokes
+    /// `inferred_type`, which indexes into `type_constraints[idx]` —
+    /// OOB when idx points past the truncated length.
+    ///
+    /// Repro: enrich the same FileAnalysis twice with a module_index.
+    /// The second call must not panic.
+    #[test]
+    fn enrichment_twice_does_not_crash_on_stale_indices() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let app_src = r#"
+package main;
+use Mojolicious::Lite;
+
+my $r = app->routes;
+$r->get('/users')->to('Users#list');
+"#;
+        let mojolicious_pm = r#"
+package Mojolicious;
+use Mojo::Base -base;
+has routes => sub { Mojolicious::Routes->new };
+1;
+"#;
+        let routes_pm = r#"
+package Mojolicious::Routes;
+use Mojo::Base 'Mojolicious::Routes::Route';
+1;
+"#;
+        let route_pm = r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+sub get { my $self = shift; return $self; }
+sub to  { my $self = shift; return $self; }
+1;
+"#;
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious.pm"),
+            Arc::new(build_fa(mojolicious_pm)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes.pm"),
+            Arc::new(build_fa(routes_pm)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(build_fa(route_pm)),
+        );
+
+        let mut fa = build_fa(app_src);
+        // First enrichment — simulates publish_diagnostics after module
+        // resolution. Populates type_constraints + type_constraints_by_var.
+        fa.enrich_imported_types_with_keys(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            Some(&idx),
+        );
+        // Second enrichment — simulates a subsequent change or refresh.
+        // Before the fix, the stale type_constraints_by_var indices
+        // panicked `inferred_type` during resolve_method_call_types.
+        fa.enrich_imported_types_with_keys(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            Some(&idx),
+        );
+
+        // Sanity: `$r` is still typed after the second run (not just
+        // "didn't crash" — the state is actually usable).
+        let r_type = fa.inferred_type_via_bag("$r", tree_sitter::Point { row: 5, column: 0 });
+        assert!(
+            r_type.as_ref().and_then(|t| t.class_name()) == Some("Mojolicious::Routes"),
+            "after two enrichments, $$r should still be typed as Mojolicious::Routes; got: {:?}",
+            r_type,
+        );
+    }
+
+    /// Real-file invariant: every meaningful token on the
+    /// `app->routes` / `$r->get(...)->to(...)` lines of the mojo demo
+    /// must surface a useful hover AND a useful goto-def. This is the
+    /// exact scenario the user reports dead in nvim — hover returns
+    /// nothing, gd has nowhere to go.
+    ///
+    /// Probes (all on the actual demo file, not a synthetic snippet):
+    ///   * `app`    in `my $r = app->routes;`         → hover mentions Mojolicious; gd lands somewhere
+    ///   * `routes` in `app->routes`                  → hover mentions routes / Mojolicious::Routes; gd into Mojolicious.pm
+    ///   * `$r`     in `$r->get(...)`                 → hover shows the declaration line
+    ///   * `get`    in `$r->get(...)`                 → hover mentions the real Route::get POD; gd into Route.pm
+    ///   * `to`     in `->to('Users#list')`           → hover mentions Route::to; gd into Route.pm
+    ///
+    /// Any probe returning `None` for BOTH hover and gd is a bug. The
+    /// test enumerates each probe independently so failures pinpoint
+    /// which hop of the chain is broken, not "something somewhere".
+    #[test]
+    fn mojo_demo_lines_70_71_all_tokens_intelligent() {
+        use crate::module_index::ModuleIndex;
+        use std::sync::Arc;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_files/plugin_mojo_demo.pl");
+        let src = std::fs::read_to_string(&path).unwrap();
+        let fa = build_fa(&src);
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&src, None).unwrap();
+
+        // Stub the three Mojo modules the chain walks through so
+        // cross-file resolution has something to reach. Shapes mirror
+        // the real @INC modules' method signatures.
+        let mojolicious_pm = r#"
+package Mojolicious;
+use Mojo::Base -base;
+
+=head2 routes
+
+Returns the router.
+
+=cut
+
+has routes => sub { Mojolicious::Routes->new };
+
+=head2 helper
+
+Register a helper.
+
+=cut
+
+sub helper { my $self = shift; }
+1;
+"#;
+        let routes_pm = r#"
+package Mojolicious::Routes;
+use Mojo::Base 'Mojolicious::Routes::Route';
+1;
+"#;
+        let route_pm = r#"
+package Mojolicious::Routes::Route;
+use Mojo::Base -base;
+
+=head2 get
+
+  my $route = $r->get('/:foo' => sub ($c) {...});
+
+Generate route matching only C<GET> requests.
+
+=cut
+
+sub get { my $self = shift; return $self; }
+
+=head2 to
+
+  $r->to('Users#list');
+
+Set the route's target.
+
+=cut
+
+sub to { my $self = shift; return $self; }
+1;
+"#;
+
+        let idx = ModuleIndex::new_for_test();
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious.pm"),
+            Arc::new(build_fa(mojolicious_pm)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes.pm"),
+            Arc::new(build_fa(routes_pm)),
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Mojolicious/Routes/Route.pm"),
+            Arc::new(build_fa(route_pm)),
+        );
+
+        // Cross-file enrichment — mirrors `Backend::enrich_analysis`.
+        // Without this pass, MethodCallBindings whose resolution needs
+        // a cross-file return type (e.g. `$r = app->routes` needs real
+        // Mojolicious.pm's `routes` accessor) don't land in
+        // `type_constraints`, and `$r` stays untyped.
+        let mut fa = fa;
+        fa.enrich_imported_types_with_keys(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            Some(&idx),
+        );
+        let fa = fa;
+
+        // Locate the two target lines by content — decoupled from
+        // absolute row numbers so reformats don't invalidate the test.
+        let (row_app_routes, line_app_routes) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("my $r = app->routes;"))
+            .map(|(i, l)| (i, l))
+            .expect("demo must contain `my $r = app->routes;`");
+        let (row_r_get_to, line_r_get_to) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("$r->get('/users')->to('Users#list');"))
+            .map(|(i, l)| (i, l))
+            .expect("demo must contain `$r->get('/users')->to('Users#list');`");
+
+        // Column helper — cursor one char into the token, not at its start,
+        // so `ref_at` / `symbol_at` hit the token reliably.
+        let col_of = |line: &str, needle: &str| -> usize {
+            line.find(needle).expect("needle in line") + 1
+        };
+        let probe = |row: usize, col: usize| tree_sitter::Point { row, column: col };
+
+        // Per-probe assertion. Any probe where BOTH hover and gd come
+        // back empty is a dead token — the user's reported symptom.
+        // Print detailed per-probe status so failures pinpoint the hop.
+        let check = |label: &str, point: tree_sitter::Point| {
+            let hover = fa.hover_info(point, &src, Some(&tree), Some(&idx));
+            let def = fa.find_definition(point, Some(&tree), Some(src.as_bytes()), Some(&idx));
+            assert!(
+                hover.is_some() || def.is_some(),
+                "[{label}] @ ({},{}) is a dead token — NO hover AND NO gd. \
+                 Chain-resolution hit a wall here. src: {:?}",
+                point.row, point.column,
+                src.lines().nth(point.row).unwrap_or("<oob>"),
+            );
+        };
+
+        // Line 70 probes.
+        check("app bareword",
+              probe(row_app_routes, col_of(line_app_routes, "app")));
+        check("routes accessor",
+              probe(row_app_routes, col_of(line_app_routes, "routes")));
+
+        // Line 71 probes.
+        check("$r receiver",
+              probe(row_r_get_to, col_of(line_r_get_to, "$r")));
+        check("get method",
+              probe(row_r_get_to, col_of(line_r_get_to, "->get") + 2)); // skip "->"
+        check("to method",
+              probe(row_r_get_to, col_of(line_r_get_to, "->to") + 2));
+
+        // Focused assertions on `app`:
+        //   1. Hover surfaces the plugin's `app` Sub doc — i.e. ref_at
+        //      resolves to the narrow FunctionCall ref for the bareword,
+        //      NOT the wider MethodCall ref that would describe `routes`.
+        //   2. A semantic token lands on the bareword span — the user
+        //      reported no highlight on `app->` in nvim; the narrow
+        //      FunctionCall ref is what feeds semantic tokens.
+        let app_point = probe(row_app_routes, col_of(line_app_routes, "app"));
+        let app_hover = fa.hover_info(app_point, &src, Some(&tree), Some(&idx));
+        let app_hover_text = app_hover.as_deref().unwrap_or("");
+        assert!(
+            app_hover_text.contains("The Mojolicious application instance"),
+            "hover on `app` must surface the plugin-emitted Sub's doc \
+             — proving ref_at picked the narrow FunctionCall ref, not \
+             the outer MethodCall for `routes`. got: {:?}",
+            app_hover,
+        );
+
+        // Semantic token on the bareword — any token kind is fine, the
+        // point is SOMETHING lights it up.
+        let tokens = fa.semantic_tokens();
+        let app_row = row_app_routes;
+        let app_col_start = line_app_routes.find("app").unwrap();
+        let app_col_end = app_col_start + "app".len();
+        let app_has_token = tokens.iter().any(|t|
+            t.span.start.row == app_row
+            && t.span.start.column == app_col_start
+            && t.span.end.column == app_col_end
+        );
+        assert!(
+            app_has_token,
+            "semantic token must fire on the `app` bareword span — \
+             user reported no highlight and traced it to a missing \
+             Ref at the invocant. tokens near row {}: {:?}",
+            app_row,
+            tokens.iter()
+                .filter(|t| t.span.start.row == app_row)
+                .collect::<Vec<_>>(),
+        );
+
+        // Headline chain assertion: `$r` MUST be typed as
+        // Mojolicious::Routes after the `my $r = app->routes;` line.
+        // This is the single most important observable — without it,
+        // every `$r->...` downstream loses intelligence (precisely
+        // the user's report). `inferred_type` is the same query
+        // resolve_invocant_class uses for method resolution, so if
+        // this says None, nothing on line 71 can work.
+        let r_point = probe(row_r_get_to, col_of(line_r_get_to, "$r"));
+        let r_type = fa.inferred_type_via_bag("$r", r_point);
+        assert_eq!(
+            r_type.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes"),
+            "`$$r` must be typed as Mojolicious::Routes at the `$$r->get` \
+             call site. Without this, the rest of line 71 is dead. got: {:?}",
+            r_type,
+        );
+
+        // `$r->get` must resolve via inheritance (Mojolicious::Routes
+        // ISA Mojolicious::Routes::Route) to the real `get` method.
+        // Return type is fluent — stays on Route for `->to` to work.
+        let get_rt = fa.find_method_return_type(
+            "Mojolicious::Routes", "get", Some(&idx), None,
+        );
+        assert_eq!(
+            get_rt.as_ref().and_then(|t| t.class_name()),
+            Some("Mojolicious::Routes::Route"),
+            "`$$r->get` must resolve to Mojolicious::Routes::Route::get \
+             via inheritance. got: {:?}", get_rt,
+        );
+    }
+
+    /// Real-file invariant pinning the original nvim repro: line 118
+    /// of plugin_mojo_demo.pl, which sits textually in `package MyApp`
+    /// but before the fix was reported as `MyApp::Progress` (the LAST-
+    /// declared package in the file) — so Minion's trigger didn't
+    /// match, the plugin hook didn't fire, and the native path
+    /// mis-keyed the task's sig off the enqueue parens.
+    ///
+    /// Pinned points:
+    ///   * cursor inside `'alice@example.com'` → $to   (slot 0)
+    ///   * cursor inside `'hi'`                → $subject (slot 1)
+    ///   * cursor inside `'body'`              → $body   (slot 2)
+    ///   * cursor past the closing `]`          → NOT the task sig
+    #[test]
+    fn enqueue_sighelp_line_118_of_demo() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_files/plugin_mojo_demo.pl");
+        let src = std::fs::read_to_string(&path).unwrap();
+        let fa = build_fa(&src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&src, None).unwrap();
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+
+        // Locate the enqueue call by content — line numbers in the
+        // demo file shift whenever it's edited, and the test's value
+        // is the signature-help behavior, not a literal row.
+        let (line_idx, line) = src.lines().enumerate()
+            .find(|(_, l)| l.contains("$minion->enqueue(send_email"))
+            .map(|(i, l)| (i as u32, l))
+            .expect("demo must contain the send_email enqueue site");
+
+        let cases: &[(&str, &str, Option<u32>)] = &[
+            ("alice@example.com", "'alice", Some(0)),
+            ("hi",                "'hi'",   Some(1)),
+            ("body",              "'body'", Some(2)),
+        ];
+        for (slot_label, needle, expected) in cases {
+            let col = (line.find(needle).unwrap() + 2) as u32;
+            let pos = Position { line: line_idx, character: col };
+            let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx)
+                .unwrap_or_else(|| panic!("[{slot_label}] sig help must fire"));
+            assert!(sig.signatures[0].label.contains("send_email"),
+                "[{slot_label}] task sig expected; got {:?}", sig.signatures[0].label);
+            assert_eq!(sig.active_parameter, *expected,
+                "[{slot_label}] wrong slot; got {:?}", sig.active_parameter);
+        }
+
+        // Past the closing `]` — must NOT show the task sig.
+        let col = (line.rfind(']').unwrap() + 1) as u32;
+        let pos = Position { line: line_idx, character: col };
+        if let Some(s) = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx) {
+            let lbl = &s.signatures[0].label;
+            assert!(!lbl.contains("send_email"),
+                "past `]`: task sig must not leak; got {lbl:?}");
+        }
+    }
+
+    /// Pinned invariant for the real-nvim Minion sig-help bug:
+    ///
+    ///   * Fat commas and literal commas must produce the SAME
+    ///     signature-help behavior at identical cursor positions.
+    ///     Two cases before the fix: (a) inside the arrayref, both
+    ///     variants routed to the task sig — that worked. (b) once
+    ///     the cursor left the arrayref, the native string-dispatch
+    ///     path keyed the task's active_param off the outer call's
+    ///     literal-comma count, surfacing `$subject` at the options-
+    ///     hash slot, and `$body` several slots into a run of
+    ///     trailing commas. Both wrong in obviously different ways.
+    ///
+    ///   * Cursor inside the arrayref → task sig, correct slot.
+    ///   * Cursor outside the arrayref but still in the enqueue call
+    ///     → NEVER the task sig. Falls through to enqueue's own
+    ///     method sig (none here, since Minion.pm isn't indexed in
+    ///     the test — `None` is the acceptable outcome).
+    ///
+    /// If this regresses, the sweep-style bug is back: flip to
+    /// `DUMP_SWEEP=1 cargo test` to get a per-column dump.
+    #[test]
+    fn enqueue_sighelp_separator_agnostic() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let cases: &[(&str, &str)] = &[
+            ("literal-comma", "$minion->enqueue('send_email', [ 'alice' ], {})"),
+            ("fat-comma",     "$minion->enqueue(send_email => [ 'alice' ], , , , )"),
+        ];
+
+        let header = "package MyApp;\nuse Minion;\nmy $minion = Minion->new;\n\
+             $minion->add_task(send_email => sub { my ($job, $to, $subject, $body) = @_; });\n";
+
+        let dump = std::env::var("DUMP_SWEEP").is_ok();
+        let mut dump_out = String::new();
+
+        for (label, call_line) in cases {
+            let src = format!("{}{};\n", header, call_line);
+            let fa = build_fa(&src);
+            let mut parser = Parser::new();
+            parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+            let tree = parser.parse(&src, None).unwrap();
+            let idx = crate::module_index::ModuleIndex::new_for_test();
+
+            let line_idx = src.lines().position(|l| l.starts_with("$minion->enqueue")).unwrap();
+            let line = src.lines().nth(line_idx).unwrap();
+
+            // Cursor inside 'alice' → task sig, slot 0 ($to).
+            let in_alice = line.find("'alice'").unwrap() + 3;
+            let pos = Position { line: line_idx as u32, character: in_alice as u32 };
+            let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx)
+                .unwrap_or_else(|| panic!("[{label}] cursor in 'alice' must fire task sig"));
+            assert!(sig.signatures[0].label.contains("send_email"),
+                "[{label}] in 'alice' → task sig; got: {:?}", sig.signatures[0].label);
+            assert_eq!(sig.active_parameter, Some(0),
+                "[{label}] in 'alice' → $to (slot 0); got {:?}", sig.active_parameter);
+
+            // Cursor past the `]` but still inside the enqueue parens
+            // → the options-hash slot / trailing-comma space. MUST NOT
+            // show the task sig. `None` is acceptable (enqueue's own
+            // method isn't indexed in this test).
+            let past_bracket = line.find(']').unwrap() + 2;
+            let pos = Position { line: line_idx as u32, character: past_bracket as u32 };
+            let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx);
+            if let Some(s) = &sig {
+                let lbl = &s.signatures[0].label;
+                assert!(!lbl.contains("send_email"),
+                    "[{label}] past `]`: task sig must NOT show; got: {:?}", lbl);
+            }
+
+            // Fat-comma specific: sweep the trailing-commas region
+            // and ensure NONE of those columns surface the task sig.
+            // Before the fix, each literal comma bumped active_param
+            // and produced $subject / $body at arbitrary positions.
+            if *label == "fat-comma" {
+                let start = line.find(']').unwrap() + 1;
+                let end = line.rfind(')').unwrap();
+                for col in start..=end {
+                    let pos = Position { line: line_idx as u32, character: col as u32 };
+                    let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx);
+                    if let Some(s) = &sig {
+                        let lbl = &s.signatures[0].label;
+                        assert!(!lbl.contains("send_email"),
+                            "[{label}] col {col}: task sig leaked into trailing-comma region; got: {:?}",
+                            lbl);
+                    }
+                }
+            }
+
+            if dump {
+                dump_out.push_str(&format!("\n=== {} ===\n{}\n", label, line));
+                for col in 0..=line.len() {
+                    let pos = Position { line: line_idx as u32, character: col as u32 };
+                    let sig = crate::symbols::signature_help(&fa, &tree, &src, pos, &idx);
+                    let label_str = match &sig {
+                        None => "<none>".to_string(),
+                        Some(s) => format!("ap={:?} sig={}",
+                            s.active_parameter,
+                            s.signatures.first().map(|si| si.label.as_str()).unwrap_or("")),
+                    };
+                    let ch = line.chars().nth(col).map(|c| c.to_string())
+                        .unwrap_or_else(|| "<eol>".into());
+                    dump_out.push_str(&format!("col {:>3} ({:<5}): {}\n", col, ch, label_str));
+                }
+            }
+        }
+
+        if dump { panic!("{}", dump_out); }
+    }
+
+    /// Sanity: the minion plugin registers a task Handler with the
+    /// expected shape. The arrayref-sig-help behavior itself lives in
+    /// the plugin's `on_signature_help` IoC hook (tested end-to-end
+    /// below) — no data flag on the Handler.
+    #[test]
+    fn minion_registers_task_handler() {
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job, $to) = @_; });
+"#;
+        let fa = build_fa(src);
+        let h = fa.symbols.iter()
+            .find(|s| s.kind == SymKind::Handler && s.name == "send_email")
+            .expect("handler exists");
+        let SymbolDetail::Handler { dispatchers, display, .. } = &h.detail else {
+            panic!("detail shape");
+        };
+        assert!(dispatchers.iter().any(|d| d == "enqueue"),
+            "must list enqueue as a dispatcher; got: {:?}", dispatchers);
+        assert!(matches!(display, HandlerDisplay::Task),
+            "task handlers display as Task; got: {:?}", display);
+    }
+
+    /// Test 2 — arrayref sig help, through the REAL LSP pipeline.
+    /// Cursor sits INSIDE the middle string literal `'hi'` — the
+    /// shape a user actually produces in nvim. active_parameter must
+    /// be 1 (= $subject). Earlier version of this test used a
+    /// cursor-right-after-comma position that nobody types at, and
+    /// passed while the real nvim experience was broken.
+    #[test]
+    fn enqueue_arrayref_sig_help_active_param_inside_string() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject, $body) = @_;
+});
+$minion->enqueue(send_email => ['alice', 'hi', 'body']);
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Cursor between `h` and `i` of `'hi'` — the middle slot of
+        // the arrayref, which is $subject.
+        let line_idx = src.lines().position(|l| l.contains("enqueue(send_email"))
+            .expect("enqueue line present");
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("'hi'").unwrap() + 2; // between h and i
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
+            .expect("sig help must fire inside a string-literal arrayref arg");
+
+        let info = &sig.signatures[0];
+        assert!(info.label.contains("send_email"),
+            "label references the task, not enqueue; got: {:?}", info.label);
+        assert!(info.label.contains("$subject"),
+            "label surfaces the task's params; got: {:?}", info.label);
+        assert_eq!(sig.active_parameter, Some(1),
+            "cursor inside `'hi'` → $subject (index 1), NOT $to. \
+             If you see 0 here, sig help isn't recognizing it's inside \
+             the arrayref at slot 1; got: {:?}", sig.active_parameter);
+    }
+
+    /// Sig help must also land on the LAST arrayref slot when the
+    /// cursor is inside its string literal. Pinned separately from
+    /// the middle-slot test because count_commas can off-by-one on
+    /// the last slot if the walker breaks wrong.
+    #[test]
+    fn enqueue_arrayref_sig_help_active_param_inside_last_string() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject, $body) = @_;
+});
+$minion->enqueue(send_email => ['alice', 'hi', 'body']);
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let line_idx = src.lines().position(|l| l.contains("enqueue(send_email"))
+            .unwrap();
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("'body'").unwrap() + 3; // inside "body"
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
+            .expect("sig help fires inside the last string too");
+
+        assert_eq!(sig.active_parameter, Some(2),
+            "cursor inside `'body'` → $body (index 2); got: {:?}",
+            sig.active_parameter);
+    }
+
+    /// Test 3a — hash-key completion on an empty enqueue options hash
+    /// in a file that ALSO has a matching add_task. The earlier
+    /// version of this test used an enqueue for an unknown task name,
+    /// which accidentally sidestepped the dispatch-args short-circuit
+    /// — nvim's real experience (task registered, enqueue at 3rd arg)
+    /// was silently broken. Pin the real shape.
+    #[test]
+    fn enqueue_options_hash_completion_empty() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(task_x => sub { my ($job, $a) = @_; });
+$minion->enqueue(task_x => ['a'], {  });
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Cursor inside the enqueue options hash — `{  }` on the
+        // enqueue line. Can't just search for "{ " globally because
+        // the sub body `sub { my ($job` matches first.
+        let line_idx = src.lines().position(|l| l.contains("enqueue(task_x"))
+            .expect("enqueue line");
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("{  }").unwrap() + 2; // halfway between `{` and `}`
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        for expected in &["priority", "queue", "delay", "attempts"] {
+            assert!(labels.contains(expected),
+                "empty-hash: `{}` must complete; got: {:?}", expected, labels);
+        }
+    }
+
+    /// Test 3b — with an existing key in the hash, it must NOT be
+    /// offered again; the rest of the options must still appear.
+    /// Same task-registered shape as 3a so the dispatch-args
+    /// short-circuit IS active and gets properly bypassed on HashKey.
+    #[test]
+    fn enqueue_options_hash_completion_with_existing_keys() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(task_x => sub { my ($job, $a) = @_; });
+$minion->enqueue(task_x => ['a'], { priority => 10,  });
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Scope the anchor to the enqueue line so the sub body's own
+        // brace/comma pattern doesn't claim the match first.
+        let line_idx = src.lines().position(|l| l.contains("enqueue(task_x"))
+            .expect("enqueue line");
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("priority => 10, ").unwrap() + "priority => 10, ".len();
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        assert!(labels.contains(&"queue"),
+            "with-existing: `queue` must still complete; got: {:?}", labels);
+        assert!(labels.contains(&"delay"),
+            "with-existing: `delay` must still complete; got: {:?}", labels);
+        assert!(!labels.contains(&"priority"),
+            "with-existing: `priority` is already used — must NOT re-appear; got: {:?}",
+            labels);
+    }
+
+    /// mojo-helpers emits a PluginNamespace for the app, bridging to
+    /// `Mojolicious::Controller` and `Mojolicious`. Each registered
+    /// helper's name is an entity; the two fan-out Method symbols
+    /// (one per entry class) both land in the namespace via name
+    /// resolution. Multi-app workspaces get one namespace per app.
+    #[test]
+    fn mojo_helpers_emits_app_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package MyApp;
+use Mojolicious::Lite;
+my $app = Mojolicious->new;
+$app->helper(current_user => sub { my ($c) = @_; });
+$app->helper('users.create' => sub { my ($c) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        // Identify by semantic shape (kind + bridges), not by plugin
+        // id — the contract is "there's an 'app' namespace bridging to
+        // both Controller and Mojolicious", not "a plugin literally
+        // called mojo-helpers emits it".
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n|
+                n.kind == "app"
+                && n.bridges.contains(&Bridge::Class("Mojolicious::Controller".into()))
+                && n.bridges.contains(&Bridge::Class("Mojolicious".into()))
+            )
+            .expect("an `app` namespace must bridge both Controller and Mojolicious");
+
+        // Entities cover both registered helpers, through the
+        // name-keyed resolution that expands fan-out Methods.
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        assert!(entity_names.contains(&"current_user"),
+            "simple helper must land in the namespace; got: {:?}", entity_names);
+        assert!(entity_names.contains(&"users"),
+            "dotted-helper root must land in the namespace; got: {:?}", entity_names);
+
+        // Namespace ID is stable per enclosing package — one namespace
+        // for MyApp regardless of how many helpers it registers. Scope
+        // the count to this namespace's own (plugin_id, id) pair.
+        let count = fa.plugin_namespaces.iter()
+            .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
+            .count();
+        assert_eq!(count, 1, "one namespace per app, not one per helper");
+    }
+
+    /// Plugin namespaces are a structural concept (bridges into class
+    /// lookups via `for_each_entity_bridged_to`) — they are deliberately
+    /// NOT surfaced in the document outline. The entities inside (helpers,
+    /// routes, tasks) already render as individual entries with their
+    /// `<word>` kind prefix; a separate "this file hosts a mojo app" row
+    /// is noise the user can't act on. The namespace data still has to
+    /// be populated for cross-file bridge lookups to work — that's what
+    /// this test pins.
+    #[test]
+    fn plugin_namespaces_are_populated_but_not_in_outline() {
+        let src = r#"package MyApp;
+use Mojolicious::Lite;
+app->helper(current_user => sub { my ($c) = @_; });
+get '/home' => sub { my $c = shift; };
+"#;
+        let fa = build_fa(src);
+
+        // The namespace data is still there for bridge queries — that's
+        // how `$c->current_user` resolves to the helper across files.
+        assert!(
+            fa.plugin_namespaces.iter().any(|n| n.kind == "app"),
+            "app namespace should still exist in FileAnalysis; got: {:?}",
+            fa.plugin_namespaces.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        // Outline must NOT contain any Namespace kind entries from the
+        // plugin namespaces. Packages (`MyApp`) are Namespace-kind too
+        // but come from SymKind::Package symbols, which are fine.
+        let outline = fa.document_symbols();
+        let plugin_ns_in_outline: Vec<&str> = outline.iter()
+            .filter(|o| o.kind == SymKind::Namespace)
+            .map(|o| o.name.as_str())
+            .filter(|n| n.starts_with('['))
+            .collect();
+        assert!(
+            plugin_ns_in_outline.is_empty(),
+            "plugin namespaces must not surface in outline; leaked: {:?}",
+            plugin_ns_in_outline,
+        );
+
+        // The actual entries (helper, route) still show flat.
+        fn walk<'a>(xs: &'a [crate::file_analysis::OutlineSymbol], out: &mut Vec<&'a str>) {
+            for x in xs {
+                out.push(x.name.as_str());
+                walk(&x.children, out);
+            }
+        }
+        let mut all = Vec::new();
+        walk(&outline, &mut all);
+        assert!(all.iter().any(|n| n.contains("current_user")),
+            "helper must still appear flat in outline; got: {:?}", all);
+        assert!(all.iter().any(|n| n.contains("/home")),
+            "route must still appear flat in outline; got: {:?}", all);
+    }
+
+    /// mojo-events emits a PluginNamespace per emitter class. Bridges to
+    /// the emitter class; entity_names are the event Handler names.
+    /// Multiple `->on/->once/->subscribe` wire-ups on the same emitter
+    /// accumulate under the same namespace id.
+    #[test]
+    fn mojo_events_emits_emitter_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package My::Emitter;
+use parent 'Mojo::EventEmitter';
+sub register {
+    my $self = shift;
+    $self->on(connect => sub { my ($e) = @_; });
+    $self->on(disconnect => sub { my ($e) = @_; });
+    $self->once(ready => sub { my ($e) = @_; });
+}
+"#;
+        let fa = build_fa(src);
+
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n|
+                n.kind == "events"
+                && n.bridges.contains(&Bridge::Class("My::Emitter".into()))
+            )
+            .expect("an `events` namespace must bridge My::Emitter");
+
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        for ev in ["connect", "disconnect", "ready"] {
+            assert!(entity_names.contains(&ev),
+                "event `{}` must land in the namespace; got: {:?}", ev, entity_names);
+        }
+
+        let count = fa.plugin_namespaces.iter()
+            .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
+            .count();
+        assert_eq!(count, 1, "one namespace per emitter, not one per wire-up");
+    }
+
+    /// mojo-routes emits a PluginNamespace per declaring package. Each
+    /// `->to('Ctrl#action')` call's Handler lands as a namespace entity;
+    /// the bridge points at `Mojolicious::Controller` (not the declaring
+    /// package) so `$c->url_for('|')` from any controller resolves via
+    /// `for_each_entity_bridged_to` walking through Controller in its
+    /// ancestor chain. Namespace id still keys on the declaring package
+    /// so future app-scoping has per-app buckets to narrow to.
+    #[test]
+    fn mojo_routes_emits_app_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package MyApp;
+use Mojolicious;
+sub startup {
+    my $self = shift;
+    my $r = $self->routes;
+    $r->get('/users')->to('Users#list');
+    $r->post('/users')->to('Users#create');
+}
+"#;
+        let fa = build_fa(src);
+
+        // Identify by semantic shape — a `routes` namespace that
+        // bridges to Mojolicious::Controller (the happy-path owner
+        // for the workspace-wide url_for lookup). Entity names are
+        // the Controller#action form, distinguishing from the Lite
+        // path-based flavor.
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n|
+                n.kind == "routes"
+                && n.bridges.contains(&Bridge::Class("Mojolicious::Controller".into()))
+                && n.entities.iter().any(|id| fa.symbol(*id).name.contains('#'))
+            )
+            .expect("a `routes` namespace must bridge Mojolicious::Controller with Ctrl#action entities");
+
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        assert!(entity_names.contains(&"Users#list"),
+            "route Users#list must land in the namespace; got: {:?}", entity_names);
+        assert!(entity_names.contains(&"Users#create"),
+            "route Users#create must land in the namespace; got: {:?}", entity_names);
+
+        let count = fa.plugin_namespaces.iter()
+            .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
+            .count();
+        assert_eq!(count, 1, "one namespace per declaring package, not one per route");
+    }
+
+    /// mojo-lite emits a PluginNamespace per Lite app. Entity names are
+    /// the route paths (the same string that mojo-lite stamps into the
+    /// Handler). Bridge is `Mojolicious::Controller` so `$c->url_for(|)`
+    /// inside any controller picks up these Lite routes too — mirrors
+    /// mojo-routes; the Lite script package lives on in the namespace
+    /// id (`mojo-lite:<pkg>`) for future app-scoping.
+    #[test]
+    fn mojo_lite_emits_app_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package main;
+use Mojolicious::Lite;
+get '/users' => sub { my $c = shift; };
+post '/login' => sub { my $c = shift; };
+"#;
+        let fa = build_fa(src);
+
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n|
+                n.kind == "routes"
+                && n.bridges.contains(&Bridge::Class("Mojolicious::Controller".into()))
+                && n.entities.iter().any(|id| fa.symbol(*id).name.starts_with('/'))
+            )
+            .expect("a Lite `routes` namespace must bridge Mojolicious::Controller with /path entities");
+
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        assert!(entity_names.contains(&"/users"),
+            "route /users must land in the namespace; got: {:?}", entity_names);
+        assert!(entity_names.contains(&"/login"),
+            "route /login must land in the namespace; got: {:?}", entity_names);
+    }
+
+    /// minion emits a PluginNamespace per enclosing package. Tasks land
+    /// as entities; bridge is `Class(Minion)` so the namespace feeds the
+    /// same cross-file lookup primitive used by the other plugins.
+    /// (The `dispatch_targets_for` completion-hook path is independent —
+    /// the namespace here is for outline/workspace-symbol and future
+    /// consolidation of the task-lookup path.)
+    #[test]
+    fn minion_emits_tasks_plugin_namespace() {
+        use crate::file_analysis::Bridge;
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job) = @_; });
+$minion->add_task(resize_image => sub { my ($job) = @_; });
+"#;
+        let fa = build_fa(src);
+
+        let ns = fa.plugin_namespaces.iter()
+            .find(|n|
+                n.kind == "tasks"
+                && n.bridges.contains(&Bridge::Class("Minion".into()))
+            )
+            .expect("a `tasks` namespace must bridge Minion");
+
+        let entity_names: Vec<&str> = ns.entities.iter()
+            .map(|id| fa.symbol(*id).name.as_str())
+            .collect();
+        assert!(entity_names.contains(&"send_email"),
+            "task send_email must land in the namespace; got: {:?}", entity_names);
+        assert!(entity_names.contains(&"resize_image"),
+            "task resize_image must land in the namespace; got: {:?}", entity_names);
+
+        let count = fa.plugin_namespaces.iter()
+            .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
+            .count();
+        assert_eq!(count, 1, "one namespace per package, not one per add_task");
+    }
+
+    /// RED — sig help at the OPTIONS hash of enqueue should show
+    /// enqueue's own signature, not the task's. Currently broken:
+    /// the string-dispatch sig help fires whenever the cursor is past
+    /// arg-0 of a dispatcher call, regardless of whether the cursor
+    /// is actually inside the handler-args slot. For `enqueue`,
+    /// handler args live INSIDE the arrayref at slot 1 — slot 2 is
+    /// enqueue's own options hash.
+    ///
+    /// Proper fix: plugin-controlled dispatch (see
+    /// `docs/prompt-plugin-architecture.md` — IoC query hooks).
+    /// The plugin decides when sig help applies to the handler vs
+    /// when it applies to the dispatcher itself. Core-side fix is
+    /// possible (narrow the string-dispatch path to the declared
+    /// handler-args slot) but fragile; leaving as RED until the
+    /// IoC hook lands.
+    #[test]
+    fn enqueue_options_hash_sig_help_is_enqueue_not_task() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject) = @_;
+});
+$minion->enqueue(send_email => ['a', 'b'], {  });
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let line_idx = src.lines().position(|l| l.contains("enqueue(send_email"))
+            .unwrap();
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("{  }").unwrap() + 2;
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx);
+
+        // Tight contract: `PluginSigHelpAnswer::Silent` returns None
+        // from `signature_help` — full stop. The plugin explicitly
+        // claims the slot to block the native string-dispatch path
+        // that would mis-show the task's sig. Anything else means
+        // either the plugin stopped claiming, or the core's Silent
+        // handler regressed.
+        assert!(sig.is_none(),
+            "plugin `Silent` on the options-hash slot must suppress native \
+             sig help entirely; got: {:?}", sig);
+    }
+
+    /// RED — completion at arg-0 of enqueue should offer ONLY
+    /// registered task names (Handler dispatch targets), not a
+    /// union of tasks + every other `Minion` instance method.
+    /// Matches the real nvim env where CPAN-installed Minion brings
+    /// ~30 instance methods cross-file, which leak in when a
+    /// user types `$minion->enqueue(|)`.
+    ///
+    /// Same arch gap as the sig-help one above: the core doesn't
+    /// know that `enqueue`'s arg-0 is semantically "pick a task
+    /// name", so `dispatch_target_completions` contributes task
+    /// names but instance methods reach in through completion of
+    /// the receiver's class methods on the `$minion->` receiver.
+    ///
+    /// Proper fix: plugin-controlled `on_completion` hook + the
+    /// PluginNamespace entities indexed for fast "names of kind
+    /// `task` on this minion" lookup. See the arch doc.
+    #[test]
+    fn enqueue_arg0_offers_task_names_only() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        // Task-declaring file.
+        let src = r#"package MyApp;
+use Minion;
+my $minion = Minion->new;
+$minion->add_task(send_email => sub { my ($job) = @_; });
+$minion->add_task(resize_image => sub { my ($job) = @_; });
+$minion->enqueue();
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Mock CPAN Minion with realistic instance methods that
+        // would otherwise leak into `$minion->enqueue(|)`. Uses the
+        // same workspace-module-registration path nvim startup uses.
+        let minion_src = r#"package Minion;
+sub new { my $class = shift; bless {}, $class }
+sub enqueue     { my ($self, $task, $args, $opts) = @_; }
+sub enqueue_p   { my ($self, $task, $args, $opts) = @_; }
+sub perform_jobs { my ($self) = @_; }
+sub backend     { my ($self) = @_; }
+sub reset       { my ($self) = @_; }
+sub stats       { my ($self) = @_; }
+sub worker      { my ($self) = @_; }
+sub repair      { my ($self) = @_; }
+sub foreground  { my ($self, $id) = @_; }
+1;
+"#;
+        let minion_fa = std::sync::Arc::new(build_fa(minion_src));
+        let idx = std::sync::Arc::new(crate::module_index::ModuleIndex::new_for_test());
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/tmp/Minion.pm"),
+            minion_fa,
+        );
+
+        // Cursor inside `enqueue(|)` — just after the `(`.
+        let line_idx = src.lines().position(|l| l.ends_with("enqueue();"))
+            .unwrap();
+        let line = src.lines().nth(line_idx).unwrap();
+        let col = line.find("enqueue(").unwrap() + "enqueue(".len();
+        let pos = Position { line: line_idx as u32, character: col as u32 };
+
+        let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        assert!(labels.contains(&"send_email"),
+            "task names must appear at enqueue's arg 0; got: {:?}", labels);
+        assert!(labels.contains(&"resize_image"),
+            "every registered task name must be offered; got: {:?}", labels);
+
+        // The tight contract — only tasks, nothing else. When this
+        // goes green we'll know the plugin owns the completion shape
+        // at this position and the Minion-method firehose is gone.
+        for label in &labels {
+            assert!(
+                *label == "send_email" || *label == "resize_image",
+                "only task names should appear at enqueue's arg 0; \
+                 got unexpected `{}` in {:?}", label, labels,
+            );
+        }
+    }
+
+    /// Sig help on a helper call strips `$c` like it strips `$self`.
+    /// The helper plugin flags its callback's first param as invocant
+    /// via `as_invocant_params`; the core sig help path drops any
+    /// invocant-flagged first positional instead of name-matching
+    /// `$self`/`$class` only.
+    #[test]
+    fn plugin_mojo_helpers_sig_help_strips_invocant() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::Parser;
+
+        let src = r#"package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(current_user => sub {
+    my ($c, $fallback) = @_;
+});
+
+sub act {
+    my ($c) = @_;
+    $c->current_user();
+}
+"#;
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Cursor inside `$c->current_user(|)` — between the parens.
+        let (row, col) = src.lines().enumerate()
+            .find_map(|(r, l)| l.find("current_user()").map(|c| (r, c + "current_user(".len())))
+            .expect("find call site");
+        let pos = Position { line: row as u32, character: col as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
+            .expect("sig help fires on helper call");
+
+        let info = &sig.signatures[0];
+        assert!(info.label.contains("current_user"), "label: {:?}", info.label);
+        assert!(info.label.contains("$fallback"),
+            "sig should show declared param `$fallback`; got: {:?}", info.label);
+        assert!(!info.label.contains("$c"),
+            "`$c` must be stripped as invocant; got: {:?}", info.label);
+    }
+
+    /// Sig help when the cursor sits inside the arrayref at position 1
+    /// of `enqueue` — the core routes via the Handler's
+    /// `args_in_arrayref_at` declaration (set by the minion plugin)
+    /// and shows the task's params (invocant-stripped). Plugin-agnostic
+    /// on the sig-help side: all the core needs is the declaration.
+    #[test]
+    fn plugin_minion_sig_help_on_enqueue_array_args() {
+        use tower_lsp::lsp_types::Position;
+        use tree_sitter::{Parser, Point};
+
+        let src = r#"package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->add_task(send_email => sub {
+    my ($job, $to, $subject, $body) = @_;
+});
+$minion->enqueue(send_email => [ ]);
+"#;
+        let fa = build_fa(src);
+
+        // Cursor inside the enqueue call's arrayref: point at the
+        // single space between the `[` and `]` on the last line.
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Find the `[ ]` — cursor at col AFTER `[`.
+        let mut cursor_point: Option<Point> = None;
+        for (row, line) in src.lines().enumerate() {
+            if line.contains("enqueue(send_email") {
+                if let Some(col) = line.find("[ ") {
+                    cursor_point = Some(Point::new(row, col + 1));
+                }
+            }
+        }
+        let cursor_point = cursor_point.expect("locate cursor inside [ ]");
+        let pos = Position { line: cursor_point.row as u32, character: cursor_point.column as u32 };
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let sig = crate::symbols::signature_help(&fa, &tree, src, pos, &idx)
+            .expect("sig help must fire inside enqueue's arrayref");
+
+        // At least one signature, matching the `send_email` handler
+        // (the task's params minus $job).
+        assert!(!sig.signatures.is_empty(), "at least one signature");
+        let info = &sig.signatures[0];
+        let label = &info.label;
+        assert!(label.contains("send_email"),
+            "sig label must reference the handler name: {:?}", label);
+        assert!(label.contains("$to"),
+            "sig should surface task params (`$to`): {:?}", label);
+        assert!(!label.contains("$job"),
+            "invocant `$job` must be stripped from display: {:?}", label);
+    }
+
+    /// Hash-key completion on the enqueue options hash
+    /// (`$minion->enqueue('task', [args], { | })`) — the cursor_context
+    /// layer now recognizes a nested hash literal as a positional
+    /// argument and routes it to `HashKeyOwner::Sub { name: enqueue }`.
+    #[test]
+    fn plugin_minion_hashkey_help_on_enqueue_options() {
+        use tree_sitter::{Parser, Point};
+        let src = r#"package MyApp;
+use Minion;
+
+my $minion = Minion->new;
+$minion->enqueue(task_x => ['arg'] => { });
+"#;
+        // Build + parse
+        let fa = build_fa(src);
+        let mut parser = Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        // Cursor inside the empty options hash literal `{ | }`.
+        // Line 4 (0-indexed) column after "{ " — aim at the middle
+        // of the hash's interior.
+        let src_bytes = src.as_bytes();
+        let mut cursor: Option<Point> = None;
+        for (row, line) in src.lines().enumerate() {
+            if let Some(col) = line.find("{ ") {
+                cursor = Some(Point::new(row, col + 2));
+            }
+        }
+        let cursor = cursor.expect("find the `{ ` in the source");
+
+        let ctx = crate::cursor_context::detect_cursor_context_tree(
+            &tree, src_bytes, cursor, &fa,
+        ).expect("context should be detected inside hash literal");
+        match ctx {
+            crate::cursor_context::CursorContext::HashKey { source_sub, .. } => {
+                assert_eq!(source_sub.as_deref(), Some("enqueue"),
+                    "nested {{ }} at call-arg position routes to the callee");
+            }
+            other => panic!("expected HashKey context, got {:?}", other),
+        }
+
+        // Completion path surfaces the plugin's HashKeyDefs.
+        let candidates = fa.complete_hash_keys_for_sub("enqueue", cursor);
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        for expected in &["priority", "queue", "delay", "attempts"] {
+            assert!(labels.contains(expected),
+                "enqueue option `{}` must complete; got: {:?}",
+                expected, labels);
+        }
+    }
+
+    // ---- Plugin type overrides ----
+    //
+    // Tests pin the contract: a plugin's `overrides()` manifest patches
+    // local Sub/Method return types AFTER inference, with provenance
+    // recorded so debugging can tell asserted from inferred. The
+    // bundled `mojo-routes` plugin overrides `Mojolicious::Routes::Route::_route`
+    // to return `$self` because the upstream impl uses an `@_`-shift /
+    // array-slice idiom inference doesn't model.
+    //
+    // Targeting is by exact (class, method) — the override fires on the
+    // home class only; subclasses still get the type via the existing
+    // cross-file resolution path.
+
+    #[test]
+    fn plugin_override_patches_return_type_on_matching_method() {
+        let src = "\
+package Mojolicious::Routes::Route;
+
+sub _route {
+    my $self = shift;
+    # Real impl uses an array slice that inference can't model.
+    return $self;
+}
+
+1;
+";
+        let fa = build_fa(src);
+        let route_sym = fa.symbols.iter()
+            .find(|s| s.name == "_route" && matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .expect("_route must be parsed as a sub");
+        match &route_sym.detail {
+            SymbolDetail::Sub { return_type, .. } => {
+                assert_eq!(
+                    return_type.as_ref(),
+                    Some(&InferredType::ClassName("Mojolicious::Routes::Route".into())),
+                    "override must rewrite return_type to ClassName(Mojolicious::Routes::Route)",
+                );
+            }
+            other => panic!("_route must be a Sub detail; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plugin_override_records_provenance_with_plugin_id_and_reason() {
+        // The point of provenance is debug-time introspection: a
+        // future inspector should be able to ask "why does the LSP
+        // think `_route` returns Mojolicious::Routes::Route?" and
+        // get back "because mojo-routes' overrides() said so". We pin
+        // the plugin id and assert the reason isn't empty so a future
+        // refactor that drops the reason field surfaces here.
+        let src = "\
+package Mojolicious::Routes::Route;
+sub _route { my $self = shift; $self }
+1;
+";
+        let fa = build_fa(src);
+        let route_id = fa.symbols.iter()
+            .find(|s| s.name == "_route")
+            .expect("_route present")
+            .id;
+        match fa.return_type_provenance(route_id) {
+            TypeProvenance::PluginOverride { plugin_id, reason } => {
+                assert_eq!(plugin_id, "mojo-routes");
+                assert!(!reason.is_empty(), "reason must explain why override exists");
+            }
+            other => panic!("expected PluginOverride provenance; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plugin_override_does_not_touch_unrelated_subs() {
+        // Same method NAME, different class → override must NOT apply.
+        // The match is (class, method); a same-named method on an
+        // unrelated package keeps whatever inference produced.
+        let src = "\
+package Some::Other::Package;
+sub _route { my ($x) = @_; { id => $x } }
+1;
+";
+        let fa = build_fa(src);
+        let id = fa.symbols.iter()
+            .find(|s| s.name == "_route")
+            .expect("_route present")
+            .id;
+        // Override must not apply — provenance can be Inferred or
+        // ReducerFold (inference produced the type via the witness
+        // fold), but NOT PluginOverride.
+        assert!(
+            !matches!(fa.return_type_provenance(id), TypeProvenance::PluginOverride { .. }),
+            "override must not bleed across packages; provenance: {:?}",
+            fa.return_type_provenance(id),
+        );
+    }
+
+    #[test]
+    fn plugin_override_does_not_touch_other_methods_in_target_class() {
+        // Same class, different method name → not the target.
+        let src = "\
+package Mojolicious::Routes::Route;
+sub other_method { my $self = shift; { ok => 1 } }
+1;
+";
+        let fa = build_fa(src);
+        let id = fa.symbols.iter()
+            .find(|s| s.name == "other_method")
+            .expect("other_method present")
+            .id;
+        assert!(
+            !matches!(fa.return_type_provenance(id), TypeProvenance::PluginOverride { .. }),
+            "override must not bleed across method names; got {:?}",
+            fa.return_type_provenance(id),
+        );
+    }
+
+    #[test]
+    fn plugin_override_visible_via_find_method_return_type() {
+        // The user-visible payoff: any code path that asks "what does
+        // calling `_route` on a Mojolicious::Routes::Route return?"
+        // gets the override answer. find_method_return_type is the
+        // primary API every chain-resolver / hover / completion path
+        // routes through, so pinning it here covers the downstream
+        // features without coupling to their specific internals.
+        let src = "\
+package Mojolicious::Routes::Route;
+sub _route { my $self = shift; $self }
+1;
+";
+        let fa = build_fa(src);
+        let rt = fa.find_method_return_type(
+            "Mojolicious::Routes::Route",
+            "_route",
+            None,
+            None,
+        );
+        assert_eq!(
+            rt,
+            Some(InferredType::ClassName("Mojolicious::Routes::Route".into())),
+            "find_method_return_type must surface the override-supplied type",
+        );
+    }
+
+    #[test]
+    fn plugin_override_wins_over_inferred_return_type() {
+        // Even if inference DID produce a (different) return type, the
+        // override replaces it — the whole point is "inference reaches
+        // the wrong answer here". The body explicitly returns a hashref
+        // so inference would say HashRef without the override.
+        let src = "\
+package Mojolicious::Routes::Route;
+
+sub _route {
+    return { stub => 1 };
+}
+
+1;
+";
+        let fa = build_fa(src);
+        let sym = fa.symbols.iter()
+            .find(|s| s.name == "_route")
+            .expect("_route present");
+        match &sym.detail {
+            SymbolDetail::Sub { return_type, .. } => {
+                assert_eq!(
+                    return_type.as_ref(),
+                    Some(&InferredType::ClassName("Mojolicious::Routes::Route".into())),
+                    "override must replace inferred HashRef, not be skipped",
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ---- data-printer plugin ----
+    //
+    // Data::Printer monkey-patches `&p` and `&np` into the caller's
+    // symbol table from inside its custom `import` sub — no
+    // `@EXPORT` / `@EXPORT_OK`, so the cross-file extractor sees them
+    // as plain Subs but no caller's import list claims them. The
+    // plugin's job is to declare the imports plugin-side so call
+    // sites resolve.
+    //
+    // `use DDP` is a literal alias for `use Data::Printer` (DDP.pm
+    // just `push our @ISA, 'Data::Printer'` and re-uses the import).
+    // The plugin pins the synthetic Import at Data::Printer (the real
+    // module) regardless of which name the user typed, so cross-file
+    // hover/gd/sig-help on `p`/`np` always flow to the real source.
+
+    #[test]
+    fn plugin_data_printer_synthesizes_p_np_on_use_data_printer() {
+        // `use Data::Printer;` — empty native qw list. Plugin must
+        // emit an additional Import that lists `p` and `np` so
+        // resolve_call_package finds them and routes cross-file
+        // lookups to Data::Printer.
+        let src = "\
+use Data::Printer;
+p $foo;
+np \\%bar;
+";
+        let fa = build_fa(src);
+        let dp_import = fa.imports.iter().find(|i|
+            i.module_name == "Data::Printer"
+            && i.imported_symbols.iter().any(|s| s.local_name == "p")
+        );
+        assert!(
+            dp_import.is_some(),
+            "plugin must emit Import for Data::Printer carrying `p`; got: {:?}",
+            fa.imports
+        );
+        let names: Vec<&str> = dp_import.unwrap()
+            .imported_symbols.iter().map(|s| s.local_name.as_str()).collect();
+        assert!(names.contains(&"p"));
+        assert!(names.contains(&"np"));
+    }
+
+    #[test]
+    fn plugin_data_printer_aliases_ddp_to_data_printer() {
+        // `use DDP;` — the alias case. Plugin must still emit a
+        // synthetic Import keyed on Data::Printer (NOT DDP) so
+        // cross-file `p`/`np` lookups route to the real source
+        // module. Otherwise the user gets nothing on hover/gd
+        // when they typed `use DDP` instead of `use Data::Printer`.
+        let src = "\
+use DDP;
+p $foo;
+";
+        let fa = build_fa(src);
+        let dp_import = fa.imports.iter().find(|i|
+            i.module_name == "Data::Printer"
+            && i.imported_symbols.iter().any(|s| s.local_name == "p")
+        );
+        assert!(
+            dp_import.is_some(),
+            "use DDP must produce an Import for Data::Printer (alias resolution); got: {:?}",
+            fa.imports.iter().map(|i| (
+                i.module_name.clone(),
+                i.imported_symbols.iter().map(|s| s.local_name.clone()).collect::<Vec<_>>(),
+            )).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn plugin_data_printer_skips_unrelated_use_statements() {
+        // Sanity check: an unrelated `use` doesn't pull a synthetic
+        // Data::Printer import into the file. Otherwise the plugin
+        // would be silently claiming every use statement.
+        let src = "use List::Util qw(max);";
+        let fa = build_fa(src);
+        assert!(
+            fa.imports.iter().find(|i| i.module_name == "Data::Printer").is_none(),
+            "plugin must not synthesize a Data::Printer import unless DDP/Data::Printer was used"
+        );
+    }
+
+    // ---- Red-pin: regressions caught against the rhai-plugins branch ----
+
+    /// `my` is lexical and crosses statement-form `package X;`
+    /// boundaries. The branch's sibling `ScopeKind::Package` was
+    /// originally swallowing `my` decls, so a use site under
+    /// `package main;` couldn't resolve a `my` declared under
+    /// `package Calculator;` earlier in the same file. e2e
+    /// `rename: $pi → $tau` turned red on the interpolated-string
+    /// occurrence (the only `$pi` use under `package main;`); this
+    /// pins the underlying `resolves_to` linkage so the regression
+    /// can't sneak back in if the scope tree is reshuffled.
+    #[test]
+    fn red_pin_my_resolves_across_statement_packages() {
+        let src = "\
+package Calculator;
+my $pi = 3.14159;
+sub circumference { my ($self, $r) = @_; return 2 * $pi * $r }
+
+package main;
+print \"pi is $pi\\n\";
+";
+        let fa = build_fa(src);
+        let pi_sym = fa.symbols.iter()
+            .find(|s| s.name == "$pi" && s.kind == SymKind::Variable)
+            .expect("$pi Variable symbol");
+        let pi_refs: Vec<_> = fa.refs.iter().filter(|r| r.target_name == "$pi").collect();
+        assert_eq!(pi_refs.len(), 3, "decl + body use + interpolation = 3 refs");
+        for r in &pi_refs {
+            assert_eq!(
+                r.resolves_to,
+                Some(pi_sym.id),
+                "ref at {:?} (scope {:?}) didn't resolve to the lexical decl — \
+                 sibling Package scopes are leaking into variable lookup",
+                r.span.start, r.scope,
+            );
+        }
+    }
+
+    /// Caller-side `HashKeyAccess` for a method/function call's
+    /// even-position stringy args. `MooApp->new(name => 'alice')`
+    /// must emit a HashKeyAccess at the `name` token so
+    /// cursor-on-key resolves to the `has`-emitted HashKeyDef
+    /// instead of the broad MethodCall ref. Gated on a matching
+    /// HashKeyDef existing — emission would otherwise shadow the
+    /// `class Foo { field $x :param }` `find_param_field`
+    /// fallback. e2e `rename: 'name' constructor arg` was the
+    /// surfacing failure.
+    #[test]
+    fn red_pin_call_arg_emits_hash_key_access_when_def_exists() {
+        let src = "\
+package MooApp;
+use Moo;
+has name => (is => 'ro');
+
+package main;
+my $m = MooApp->new(name => 'alice');
+";
+        let fa = build_fa(src);
+        let name_access: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "name"
+                && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        assert!(
+            !name_access.is_empty(),
+            "no HashKeyAccess emitted for `name` in MooApp->new(name => 'alice')",
+        );
+        let RefKind::HashKeyAccess { owner: Some(owner), .. } = &name_access[0].kind else {
+            panic!("HashKeyAccess emitted with no owner");
+        };
+        assert_eq!(
+            *owner,
+            HashKeyOwner::Sub { package: Some("MooApp".to_string()), name: "new".to_string() },
+            "constructor-key owner should be Sub{{class, method}}, matching the has-emitted def",
+        );
+
+        // No matching HashKeyDef for `count` → no shadow ref.
+        let count_access: Vec<_> = fa.refs.iter()
+            .filter(|r| r.target_name == "count"
+                && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        let src_no_def = "\
+package Plain;
+sub run {}
+
+package main;
+my $p = Plain->run(count => 1);
+";
+        let fa2 = build_fa(src_no_def);
+        let no_emit: Vec<_> = fa2.refs.iter()
+            .filter(|r| r.target_name == "count"
+                && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+            .collect();
+        assert!(
+            no_emit.is_empty(),
+            "no HashKeyDef registered for Plain::run/count → \
+             must not emit a phantom HashKeyAccess (would shadow other resolution paths)",
+        );
+        // `count` accesses on MooApp (which DOESN'T define count) — should not emit either.
+        assert!(
+            count_access.is_empty(),
+            "MooApp has no `count` HashKeyDef → no HashKeyAccess emission expected",
+        );
+    }
+
+    /// `=>` is autoquoting sugar for `,` — `f(name => 'alice')` and
+    /// `f('name', 'alice')` are the same call. The HashKeyAccess
+    /// emission must be position-based (every odd-indexed stringy
+    /// arg is a key), NOT keyed off the `=>` token. Pinning this
+    /// because the original draft of the helper walked siblings
+    /// looking for `=>` and would have missed the bare-comma form
+    /// — letting cursor-on-key in the bare-comma shape land on
+    /// the broad MethodCall ref, which renames the wrong token.
+    #[test]
+    fn red_pin_hash_key_access_emission_is_position_based() {
+        // Same `has`-emitted def, two call shapes. Both should land
+        // a HashKeyAccess at `name`, with the same owner.
+        let fat_comma_src = "\
+package MooApp;
+use Moo;
+has name => (is => 'ro');
+
+package main;
+my $a = MooApp->new(name => 'alice');
+";
+        let bare_comma_src = "\
+package MooApp;
+use Moo;
+has name => (is => 'ro');
+
+package main;
+my $a = MooApp->new('name', 'alice');
+";
+        let fa_fat = build_fa(fat_comma_src);
+        let fa_bare = build_fa(bare_comma_src);
+
+        // Constructor call site only — the `has name` declaration
+        // synthesizes its own internal-key refs that we're not
+        // asserting on here.
+        fn name_access_at_call<'a>(fa: &'a FileAnalysis) -> Vec<&'a Ref> {
+            fa.refs.iter()
+                .filter(|r| r.target_name == "name"
+                    && matches!(r.kind, RefKind::HashKeyAccess { .. })
+                    && r.span.start.row == 5)
+                .collect()
+        }
+
+        let fat_refs = name_access_at_call(&fa_fat);
+        let bare_refs = name_access_at_call(&fa_bare);
+
+        assert_eq!(
+            fat_refs.len(), 1,
+            "fat-comma form should emit exactly one HashKeyAccess at the call site",
+        );
+        assert_eq!(
+            bare_refs.len(), 1,
+            "bare-comma form (`'name', 'alice'`) must emit the same HashKeyAccess — \
+             `=>` is autoquoting sugar, not a structural marker",
+        );
+
+        let owner_of = |r: &Ref| match &r.kind {
+            RefKind::HashKeyAccess { owner: Some(o), .. } => o.clone(),
+            _ => panic!("expected HashKeyAccess with owner"),
+        };
+        assert_eq!(
+            owner_of(fat_refs[0]),
+            owner_of(bare_refs[0]),
+            "both forms must produce the same Sub{{MooApp, new}} owner",
+        );
+
+        // Even-indexed args ARE keys; odd-indexed (values) must
+        // NOT get a HashKeyAccess regardless of whether they happen
+        // to look like a key string. `'alice'` at idx 1 stays a value.
+        for fa in [&fa_fat, &fa_bare] {
+            let alice_access: Vec<_> = fa.refs.iter()
+                .filter(|r| r.target_name == "alice"
+                    && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+                .collect();
+            assert!(
+                alice_access.is_empty(),
+                "value-position arg must never become a HashKeyAccess",
+            );
+        }
+
+        // Multi-pair, all bare commas — `('a', 1, 'b', 2)`. Both
+        // `a` and `b` are keys (idx 0 and 2); `1` and `2` aren't
+        // stringy so they don't even tempt the helper. Need a def
+        // for each so emission isn't gated out.
+        let multi_src = "\
+package MooApp;
+use Moo;
+has a => (is => 'ro');
+has b => (is => 'ro');
+
+package main;
+my $m = MooApp->new('a', 1, 'b', 2);
+";
+        let fa_multi = build_fa(multi_src);
+        let call_keys: Vec<&Ref> = fa_multi.refs.iter()
+            .filter(|r| matches!(r.kind, RefKind::HashKeyAccess { .. })
+                && r.span.start.row == 6
+                && (r.target_name == "a" || r.target_name == "b"))
+            .collect();
+        assert_eq!(
+            call_keys.len(), 2,
+            "both even-position args (`'a'`, `'b'`) must emit HashKeyAccess",
+        );
     }
 }

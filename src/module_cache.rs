@@ -19,7 +19,7 @@ const SCHEMA_VERSION: &str = "9";
 /// Bumped when the builder's analysis output changes shape in a way that
 /// invalidates cached blobs. Unlike `SCHEMA_VERSION`, this does not drop
 /// the table — stale entries are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 1;
+pub const EXTRACT_VERSION: i64 = 11;
 
 /// zstd compression level for the `analysis` blob. Lower numbers are faster;
 /// 3 is zstd's default and gives a solid space/speed tradeoff.
@@ -172,6 +172,40 @@ pub fn validate_inc_paths(conn: &Connection, inc_paths: &[PathBuf]) -> rusqlite:
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('inc_hash', ?1)",
             params![current_hash],
+        )?;
+    }
+    Ok(())
+}
+
+/// Drop the module cache when the plugin set has changed since the last
+/// run. `fingerprint` is the value returned by
+/// `plugin::rhai_host::plugin_fingerprint()` — a hash over bundled
+/// plugin sources plus every `.rhai` in `$PERL_LSP_PLUGIN_DIR`.
+///
+/// Without this check, a plugin author who edits a `.rhai`, restarts
+/// the LSP, and inspects a cross-file query will see the *old*
+/// plugin's emissions in the cached `FileAnalysis` blobs — making
+/// plugin QA impossible. Mirrors `validate_inc_paths`: same meta-row
+/// pattern, same hard-clear on mismatch.
+pub fn validate_plugin_fingerprint(conn: &Connection, fingerprint: &str) -> rusqlite::Result<()> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'plugin_fingerprint'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if stored.as_deref() != Some(fingerprint) {
+        log::info!(
+            "Plugin set changed (was {:?}, now {}), clearing module cache",
+            stored,
+            fingerprint
+        );
+        conn.execute("DELETE FROM modules", [])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('plugin_fingerprint', ?1)",
+            params![fingerprint],
         )?;
     }
     Ok(())
@@ -347,6 +381,62 @@ mod tests {
         let _ = std::fs::remove_file(&pm);
     }
 
+    /// Pin-the-fix: `plugin_namespaces` survives the bincode +
+    /// zstd + SQLite round trip with entities, bridges, and
+    /// plugin_id intact. Without this test, schema drift on the
+    /// PluginNamespace struct would silently truncate cached
+    /// modules and we'd notice only when cross-file bridge lookups
+    /// mysteriously missed entries.
+    #[test]
+    fn test_db_plugin_namespaces_roundtrip() {
+        let conn = test_db();
+        let dir = std::env::temp_dir();
+        let pm = dir.join("TestMojoApp_namespaces.pm");
+        // A Mojolicious::Lite script — mojo-lite + mojo-routes +
+        // mojo-helpers should all emit namespaces that round-trip.
+        std::fs::write(&pm,
+            "package TestMojoApp;\n\
+             use Mojolicious::Lite;\n\
+             app->helper(current_user => sub { my ($c) = @_; });\n\
+             get '/users' => sub { my $c = shift; };\n\
+             1;\n"
+        ).unwrap();
+
+        let source = std::fs::read_to_string(&pm).unwrap();
+        let cached = Some(parse_source_to_cached(&source, &pm));
+        let original_ns_count = cached.as_ref().unwrap()
+            .analysis.plugin_namespaces.len();
+        assert!(original_ns_count > 0,
+            "sanity: fixture must produce at least one PluginNamespace");
+
+        save_to_db(&conn, "TestMojoApp", &cached, "import");
+
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
+        let (n, stale) = warm_cache(&conn, &cache);
+        assert_eq!(n, 1);
+        assert!(stale.is_empty(), "fresh insert should not be stale");
+
+        let loaded = cache.get("TestMojoApp").unwrap();
+        let loaded = loaded.as_ref().unwrap();
+        let loaded_ns = &loaded.analysis.plugin_namespaces;
+        assert_eq!(loaded_ns.len(), original_ns_count,
+            "PluginNamespace count must round-trip; got: {:?}", loaded_ns);
+
+        // Every namespace must preserve its plugin_id, kind, and at
+        // least one Bridge::Class — the three fields that `bridges_index`
+        // and `for_each_entity_bridged_to` depend on.
+        for ns in loaded_ns {
+            assert!(!ns.plugin_id.is_empty(), "plugin_id preserved");
+            assert!(!ns.kind.is_empty(), "kind preserved");
+            assert!(!ns.bridges.is_empty(), "bridges preserved");
+            assert!(ns.bridges.iter().any(|b|
+                matches!(b, crate::file_analysis::Bridge::Class(_))),
+                "at least one Class bridge survives");
+        }
+
+        let _ = std::fs::remove_file(&pm);
+    }
+
     #[test]
     fn test_db_negative_result_roundtrip() {
         let conn = test_db();
@@ -381,6 +471,34 @@ mod tests {
         assert!(!cache.contains_key("StaleModule"));
 
         let _ = std::fs::remove_file(&pm);
+    }
+
+    #[test]
+    fn test_db_plugin_fingerprint_invalidation() {
+        let conn = test_db();
+
+        // First run: claims plugin set fingerprint "hash-A".
+        validate_plugin_fingerprint(&conn, "hash-A").unwrap();
+        save_to_db(&conn, "Foo", &None, "import");
+
+        // Same fingerprint → cache survives.
+        validate_plugin_fingerprint(&conn, "hash-A").unwrap();
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
+        let (n, _) = warm_cache(&conn, &cache);
+        assert_eq!(n, 1, "cache should survive identical fingerprint");
+
+        // Plugin set changed → cache cleared.
+        validate_plugin_fingerprint(&conn, "hash-B").unwrap();
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
+        let (n, _) = warm_cache(&conn, &cache);
+        assert_eq!(n, 0, "cache should be empty after plugin set change");
+
+        // Stamp persists — second run with hash-B doesn't re-clear.
+        save_to_db(&conn, "Bar", &None, "import");
+        validate_plugin_fingerprint(&conn, "hash-B").unwrap();
+        let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
+        let (n, _) = warm_cache(&conn, &cache);
+        assert_eq!(n, 1, "stamp should persist between same-fingerprint runs");
     }
 
     #[test]

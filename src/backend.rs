@@ -123,7 +123,15 @@ fn refs_to_locations(results: Vec<crate::resolve::RefLocation>) -> Option<Vec<Lo
     Some(locations)
 }
 
-fn build_imported_return_types(
+#[cfg(test)]
+pub fn build_imported_return_types_for_test(
+    analysis: &crate::file_analysis::FileAnalysis,
+    module_index: &ModuleIndex,
+) -> (HashMap<String, InferredType>, HashMap<String, Vec<String>>) {
+    build_imported_return_types(analysis, module_index)
+}
+
+pub(crate) fn build_imported_return_types(
     analysis: &crate::file_analysis::FileAnalysis,
     module_index: &ModuleIndex,
 ) -> (HashMap<String, InferredType>, HashMap<String, Vec<String>>) {
@@ -275,6 +283,7 @@ impl LanguageServer for Backend {
         // Spawn workspace indexing in background with progress reporting
         let files = Arc::clone(&self.files);
         let client = self.client.clone();
+        let module_index = Arc::clone(&self.module_index);
         let root = self.module_index.workspace_root();
         tokio::task::spawn_blocking(move || {
             if let Some(root_uri) = root {
@@ -301,7 +310,11 @@ impl LanguageServer for Backend {
                         },
                     ));
 
-                    let count = crate::module_resolver::index_workspace(&root_path, &files);
+                    let count = crate::module_resolver::index_workspace_with_index(
+                        &root_path,
+                        &files,
+                        Some(&module_index),
+                    );
 
                     // End progress
                     rt.block_on(client.send_notification::<notification::Progress>(
@@ -426,13 +439,13 @@ impl LanguageServer for Backend {
 
         let point = symbols::position_to_point(pos);
         let target = match doc.analysis.rename_kind_at(point) {
-            Some(RenameKind::Function(name)) => TargetRef {
+            Some(RenameKind::Function { name, package }) => TargetRef {
                 name,
-                kind: TargetKind::Sub,
+                kind: TargetKind::Sub { package },
             },
-            Some(RenameKind::Method(name)) => TargetRef {
+            Some(RenameKind::Method { name, class }) => TargetRef {
                 name,
-                kind: TargetKind::Method,
+                kind: TargetKind::Method { class },
             },
             Some(RenameKind::Package(name)) => TargetRef {
                 name,
@@ -508,6 +521,10 @@ impl LanguageServer for Backend {
                 );
                 return Ok(if refs.is_empty() { None } else { Some(refs) });
             }
+            Some(RenameKind::Handler { owner, name }) => TargetRef {
+                name: name.clone(),
+                kind: TargetKind::Handler { owner, name },
+            },
         };
 
         // Cross-file walk: workspace + open + deps.
@@ -562,25 +579,56 @@ impl LanguageServer for Backend {
                 // Single-file only — lexical scope doesn't cross files
                 Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
             }
-            Some(crate::file_analysis::RenameKind::Function(ref name))
-            | Some(crate::file_analysis::RenameKind::Method(ref name))
-            | Some(crate::file_analysis::RenameKind::Package(ref name))
-            | Some(crate::file_analysis::RenameKind::HashKey(ref name)) => {
-                let rename_fn: fn(&FileAnalysis, &str, &str) -> Vec<(crate::file_analysis::Span, String)> = match &rename_kind {
-                    Some(crate::file_analysis::RenameKind::Function(_)) => FileAnalysis::rename_sub,
-                    Some(crate::file_analysis::RenameKind::Package(_)) => FileAnalysis::rename_package,
-                    Some(crate::file_analysis::RenameKind::Method(_)) => FileAnalysis::rename_sub,
-                    Some(crate::file_analysis::RenameKind::HashKey(_)) => {
-                        // Hash keys: single-file for now
-                        return Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)));
+            Some(crate::file_analysis::RenameKind::Handler { .. }) => {
+                // Cross-file handler rename not yet wired — fall back to
+                // single-file for the moment. This will edit the Handler
+                // symbol + every DispatchCall ref in the current file.
+                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
+            }
+            Some(crate::file_analysis::RenameKind::HashKey(_)) => {
+                // Hash keys: single-file for now
+                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
+            }
+            Some(crate::file_analysis::RenameKind::Function { .. })
+            | Some(crate::file_analysis::RenameKind::Method { .. })
+            | Some(crate::file_analysis::RenameKind::Package(_)) => {
+                // Unpack per-kind name + build a per-kind rename closure.
+                let (name, rename_fn): (String, Box<dyn Fn(&FileAnalysis, &str, &str) -> Vec<(crate::file_analysis::Span, String)>>) = match rename_kind.as_ref().unwrap() {
+                    crate::file_analysis::RenameKind::Function { name, package } => {
+                        let p = package.clone();
+                        (name.clone(), Box::new(move |fa, old, new| fa.rename_sub_in_package(old, &p, new)))
                     }
+                    crate::file_analysis::RenameKind::Method { name, class } => {
+                        // Walk MyWorker → ... → BaseWorker (the actual
+                        // defining class). Each link is needed: the
+                        // call-site invocant_class on `$worker->process`
+                        // is "MyWorker" (the static type), while the
+                        // `sub process` definition lives in BaseWorker.
+                        // `rename_method_in_class` matches strict
+                        // `invocant_class == scope`, so without the
+                        // chain we'd pick up only one of the two ends.
+                        let chain = doc.analysis.method_rename_chain(
+                            class,
+                            name,
+                            Some(&self.module_index),
+                        );
+                        (name.clone(), Box::new(move |fa, old, new| {
+                            let mut all = Vec::new();
+                            for c in &chain {
+                                all.extend(fa.rename_method_in_class(old, c, new));
+                            }
+                            all
+                        }))
+                    }
+                    crate::file_analysis::RenameKind::Package(n) =>
+                        (n.clone(), Box::new(FileAnalysis::rename_package)),
                     _ => unreachable!(),
                 };
 
                 let mut all_changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
 
                 let mut collect = |uri: Url, analysis: &FileAnalysis| {
-                    let edits = rename_fn(analysis, name, new_name);
+                    let edits = rename_fn(analysis, &name, new_name);
                     if !edits.is_empty() {
                         all_changes.entry(uri).or_default().extend(
                             edits.into_iter().map(|(span, text)| TextEdit {
@@ -889,6 +937,15 @@ impl LanguageServer for Backend {
                     if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
                         results.push(info);
                     }
+                }
+            }
+            // Plugin namespaces — match on both id and kind so users
+            // can find "the minion tasks in this workspace" via either
+            // "minion" or "tasks".
+            for ns in &analysis.plugin_namespaces {
+                let hay = format!("{} {}", ns.id.to_lowercase(), ns.kind.to_lowercase());
+                if hay.contains(&query) {
+                    results.push(symbols::plugin_namespace_to_workspace_info(ns, uri.clone()));
                 }
             }
         });

@@ -8,10 +8,12 @@ mod file_store;
 mod module_cache;
 mod module_index;
 mod module_resolver;
+mod plugin;
 mod pod;
 mod query_cache;
 mod resolve;
 mod symbols;
+mod witnesses;
 
 use backend::Backend;
 use tower_lsp::{LspService, Server};
@@ -64,6 +66,22 @@ async fn main() {
             cli_workspace_symbol(&args[2], &args[3]);
             return;
         }
+        Some("--plugin-check") => {
+            plugin::cli::cli_plugin_check(&args[2..]);
+            return;
+        }
+        Some("--plugin-run") => {
+            plugin::cli::cli_plugin_run(&args[2..]);
+            return;
+        }
+        Some("--plugin-test") => {
+            plugin::cli::cli_plugin_test(&args[2..]);
+            return;
+        }
+        Some("--dump-package") if args.len() >= 4 => {
+            cli_dump_package(&args[2], &args[3]);
+            return;
+        }
         _ => {}
     }
 
@@ -95,6 +113,15 @@ fn print_usage() {
     eprintln!("REFACTORING:");
     eprintln!("  perl-lsp --rename <root> <file> <line> <col> <new>     Cross-file rename");
     eprintln!("  perl-lsp --workspace-symbol <root> <query>             Search symbols");
+    eprintln!();
+    eprintln!("PLUGIN AUTHORING:");
+    eprintln!("  perl-lsp --plugin-check <file.rhai>                    Lint a Rhai plugin");
+    eprintln!("  perl-lsp --plugin-run <file.rhai> --on <fixture.pl>    Run plugin on one Perl file");
+    eprintln!("  perl-lsp --plugin-test <plugin-dir> [--update]         Snapshot-test a plugin dir");
+    eprintln!();
+    eprintln!("DEBUG:");
+    eprintln!("  perl-lsp --dump-package <root> <package>               Dump every sub in <package>");
+    eprintln!("                                                         with derived type info");
     eprintln!();
     eprintln!("  perl-lsp --version                                     Print version");
 }
@@ -136,6 +163,71 @@ fn index_workspace(root: &str) -> file_store::FileStore {
     store
 }
 
+/// Full CLI workspace setup: index the workspace, open the SQLite cache,
+/// warm cached modules, resolve missing imports + ancestors via @INC,
+/// save fresh entries back to disk. Mirrors the LSP server's startup
+/// minus the resolver thread (one-shot, synchronous). Used by every
+/// CLI command that needs cross-file resolution to behave like the
+/// running server.
+fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleIndex) {
+    let ws = index_workspace(root);
+
+    let module_index = module_index::ModuleIndex::new_for_cli();
+    let root_path = std::path::Path::new(root).canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(root));
+    let root_uri = format!("file://{}", root_path.display());
+
+    let mut inc_paths = module_resolver::discover_inc_paths();
+    module_resolver::add_project_lib_paths(&mut inc_paths, &root_path);
+
+    let db = module_cache::open_cache_db(Some(&root_uri));
+    let mut stale_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(ref conn) = db {
+        let _ = module_cache::validate_inc_paths(conn, &inc_paths);
+        let _ = module_cache::validate_plugin_fingerprint(
+            conn,
+            &plugin::rhai_host::plugin_fingerprint(),
+        );
+        let (warmed, stale) = module_cache::warm_cache(conn, &module_index.cache_raw());
+        if warmed > 0 {
+            eprintln!("Cache: {} modules loaded from disk", warmed);
+        }
+        stale_set = stale.into_iter().collect();
+    }
+
+    let mut needed = std::collections::HashSet::new();
+    for entry in ws.workspace_raw().iter() {
+        for imp in &entry.value().imports {
+            needed.insert(imp.module_name.clone());
+        }
+        for parents in entry.value().package_parents.values() {
+            for p in parents {
+                needed.insert(p.clone());
+            }
+        }
+    }
+
+    let mut parser = module_resolver::create_parser();
+    let mut resolved = 0usize;
+    let mut already_cached = 0usize;
+    for name in &needed {
+        if module_index.cache_raw().contains_key(name.as_str()) && !stale_set.contains(name) {
+            already_cached += 1;
+            continue;
+        }
+        if let Some(cached) = module_resolver::resolve_and_parse(&inc_paths, name, &mut parser) {
+            if let Some(ref conn) = db {
+                module_cache::save_to_db(conn, name, &Some(std::sync::Arc::clone(&cached)), "cli");
+            }
+            module_index.insert_cache(name, Some(cached));
+            resolved += 1;
+        }
+    }
+    eprintln!("Modules: {} cached, {} resolved, {} total", already_cached, resolved, needed.len());
+
+    (ws, module_index)
+}
+
 fn is_json_format(args: &[String]) -> bool {
     args.windows(2).any(|w| w[0] == "--format" && w[1] == "json")
 }
@@ -174,63 +266,7 @@ fn cli_check(args: &[String]) {
     let min_severity = get_arg_value(args, "--severity").unwrap_or("warning");
     let min_rank = severity_rank(min_severity);
 
-    let ws = index_workspace(root);
-
-    // Resolve imported modules so diagnostics can suppress known imports.
-    // Uses SQLite cache (same as the LSP resolver thread) for fast repeat runs.
-    let module_index = module_index::ModuleIndex::new_for_cli();
-    {
-        let root_path = std::path::Path::new(root).canonicalize()
-            .unwrap_or_else(|_| std::path::PathBuf::from(root));
-        let root_uri = format!("file://{}", root_path.display());
-
-        let mut inc_paths = module_resolver::discover_inc_paths();
-        module_resolver::add_project_lib_paths(&mut inc_paths, &root_path);
-
-        // Open (or create) the per-project SQLite cache
-        let db = module_cache::open_cache_db(Some(&root_uri));
-        let mut stale_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if let Some(ref conn) = db {
-            let _ = module_cache::validate_inc_paths(conn, &inc_paths);
-            let (warmed, stale) = module_cache::warm_cache(conn, &module_index.cache_raw());
-            if warmed > 0 {
-                eprintln!("Cache: {} modules loaded from disk", warmed);
-            }
-            stale_set = stale.into_iter().collect();
-        }
-
-        // Collect all unique module names needed
-        let mut needed = std::collections::HashSet::new();
-        for entry in ws.workspace_raw().iter() {
-            for imp in &entry.value().imports {
-                needed.insert(imp.module_name.clone());
-            }
-            for parents in entry.value().package_parents.values() {
-                for p in parents {
-                    needed.insert(p.clone());
-                }
-            }
-        }
-
-        // Resolve modules not already in cache (or stale from version bump)
-        let mut parser = module_resolver::create_parser();
-        let mut resolved = 0usize;
-        let mut already_cached = 0usize;
-        for name in &needed {
-            if module_index.cache_raw().contains_key(name.as_str()) && !stale_set.contains(name) {
-                already_cached += 1;
-                continue;
-            }
-            if let Some(cached) = module_resolver::resolve_and_parse(&inc_paths, name, &mut parser) {
-                if let Some(ref conn) = db {
-                    module_cache::save_to_db(conn, name, &Some(std::sync::Arc::clone(&cached)), "cli-check");
-                }
-                module_index.insert_cache(name, Some(cached));
-                resolved += 1;
-            }
-        }
-        eprintln!("Modules: {} cached, {} resolved, {} total", already_cached, resolved, needed.len());
-    }
+    let (ws, module_index) = cli_full_startup(root);
 
     let mut all_diagnostics = Vec::new();
 
@@ -290,13 +326,23 @@ fn cli_outline(file: &str) {
     let (_source, _tree, analysis) = parse_file(file);
 
     let mut results = Vec::new();
+    let mut outline_seen: std::collections::HashSet<(String, String, usize, usize)> =
+        std::collections::HashSet::new();
     for sym in &analysis.symbols {
         match sym.kind {
             file_analysis::SymKind::Sub | file_analysis::SymKind::Method
             | file_analysis::SymKind::Package | file_analysis::SymKind::Class
-            | file_analysis::SymKind::Variable => {}
+            | file_analysis::SymKind::Variable | file_analysis::SymKind::Handler => {}
             _ => continue,
         }
+        // Honor plugin-opted-out symbols: DSL imports, framework
+        // infrastructure, anything the plugin flagged as non-outline.
+        let hidden = match &sym.detail {
+            file_analysis::SymbolDetail::Sub { hide_in_outline, .. } => *hide_in_outline,
+            file_analysis::SymbolDetail::Handler { hide_in_outline, .. } => *hide_in_outline,
+            _ => false,
+        };
+        if hidden { continue; }
         let mut entry = serde_json::json!({
             "name": sym.name,
             "kind": format!("{:?}", sym.kind),
@@ -306,9 +352,12 @@ fn cli_outline(file: &str) {
         if let Some(ref pkg) = sym.package {
             entry["package"] = serde_json::json!(pkg);
         }
-        if let file_analysis::SymbolDetail::Sub { ref params, ref return_type, is_method, .. } = sym.detail {
-            if !params.is_empty() {
-                let param_names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        if let file_analysis::SymbolDetail::Sub { ref params, ref return_type, is_method, ref display, .. } = sym.detail {
+            if params.iter().any(|p| !p.is_invocant) {
+                let param_names: Vec<&str> = params.iter()
+                    .filter(|p| !p.is_invocant)
+                    .map(|p| p.name.as_str())
+                    .collect();
                 entry["params"] = serde_json::json!(param_names);
             }
             if let Some(ref rt) = return_type {
@@ -316,6 +365,37 @@ fn cli_outline(file: &str) {
             }
             if is_method {
                 entry["is_method"] = serde_json::json!(true);
+            }
+            if let Some(d) = display {
+                entry["display"] = serde_json::json!(format!("{:?}", d));
+            }
+        }
+        if let file_analysis::SymbolDetail::Handler { ref params, ref dispatchers, ref display, .. } = sym.detail {
+            let param_names: Vec<&str> = params.iter()
+                .filter(|p| !p.is_invocant)
+                .map(|p| p.name.as_str())
+                .collect();
+            entry["params"] = serde_json::json!(param_names);
+            entry["dispatchers"] = serde_json::json!(dispatchers);
+            entry["display"] = serde_json::json!(format!("{:?}", display));
+        }
+
+        // Fan-out dedup: framework plugins may register the same Symbol
+        // on multiple classes (Mojo helpers on Controller AND the app
+        // class) for resolution; the outline should only show it once.
+        use file_analysis::Namespace;
+        let is_framework = matches!(sym.namespace, Namespace::Framework { .. });
+        let is_dupeable = is_framework && matches!(sym.kind,
+            file_analysis::SymKind::Sub | file_analysis::SymKind::Method);
+        if is_dupeable {
+            let key = (
+                format!("{:?}", sym.kind),
+                sym.name.clone(),
+                sym.span.start.row,
+                sym.span.start.column,
+            );
+            if !outline_seen.insert(key) {
+                continue;
             }
         }
         results.push(entry);
@@ -343,17 +423,18 @@ fn cli_type_at(file: &str, line_str: &str, col_str: &str) {
     let (_source, _tree, analysis) = parse_file(file);
     let point = parse_point(line_str, col_str);
 
-    // Check refs for inferred type
+    // Check refs for inferred type — route through the witness bag
+    // so framework / branch / arity rules refine the answer.
     if let Some(r) = analysis.ref_at(point) {
-        if let Some(ty) = analysis.inferred_type(&r.target_name, point) {
-            println!("{}", file_analysis::format_inferred_type(ty));
+        if let Some(ty) = analysis.inferred_type_via_bag(&r.target_name, point) {
+            println!("{}", file_analysis::format_inferred_type(&ty));
             return;
         }
     }
     // Check symbols
     if let Some(sym) = analysis.symbol_at(point) {
-        if let Some(ty) = analysis.inferred_type(&sym.name, point) {
-            println!("{}", file_analysis::format_inferred_type(ty));
+        if let Some(ty) = analysis.inferred_type_via_bag(&sym.name, point) {
+            println!("{}", file_analysis::format_inferred_type(&ty));
             return;
         }
     }
@@ -366,48 +447,46 @@ fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
     let (source, tree, analysis) = parse_file(file);
     let point = parse_point(line_str, col_str);
 
-    if let Some(span) = analysis.find_definition(point, Some(&tree), Some(source.as_bytes()), None) {
-        println!("{}:{}:{}", file, span.start.row + 1, span.start.column + 1);
-        return;
-    }
+    // Build a real ModuleIndex and register workspace modules the same
+    // way the backend does, so CLI gd goes through the production
+    // cross-file resolution path (Handler/MethodCallRef/DispatchCall/
+    // inheritance walk via class_content_index) instead of the CLI's
+    // old ad-hoc workspace scan. Keeps nvim and CLI results in sync.
+    let idx = module_index::ModuleIndex::new_for_cli();
+    let files = file_store::FileStore::new();
+    let root_path = std::path::PathBuf::from(root);
+    module_resolver::index_workspace_with_index(&root_path, &files, Some(&idx));
 
-    // Cross-file: check if it's a method/package ref that resolves via workspace
-    let ws = index_workspace(root);
+    let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+    let uri = tower_lsp::lsp_types::Url::from_file_path(&abs)
+        .unwrap_or_else(|_| tower_lsp::lsp_types::Url::parse("file:///unknown").unwrap());
+    let pos = tower_lsp::lsp_types::Position {
+        line: point.row as u32,
+        character: point.column as u32,
+    };
 
-    if let Some(r) = analysis.ref_at(point) {
-        match &r.kind {
-            file_analysis::RefKind::FunctionCall | file_analysis::RefKind::MethodCall { .. } => {
-                for entry in ws.workspace_raw().iter() {
-                    for sym in &entry.value().symbols {
-                        if sym.name == r.target_name
-                            && matches!(sym.kind, file_analysis::SymKind::Sub | file_analysis::SymKind::Method)
-                        {
-                            println!("{}:{}:{}", entry.key().display(),
-                                sym.selection_span.start.row + 1,
-                                sym.selection_span.start.column + 1);
-                            return;
-                        }
-                    }
-                }
-            }
-            file_analysis::RefKind::PackageRef => {
-                for entry in ws.workspace_raw().iter() {
-                    for sym in &entry.value().symbols {
-                        if sym.name == r.target_name
-                            && matches!(sym.kind, file_analysis::SymKind::Package | file_analysis::SymKind::Class)
-                        {
-                            println!("{}:{}:{}", entry.key().display(),
-                                sym.selection_span.start.row + 1,
-                                sym.selection_span.start.column + 1);
-                            return;
-                        }
-                    }
-                }
-            }
-            _ => {}
+    if let Some(resp) = symbols::find_definition(&analysis, pos, &uri, &idx, &tree, &source) {
+        use tower_lsp::lsp_types::GotoDefinitionResponse;
+        let first = match resp {
+            GotoDefinitionResponse::Scalar(loc) => Some(loc),
+            GotoDefinitionResponse::Array(v) => v.into_iter().next(),
+            GotoDefinitionResponse::Link(v) => v.into_iter().next().map(|l| tower_lsp::lsp_types::Location {
+                uri: l.target_uri,
+                range: l.target_range,
+            }),
+        };
+        if let Some(loc) = first {
+            let path = loc.uri.to_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| loc.uri.to_string());
+            println!("{}:{}:{}", path,
+                loc.range.start.line + 1,
+                loc.range.start.character + 1);
+            return;
         }
     }
 
+    let _ = files; // suppress unused-variable warnings
     eprintln!("No definition found at {}:{}", line_str, col_str);
     std::process::exit(1);
 }
@@ -435,19 +514,44 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
     if let Some(r) = analysis.ref_at(point) {
         let target = &r.target_name;
         let is_sub = matches!(r.kind,
-            file_analysis::RefKind::FunctionCall | file_analysis::RefKind::MethodCall { .. }
+            file_analysis::RefKind::FunctionCall { .. } | file_analysis::RefKind::MethodCall { .. }
         ) || analysis.symbol_at(point).map(|s| matches!(s.kind,
             file_analysis::SymKind::Sub | file_analysis::SymKind::Method
         )).unwrap_or(false);
 
         if is_sub || matches!(r.kind, file_analysis::RefKind::PackageRef) {
             let ws = index_workspace(root);
+            // Derive the scope (package for Sub, class for Method) so
+            // cross-file walks don't union unrelated packages that
+            // share a symbol name.
+            let scope_from_ref = match &r.kind {
+                file_analysis::RefKind::FunctionCall { resolved_package } =>
+                    Some(("sub", resolved_package.clone())),
+                file_analysis::RefKind::MethodCall { invocant_class, .. } =>
+                    invocant_class.as_ref().map(|c| ("method", Some(c.clone()))),
+                _ => None,
+            };
+            let scope_from_sym = analysis.symbol_at(point).and_then(|s| match s.kind {
+                file_analysis::SymKind::Sub => Some(("sub", s.package.clone())),
+                file_analysis::SymKind::Method => Some(("method", s.package.clone())),
+                _ => None,
+            });
+            let scope = scope_from_ref.or(scope_from_sym);
+
             for entry in ws.workspace_raw().iter() {
                 if *entry.key() == file_path { continue; }
-                let edits = if is_sub {
-                    entry.value().rename_sub(target, target)
-                } else {
+                let edits = if matches!(r.kind, file_analysis::RefKind::PackageRef) {
                     entry.value().rename_package(target, target)
+                } else {
+                    match &scope {
+                        Some(("sub", package)) =>
+                            entry.value().rename_sub_in_package(target, package, target),
+                        Some(("method", Some(class))) =>
+                            entry.value().rename_method_in_class(target, class, target),
+                        // Unresolvable method scope — skip rather than
+                        // cross-link. Matches refs_to / rename semantics.
+                        _ => Vec::new(),
+                    }
                 };
                 for (span, _) in edits {
                     results.push(serde_json::json!({
@@ -493,7 +597,9 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
     let mut all_edits: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
     match &rename_kind {
-        file_analysis::RenameKind::Variable | file_analysis::RenameKind::HashKey(_) => {
+        file_analysis::RenameKind::Variable
+        | file_analysis::RenameKind::HashKey(_)
+        | file_analysis::RenameKind::Handler { .. } => {
             let source = std::fs::read_to_string(&file_path).expect("cannot read file");
             let mut parser = module_resolver::create_parser();
             let tree = parser.parse(&source, None).expect("parse failed");
@@ -504,13 +610,15 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
                 all_edits.insert(file_path.display().to_string(), json_edits);
             }
         }
-        file_analysis::RenameKind::Function(_) | file_analysis::RenameKind::Method(_) => {
-            let name = match &rename_kind {
-                file_analysis::RenameKind::Function(n) | file_analysis::RenameKind::Method(n) => n.clone(),
-                _ => unreachable!(),
-            };
+        file_analysis::RenameKind::Function { .. } | file_analysis::RenameKind::Method { .. } => {
             for entry in ws.workspace_raw().iter() {
-                let edits = entry.value().rename_sub(&name, new_name);
+                let edits = match &rename_kind {
+                    file_analysis::RenameKind::Function { name, package } =>
+                        entry.value().rename_sub_in_package(name, package, new_name),
+                    file_analysis::RenameKind::Method { name, class } =>
+                        entry.value().rename_method_in_class(name, class, new_name),
+                    _ => unreachable!(),
+                };
                 if !edits.is_empty() {
                     let json_edits: Vec<_> = edits.into_iter()
                         .map(|(span, text)| span_to_json(span, text))
@@ -540,6 +648,260 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
     drop(analysis_ref);
 
     println!("{}", serde_json::to_string_pretty(&serde_json::json!(all_edits)).unwrap());
+}
+
+/// --dump-package <root> <package> — Dump every sub in a package with
+/// derived type info. Debugging aid for the witness/reducer pipeline:
+/// prints the raw `return_type` baked into the Symbol, the witness-bag
+/// projection at the default and a few common arities, the structural
+/// tail (`return_self_method`), every param's inferred type at a point
+/// just past the sub's signature, and a witness count so you can see at
+/// a glance whether the bag has anything to say.
+fn cli_dump_package(root: &str, package_name: &str) {
+    use std::sync::Arc;
+    use file_analysis::{FileAnalysis, SymKind, SymbolDetail};
+
+    let (ws, module_index) = cli_full_startup(root);
+
+    // Find a FileAnalysis whose package matches. Workspace first; fall
+    // back to cached @INC modules. No bespoke discovery — only what
+    // the normal startup populated.
+    let mut found: Option<(String, Arc<FileAnalysis>)> = None;
+    for entry in ws.workspace_raw().iter() {
+        let analysis = entry.value();
+        let has_package = analysis.symbols.iter().any(|s| {
+            matches!(s.kind, SymKind::Package | SymKind::Class)
+                && s.name == package_name
+        });
+        if has_package {
+            found = Some((entry.key().display().to_string(), Arc::clone(analysis)));
+            break;
+        }
+    }
+    if found.is_none() {
+        if let Some(cached) = module_index.get_cached(package_name) {
+            found = Some((cached.path.display().to_string(), Arc::clone(&cached.analysis)));
+        }
+    }
+
+    let Some((path, analysis_ro)) = found else {
+        eprintln!("Package '{}' not found in workspace or module cache.", package_name);
+        eprintln!("(Run the LSP against this workspace once to populate cached @INC modules.)");
+        std::process::exit(1);
+    };
+
+    // Deep-copy via bincode (FileAnalysis isn't Clone) and enrich the
+    // private copy with imported types so cross-file return inferences
+    // are visible — same pass the LSP runs in publish_diagnostics.
+    let bin = bincode::serialize(&*analysis_ro).expect("bincode FileAnalysis");
+    let mut analysis: FileAnalysis = bincode::deserialize(&bin).expect("bincode FileAnalysis roundtrip");
+    let (imported_returns, imported_keys) =
+        backend::build_imported_return_types(&analysis, &module_index);
+    analysis.enrich_imported_types_with_keys(
+        imported_returns,
+        imported_keys,
+        Some(&module_index),
+    );
+
+    // Collect subs/methods declared inside this package.
+    let mut subs: Vec<&file_analysis::Symbol> = analysis
+        .symbols
+        .iter()
+        .filter(|s| {
+            matches!(s.kind, SymKind::Sub | SymKind::Method)
+                && s.package.as_deref() == Some(package_name)
+        })
+        .collect();
+    subs.sort_by_key(|s| (s.span.start.row, s.span.start.column));
+
+    let framework = analysis
+        .package_framework
+        .get(package_name)
+        .map(|f| format!("{:?}", f));
+
+    let mut sub_entries = Vec::with_capacity(subs.len());
+    for sym in &subs {
+        let SymbolDetail::Sub {
+            ref params,
+            is_method,
+            ref return_type,
+            ref display,
+            hide_in_outline,
+            opaque_return,
+            ref return_self_method,
+            ref doc,
+        } = sym.detail
+        else {
+            continue;
+        };
+
+        // Pick a point inside the sub body so scope-resolved param
+        // lookups land in the right scope. End of line N+1 is past
+        // any signature parens for almost every shape.
+        let probe = tree_sitter::Point::new(
+            sym.span.start.row.saturating_add(1),
+            0,
+        );
+
+        let bag_default = analysis
+            .sub_return_type_at_arity(&sym.name, None)
+            .as_ref()
+            .map(file_analysis::format_inferred_type);
+        let mut by_arity = serde_json::Map::new();
+        for arity in 0u32..=2 {
+            if let Some(t) = analysis.sub_return_type_at_arity(&sym.name, Some(arity)) {
+                by_arity.insert(arity.to_string(), serde_json::json!(file_analysis::format_inferred_type(&t)));
+            }
+        }
+
+        let raw_return = return_type
+            .as_ref()
+            .map(file_analysis::format_inferred_type);
+
+        let param_entries: Vec<_> = params
+            .iter()
+            .map(|p| {
+                let inferred = analysis
+                    .inferred_type_via_bag(&p.name, probe)
+                    .as_ref()
+                    .map(file_analysis::format_inferred_type);
+                serde_json::json!({
+                    "name": p.name,
+                    "is_invocant": p.is_invocant,
+                    "is_slurpy": p.is_slurpy,
+                    "default": p.default,
+                    "inferred_type": inferred,
+                })
+            })
+            .collect();
+
+        // Witness count on the sub's Symbol attachment — surfaces
+        // arity / branch-arm observations the reducer is folding.
+        let symbol_witness_count = analysis
+            .witnesses
+            .for_attachment(&witnesses::WitnessAttachment::Symbol(sym.id))
+            .len();
+
+        // Provenance: where did this return type come from? Default
+        // (Inferred) is implicit; surfaced explicitly only when
+        // something else (plugin override / reducer / delegation)
+        // contributed. Critical debugging aid when inference grows
+        // complex enough that "the LSP says X" needs to come with
+        // "because Y" — without re-running the build.
+        let provenance = match analysis.return_type_provenance(sym.id) {
+            file_analysis::TypeProvenance::Inferred => None,
+            file_analysis::TypeProvenance::PluginOverride { plugin_id, reason } => {
+                Some(serde_json::json!({
+                    "kind": "PluginOverride",
+                    "plugin_id": plugin_id,
+                    "reason": reason,
+                }))
+            }
+            file_analysis::TypeProvenance::ReducerFold { reducer, evidence } => {
+                Some(serde_json::json!({
+                    "kind": "ReducerFold",
+                    "reducer": reducer,
+                    "evidence": evidence,
+                }))
+            }
+            file_analysis::TypeProvenance::Delegation { kind, via } => {
+                Some(serde_json::json!({
+                    "kind": "Delegation",
+                    "delegation_kind": kind,
+                    "via": via,
+                }))
+            }
+        };
+
+        // Variables typed inside this sub's scope. Surfaces chain
+        // assignments like `my $route = $self->_route(...)->...->to(...)`
+        // — when `$route` shows up here with a class type, the chain
+        // typer worked. When it doesn't, the chain died at some link.
+        // The same dump that answers "why is `_generate_route`'s
+        // return type None" answers "is `$route` typed at all".
+        let sub_scope_id = analysis
+            .scopes
+            .iter()
+            .find(|s| {
+                matches!(
+                    &s.kind,
+                    file_analysis::ScopeKind::Sub { name } | file_analysis::ScopeKind::Method { name }
+                        if name == &sym.name
+                ) && s.span.start == sym.span.start
+            })
+            .map(|s| s.id);
+        let mut vars_in_scope: Vec<serde_json::Value> = Vec::new();
+        if let Some(sid) = sub_scope_id {
+            for tc in &analysis.type_constraints {
+                if tc.scope == sid {
+                    vars_in_scope.push(serde_json::json!({
+                        "var": tc.variable,
+                        "type": file_analysis::format_inferred_type(&tc.inferred_type),
+                        "line": tc.constraint_span.start.row,
+                    }));
+                }
+            }
+        }
+
+        let mut entry = serde_json::json!({
+            "name": sym.name,
+            "kind": format!("{:?}", sym.kind),
+            "is_method": is_method,
+            "line": sym.selection_span.start.row,
+            "params": param_entries,
+            "raw_return_type": raw_return,
+            "bag_return_type": bag_default,
+            "bag_return_type_at_arity": serde_json::Value::Object(by_arity),
+            "return_self_method": return_self_method,
+            "symbol_witness_count": symbol_witness_count,
+            "vars_in_scope": vars_in_scope,
+        });
+        if let Some(prov) = provenance {
+            entry["return_type_provenance"] = prov;
+        }
+        if let Some(d) = display {
+            entry["display"] = serde_json::json!(format!("{:?}", d));
+        }
+        if hide_in_outline {
+            entry["hide_in_outline"] = serde_json::json!(true);
+        }
+        if opaque_return {
+            entry["opaque_return"] = serde_json::json!(true);
+        }
+        if let Some(ref outline) = sym.outline_label {
+            entry["outline_label"] = serde_json::json!(outline);
+        }
+        if let Some(d) = doc.as_ref() {
+            let first_line = d.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            if !first_line.is_empty() {
+                entry["doc_first_line"] = serde_json::json!(first_line);
+            }
+        }
+        sub_entries.push(entry);
+    }
+
+    let parents = analysis
+        .package_parents
+        .get(package_name)
+        .cloned()
+        .unwrap_or_default();
+
+    let out = serde_json::json!({
+        "package": package_name,
+        "file": path,
+        "framework": framework,
+        "parents": parents,
+        "total_witnesses_in_file": analysis.witnesses.len(),
+        "subs": sub_entries,
+    });
+
+    eprintln!(
+        "Dumped {} subs from {} (file: {})",
+        subs.len(),
+        package_name,
+        out.get("file").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
 }
 
 /// --workspace-symbol <root> <query> — Search symbols

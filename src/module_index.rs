@@ -156,8 +156,11 @@ impl<'a> SubInfo<'a> {
     }
 
     /// Inferred type for a param by name (if the analysis resolved one).
-    pub fn param_inferred_type(&self, param_name: &str) -> Option<&'a InferredType> {
-        self.analysis.inferred_type(param_name, self.primary.span.end)
+    /// Goes through the canonical bag-aware query so framework rules
+    /// (Mojo `$self` etc.) apply consistently across every consumer.
+    pub fn param_inferred_type(&self, param_name: &str) -> Option<InferredType> {
+        self.analysis
+            .inferred_type_via_bag(param_name, self.primary.span.end)
     }
 }
 
@@ -191,8 +194,28 @@ pub(crate) struct WorkspaceRootChannel {
 #[allow(dead_code)]
 pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
-    /// Reverse index: function name → list of module names that export it.
+    /// Reverse symbol index: name → list of module names whose
+    /// `FileAnalysis` contains at least one symbol with that name
+    /// (of any module-visible kind — Sub, Method, Package, Class,
+    /// Module, HashKeyDef, Handler). Populated at resolve + cache-
+    /// warm time. Queries that want narrower semantics (only exports,
+    /// only Handlers on a given class, only methods of a given kind,
+    /// etc.) filter the result themselves via per-module inspection.
+    ///
+    /// This is the single generic "find me modules with symbol X"
+    /// primitive — hover, signature help, goto-def, auto-import, and
+    /// the unimported-completion path all route through it instead
+    /// of reinventing per-feature cache walks. Different features
+    /// apply their own override / stacking rules on top.
     reverse_index: Arc<DashMap<String, Vec<String>>>,
+    /// Class → modules declaring at least one `PluginNamespace`
+    /// whose `bridges` list contains `Bridge::Class(class)`. The
+    /// one reverse index for plugin-synthesized content — explicit
+    /// (plugin declares its bridges), supports multiple instances
+    /// (each app is its own namespace), and avoids the inferred
+    /// "any symbol with this package" variant that used to live
+    /// alongside this one. Queried through `for_each_entity_bridged_to`.
+    bridges_index: Arc<DashMap<String, Vec<String>>>,
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
     stale_modules: Arc<DashMap<String, ()>>,
@@ -242,7 +265,7 @@ impl ModuleIndex {
 
         ModuleIndex {
             cache,
-            reverse_index,
+            reverse_index,            bridges_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             queue,
@@ -359,17 +382,39 @@ impl ModuleIndex {
         None
     }
 
-    /// Find all cached modules that export the given function name.
-    /// Uses the reverse index — O(1) lookup instead of scanning all modules.
+    /// Find all cached modules that *export* the given function name.
+    /// Starts from the generic symbol index, then filters to modules
+    /// whose `export` / `export_ok` list actually contains the name —
+    /// the reverse_index covers every named symbol, not just exports.
     pub fn find_exporters(&self, func_name: &str) -> Vec<String> {
-        match self.reverse_index.get(func_name) {
+        let mut result: Vec<String> = self.modules_with_symbol(func_name)
+            .into_iter()
+            .filter(|m| {
+                self.get_cached(m)
+                    .map(|c| c.analysis.export.iter().any(|e| e == func_name)
+                        || c.analysis.export_ok.iter().any(|e| e == func_name))
+                    .unwrap_or(false)
+            })
+            .collect();
+        result.sort();
+        result.dedup();
+        result
+    }
+
+    /// Generic "find modules with a symbol named N" primitive —
+    /// O(1) hash + O(matches) scan, replaces every `for_each_cached`
+    /// pattern where the predicate is name-based. Callers apply their
+    /// own kind/detail filter + override/stacking semantics after
+    /// picking which specific symbols matter to them.
+    pub fn modules_with_symbol(&self, name: &str) -> Vec<String> {
+        match self.reverse_index.get(name) {
             Some(modules) => {
                 let mut result = modules.clone();
                 result.sort();
                 result.dedup();
                 result
             }
-            None => vec![],
+            None => Vec::new(),
         }
     }
 
@@ -377,7 +422,7 @@ impl ModuleIndex {
     pub fn new_for_cli() -> Self {
         ModuleIndex {
             cache: Arc::new(DashMap::new()),
-            reverse_index: Arc::new(DashMap::new()),
+            reverse_index: Arc::new(DashMap::new()),            bridges_index: Arc::new(DashMap::new()),
             stale_modules: Arc::new(DashMap::new()),
             available_modules: Arc::new(DashMap::new()),
             queue: Arc::new(ResolveQueue {
@@ -431,7 +476,7 @@ impl ModuleIndex {
 
         ModuleIndex {
             cache,
-            reverse_index,
+            reverse_index,            bridges_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             queue,
@@ -458,6 +503,134 @@ impl ModuleIndex {
             }
         }
         self.cache.insert(module_name.to_string(), cached);
+    }
+
+    /// Register a workspace-indexed file under its primary package name
+    /// so cross-file resolution (method lookup, Handler walks) can find
+    /// it without first requiring an `@INC` resolve. Workspace files
+    /// otherwise live only in `FileStore` — this bridges them into the
+    /// ModuleIndex so queries that key on package name work uniformly
+    /// whether the target came from `use` or from the project tree.
+    ///
+    /// No-op for files without a `package` declaration (top-level scripts).
+    pub fn register_workspace_module(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
+        let Some(module_name) = first_package_name(&analysis) else { return };
+        // Canonicalize the path — `Url::from_file_path` in symbols.rs
+        // requires absolute paths, so relative workspace paths (e.g.
+        // "./test_files/lib/Users.pm" from CLI `.` root) would silently
+        // fail conversion and break cross-file goto-def.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let cached = Arc::new(CachedModule::new(path, analysis.clone()));
+
+        // Re-registration happens on file-watcher save. Old edges in
+        // `reverse_index` and `bridges_index` still point at this module,
+        // so without a purge they accumulate forever — a name or bridge
+        // that a previous version declared lingers after it's removed,
+        // and cross-file lookups return phantom modules.
+        self.purge_module_edges(&module_name);
+
+        let mut name_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for sym in &analysis.symbols {
+            // Name-keyed reverse index (every module-visible symbol).
+            if matches!(
+                sym.kind,
+                SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class
+                    | SymKind::Module | SymKind::HashKeyDef | SymKind::Handler,
+            ) && name_seen.insert(sym.name.as_str()) {
+                self.reverse_index
+                    .entry(sym.name.clone())
+                    .or_default()
+                    .push(module_name.clone());
+            }
+        }
+        // Bridges index: any PluginNamespace whose Bridge::Class(c)
+        // matches means this module declares a namespace reachable
+        // from class `c`. One entry per class per module (dedup).
+        let mut bridge_classes_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ns in &analysis.plugin_namespaces {
+            for crate::file_analysis::Bridge::Class(c) in &ns.bridges {
+                if bridge_classes_seen.insert(c.clone()) {
+                    self.bridges_index
+                        .entry(c.clone())
+                        .or_default()
+                        .push(module_name.clone());
+                }
+            }
+        }
+        self.cache.insert(module_name, Some(cached));
+    }
+
+    /// Remove `module_name` from every `reverse_index` and `bridges_index`
+    /// bucket it currently sits in. Called from
+    /// `register_workspace_module` before the re-insert so stale edges
+    /// from a prior version of the same module don't accumulate.
+    fn purge_module_edges(&self, module_name: &str) {
+        self.reverse_index.retain(|_name, mods| {
+            mods.retain(|m| m != module_name);
+            !mods.is_empty()
+        });
+        self.bridges_index.retain(|_class, mods| {
+            mods.retain(|m| m != module_name);
+            !mods.is_empty()
+        });
+    }
+
+    /// Every cached module that declares at least one `PluginNamespace`
+    /// whose `bridges` list includes `Bridge::Class(class_name)`.
+    /// Callers then pull the namespace's entities from the module's
+    /// `FileAnalysis` and iterate. Successor to
+    /// `modules_with_class_content` — explicit bridges instead of
+    /// symbol-package inference.
+    pub fn modules_bridging_to(&self, class_name: &str) -> Vec<String> {
+        match self.bridges_index.get(class_name) {
+            Some(mods) => {
+                let mut result = mods.clone();
+                result.sort();
+                result.dedup();
+                result
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Run a closure on every `Symbol` reachable from `class_name`
+    /// through a plugin bridge. The namespace-wide `Bridge::Class(X)`
+    /// identifies which namespaces to walk; per-entity `package`
+    /// narrows to "this entity is bound on class X specifically".
+    /// Lets one namespace span multiple classes (Mojo helpers on
+    /// both Controller and Mojolicious, plus each proxy class in a
+    /// dotted chain) without every entity being visible on every
+    /// bridged class.
+    ///
+    /// Single source of truth for plugin-synthesized entity lookup
+    /// across files. Replaces the former `modules_with_class_content`
+    /// / per-caller symbol.package scan that kept getting forgotten
+    /// by new features.
+    pub fn for_each_entity_bridged_to(
+        &self,
+        class_name: &str,
+        mut visit: impl FnMut(&Arc<CachedModule>, &crate::file_analysis::Symbol),
+    ) {
+        for mod_name in self.modules_bridging_to(class_name) {
+            let Some(cached) = self.get_cached(&mod_name) else { continue };
+            for ns in &cached.analysis.plugin_namespaces {
+                let bridges_class = ns.bridges.iter().any(|b|
+                    matches!(b, crate::file_analysis::Bridge::Class(c) if c == class_name));
+                if !bridges_class { continue; }
+                // Namespace membership IS the filter — if this namespace
+                // bridges to `class_name`, every entity it owns is
+                // visible from `class_name`. We used to additionally
+                // require `sym.package == class_name`, which forced
+                // mojo-helpers to fan-out one Method per bridge class.
+                // Now the plugin picks ONE canonical home package and
+                // the namespace's bridges control visibility.
+                for sym_id in &ns.entities {
+                    let idx = sym_id.0 as usize;
+                    let Some(sym) = cached.analysis.symbols.get(idx) else { continue };
+                    visit(&cached, sym);
+                }
+            }
+        }
     }
 
     /// Block until `module_name` appears in the cache, or timeout.
@@ -511,6 +684,20 @@ impl ModuleIndex {
 /// Return the parents of the primary package of a module, preferring the
 /// package with the same name as `module_name` and falling back to the
 /// single-package case if only one package exists in the file.
+/// First `package X;` declaration in a FileAnalysis. Used to decide
+/// under what name a workspace file should be registered in the
+/// module index so cross-file method resolution (which keys on
+/// package name, e.g. "Users" for `->to('Users#list')`) can find it.
+/// Returns `None` for scripts with no explicit package declaration.
+pub fn first_package_name(analysis: &FileAnalysis) -> Option<String> {
+    for sym in &analysis.symbols {
+        if matches!(sym.kind, SymKind::Package | SymKind::Class) {
+            return Some(sym.name.clone());
+        }
+    }
+    None
+}
+
 pub fn primary_package_parents(analysis: &FileAnalysis, module_name: &str) -> Vec<String> {
     if let Some(parents) = analysis.package_parents.get(module_name) {
         return parents.clone();

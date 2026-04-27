@@ -61,6 +61,10 @@ pub fn spawn_resolver(
             let db = module_cache::open_cache_db(ws_root.as_deref());
             if let Some(ref conn) = db {
                 let _ = module_cache::validate_inc_paths(conn, &inc_paths);
+                let _ = module_cache::validate_plugin_fingerprint(
+                    conn,
+                    &crate::plugin::rhai_host::plugin_fingerprint(),
+                );
                 let (n, stale_names) = module_cache::warm_cache(conn, &cache);
                 log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
                 // Queue stale modules for priority re-resolution.
@@ -160,6 +164,56 @@ pub fn spawn_resolver(
 
                     if let Some(ref conn) = db {
                         module_cache::save_to_db(conn, &module_name, &result, "import");
+                    }
+
+                    // Descend into the module's own dependencies so the
+                    // chain keeps resolving beyond the open doc's direct
+                    // imports. Without this the cache stops at depth 1 —
+                    // e.g. opening a Mojolicious::Lite script resolves
+                    // Mojolicious.pm, but Mojolicious.pm's
+                    // `has routes => sub { Mojolicious::Routes->new }`
+                    // never triggers a resolve on Mojolicious::Routes,
+                    // and `$r->get` on line 71 of the demo chain-dies
+                    // because the intermediate class is a cache miss.
+                    //
+                    // The `seen` guard above makes this cycle-safe: a
+                    // transitively-enqueued name that was already
+                    // resolved at the current EXTRACT_VERSION gets
+                    // skipped on its next turn.
+                    if let Some(ref m) = result {
+                        let mut pending = queue.pending.lock().unwrap();
+                        let enqueue = |pending: &mut Vec<String>, name: String| {
+                            if name.is_empty() { return; }
+                            if cache.contains_key(&name) { return; }
+                            if seen.contains_key(&name) { return; }
+                            if !pending.iter().any(|p| p == &name) {
+                                pending.push(name);
+                            }
+                        };
+                        // Explicit imports — the module's own `use` statements.
+                        for imp in &m.analysis.imports {
+                            enqueue(&mut pending, imp.module_name.clone());
+                        }
+                        // Parent classes — inheritance chain.
+                        for parents in m.analysis.package_parents.values() {
+                            for parent in parents {
+                                enqueue(&mut pending, parent.clone());
+                            }
+                        }
+                        // ClassName return types — `has foo => sub { Bar->new }`,
+                        // plugin-emitted typed Subs, method return annotations.
+                        // These are the chain-invisible-but-reachable classes
+                        // the user's chain walks through at query time.
+                        for sym in &m.analysis.symbols {
+                            use crate::file_analysis::{SymKind, SymbolDetail, InferredType};
+                            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                            if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
+                                enqueue(&mut pending, c.clone());
+                            }
+                        }
+                        if !pending.is_empty() {
+                            queue.condvar.notify_one();
+                        }
                     }
 
                     // Remove from stale set after successful re-resolution.
@@ -263,6 +317,10 @@ pub fn spawn_test_resolver(
             let db = module_cache::open_cache_db(ws_root.as_deref());
             if let Some(ref conn) = db {
                 let _ = module_cache::validate_inc_paths(conn, &inc_paths);
+                let _ = module_cache::validate_plugin_fingerprint(
+                    conn,
+                    &crate::plugin::rhai_host::plugin_fingerprint(),
+                );
                 let (_, stale_names) = module_cache::warm_cache(conn, &cache);
                 for name in stale_names {
                     stale_modules.insert(name, ());
@@ -315,6 +373,25 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
     guard.clone().flatten()
 }
 
+/// Names of every module-visible symbol in the analysis. Variables and
+/// fields are skipped — they're file-local and can't be queried across
+/// files. Deduplicated via a set first so a module with 10 subs named
+/// `foo` (unlikely but possible) contributes one entry, not ten.
+fn indexable_symbol_names(analysis: &crate::file_analysis::FileAnalysis) -> Vec<String> {
+    use crate::file_analysis::SymKind;
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sym in &analysis.symbols {
+        if matches!(
+            sym.kind,
+            SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class
+                | SymKind::Module | SymKind::HashKeyDef | SymKind::Handler,
+        ) {
+            names.insert(sym.name.clone());
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// Insert a resolved module into the cache and update the reverse index.
 fn insert_into_cache(
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
@@ -323,12 +400,18 @@ fn insert_into_cache(
     result: Option<Arc<CachedModule>>,
 ) {
     if let Some(ref cached) = result {
-        for func in cached.analysis.export.iter().chain(cached.analysis.export_ok.iter()) {
+        for name in indexable_symbol_names(&cached.analysis) {
             reverse_index
-                .entry(func.clone())
+                .entry(name)
                 .or_default()
                 .push(module_name.to_string());
         }
+        // `class_content_index` isn't threaded through the resolver
+        // APIs yet — resolver-path registration populates it via the
+        // `post_insert_hook` call below if provided by the caller.
+        // (Initially only workspace-index registration uses it; the
+        // resolver thread path is not yet on this hot path for
+        // plugin-synthesized content.)
     }
     cache.insert(module_name.to_string(), result);
 }
@@ -340,9 +423,9 @@ fn rebuild_reverse_index(
 ) {
     for entry in cache.iter() {
         if let Some(ref cached) = *entry.value() {
-            for func in cached.analysis.export.iter().chain(cached.analysis.export_ok.iter()) {
+            for name in indexable_symbol_names(&cached.analysis) {
                 reverse_index
-                    .entry(func.clone())
+                    .entry(name)
                     .or_default()
                     .push(entry.key().clone());
             }
@@ -456,6 +539,21 @@ pub fn index_workspace(
     root: &std::path::Path,
     files: &crate::file_store::FileStore,
 ) -> usize {
+    index_workspace_with_index(root, files, None)
+}
+
+/// Variant that also registers each indexed file in the given
+/// `ModuleIndex` under its primary package name. Used so workspace
+/// modules participate in cross-file lookups (method resolution,
+/// Handler walks, etc.) without waiting for an on-demand `use`
+/// resolve. Without this, `->to('Users#list')` couldn't find
+/// `test_files/lib/Users.pm` because nothing ever triggers a
+/// module_index populate for workspace files.
+pub fn index_workspace_with_index(
+    root: &std::path::Path,
+    files: &crate::file_store::FileStore,
+    module_index: Option<&crate::module_index::ModuleIndex>,
+) -> usize {
     use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
     use rayon::prelude::*;
@@ -489,7 +587,11 @@ pub fn index_workspace(
 
         match result {
             Ok(Some(analysis)) => {
-                files.insert_workspace(path.clone(), analysis);
+                let arc = std::sync::Arc::new(analysis);
+                files.insert_workspace_arc(path.clone(), arc.clone());
+                if let Some(idx) = module_index {
+                    idx.register_workspace_module(path.clone(), arc);
+                }
                 count.fetch_add(1, Ordering::Relaxed);
             }
             Ok(None) => { /* parse failed, skip */ }
