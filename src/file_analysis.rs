@@ -130,9 +130,9 @@ pub enum ScopeKind {
 
 /// Flat per-file record of which `package`/`class` declaration governs a
 /// byte range. Independent of the lexical scope tree — `package Foo;` is
-/// not a lexical boundary in Perl, so collapsing the two concepts forces
-/// shims (lift `my` past the package "scope", merge buckets in the
-/// outline). See `docs/prompt-scope-separation.md`.
+/// not a lexical boundary in Perl, so collapsing the two concepts would
+/// force shims (lift `my` past the package "scope", merge buckets in the
+/// outline) we'd rather not have.
 ///
 /// Query via `FileAnalysis::package_at(point)` — innermost (latest-starting)
 /// containing range wins for nested `package Foo { … package Bar; … }`.

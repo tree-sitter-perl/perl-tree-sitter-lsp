@@ -839,10 +839,11 @@ struct Builder<'a> {
     next_symbol_id: u32,
 
     /// Flat record of `package`/`class` declarations and the byte
-    /// ranges they govern. Independent of the lexical scope tree (see
-    /// `docs/prompt-scope-separation.md`). For statement-form
-    /// declarations the end is initially seeded with the file end and
-    /// gets trimmed when a same-level successor appears.
+    /// ranges they govern. Independent of the lexical scope tree —
+    /// `package Foo;` is not a lexical boundary in Perl. For
+    /// statement-form declarations the end is initially seeded with
+    /// the file end and gets trimmed when a same-level successor
+    /// appears.
     package_ranges: Vec<crate::file_analysis::PackageRange>,
     /// Index in `package_ranges` of the currently-open statement-form
     /// declaration (the one a successor `package X;` / `class X;`
@@ -914,8 +915,7 @@ impl<'a> Builder<'a> {
         // context lives separately in `package_ranges`; the variable
         // resolver gates `our` decls by package match at lookup time
         // (so bare `$version` from a sibling `package main;` doesn't
-        // reach a Calculator-package `our $version`). See
-        // `docs/prompt-scope-separation.md` for the design split.
+        // reach a Calculator-package `our $version`).
         self.symbols.push(Symbol {
             id,
             name,

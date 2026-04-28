@@ -133,8 +133,21 @@ end
 
 --- Assert zero diagnostics (or only expected ones). Call after cross-file resolution.
 --- `allowed` is an optional list of message substrings to tolerate.
-function M.assert_no_diagnostics(t, buf, allowed)
-  allowed = allowed or {}
+---
+--- Diagnostics are published asynchronously after each cross-file
+--- resolution completes (`on_resolved` → spawn task → publish). For
+--- files that depend on multiple modules (a Moo class with a role
+--- AND a DBIC component, say), the publish stream lags the last
+--- resolution. The completion-poll gate (`wait_for_cross_file`) only
+--- waits for a single representative method to appear — by the time
+--- the test reaches this assert, the LATER resolutions may still be
+--- in flight, and the most recent published diagnostics are stale.
+---
+--- Strategy: zero diagnostics → instant pass. Otherwise, poll up to
+--- `grace_secs` (default 5) waiting for the publish stream to catch
+--- up. Fast on the happy path, tolerates the post-resolution publish
+--- lag without slowing every test by a fixed sleep.
+local function collect_unexpected(buf, allowed)
   local diags = vim.diagnostic.get(buf)
   local unexpected = {}
   for _, d in ipairs(diags) do
@@ -144,6 +157,20 @@ function M.assert_no_diagnostics(t, buf, allowed)
     end
     if not ok then
       table.insert(unexpected, string.format("L%d: %s", d.lnum + 1, d.message))
+    end
+  end
+  return unexpected
+end
+
+function M.assert_no_diagnostics(t, buf, allowed, grace_secs)
+  allowed = allowed or {}
+  grace_secs = grace_secs or 5
+  local unexpected = collect_unexpected(buf, allowed)
+  if #unexpected > 0 then
+    for _ = 1, grace_secs * 4 do
+      vim.wait(250)
+      unexpected = collect_unexpected(buf, allowed)
+      if #unexpected == 0 then break end
     end
   end
   t.test("no unexpected diagnostics", function()
