@@ -1,0 +1,198 @@
+{
+  "file": "$HOME/personal/projects/perl-tree-sitter-lsp/test_files/oop_playground.pl",
+  "framework": null,
+  "package": "Schema::Result::User",
+  "parents": [
+    "DBIx::Class::Core"
+  ],
+  "subs": [
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "is_method": true,
+      "kind": "Method",
+      "line": 192,
+      "name": "id",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "is_method": true,
+      "kind": "Method",
+      "line": 193,
+      "name": "username",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "String",
+      "bag_return_type_at_arity": {
+        "0": "String",
+        "1": "String",
+        "2": "String"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 194,
+      "name": "email",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "is_method": true,
+      "kind": "Method",
+      "line": 195,
+      "name": "created_at",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "DBIx::Class::ResultSet",
+      "bag_return_type_at_arity": {
+        "0": "DBIx::Class::ResultSet",
+        "1": "DBIx::Class::ResultSet",
+        "2": "DBIx::Class::ResultSet"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 198,
+      "name": "posts",
+      "params": [],
+      "raw_return_type": "DBIx::Class::ResultSet",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Schema::Result::Profile",
+      "bag_return_type_at_arity": {
+        "0": "Schema::Result::Profile",
+        "1": "Schema::Result::Profile",
+        "2": "Schema::Result::Profile"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 199,
+      "name": "profile",
+      "params": [],
+      "raw_return_type": "Schema::Result::Profile",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Schema::Result::Avatar",
+      "bag_return_type_at_arity": {
+        "0": "Schema::Result::Avatar",
+        "1": "Schema::Result::Avatar",
+        "2": "Schema::Result::Avatar"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 200,
+      "name": "avatar",
+      "params": [],
+      "raw_return_type": "Schema::Result::Avatar",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "String",
+      "bag_return_type_at_arity": {
+        "0": "String",
+        "1": "String",
+        "2": "String"
+      },
+      "is_method": false,
+      "kind": "Sub",
+      "line": 202,
+      "name": "full_info",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "String",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 202,
+          "type": "Schema::Result::User",
+          "var": "$self"
+        },
+        {
+          "line": 208,
+          "type": "DBIx::Class::ResultSet",
+          "var": "$posts"
+        },
+        {
+          "line": 209,
+          "type": "Schema::Result::Profile",
+          "var": "$profile"
+        }
+      ]
+    }
+  ],
+  "total_witnesses_in_file": 274
+}

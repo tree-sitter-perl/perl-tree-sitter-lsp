@@ -1,0 +1,141 @@
+{
+  "file": "$HOME/personal/projects/perl-tree-sitter-lsp/test_files/oop_playground.pl",
+  "framework": "Moo",
+  "package": "Moo::Service",
+  "parents": [],
+  "subs": [
+    {
+      "bag_return_type": "Moo::Config",
+      "bag_return_type_at_arity": {
+        "0": "Moo::Config",
+        "1": "Moo::Config",
+        "2": "Moo::Config"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 50,
+      "name": "config",
+      "params": [],
+      "raw_return_type": "Moo::Config",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Log::Any",
+      "bag_return_type_at_arity": {
+        "0": "Log::Any",
+        "1": "Log::Any",
+        "2": "Log::Any"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 51,
+      "name": "logger",
+      "params": [],
+      "raw_return_type": "Log::Any",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "ArrayRef",
+      "bag_return_type_at_arity": {
+        "0": "ArrayRef",
+        "1": "ArrayRef",
+        "2": "ArrayRef"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 52,
+      "name": "data",
+      "params": [],
+      "raw_return_type": "ArrayRef",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "HashRef",
+      "bag_return_type_at_arity": {
+        "0": "HashRef",
+        "1": "HashRef",
+        "2": "HashRef"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 53,
+      "name": "cache",
+      "params": [],
+      "raw_return_type": "HashRef",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "CodeRef",
+      "bag_return_type_at_arity": {
+        "0": "CodeRef",
+        "1": "CodeRef",
+        "2": "CodeRef"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 54,
+      "name": "handler",
+      "params": [],
+      "raw_return_type": "CodeRef",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "is_method": false,
+      "kind": "Sub",
+      "line": 56,
+      "name": "run",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 56,
+          "type": "Moo::Service",
+          "var": "$self"
+        },
+        {
+          "line": 59,
+          "type": "Moo::Config",
+          "var": "$cfg"
+        },
+        {
+          "line": 60,
+          "type": "String",
+          "var": "$dsn"
+        },
+        {
+          "line": 62,
+          "type": "ArrayRef",
+          "var": "$items"
+        },
+        {
+          "line": 64,
+          "type": "HashRef",
+          "var": "$c"
+        }
+      ]
+    }
+  ],
+  "total_witnesses_in_file": 274
+}

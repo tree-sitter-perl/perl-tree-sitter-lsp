@@ -1,0 +1,1272 @@
+{
+  "file": "$HOME/.plenv/versions/5.42.0/lib/perl5/site_perl/5.42.0/Mojolicious/Routes/Route.pm",
+  "framework": "MojoBase",
+  "package": "Mojolicious::Routes::Route",
+  "parents": [],
+  "subs": [
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 8,
+      "name": "inline",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 8,
+      "name": "inline",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 8,
+      "name": "partial",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 8,
+      "name": "partial",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "ArrayRef",
+      "bag_return_type_at_arity": {
+        "0": "ArrayRef",
+        "1": "ArrayRef",
+        "2": "ArrayRef"
+      },
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 9,
+      "name": "children",
+      "params": [],
+      "raw_return_type": "ArrayRef",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "ArrayRef",
+      "bag_return_type_at_arity": {
+        "0": "ArrayRef",
+        "1": "ArrayRef",
+        "2": "ArrayRef"
+      },
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 9,
+      "name": "children",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 10,
+      "name": "parent",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 10,
+      "name": "parent",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Pattern",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Pattern",
+        "1": "Mojolicious::Routes::Pattern",
+        "2": "Mojolicious::Routes::Pattern"
+      },
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 11,
+      "name": "pattern",
+      "params": [],
+      "raw_return_type": "Mojolicious::Routes::Pattern",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Pattern",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Pattern",
+        "1": "Mojolicious::Routes::Pattern",
+        "2": "Mojolicious::Routes::Pattern"
+      },
+      "doc_first_line": "```perl",
+      "is_method": true,
+      "kind": "Method",
+      "line": 11,
+      "name": "pattern",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "CodeRef",
+      "bag_return_type_at_arity": {
+        "0": "CodeRef",
+        "1": "CodeRef",
+        "2": "CodeRef"
+      },
+      "is_method": false,
+      "kind": "Sub",
+      "line": 19,
+      "name": "BUILD_DYNAMIC",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$class"
+        },
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$method"
+        },
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$dyn_methods"
+        }
+      ],
+      "raw_return_type": "CodeRef",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 19,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$class"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 31,
+      "name": "add_child",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        },
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$route"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 31,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 38,
+      "name": "any",
+      "params": [],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": "_generate_route",
+      "return_type_provenance": {
+        "delegation_kind": "self_method_tail",
+        "kind": "Delegation",
+        "via": "_generate_route"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 40,
+      "name": "delete",
+      "params": [],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": "_generate_route",
+      "return_type_provenance": {
+        "delegation_kind": "self_method_tail",
+        "kind": "Delegation",
+        "via": "_generate_route"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 42,
+      "name": "find",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 44,
+      "name": "get",
+      "params": [],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": "_generate_route",
+      "return_type_provenance": {
+        "delegation_kind": "self_method_tail",
+        "kind": "Delegation",
+        "via": "_generate_route"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 46,
+      "name": "has_custom_name",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 48,
+      "name": "has_websocket",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 48,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 50,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 50,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 51,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 49,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        }
+      ]
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 54,
+      "name": "is_endpoint",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 56,
+      "name": "is_reserved",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 58,
+      "name": "is_websocket",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 60,
+      "name": "methods",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 60,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 62,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 63,
+          "type": "ArrayRef",
+          "var": "$methods"
+        },
+        {
+          "line": 63,
+          "type": "String",
+          "var": "$_"
+        },
+        {
+          "line": 64,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 61,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 68,
+      "name": "name",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 68,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 70,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 69,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 75,
+      "name": "options",
+      "params": [],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": "_generate_route",
+      "return_type_provenance": {
+        "delegation_kind": "self_method_tail",
+        "kind": "Delegation",
+        "via": "_generate_route"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 77,
+      "name": "parse",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 77,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 79,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 80,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 78,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 84,
+      "name": "patch",
+      "params": [],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": "_generate_route",
+      "return_type_provenance": {
+        "delegation_kind": "self_method_tail",
+        "kind": "Delegation",
+        "via": "_generate_route"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 85,
+      "name": "post",
+      "params": [],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": "_generate_route",
+      "return_type_provenance": {
+        "delegation_kind": "self_method_tail",
+        "kind": "Delegation",
+        "via": "_generate_route"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 86,
+      "name": "put",
+      "params": [],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": "_generate_route",
+      "return_type_provenance": {
+        "delegation_kind": "self_method_tail",
+        "kind": "Delegation",
+        "via": "_generate_route"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 88,
+      "name": "remove",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=2"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 88,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 89,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 90,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$parent"
+        }
+      ]
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 95,
+      "name": "render",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        },
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$values"
+        }
+      ],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 95,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 97,
+          "type": "String",
+          "var": "$path"
+        },
+        {
+          "line": 97,
+          "type": "String",
+          "var": "$path"
+        }
+      ]
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 101,
+      "name": "root",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 103,
+      "name": "requires",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=2"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 103,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 107,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 110,
+          "type": "HashRef",
+          "var": "$self"
+        },
+        {
+          "line": 104,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "String",
+      "bag_return_type_at_arity": {
+        "0": "String",
+        "1": "String",
+        "2": "String"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 116,
+      "name": "suggested_method",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "String",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 116,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 117,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 129,
+      "name": "to",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 129,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 130,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 132,
+          "type": "Mojolicious::Routes::Pattern",
+          "var": "$pattern"
+        }
+      ]
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 153,
+      "name": "to_string",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 157,
+      "name": "under",
+      "params": [],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": "_generate_route",
+      "return_type_provenance": {
+        "delegation_kind": "self_method_tail",
+        "kind": "Delegation",
+        "via": "_generate_route"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "HashRef",
+      "bag_return_type_at_arity": {
+        "0": "HashRef",
+        "1": "HashRef",
+        "2": "HashRef"
+      },
+      "doc_first_line": "```perl",
+      "is_method": false,
+      "kind": "Sub",
+      "line": 159,
+      "name": "websocket",
+      "params": [],
+      "raw_return_type": "HashRef",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 161,
+          "type": "HashRef",
+          "var": "$route"
+        }
+      ]
+    },
+    {
+      "bag_return_type": null,
+      "bag_return_type_at_arity": {},
+      "is_method": false,
+      "kind": "Sub",
+      "line": 165,
+      "name": "_chain",
+      "params": [],
+      "raw_return_type": null,
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 166,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$parent"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "is_method": false,
+      "kind": "Sub",
+      "line": 171,
+      "name": "_generate_route",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        },
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$methods"
+        },
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": true,
+          "name": "@args"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 171,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 197,
+          "type": "String",
+          "var": "$methods"
+        },
+        {
+          "line": 175,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$arg"
+        },
+        {
+          "line": 196,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$route"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "HashRef",
+      "bag_return_type_at_arity": {
+        "0": "HashRef",
+        "1": "HashRef",
+        "2": "HashRef"
+      },
+      "is_method": false,
+      "kind": "Sub",
+      "line": 202,
+      "name": "_index",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "HashRef",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 202,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 203,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 207,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$child"
+        }
+      ]
+    },
+    {
+      "bag_return_type": "Mojolicious::Routes::Route",
+      "bag_return_type_at_arity": {
+        "0": "Mojolicious::Routes::Route",
+        "1": "Mojolicious::Routes::Route",
+        "2": "Mojolicious::Routes::Route"
+      },
+      "is_method": false,
+      "kind": "Sub",
+      "line": 216,
+      "name": "_route",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "Mojolicious::Routes::Route",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "kind": "PluginOverride",
+        "plugin_id": "mojo-routes",
+        "reason": "_route returns $self via @_-shift; inference doesn't model array-slice returns"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 216,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 226,
+          "type": "HashRef",
+          "var": "$constraints"
+        },
+        {
+          "line": 226,
+          "type": "HashRef",
+          "var": "$constraints"
+        },
+        {
+          "line": 228,
+          "type": "HashRef",
+          "var": "$defaults"
+        },
+        {
+          "line": 228,
+          "type": "HashRef",
+          "var": "$defaults"
+        },
+        {
+          "line": 217,
+          "type": "Mojolicious::Routes::Route",
+          "var": "$self"
+        },
+        {
+          "line": 224,
+          "type": "Mojolicious::Routes::Pattern",
+          "var": "$old_pattern"
+        }
+      ]
+    }
+  ],
+  "total_witnesses_in_file": 196
+}

@@ -1,0 +1,131 @@
+{
+  "file": "$HOME/personal/projects/perl-tree-sitter-lsp/test_files/frameworks.pl",
+  "framework": "MojoBase",
+  "package": "MojoApp",
+  "parents": [],
+  "subs": [
+    {
+      "bag_return_type": "String",
+      "bag_return_type_at_arity": {
+        "0": "String",
+        "1": "String",
+        "2": "String"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 29,
+      "name": "title",
+      "params": [],
+      "raw_return_type": "String",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "String",
+      "bag_return_type_at_arity": {
+        "0": "String",
+        "1": "String",
+        "2": "String"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 29,
+      "name": "title",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": "MojoApp",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "ArrayRef",
+      "bag_return_type_at_arity": {
+        "0": "ArrayRef",
+        "1": "ArrayRef",
+        "2": "ArrayRef"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 30,
+      "name": "items",
+      "params": [],
+      "raw_return_type": "ArrayRef",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "ArrayRef",
+      "bag_return_type_at_arity": {
+        "0": "ArrayRef",
+        "1": "ArrayRef",
+        "2": "ArrayRef"
+      },
+      "is_method": true,
+      "kind": "Method",
+      "line": 30,
+      "name": "items",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": false,
+          "is_slurpy": false,
+          "name": "$val"
+        }
+      ],
+      "raw_return_type": "MojoApp",
+      "return_self_method": null,
+      "symbol_witness_count": 0,
+      "vars_in_scope": []
+    },
+    {
+      "bag_return_type": "String",
+      "bag_return_type_at_arity": {
+        "0": "String",
+        "1": "String",
+        "2": "String"
+      },
+      "is_method": false,
+      "kind": "Sub",
+      "line": 32,
+      "name": "describe",
+      "params": [
+        {
+          "default": null,
+          "inferred_type": null,
+          "is_invocant": true,
+          "is_slurpy": false,
+          "name": "$self"
+        }
+      ],
+      "raw_return_type": "String",
+      "return_self_method": null,
+      "return_type_provenance": {
+        "evidence": [
+          "return_arms=1"
+        ],
+        "kind": "ReducerFold",
+        "reducer": "return_arms"
+      },
+      "symbol_witness_count": 0,
+      "vars_in_scope": [
+        {
+          "line": 32,
+          "type": "MojoApp",
+          "var": "$self"
+        }
+      ]
+    }
+  ],
+  "total_witnesses_in_file": 41
+}
