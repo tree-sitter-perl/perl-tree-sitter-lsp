@@ -1,5 +1,16 @@
 # Type Inference Pipeline → Worklist Refactor
 
+> **Status: landed (April 2026).** All seven phases shipped on
+> `refactor/type-inference-worklist`; `Builder::fold_to_fixed_point` is
+> the live driver, the 13-step pipeline collapsed to ~9 phases (see
+> `CLAUDE.md` "Build pipeline phases" and "Worklist invariants"), and
+> `docs/prompt-type-inference-spec.md`'s status snapshot reflects the
+> new shape. This document is preserved as the design rationale and
+> phasing record; the references below to "the 13-step pipeline being
+> collapsed", "fold pass 1 / fold pass 2", etc. are historical context
+> for how the system looked before the refactor, not a description of
+> current behavior.
+>
 > Collapse the manually-scheduled phases 4–10 of `build_with_plugins()` into a
 > monotone fixed-point worklist over the witness bag. Test contract is the
 > hard constraint: every existing test stays green at every commit on the
@@ -7,7 +18,8 @@
 >
 > Cross-refs:
 > - `docs/prompt-type-inference-spec.md` — the witness/reducer model this builds on.
-> - `CLAUDE.md` "Build pipeline phases" — the 13-step pipeline being collapsed.
+> - `CLAUDE.md` "Build pipeline phases" + "Worklist invariants" — the
+>   landed pipeline + reducer-extension contract.
 
 ## Why
 
