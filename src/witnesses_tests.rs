@@ -471,3 +471,77 @@ fn numeric_then_string_prefers_numeric_noop_when_class_set() {
         ReducedValue::Type(InferredType::Numeric)
     );
 }
+
+// ---- Plugin override priority short-circuit -----------------------
+//
+// `apply_type_overrides` pushes a Plugin-source `InferredType`
+// witness on `Symbol(sym_id)`. The `PluginOverrideReducer` runs
+// first in the default registry and must dominate any other
+// Symbol-attached InferredType evidence. Pin the priority short-
+// circuit at the reducer level so a future refactor that drops the
+// priority check fails here, not silently downstream in
+// `--dump-package` provenance.
+
+#[test]
+fn plugin_override_priority_dominates_builder_inferred_type() {
+    let sym_id = SymbolId(0);
+    let mut bag = WitnessBag::new();
+    bag.push(Witness {
+        attachment: WitnessAttachment::Symbol(sym_id),
+        source: WitnessSource::Builder("inferred".into()),
+        payload: WitnessPayload::InferredType(InferredType::HashRef),
+        span: span(0, 0, 0, 0),
+    });
+    bag.push(Witness {
+        attachment: WitnessAttachment::Symbol(sym_id),
+        source: WitnessSource::Plugin("test-plugin".into()),
+        payload: WitnessPayload::InferredType(InferredType::ClassName("Baz".into())),
+        span: span(0, 0, 0, 0),
+    });
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Symbol(sym_id);
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    match reg.query(&bag, &q) {
+        ReducedValue::Type(InferredType::ClassName(name)) => {
+            assert_eq!(
+                name, "Baz",
+                "Plugin priority must dominate Builder-source InferredType on the same Symbol attachment"
+            );
+        }
+        other => panic!("expected ClassName(Baz) from PluginOverrideReducer; got {other:?}"),
+    }
+}
+
+#[test]
+fn plugin_override_reducer_yields_when_only_builder_witnesses_present() {
+    // Plugin-priority short-circuit must not claim Builder-only
+    // Symbol+InferredType witnesses — those are Phase 4+ inferred
+    // facts. Returning None here lets later reducers handle them.
+    let sym_id = SymbolId(7);
+    let mut bag = WitnessBag::new();
+    bag.push(Witness {
+        attachment: WitnessAttachment::Symbol(sym_id),
+        source: WitnessSource::Builder("inferred".into()),
+        payload: WitnessPayload::InferredType(InferredType::String),
+        span: span(0, 0, 0, 0),
+    });
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Symbol(sym_id);
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    // PluginOverrideReducer declines (priority == 10), no other
+    // reducer claims Symbol+InferredType in Phase 3, so the
+    // registry returns None.
+    assert_eq!(reg.query(&bag, &q), ReducedValue::None);
+}

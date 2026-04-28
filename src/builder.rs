@@ -6029,6 +6029,36 @@ impl<'a> Builder<'a> {
             }
         }
 
+        // Seed Plugin overrides into `return_types` before delegation /
+        // self_method_tail propagation. Plugin-source `InferredType`
+        // witnesses on `Symbol(sym_id)` (pushed by
+        // `apply_type_overrides`) carry priority > Builder, so a
+        // priority-aware short-circuit dominates the per-arm fold
+        // above. Provenance was already written as `PluginOverride`
+        // by `apply_type_overrides`; clear any conflicting
+        // `return_provenance` entry so the writeback below doesn't
+        // clobber that with `ReducerFold`. Subs that delegate to an
+        // overridden sub inherit the override (the delegation pass
+        // sees `return_types[overridden] = override`).
+        for sym in &self.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+            let att = WitnessAttachment::Symbol(sym.id);
+            let bag_override = self
+                .bag
+                .for_attachment(&att)
+                .iter()
+                .filter_map(|w| match (w.source.priority(), &w.payload) {
+                    (p, WitnessPayload::InferredType(t)) if p > 10 => Some((p, t.clone())),
+                    _ => None,
+                })
+                .max_by_key(|(p, _)| *p)
+                .map(|(_, t)| t);
+            if let Some(t) = bag_override {
+                return_types.insert(sym.name.clone(), t);
+                return_provenance.remove(&sym.name);
+            }
+        }
+
         // Propagate return types through delegation chains. If sub X's body
         // is `return Y()` (recorded in sub_return_delegations) and Y has a
         // known return type, X inherits it. Iterate until no changes — chains
@@ -6126,16 +6156,14 @@ impl<'a> Builder<'a> {
             .collect();
         for sym in &mut self.symbols {
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                // Plugin override pinned this symbol — DON'T overwrite
-                // it with the inferred fold. The whole point of an
-                // override is "inference reaches the wrong answer
-                // here". Provenance is recorded as `PluginOverride`
-                // in `type_provenance`; we use that as the signal.
-                let is_overridden = matches!(
-                    self.type_provenance.get(&sym.id),
-                    Some(crate::file_analysis::TypeProvenance::PluginOverride { .. }),
-                );
-                if is_overridden { continue; }
+                // Plugin overrides flow through `return_types` via the
+                // bag-priority seeding step above, with `return_provenance`
+                // cleared so we don't clobber the existing
+                // `PluginOverride` entry written by
+                // `apply_type_overrides`. No special-case skip needed
+                // here — overrides win because they're higher-priority
+                // bag witnesses, not because the writeback knows about
+                // them.
                 if let SymbolDetail::Sub {
                     ref mut return_type,
                     ref mut return_self_method,
@@ -6307,9 +6335,20 @@ impl<'a> Builder<'a> {
     /// the inheritance chain (a base class's override wins for that
     /// base's symbol; subclasses get it via the existing cross-file
     /// resolution path).
+    ///
+    /// Mechanism: pushes a Plugin-source `InferredType` witness onto
+    /// `Symbol(sym_id)`. The `PluginOverrideReducer` priority
+    /// short-circuit (witnesses.rs) makes that witness dominate any
+    /// inferred Symbol+InferredType evidence in the same fold. Direct
+    /// writes to `Symbol.return_type` happen later in
+    /// `resolve_return_types`, sourced from the bag — this keeps the
+    /// override flow uniform with the rest of the type-inference
+    /// pipeline (no parallel "pinned by override" path).
     fn apply_type_overrides(&mut self) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+
         // Snapshot first — can't borrow self.plugins while mutating
-        // self.symbols + self.type_provenance below.
+        // self.bag + self.type_provenance below.
         let pairs: Vec<(String, plugin::TypeOverride)> = self.plugins
             .overrides()
             .map(|(id, o)| (id.to_string(), o.clone()))
@@ -6318,7 +6357,11 @@ impl<'a> Builder<'a> {
             return;
         }
         for (plugin_id, ov) in pairs {
-            for sym in &mut self.symbols {
+            // Collect target SymbolIds in a snapshot so we can mutate
+            // self.bag + self.type_provenance below without holding
+            // an aliasing borrow on self.symbols.
+            let mut targets: Vec<SymbolId> = Vec::new();
+            for sym in &self.symbols {
                 if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
                 let target_matches = match &ov.target {
                     plugin::OverrideTarget::Method { class, name } => {
@@ -6329,16 +6372,31 @@ impl<'a> Builder<'a> {
                     }
                 };
                 if !target_matches { continue; }
-                if let SymbolDetail::Sub { ref mut return_type, .. } = sym.detail {
-                    *return_type = Some(ov.return_type.clone());
-                    self.type_provenance.insert(
-                        sym.id,
-                        TypeProvenance::PluginOverride {
-                            plugin_id: plugin_id.clone(),
-                            reason: ov.reason.clone(),
-                        },
-                    );
+                if matches!(sym.detail, SymbolDetail::Sub { .. }) {
+                    targets.push(sym.id);
                 }
+            }
+            for sym_id in targets {
+                // Zero-extent span — core-synthesized witness, no
+                // user-visible "because: …" anchor needed beyond the
+                // provenance entry below.
+                let zero = Span {
+                    start: Point { row: 0, column: 0 },
+                    end: Point { row: 0, column: 0 },
+                };
+                self.bag.push(Witness {
+                    attachment: WitnessAttachment::Symbol(sym_id),
+                    source: WitnessSource::Plugin(plugin_id.clone()),
+                    payload: WitnessPayload::InferredType(ov.return_type.clone()),
+                    span: zero,
+                });
+                self.type_provenance.insert(
+                    sym_id,
+                    TypeProvenance::PluginOverride {
+                        plugin_id: plugin_id.clone(),
+                        reason: ov.reason.clone(),
+                    },
+                );
             }
         }
     }

@@ -85,6 +85,22 @@ pub enum WitnessSource {
     DerivedFrom(RefIdx),
 }
 
+impl WitnessSource {
+    /// Priority hint for "highest-priority source wins" tie-breaking
+    /// in reducers that fold multiple witnesses into one answer.
+    /// Plugin overrides dominate everything else — the whole point of
+    /// an override is "inference reaches the wrong answer here". The
+    /// exact weights only need to satisfy `Plugin > everything else`.
+    pub fn priority(&self) -> u8 {
+        match self {
+            WitnessSource::Plugin(_) => 100,
+            WitnessSource::Builder(_)
+            | WitnessSource::Enrichment(_)
+            | WitnessSource::DerivedFrom(_) => 10,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WitnessPayload {
     /// Final-form type belief — what legacy `TypeConstraint` carries.
@@ -698,6 +714,61 @@ impl WitnessReducer for NamedSubReturn {
     }
 }
 
+// ---- Plugin-override priority reducer ----
+//
+// Claims `Symbol(_)` attachments carrying an `InferredType` payload
+// from a high-priority source (Plugin). When such a witness exists
+// in the bag, it short-circuits the symbol-return fold — overrides
+// dominate inference. Registered first in `with_defaults()` so its
+// short-circuit runs before any inferred fold (BranchArmFold,
+// FluentArityDispatch) gets a chance to claim Symbol attachments.
+//
+// Why a separate reducer rather than a branch in
+// FrameworkAwareTypeFold: keeping the priority short-circuit a
+// distinct, named reducer means
+// (a) the `claims` predicate is precise — only fires when a
+//     priority>10 witness is present, not on every Symbol+InferredType
+//     fact (which become more common as Phase 4–6 land);
+// (b) the dump-package debug output can attribute the answer to
+//     `plugin_override` specifically, not a generic `framework_aware`.
+
+pub struct PluginOverrideReducer;
+
+impl WitnessReducer for PluginOverrideReducer {
+    fn name(&self) -> &str {
+        "plugin_override"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::Symbol(_))
+            && matches!(w.payload, WitnessPayload::InferredType(_))
+            && w.source.priority() > 10
+    }
+
+    fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
+        // Highest priority wins. Multiple plugins overriding the
+        // same symbol is a registration-order question — last one
+        // pushed wins on tie, matching the registry's iteration
+        // order and the existing "last seed wins" rule for
+        // InferredType witnesses elsewhere.
+        let mut best: Option<(&Witness, u8)> = None;
+        for w in ws {
+            let pr = w.source.priority();
+            match best {
+                None => best = Some((*w, pr)),
+                Some((_, prev)) if pr >= prev => best = Some((*w, pr)),
+                _ => {}
+            }
+        }
+        if let Some((w, _)) = best {
+            if let WitnessPayload::InferredType(t) = &w.payload {
+                return ReducedValue::Type(t.clone());
+            }
+        }
+        ReducedValue::None
+    }
+}
+
 // ---- Reducer registry ----
 
 #[derive(Default)]
@@ -712,6 +783,10 @@ impl ReducerRegistry {
 
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
+        // Plugin overrides short-circuit before any inferred fold —
+        // registered first so it sees Symbol+InferredType witnesses
+        // before FrameworkAwareTypeFold or BranchArmFold get a chance.
+        r.register(Box::new(PluginOverrideReducer));
         r.register(Box::new(FrameworkAwareTypeFold));
         r.register(Box::new(BranchArmFold));
         r.register(Box::new(FluentArityDispatch));
