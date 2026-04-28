@@ -43,6 +43,38 @@ pub fn build_with_plugins(
     source: &[u8],
     plugins: Arc<PluginRegistry>,
 ) -> FileAnalysis {
+    build_with_plugins_inner(tree, source, plugins, false)
+}
+
+/// Test-only entry: build the file, then re-run the post-walk fold
+/// sequence (resolve_return_types → chain typing → return-arm refresh →
+/// second resolve_return_types → invocant-class refresh) one extra time
+/// before finalizing.
+///
+/// **Observable** idempotency holds today: the resulting `FileAnalysis`
+/// produces the same `Symbol.return_type`, the same `type_provenance`,
+/// and the same `sub_return_type_at_arity` answers as a plain
+/// `build_with_plugins(...)` call. **Witness count is not preserved**
+/// — `resolve_return_types` re-emits `ArityReturn` witnesses on every
+/// invocation, so an extra fold pass adds duplicates. The worklist
+/// driver in Phase 6 closes that gap by pushing each fact once and
+/// terminating when the lattice stops moving; until then this hook
+/// pins what the current pipeline actually guarantees.
+#[cfg(test)]
+pub(crate) fn build_with_plugins_extra_re_fold(
+    tree: &Tree,
+    source: &[u8],
+    plugins: Arc<PluginRegistry>,
+) -> FileAnalysis {
+    build_with_plugins_inner(tree, source, plugins, true)
+}
+
+fn build_with_plugins_inner(
+    tree: &Tree,
+    source: &[u8],
+    plugins: Arc<PluginRegistry>,
+    extra_re_fold: bool,
+) -> FileAnalysis {
     let mut b = Builder {
         source,
         scopes: Vec::new(),
@@ -185,6 +217,17 @@ pub fn build_with_plugins(
     // receiver class of `->bar`; that return type comes from the
     // bag-aware fold in post-pass 3 plus any post-pass-3b overrides.
     b.resolve_invocant_classes_post_pass(tree);
+
+    // Test-only: re-run the post-walk fold sequence one more time to
+    // pin idempotency. Production callers always pass `false`; only
+    // `build_with_plugins_extra_re_fold` flips this on.
+    if extra_re_fold {
+        b.resolve_return_types();
+        b.type_assignments_into_bag(tree);
+        b.refresh_return_arm_types(tree);
+        b.resolve_return_types();
+        b.resolve_invocant_classes_post_pass(tree);
+    }
 
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
     b.resolve_tail_pod_docs();
@@ -6378,3 +6421,7 @@ impl<'a> Builder<'a> {
 #[cfg(test)]
 #[path = "builder_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "type_inference_invariants_tests.rs"]
+mod invariants_tests;
