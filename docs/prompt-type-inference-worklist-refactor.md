@@ -150,10 +150,30 @@ Steps (one commit per file, fully mechanical):
 
 1. For each `src/<file>.rs` containing a non-trivial `mod tests`:
    - Cut the entire `#[cfg(test)] mod tests { ... }` body.
-   - Replace with `#[cfg(test)] mod tests;` (note: trailing semicolon, no body).
+   - Replace with:
+     ```
+     #[cfg(test)]
+     #[path = "<file>_tests.rs"]
+     mod tests;
+     ```
+     The `#[path]` attribute is required because `src/<file>.rs` is a flat
+     module file (not `src/<file>/mod.rs`), so the default lookup
+     (`src/<file>/tests.rs`) doesn't match the sibling layout we want.
    - Paste the body into a new `src/<file>_tests.rs`. Strip the outer
-     `#[cfg(test)] mod tests {` / closing `}`. The `use super::*;` and
-     all inner `use` lines come along verbatim.
+     `#[cfg(test)] mod tests {` / closing `}`. **Do not dedent by hand**
+     — a blanket `sed 's/^    //'` corrupts lines inside multi-line raw
+     string literals (`r#"..."#`), shifting columns inside test fixtures
+     and breaking position-sensitive assertions (e.g. `Position { line:
+     5, character: 25 }`). Instead, lift the body verbatim (still
+     indented +4 from the original `mod tests {` block), then run
+     `rustfmt --edition 2021 src/*_tests.rs` to dedent to column 0.
+     Rustfmt is raw-string-aware and leaves their contents alone.
+   - **Do not run `cargo fmt`** during the lift commit. `cargo fmt`
+     formats the whole crate regardless of arguments after `--`, which
+     sweeps unrelated production files and buries the test-lift diff
+     under a huge formatting churn. Use `rustfmt <file>` directly to
+     scope the format strictly to lifted files. The `use super::*;`
+     and all inner `use` lines come along verbatim.
 2. Files in scope:
    - `src/file_analysis.rs` — biggest payoff.
    - `src/builder.rs` — biggest payoff.
