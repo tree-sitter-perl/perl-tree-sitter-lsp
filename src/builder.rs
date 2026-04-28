@@ -75,19 +75,14 @@ pub fn build_with_plugins(
         current_package: None,
         next_scope_id: 0,
         next_symbol_id: 0,
+        package_ranges: Vec::new(),
+        open_statement_package: None,
         plugins,
     };
 
     // Create file-level scope and walk
     let file_scope = b.push_scope(ScopeKind::File, node_to_span(tree.root_node()), None);
     b.visit_children(tree.root_node());
-    // Close any non-block `package`/`class` sibling scopes still open
-    // at EOF — their spans were seeded with the file end, so popping
-    // without trimming leaves them covering exactly the right range.
-    while let Some(&top) = b.scope_stack.last() {
-        if top == file_scope { break; }
-        b.pop_scope();
-    }
     b.pop_scope();
     let _ = file_scope;
 
@@ -213,6 +208,7 @@ pub fn build_with_plugins(
         b.plugin_namespaces,
         b.package_uses,
         b.type_provenance,
+        b.package_ranges,
     );
     fa.package_framework = package_framework;
     fa.witnesses = bag;
@@ -842,6 +838,18 @@ struct Builder<'a> {
     next_scope_id: u32,
     next_symbol_id: u32,
 
+    /// Flat record of `package`/`class` declarations and the byte
+    /// ranges they govern. Independent of the lexical scope tree —
+    /// `package Foo;` is not a lexical boundary in Perl. For
+    /// statement-form declarations the end is initially seeded with
+    /// the file end and gets trimmed when a same-level successor
+    /// appears.
+    package_ranges: Vec<crate::file_analysis::PackageRange>,
+    /// Index in `package_ranges` of the currently-open statement-form
+    /// declaration (the one a successor `package X;` / `class X;`
+    /// would supplant), if any.
+    open_statement_package: Option<usize>,
+
     /// Framework plugin registry. Shared Arc so multiple builders in one
     /// process avoid re-compiling the same Rhai scripts.
     plugins: Arc<PluginRegistry>,
@@ -903,43 +911,18 @@ impl<'a> Builder<'a> {
     ) -> SymbolId {
         let id = SymbolId(self.next_symbol_id);
         self.next_symbol_id += 1;
-        // Lexical decls (`my`, `state`, `field`) cross statement-form
-        // `package Foo;` boundaries — they're tied to the enclosing
-        // real lexical scope (file / block / sub / method / class
-        // block / for-loop), not to package context. Sibling Package
-        // scopes are a package-lookup mechanism (subs, `package_at`,
-        // namespace grouping); attaching lexicals to them hides
-        // decls from later `package X;` sections of the same file.
-        //
-        // `our` is the exception — it's a *package-global* with a
-        // lexical alias. The variable lives in `$Package::name`, so
-        // it stays attached to the current Package scope and is
-        // *not* visible from a sibling `package main;` section as a
-        // bare `$name`.
-        //
-        // TODO(scope-separation): once lexical-vs-package scopes are
-        // split (see `docs/prompt-scope-separation.md`), this Lift
-        // becomes unnecessary — `add_symbol_ns` uses the lexical
-        // tree directly and `our` is recorded with package context
-        // separately.
-        let is_lexical = match (&kind, &detail) {
-            (SymKind::Field, _) => true,
-            (SymKind::Variable, SymbolDetail::Variable { decl_kind, .. }) => *decl_kind != DeclKind::Our,
-            (SymKind::Variable, _) => true,
-            _ => false,
-        };
-        let scope = if is_lexical {
-            self.nearest_lexical_scope()
-        } else {
-            self.current_scope()
-        };
+        // Every symbol attaches to the current lexical scope. Package
+        // context lives separately in `package_ranges`; the variable
+        // resolver gates `our` decls by package match at lookup time
+        // (so bare `$version` from a sibling `package main;` doesn't
+        // reach a Calculator-package `our $version`).
         self.symbols.push(Symbol {
             id,
             name,
             kind,
             span,
             selection_span,
-            scope,
+            scope: self.current_scope(),
             package: self.current_package.clone(),
             detail,
             namespace,
@@ -948,20 +931,76 @@ impl<'a> Builder<'a> {
         id
     }
 
-    /// Walk up `current_scope()` past any `ScopeKind::Package` sibling
-    /// scopes — those track package context, not lexical scope.
-    fn nearest_lexical_scope(&self) -> ScopeId {
-        let mut id = self.current_scope();
-        loop {
-            let scope = &self.scopes[id.0 as usize];
-            if !matches!(scope.kind, ScopeKind::Package) {
-                return id;
+    // ---- Package-range tracking ----
+
+    /// Record a `package Foo;` / `class Foo;` (statement form). Trims
+    /// the previously-open statement range to end at `start`, then
+    /// pushes a new range whose end is seeded with the file end —
+    /// trimmed in turn when a successor appears, or left at file end
+    /// if none does.
+    fn open_statement_package_range(&mut self, name: String, start: Point) {
+        use crate::file_analysis::{PackageKind, PackageRange};
+        if let Some(idx) = self.open_statement_package.take() {
+            self.package_ranges[idx].span.end = start;
+        }
+        let file_end = self
+            .scope_stack
+            .first()
+            .map(|id| self.scopes[id.0 as usize].span.end)
+            .unwrap_or(start);
+        self.package_ranges.push(PackageRange {
+            package: name,
+            span: Span { start, end: file_end },
+            kind: PackageKind::Statement,
+        });
+        self.open_statement_package = Some(self.package_ranges.len() - 1);
+    }
+
+    /// Record a `package Foo { … }` / `class Foo { … }` (block form).
+    /// Span is the node's own span — no successor-trimming required.
+    /// Block forms do NOT supplant any statement-form range that
+    /// brackets them: `package Foo; package Bar { … }` leaves Foo
+    /// covering everything outside the Bar block.
+    fn push_block_package_range(&mut self, name: String, span: Span) {
+        use crate::file_analysis::{PackageKind, PackageRange};
+        self.package_ranges.push(PackageRange {
+            package: name,
+            span,
+            kind: PackageKind::Block,
+        });
+    }
+
+    /// Build-time mirror of `FileAnalysis::package_at`. Used by the
+    /// variable resolver to gate `our` decls by package context — the
+    /// builder can't call into FileAnalysis (it hasn't been
+    /// constructed yet).
+    fn package_at_pos(&self, point: Point) -> Option<&str> {
+        let mut best: Option<&crate::file_analysis::PackageRange> = None;
+        for r in &self.package_ranges {
+            if !crate::file_analysis::contains_point(&r.span, point) {
+                continue;
             }
-            match scope.parent {
-                Some(p) => id = p,
-                None => return id,
+            let win = match best {
+                None => true,
+                Some(prev) => {
+                    let cur_start = (r.span.start.row, r.span.start.column);
+                    let prev_start = (prev.span.start.row, prev.span.start.column);
+                    let cur_size = (
+                        r.span.end.row - r.span.start.row,
+                        r.span.end.column.saturating_sub(r.span.start.column),
+                    );
+                    let prev_size = (
+                        prev.span.end.row - prev.span.start.row,
+                        prev.span.end.column.saturating_sub(prev.span.start.column),
+                    );
+                    cur_start > prev_start || (cur_start == prev_start && cur_size < prev_size)
+                }
+            };
+            if win {
+                best = Some(r);
             }
         }
+        best.map(|r| r.package.as_str())
     }
 
     fn add_ref(&mut self, kind: RefKind, span: Span, target_name: String, access: AccessKind) {
@@ -1927,52 +1966,25 @@ impl<'a> Builder<'a> {
         let has_block = (0..node.child_count())
             .any(|i| node.child(i).map_or(false, |c| c.kind() == "block"));
         if has_block {
-            // `package Foo { ... }` — scope is the block. Set package
-            // ONLY for the duration of the walk, then restore.
+            // `package Foo { ... }` — record the block as a package
+            // range and set current_package for the walk, then
+            // restore. The block doesn't push a lexical scope on its
+            // own (children will, e.g. via subs/methods inside).
             self.add_fold_range(node);
+            self.push_block_package_range(name.clone(), node_to_span(node));
             self.current_package = Some(name);
             self.visit_children(node);
             self.current_package = prev_package;
         } else {
-            // `package Foo;` — the rest of the file (up to the next
-            // `package X;`) sits under this package. Set
-            // current_package for the remainder of this walk;
-            // open_sibling_scope handles the Scope-side bookkeeping.
+            // `package Foo;` — package context flows to the next
+            // sibling `package X;` / `class X;` or end of file.
+            // `package_ranges` carries that for `package_at`; the
+            // walk-time `current_package` drives synthesised
+            // sub/method packages. No lexical scope is pushed —
+            // `package Foo;` is not a lexical boundary in Perl.
             self.current_package = Some(name.clone());
-            self.open_sibling_scope(ScopeKind::Package, node.start_position(), Some(name));
+            self.open_statement_package_range(name, node.start_position());
         }
-    }
-
-    /// Close any currently-open Package/Class sibling scope at the top
-    /// of the stack, trimming its span to end at `close_at`. Used when a
-    /// later `package X;` / `class Y;` supersedes an earlier one.
-    fn close_sibling_scope_if_open(&mut self, close_at: Point) {
-        while let Some(&top) = self.scope_stack.last() {
-            let kind = &self.scopes[top.0 as usize].kind;
-            // Only non-block `package`/`class` scopes (tagged as
-            // `ScopeKind::Package`) are sibling scopes that get
-            // supplanted by a successor. Block-scoped Class stays
-            // pushed until its block ends.
-            if !matches!(kind, ScopeKind::Package) { break; }
-            self.scopes[top.0 as usize].span.end = close_at;
-            self.scope_stack.pop();
-        }
-    }
-
-    /// Open a Package/Class scope that flows until the next same-level
-    /// sibling or end of file. Prior sibling is closed at `start`. The
-    /// new scope's end is initially the FILE-level scope's end (acting
-    /// as "end of file") and gets trimmed if a successor appears.
-    fn open_sibling_scope(&mut self, kind: ScopeKind, start: Point, package: Option<String>) {
-        self.close_sibling_scope_if_open(start);
-        // Use the outer (file) scope's end as the default terminator.
-        let file_end = self
-            .scope_stack
-            .first()
-            .map(|id| self.scopes[id.0 as usize].span.end)
-            .unwrap_or(start);
-        let span = Span { start, end: file_end };
-        self.push_scope(kind, span, package);
     }
 
     fn visit_class(&mut self, node: Node<'a>) {
@@ -2050,6 +2062,7 @@ impl<'a> Builder<'a> {
             // Block class: push/pop scope, restore package after block
             self.add_fold_range(node);
             let prev_package = self.current_package.take();
+            self.push_block_package_range(name.clone(), node_to_span(node));
             self.current_package = Some(name.clone());
             self.push_scope(ScopeKind::Class { name: name.clone() }, node_to_span(node), Some(name));
             self.visit_children(node);
@@ -2057,12 +2070,11 @@ impl<'a> Builder<'a> {
             self.current_package = prev_package;
         } else {
             // Flat `class Foo;` — same semantics as non-block
-            // `package Foo;`: threads a sibling scope tagged as
-            // `ScopeKind::Package` so it flattens-in-outline and the
-            // class name flows via `scope.package`. The Class SYMBOL
-            // is still emitted above — this is just the scope.
+            // `package Foo;`: package context flows in
+            // `package_ranges`; no lexical scope is pushed. The
+            // Class SYMBOL was already emitted above.
             self.current_package = Some(name.clone());
-            self.open_sibling_scope(ScopeKind::Package, node.start_position(), Some(name));
+            self.open_statement_package_range(name, node.start_position());
         }
     }
 
@@ -2762,14 +2774,14 @@ impl<'a> Builder<'a> {
         // Don't recurse — use statements don't contain interesting sub-nodes
     }
 
-    /// Check if we're at package scope (file scope or package block, not inside a sub).
+    /// Check if we're at package scope (file scope or class block, not inside a sub).
     #[allow(dead_code)]
     fn is_package_scope(&self) -> bool {
         for &scope_id in self.scope_stack.iter().rev() {
             match &self.scopes[scope_id.0 as usize].kind {
-                ScopeKind::File | ScopeKind::Package { .. } => return true,
+                ScopeKind::File => return true,
                 ScopeKind::Sub { .. } | ScopeKind::Method { .. } => return false,
-                _ => continue, // blocks, for loops at package level are OK
+                _ => continue, // class/block/for-loop at package level are OK
             }
         }
         true // empty stack = file scope
@@ -5543,39 +5555,61 @@ impl<'a> Builder<'a> {
     // ---- Post-passes ----
 
     fn resolve_variable_refs(&mut self) {
-        // Build a temporary scope-to-symbols map for efficient lookup
-        let mut scope_symbols: std::collections::HashMap<ScopeId, Vec<(String, SymbolId, Point)>> =
-            std::collections::HashMap::new();
+        // Build a temporary scope-to-symbols map for efficient lookup.
+        //
+        // `gating_package` is `Some(pkg)` for `our` decls — they're
+        // package-globals with a lexical alias, so a use site only
+        // resolves to them when the use's enclosing package matches
+        // (`$Calculator::version` is reachable as bare `$version`
+        // only inside `package Calculator;`). It's `None` for `my` /
+        // `state` / `field`, which are pure-lexical: they resolve
+        // wherever the lexical scope chain reaches them, regardless
+        // of which `package X;` section the use sits under.
+        let mut scope_symbols: std::collections::HashMap<
+            ScopeId,
+            Vec<(String, SymbolId, Point, Option<String>)>,
+        > = std::collections::HashMap::new();
         for sym in &self.symbols {
             if matches!(sym.kind, SymKind::Variable | SymKind::Field) {
+                let gating_package = match &sym.detail {
+                    SymbolDetail::Variable { decl_kind: DeclKind::Our, .. } => sym.package.clone(),
+                    _ => None,
+                };
                 scope_symbols
                     .entry(sym.scope)
                     .or_default()
-                    .push((sym.name.clone(), sym.id, sym.span.start));
+                    .push((sym.name.clone(), sym.id, sym.span.start, gating_package));
             }
         }
 
-        for r in &mut self.refs {
-            if !matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) {
+        for idx in 0..self.refs.len() {
+            if !matches!(self.refs[idx].kind, RefKind::Variable | RefKind::ContainerAccess) {
                 continue;
             }
+            let ref_span_start = self.refs[idx].span.start;
+            let ref_target = self.refs[idx].target_name.clone();
+            let ref_scope = self.refs[idx].scope;
+
+            let use_pkg = self.package_at_pos(ref_span_start).map(|s| s.to_string());
 
             // Walk scope chain to find the innermost matching declaration
-            let mut current = Some(r.scope);
+            let mut current = Some(ref_scope);
             while let Some(scope_id) = current {
                 if let Some(symbols) = scope_symbols.get(&scope_id) {
-                    // Find the best match: declared before this ref, matching name
-                    let target_name = if matches!(r.kind, RefKind::ContainerAccess) {
-                        // Container refs need to match by base name, accounting for sigil differences
-                        &r.target_name
-                    } else {
-                        &r.target_name
-                    };
-                    if let Some((_, sym_id, _)) = symbols.iter()
-                        .filter(|(name, _, decl_point)| name == target_name && *decl_point <= r.span.start)
+                    // Find the best match: declared before this ref, matching name,
+                    // and (for `our`) sharing the use's enclosing package.
+                    if let Some((_, sym_id, _, _)) = symbols.iter()
+                        .filter(|(name, _, decl_point, gating_package)| {
+                            if name != &ref_target { return false; }
+                            if *decl_point > ref_span_start { return false; }
+                            match gating_package {
+                                Some(decl_pkg) => use_pkg.as_deref() == Some(decl_pkg.as_str()),
+                                None => true,
+                            }
+                        })
                         .last()
                     {
-                        r.resolves_to = Some(*sym_id);
+                        self.refs[idx].resolves_to = Some(*sym_id);
                         break;
                     }
                 }
@@ -5677,18 +5711,18 @@ impl<'a> Builder<'a> {
         // `self.current_package` for the `$self` / `shift` / `$_[0]`
         // fallback. After the live walk, `current_package` is stale
         // (= last package opened in the file). To make the typer
-        // package-correct at every assignment site, we set
-        // `self.current_package` to the enclosing scope's package
-        // (a stored field — `Scope.package`) around each call.
+        // package-correct at every assignment site, we query
+        // `package_ranges` for the package at the assignment's
+        // position and override `current_package` for the call.
         //
-        // Why scope.package and not "track package_statement nodes":
-        // `package X;` is a SIBLING of the subs that follow it in the
-        // AST, not a parent — its scope extends forward through
-        // siblings until the next `package`. Walking the AST and
-        // saving/restoring on package_statement entry/exit doesn't
-        // model that. The walk-time recorder already correctly
-        // attributes the right package to each scope; reading
-        // `scope.package` at post-walk time inherits that.
+        // Why `package_ranges` and not "track package_statement
+        // nodes": `package X;` is a SIBLING of the subs that follow
+        // it in the AST, not a parent — its scope extends forward
+        // through siblings until the next `package`. Walking the
+        // AST and saving/restoring on package_statement entry/exit
+        // doesn't model that. `package_ranges` is the flat record
+        // populated at walk time and trimmed by successor decls;
+        // a point-query gives the right answer at any byte.
         let mut to_push: Vec<(String, ScopeId, Span, InferredType)> = Vec::new();
 
         // Recurse the AST. For each assignment, find its enclosing
@@ -5725,18 +5759,7 @@ impl<'a> Builder<'a> {
                                 })
                                 .map(|(i, _)| i);
 
-                            // Walk scope chain to find the nearest enclosing package.
-                            let scope_pkg = scope_idx.and_then(|si| {
-                                let mut cur = Some(si);
-                                while let Some(i) = cur {
-                                    let s = &b.scopes[i];
-                                    if let Some(ref p) = s.package {
-                                        return Some(p.clone());
-                                    }
-                                    cur = s.parent.map(|pid| pid.0 as usize);
-                                }
-                                None
-                            });
+                            let scope_pkg = b.package_at_pos(span.start).map(|s| s.to_string());
 
                             let saved_pkg = b.current_package.clone();
                             if scope_pkg.is_some() {
@@ -12867,6 +12890,55 @@ print \"pi is $pi\\n\";
                 r.span.start, r.scope,
             );
         }
+    }
+
+    /// `our` is package-global with a lexical alias — bare `$version`
+    /// from a sibling `package main;` does NOT reach an `our $version`
+    /// declared under an earlier `package Calculator;` (you'd have to
+    /// spell `$Calculator::version`). The mirror of
+    /// `red_pin_my_resolves_across_statement_packages`: that test
+    /// guarantees `my` keeps crossing package boundaries; this one
+    /// guarantees `our` keeps NOT crossing them. Pinned now so the
+    /// scope-separation refactor — which moves variables onto the
+    /// real lexical scope tree — doesn't accidentally let `our` leak
+    /// across siblings the way it would if we forgot to keep `our`
+    /// attached to the package-context scope.
+    #[test]
+    fn red_pin_our_does_not_resolve_across_statement_packages() {
+        let src = "\
+package Calculator;
+our $version = 1;
+sub bump { $version++ }
+
+package main;
+print \"v=$version\\n\";
+";
+        let fa = build_fa(src);
+        let our_sym = fa.symbols.iter()
+            .find(|s| s.name == "$version" && s.kind == SymKind::Variable)
+            .expect("$version Variable symbol");
+        // Under Calculator the bare $version refs SHOULD resolve to
+        // the our-decl: that's the lexical alias half of `our`.
+        let bump_use = fa.refs.iter()
+            .find(|r| r.target_name == "$version" && r.span.start.row == 2)
+            .expect("ref inside Calculator's bump");
+        assert_eq!(
+            bump_use.resolves_to,
+            Some(our_sym.id),
+            "bare $version inside the same package as the `our` decl \
+             must still resolve to it (lexical alias)"
+        );
+        // Under `package main;` the bare $version must NOT resolve.
+        let main_use = fa.refs.iter()
+            .find(|r| r.target_name == "$version" && r.span.start.row == 5)
+            .expect("ref inside package main's print");
+        assert_eq!(
+            main_use.resolves_to,
+            None,
+            "bare $version under a sibling `package main;` must not \
+             reach Calculator's `our $version` — that's $Calculator::version, \
+             a different binding"
+        );
     }
 
     /// Caller-side `HashKeyAccess` for a method/function call's
