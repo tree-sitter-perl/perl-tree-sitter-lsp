@@ -518,6 +518,209 @@ fn plugin_override_priority_dominates_builder_inferred_type() {
     }
 }
 
+// ---- Phase 4: delegation reducers ---------------------------------
+//
+// `DelegationReducer` (`return Other(...)`) and
+// `SelfMethodTailReducer` (`shift->method(...)` tail) attach to
+// `Symbol(sub_id)` and chase their target via
+// `ReducerQuery::return_of`. They're dormant at query sites that
+// don't install a `return_of` closure (today's
+// `query_sub_return_type` / `query_variable_type`); these tests pin
+// the reducer-level contract so the worklist driver in Phase 6 can
+// drop them in without further changes.
+
+fn wsym_named(sym_id: u32, source: &str, payload: WitnessPayload) -> Witness {
+    Witness {
+        attachment: WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id)),
+        source: WitnessSource::Builder(source.into()),
+        payload,
+        span: span(0, 0, 0, 0),
+    }
+}
+
+#[test]
+fn delegation_reducer_claims_only_return_delegation_observations() {
+    let r = DelegationReducer;
+    // Positive: Symbol + ReturnDelegation matches.
+    assert!(r.claims(&wsym_named(
+        1,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    )));
+    // Negative: same payload on a non-Symbol attachment doesn't.
+    assert!(!r.claims(&wvar(
+        "$x",
+        0,
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    )));
+    // Negative: Symbol + a different observation doesn't match.
+    assert!(!r.claims(&wsym_named(
+        1,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("m".into())),
+    )));
+    // Negative: Symbol + InferredType (PluginOverride's domain) doesn't.
+    assert!(!r.claims(&wsym_named(
+        1,
+        "inferred",
+        WitnessPayload::InferredType(InferredType::HashRef),
+    )));
+}
+
+#[test]
+fn delegation_reducer_resolves_via_return_of_lookup() {
+    let sym_id = 5;
+    let mut bag = WitnessBag::new();
+    bag.push(wsym_named(
+        sym_id,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    ));
+    let lookup = |k: &ReturnOfKey| match k {
+        ReturnOfKey::Name(n) if n == "inner" => Some(InferredType::ClassName("Foo".into())),
+        _ => None,
+    };
+    let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id));
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: Some(&lookup),
+        arity_hint: None,
+    };
+    let claimed: Vec<&Witness> = bag
+        .for_attachment(&att)
+        .into_iter()
+        .filter(|w| DelegationReducer.claims(w))
+        .collect();
+    assert_eq!(
+        DelegationReducer.reduce(&claimed, &q),
+        ReducedValue::Type(InferredType::ClassName("Foo".into()))
+    );
+}
+
+#[test]
+fn delegation_reducer_declines_when_return_of_unset() {
+    // Without a `return_of` closure, the reducer can't chase the
+    // delegate's name to a type — it returns None. This is the
+    // dormant-at-query-time invariant Phase 4 relies on.
+    let sym_id = 5;
+    let mut bag = WitnessBag::new();
+    bag.push(wsym_named(
+        sym_id,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    ));
+    let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id));
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    let claimed: Vec<&Witness> = bag
+        .for_attachment(&att)
+        .into_iter()
+        .filter(|w| DelegationReducer.claims(w))
+        .collect();
+    assert_eq!(DelegationReducer.reduce(&claimed, &q), ReducedValue::None);
+}
+
+#[test]
+fn self_method_tail_reducer_claims_only_self_method_tail_observations() {
+    let r = SelfMethodTailReducer;
+    // Positive: Symbol + SelfMethodTail.
+    assert!(r.claims(&wsym_named(
+        2,
+        "self_method_tail",
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("get".into())),
+    )));
+    // Negative: ReturnDelegation is DelegationReducer's domain.
+    assert!(!r.claims(&wsym_named(
+        2,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    )));
+    // Negative: same payload on a Variable attachment doesn't match.
+    assert!(!r.claims(&wvar(
+        "$x",
+        0,
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("get".into())),
+    )));
+}
+
+#[test]
+fn self_method_tail_reducer_resolves_via_return_of_lookup() {
+    // `sub get { shift->_generate_route(...) }` — once
+    // `_generate_route`'s return type is known to `return_of`, `get`
+    // inherits it.
+    let sym_id = 9;
+    let mut bag = WitnessBag::new();
+    bag.push(wsym_named(
+        sym_id,
+        "self_method_tail",
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("_generate_route".into())),
+    ));
+    let lookup = |k: &ReturnOfKey| match k {
+        ReturnOfKey::Name(n) if n == "_generate_route" => {
+            Some(InferredType::ClassName("Mojolicious::Routes::Route".into()))
+        }
+        _ => None,
+    };
+    let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id));
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: Some(&lookup),
+        arity_hint: None,
+    };
+    let claimed: Vec<&Witness> = bag
+        .for_attachment(&att)
+        .into_iter()
+        .filter(|w| SelfMethodTailReducer.claims(w))
+        .collect();
+    assert_eq!(
+        SelfMethodTailReducer.reduce(&claimed, &q),
+        ReducedValue::Type(InferredType::ClassName(
+            "Mojolicious::Routes::Route".into()
+        ))
+    );
+}
+
+#[test]
+fn self_method_tail_reducer_declines_when_target_unknown() {
+    // `return_of` says "I have no answer for that name" — the reducer
+    // yields, letting the next iteration try (Phase 6 worklist
+    // driver requeues dependents).
+    let sym_id = 9;
+    let mut bag = WitnessBag::new();
+    bag.push(wsym_named(
+        sym_id,
+        "self_method_tail",
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("not_yet_typed".into())),
+    ));
+    let lookup = |_: &ReturnOfKey| None;
+    let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id));
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: Some(&lookup),
+        arity_hint: None,
+    };
+    let claimed: Vec<&Witness> = bag
+        .for_attachment(&att)
+        .into_iter()
+        .filter(|w| SelfMethodTailReducer.claims(w))
+        .collect();
+    assert_eq!(
+        SelfMethodTailReducer.reduce(&claimed, &q),
+        ReducedValue::None
+    );
+}
+
 #[test]
 fn plugin_override_reducer_yields_when_only_builder_witnesses_present() {
     // Plugin-priority short-circuit must not claim Builder-only

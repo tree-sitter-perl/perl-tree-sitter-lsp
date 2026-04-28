@@ -5901,29 +5901,44 @@ impl<'a> Builder<'a> {
         self.return_infos = infos;
     }
 
+    /// Phase 4 of the worklist refactor: this is the tiny driver. Each
+    /// step is a named helper below. The call-binding propagator and
+    /// hash-key-owner fixup are post-fold sync passes — they're
+    /// conceptually "not reducers" (per the spec) and stay procedural,
+    /// but factored out as named methods. Mirror reducers
+    /// (`DelegationReducer`, `SelfMethodTailReducer`,
+    /// `FluentArityDispatch` for arity, `PluginOverrideReducer`) live
+    /// in `witnesses.rs` and carry the same logic — Phase 6's worklist
+    /// driver will switch the loop bodies below to registry calls.
     fn resolve_return_types(&mut self) {
-        use crate::witnesses::{
-            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
-        };
+        let (returns_by_scope, arm_types_per_ri) = self.collect_return_arm_types();
+        self.emit_arity_return_witnesses(&arm_types_per_ri);
+        let (mut return_types, mut return_provenance) =
+            self.fold_per_sub_return_arms(&returns_by_scope);
+        self.seed_plugin_overrides_into_return_types(&mut return_types, &mut return_provenance);
+        self.propagate_via_delegation(&mut return_types, &mut return_provenance);
+        self.propagate_via_self_method_tails(&mut return_types, &mut return_provenance);
+        self.write_back_sub_return_types(&return_types, &return_provenance);
+        self.propagate_call_bindings_to_constraints(&return_types);
+        self.fixup_call_bound_hash_key_owners(&return_types);
+    }
 
-        // Group return arms by scope. Each arm is materialised:
-        //   - `return $var` → ask the bag (single, framework-aware fold).
-        //   - literal / constructor / arithmetic → use the type the
-        //     walk could read off directly.
-        // The bag is already populated by `populate_witness_bag()`, so
-        // every reducer rule (Part 6 framework, Part 5b branch arm,
-        // Part 6b arity dispatch) participates here at the SAME phase
-        // they participate at query time. One reduction, one place.
-        //
-        // While we're at it, emit `ArityReturn` witnesses with the
-        // *bag-resolved* per-arm type — the walk just classified the
-        // arity branch (no fold), so `FluentArityDispatch` sees the
-        // same rules everyone else does. Walk-time emission of
-        // ArityReturn would have baked in a collection-time fold,
-        // exactly the bug we just removed for `Symbol.return_type`.
+    /// Step 1: walk every recorded `ReturnInfo` and resolve each arm's
+    /// type — `return $var` consults the bag (single, framework-aware
+    /// fold via `var_type_via_bag`); literals / constructors / arithmetic
+    /// use the type the walk read off directly. Returns
+    /// `returns_by_scope` for the per-Sub fold (step 3) and a
+    /// per-`ReturnInfo` view for the arity-witness emitter (step 2).
+    /// Restores `self.return_infos` before returning so later steps can
+    /// iterate it again.
+    fn collect_return_arm_types(
+        &mut self,
+    ) -> (
+        std::collections::HashMap<ScopeId, Vec<InferredType>>,
+        Vec<Option<InferredType>>,
+    ) {
         let mut returns_by_scope: std::collections::HashMap<ScopeId, Vec<InferredType>> =
             std::collections::HashMap::new();
-        // Per-arm computed type (for the second-pass arity emission).
         let mut arm_types_per_ri: Vec<Option<InferredType>> =
             Vec::with_capacity(self.return_infos.len());
         let return_infos = std::mem::take(&mut self.return_infos);
@@ -5939,15 +5954,27 @@ impl<'a> Builder<'a> {
             }
             arm_types_per_ri.push(arm_type);
         }
+        self.return_infos = return_infos;
+        (returns_by_scope, arm_types_per_ri)
+    }
 
-        // ArityReturn is for arity-DISCRIMINATED subs. Only emit when
-        // a sub has at least one Zero/Exact arm — emitting Default in
-        // a sub that just has plain (possibly disagreeing) returns
-        // would make `FluentArityDispatch` answer with one arm even
-        // when `Symbol.return_type` correctly says "agreement failed".
+    /// Step 2: emit `ArityReturn` witnesses on `Symbol(sub_id)` — the
+    /// payload `FluentArityDispatch` (the spec's "ArityReturnReducer")
+    /// folds at query time. Only for arity-DISCRIMINATED subs (≥ 1
+    /// `Zero`/`Exact(_)` arm); plain subs don't emit, otherwise
+    /// `FluentArityDispatch` would answer with one arm even when the
+    /// per-arm fold says "agreement failed" (different arms differ).
+    /// Walk-time arity classification stays a `Some(_)` enum on
+    /// `ReturnInfo`; only the fold consults the bag-resolved arm type
+    /// from step 1.
+    fn emit_arity_return_witnesses(&mut self, arm_types_per_ri: &[Option<InferredType>]) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+
         let mut arity_discriminated_scopes: std::collections::HashSet<ScopeId> =
             std::collections::HashSet::new();
-        for ri in &return_infos {
+        for ri in &self.return_infos {
             if matches!(
                 ri.arity_branch,
                 Some(ArityBranch::Zero) | Some(ArityBranch::Exact(_))
@@ -5957,7 +5984,7 @@ impl<'a> Builder<'a> {
         }
 
         let mut arity_witnesses: Vec<Witness> = Vec::new();
-        for (ri, arm_type) in return_infos.iter().zip(arm_types_per_ri.iter()) {
+        for (ri, arm_type) in self.return_infos.iter().zip(arm_types_per_ri.iter()) {
             let Some(branch) = ri.arity_branch else { continue };
             if !arity_discriminated_scopes.contains(&ri.scope) {
                 continue;
@@ -5979,22 +6006,31 @@ impl<'a> Builder<'a> {
                 span: ri.span,
             });
         }
-        self.return_infos = return_infos;
         for w in arity_witnesses {
             self.bag.push(w);
         }
+    }
 
-        // For each Sub/Method scope, agree-or-None across arms.
+    /// Step 3: fold each Sub/Method scope's return arms into a single
+    /// type via `resolve_return_type` (1+ arms agree → `Some(t)`,
+    /// disagreement → `None`). Falls back to `last_expr_type` for subs
+    /// without explicit `return`s — Perl's last statement is the
+    /// implicit return. Provenance is recorded as `ReducerFold {
+    /// reducer: "return_arms" }` so `--dump-package` can answer "why
+    /// does this return X?".
+    fn fold_per_sub_return_arms(
+        &self,
+        returns_by_scope: &std::collections::HashMap<ScopeId, Vec<InferredType>>,
+    ) -> (
+        std::collections::HashMap<String, InferredType>,
+        std::collections::HashMap<String, crate::file_analysis::TypeProvenance>,
+    ) {
         let mut return_types: std::collections::HashMap<String, InferredType> =
             std::collections::HashMap::new();
-        // Per-sub provenance recorded as we derive types — surfaces
-        // in `--dump-package` so debugging answers "why does this
-        // return X?" without re-running the build. Keyed by sub name
-        // (matching `return_types`); flushed onto SymbolId in the
-        // write loop below. Plugin overrides keep their existing
-        // PluginOverride provenance — we don't touch overridden subs.
-        let mut return_provenance: std::collections::HashMap<String, crate::file_analysis::TypeProvenance> =
-            std::collections::HashMap::new();
+        let mut return_provenance: std::collections::HashMap<
+            String,
+            crate::file_analysis::TypeProvenance,
+        > = std::collections::HashMap::new();
 
         for scope in &self.scopes {
             let sub_name = match &scope.kind {
@@ -6012,7 +6048,9 @@ impl<'a> Builder<'a> {
                     let r = self.last_expr_type.get(&scope.id).and_then(|t| t.clone());
                     let ev = if r.is_some() {
                         vec!["last_expr".into()]
-                    } else { Vec::new() };
+                    } else {
+                        Vec::new()
+                    };
                     (r, ev)
                 }
             };
@@ -6028,20 +6066,34 @@ impl<'a> Builder<'a> {
                 );
             }
         }
+        (return_types, return_provenance)
+    }
 
-        // Seed Plugin overrides into `return_types` before delegation /
-        // self_method_tail propagation. Plugin-source `InferredType`
-        // witnesses on `Symbol(sym_id)` (pushed by
-        // `apply_type_overrides`) carry priority > Builder, so a
-        // priority-aware short-circuit dominates the per-arm fold
-        // above. Provenance was already written as `PluginOverride`
-        // by `apply_type_overrides`; clear any conflicting
-        // `return_provenance` entry so the writeback below doesn't
-        // clobber that with `ReducerFold`. Subs that delegate to an
-        // overridden sub inherit the override (the delegation pass
-        // sees `return_types[overridden] = override`).
+    /// Step 4: seed Plugin overrides into `return_types` before
+    /// delegation / self_method_tail propagation. Plugin-source
+    /// `InferredType` witnesses on `Symbol(sym_id)` (pushed by
+    /// `apply_type_overrides`) carry priority > Builder; the
+    /// `PluginOverrideReducer` short-circuit dominates the per-arm
+    /// fold above. Provenance was already written as `PluginOverride`
+    /// by `apply_type_overrides`; clear any conflicting
+    /// `return_provenance` entry so the writeback can't clobber that
+    /// with `ReducerFold`. Subs that delegate to an overridden sub
+    /// inherit the override (the delegation pass sees
+    /// `return_types[overridden] = override`).
+    fn seed_plugin_overrides_into_return_types(
+        &self,
+        return_types: &mut std::collections::HashMap<String, InferredType>,
+        return_provenance: &mut std::collections::HashMap<
+            String,
+            crate::file_analysis::TypeProvenance,
+        >,
+    ) {
+        use crate::witnesses::{WitnessAttachment, WitnessPayload};
+
         for sym in &self.symbols {
-            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                continue;
+            }
             let att = WitnessAttachment::Symbol(sym.id);
             let bag_override = self
                 .bag
@@ -6058,17 +6110,32 @@ impl<'a> Builder<'a> {
                 return_provenance.remove(&sym.name);
             }
         }
+    }
 
-        // Propagate return types through delegation chains. If sub X's body
-        // is `return Y()` (recorded in sub_return_delegations) and Y has a
-        // known return type, X inherits it. Iterate until no changes — chains
-        // converge in at most `delegations.len()` passes.
+    /// Step 5: propagate return types through delegation chains. If
+    /// sub X's body is `return Y()` (recorded in
+    /// `sub_return_delegations`) and Y has a known return type, X
+    /// inherits it. Iterate until no changes — chains converge in at
+    /// most `delegations.len()` passes; the 20-iter cap is a safety
+    /// net for unforeseen cycles. Mirrors `DelegationReducer` in
+    /// `witnesses.rs` (which uses `ReducerQuery::return_of` instead of
+    /// the in-progress `return_types` map).
+    fn propagate_via_delegation(
+        &self,
+        return_types: &mut std::collections::HashMap<String, InferredType>,
+        return_provenance: &mut std::collections::HashMap<
+            String,
+            crate::file_analysis::TypeProvenance,
+        >,
+    ) {
         let mut changed = true;
         let mut iters = 0;
         while changed && iters < 20 {
             changed = false;
             iters += 1;
-            let pairs: Vec<(String, String)> = self.sub_return_delegations.iter()
+            let pairs: Vec<(String, String)> = self
+                .sub_return_delegations
+                .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             for (delegator, delegate) in pairs {
@@ -6088,15 +6155,22 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+    }
 
-        // Self-method-tail propagation. Perl's last statement
-        // returns, so `sub get { shift->_generate_route(GET => @_) }`
-        // returns whatever `_generate_route` returns. Fixed-point
-        // iterate: if sub X's body-tail is `shift->M(...)` /
-        // `$self->M(...)` and M's return_type is now known, X
-        // inherits it.
-        //
-        // Build a scope_id → sub_name map for lookups.
+    /// Step 6: self-method-tail propagation. Perl's last statement
+    /// returns, so `sub get { shift->_generate_route(GET => @_) }`
+    /// returns whatever `_generate_route` returns. Same fixed-point
+    /// shape as delegation; mirrors `SelfMethodTailReducer`.
+    /// Self-recursion (`sub_name == tail_method`) is skipped — can't
+    /// infer your own return type from yourself.
+    fn propagate_via_self_method_tails(
+        &self,
+        return_types: &mut std::collections::HashMap<String, InferredType>,
+        return_provenance: &mut std::collections::HashMap<
+            String,
+            crate::file_analysis::TypeProvenance,
+        >,
+    ) {
         let scope_to_sub: std::collections::HashMap<ScopeId, String> = self
             .scopes
             .iter()
@@ -6123,10 +6197,10 @@ impl<'a> Builder<'a> {
                     None => continue,
                 };
                 if return_types.contains_key(&sub_name) {
-                    continue; // already resolved
+                    continue;
                 }
                 if sub_name == tail_method {
-                    continue; // direct self-recursion — can't infer
+                    continue;
                 }
                 if let Some(t) = return_types.get(&tail_method).cloned() {
                     return_types.insert(sub_name.clone(), t);
@@ -6141,87 +6215,84 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+    }
 
-        // Set return_type on matching Sub/Method symbols, and
-        // record the self-method tail shape for subs whose return
-        // type couldn't be collapsed in-file. Consumer side chains
-        // through `return_self_method` when `return_type` is None.
-        // Look up each sub's scope by matching the symbol's span
-        // against the sub scope's span.
-        let scope_by_sub_span: std::collections::HashMap<(Point, Point), ScopeId> = self
-            .scopes
-            .iter()
-            .filter(|s| matches!(s.kind, ScopeKind::Sub { .. } | ScopeKind::Method { .. }))
-            .map(|s| ((s.span.start, s.span.end), s.id))
-            .collect();
+    /// Step 7: writeback. Set `return_type` on matching Sub/Method
+    /// symbols, and record `return_self_method` for subs whose return
+    /// type couldn't be collapsed in-file (the consumer side chains
+    /// through `return_self_method` when `return_type` is None).
+    /// Plugin overrides flow through `return_types` via the bag-priority
+    /// seeding step, with `return_provenance` cleared so we don't
+    /// clobber the existing `PluginOverride` entry written by
+    /// `apply_type_overrides`. No special-case skip needed — overrides
+    /// win because they're higher-priority bag witnesses, not because
+    /// the writeback knows about them.
+    fn write_back_sub_return_types(
+        &mut self,
+        return_types: &std::collections::HashMap<String, InferredType>,
+        return_provenance: &std::collections::HashMap<
+            String,
+            crate::file_analysis::TypeProvenance,
+        >,
+    ) {
         for sym in &mut self.symbols {
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                // Plugin overrides flow through `return_types` via the
-                // bag-priority seeding step above, with `return_provenance`
-                // cleared so we don't clobber the existing
-                // `PluginOverride` entry written by
-                // `apply_type_overrides`. No special-case skip needed
-                // here — overrides win because they're higher-priority
-                // bag witnesses, not because the writeback knows about
-                // them.
-                if let SymbolDetail::Sub {
-                    ref mut return_type,
-                    ref mut return_self_method,
-                    ..
-                } = sym.detail
-                {
-                    if let Some(rt) = return_types.get(&sym.name) {
-                        *return_type = Some(rt.clone());
-                        // Flush provenance to the SymbolId-keyed map
-                        // so debug introspection (--dump-package) can
-                        // surface the inference chain. Only writes
-                        // for non-Inferred provenances; the default
-                        // (Inferred) is implicit via missing entry.
-                        if let Some(prov) = return_provenance.get(&sym.name) {
-                            self.type_provenance.insert(sym.id, prov.clone());
-                        }
-                    } else {
-                        // Couldn't resolve in-file. If the body
-                        // tails on `shift->M(...)` / `$self->M(...)`,
-                        // record M so cross-file resolution can chain
-                        // through at query time.
-                        let sub_scope = self
-                            .scopes
-                            .iter()
-                            .find(|s| {
-                                matches!(
-                                    &s.kind,
-                                    ScopeKind::Sub { name } | ScopeKind::Method { name }
-                                        if name == &sym.name
-                                )
-                                    && s.span.start >= sym.span.start
-                                    && s.span.end <= sym.span.end
-                            })
-                            .map(|s| s.id);
-                        if let Some(sid) = sub_scope {
-                            if let Some(m) = self.self_method_tails.get(&sid) {
-                                *return_self_method = Some(m.clone());
-                            }
-                        }
-                        let _ = &scope_by_sub_span;
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                continue;
+            }
+            let SymbolDetail::Sub {
+                ref mut return_type,
+                ref mut return_self_method,
+                ..
+            } = sym.detail
+            else {
+                continue;
+            };
+            if let Some(rt) = return_types.get(&sym.name) {
+                *return_type = Some(rt.clone());
+                if let Some(prov) = return_provenance.get(&sym.name) {
+                    self.type_provenance.insert(sym.id, prov.clone());
+                }
+            } else {
+                let sub_scope = self
+                    .scopes
+                    .iter()
+                    .find(|s| {
+                        matches!(
+                            &s.kind,
+                            ScopeKind::Sub { name } | ScopeKind::Method { name }
+                                if name == &sym.name
+                        ) && s.span.start >= sym.span.start
+                            && s.span.end <= sym.span.end
+                    })
+                    .map(|s| s.id);
+                if let Some(sid) = sub_scope {
+                    if let Some(m) = self.self_method_tails.get(&sid) {
+                        *return_self_method = Some(m.clone());
                     }
                 }
             }
         }
+    }
 
-        // Propagate return types to call sites via structural bindings
-        // recorded during the walk (my $cfg = get_config()). Push BOTH
-        // the legacy `TypeConstraint` and the corresponding `Variable`
-        // witness so the bag stays the source of truth — any later
-        // bag query about `$cfg` sees the call-resolved type without
-        // a separate sync pass.
-        // TODO: inline expression propagation (get_config()->{key}) is a separate
-        // code path — needs return type resolution at the expression level without
-        // a variable assignment. Not handled here.
+    /// Step 8: `CallBindingPropagator` (per Phase 4 spec — not a
+    /// witness reducer, just the bag-and-TC sync pass that runs after
+    /// the fold). For each `my $cfg = get_config()` binding recorded
+    /// during the walk, push BOTH the legacy `TypeConstraint` and the
+    /// corresponding `Variable` witness so any later bag query about
+    /// `$cfg` sees the call-resolved type without a separate sync pass.
+    /// Inline expression propagation (`get_config()->{key}` without an
+    /// intermediate variable) is a separate code path — not handled here.
+    fn propagate_call_bindings_to_constraints(
+        &mut self,
+        return_types: &std::collections::HashMap<String, InferredType>,
+    ) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+
         let mut new_constraints = Vec::new();
         let mut new_witnesses = Vec::new();
         for binding in &self.call_bindings {
-            let rt = return_types.get(&binding.func_name)
+            let rt = return_types
+                .get(&binding.func_name)
                 .cloned()
                 .or_else(|| builtin_return_type(&binding.func_name));
             if let Some(rt) = rt {
@@ -6238,7 +6309,10 @@ impl<'a> Builder<'a> {
                     },
                     source: WitnessSource::Builder("call_binding".into()),
                     payload: WitnessPayload::InferredType(rt),
-                    span: Span { start: binding.span.start, end: binding.span.start },
+                    span: Span {
+                        start: binding.span.start,
+                        end: binding.span.start,
+                    },
                 });
             }
         }
@@ -6246,38 +6320,53 @@ impl<'a> Builder<'a> {
         for w in new_witnesses {
             self.bag.push(w);
         }
+    }
 
-        // Fixup: update HashKeyAccess owners for variables bound to sub calls
-        // that return HashRef. Two normalizations beyond the naive name match:
-        //   1. Call names may be qualified (`Pkg::foo`) — strip the package
-        //      prefix since return_types and the symbol table key on the
-        //      bare name.
-        //   2. The bound func may itself just `return other()` — walk the
-        //      delegation chain to the sub that actually declares the hash
-        //      literal. Otherwise `sub chain { return get_config() }` leaves
-        //      `$cfg = chain(); $cfg->{host}` with an owner that has no
-        //      matching HashKeyDefs.
+    /// Step 9: hash-key-owner fixup for variables bound to sub calls
+    /// that return HashRef. Two normalizations beyond the naive name
+    /// match:
+    ///   1. Call names may be qualified (`Pkg::foo`) — strip the
+    ///      package prefix since `return_types` and the symbol table
+    ///      key on the bare name.
+    ///   2. The bound func may itself just `return other()` — walk
+    ///      the delegation chain to the sub that actually declares
+    ///      the hash literal. Otherwise `sub chain { return
+    ///      get_config() }` leaves `$cfg = chain(); $cfg->{host}`
+    ///      with an owner that has no matching HashKeyDefs.
+    fn fixup_call_bound_hash_key_owners(
+        &mut self,
+        return_types: &std::collections::HashMap<String, InferredType>,
+    ) {
         let bare = |s: &str| -> String { s.rsplit("::").next().unwrap_or(s).to_string() };
 
-        let binding_map: std::collections::HashMap<&str, String> = self.call_bindings.iter()
+        let binding_map: std::collections::HashMap<&str, String> = self
+            .call_bindings
+            .iter()
             .filter(|b| {
                 let name = bare(&b.func_name);
-                return_types.get(&name).map_or(false, |t| *t == InferredType::HashRef)
+                return_types
+                    .get(&name)
+                    .map_or(false, |t| *t == InferredType::HashRef)
             })
             .map(|b| (b.variable.as_str(), bare(&b.func_name)))
             .collect();
 
-        let sub_package: std::collections::HashMap<&str, Option<String>> = self.symbols.iter()
+        let sub_package: std::collections::HashMap<&str, Option<String>> = self
+            .symbols
+            .iter()
             .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
             .map(|s| (s.name.as_str(), s.package.clone()))
             .collect();
 
-        // Which subs have at least one HashKeyDef they actually own?
-        let subs_with_own_keys: std::collections::HashSet<String> = self.symbols.iter()
+        let subs_with_own_keys: std::collections::HashSet<String> = self
+            .symbols
+            .iter()
             .filter_map(|s| {
                 if let SymbolDetail::HashKeyDef {
-                    owner: HashKeyOwner::Sub { name, .. }, ..
-                } = &s.detail {
+                    owner: HashKeyOwner::Sub { name, .. },
+                    ..
+                } = &s.detail
+                {
                     Some(name.clone())
                 } else {
                     None
@@ -6285,16 +6374,23 @@ impl<'a> Builder<'a> {
             })
             .collect();
 
-        // Method-call bindings: `my $c = $obj->method()` (including dynamic
-        // `$obj->$m()` where $m was constant-folded during method_call_binding
-        // emission). Same ownership logic as function calls — point $c's
-        // hash-key accesses at the HashKeyDefs inside `method`.
-        let method_binding_map: std::collections::HashMap<&str, String> = self.method_call_bindings.iter()
+        // Method-call bindings: `my $c = $obj->method()` (including
+        // dynamic `$obj->$m()` where $m was constant-folded during
+        // method_call_binding emission). Same ownership logic as
+        // function calls — point $c's hash-key accesses at the
+        // HashKeyDefs inside `method`.
+        let method_binding_map: std::collections::HashMap<&str, String> = self
+            .method_call_bindings
+            .iter()
             .map(|mcb| (mcb.variable.as_str(), mcb.method_name.clone()))
             .collect();
 
         for r in &mut self.refs {
-            if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
+            if let RefKind::HashKeyAccess {
+                ref var_text,
+                ref mut owner,
+            } = r.kind
+            {
                 if let Some(func_name) = binding_map.get(var_text.as_str()) {
                     let resolved = walk_return_delegation_chain(
                         func_name,
@@ -6306,7 +6402,6 @@ impl<'a> Builder<'a> {
                         name: resolved,
                     });
                 } else if let Some(method_name) = method_binding_map.get(var_text.as_str()) {
-                    // Method call — does the method itself own hash keys?
                     let resolved = walk_return_delegation_chain(
                         method_name,
                         &self.sub_return_delegations,

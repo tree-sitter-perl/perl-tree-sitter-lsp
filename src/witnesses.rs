@@ -160,6 +160,20 @@ pub enum TypeObservation {
     /// returns `return_type`. `None` for `arg_count` means the
     /// fall-through / default branch. Attached to a `Symbol(sub_id)`.
     ArityReturn { arg_count: Option<u32>, return_type: InferredType },
+    /// "This sub's body is `return Other(...)`" — its return type is
+    /// whatever Other returns. The string carries Other's name; the
+    /// `DelegationReducer` chases it via `ReducerQuery::return_of`.
+    /// Attached to `Symbol(delegator_sub_id)`. Mirrors the
+    /// `Builder.sub_return_delegations` map; the map stays as an
+    /// internal lookup, the witness is the bag-side fact.
+    ReturnDelegation(String),
+    /// "This sub's body tail is `shift->method(...)` or
+    /// `$self->method(...)`" — Perl's last-statement-returns rule
+    /// means the sub returns whatever `method` returns on the same
+    /// receiver. The string carries the method name; the
+    /// `SelfMethodTailReducer` chases it via `ReducerQuery::return_of`.
+    /// Attached to `Symbol(sub_id)`. Mirrors `Builder.self_method_tails`.
+    SelfMethodTail(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -468,6 +482,11 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                     TypeObservation::ArityReturn { .. } => {
                         // Arity dispatch is a separate reducer.
                     }
+                    TypeObservation::ReturnDelegation(_)
+                    | TypeObservation::SelfMethodTail(_) => {
+                        // Sub-return delegation chains have their own
+                        // reducers (DelegationReducer / SelfMethodTailReducer).
+                    }
                     TypeObservation::ReturnOfName(n) => {
                         if let Some(f) = q.return_of {
                             if let Some(t) = f(&ReturnOfKey::Name(n.clone())) {
@@ -681,6 +700,99 @@ impl WitnessReducer for FluentArityDispatch {
     }
 }
 
+// ---- Sub-return delegation reducers ----
+//
+// These two reducers turn the `Builder.sub_return_delegations` and
+// `Builder.self_method_tails` maps into bag-side facts that the
+// registry can fold uniformly with everything else. Phase 4 of the
+// worklist refactor (docs/prompt-type-inference-worklist-refactor.md):
+// the procedural fixed-point loops in `resolve_return_types` push the
+// same maps as `ReturnDelegation` / `SelfMethodTail` observations on
+// `Symbol(sub_id)`. The reducers chase them via
+// `ReducerQuery::return_of`, which the registry caller must install
+// (Phase 6 will wire it in the worklist driver). Today the procedural
+// loops still own the build-time fixed point; the reducers stand
+// ready for the worklist driver to consume them without further
+// changes to the bag's contents.
+//
+// They claim narrowly (only their specific observation variant) so
+// they don't conflict with FluentArityDispatch / BranchArmFold on
+// the same `Symbol(_)` attachment.
+
+/// Sub X's body is `return Y(...)` — X returns whatever Y returns.
+pub struct DelegationReducer;
+
+impl WitnessReducer for DelegationReducer {
+    fn name(&self) -> &str {
+        "delegation"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::Symbol(_))
+            && matches!(
+                w.payload,
+                WitnessPayload::Observation(TypeObservation::ReturnDelegation(_))
+            )
+    }
+
+    fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
+        // Multiple ReturnDelegation observations on one symbol shouldn't
+        // happen (a sub has one tail expression), but if they do, take
+        // the first that resolves — matches the procedural loop's
+        // "first delegation that lands a type wins" behavior.
+        let lookup = match q.return_of {
+            Some(f) => f,
+            None => return ReducedValue::None,
+        };
+        for w in ws {
+            if let WitnessPayload::Observation(TypeObservation::ReturnDelegation(name)) =
+                &w.payload
+            {
+                if let Some(t) = lookup(&ReturnOfKey::Name(name.clone())) {
+                    return ReducedValue::Type(t);
+                }
+            }
+        }
+        ReducedValue::None
+    }
+}
+
+/// Sub X's body tail is `shift->method(...)` / `$self->method(...)` —
+/// Perl's last-statement-returns rule means X returns whatever
+/// `method` returns on the same receiver class.
+pub struct SelfMethodTailReducer;
+
+impl WitnessReducer for SelfMethodTailReducer {
+    fn name(&self) -> &str {
+        "self_method_tail"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::Symbol(_))
+            && matches!(
+                w.payload,
+                WitnessPayload::Observation(TypeObservation::SelfMethodTail(_))
+            )
+    }
+
+    fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
+        let lookup = match q.return_of {
+            Some(f) => f,
+            None => return ReducedValue::None,
+        };
+        for w in ws {
+            if let WitnessPayload::Observation(TypeObservation::SelfMethodTail(method)) =
+                &w.payload
+            {
+                if let Some(t) = lookup(&ReturnOfKey::Name(method.clone())) {
+                    return ReducedValue::Type(t);
+                }
+            }
+        }
+        ReducedValue::None
+    }
+}
+
 // ---- Named-sub return reducer ----
 //
 // Claims plain `InferredType` payloads on `NamedSub` attachments —
@@ -790,6 +902,14 @@ impl ReducerRegistry {
         r.register(Box::new(FrameworkAwareTypeFold));
         r.register(Box::new(BranchArmFold));
         r.register(Box::new(FluentArityDispatch));
+        // Phase 4: Symbol-attached delegation reducers. They only fire
+        // when `ReducerQuery::return_of` is installed; today's query
+        // sites don't install one, so they're dormant — Phase 6's
+        // worklist driver activates them. Registered now so the
+        // priority order is locked in (chained delegation → arity →
+        // arms) before the driver lands.
+        r.register(Box::new(DelegationReducer));
+        r.register(Box::new(SelfMethodTailReducer));
         r.register(Box::new(NamedSubReturn));
         r
     }
