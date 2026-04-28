@@ -122,20 +122,19 @@ pub fn build_with_plugins(
     build_with_plugins_inner(tree, source, plugins, false)
 }
 
-/// Test-only entry: build the file, then re-run the post-walk fold
-/// sequence (resolve_return_types → chain typing → return-arm refresh →
-/// second resolve_return_types → invocant-class refresh) one extra time
-/// before finalizing.
+/// Test-only entry: build the file, then re-run the worklist fold
+/// driver (`fold_to_fixed_point`) one extra time before finalizing.
 ///
-/// **Observable** idempotency holds today: the resulting `FileAnalysis`
-/// produces the same `Symbol.return_type`, the same `type_provenance`,
-/// and the same `sub_return_type_at_arity` answers as a plain
-/// `build_with_plugins(...)` call. **Witness count is not preserved**
-/// — `resolve_return_types` re-emits `ArityReturn` witnesses on every
-/// invocation, so an extra fold pass adds duplicates. The worklist
-/// driver in Phase 6 closes that gap by pushing each fact once and
-/// terminating when the lattice stops moving; until then this hook
-/// pins what the current pipeline actually guarantees.
+/// Since Phase 6, the fold is fully idempotent: the resulting
+/// `FileAnalysis` is byte-identical to a plain `build_with_plugins(...)`
+/// call — same `Symbol.return_type`, same `type_provenance`, same
+/// `sub_return_type_at_arity` answers, AND same witness counts and
+/// `type_constraints` shape. The two re-emittable passes inside
+/// `resolve_return_types` (arity-return emission, call-binding
+/// propagator) clear their prior outputs before re-emitting, so each
+/// fact lands in the bag exactly once regardless of iteration count.
+/// The `post_walk_fold_is_observably_idempotent` invariant test
+/// asserts the answer-level guarantee directly.
 #[cfg(test)]
 pub(crate) fn build_with_plugins_extra_re_fold(
     tree: &Tree,
@@ -251,53 +250,40 @@ fn build_with_plugins_inner(
     // this point the bag is the source of truth for the witness pipeline.
     b.populate_witness_bag();
 
-    // First fold: derive sub return types from the bag. Every reducer
-    // rule (framework / branch / arity) participates here. After this
-    // pass, return-shaped methods like `requires`, `to`, `name` are
-    // typed via the framework-aware fold; `_route` keeps its override.
-    b.resolve_return_types();
-
-    // ChainTypingReducer (Phase 5): the three former post-walk CST
-    // walks (assignment typing, return-arm refresh, invocant-class
-    // refresh) collapse into one shared index + one named reducer.
+    // Phase 6: worklist driver. Replaces the manually-ordered
+    // `fold → chain → fold → chain` sequence with one fixed-point
+    // loop over chain typing + reducer dispatch. Each iteration runs
+    // `ChainPassMode::PreFold` (assignment + return-arm refresh)
+    // followed by `resolve_return_types`; the loop exits when the
+    // snapshot of Sub/Method return types and `type_constraints`
+    // length stops moving. Invocant-class refresh runs once after
+    // the lattice settles.
     //
-    //   - Assignments + return arms run BEFORE the second fold so
-    //     fold-2 sees chain-typed variables (`return $route` reads
-    //     `$route`'s newly-pushed TC) and refreshed return arms.
-    //   - Invocant typing runs AFTER the second fold because chains
-    //     like `get_foo()->bar()` need `get_foo`'s return type, which
-    //     fold-2 finalizes (delegation cascades close on the second
-    //     pass). Invocants are query-time outputs (`Ref.invocant_class`)
-    //     so this is purely a write — fold-2 does not consume them.
+    // The two re-emittable passes inside `resolve_return_types`
+    // (arity-return witnesses, call-binding propagator) became
+    // clear-and-emit in this same commit, so the bag stays canonical
+    // regardless of how many iterations the loop runs — each fact
+    // lands exactly once at the end. Chain typing's TC-existence
+    // check keeps it idempotent on the same assignment span.
     //
-    // Same recursive typers as before (`resolve_invocant_class_tree`
-    // for assignments + invocants, `infer_return_value_type` for
-    // return arms); only the scheduling collapses. Phase 6 will lift
-    // the explicit pre/post split into a worklist driver.
+    // For shallow files (no through-chain dependencies on inferred
+    // sub return types) the loop terminates in two iterations: one
+    // to derive the initial fold answer, one to confirm stability.
+    // Deeper chains take more iterations; `MAX_FOLD_ITERATIONS`
+    // (debug-only) catches dependency-tracking bugs that would
+    // otherwise spin forever.
     let chain_idx = build_chain_typing_index(tree);
-    b.run_chain_typing_reducer(&chain_idx, ChainPassMode::PreFold);
+    b.fold_to_fixed_point(&chain_idx);
 
-    // Second fold: now that chain-assigned variables (`$route`) have
-    // typed bag entries AND return arms have been re-typed against
-    // the chain-populated TCs, subs whose return is `return …$route…` —
-    // most prominently `_generate_route` — fold correctly, and the
-    // tail-delegation propagation cascades to `get`/`post`/`put`/etc.
-    b.resolve_return_types();
-
-    // Post-fold invocant resolution. Method-call chains like
-    // `get_foo()->bar()` need `get_foo`'s return type to pin the
-    // receiver class of `->bar`; that return type comes from the
-    // second fold above plus any plugin overrides.
-    b.run_chain_typing_reducer(&chain_idx, ChainPassMode::PostFold);
-
-    // Test-only: re-run the post-walk fold sequence one more time to
-    // pin idempotency. Production callers always pass `false`; only
-    // `build_with_plugins_extra_re_fold` flips this on.
+    // Test-only: re-run the worklist fold one more time to pin
+    // idempotency. Production callers always pass `false`; only
+    // `build_with_plugins_extra_re_fold` flips this on. Re-running
+    // `fold_to_fixed_point` against a settled state should land in
+    // 1 iteration (loop sees `prev == cur` immediately) and produce
+    // a byte-identical FileAnalysis — including witness counts,
+    // unlike the pre-Phase-6 pipeline.
     if extra_re_fold {
-        b.resolve_return_types();
-        b.run_chain_typing_reducer(&chain_idx, ChainPassMode::PreFold);
-        b.resolve_return_types();
-        b.run_chain_typing_reducer(&chain_idx, ChainPassMode::PostFold);
+        b.fold_to_fixed_point(&chain_idx);
     }
 
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
@@ -5770,6 +5756,88 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Phase 6: replace the manually-ordered `fold → chain → fold`
+    /// sequence with a fixed-point loop. Each iteration runs
+    /// `ChainPassMode::PreFold` (assignment typing + return-arm refresh)
+    /// followed by `resolve_return_types` (the reducer-dispatch driver
+    /// from Phase 4); when the snapshot of Sub/Method return types and
+    /// the `type_constraints` length stops moving, the lattice has
+    /// settled and the loop exits.
+    ///
+    /// The two re-emittable passes inside `resolve_return_types`
+    /// (arity-return witnesses, call-binding propagator) are
+    /// **clear-and-emit**: they drop their prior outputs at the start
+    /// of every call so the bag stays canonical regardless of how many
+    /// iterations the loop runs. Chain typing's TC-existence check
+    /// keeps it idempotent on the same span. The result: each fact
+    /// lands in the bag exactly once at the end of the loop, no matter
+    /// how deep the chain is.
+    ///
+    /// `MAX_FOLD_ITERATIONS` is the debug-only safety net the spec
+    /// calls for: the lattice argument (witnesses are monotonically
+    /// appended; reduced answers refine within a finite enum)
+    /// guarantees termination, and the assertion catches dependency
+    /// tracking bugs that would otherwise spin forever.
+    ///
+    /// `ChainPassMode::PostFold` (invocant-class refresh on
+    /// `MethodCall` refs) runs once after the loop terminates, since
+    /// invocant typing is a query-time write that doesn't feed back
+    /// into the bag — a single pass against the now-final symbol
+    /// table is sufficient.
+    fn fold_to_fixed_point(&mut self, idx: &ChainTypingIndex<'a>) {
+        const MAX_FOLD_ITERATIONS: usize = 64;
+        let mut iters = 0usize;
+        let mut prev = self.fold_state_snapshot();
+        loop {
+            iters += 1;
+            debug_assert!(
+                iters < MAX_FOLD_ITERATIONS,
+                "type-inference fold did not converge in {iters} iterations — \
+                 lattice argument or dependency tracking is broken"
+            );
+            self.run_chain_typing_reducer(idx, ChainPassMode::PreFold);
+            self.resolve_return_types();
+            let cur = self.fold_state_snapshot();
+            if cur == prev {
+                break;
+            }
+            prev = cur;
+        }
+        self.run_chain_typing_reducer(idx, ChainPassMode::PostFold);
+    }
+
+    /// Snapshot of the answers the worklist driver tracks for fixed
+    /// point detection: every Sub/Method's return type + the
+    /// `type_constraints` length. Two consecutive iterations producing
+    /// the same snapshot means no fold pass changed any sub's answer
+    /// AND chain typing pushed no new TCs — the lattice has settled.
+    ///
+    /// Excludes bag length on purpose: the re-emittable passes inside
+    /// `resolve_return_types` (arity, call-binding) are now
+    /// clear-and-emit, so their bag contribution is stable across
+    /// iterations. The only monotonic-grower is chain typing's TCs,
+    /// which the `type_constraints.len()` term captures.
+    fn fold_state_snapshot(&self) -> (Vec<(SymbolId, Option<InferredType>, Option<String>)>, usize) {
+        let mut answers: Vec<(SymbolId, Option<InferredType>, Option<String>)> = self
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .map(|s| {
+                let (rt, rsm) = match &s.detail {
+                    SymbolDetail::Sub {
+                        return_type,
+                        return_self_method,
+                        ..
+                    } => (return_type.clone(), return_self_method.clone()),
+                    _ => (None, None),
+                };
+                (s.id, rt, rsm)
+            })
+            .collect();
+        answers.sort_by_key(|(id, _, _)| id.0);
+        (answers, self.type_constraints.len())
+    }
+
     /// Symbolically execute the rhs of every `my $X = <expr>` and
     /// push the resulting class type into the bag (and
     /// `type_constraints`). ONE recursive typer
@@ -6027,10 +6095,18 @@ impl<'a> Builder<'a> {
     /// Walk-time arity classification stays a `Some(_)` enum on
     /// `ReturnInfo`; only the fold consults the bag-resolved arm type
     /// from step 1.
+    ///
+    /// Idempotent across re-runs — clears every prior `arity_detection`
+    /// witness from the bag before re-emitting. The worklist driver
+    /// calls `resolve_return_types` repeatedly until fixed point;
+    /// without this clear-and-emit, each iteration would duplicate
+    /// every arity witness in the bag.
     fn emit_arity_return_witnesses(&mut self, arm_types_per_ri: &[Option<InferredType>]) {
         use crate::witnesses::{
             TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
         };
+
+        self.bag.remove_by_source_tag("arity_detection");
 
         let mut arity_discriminated_scopes: std::collections::HashSet<ScopeId> =
             std::collections::HashSet::new();
@@ -6342,11 +6418,28 @@ impl<'a> Builder<'a> {
     /// `$cfg` sees the call-resolved type without a separate sync pass.
     /// Inline expression propagation (`get_config()->{key}` without an
     /// intermediate variable) is a separate code path — not handled here.
+    ///
+    /// Idempotent across re-runs — clears every prior `call_binding`
+    /// witness from the bag and drops any matching TC before
+    /// re-emitting. The worklist driver calls `resolve_return_types`
+    /// repeatedly until fixed point; without this clear-and-emit, each
+    /// iteration would duplicate the (variable, scope, span) TCs and
+    /// Variable witnesses for every binding.
     fn propagate_call_bindings_to_constraints(
         &mut self,
         return_types: &std::collections::HashMap<String, InferredType>,
     ) {
         use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+
+        self.bag.remove_by_source_tag("call_binding");
+        let cb_keys: std::collections::HashSet<(String, ScopeId, Span)> = self
+            .call_bindings
+            .iter()
+            .map(|b| (b.variable.clone(), b.scope, b.span))
+            .collect();
+        self.type_constraints.retain(|tc| {
+            !cb_keys.contains(&(tc.variable.clone(), tc.scope, tc.constraint_span))
+        });
 
         let mut new_constraints = Vec::new();
         let mut new_witnesses = Vec::new();

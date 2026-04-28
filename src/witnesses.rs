@@ -282,6 +282,26 @@ impl WitnessBag {
         self.rebuild_index();
     }
 
+    /// Drop every witness whose source is `WitnessSource::Builder(tag)`
+    /// and rebuild the index. Returns the number of witnesses removed.
+    /// Used by re-emittable builder passes (arity-return emission,
+    /// call-binding propagator) inside the worklist driver: each pass
+    /// clears its prior outputs at the start of every fold iteration so
+    /// the bag stays canonical (no duplicates) regardless of how many
+    /// times the fold runs to reach fixed point.
+    pub fn remove_by_source_tag(&mut self, tag: &str) -> usize {
+        let before = self.witnesses.len();
+        self.witnesses.retain(|w| match &w.source {
+            WitnessSource::Builder(s) => s != tag,
+            _ => true,
+        });
+        let removed = before - self.witnesses.len();
+        if removed > 0 {
+            self.rebuild_index();
+        }
+        removed
+    }
+
     pub fn len(&self) -> usize {
         self.witnesses.len()
     }

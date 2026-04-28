@@ -40,32 +40,29 @@ fn build_with_extra_re_fold(source: &str, plugins: Arc<PluginRegistry>) -> FileA
 
 // ---- Test 1: convergence over reassignment chains --------------------------
 
-/// Two-hop reassignment chain (`make → a`): `sub a { my $x = make()->step;
-/// return $x }`. Resolving `a` requires three things to all land in the
-/// right order:
-///   1. The first `resolve_return_types` fold types `make` (returns
-///      `Foo`) and `Foo::step` (returns `Foo`).
-///   2. `run_chain_typing_reducer(PreFold)` walks the chain
-///      `make()->step` and types `$x` as `Foo` (assignment apply step).
-///   3. The same reducer pass also re-evaluates `return $x` against
-///      the now-typed `$x` (return-arm apply step), then the **second**
-///      `resolve_return_types` fold collapses `a`'s arms to
-///      `ClassName(Foo)`.
+/// Four-hop reassignment chain (`make → a → b → c → d`): each link is
+/// `sub <n> { my $x = <prev>()->step; return $x }`. Resolving `d`
+/// requires the chain typer + return-type fold to converge through
+/// every intermediate link, since each rhs reads the previous sub's
+/// return type to type its `$x` and then to fold its own return.
 ///
-/// Delete any of the three and `a` collapses to `None`. That's the
-/// teeth: this test fails compellingly if the second-fold call is
-/// removed (or if chain typing is skipped).
+/// The pre-Phase-6 pipeline ran exactly two `resolve_return_types`
+/// folds with one chain-typing pass between them, so deep chains
+/// silently bottomed out at depth 1: the second fold could pick up
+/// `a`'s type from `make`, but `b` (which depends on `a`) was never
+/// re-folded with the chain-typed `$x`. Phase 6's worklist driver
+/// loops chain typing + reducer dispatch to fixed point, so every
+/// hop converges regardless of depth.
 ///
-/// **Depth note.** Empirically the current pipeline reaches **one
-/// reassignment hop**. A `b` link (`my $x = a()->step; return $x`)
-/// fails today because the chain-typing reducer's PreFold pass runs
-/// *before* the second fold and can't see `a`'s type at chain-typing
-/// time. The
-/// spec's depth=4 probe was over-optimistic about today's behavior;
-/// once Phase 6 lands the worklist driver, this test should be lifted
-/// to deeper chains as a regression check on the new convergence path.
+/// **Teeth.** Delete the `fold_to_fixed_point` loop body and replace
+/// it with a single-pass `chain → fold`, and `b` / `c` / `d` collapse
+/// to `None` while `make` / `a` still resolve. Re-introduce the loop
+/// and they all come back. The depth chosen here (4) is comfortably
+/// past the 2-pass threshold the previous implementation could
+/// service; raise if a future regression somehow restores accidental
+/// 4-pass scheduling.
 #[test]
-fn convergence_chain_resolves_through_one_reassignment_hop() {
+fn convergence_chain_resolves_through_four_reassignment_hops() {
     let source = r#"
         package Foo;
         sub new { my ($class) = @_; return bless {}, $class }
@@ -73,18 +70,21 @@ fn convergence_chain_resolves_through_one_reassignment_hop() {
 
         package main;
         sub make { return Foo->new }
-        sub a { my $x = make()->step;     return $x }
+        sub a { my $x = make()->step; return $x }
+        sub b { my $x = a()->step;    return $x }
+        sub c { my $x = b()->step;    return $x }
+        sub d { my $x = c()->step;    return $x }
     "#;
     let fa = build_with(source, super::default_plugin_registry());
 
-    for name in ["make", "a"] {
+    for name in ["make", "a", "b", "c", "d"] {
         assert_eq!(
             fa.sub_return_type_at_arity(name, None),
             Some(InferredType::ClassName("Foo".into())),
             "chain link `{name}` should resolve to ClassName(Foo); \
-             got {:?}. The post-walk fold's two-pass shape is what \
-             carries this — if this fails, chain typing or the \
-             second resolve_return_types call has regressed.",
+             got {:?}. Phase 6's worklist driver is what carries deep \
+             chains — if this fails, `fold_to_fixed_point` has \
+             regressed to the pre-Phase-6 two-pass shape.",
             fa.sub_return_type_at_arity(name, None)
         );
     }
@@ -178,21 +178,23 @@ fn plugin_override_survives_all_folds() {
 
 // ---- Test 3: idempotent re-fold (observable fixed-point property) ---------
 
-/// Pins that the post-walk fold sequence is **observably** a fixed
+/// Pins that the post-walk fold sequence is a structural fixed
 /// point — running it once more changes no answer the type-query API
-/// returns, no Symbol's `return_type`, and no `type_provenance` entry.
-/// Compares two builds of the same source: one through the standard
-/// pipeline, one with an extra post-walk fold sandwiched in
-/// (`build_with_plugins_extra_re_fold`).
+/// returns, no Symbol's `return_type`, no `type_provenance` entry,
+/// AND adds zero witnesses to the bag. Compares two builds of the
+/// same source: one through the standard pipeline, one with an extra
+/// post-walk fold sandwiched in (`build_with_plugins_extra_re_fold`).
 ///
-/// **Witness count is *not* compared.** Today's `resolve_return_types`
-/// re-emits `ArityReturn` witnesses on every invocation (it doesn't
-/// track which it has already pushed), so an extra fold pass adds
-/// duplicates without changing any reducer's answer. The spec's
-/// stronger "no witness was duplicated" assertion is the worklist
-/// driver's promise (Phase 6) — by construction it pushes each fact
-/// once and terminates when the lattice stops moving. Tightening this
-/// test to assert exact witness equality is a Phase 6 follow-up.
+/// **Phase 6 tightening.** Before the worklist driver landed, an
+/// extra fold pass duplicated every `ArityReturn` and call-binding
+/// witness in the bag, so this test could only check answers (return
+/// types + provenance) and not witness counts. The Phase 6 driver
+/// makes the two re-emittable passes inside `resolve_return_types`
+/// (`emit_arity_return_witnesses`, `propagate_call_bindings_to_constraints`)
+/// clear-and-emit: each iteration drops its prior outputs before
+/// re-emitting, so the bag has the same witnesses regardless of how
+/// many times the fold runs. This test now asserts exact witness
+/// equality, closing the gap the earlier docstring called out.
 #[test]
 fn post_walk_fold_is_observably_idempotent() {
     // A fixture with enough shape to exercise the major reducers:
@@ -278,6 +280,27 @@ fn post_walk_fold_is_observably_idempotent() {
             sym.name, a, b
         );
     }
+
+    // Phase 6 strengthening: bag size and `type_constraints` length
+    // must be byte-identical across single-fold and double-fold runs.
+    // The worklist driver's clear-and-emit invariant (each iteration
+    // truncates its own prior outputs before re-emitting) is what
+    // makes this hold; the pre-Phase-6 pipeline duplicated arity +
+    // call-binding witnesses on every extra fold pass, which is why
+    // this assertion didn't exist before.
+    assert_eq!(
+        fa_once.witnesses.len(),
+        fa_twice.witnesses.len(),
+        "extra fold pass must not change witness count — \
+         Phase 6's clear-and-emit invariant has regressed"
+    );
+    assert_eq!(
+        fa_once.type_constraints.len(),
+        fa_twice.type_constraints.len(),
+        "extra fold pass must not change type_constraints length — \
+         the call-binding propagator's clear-and-emit invariant has \
+         regressed"
+    );
 }
 
 // ---- Test 4: provenance accessor + serde round-trip -------------------------
