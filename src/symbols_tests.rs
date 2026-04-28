@@ -2222,13 +2222,13 @@ fn test_demo_chain_empirical_truth_table() {
     // The chain pin. With:
     //   - mojo-routes plugin's `_route` override pinning the
     //     return type inference can't reach, AND
-    //   - the unified post-walk `type_assignments_into_bag` pass
+    //   - the post-walk `ChainTypingReducer` (PreFold mode)
     //     symbolically executing every `my $X = <expr>` rhs (no
     //     "is it a chain" branch — same recursion every consumer
     //     uses), AND
-    //   - a refresh of return-arm types before the second
-    //     fold so `_generate_route`'s ternary return picks up
-    //     the now-typed `$route`,
+    //   - the same reducer's return-arm refresh running before the
+    //     second fold so `_generate_route`'s ternary return picks
+    //     up the now-typed `$route`,
     // the full `$r->get(...)->to(...)` chain resolves end-to-end.
     // Each link is pinned individually so a regression localizes
     // to a specific hop instead of "the chain broke".

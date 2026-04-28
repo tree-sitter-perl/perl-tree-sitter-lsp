@@ -31,6 +31,82 @@ pub fn default_plugin_registry() -> Arc<PluginRegistry> {
     }).clone()
 }
 
+/// Single CST walk that powers the post-walk `ChainTypingReducer`
+/// (Phase 5 of the type-inference worklist refactor). Replaces three
+/// independent tree walks at the old steps 7/8/10:
+///
+/// - `assignment_nodes` — every `assignment_expression`, used to type
+///   `my $X = <rhs>` (and bare `$X = …`) via `resolve_invocant_class_tree`.
+/// - `return_nodes` — every `return_expression`, indexed by span so
+///   the return-arm refresh can match it back to a `ReturnInfo`.
+/// - `invocant_nodes` — every `method_call_expression`'s invocant,
+///   indexed by span so the post-fold invocant-class refresh can
+///   find the right node for a `MethodCall` ref's `invocant_span`.
+///
+/// Built once per `build_with_plugins_inner` call and consumed by both
+/// `ChainPassMode::PreFold` and `ChainPassMode::PostFold` invocations
+/// of the reducer.
+struct ChainTypingIndex<'a> {
+    assignment_nodes: Vec<Node<'a>>,
+    return_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
+    invocant_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
+}
+
+/// Which chain-typing tasks the reducer should apply on this call.
+///
+/// `PreFold` runs between the two `resolve_return_types` calls —
+/// assignments and return arms feed the second fold (assignments via
+/// `var_type_via_bag` for `return $var`; return arms directly through
+/// `return_infos`). Invocants are query-time outputs (`Ref.invocant_class`)
+/// and don't influence the fold, so they wait until after every sub
+/// return type is resolved.
+///
+/// `PostFold` runs once after the second `resolve_return_types` and
+/// types method-call invocants (e.g. the `get_foo` in `get_foo()->bar()`)
+/// using the now-final symbol table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChainPassMode {
+    PreFold,
+    PostFold,
+}
+
+/// Walk the tree once, indexing the three node kinds the chain-typing
+/// reducer cares about. Pure: reads only tree-sitter structural data,
+/// no Builder state. Same recursion shape (depth-first via
+/// `named_child(i)`) the three former independent walks all used.
+fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
+    let mut idx = ChainTypingIndex {
+        assignment_nodes: Vec::new(),
+        return_nodes: std::collections::HashMap::new(),
+        invocant_nodes: std::collections::HashMap::new(),
+    };
+    fn walk<'t>(node: Node<'t>, idx: &mut ChainTypingIndex<'t>) {
+        match node.kind() {
+            "assignment_expression" => {
+                idx.assignment_nodes.push(node);
+            }
+            "return_expression" => {
+                idx.return_nodes
+                    .insert((node.start_position(), node.end_position()), node);
+            }
+            "method_call_expression" => {
+                if let Some(inv) = node.child_by_field_name("invocant") {
+                    idx.invocant_nodes
+                        .insert((inv.start_position(), inv.end_position()), inv);
+                }
+            }
+            _ => {}
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i) {
+                walk(c, idx);
+            }
+        }
+    }
+    walk(tree.root_node(), &mut idx);
+    idx
+}
+
 /// Build a FileAnalysis from a parsed tree in a single walk.
 pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     build_with_plugins(tree, source, default_plugin_registry())
@@ -181,28 +257,25 @@ fn build_with_plugins_inner(
     // typed via the framework-aware fold; `_route` keeps its override.
     b.resolve_return_types();
 
-    // Symbolically execute every `my $X = <expr>` and push the result
-    // into the bag. ONE recursive typer (`resolve_invocant_class_tree`)
-    // handles whatever shape the rhs is — scalar, method-call chain,
-    // bareword, shift idiom, function call. No "is it a chain" branch.
-    // The result lands as both a `TypeConstraint` and a `Variable`
-    // witness, so the bag sees it like any other observation.
+    // ChainTypingReducer (Phase 5): the three former post-walk CST
+    // walks (assignment typing, return-arm refresh, invocant-class
+    // refresh) collapse into one shared index + one named reducer.
     //
-    // Why now: the rhs of an assignment may walk through other subs'
-    // return types (`my $route = $self->_route(...)->requires(...)->to(...)`).
-    // Those return types only exist after the first fold above plus
-    // the override pass, so the typer must run AFTER both.
-    b.type_assignments_into_bag(tree);
-
-    // Refresh walk-time return-arm typings. `ReturnInfo.inferred_type`
-    // was computed during the walk against an empty `type_constraints`
-    // table — `return $route->name(...)` couldn't be typed because
-    // `$route` had no TC yet. Now that the chain pass has populated
-    // every assigned variable, re-walk each return expression with
-    // the same typer the walk used; whatever resolves now resolves
-    // for keeps. Same code path as walk-time typing — just rerun
-    // against the richer state.
-    b.refresh_return_arm_types(tree);
+    //   - Assignments + return arms run BEFORE the second fold so
+    //     fold-2 sees chain-typed variables (`return $route` reads
+    //     `$route`'s newly-pushed TC) and refreshed return arms.
+    //   - Invocant typing runs AFTER the second fold because chains
+    //     like `get_foo()->bar()` need `get_foo`'s return type, which
+    //     fold-2 finalizes (delegation cascades close on the second
+    //     pass). Invocants are query-time outputs (`Ref.invocant_class`)
+    //     so this is purely a write — fold-2 does not consume them.
+    //
+    // Same recursive typers as before (`resolve_invocant_class_tree`
+    // for assignments + invocants, `infer_return_value_type` for
+    // return arms); only the scheduling collapses. Phase 6 will lift
+    // the explicit pre/post split into a worklist driver.
+    let chain_idx = build_chain_typing_index(tree);
+    b.run_chain_typing_reducer(&chain_idx, ChainPassMode::PreFold);
 
     // Second fold: now that chain-assigned variables (`$route`) have
     // typed bag entries AND return arms have been re-typed against
@@ -211,22 +284,20 @@ fn build_with_plugins_inner(
     // tail-delegation propagation cascades to `get`/`post`/`put`/etc.
     b.resolve_return_types();
 
-    // Post-pass 4: re-resolve invocant classes on MethodCall refs now
-    // that sub return types are known. Function-call chains like
+    // Post-fold invocant resolution. Method-call chains like
     // `get_foo()->bar()` need `get_foo`'s return type to pin the
     // receiver class of `->bar`; that return type comes from the
-    // bag-aware fold in post-pass 3 plus any post-pass-3b overrides.
-    b.resolve_invocant_classes_post_pass(tree);
+    // second fold above plus any plugin overrides.
+    b.run_chain_typing_reducer(&chain_idx, ChainPassMode::PostFold);
 
     // Test-only: re-run the post-walk fold sequence one more time to
     // pin idempotency. Production callers always pass `false`; only
     // `build_with_plugins_extra_re_fold` flips this on.
     if extra_re_fold {
         b.resolve_return_types();
-        b.type_assignments_into_bag(tree);
-        b.refresh_return_arm_types(tree);
+        b.run_chain_typing_reducer(&chain_idx, ChainPassMode::PreFold);
         b.resolve_return_types();
-        b.resolve_invocant_classes_post_pass(tree);
+        b.run_chain_typing_reducer(&chain_idx, ChainPassMode::PostFold);
     }
 
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
@@ -5661,54 +5732,40 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Post-pass: re-resolve `invocant_class` on every MethodCall ref
-    /// using the tree + the now-final symbol table (return types
-    /// have been filled in by `resolve_return_types`). This catches
-    /// function-call chains like `get_foo()->bar()` where the
-    /// invocant's class can only be pinned after `get_foo`'s
-    /// return_type is known.
+    /// Phase 5 of the worklist refactor: the three post-walk CST walks
+    /// (assignment typing, return-arm refresh, invocant-class refresh)
+    /// collapse into one **ChainTypingReducer**. A single CST walk
+    /// builds a `ChainTypingIndex` (assignment, return-expression, and
+    /// invocant nodes by span); the reducer drains the index in two
+    /// modes — `PreFold` between the two `resolve_return_types` calls
+    /// (assignments + return arms feed fold-2), `PostFold` after the
+    /// second fold (invocants are query-time outputs and need every
+    /// sub return type resolved).
     ///
-    /// Walks the tree: for each node whose byte span matches a
-    /// MethodCall ref's `invocant_span`, re-runs
-    /// `resolve_invocant_class_tree` and updates the ref in-place.
-    /// Refs whose class was already pinned during the walk keep
-    /// their value.
-    fn resolve_invocant_classes_post_pass(&mut self, tree: &Tree) {
-        use std::collections::HashMap;
-        // Index invocant nodes by (start_point, end_point) for
-        // O(1) lookup against ref.invocant_span.
-        let mut node_by_points: HashMap<(Point, Point), Node<'_>> = HashMap::new();
-        fn walk<'t>(node: Node<'t>, out: &mut HashMap<(Point, Point), Node<'t>>) {
-            if node.kind() == "method_call_expression" {
-                if let Some(inv) = node.child_by_field_name("invocant") {
-                    out.insert((inv.start_position(), inv.end_position()), inv);
-                }
+    /// The recursive typer (`resolve_invocant_class_tree` for
+    /// assignments + invocants, `infer_return_value_type` for return
+    /// arms) is unchanged — only the scheduling collapses. Step 6's
+    /// first invocation feeds chain types via the same path; step 9
+    /// (still the second hardcoded fold call) re-runs and picks up any
+    /// chain types that needed the first fold to land. Phase 6 will
+    /// replace the explicit pre/post split with a worklist driver.
+    ///
+    /// Idempotent across both calls — assignments skip if a TC already
+    /// exists, return arms only upgrade `None → Some`, invocants skip
+    /// if `invocant_class` is already pinned. Running the reducer twice
+    /// in `PostFold` mode would type strictly the same set as one call.
+    fn run_chain_typing_reducer(
+        &mut self,
+        idx: &ChainTypingIndex<'a>,
+        mode: ChainPassMode,
+    ) {
+        match mode {
+            ChainPassMode::PreFold => {
+                self.apply_chain_typing_assignments(idx);
+                self.apply_chain_typing_return_arms(idx);
             }
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    walk(c, out);
-                }
-            }
-        }
-        walk(tree.root_node(), &mut node_by_points);
-
-        // Collect ref indices + their invocant nodes first so we
-        // don't borrow `self.refs` mutably while also calling
-        // `resolve_invocant_class_tree` (which reads `&self`).
-        let mut pending: Vec<(usize, Node<'_>)> = Vec::new();
-        for (idx, r) in self.refs.iter().enumerate() {
-            if let RefKind::MethodCall { invocant_class, invocant_span: Some(sp), .. } = &r.kind {
-                if invocant_class.is_some() { continue; }
-                if let Some(n) = node_by_points.get(&(sp.start, sp.end)).copied() {
-                    pending.push((idx, n));
-                }
-            }
-        }
-        for (idx, node) in pending {
-            if let Some(class) = self.resolve_invocant_class_tree(node) {
-                if let RefKind::MethodCall { invocant_class, .. } = &mut self.refs[idx].kind {
-                    *invocant_class = Some(class);
-                }
+            ChainPassMode::PostFold => {
+                self.apply_chain_typing_invocants(idx);
             }
         }
     }
@@ -5732,102 +5789,77 @@ impl<'a> Builder<'a> {
     /// `WitnessSource::Builder("chain_assignment")` so a future debug
     /// dump can answer "why does $X have this type?" without
     /// re-running the typer.
-    fn type_assignments_into_bag(&mut self, tree: &'a Tree) {
+    ///
+    /// Reads from the shared `ChainTypingIndex.assignment_nodes` (built
+    /// by `build_chain_typing_index`); does not walk the tree itself.
+    ///
+    /// The recursive typer (`resolve_invocant_class_tree`) uses
+    /// `self.current_package` for the `$self` / `shift` / `$_[0]`
+    /// fallback. After the live walk, `current_package` is stale
+    /// (= last package opened in the file). To make the typer
+    /// package-correct at every assignment site, we query
+    /// `package_ranges` for the package at the assignment's
+    /// position and override `current_package` for the call.
+    ///
+    /// Why `package_ranges` and not "track package_statement
+    /// nodes": `package X;` is a SIBLING of the subs that follow
+    /// it in the AST, not a parent — its scope extends forward
+    /// through siblings until the next `package`. Walking the
+    /// AST and saving/restoring on package_statement entry/exit
+    /// doesn't model that. `package_ranges` is the flat record
+    /// populated at walk time and trimmed by successor decls;
+    /// a point-query gives the right answer at any byte.
+    fn apply_chain_typing_assignments(&mut self, idx: &ChainTypingIndex<'a>) {
         use crate::witnesses::{
             TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
         };
-        // Two-pass: collect first, then push. The collector borrows
-        // &self (so the recursive class typer can read symbols /
-        // type_constraints); push goes through the same shape as
-        // `populate_witness_bag` (TC + bag witness in lockstep) so the
-        // bag stays the single source of truth.
-        //
-        // What counts as "an assignment to a variable":
-        //   - `my $X = …` (variable_declaration lhs)
-        //   - `my ($x) = …` (paren-list — first var)
-        //   - `$X = …` / `@X = …` / `%X = …` (no `my`)
-        // No filter on the rhs shape — whatever it is, the recursive
-        // typer either resolves it to a class or doesn't. No "is it a
-        // chain" branch.
-        //
-        // The recursive typer (`resolve_invocant_class_tree`) uses
-        // `self.current_package` for the `$self` / `shift` / `$_[0]`
-        // fallback. After the live walk, `current_package` is stale
-        // (= last package opened in the file). To make the typer
-        // package-correct at every assignment site, we query
-        // `package_ranges` for the package at the assignment's
-        // position and override `current_package` for the call.
-        //
-        // Why `package_ranges` and not "track package_statement
-        // nodes": `package X;` is a SIBLING of the subs that follow
-        // it in the AST, not a parent — its scope extends forward
-        // through siblings until the next `package`. Walking the
-        // AST and saving/restoring on package_statement entry/exit
-        // doesn't model that. `package_ranges` is the flat record
-        // populated at walk time and trimmed by successor decls;
-        // a point-query gives the right answer at any byte.
+
         let mut to_push: Vec<(String, ScopeId, Span, InferredType)> = Vec::new();
-
-        // Recurse the AST. For each assignment, find its enclosing
-        // scope, set `self.current_package` to that scope's package,
-        // type the rhs, push the result.
-        fn walk<'b, 'a: 'b>(
-            b: &'b mut Builder<'a>,
-            node: Node<'a>,
-            out: &mut Vec<(String, ScopeId, Span, InferredType)>,
-        ) {
-            if node.kind() == "assignment_expression" {
-                if let (Some(left), Some(right)) = (
-                    node.child_by_field_name("left"),
-                    node.child_by_field_name("right"),
-                ) {
-                    if let Some(var) = b.get_var_text_from_lhs(left) {
-                        let span = node_to_span(node);
-                        let already_typed = b.type_constraints.iter().any(|tc| {
-                            tc.variable == var && tc.constraint_span.start == span.start
-                        });
-                        if !already_typed {
-                            // Find the innermost scope containing this assignment.
-                            let scope_idx = b
-                                .scopes
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, s)| crate::file_analysis::contains_point(&s.span, span.start))
-                                .min_by_key(|(_, s)| {
-                                    let r = (s.span.end.row.saturating_sub(s.span.start.row)) as u64;
-                                    let c = if s.span.start.row == s.span.end.row {
-                                        s.span.end.column.saturating_sub(s.span.start.column) as u64
-                                    } else { 0 };
-                                    r * 1_000_000 + c
-                                })
-                                .map(|(i, _)| i);
-
-                            let scope_pkg = b.package_at_pos(span.start).map(|s| s.to_string());
-
-                            let saved_pkg = b.current_package.clone();
-                            if scope_pkg.is_some() {
-                                b.current_package = scope_pkg;
-                            }
-                            let class_opt = b.resolve_invocant_class_tree(right);
-                            b.current_package = saved_pkg;
-
-                            if let Some(class) = class_opt {
-                                let sid = scope_idx
-                                    .map(|i| b.scopes[i].id)
-                                    .unwrap_or(ScopeId(0));
-                                out.push((var, sid, span, InferredType::ClassName(class)));
-                            }
-                        }
-                    }
-                }
+        for &node in &idx.assignment_nodes {
+            let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) else { continue };
+            let Some(var) = self.get_var_text_from_lhs(left) else { continue };
+            let span = node_to_span(node);
+            let already_typed = self
+                .type_constraints
+                .iter()
+                .any(|tc| tc.variable == var && tc.constraint_span.start == span.start);
+            if already_typed {
+                continue;
             }
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    walk(b, c, out);
-                }
+            // Innermost scope containing this assignment.
+            let scope_idx = self
+                .scopes
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| crate::file_analysis::contains_point(&s.span, span.start))
+                .min_by_key(|(_, s)| {
+                    let r = (s.span.end.row.saturating_sub(s.span.start.row)) as u64;
+                    let c = if s.span.start.row == s.span.end.row {
+                        s.span.end.column.saturating_sub(s.span.start.column) as u64
+                    } else {
+                        0
+                    };
+                    r * 1_000_000 + c
+                })
+                .map(|(i, _)| i);
+
+            let scope_pkg = self.package_at_pos(span.start).map(|s| s.to_string());
+
+            let saved_pkg = self.current_package.clone();
+            if scope_pkg.is_some() {
+                self.current_package = scope_pkg;
+            }
+            let class_opt = self.resolve_invocant_class_tree(right);
+            self.current_package = saved_pkg;
+
+            if let Some(class) = class_opt {
+                let sid = scope_idx.map(|i| self.scopes[i].id).unwrap_or(ScopeId(0));
+                to_push.push((var, sid, span, InferredType::ClassName(class)));
             }
         }
-        walk(self, tree.root_node(), &mut to_push);
 
         for (variable, scope, constraint_span, ty) in to_push {
             self.type_constraints.push(TypeConstraint {
@@ -5873,25 +5905,15 @@ impl<'a> Builder<'a> {
     /// Only upgrades `None` → `Some` — never downgrades. The walk
     /// already pinned literal/constructor/agree-arm cases; we don't
     /// want a partial second-pass result to overwrite them.
-    fn refresh_return_arm_types(&mut self, tree: &Tree) {
-        use std::collections::HashMap;
-        let mut nodes_by_span: HashMap<(Point, Point), Node<'_>> = HashMap::new();
-        fn walk<'t>(node: Node<'t>, out: &mut HashMap<(Point, Point), Node<'t>>) {
-            if node.kind() == "return_expression" {
-                out.insert((node.start_position(), node.end_position()), node);
-            }
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    walk(c, out);
-                }
-            }
-        }
-        walk(tree.root_node(), &mut nodes_by_span);
-
+    ///
+    /// Reads from the shared `ChainTypingIndex.return_nodes`.
+    fn apply_chain_typing_return_arms(&mut self, idx: &ChainTypingIndex<'a>) {
         let mut infos = std::mem::take(&mut self.return_infos);
         for ri in &mut infos {
-            if ri.inferred_type.is_some() { continue; }
-            if let Some(node) = nodes_by_span.get(&(ri.span.start, ri.span.end)) {
+            if ri.inferred_type.is_some() {
+                continue;
+            }
+            if let Some(node) = idx.return_nodes.get(&(ri.span.start, ri.span.end)) {
                 let new_type = self.infer_return_value_type(*node);
                 if new_type.is_some() {
                     ri.inferred_type = new_type;
@@ -5899,6 +5921,44 @@ impl<'a> Builder<'a> {
             }
         }
         self.return_infos = infos;
+    }
+
+    /// Re-resolve `invocant_class` on every MethodCall ref using the
+    /// tree + the now-final symbol table (return types have been
+    /// filled in by the second `resolve_return_types`). This catches
+    /// function-call chains like `get_foo()->bar()` where the
+    /// invocant's class can only be pinned after `get_foo`'s
+    /// return_type is known.
+    ///
+    /// Reads from the shared `ChainTypingIndex.invocant_nodes`. Refs
+    /// whose class was already pinned during the walk keep their value.
+    fn apply_chain_typing_invocants(&mut self, idx: &ChainTypingIndex<'a>) {
+        // Collect ref indices + their invocant nodes first so we
+        // don't borrow `self.refs` mutably while also calling
+        // `resolve_invocant_class_tree` (which reads `&self`).
+        let mut pending: Vec<(usize, Node<'a>)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            if let RefKind::MethodCall {
+                invocant_class,
+                invocant_span: Some(sp),
+                ..
+            } = &r.kind
+            {
+                if invocant_class.is_some() {
+                    continue;
+                }
+                if let Some(n) = idx.invocant_nodes.get(&(sp.start, sp.end)).copied() {
+                    pending.push((i, n));
+                }
+            }
+        }
+        for (i, node) in pending {
+            if let Some(class) = self.resolve_invocant_class_tree(node) {
+                if let RefKind::MethodCall { invocant_class, .. } = &mut self.refs[i].kind {
+                    *invocant_class = Some(class);
+                }
+            }
+        }
     }
 
     /// Phase 4 of the worklist refactor: this is the tiny driver. Each

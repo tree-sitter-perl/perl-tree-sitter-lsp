@@ -45,11 +45,12 @@ fn build_with_extra_re_fold(source: &str, plugins: Arc<PluginRegistry>) -> FileA
 /// right order:
 ///   1. The first `resolve_return_types` fold types `make` (returns
 ///      `Foo`) and `Foo::step` (returns `Foo`).
-///   2. `type_assignments_into_bag` walks the chain `make()->step` and
-///      types `$x` as `Foo`.
-///   3. `refresh_return_arm_types` re-evaluates `return $x` against the
-///      now-typed `$x`, then the **second** `resolve_return_types` fold
-///      collapses `a`'s arms to `ClassName(Foo)`.
+///   2. `run_chain_typing_reducer(PreFold)` walks the chain
+///      `make()->step` and types `$x` as `Foo` (assignment apply step).
+///   3. The same reducer pass also re-evaluates `return $x` against
+///      the now-typed `$x` (return-arm apply step), then the **second**
+///      `resolve_return_types` fold collapses `a`'s arms to
+///      `ClassName(Foo)`.
 ///
 /// Delete any of the three and `a` collapses to `None`. That's the
 /// teeth: this test fails compellingly if the second-fold call is
@@ -57,8 +58,9 @@ fn build_with_extra_re_fold(source: &str, plugins: Arc<PluginRegistry>) -> FileA
 ///
 /// **Depth note.** Empirically the current pipeline reaches **one
 /// reassignment hop**. A `b` link (`my $x = a()->step; return $x`)
-/// fails today because `type_assignments_into_bag` runs *before* the
-/// second fold and can't see `a`'s type at chain-typing time. The
+/// fails today because the chain-typing reducer's PreFold pass runs
+/// *before* the second fold and can't see `a`'s type at chain-typing
+/// time. The
 /// spec's depth=4 probe was over-optimistic about today's behavior;
 /// once Phase 6 lands the worklist driver, this test should be lifted
 /// to deeper chains as a regression check on the new convergence path.
