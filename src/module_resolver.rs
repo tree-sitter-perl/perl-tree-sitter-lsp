@@ -484,11 +484,18 @@ fn resolve_and_parse_inner(
         return None;
     }
 
+    let bench = std::env::var_os("PERL_LSP_BENCH").is_some();
+    let bench_start = if bench { Some(std::time::Instant::now()) } else { None };
+
     let path = resolve_module_path(inc_paths, module_name)?;
     let metadata = std::fs::metadata(&path).ok()?;
     if metadata.len() > 1_000_000 {
+        if let Some(start) = bench_start {
+            eprintln!("bench\t{}\t{}\toversize\t{}", module_name, start.elapsed().as_micros(), metadata.len());
+        }
         return None;
     }
+    let bytes = metadata.len();
     let source = std::fs::read_to_string(&path).ok()?;
     let tree = parser.parse(&source, None)?;
 
@@ -512,7 +519,12 @@ fn resolve_and_parse_inner(
         }
     }
 
-    Some(Arc::new(CachedModule::new(path, Arc::new(analysis))))
+    let symbols = analysis.symbols.len();
+    let result = Arc::new(CachedModule::new(path, Arc::new(analysis)));
+    if let Some(start) = bench_start {
+        eprintln!("bench\t{}\t{}\t{}\t{}", module_name, start.elapsed().as_micros(), symbols, bytes);
+    }
+    Some(result)
 }
 
 // ---- @INC discovery ----
