@@ -1,0 +1,93 @@
+# Default curated grab-bag for type-correctness QA.
+# Lines starting with `#` and blank lines are ignored.
+# Supplement with `shuf -n N qa-workspace/modules.list` for a random tail.
+
+# Frameworks (Mojo writers stress B1, fluent setters)
+Mojo::URL
+Mojo::DOM
+Mojo::File
+Mojo::Headers
+Mojo::Message
+Mojo::UserAgent
+Mojo::IOLoop
+Mojo::Server
+Mojo::Transaction
+Mojo::Cookie
+Mojo::Date
+Mojo::Log
+Mojo::ByteStream
+Mojo::Collection
+Mojolicious::Controller
+Mojolicious::Plugins
+Mojolicious::Routes
+
+# Roles
+Role::Tiny
+Moose::Role
+Moo::Role
+
+# Async / control flow
+Try::Tiny
+Future
+Future::PP
+AnyEvent
+
+# XS-heavy / pp wrappers
+Scalar::Util
+List::Util
+JSON::PP
+Encode
+
+# Functional / unusual idioms
+List::MoreUtils
+Path::Tiny
+Type::Tiny
+
+# Plain OO (non-framework)
+URI
+HTTP::Tiny
+Net::SMTP
+Net::FTP
+Time::Piece
+Storable
+Term::ANSIColor
+
+# Indirect-package idiom
+Future::Exception
+Future::Utils
+
+# Platform-dispatch idiom
+File::Spec
+File::Spec::Unix
+
+# Old-school
+CGI
+Carp
+Data::Dumper
+POSIX
+
+# Test family
+Test::Builder
+Test::More
+Test::Deep
+Test2::API
+Test2::Compare
+Test2::Hub
+
+# HTTP
+HTTP::Request
+HTTP::Response
+LWP::UserAgent
+
+# Heavy
+DateTime
+DateTime::TimeZone
+Math::BigInt
+Math::BigFloat
+Math::Complex
+
+# Pod
+Pod::Simple
+
+# Misc
+CPAN::Meta
