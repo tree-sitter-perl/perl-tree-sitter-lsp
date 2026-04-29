@@ -469,6 +469,21 @@ pub fn resolve_and_parse(
     module_name: &str,
     parser: &mut Parser,
 ) -> Option<Arc<CachedModule>> {
+    let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+    resolve_and_parse_inner(inc_paths, module_name, parser, &mut visiting)
+}
+
+fn resolve_and_parse_inner(
+    inc_paths: &[PathBuf],
+    module_name: &str,
+    parser: &mut Parser,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Option<Arc<CachedModule>> {
+    if !visiting.insert(module_name.to_string()) {
+        // Cycle in `@ISA` parent fallback — bail rather than blow the stack.
+        return None;
+    }
+
     let path = resolve_module_path(inc_paths, module_name)?;
     let metadata = std::fs::metadata(&path).ok()?;
     if metadata.len() > 1_000_000 {
@@ -485,7 +500,7 @@ pub fn resolve_and_parse(
     if analysis.export.is_empty() && analysis.export_ok.is_empty() {
         let parents = crate::module_index::primary_package_parents(&analysis, module_name);
         for parent in &parents {
-            if let Some(parent_cached) = resolve_and_parse(inc_paths, parent, parser) {
+            if let Some(parent_cached) = resolve_and_parse_inner(inc_paths, parent, parser, visiting) {
                 if !parent_cached.analysis.export.is_empty()
                     || !parent_cached.analysis.export_ok.is_empty()
                 {
