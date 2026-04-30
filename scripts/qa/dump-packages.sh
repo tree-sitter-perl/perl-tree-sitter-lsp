@@ -23,7 +23,8 @@ while IFS= read -r pkg; do
   case "$pkg" in '#'*) continue ;; esac
   safe=$(printf '%s' "$pkg" | sed 's/::/__/g')
   out="$WS/dumps/${safe}.json"
-  "$BIN" --dump-package "$WS" "$pkg" 2>/dev/null > "$out"
+  # tolerate non-zero exit (e.g. package not in @INC) — checked via empty output
+  "$BIN" --dump-package "$WS" "$pkg" 2>/dev/null > "$out" || true
   if [ -s "$out" ]; then
     ok=$((ok+1))
   else
