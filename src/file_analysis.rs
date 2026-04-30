@@ -560,6 +560,18 @@ pub enum TypeProvenance {
     /// _generate_route which the framework-aware reducer typed as
     /// ClassName(Route)".
     Delegation { kind: String, via: String },
+    /// Core framework synthesis — Mojo::Base / Moo / Moose `has`,
+    /// DBIx::Class `add_columns` / `has_many` / etc. The accessor
+    /// has no source body to fold; the type comes directly from the
+    /// declaration shape (Mojo writers always return the invocant;
+    /// Moo getters honour `isa`; DBIC relationships return the
+    /// related class). `framework` names the rule set
+    /// ("Mojo::Base" / "Moo" / "Moose" / "DBIx::Class") and
+    /// `reason` describes the specific accessor ("`has 'level'`
+    /// fluent writer", "DBIx::Class row relationship `book`").
+    /// Distinct from `PluginOverride` because plugins are user-installed
+    /// and configurable; framework synthesis is built into the analyzer.
+    FrameworkSynthesis { framework: String, reason: String },
 }
 
 /// Resolve a return type from a list of inferred types (one per return statement).

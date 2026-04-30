@@ -226,11 +226,44 @@ impl FrameworkFact {
 /// Lightweight attachment-indexed bag. Kept separate from the raw
 /// witness vec so callers can iterate all witnesses for one attachment
 /// without scanning. Indexes are rebuilt on demand.
-#[derive(Debug, Default, Serialize, Deserialize)]
+///
+/// `index` is `serde(skip)` (cheap to recompute, redundant on disk),
+/// but every consumer that loads a `FileAnalysis` from bincode (the
+/// SQLite cache, the dump-package debug tool, the cross-file enrichment
+/// pass, …) routes through `Deserialize`. The custom `Deserialize` impl
+/// rebuilds the index so `for_attachment` queries answer correctly on
+/// the deserialized bag — without it, every reducer claims an empty
+/// witness slice and the bag silently returns `None`. Symptom: a
+/// freshly-built `FileAnalysis` answers correctly, but the same bytes
+/// after a serialize/deserialize round-trip don't. `--dump-package`'s
+/// own bincode copy hit exactly this.
+#[derive(Debug, Default, Serialize)]
 pub struct WitnessBag {
     witnesses: Vec<Witness>,
-    #[serde(skip, default)]
+    #[serde(skip)]
     index: HashMap<WitnessAttachment, Vec<usize>>,
+}
+
+impl<'de> Deserialize<'de> for WitnessBag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Helper struct mirrors the on-disk shape (just the witness
+        // vec — `index` is recomputed). Without an explicit helper the
+        // derived impl would expect both fields and fail bincode loads.
+        #[derive(Deserialize)]
+        struct WitnessBagOnDisk {
+            witnesses: Vec<Witness>,
+        }
+        let on_disk = WitnessBagOnDisk::deserialize(deserializer)?;
+        let mut bag = WitnessBag {
+            witnesses: on_disk.witnesses,
+            index: HashMap::new(),
+        };
+        bag.rebuild_index();
+        Ok(bag)
+    }
 }
 
 impl WitnessBag {
@@ -683,11 +716,23 @@ impl WitnessReducer for FluentArityDispatch {
     }
 
     fn claims(&self, w: &Witness) -> bool {
-        matches!(w.attachment, WitnessAttachment::Symbol(_))
-            && matches!(
-                w.payload,
-                WitnessPayload::Observation(TypeObservation::ArityReturn { .. })
-            )
+        // Two attachment shapes carry `ArityReturn` observations:
+        //   - `Symbol(_)` — single sub with internal arity branches
+        //     (`return X unless @_; return Y;`), one Symbol id, one
+        //     witness per arm.
+        //   - `NamedSub(_)` — multiple Symbol ids share a logical name
+        //     (Mojo::Base / Moo `has` synthesizes a getter and writer
+        //     under the same method name). Per-Symbol witnesses can't
+        //     dispatch across distinct symbols, so the framework
+        //     synthesis publishes name-keyed observations and this
+        //     reducer folds them at query time.
+        matches!(
+            w.attachment,
+            WitnessAttachment::Symbol(_) | WitnessAttachment::NamedSub(_)
+        ) && matches!(
+            w.payload,
+            WitnessPayload::Observation(TypeObservation::ArityReturn { .. })
+        )
     }
 
     fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
@@ -1003,17 +1048,16 @@ pub fn query_sub_return_type(
         if let ReducedValue::Type(t) = reg.query(bag, &q) {
             return Some(t);
         }
-        // Fall back to the symbol's stored `return_type` — written
-        // by the bag-aware fold during build, so this is consistent.
-        if let crate::file_analysis::SymbolDetail::Sub { return_type, .. } = &sym.detail {
-            if let Some(t) = return_type {
-                return Some(t.clone());
-            }
-        }
     }
-    // Imported / cross-file: NamedSub attachment carries the type
-    // pushed by `enrich_imported_types_with_keys`. Same registry,
-    // same reducers — no parallel lookup.
+    // Name-keyed multi-dispatch and cross-file imports both ride
+    // `NamedSub` — frameworks like Mojo::Base publish per-arity
+    // observations on the logical name (one getter + one writer share
+    // it), and `enrich_imported_types_with_keys` mirrors imported
+    // return types here. We query this BEFORE falling back to the
+    // local symbol's stored `return_type`, otherwise the first matching
+    // Symbol's type would pre-empt the multi-dispatch answer (e.g.
+    // `level(1)` would return the getter's String instead of the
+    // writer's invocant ClassName).
     let att = WitnessAttachment::NamedSub(sub_name.to_string());
     let q = ReducerQuery {
         attachment: &att,
@@ -1024,6 +1068,17 @@ pub fn query_sub_return_type(
     };
     if let ReducedValue::Type(t) = reg.query(bag, &q) {
         return Some(t);
+    }
+    // Final fallback: the local symbol's stored `return_type`. This
+    // covers plain subs whose return came from the per-arm fold and
+    // got written back to `Symbol.return_type` directly, with no
+    // name-keyed observations published.
+    if let Some(sym) = local_sym {
+        if let crate::file_analysis::SymbolDetail::Sub { return_type, .. } = &sym.detail {
+            if let Some(t) = return_type {
+                return Some(t.clone());
+            }
+        }
     }
     None
 }
