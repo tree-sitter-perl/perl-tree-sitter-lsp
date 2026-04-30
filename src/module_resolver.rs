@@ -83,6 +83,12 @@ pub fn spawn_resolver(
             // Track which extract version each module was resolved at.
             let mut seen: HashMap<String, i64> = HashMap::new();
 
+            // One parser + one parent-fallback memo for the whole sweep.
+            // Without the memo, every child whose own exports are empty re-parses
+            // its parent (e.g. ~50× Exporter, ~30× URI on a cold cpanfile run).
+            let mut parser = create_parser();
+            let mut parse_memo: ParseMemo = HashMap::new();
+
             // Queue cpanfile dependencies (non-blocking — lets priority items go first).
             // Track total for progress reporting in the main loop.
             let mut cpanfile_total = 0usize;
@@ -141,11 +147,13 @@ pub fn spawn_resolver(
                     let is_re_resolve = stale_modules.contains_key(&module_name);
                     if is_re_resolve {
                         log::info!("Re-resolving stale module '{}'", module_name);
+                        // Stale entry must not be served from the run-local memo.
+                        parse_memo.remove(&module_name);
                     } else {
                         log::info!("Resolving module '{}'", module_name);
                     }
 
-                    let result = parse_module(&inc_paths, &module_name);
+                    let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
                     match &result {
                         Some(m) => log::info!(
                             "Resolved '{}': {} export, {} export_ok",
@@ -329,6 +337,8 @@ pub fn spawn_test_resolver(
             }
 
             let mut seen: HashMap<String, i64> = HashMap::new();
+            let mut parser = create_parser();
+            let mut parse_memo: ParseMemo = HashMap::new();
             loop {
                 let batch = drain_next_batch(&queue);
                 for module_name in batch {
@@ -338,8 +348,11 @@ pub fn spawn_test_resolver(
                         }
                     }
                     seen.insert(module_name.clone(), module_cache::EXTRACT_VERSION);
+                    if stale_modules.contains_key(&module_name) {
+                        parse_memo.remove(&module_name);
+                    }
 
-                    let result = parse_module(&inc_paths, &module_name);
+                    let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
                     insert_into_cache(&cache, &reverse_index, &module_name, result.clone());
                     if let Some(ref conn) = db {
                         module_cache::save_to_db(conn, &module_name, &result, "import");
@@ -435,11 +448,21 @@ fn rebuild_reverse_index(
 
 // ---- Module parsing ----
 
+/// Run-local memo for `resolve_and_parse_with_memo`. Persists across many
+/// top-level calls within a single resolver sweep so that parent-fallback
+/// recursion (e.g. 50 children all inheriting from `Exporter`) parses each
+/// parent exactly once.
+pub type ParseMemo = HashMap<String, Option<Arc<CachedModule>>>;
+
 /// Parse a module file directly in-process.
 /// tree-sitter-perl is stable — no subprocess isolation needed.
-fn parse_module(inc_paths: &[PathBuf], module_name: &str) -> Option<Arc<CachedModule>> {
-    let mut parser = create_parser();
-    resolve_and_parse(inc_paths, module_name, &mut parser)
+fn parse_module(
+    inc_paths: &[PathBuf],
+    module_name: &str,
+    parser: &mut Parser,
+    memo: &mut ParseMemo,
+) -> Option<Arc<CachedModule>> {
+    resolve_and_parse_with_memo(inc_paths, module_name, parser, memo)
 }
 
 pub fn create_parser() -> Parser {
@@ -469,8 +492,22 @@ pub fn resolve_and_parse(
     module_name: &str,
     parser: &mut Parser,
 ) -> Option<Arc<CachedModule>> {
+    let mut memo: ParseMemo = HashMap::new();
+    resolve_and_parse_with_memo(inc_paths, module_name, parser, &mut memo)
+}
+
+/// Parse a module while sharing a memo across calls. Callers that resolve
+/// many modules in a loop (the resolver thread, CLI startup) should hoist
+/// one `ParseMemo` and reuse it so parent-fallback recursion doesn't
+/// re-parse the same ancestor for each child.
+pub fn resolve_and_parse_with_memo(
+    inc_paths: &[PathBuf],
+    module_name: &str,
+    parser: &mut Parser,
+    memo: &mut ParseMemo,
+) -> Option<Arc<CachedModule>> {
     let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
-    resolve_and_parse_inner(inc_paths, module_name, parser, &mut visiting)
+    resolve_and_parse_inner(inc_paths, module_name, parser, &mut visiting, memo)
 }
 
 fn resolve_and_parse_inner(
@@ -478,7 +515,11 @@ fn resolve_and_parse_inner(
     module_name: &str,
     parser: &mut Parser,
     visiting: &mut std::collections::HashSet<String>,
+    memo: &mut ParseMemo,
 ) -> Option<Arc<CachedModule>> {
+    if let Some(cached) = memo.get(module_name) {
+        return cached.clone();
+    }
     if !visiting.insert(module_name.to_string()) {
         // Cycle in `@ISA` parent fallback — bail rather than blow the stack.
         return None;
@@ -507,7 +548,9 @@ fn resolve_and_parse_inner(
     if analysis.export.is_empty() && analysis.export_ok.is_empty() {
         let parents = crate::module_index::primary_package_parents(&analysis, module_name);
         for parent in &parents {
-            if let Some(parent_cached) = resolve_and_parse_inner(inc_paths, parent, parser, visiting) {
+            if let Some(parent_cached) =
+                resolve_and_parse_inner(inc_paths, parent, parser, visiting, memo)
+            {
                 if !parent_cached.analysis.export.is_empty()
                     || !parent_cached.analysis.export_ok.is_empty()
                 {
@@ -524,6 +567,7 @@ fn resolve_and_parse_inner(
     if let Some(start) = bench_start {
         eprintln!("bench\t{}\t{}\t{}\t{}", module_name, start.elapsed().as_micros(), symbols, bytes);
     }
+    memo.insert(module_name.to_string(), Some(result.clone()));
     Some(result)
 }
 

@@ -208,6 +208,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     }
 
     let mut parser = module_resolver::create_parser();
+    let mut parse_memo: module_resolver::ParseMemo = std::collections::HashMap::new();
     let mut resolved = 0usize;
     let mut already_cached = 0usize;
     for name in &needed {
@@ -215,7 +216,12 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             already_cached += 1;
             continue;
         }
-        if let Some(cached) = module_resolver::resolve_and_parse(&inc_paths, name, &mut parser) {
+        if stale_set.contains(name) {
+            parse_memo.remove(name);
+        }
+        if let Some(cached) =
+            module_resolver::resolve_and_parse_with_memo(&inc_paths, name, &mut parser, &mut parse_memo)
+        {
             if let Some(ref conn) = db {
                 module_cache::save_to_db(conn, name, &Some(std::sync::Arc::clone(&cached)), "cli");
             }
