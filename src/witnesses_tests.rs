@@ -1,0 +1,750 @@
+use super::*;
+use tree_sitter::Point;
+
+fn p(row: usize, col: usize) -> Point {
+    Point { row, column: col }
+}
+
+fn span(r0: usize, c0: usize, r1: usize, c1: usize) -> Span {
+    Span {
+        start: p(r0, c0),
+        end: p(r1, c1),
+    }
+}
+
+fn wvar(name: &str, scope: u32, payload: WitnessPayload) -> Witness {
+    Witness {
+        attachment: WitnessAttachment::Variable {
+            name: name.to_string(),
+            scope: ScopeId(scope),
+        },
+        source: WitnessSource::Builder("test".into()),
+        payload,
+        span: span(0, 0, 0, 0),
+    }
+}
+
+// ---- Phase 0: bag stores and retrieves ----
+
+#[test]
+fn witness_bag_stores_and_retrieves_by_attachment() {
+    let mut bag = WitnessBag::new();
+    bag.push(wvar(
+        "$self",
+        0,
+        WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+            package: "Foo".into(),
+        }),
+    ));
+    bag.push(wvar(
+        "$self",
+        0,
+        WitnessPayload::Observation(TypeObservation::HashRefAccess),
+    ));
+    bag.push(wvar(
+        "$other",
+        0,
+        WitnessPayload::Observation(TypeObservation::ArrayRefAccess),
+    ));
+
+    let att = WitnessAttachment::Variable {
+        name: "$self".into(),
+        scope: ScopeId(0),
+    };
+    let hits = bag.for_attachment(&att);
+    assert_eq!(hits.len(), 2);
+}
+
+// ---- Part 6 core bug: Mojo sub name, blessed-hashref ----
+
+#[test]
+fn mojo_sub_name_does_not_flip_type_to_hashref() {
+    // `sub name { my $self = shift; return $self->{name} unless @_; … }`
+    // inside a Mojo::Base class — `$self` is blessed, and the
+    // hashref access is *backing-rep consistent* with Mojo::Base.
+    // The old flat-enum inference would overwrite ClassName with
+    // HashRef. The resolver must keep the class.
+    let mut bag = WitnessBag::new();
+    bag.push(wvar(
+        "$self",
+        0,
+        WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+            package: "Mojolicious::Routes::Route".into(),
+        }),
+    ));
+    bag.push(wvar(
+        "$self",
+        0,
+        WitnessPayload::Observation(TypeObservation::HashRefAccess),
+    ));
+
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Variable {
+        name: "$self".into(),
+        scope: ScopeId(0),
+    };
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::MojoBase,
+        return_of: None,
+        arity_hint: None,
+    };
+    let v = reg.query(&bag, &q);
+    assert_eq!(
+        v,
+        ReducedValue::Type(InferredType::ClassName("Mojolicious::Routes::Route".into()))
+    );
+}
+
+// ---- Sanity: no class evidence — plain hash access folds to HashRef ----
+
+#[test]
+fn plain_hashref_access_without_class_evidence() {
+    let mut bag = WitnessBag::new();
+    bag.push(wvar(
+        "$cfg",
+        1,
+        WitnessPayload::Observation(TypeObservation::HashRefAccess),
+    ));
+
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Variable {
+        name: "$cfg".into(),
+        scope: ScopeId(1),
+    };
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &q),
+        ReducedValue::Type(InferredType::HashRef)
+    );
+}
+
+// ---- Arrayref-backed class via bless target ----
+
+#[test]
+fn bless_target_array_with_class_assertion_keeps_class() {
+    // `bless [], $c` in scope + `$x = Foo->new` → $x is ClassName,
+    // rep is Array. Access as `$x->[0]` matches rep; class wins.
+    let mut bag = WitnessBag::new();
+    bag.push(wvar(
+        "$x",
+        2,
+        WitnessPayload::Observation(TypeObservation::ClassAssertion("Arr::Foo".into())),
+    ));
+    bag.push(wvar(
+        "$x",
+        2,
+        WitnessPayload::Observation(TypeObservation::BlessTarget(Rep::Array)),
+    ));
+    bag.push(wvar(
+        "$x",
+        2,
+        WitnessPayload::Observation(TypeObservation::ArrayRefAccess),
+    ));
+
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Variable {
+        name: "$x".into(),
+        scope: ScopeId(2),
+    };
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &q),
+        ReducedValue::Type(InferredType::ClassName("Arr::Foo".into()))
+    );
+}
+
+// ---- CoreClass (Perl 5.38) — hashref access is a contradiction ----
+
+#[test]
+fn core_class_still_holds_class_against_hashref_access() {
+    // Perl 5.38 `class` uses opaque fields — `$self->{k}` inside
+    // is really a bug, but the type should stay ClassName so the
+    // rest of the chain types correctly. A separate diagnostic
+    // pass would warn.
+    let mut bag = WitnessBag::new();
+    bag.push(wvar(
+        "$self",
+        0,
+        WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+            package: "MyApp::Thing".into(),
+        }),
+    ));
+    bag.push(wvar(
+        "$self",
+        0,
+        WitnessPayload::Observation(TypeObservation::HashRefAccess),
+    ));
+
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Variable {
+        name: "$self".into(),
+        scope: ScopeId(0),
+    };
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::CoreClass,
+        return_of: None,
+        arity_hint: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &q),
+        ReducedValue::Type(InferredType::ClassName("MyApp::Thing".into()))
+    );
+}
+
+// ---- Context observations ----
+
+// ---- Part 6 + 7 together: fluent chain via Expression-attached ReturnOf ----
+
+#[test]
+fn fluent_chain_get_to_resolves_via_return_of() {
+    // `$r->get('/x')->to('Y#z')` — the RefIdx for `->get(...)`'s
+    // result carries Observation::ReturnOfName("get"). The
+    // resolver walks `return_of` and finds Route.
+    let mut bag = WitnessBag::new();
+    let get_ref = RefIdx(42);
+    bag.push(Witness {
+        attachment: WitnessAttachment::Expression(get_ref),
+        source: WitnessSource::Builder("chain".into()),
+        payload: WitnessPayload::Observation(TypeObservation::ReturnOfName("get".into())),
+        span: span(0, 0, 0, 0),
+    });
+    // Simulate the receiver of `->to`: the core resolves the
+    // invocant expression to RefIdx(42) (the `->get` call), and
+    // queries the bag for that RefIdx's type.
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Expression(get_ref);
+    let return_of = |k: &ReturnOfKey| -> Option<InferredType> {
+        match k {
+            ReturnOfKey::Name(n) if n == "get" => {
+                Some(InferredType::ClassName("Mojolicious::Routes::Route".into()))
+            }
+            _ => None,
+        }
+    };
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: Some(&return_of),
+        arity_hint: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &q),
+        ReducedValue::Type(InferredType::ClassName("Mojolicious::Routes::Route".into()))
+    );
+}
+
+// ---- Part 5b — narrowing via scoped-span InferredType witnesses ----
+
+#[test]
+fn narrowed_span_wins_over_outer_witness_at_inside_point() {
+    // Outer scope says $v: HashRef. An `if (ref $v eq 'ARRAY')`
+    // body at rows 4..8 narrows $v to ArrayRef. A query at
+    // row=5 (inside the body) must see ArrayRef; a query at
+    // row=2 (before the if) must see HashRef.
+    let mut bag = WitnessBag::new();
+    bag.push(Witness {
+        attachment: WitnessAttachment::Variable {
+            name: "$v".into(),
+            scope: ScopeId(0),
+        },
+        source: WitnessSource::Builder("outer".into()),
+        payload: WitnessPayload::InferredType(InferredType::HashRef),
+        span: span(0, 0, 0, 0), // zero = outer / unconstrained
+    });
+    bag.push(Witness {
+        attachment: WitnessAttachment::Variable {
+            name: "$v".into(),
+            scope: ScopeId(0),
+        },
+        source: WitnessSource::Builder("narrowing".into()),
+        payload: WitnessPayload::InferredType(InferredType::ArrayRef),
+        span: span(4, 0, 8, 0),
+    });
+
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Variable {
+        name: "$v".into(),
+        scope: ScopeId(0),
+    };
+
+    let inside = ReducerQuery {
+        attachment: &att,
+        point: Some(p(5, 4)),
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &inside),
+        ReducedValue::Type(InferredType::ArrayRef)
+    );
+
+    let outside = ReducerQuery {
+        attachment: &att,
+        point: Some(p(2, 0)),
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &outside),
+        ReducedValue::Type(InferredType::HashRef)
+    );
+}
+
+// ---- BranchArm reduction (ternary + explicit if/else) ----
+
+#[test]
+fn branch_arms_agree_folds_to_that_type() {
+    let mut bag = WitnessBag::new();
+    bag.push(wvar(
+        "$x",
+        0,
+        WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::Numeric)),
+    ));
+    bag.push(wvar(
+        "$x",
+        0,
+        WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::Numeric)),
+    ));
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Variable {
+        name: "$x".into(),
+        scope: ScopeId(0),
+    };
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &q),
+        ReducedValue::Type(InferredType::Numeric)
+    );
+}
+
+#[test]
+fn branch_arms_disagree_folds_to_none() {
+    let mut bag = WitnessBag::new();
+    bag.push(wvar(
+        "$x",
+        0,
+        WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::Numeric)),
+    ));
+    bag.push(wvar(
+        "$x",
+        0,
+        WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::String)),
+    ));
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Variable {
+        name: "$x".into(),
+        scope: ScopeId(0),
+    };
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    assert_eq!(reg.query(&bag, &q), ReducedValue::None);
+}
+
+// ---- Fluent arity dispatch reducer ----
+
+fn wsym(sym_id: u32, payload: WitnessPayload) -> Witness {
+    Witness {
+        attachment: WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id)),
+        source: WitnessSource::Builder("arity_detection".into()),
+        payload,
+        span: span(0, 0, 0, 0),
+    }
+}
+
+#[test]
+fn arity_zero_returns_string_default_returns_self() {
+    // `sub name { my $self = shift; return $self->{name} unless @_; ...; $self }`
+    // — arity 0 → String; default → ClassName(MojoRoute).
+    let sub_id = 42;
+    let mut bag = WitnessBag::new();
+    bag.push(wsym(
+        sub_id,
+        WitnessPayload::Observation(TypeObservation::ArityReturn {
+            arg_count: Some(0),
+            return_type: InferredType::String,
+        }),
+    ));
+    bag.push(wsym(
+        sub_id,
+        WitnessPayload::Observation(TypeObservation::ArityReturn {
+            arg_count: None,
+            return_type: InferredType::ClassName("MojoRoute".into()),
+        }),
+    ));
+
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sub_id));
+
+    // Caller passes no args: `$r->name` — arity 0.
+    let q0 = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: Some(0),
+    };
+    assert_eq!(
+        reg.query(&bag, &q0),
+        ReducedValue::Type(InferredType::String)
+    );
+
+    // Caller passes one arg: `$r->name('x')` — arity 1 matches no
+    // exact; fall back to default.
+    let q1 = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: Some(1),
+    };
+    assert_eq!(
+        reg.query(&bag, &q1),
+        ReducedValue::Type(InferredType::ClassName("MojoRoute".into()))
+    );
+
+    // Arity unknown (not at a call site) — also falls back to default.
+    let qn = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &qn),
+        ReducedValue::Type(InferredType::ClassName("MojoRoute".into()))
+    );
+}
+
+#[test]
+fn numeric_then_string_prefers_numeric_noop_when_class_set() {
+    let mut bag = WitnessBag::new();
+    bag.push(wvar(
+        "$n",
+        0,
+        WitnessPayload::Observation(TypeObservation::NumericUse),
+    ));
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Variable {
+        name: "$n".into(),
+        scope: ScopeId(0),
+    };
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &q),
+        ReducedValue::Type(InferredType::Numeric)
+    );
+}
+
+// ---- Plugin override priority short-circuit -----------------------
+//
+// `apply_type_overrides` pushes a Plugin-source `InferredType`
+// witness on `Symbol(sym_id)`. The `PluginOverrideReducer` runs
+// first in the default registry and must dominate any other
+// Symbol-attached InferredType evidence. Pin the priority short-
+// circuit at the reducer level so a future refactor that drops the
+// priority check fails here, not silently downstream in
+// `--dump-package` provenance.
+
+#[test]
+fn plugin_override_priority_dominates_builder_inferred_type() {
+    let sym_id = SymbolId(0);
+    let mut bag = WitnessBag::new();
+    bag.push(Witness {
+        attachment: WitnessAttachment::Symbol(sym_id),
+        source: WitnessSource::Builder("inferred".into()),
+        payload: WitnessPayload::InferredType(InferredType::HashRef),
+        span: span(0, 0, 0, 0),
+    });
+    bag.push(Witness {
+        attachment: WitnessAttachment::Symbol(sym_id),
+        source: WitnessSource::Plugin("test-plugin".into()),
+        payload: WitnessPayload::InferredType(InferredType::ClassName("Baz".into())),
+        span: span(0, 0, 0, 0),
+    });
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Symbol(sym_id);
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    match reg.query(&bag, &q) {
+        ReducedValue::Type(InferredType::ClassName(name)) => {
+            assert_eq!(
+                name, "Baz",
+                "Plugin priority must dominate Builder-source InferredType on the same Symbol attachment"
+            );
+        }
+        other => panic!("expected ClassName(Baz) from PluginOverrideReducer; got {other:?}"),
+    }
+}
+
+// ---- Phase 4: delegation reducers ---------------------------------
+//
+// `DelegationReducer` (`return Other(...)`) and
+// `SelfMethodTailReducer` (`shift->method(...)` tail) attach to
+// `Symbol(sub_id)` and chase their target via
+// `ReducerQuery::return_of`. They're dormant at query sites that
+// don't install a `return_of` closure (today's
+// `query_sub_return_type` / `query_variable_type`); these tests pin
+// the reducer-level contract so the worklist driver in Phase 6 can
+// drop them in without further changes.
+
+fn wsym_named(sym_id: u32, source: &str, payload: WitnessPayload) -> Witness {
+    Witness {
+        attachment: WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id)),
+        source: WitnessSource::Builder(source.into()),
+        payload,
+        span: span(0, 0, 0, 0),
+    }
+}
+
+#[test]
+fn delegation_reducer_claims_only_return_delegation_observations() {
+    let r = DelegationReducer;
+    // Positive: Symbol + ReturnDelegation matches.
+    assert!(r.claims(&wsym_named(
+        1,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    )));
+    // Negative: same payload on a non-Symbol attachment doesn't.
+    assert!(!r.claims(&wvar(
+        "$x",
+        0,
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    )));
+    // Negative: Symbol + a different observation doesn't match.
+    assert!(!r.claims(&wsym_named(
+        1,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("m".into())),
+    )));
+    // Negative: Symbol + InferredType (PluginOverride's domain) doesn't.
+    assert!(!r.claims(&wsym_named(
+        1,
+        "inferred",
+        WitnessPayload::InferredType(InferredType::HashRef),
+    )));
+}
+
+#[test]
+fn delegation_reducer_resolves_via_return_of_lookup() {
+    let sym_id = 5;
+    let mut bag = WitnessBag::new();
+    bag.push(wsym_named(
+        sym_id,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    ));
+    let lookup = |k: &ReturnOfKey| match k {
+        ReturnOfKey::Name(n) if n == "inner" => Some(InferredType::ClassName("Foo".into())),
+        _ => None,
+    };
+    let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id));
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: Some(&lookup),
+        arity_hint: None,
+    };
+    let claimed: Vec<&Witness> = bag
+        .for_attachment(&att)
+        .into_iter()
+        .filter(|w| DelegationReducer.claims(w))
+        .collect();
+    assert_eq!(
+        DelegationReducer.reduce(&claimed, &q),
+        ReducedValue::Type(InferredType::ClassName("Foo".into()))
+    );
+}
+
+#[test]
+fn delegation_reducer_declines_when_return_of_unset() {
+    // Without a `return_of` closure, the reducer can't chase the
+    // delegate's name to a type — it returns None. This is the
+    // dormant-at-query-time invariant Phase 4 relies on.
+    let sym_id = 5;
+    let mut bag = WitnessBag::new();
+    bag.push(wsym_named(
+        sym_id,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    ));
+    let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id));
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    let claimed: Vec<&Witness> = bag
+        .for_attachment(&att)
+        .into_iter()
+        .filter(|w| DelegationReducer.claims(w))
+        .collect();
+    assert_eq!(DelegationReducer.reduce(&claimed, &q), ReducedValue::None);
+}
+
+#[test]
+fn self_method_tail_reducer_claims_only_self_method_tail_observations() {
+    let r = SelfMethodTailReducer;
+    // Positive: Symbol + SelfMethodTail.
+    assert!(r.claims(&wsym_named(
+        2,
+        "self_method_tail",
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("get".into())),
+    )));
+    // Negative: ReturnDelegation is DelegationReducer's domain.
+    assert!(!r.claims(&wsym_named(
+        2,
+        "delegation",
+        WitnessPayload::Observation(TypeObservation::ReturnDelegation("inner".into())),
+    )));
+    // Negative: same payload on a Variable attachment doesn't match.
+    assert!(!r.claims(&wvar(
+        "$x",
+        0,
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("get".into())),
+    )));
+}
+
+#[test]
+fn self_method_tail_reducer_resolves_via_return_of_lookup() {
+    // `sub get { shift->_generate_route(...) }` — once
+    // `_generate_route`'s return type is known to `return_of`, `get`
+    // inherits it.
+    let sym_id = 9;
+    let mut bag = WitnessBag::new();
+    bag.push(wsym_named(
+        sym_id,
+        "self_method_tail",
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("_generate_route".into())),
+    ));
+    let lookup = |k: &ReturnOfKey| match k {
+        ReturnOfKey::Name(n) if n == "_generate_route" => {
+            Some(InferredType::ClassName("Mojolicious::Routes::Route".into()))
+        }
+        _ => None,
+    };
+    let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id));
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: Some(&lookup),
+        arity_hint: None,
+    };
+    let claimed: Vec<&Witness> = bag
+        .for_attachment(&att)
+        .into_iter()
+        .filter(|w| SelfMethodTailReducer.claims(w))
+        .collect();
+    assert_eq!(
+        SelfMethodTailReducer.reduce(&claimed, &q),
+        ReducedValue::Type(InferredType::ClassName(
+            "Mojolicious::Routes::Route".into()
+        ))
+    );
+}
+
+#[test]
+fn self_method_tail_reducer_declines_when_target_unknown() {
+    // `return_of` says "I have no answer for that name" — the reducer
+    // yields, letting the next iteration try (Phase 6 worklist
+    // driver requeues dependents).
+    let sym_id = 9;
+    let mut bag = WitnessBag::new();
+    bag.push(wsym_named(
+        sym_id,
+        "self_method_tail",
+        WitnessPayload::Observation(TypeObservation::SelfMethodTail("not_yet_typed".into())),
+    ));
+    let lookup = |_: &ReturnOfKey| None;
+    let att = WitnessAttachment::Symbol(crate::file_analysis::SymbolId(sym_id));
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: Some(&lookup),
+        arity_hint: None,
+    };
+    let claimed: Vec<&Witness> = bag
+        .for_attachment(&att)
+        .into_iter()
+        .filter(|w| SelfMethodTailReducer.claims(w))
+        .collect();
+    assert_eq!(
+        SelfMethodTailReducer.reduce(&claimed, &q),
+        ReducedValue::None
+    );
+}
+
+#[test]
+fn plugin_override_reducer_yields_when_only_builder_witnesses_present() {
+    // Plugin-priority short-circuit must not claim Builder-only
+    // Symbol+InferredType witnesses — those are Phase 4+ inferred
+    // facts. Returning None here lets later reducers handle them.
+    let sym_id = SymbolId(7);
+    let mut bag = WitnessBag::new();
+    bag.push(Witness {
+        attachment: WitnessAttachment::Symbol(sym_id),
+        source: WitnessSource::Builder("inferred".into()),
+        payload: WitnessPayload::InferredType(InferredType::String),
+        span: span(0, 0, 0, 0),
+    });
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Symbol(sym_id);
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        return_of: None,
+        arity_hint: None,
+    };
+    // PluginOverrideReducer declines (priority == 10), no other
+    // reducer claims Symbol+InferredType in Phase 3, so the
+    // registry returns None.
+    assert_eq!(reg.query(&bag, &q), ReducedValue::None);
+}

@@ -469,11 +469,33 @@ pub fn resolve_and_parse(
     module_name: &str,
     parser: &mut Parser,
 ) -> Option<Arc<CachedModule>> {
+    let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+    resolve_and_parse_inner(inc_paths, module_name, parser, &mut visiting)
+}
+
+fn resolve_and_parse_inner(
+    inc_paths: &[PathBuf],
+    module_name: &str,
+    parser: &mut Parser,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Option<Arc<CachedModule>> {
+    if !visiting.insert(module_name.to_string()) {
+        // Cycle in `@ISA` parent fallback — bail rather than blow the stack.
+        return None;
+    }
+
+    let bench = std::env::var_os("PERL_LSP_BENCH").is_some();
+    let bench_start = if bench { Some(std::time::Instant::now()) } else { None };
+
     let path = resolve_module_path(inc_paths, module_name)?;
     let metadata = std::fs::metadata(&path).ok()?;
     if metadata.len() > 1_000_000 {
+        if let Some(start) = bench_start {
+            eprintln!("bench\t{}\t{}\toversize\t{}", module_name, start.elapsed().as_micros(), metadata.len());
+        }
         return None;
     }
+    let bytes = metadata.len();
     let source = std::fs::read_to_string(&path).ok()?;
     let tree = parser.parse(&source, None)?;
 
@@ -485,7 +507,7 @@ pub fn resolve_and_parse(
     if analysis.export.is_empty() && analysis.export_ok.is_empty() {
         let parents = crate::module_index::primary_package_parents(&analysis, module_name);
         for parent in &parents {
-            if let Some(parent_cached) = resolve_and_parse(inc_paths, parent, parser) {
+            if let Some(parent_cached) = resolve_and_parse_inner(inc_paths, parent, parser, visiting) {
                 if !parent_cached.analysis.export.is_empty()
                     || !parent_cached.analysis.export_ok.is_empty()
                 {
@@ -497,7 +519,12 @@ pub fn resolve_and_parse(
         }
     }
 
-    Some(Arc::new(CachedModule::new(path, Arc::new(analysis))))
+    let symbols = analysis.symbols.len();
+    let result = Arc::new(CachedModule::new(path, Arc::new(analysis)));
+    if let Some(start) = bench_start {
+        eprintln!("bench\t{}\t{}\t{}\t{}", module_name, start.elapsed().as_micros(), symbols, bytes);
+    }
+    Some(result)
 }
 
 // ---- @INC discovery ----
@@ -640,64 +667,5 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_resolve_module_list_util() {
-        let inc_paths = discover_inc_paths();
-        if inc_paths.is_empty() {
-            return;
-        }
-        let path = resolve_module_path(&inc_paths, "List::Util");
-        assert!(path.is_some(), "List::Util should be resolvable");
-        let p = path.unwrap();
-        assert!(p.to_str().unwrap().contains("List/Util.pm"));
-    }
-
-    #[test]
-    fn test_extract_exports_qw() {
-        let source = r#"
-package Foo;
-use Exporter 'import';
-our @EXPORT_OK = qw(alpha beta gamma);
-our @EXPORT = qw(delta);
-1;
-"#;
-        let mut parser = create_parser();
-        let tree = parser.parse(source, None).unwrap();
-        let analysis = crate::builder::build(&tree, source.as_bytes());
-        assert_eq!(analysis.export, vec!["delta"]);
-        assert_eq!(analysis.export_ok, vec!["alpha", "beta", "gamma"]);
-    }
-
-    #[test]
-    fn test_extract_exports_parenthesized() {
-        let source = r#"
-package Bar;
-our @EXPORT_OK = ('foo', 'bar', 'baz');
-1;
-"#;
-        let mut parser = create_parser();
-        let tree = parser.parse(source, None).unwrap();
-        let analysis = crate::builder::build(&tree, source.as_bytes());
-        assert_eq!(analysis.export_ok, vec!["foo", "bar", "baz"]);
-    }
-
-    #[test]
-    fn test_discover_inc_paths() {
-        let paths = discover_inc_paths();
-        if !paths.is_empty() {
-            assert!(paths.iter().all(|p| p.is_dir()));
-        }
-    }
-
-    #[test]
-    fn test_uri_to_path() {
-        assert_eq!(
-            uri_to_path("file:///Users/foo/project"),
-            Some(PathBuf::from("/Users/foo/project"))
-        );
-        assert_eq!(uri_to_path("http://example.com"), None);
-    }
-}
+#[path = "module_resolver_tests.rs"]
+mod tests;

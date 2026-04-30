@@ -114,18 +114,24 @@ See `docs/prompt-unification-spec.md` for the cross-file unification roadmap (ph
 1. **live walk** (`visit_*`) — emits Symbols/Refs/Scopes/TypeConstraints, queues plugin emissions, records ReturnInfos with walk-time-typed values.
 2. `resolve_variable_refs()` — scalar refs → `resolves_to`.
 3. `resolve_hash_key_owners()` — HashKeyAccess → HashKeyOwner via TC types.
-4. `apply_type_overrides()` — plugin manifests pin Sub return types inference can't reach (`TypeProvenance::PluginOverride`). Runs BEFORE the witness fold so dependent inference sees overrides.
-5. `populate_witness_bag()` — one-shot bag seed. Bag is canonical after this.
-6. `resolve_return_types()` — **fold pass 1**. Witness fold per Sub/Method, agreement combinator, delegation + `self_method_tails` propagate to fixed-point. Skips `PluginOverride` subs so step 4 wins.
-7. `type_assignments_into_bag(tree)` — chain-typing pass. Walks every `assignment_expression`, types rhs via `resolve_invocant_class_tree` (single recursive expression typer — handles scalar/method-chain/bareword/shift/$_[0]/function-call uniformly). Lands as TC + Variable witness in lockstep. **Must run after step 6** — chain rhs may walk through other subs' return types (`my $route = $self->_route(...)->requires(...)->to(...)`).
-8. `refresh_return_arm_types(tree)` — re-evaluate `ReturnInfo.inferred_type` against richer state. Same typer the live walk used. Only upgrades `None → Some`.
-9. `resolve_return_types()` — **fold pass 2**. Closes the chain-vs-return chicken-and-egg (`_generate_route` folds only after `$route` is typed; tail-delegation cascades through every verb method).
-10. `resolve_invocant_classes_post_pass(tree)` — fill `invocant_class` on MethodCall refs the live walk left empty (`get_foo()->bar()` needs `get_foo`'s now-known return type). Same recursive typer.
-11. `resolve_tail_pod_docs()` — POD docs for subs lacking preceding doc.
-12. `FileAnalysis::new(...)` — construct FA, build indices, `resolve_method_call_types(None)` as text-based MCB fallback.
-13. `fa.finalize_post_walk()` — seal `base_*_count` for idempotent re-enrichment.
+4. `apply_type_overrides()` — plugin manifests push **Plugin-priority** witnesses on `Symbol(sub_id)`. The `PluginOverrideReducer`'s priority short-circuit (Plugin > Builder) makes them dominate the per-arm fold. Provenance is recorded as `TypeProvenance::PluginOverride` so `--dump-package` can answer "why does this return X?". Runs BEFORE the worklist fold so dependent inference sees overrides via the bag.
+5. `populate_witness_bag()` — one-shot bag seed. Mirrors walk-time `TypeConstraint`s as Variable witnesses, drains `pending_witnesses` (branch arms / arity gates), pushes `HashRefAccess` / `ReturnOfName` from refs. Bag is canonical after this.
+6. `fold_to_fixed_point(chain_idx)` — **the worklist fold**. One driver replaces the old hand-ordered `fold → chain → fold → chain` sequence: each iteration runs `ChainTypingReducer::PreFold` (assignment + return-arm refresh) followed by `resolve_return_types` (the reducer-dispatch driver split out in Phase 4 — `ArityReturnReducer`, plugin-override seeding, `DelegationReducer`, `SelfMethodTailReducer`, `CallBindingPropagator`, hash-key-owner fixup). The loop exits when the snapshot of Sub/Method `return_type` + `type_constraints.len()` stops moving; `MAX_FOLD_ITERATIONS = 64` is the debug-only safety net. After the lattice settles, `ChainTypingReducer::PostFold` runs once to fill `invocant_class` on `MethodCall` refs (`get_foo()->bar()` needs `get_foo`'s now-known return type).
+7. `resolve_tail_pod_docs()` — POD docs for subs lacking preceding doc.
+8. `FileAnalysis::new(...)` — construct FA, build indices, `resolve_method_call_types(None)` as text-based MCB fallback.
+9. `fa.finalize_post_walk()` — seal `base_*_count` for idempotent re-enrichment.
 
-`Builder::resolve_invocant_class_tree` is the **single** symbolic-execution function (steps 7, 8, 10). Adding a second is wrong; add cases. `FileAnalysis::resolve_expression_type` is the FA-side mirror at query time (cursor context, hover, completion) — keep them in sync.
+`Builder::resolve_invocant_class_tree` is the **single** symbolic-execution function (chain typing, return-arm refresh, invocant filling). Adding a second is wrong; add cases. `FileAnalysis::resolve_expression_type` is the FA-side mirror at query time (cursor context, hover, completion) — keep them in sync.
+
+### Worklist invariants
+
+The fold driver in step 6 is the only place type inference iterates. Adding a new fact-fold means **adding a reducer**, not changing the driver:
+
+- **Reducers are stateless.** A `WitnessReducer` claims a `WitnessAttachment` shape (`Symbol(_)` / `Variable{..}` / `Expression(_)` / etc.) and folds the witnesses for that attachment into a `ReducedValue`. They live in `witnesses.rs` and register through `ReducerRegistry::with_defaults()`. The worklist driver never special-cases a reducer — it just runs the registry on each attachment.
+- **Witnesses are monotone.** Once a witness is in the bag, it stays. New facts append; no reducer rewrites or deletes another's witness. Termination follows from the lattice (`InferredType` is a finite enum, ~12 variants) plus the snapshot check: when nothing new appears in two consecutive iterations, the fixed point is reached.
+- **Re-emittable passes are clear-and-emit.** The two builder passes that legitimately re-derive their bag contribution every iteration — `emit_arity_return_witnesses` and `propagate_call_bindings_to_constraints` — call `WitnessBag::remove_by_source_tag(...)` at the start of every run, then re-push from current state. This is how the bag stays canonical (no duplicates) regardless of how many iterations the loop runs. Chain typing's TC-existence check serves the same role for chain-assignment witnesses. Anything else added to a fold step that pushes witnesses MUST follow one of these two idempotency patterns or the worklist will spin.
+- **Source priority breaks ties.** `WitnessSource::priority()` returns 100 for `Plugin(_)` and 10 for everything else. The `PluginOverrideReducer` runs first in the registry and short-circuits when it sees a higher-priority witness on a Symbol attachment. New "this answer must dominate" sources go on this priority axis — never as a special-case branch in another reducer.
+- **Bag-and-TC stay in sync.** `FileAnalysis::push_type_constraint(tc)` writes both. Direct `type_constraints.push` outside the walk seed step is forbidden — the bag would diverge from the legacy TC vec, and the legacy code paths still read TCs.
 
 ### Debugging type inference
 

@@ -4,3 +4,4 @@ editors/vscode/node_modules/
 editors/vscode/out/
 
 .claude/
+qa-workspace/

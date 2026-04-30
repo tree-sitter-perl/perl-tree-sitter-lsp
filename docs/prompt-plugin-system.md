@@ -121,11 +121,16 @@ re-running the build.
 - **Read once at plugin compile time.** No runtime call cost — the
   host calls `overrides()` once during `RhaiPlugin::from_source` and
   caches the list on the plugin struct.
-- **Wins over inference.** Application runs as builder post-pass 3b,
-  *after* `resolve_return_types` — overriding an existing inferred
-  type is the whole point ("inference reaches the wrong answer
-  here"). Provenance is recorded in `FileAnalysis.type_provenance` so
-  the inferred answer isn't lost to the debugger.
+- **Wins over inference.** `apply_type_overrides` runs *before*
+  `populate_witness_bag` and the worklist fold; each override pushes a
+  Plugin-priority `InferredType` witness onto the target Symbol. The
+  `PluginOverrideReducer` short-circuit (`WitnessSource::priority()`
+  returns 100 for Plugin, 10 for Builder) makes that witness dominate
+  every per-arm fold the inference pipeline runs — overriding an
+  existing inferred type is the whole point ("inference reaches the
+  wrong answer here"). Provenance is recorded in
+  `FileAnalysis.type_provenance` so the inferred answer isn't lost to
+  the debugger.
 - **Cross-file falls out for free.** When the resolver builds the
   home module, the override patches the cached symbol's
   `return_type`. User code's `find_method_return_type(class, name)`
