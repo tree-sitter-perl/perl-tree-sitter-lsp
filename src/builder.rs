@@ -4277,6 +4277,83 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Publish a framework-synthesized accessor's return type into the
+    /// witness bag instead of relying solely on `Symbol.return_type`.
+    ///
+    /// `apply_type_overrides` (the plugin path) writes Plugin-priority
+    /// witnesses on `Symbol(_)` so the bag — the spec's "single
+    /// type-query path" — answers consistently with the symbol's
+    /// stored type. Framework accessors used to skip this and only set
+    /// `Symbol.return_type` directly. The dump-package round of QA
+    /// caught two consequences:
+    ///
+    ///   1. `symbol_witness_count: 0` for every Mojo::Base / Moo / DBIC
+    ///      accessor — bag-level introspection couldn't see them.
+    ///   2. Multi-arity sisters (Mojo::Base getter `name()` + writer
+    ///      `name($v)`) share a method name. `query_sub_return_type`
+    ///      finds the first `Symbol` by name and folds witnesses on
+    ///      that id; the writer's distinct return type was never
+    ///      visible. `level(1)` returned the getter's `String` instead
+    ///      of the invocant's `Mojo::Log`.
+    ///
+    /// This helper publishes both witnesses and the per-symbol
+    /// provenance entry. The two attachments cover the two query
+    /// shapes:
+    ///   - `Symbol(sym_id)` — bumps the symbol's witness count and
+    ///     handles per-symbol queries with an arity hint (e.g. the
+    ///     dump-package iteration).
+    ///   - `NamedSub(name)` — handles cross-symbol arity dispatch via
+    ///     `FluentArityDispatch`. The writer's `Some(1)` and the
+    ///     getter's `Some(0)` both attach here, and the reducer picks
+    ///     by `arity_hint` regardless of which sister `find()` returned.
+    ///
+    /// Source is `Builder("framework_accessor")` — core synthesis,
+    /// not a Plugin override. Provenance is `FrameworkSynthesis`
+    /// for the same reason; plugins are user-installed and
+    /// configurable, framework `has` synthesis is part of the
+    /// analyzer itself.
+    fn record_framework_accessor_witness(
+        &mut self,
+        sym_id: SymbolId,
+        name: &str,
+        arity: Option<u32>,
+        return_type: Option<InferredType>,
+        framework: &str,
+        reason: String,
+    ) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        let Some(rt) = return_type else { return };
+        let zero = Span {
+            start: Point { row: 0, column: 0 },
+            end: Point { row: 0, column: 0 },
+        };
+        let observation = TypeObservation::ArityReturn {
+            arg_count: arity,
+            return_type: rt,
+        };
+        self.bag.push(Witness {
+            attachment: WitnessAttachment::Symbol(sym_id),
+            source: WitnessSource::Builder("framework_accessor".to_string()),
+            payload: WitnessPayload::Observation(observation.clone()),
+            span: zero,
+        });
+        self.bag.push(Witness {
+            attachment: WitnessAttachment::NamedSub(name.to_string()),
+            source: WitnessSource::Builder("framework_accessor".to_string()),
+            payload: WitnessPayload::Observation(observation),
+            span: zero,
+        });
+        self.type_provenance.insert(
+            sym_id,
+            TypeProvenance::FrameworkSynthesis {
+                framework: framework.to_string(),
+                reason,
+            },
+        );
+    }
+
     fn visit_has_call(&mut self, node: Node<'a>, mode: FrameworkMode) {
         // Extract attribute names and options from the `has` call arguments.
         // CST: ambiguous_function_call_expression
@@ -4379,9 +4456,14 @@ impl<'a> Builder<'a> {
                 let is_rw = matches!(is, Some("rw"));
                 let is_rwp = matches!(is, Some("rwp"));
 
+                let framework = match mode {
+                    FrameworkMode::Moo => "Moo",
+                    FrameworkMode::Moose => "Moose",
+                    FrameworkMode::MojoBase => unreachable!(),
+                };
                 for (name, sel_span) in &attr_names {
                     // Getter (always present for ro/rw/lazy/rwp)
-                    self.add_symbol(
+                    let getter_id = self.add_symbol(
                         name.clone(),
                         SymKind::Method,
                         node_to_span(node),
@@ -4397,9 +4479,17 @@ impl<'a> Builder<'a> {
                     return_self_method: None,
                         },
                     );
+                    self.record_framework_accessor_witness(
+                        getter_id,
+                        name,
+                        Some(0),
+                        return_type.clone(),
+                        framework,
+                        format!("{} `has '{}'` getter (isa)", framework, name),
+                    );
                     // Setter for rw
                     if is_rw {
-                        self.add_symbol(
+                        let writer_id = self.add_symbol(
                             name.clone(),
                             SymKind::Method,
                             node_to_span(node),
@@ -4420,12 +4510,20 @@ impl<'a> Builder<'a> {
                     return_self_method: None,
                             },
                         );
+                        self.record_framework_accessor_witness(
+                            writer_id,
+                            name,
+                            Some(1),
+                            return_type.clone(),
+                            framework,
+                            format!("{} `has '{}'` rw writer", framework, name),
+                        );
                     }
                     // Private writer for rwp (Moo only)
                     if is_rwp {
                         let writer_name = format!("_set_{}", name);
-                        self.add_symbol(
-                            writer_name,
+                        let writer_id = self.add_symbol(
+                            writer_name.clone(),
                             SymKind::Method,
                             node_to_span(node),
                             *sel_span,
@@ -4445,6 +4543,14 @@ impl<'a> Builder<'a> {
                     return_self_method: None,
                             },
                         );
+                        self.record_framework_accessor_witness(
+                            writer_id,
+                            &writer_name,
+                            Some(1),
+                            return_type.clone(),
+                            framework,
+                            format!("{} `has '{}'` rwp private writer", framework, name),
+                        );
                     }
                 }
             }
@@ -4452,11 +4558,16 @@ impl<'a> Builder<'a> {
                 // Infer getter return type from default value if present
                 let getter_type = mojo_default_node
                     .and_then(|n| self.infer_expression_type(n, true));
+                let fluent_type = self
+                    .current_package
+                    .as_ref()
+                    .map(|pkg| InferredType::ClassName(pkg.clone()));
+                let framework = "Mojo::Base";
 
                 // Mojo::Base `has` produces getter + setter (two symbols)
                 for (name, sel_span) in &attr_names {
                     // Getter: no params, return type from default value (or None)
-                    self.add_symbol(
+                    let getter_id = self.add_symbol(
                         name.clone(),
                         SymKind::Method,
                         node_to_span(node),
@@ -4472,8 +4583,16 @@ impl<'a> Builder<'a> {
                     return_self_method: None,
                         },
                     );
+                    self.record_framework_accessor_witness(
+                        getter_id,
+                        name,
+                        Some(0),
+                        getter_type.clone(),
+                        framework,
+                        format!("Mojo::Base `has '{}'` getter (default-value type)", name),
+                    );
                     // Setter: fluent, returns $self for chaining
-                    self.add_symbol(
+                    let writer_id = self.add_symbol(
                         name.clone(),
                         SymKind::Method,
                         node_to_span(node),
@@ -4486,14 +4605,21 @@ impl<'a> Builder<'a> {
                     is_invocant: false,
                             }],
                             is_method: true,
-                            return_type: self.current_package.as_ref()
-                                .map(|pkg| InferredType::ClassName(pkg.clone())),
+                            return_type: fluent_type.clone(),
                             doc: None,
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
                     return_self_method: None,
                         },
+                    );
+                    self.record_framework_accessor_witness(
+                        writer_id,
+                        name,
+                        Some(1),
+                        fluent_type.clone(),
+                        framework,
+                        format!("Mojo::Base `has '{}'` fluent writer (returns invocant)", name),
                     );
                 }
             }
@@ -4994,20 +5120,32 @@ impl<'a> Builder<'a> {
                 related_class.map(|c| InferredType::ClassName(c))
             };
 
-            self.add_symbol(
-                name,
+            let sym_id = self.add_symbol(
+                name.clone(),
                 SymKind::Method,
                 node_to_span(node),
                 sel_span,
                 SymbolDetail::Sub {
                     params: vec![],
                     is_method: true,
-                    return_type,
+                    return_type: return_type.clone(),
                     doc: None,
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
                     return_self_method: None,
+                },
+            );
+            self.record_framework_accessor_witness(
+                sym_id,
+                &name,
+                Some(0),
+                return_type,
+                "DBIx::Class",
+                if is_resultset {
+                    format!("DBIx::Class resultset relationship `{}`", name)
+                } else {
+                    format!("DBIx::Class row relationship `{}`", name)
                 },
             );
         }

@@ -372,6 +372,10 @@ fn provenance_accessor_and_round_trip() {
             kind: "self_method_tail".into(),
             via: "_route".into(),
         },
+        TypeProvenance::FrameworkSynthesis {
+            framework: "Mojo::Base".into(),
+            reason: "fluent writer".into(),
+        },
     ];
     for orig in cases {
         let encoded = serde_json::to_string(&orig).expect("serialize");

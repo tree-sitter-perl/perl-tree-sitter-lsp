@@ -3194,6 +3194,144 @@ has 'name';
     }
 }
 
+/// Regression test for QA finding B1 (refer to qa-workspace/qa-findings.md):
+/// Mojo::Base writer accessors lost their fluent invocant return type
+/// when queried through the bag at arity=1. The QA dump for
+/// `Mojo::Log::level` showed:
+///
+///   getter (params=0): raw=String,    bag=String     ← OK
+///   writer (params=1): raw=Mojo::Log, bag=String     ← BUG, getter's type
+///
+/// `query_sub_return_type` finds the *first* same-named symbol by name
+/// (the getter, since synthesis adds it first), folds witnesses on that
+/// id, and answers from the getter's stored `return_type`. The writer's
+/// distinct fluent type was never visible at the bag level — every
+/// `$ua->ca($f)->cert(...)` chain lost its receiver type at the second
+/// hop.
+///
+/// Fix: framework synthesis now publishes per-arity `ArityReturn`
+/// observations on `NamedSub(name)`, and `FluentArityDispatch` claims
+/// `NamedSub` so the right arm wins regardless of which sister
+/// `find()` returned. Also publishes the same observations on
+/// `Symbol(id)` so per-symbol introspection (`witness_count`,
+/// arity-aware queries on a specific id) works.
+#[test]
+fn test_mojo_base_writer_returns_invocant_via_bag() {
+    use crate::file_analysis::TypeProvenance;
+
+    let fa = build_fa(
+        "
+package MyLog;
+use Mojo::Base -base;
+
+has level => 'info';   # default value gives getter type = String
+has app;               # no default; getter has no return type
+",
+    );
+
+    // arity=1 → fluent writer must return the package class for chaining.
+    // Pre-fix this returned String (the getter's type) — that's the bug.
+    assert_eq!(
+        fa.sub_return_type_at_arity("level", Some(1)),
+        Some(InferredType::ClassName("MyLog".into())),
+        "Mojo::Base writer at arity=1 must return the invocant class for fluent chaining"
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("app", Some(1)),
+        Some(InferredType::ClassName("MyLog".into())),
+        "Mojo::Base writer with no default still returns the invocant class"
+    );
+
+    // arity=0 → getter returns its scalar accessor type.
+    assert_eq!(
+        fa.sub_return_type_at_arity("level", Some(0)),
+        Some(InferredType::String),
+        "Mojo::Base getter at arity=0 returns the default-value type"
+    );
+
+    // Both sister symbols carry per-symbol witnesses now (was 0 across
+    // every Mojo::* dump in the QA sweep).
+    let getter = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "level" && matches!(&s.detail, SymbolDetail::Sub { params, .. } if params.is_empty()))
+        .expect("getter symbol");
+    let writer = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "level" && matches!(&s.detail, SymbolDetail::Sub { params, .. } if params.len() == 1))
+        .expect("writer symbol");
+    let getter_witnesses = fa
+        .witnesses
+        .for_attachment(&crate::witnesses::WitnessAttachment::Symbol(getter.id))
+        .len();
+    let writer_witnesses = fa
+        .witnesses
+        .for_attachment(&crate::witnesses::WitnessAttachment::Symbol(writer.id))
+        .len();
+    assert!(getter_witnesses > 0, "getter must have at least one bag witness");
+    assert!(writer_witnesses > 0, "writer must have at least one bag witness");
+
+    // Provenance: each accessor flushes a FrameworkSynthesis entry, not
+    // PluginOverride (Mojo::Base synthesis is core, not a plugin).
+    match fa.return_type_provenance(writer.id) {
+        TypeProvenance::FrameworkSynthesis { framework, reason } => {
+            assert_eq!(framework, "Mojo::Base");
+            assert!(reason.contains("level"), "reason names the attribute");
+            assert!(
+                reason.contains("fluent") || reason.contains("writer"),
+                "reason describes the writer role"
+            );
+        }
+        other => panic!("writer provenance must be FrameworkSynthesis, got {other:?}"),
+    }
+    match fa.return_type_provenance(getter.id) {
+        TypeProvenance::FrameworkSynthesis { framework, .. } => {
+            assert_eq!(framework, "Mojo::Base");
+        }
+        other => panic!("getter provenance must be FrameworkSynthesis, got {other:?}"),
+    }
+}
+
+/// Mirror of B1 for Moo `is => 'rw'` writers — same shape, isa-typed
+/// rather than fluent. The writer reads back the isa type at arity=1.
+#[test]
+fn test_moo_rw_writer_returns_isa_type_via_bag() {
+    use crate::file_analysis::TypeProvenance;
+
+    let fa = build_fa(
+        "
+package Thing;
+use Moo;
+has size => (is => 'rw', isa => 'Int');
+",
+    );
+
+    // Both arities resolve to the isa-derived type.
+    assert_eq!(
+        fa.sub_return_type_at_arity("size", Some(0)),
+        Some(InferredType::Numeric),
+        "Moo getter returns isa type"
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("size", Some(1)),
+        Some(InferredType::Numeric),
+        "Moo rw writer returns isa type"
+    );
+
+    let writer = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "size" && matches!(&s.detail, SymbolDetail::Sub { params, .. } if params.len() == 1))
+        .expect("writer symbol");
+    match fa.return_type_provenance(writer.id) {
+        TypeProvenance::FrameworkSynthesis { framework, .. } => {
+            assert_eq!(framework, "Moo");
+        }
+        other => panic!("Moo writer provenance must be FrameworkSynthesis, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_mojo_base_parent_inheritance() {
     let fa = build_fa(

@@ -811,6 +811,13 @@ fn cli_dump_package(root: &str, package_name: &str) {
                     "via": via,
                 }))
             }
+            file_analysis::TypeProvenance::FrameworkSynthesis { framework, reason } => {
+                Some(serde_json::json!({
+                    "kind": "FrameworkSynthesis",
+                    "framework": framework,
+                    "reason": reason,
+                }))
+            }
         };
 
         // Variables typed inside this sub's scope. Surfaces chain
