@@ -64,53 +64,43 @@ unification step 1 ─┐
 
 ---
 
-## Architecture debt
+## Next architectural pillar (after types)
 
-### Graph traversal — needs a rethink, not just a Namespace enum
+### Graph walking — typed-edge graph with one walker
 
-The original `prompt-unification-residual.md` Phase 1 proposed widening
-`package_parents: HashMap<String, Vec<String>>` to a `Namespace` enum
-(Package / MojoApp / MojoController / MojoAction / …). That's the wrong
-keystone.
+Detailed in `prompt-graph-walking.md`. Replaces the original
+unification-spec Phase 1 (Namespace enum). The real problem isn't node
+identity; it's that we have four parallel models for what's morally one
+graph (`Scope` tree, `package_parents`, `PluginNamespace.bridges`,
+`FileStore`+`RoleMask`) walked by four bespoke functions. Forgetting one
+is a class of "feature mysteriously degraded" bug.
 
-**The real problem:** we don't have a clean graph-walk primitive. Several
-walkers do conceptually similar work via different code paths —
-`resolve_method_in_ancestors`, `for_each_entity_bridged_to`, the cross-file
-resolver in `resolve.rs`, the plugin-namespace bridges, the import-list
-walks. Each handles different edge types (parent class, plugin bridge,
-package qualified, imported) and forgetting one is a class of "cross-file
-feature mysteriously degraded" bug.
+Shape: typed edges (parent / inherits / imports / bridges_* / file_role /
+binds_*), branded edges where instance identity matters (the `$minion` /
+`$app` cases), one `walk(graph, origin, edge_kind_mask, brand_ctx)`
+function. Today's bespoke walkers collapse into `walk` calls with
+different masks. Lives as an isolated module that consumes
+`&FileAnalysis` — the builder doesn't grow this responsibility.
 
-Widening the key from `String` to `enum Namespace` doesn't fix that — it
-just spreads the same ad-hoc walking across a richer alphabet.
+**Scheduled after the type-inference triplet.** Type intelligence is the
+priority; graph rework is the next pillar. Migration is strangler fig —
+port one query at a time.
 
-**The shape we actually need:** a typed-edge graph (whatever the nodes are
-called) with one walk function. Edges have kinds (parent / role / bridge /
-import / framework-scope). Queries supply a kind-mask (analogous to how
-`RoleMask` works for `FileStore` today). Today's bespoke walkers collapse
-into "graph-walk + filter."
-
-**Until that lands**, Phase 6 (Openness diagnostic) and Phase 7's
-`home_namespace` move are blocked. Whether the resulting node identity uses
-`String` or an enum is incidental — the question worth answering is "what's
-the graph?".
-
-### Eager Ref targets (Phase 5)
+### Eager Ref targets (Phase 5 of the original unification)
 
 `Ref.resolves_to: Option<SymbolId>` → `Ref.target: SymbolId` (with
 `UNRESOLVED` sentinel). Removes lazy owner-resolution from query paths.
-Independent of the graph question; can land any time.
+Independent of the graph question; can land any time. `refs_by_target`
+already exists; just the eager-target invariant is missing.
 
-`refs_by_target` already exists; just the eager-target invariant is missing.
+### Why this matters
 
-### Why this matters for type inference
-
-The type-inference unification staircase is the immediate priority, but the
-graph rework is the next big architectural pillar. Both follow the same
-pattern: identify a pile of ad-hoc code paths doing morally-similar work,
-collapse them into one canonical mechanism, enforce the invariant by
-construction. Worth queuing the graph design discussion before Phase 6 work
-becomes urgent.
+The type-inference unification staircase is the immediate priority. Graph
+rework is what unblocks Phase 6 (Openness diagnostic), multi-app Mojo
+support, and the eventual `Symbol.home_scope` move (was: phase 7's
+`home_namespace`). All three follow the same pattern: collapse ad-hoc
+code paths doing morally-similar work into one canonical mechanism;
+enforce the invariant by construction.
 
 ---
 
