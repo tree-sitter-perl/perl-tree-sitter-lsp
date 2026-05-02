@@ -19,7 +19,7 @@ const SCHEMA_VERSION: &str = "9";
 /// Bumped when the builder's analysis output changes shape in a way that
 /// invalidates cached blobs. Unlike `SCHEMA_VERSION`, this does not drop
 /// the table — stale entries are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 14;
+pub const EXTRACT_VERSION: i64 = 15;
 
 /// zstd compression level for the `analysis` blob. Lower numbers are faster;
 /// 3 is zstd's default and gives a solid space/speed tradeoff.

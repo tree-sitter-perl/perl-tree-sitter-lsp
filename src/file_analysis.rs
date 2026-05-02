@@ -1169,9 +1169,41 @@ impl FileAnalysis {
     /// `TypeConstraint` pushed here lands as a `Witness` too.
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
+        self.mirror_local_returns_to_named_sub();
         self.base_type_constraint_count = self.type_constraints.len();
         self.base_symbol_count = self.symbols.len();
         self.base_witness_count = self.witnesses.len();
+    }
+
+    /// Mirror every local Sub/Method's resolved `return_type` into a
+    /// `NamedSub(name) → InferredType(t)` witness. Pairs with the
+    /// matching enrichment-side push for imported subs so the bag's
+    /// `NamedSub` attachment is the universal "what does sub X
+    /// return?" lookup — used by edge-chase materialization for
+    /// `Edge(NamedSub(method))` payloads (chain typer's fluent-method
+    /// receiver path). Without this, an `Edge(NamedSub("get"))` for a
+    /// local method `get` would fail to resolve because the
+    /// enrichment-side push only covers imports.
+    fn mirror_local_returns_to_named_sub(&mut self) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+        let mut to_push: Vec<Witness> = Vec::new();
+        for sym in &self.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                continue;
+            }
+            let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail else {
+                continue;
+            };
+            to_push.push(Witness {
+                attachment: WitnessAttachment::NamedSub(sym.name.clone()),
+                source: WitnessSource::Builder("local_return".into()),
+                payload: WitnessPayload::InferredType(rt.clone()),
+                span: sym.span,
+            });
+        }
+        for w in to_push {
+            self.witnesses.push(w);
+        }
     }
 
 
@@ -1436,37 +1468,15 @@ impl FileAnalysis {
     #[allow(dead_code)] // documented type-query entry point; CLAUDE.md
     pub fn method_call_return_type_via_bag(&self, ref_idx: usize) -> Option<InferredType> {
         use crate::witnesses::{
-            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, ReturnOfKey,
-            WitnessAttachment,
+            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, WitnessAttachment,
         };
 
         let att = WitnessAttachment::Expression(crate::witnesses::RefIdx(ref_idx as u32));
-        let return_of = |k: &ReturnOfKey| -> Option<InferredType> {
-            match k {
-                ReturnOfKey::Name(n) => self.sub_return_type(n).cloned(),
-                ReturnOfKey::Symbol(sym) => {
-                    self.symbols.get(sym.0 as usize).and_then(|s| {
-                        if let SymbolDetail::Sub { return_type, .. } = &s.detail {
-                            return_type.clone()
-                        } else {
-                            None
-                        }
-                    })
-                }
-                ReturnOfKey::MethodOnClass { class: _, method } => {
-                    // For the spike: name-only lookup. A follow-up
-                    // pass will thread the receiver class through
-                    // inherited resolution.
-                    self.sub_return_type(method).cloned()
-                }
-            }
-        };
         let reg = ReducerRegistry::with_defaults();
         let q = ReducerQuery {
             attachment: &att,
             point: None,
             framework: FrameworkFact::Plain,
-            return_of: Some(&return_of),
             arity_hint: None,
         };
         match reg.query(&self.witnesses, &q) {

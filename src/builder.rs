@@ -329,8 +329,11 @@ impl<'a> Builder<'a> {
     ///   - one `InferredType` payload + (optional) class-assertion
     ///     observation per `TypeConstraint`,
     ///   - `HashRefAccess` observations per `$v->{k}` ref,
-    ///   - `ReturnOfName` observations per method-call ref (for the
-    ///     fluent-chain Expression-attached fold),
+    ///   - `Edge(NamedSub(method))` payloads per method-call ref so
+    ///     the fluent-chain Expression-attached fold sees the chased
+    ///     return type as a plain `InferredType` after registry
+    ///     materialization (replaces the closure-driven
+    ///     `TypeObservation::ReturnOfName` path),
     ///   - `mutation` facts on each Class/Sub-owned hash-key write,
     ///   - everything `pending_witnesses` collected during the walk
     ///     (branch arms, arity gating).
@@ -418,7 +421,7 @@ impl<'a> Builder<'a> {
             self.bag.push(Witness {
                 attachment: WitnessAttachment::Expression(crate::witnesses::RefIdx(idx as u32)),
                 source: WitnessSource::Builder("method_call_return".into()),
-                payload: WitnessPayload::Observation(TypeObservation::ReturnOfName(method)),
+                payload: WitnessPayload::Edge(WitnessAttachment::NamedSub(method)),
                 span,
             });
         }
