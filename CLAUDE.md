@@ -22,7 +22,7 @@ Builder          builder.rs                   → produces FileAnalysis
 Data model       file_analysis.rs             → FileAnalysis (serde, bincode-cacheable)
 ```
 
-See `docs/prompt-unification-spec.md` for the cross-file unification roadmap (phases 2–5 landed; 1, 6–7 pending).
+See `docs/ROADMAP.md` for the forward design corpus entry point. `docs/adr/file-store-and-resolve.md` covers the landed cross-file unification (single role-tagged FileStore + RoleMask + resolve_symbol). Residual forward work in `docs/prompt-unification-residual.md`; the next architectural pillar (graph walking) in `docs/prompt-graph-walking.md`.
 
 ### Rules (read before writing code)
 
@@ -40,7 +40,7 @@ See `docs/prompt-unification-spec.md` for the cross-file unification roadmap (ph
 
 7. **Every meaningful token gets a ref.** If `ref_at(pos)` returns nothing or returns too-broad, the builder is missing emission. Overlapping refs → `ref_at` returns the **narrowest span**. Common gaps: fat-comma keys in calls (`connect(timeout => 30)` needs its own `HashKeyAccess`), hash literal keys, framework-synthesized entities (Moo `has name` → `HashKeyDef` for constructor, not just accessor).
 
-8. **Plugin-synthesized content is owned by `PluginNamespace`, not Perl classes.** See `docs/prompt-plugin-architecture.md`. Cross-file lookup goes through `ModuleIndex::for_each_entity_bridged_to(class, ...)` — do NOT add parallel reverse indexes (retired: `class_content_index`, `modules_with_class_content`). Plugins have **emit hooks** (`on_use`, `on_function_call`, `on_method_call`) — parse-time, declarative, return `Vec<EmitAction>` — and **query hooks** (`on_signature_help`, `on_completion`) — cursor-time, imperative, for shape-dependent behavior. `Silent` / `exclusive` answers suppress native paths when plugin knows native will mishandle the slot.
+8. **Plugin-synthesized content is owned by `PluginNamespace`, not Perl classes.** See `docs/adr/plugin-system.md`. Cross-file lookup goes through `ModuleIndex::for_each_entity_bridged_to(class, ...)` — do NOT add parallel reverse indexes (retired: `class_content_index`, `modules_with_class_content`). Plugins have **emit hooks** (`on_use`, `on_function_call`, `on_method_call`) — parse-time, declarative, return `Vec<EmitAction>` — and **query hooks** (`on_signature_help`, `on_completion`) — cursor-time, imperative, for shape-dependent behavior. `Silent` / `exclusive` answers suppress native paths when plugin knows native will mishandle the slot.
 
 9. **Provenance: derived refs trace to source** for rename/cross-ref. Constant folding (`my $m = 'process'; $self->$m()`), `has` declarations (accessor + constructor key + internal hash key), import lists, return hash keys → caller derefs (`HashKeyOwner::Sub`), package→file path, inherited overrides.
 
