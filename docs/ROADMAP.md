@@ -113,6 +113,7 @@ Wired today; smarter is downstream of the engine work above.
 | `prompt-mojo-todo.md` | Stash keys, hook completion, route naming + url_for, plugin chain transitive helpers, config completion |
 | `prompt-cli-tools.md` | Diagnostic framework (PL001–PL010, `.perl-lsp.json`, suppression directives, SARIF), `--migrate`, remaining analysis subcommands |
 | `prompt-ref-provenance.md` | Constant-fold `folded_from`, framework-attribute unified rename, package→file rename, inheritance override scoping |
+| `prompt-synthetic-use.md` | `EmitAction::SyntheticUse` so plugins can mirror real `use` lines — unblocks trivial style-kit support (`Import::Base` / `ToolKit` shims) |
 | `prompt-wasm-web-extension.md` | Cargo workspace split + browser extension; orthogonal to everything else |
 
 These are ship-when-ready, not blocked. Several are worth slotting between
