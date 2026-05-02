@@ -3439,20 +3439,23 @@ impl<'a> Builder<'a> {
     }
 
     /// Compute the right `WitnessPayload` shape for one arm of a
-    /// branch (ternary / if-else / arity-gated return) when the
-    /// walker can bake the type at walk time (literals, constructors,
-    /// simple expressions). Variable arms (`return $foo`) get
-    /// returned `None` deliberately — `infer_returned_value_type`'s
-    /// scalar branch reads `type_constraints` raw and would surface
-    /// `FirstParam`-style intermediate facts that should project to
-    /// `ClassName` under a framework. The post-walk refresh
-    /// (`apply_chain_typing_return_arms`) fills variable arms via
-    /// `query_variable_type` (scope-walking + framework-aware) so
-    /// the eventual `ReturnArm` witness carries the projected type.
+    /// branch (ternary / if-else / arity-gated return). Scalar arms
+    /// (`return $foo`, `$cond ? $a : $b`) become
+    /// `Edge(Variable{name, scope})` — registry materialization
+    /// chases the edge through `query_variable_type` (scope-walking
+    /// + framework-aware fold) so the resolved type reflects
+    /// framework projection (FirstParam → ClassName) and any later
+    /// refinements (call bindings propagated by the worklist).
+    /// Everything else (literals, constructors, chains) goes through
+    /// `infer_returned_value_type` and gets a baked `InferredType(t)`.
     fn arm_payload(&self, arm: Node<'a>) -> Option<crate::witnesses::WitnessPayload> {
-        use crate::witnesses::WitnessPayload;
+        use crate::witnesses::{WitnessAttachment, WitnessPayload};
         if arm.kind() == "scalar" {
-            return None;
+            let name = arm.utf8_text(self.source).ok()?;
+            return Some(WitnessPayload::Edge(WitnessAttachment::Variable {
+                name: name.to_string(),
+                scope: self.current_scope(),
+            }));
         }
         self.infer_returned_value_type(arm)
             .map(WitnessPayload::InferredType)
@@ -6097,23 +6100,18 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Refresh per-return-arm witnesses against the current
-    /// `type_constraints` / `Symbol.return_type` state. Fills gaps
-    /// the walker couldn't bake at walk time:
+    /// Refresh per-return-arm witnesses for arms the walker
+    /// couldn't bake at walk time — typically chain returns like
+    /// `return $route->name(...)` whose type only resolves once sub
+    /// return types and method-call bindings have been folded by an
+    /// earlier worklist iteration. Variable arms don't need this
+    /// pass — the walker emits `Edge(Variable{...})` directly and
+    /// registry materialization chases through
+    /// `query_variable_type` at every query.
     ///
-    /// - Variable returns (`return $self`, `return $foo`) — query
-    ///   `query_variable_type` (scope-walking, framework-aware) so
-    ///   the arm's type reflects framework rules (FirstParam →
-    ///   ClassName under Mojo/Moo) and any later refinements (call
-    ///   bindings propagated by the worklist).
-    /// - Chain returns (`return $route->name(...)`) — call
-    ///   `infer_return_value_type` again now that sub return types
-    ///   and method-call bindings have been folded.
-    ///
-    /// Only fills gaps; arms the walker already published on
-    /// `ReturnArm(span)` are left alone. Source tag
-    /// `return_arm_chain` makes the refresh idempotent across
-    /// worklist iterations.
+    /// Only fills gaps; arms with a current bag answer are left
+    /// alone. Source tag `return_arm_chain` makes the refresh
+    /// idempotent across worklist iterations.
     fn apply_chain_typing_return_arms(&mut self, idx: &ChainTypingIndex<'a>) {
         use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
         self.bag.remove_by_source_tag("return_arm_chain");
@@ -6126,7 +6124,7 @@ impl<'a> Builder<'a> {
             let Some(node) = idx.return_nodes.get(&(ri.span.start, ri.span.end)) else {
                 continue;
             };
-            if let Some(t) = self.compute_return_arm_type(*node, ri.scope) {
+            if let Some(t) = self.infer_return_value_type(*node) {
                 to_push.push(Witness {
                     attachment: WitnessAttachment::ReturnArm(ri.span),
                     source: WitnessSource::Builder("return_arm_chain".into()),
@@ -6139,34 +6137,6 @@ impl<'a> Builder<'a> {
             self.bag.push(w);
         }
         self.return_infos = infos;
-    }
-
-    /// Compute one return arm's type post-walk. Variable arms
-    /// (`return $foo`) go through `query_variable_type` for
-    /// scope-walking + framework-aware fold; everything else uses
-    /// `infer_return_value_type` (which handles literals,
-    /// constructors, chains, ternaries). Centralizes the "what does
-    /// this arm produce now?" decision so both the walk-time
-    /// publish (via `arm_payload`) and the post-walk refresh stay
-    /// in sync.
-    fn compute_return_arm_type(
-        &self,
-        return_node: Node<'a>,
-        scope: ScopeId,
-    ) -> Option<InferredType> {
-        let body = return_node.named_child(0)?;
-        if body.kind() == "scalar" {
-            let name = body.utf8_text(self.source).ok()?;
-            return crate::witnesses::query_variable_type(
-                &self.bag,
-                &self.scopes,
-                &self.package_framework,
-                name,
-                scope,
-                body.start_position(),
-            );
-        }
-        self.infer_return_value_type(return_node)
     }
 
     /// Re-resolve `invocant_class` on every MethodCall ref using the
