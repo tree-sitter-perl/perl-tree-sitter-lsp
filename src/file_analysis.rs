@@ -1443,16 +1443,22 @@ impl FileAnalysis {
     #[allow(dead_code)] // documented type-query entry point; CLAUDE.md
     pub fn method_call_return_type_via_bag(&self, ref_idx: usize) -> Option<InferredType> {
         use crate::witnesses::{
-            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, WitnessAttachment,
+            BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
+            WitnessAttachment,
         };
 
         let att = WitnessAttachment::Expression(crate::witnesses::RefIdx(ref_idx as u32));
         let reg = ReducerRegistry::with_defaults();
+        let ctx = BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
         let q = ReducerQuery {
             attachment: &att,
             point: None,
             framework: FrameworkFact::Plain,
             arity_hint: None,
+            context: Some(&ctx),
         };
         match reg.query(&self.witnesses, &q) {
             ReducedValue::Type(t) => {

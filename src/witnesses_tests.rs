@@ -87,7 +87,7 @@ fn mojo_sub_name_does_not_flip_type_to_hashref() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::MojoBase,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     let v = reg.query(&bag, &q);
     assert_eq!(
@@ -116,7 +116,7 @@ fn plain_hashref_access_without_class_evidence() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &q),
@@ -156,7 +156,7 @@ fn bless_target_array_with_class_assertion_keeps_class() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &q),
@@ -195,7 +195,7 @@ fn core_class_still_holds_class_against_hashref_access() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::CoreClass,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &q),
@@ -239,7 +239,7 @@ fn fluent_chain_get_to_resolves_via_edge_chase() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &q),
@@ -264,7 +264,7 @@ fn edge_with_unresolved_target_yields_none() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(reg.query(&bag, &q), ReducedValue::None);
 }
@@ -293,7 +293,7 @@ fn edge_chase_terminates_on_cycle() {
         attachment: &a,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(reg.query(&bag, &q), ReducedValue::None);
 }
@@ -321,7 +321,7 @@ fn edge_chase_resolves_transitively() {
         attachment: &a,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &q),
@@ -367,7 +367,7 @@ fn narrowed_span_wins_over_outer_witness_at_inside_point() {
         attachment: &att,
         point: Some(p(5, 4)),
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &inside),
@@ -378,7 +378,7 @@ fn narrowed_span_wins_over_outer_witness_at_inside_point() {
         attachment: &att,
         point: Some(p(2, 0)),
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &outside),
@@ -387,20 +387,31 @@ fn narrowed_span_wins_over_outer_witness_at_inside_point() {
 }
 
 // ---- BranchArm reduction (ternary + explicit if/else) ----
+//
+// Branch arms are now plain `InferredType` witnesses with source
+// `Builder("branch_arm")` (no longer a dedicated TypeObservation
+// variant). For variable arms the walker pushes `Edge(Variable{...})`
+// instead and the registry materializes through to the resolved
+// type before BranchArmFold sees it. These tests pin the agreement
+// rule on direct types.
+
+fn wbranch(name: &str, scope: u32, t: InferredType) -> Witness {
+    Witness {
+        attachment: WitnessAttachment::Variable {
+            name: name.to_string(),
+            scope: ScopeId(scope),
+        },
+        source: WitnessSource::Builder("branch_arm".into()),
+        payload: WitnessPayload::InferredType(t),
+        span: span(0, 0, 0, 0),
+    }
+}
 
 #[test]
 fn branch_arms_agree_folds_to_that_type() {
     let mut bag = WitnessBag::new();
-    bag.push(wvar(
-        "$x",
-        0,
-        WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::Numeric)),
-    ));
-    bag.push(wvar(
-        "$x",
-        0,
-        WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::Numeric)),
-    ));
+    bag.push(wbranch("$x", 0, InferredType::Numeric));
+    bag.push(wbranch("$x", 0, InferredType::Numeric));
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::Variable {
         name: "$x".into(),
@@ -410,7 +421,7 @@ fn branch_arms_agree_folds_to_that_type() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &q),
@@ -421,16 +432,8 @@ fn branch_arms_agree_folds_to_that_type() {
 #[test]
 fn branch_arms_disagree_folds_to_none() {
     let mut bag = WitnessBag::new();
-    bag.push(wvar(
-        "$x",
-        0,
-        WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::Numeric)),
-    ));
-    bag.push(wvar(
-        "$x",
-        0,
-        WitnessPayload::Observation(TypeObservation::BranchArm(InferredType::String)),
-    ));
+    bag.push(wbranch("$x", 0, InferredType::Numeric));
+    bag.push(wbranch("$x", 0, InferredType::String));
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::Variable {
         name: "$x".into(),
@@ -440,9 +443,77 @@ fn branch_arms_disagree_folds_to_none() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(reg.query(&bag, &q), ReducedValue::None);
+}
+
+// Edge-shaped branch arm: walker emits `Edge(Variable{...})` for a
+// variable return; registry materialization chases through the
+// variable's witness, giving BranchArmFold a resolved type.
+#[test]
+fn branch_arm_edge_resolves_through_variable() {
+    let mut bag = WitnessBag::new();
+    // Two arms of `my $x = $c ? $a : $b;`. $a and $b both have type
+    // String — agreement should fold to String even though the
+    // walker couldn't bake the arm types.
+    bag.push(Witness {
+        attachment: WitnessAttachment::Variable {
+            name: "$a".into(),
+            scope: ScopeId(0),
+        },
+        source: WitnessSource::Builder("test".into()),
+        payload: WitnessPayload::InferredType(InferredType::String),
+        span: span(0, 0, 0, 0),
+    });
+    bag.push(Witness {
+        attachment: WitnessAttachment::Variable {
+            name: "$b".into(),
+            scope: ScopeId(0),
+        },
+        source: WitnessSource::Builder("test".into()),
+        payload: WitnessPayload::InferredType(InferredType::String),
+        span: span(0, 0, 0, 0),
+    });
+    bag.push(Witness {
+        attachment: WitnessAttachment::Variable {
+            name: "$x".into(),
+            scope: ScopeId(0),
+        },
+        source: WitnessSource::Builder("branch_arm".into()),
+        payload: WitnessPayload::Edge(WitnessAttachment::Variable {
+            name: "$a".into(),
+            scope: ScopeId(0),
+        }),
+        span: span(0, 0, 0, 0),
+    });
+    bag.push(Witness {
+        attachment: WitnessAttachment::Variable {
+            name: "$x".into(),
+            scope: ScopeId(0),
+        },
+        source: WitnessSource::Builder("branch_arm".into()),
+        payload: WitnessPayload::Edge(WitnessAttachment::Variable {
+            name: "$b".into(),
+            scope: ScopeId(0),
+        }),
+        span: span(0, 0, 0, 0),
+    });
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Variable {
+        name: "$x".into(),
+        scope: ScopeId(0),
+    };
+    let q = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        arity_hint: None, context: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &q),
+        ReducedValue::Type(InferredType::String)
+    );
 }
 
 // ---- Fluent arity dispatch reducer ----
@@ -485,7 +556,7 @@ fn arity_zero_returns_string_default_returns_self() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: Some(0),
+        arity_hint: Some(0), context: None,
     };
     assert_eq!(
         reg.query(&bag, &q0),
@@ -498,7 +569,7 @@ fn arity_zero_returns_string_default_returns_self() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: Some(1),
+        arity_hint: Some(1), context: None,
     };
     assert_eq!(
         reg.query(&bag, &q1),
@@ -510,7 +581,7 @@ fn arity_zero_returns_string_default_returns_self() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &qn),
@@ -535,7 +606,7 @@ fn numeric_then_string_prefers_numeric_noop_when_class_set() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&bag, &q),
@@ -575,7 +646,7 @@ fn plugin_override_priority_dominates_builder_inferred_type() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     match reg.query(&bag, &q) {
         ReducedValue::Type(InferredType::ClassName(name)) => {
@@ -616,7 +687,7 @@ fn plugin_override_reducer_yields_when_only_builder_witnesses_present() {
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     // PluginOverrideReducer declines (priority == 10), no other
     // reducer claims Symbol+InferredType in Phase 3, so the

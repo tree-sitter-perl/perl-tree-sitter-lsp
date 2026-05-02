@@ -1243,7 +1243,7 @@ sub mix {
         attachment: &att_p,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&fa.witnesses, &q_p),
@@ -1256,7 +1256,7 @@ sub mix {
         attachment: &att_m,
         point: None,
         framework: FrameworkFact::Plain,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&fa.witnesses, &q_m),
