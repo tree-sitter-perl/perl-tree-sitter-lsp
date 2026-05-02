@@ -1167,43 +1167,18 @@ impl FileAnalysis {
     /// baseline counts. Called by `builder::build` after the witness
     /// bag has been moved in. Keeps the bag canonical: every new
     /// `TypeConstraint` pushed here lands as a `Witness` too.
+    ///
+    /// `NamedSub(name) → InferredType(t)` witnesses for every local
+    /// Sub/Method are already in the bag — published by
+    /// `Builder::write_back_sub_return_types` at the end of the
+    /// worklist (single emission point for "this sub's return type
+    /// is known," same shape `enrich_imported_types_with_keys` uses
+    /// for imports).
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
-        self.mirror_local_returns_to_named_sub();
         self.base_type_constraint_count = self.type_constraints.len();
         self.base_symbol_count = self.symbols.len();
         self.base_witness_count = self.witnesses.len();
-    }
-
-    /// Mirror every local Sub/Method's resolved `return_type` into a
-    /// `NamedSub(name) → InferredType(t)` witness. Pairs with the
-    /// matching enrichment-side push for imported subs so the bag's
-    /// `NamedSub` attachment is the universal "what does sub X
-    /// return?" lookup — used by edge-chase materialization for
-    /// `Edge(NamedSub(method))` payloads (chain typer's fluent-method
-    /// receiver path). Without this, an `Edge(NamedSub("get"))` for a
-    /// local method `get` would fail to resolve because the
-    /// enrichment-side push only covers imports.
-    fn mirror_local_returns_to_named_sub(&mut self) {
-        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
-        let mut to_push: Vec<Witness> = Vec::new();
-        for sym in &self.symbols {
-            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                continue;
-            }
-            let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail else {
-                continue;
-            };
-            to_push.push(Witness {
-                attachment: WitnessAttachment::NamedSub(sym.name.clone()),
-                source: WitnessSource::Builder("local_return".into()),
-                payload: WitnessPayload::InferredType(rt.clone()),
-                span: sym.span,
-            });
-        }
-        for w in to_push {
-            self.witnesses.push(w);
-        }
     }
 
 

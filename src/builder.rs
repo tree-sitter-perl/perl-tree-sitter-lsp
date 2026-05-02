@@ -6495,15 +6495,26 @@ impl<'a> Builder<'a> {
     }
 
     /// Step 7: writeback. Set `return_type` on matching Sub/Method
-    /// symbols, and record `return_self_method` for subs whose return
-    /// type couldn't be collapsed in-file (the consumer side chains
-    /// through `return_self_method` when `return_type` is None).
-    /// Plugin overrides flow through `return_types` via the bag-priority
-    /// seeding step, with `return_provenance` cleared so we don't
-    /// clobber the existing `PluginOverride` entry written by
-    /// `apply_type_overrides`. No special-case skip needed — overrides
-    /// win because they're higher-priority bag witnesses, not because
-    /// the writeback knows about them.
+    /// symbols, push a `NamedSub(name) → InferredType(t)` witness for
+    /// each resolved return so the bag publishes the answer to every
+    /// consumer (chain typer's `Edge(NamedSub(_))` chase, cross-file
+    /// callers via `query_sub_return_type`'s NamedSub branch — same
+    /// shape `enrich_imported_types_with_keys` uses for imports), and
+    /// record `return_self_method` for subs whose return type couldn't
+    /// be collapsed in-file. Plugin overrides flow through
+    /// `return_types` via the bag-priority seeding step, with
+    /// `return_provenance` cleared so we don't clobber the existing
+    /// `PluginOverride` entry written by `apply_type_overrides`. No
+    /// special-case skip needed — overrides win because they're
+    /// higher-priority bag witnesses, not because the writeback knows
+    /// about them.
+    ///
+    /// Idempotent across re-runs: `bag.remove_by_source_tag("local_return")`
+    /// at the start of every call drops the prior pass's NamedSub
+    /// witnesses before re-emitting. The worklist driver calls
+    /// `resolve_return_types` repeatedly until fixed point; without
+    /// this clear-and-emit, each iteration would duplicate every
+    /// sub's NamedSub witness.
     fn write_back_sub_return_types(
         &mut self,
         return_types: &std::collections::HashMap<String, InferredType>,
@@ -6512,6 +6523,10 @@ impl<'a> Builder<'a> {
             crate::file_analysis::TypeProvenance,
         >,
     ) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+
+        self.bag.remove_by_source_tag("local_return");
+
         for sym in &mut self.symbols {
             if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                 continue;
@@ -6548,6 +6563,37 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
+        }
+
+        // Publish every Sub/Method's resolved return type to the bag
+        // as `NamedSub(name) → InferredType(t)`. Catches both
+        // worklist-resolved returns (set above) and framework-pinned
+        // ones (Mojo::Base accessors, Moo `has`, DBIC column accessors
+        // — these set `return_type` in the SymbolDetail constructor at
+        // walk-time synthesis, never flow through `return_types`).
+        // Same shape `enrich_imported_types_with_keys` uses for
+        // imports, so NamedSub is the universal "what does sub X
+        // return?" attachment for both local and cross-file lookups.
+        let named_sub_witnesses: Vec<Witness> = self
+            .symbols
+            .iter()
+            .filter_map(|sym| {
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                    return None;
+                }
+                let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail else {
+                    return None;
+                };
+                Some(Witness {
+                    attachment: WitnessAttachment::NamedSub(sym.name.clone()),
+                    source: WitnessSource::Builder("local_return".into()),
+                    payload: WitnessPayload::InferredType(rt.clone()),
+                    span: sym.span,
+                })
+            })
+            .collect();
+        for w in named_sub_witnesses {
+            self.bag.push(w);
         }
     }
 
