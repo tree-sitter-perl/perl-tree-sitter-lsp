@@ -1167,6 +1167,13 @@ impl FileAnalysis {
     /// baseline counts. Called by `builder::build` after the witness
     /// bag has been moved in. Keeps the bag canonical: every new
     /// `TypeConstraint` pushed here lands as a `Witness` too.
+    ///
+    /// `NamedSub(name) → InferredType(t)` witnesses for every local
+    /// Sub/Method are already in the bag — published by
+    /// `Builder::write_back_sub_return_types` at the end of the
+    /// worklist (single emission point for "this sub's return type
+    /// is known," same shape `enrich_imported_types_with_keys` uses
+    /// for imports).
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
         self.base_type_constraint_count = self.type_constraints.len();
@@ -1436,38 +1443,22 @@ impl FileAnalysis {
     #[allow(dead_code)] // documented type-query entry point; CLAUDE.md
     pub fn method_call_return_type_via_bag(&self, ref_idx: usize) -> Option<InferredType> {
         use crate::witnesses::{
-            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, ReturnOfKey,
+            BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
             WitnessAttachment,
         };
 
         let att = WitnessAttachment::Expression(crate::witnesses::RefIdx(ref_idx as u32));
-        let return_of = |k: &ReturnOfKey| -> Option<InferredType> {
-            match k {
-                ReturnOfKey::Name(n) => self.sub_return_type(n).cloned(),
-                ReturnOfKey::Symbol(sym) => {
-                    self.symbols.get(sym.0 as usize).and_then(|s| {
-                        if let SymbolDetail::Sub { return_type, .. } = &s.detail {
-                            return_type.clone()
-                        } else {
-                            None
-                        }
-                    })
-                }
-                ReturnOfKey::MethodOnClass { class: _, method } => {
-                    // For the spike: name-only lookup. A follow-up
-                    // pass will thread the receiver class through
-                    // inherited resolution.
-                    self.sub_return_type(method).cloned()
-                }
-            }
-        };
         let reg = ReducerRegistry::with_defaults();
+        let ctx = BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
         let q = ReducerQuery {
             attachment: &att,
             point: None,
             framework: FrameworkFact::Plain,
-            return_of: Some(&return_of),
             arity_hint: None,
+            context: Some(&ctx),
         };
         match reg.query(&self.witnesses, &q) {
             ReducedValue::Type(t) => {
@@ -1496,11 +1487,16 @@ impl FileAnalysis {
         sub_name: &str,
         arity: Option<u32>,
     ) -> Option<InferredType> {
+        let ctx = crate::witnesses::BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
         crate::witnesses::query_sub_return_type(
             &self.witnesses,
             &self.symbols,
             sub_name,
             arity,
+            Some(&ctx),
         )
     }
 

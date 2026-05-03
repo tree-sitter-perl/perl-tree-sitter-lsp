@@ -855,7 +855,8 @@ sub name {
 /// call has an invocant expression that's itself a method call.
 /// The bag lets us ask "what's the return type of ref[i]?" without
 /// needing a named intermediate variable. Verifies the seed is
-/// present and chains name-lookup via the `return_of` hook.
+/// present and the bag's edge-chase materialization resolves the
+/// chain hop to its target sub's return type.
 #[test]
 fn test_witnesses_fluent_chain_seeds_expression_witnesses() {
     let fa = build_fa_from_source(
@@ -1242,8 +1243,7 @@ sub mix {
         attachment: &att_p,
         point: None,
         framework: FrameworkFact::Plain,
-        return_of: None,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&fa.witnesses, &q_p),
@@ -1256,8 +1256,7 @@ sub mix {
         attachment: &att_m,
         point: None,
         framework: FrameworkFact::Plain,
-        return_of: None,
-        arity_hint: None,
+        arity_hint: None, context: None,
     };
     assert_eq!(
         reg.query(&fa.witnesses, &q_m),

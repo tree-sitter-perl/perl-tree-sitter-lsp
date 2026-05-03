@@ -66,6 +66,17 @@ pub enum WitnessAttachment {
     HashKey { owner: HashKeyOwner, name: String },
     /// Package-level facts (isa edges, framework mode).
     Package(String),
+    /// One return-arm of a sub, identified by the return expression's
+    /// span. Carries the arm's resolved type as either a direct
+    /// `InferredType(t)` (literals, constructors) or an `Edge` to the
+    /// arm-source attachment (a variable's `Variable{name, scope}` for
+    /// `return $foo`). The per-sub fold queries `Symbol(sub_id)` whose
+    /// `branch_arm` witnesses are themselves edges to per-arm
+    /// `ReturnArm` attachments — registry materialization chases the
+    /// edges, so `BranchArmFold` sees each arm's resolved type
+    /// uniformly. Arity dispatch (`emit_arity_return_witnesses`)
+    /// queries each `ReturnArm` directly to read per-arm types.
+    ReturnArm(Span),
 }
 
 /// Index into `FileAnalysis::refs`.
@@ -108,6 +119,18 @@ pub enum WitnessPayload {
     /// An **observation** — raw evidence about a value's use, to be
     /// folded by the framework-aware resolver (Part 6).
     Observation(TypeObservation),
+    /// Edge fact: "the value at my attachment is whatever resolves at
+    /// `target`." The reducer registry materializes these at query
+    /// time — chase the target via recursive query, replace the edge
+    /// with a synthetic `InferredType` witness preserving source +
+    /// span, then run reducers against the materialized list. Cycle
+    /// guard breaks `A → B → A`.
+    ///
+    /// Edges replace the manual closure-driven chase that used
+    /// `ReducerQuery::return_of` for `ReturnOfName` / `ReturnOf` —
+    /// the bag now expresses "follow this reference" as a first-class
+    /// payload kind, so reducers don't need to know about chasing.
+    Edge(WitnessAttachment),
     /// Keyed fact. Family + key + value schema is the reducer's
     /// responsibility.
     Fact { family: String, key: String, value: FactValue },
@@ -145,35 +168,10 @@ pub enum TypeObservation {
     RegexpUse,
     /// `bless [], $c` pins the representation axis to Array.
     BlessTarget(Rep),
-    /// Fluent-chain binding target: the value is the return of this sub.
-    ReturnOf(SymbolId),
-    /// Same as ReturnOf but by name — handy before symbol resolution
-    /// runs or for cross-file.
-    ReturnOfName(String),
-    /// One arm of a branching expression whose result flows into the
-    /// attached subject. Both ternary `A ? B : C` and explicit
-    /// `if/unless/elsif/else` return branches use this — the builder
-    /// emits one observation per arm. The branch reducer folds them:
-    /// agreement → that type; disagreement → None (future: Union).
-    BranchArm(InferredType),
     /// A single arity-dispatch fact: for arity `arg_count`, the sub
     /// returns `return_type`. `None` for `arg_count` means the
     /// fall-through / default branch. Attached to a `Symbol(sub_id)`.
     ArityReturn { arg_count: Option<u32>, return_type: InferredType },
-    /// "This sub's body is `return Other(...)`" — its return type is
-    /// whatever Other returns. The string carries Other's name; the
-    /// `DelegationReducer` chases it via `ReducerQuery::return_of`.
-    /// Attached to `Symbol(delegator_sub_id)`. Mirrors the
-    /// `Builder.sub_return_delegations` map; the map stays as an
-    /// internal lookup, the witness is the bag-side fact.
-    ReturnDelegation(String),
-    /// "This sub's body tail is `shift->method(...)` or
-    /// `$self->method(...)`" — Perl's last-statement-returns rule
-    /// means the sub returns whatever `method` returns on the same
-    /// receiver. The string carries the method name; the
-    /// `SelfMethodTailReducer` chases it via `ReducerQuery::return_of`.
-    /// Attached to `Symbol(sub_id)`. Mirrors `Builder.self_method_tails`.
-    SelfMethodTail(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -355,24 +353,27 @@ pub struct ReducerQuery<'a> {
     pub attachment: &'a WitnessAttachment,
     pub point: Option<tree_sitter::Point>,
     pub framework: FrameworkFact,
-    /// Resolve a sub/method symbol's return type — closure the core
-    /// installs so chain-fold can follow `ReturnOf`. `None` means the
-    /// resolver is running without an index (unit tests).
-    pub return_of: Option<&'a dyn Fn(&ReturnOfKey) -> Option<InferredType>>,
     /// Arity hint for arity-dispatch reducers. `Some(N)` = caller
     /// passed exactly N additional arguments to the sub; `None` =
     /// unknown — the reducer should return the default branch's type.
     pub arity_hint: Option<u32>,
+    /// Optional scope topology + per-package framework. Threaded into
+    /// the registry's materialize step so `Edge(Variable{name, scope})`
+    /// chases use `query_variable_type` semantics (scope-chain walk
+    /// + framework-aware fold) instead of a flat single-attachment
+    /// lookup. `None` for context-free queries (tests, lookups
+    /// where the target is known to be self-contained).
+    pub context: Option<&'a BagContext<'a>>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // payloads + MethodOnClass — see module-level note
-pub enum ReturnOfKey {
-    Symbol(SymbolId),
-    Name(String),
-    /// Method on a known receiver class — the chain reducer uses this
-    /// to look up "the return of class.method" via the registry.
-    MethodOnClass { class: String, method: String },
+/// File-scope context the registry needs to chase Variable edges
+/// correctly. Carries the scope tree and per-package framework so
+/// materialization can run `query_variable_type` for `Variable`
+/// targets — which is the only edge target whose resolution
+/// fundamentally requires more than the bag itself.
+pub struct BagContext<'a> {
+    pub scopes: &'a [Scope],
+    pub package_framework: &'a HashMap<String, FrameworkFact>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -412,36 +413,22 @@ impl WitnessReducer for FrameworkAwareTypeFold {
     }
 
     fn claims(&self, w: &Witness) -> bool {
+        // Excludes `branch_arm`-source witnesses — those are claimed
+        // by `BranchArmFold` (registered earlier) so the agreement /
+        // disagreement rule applies. Without this filter the
+        // multi-axis fold below would treat a disagreeing pair of
+        // arms as "latest-wins," silently picking one instead of
+        // surfacing ambiguity.
         matches!(
             w.attachment,
             WitnessAttachment::Variable { .. } | WitnessAttachment::Expression(_)
         ) && matches!(
             w.payload,
             WitnessPayload::InferredType(_) | WitnessPayload::Observation(_)
-        )
+        ) && !matches!(&w.source, WitnessSource::Builder(s) if s == "branch_arm")
     }
 
     fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
-        // Ternary descent: if any BranchArm observations are present
-        // on this attachment, collect them. Agreement → that type.
-        // Disagreement → None (lets the caller surface it as ambiguous
-        // rather than silently picking an arm).
-        let ternary_arms: Vec<&InferredType> = ws
-            .iter()
-            .filter_map(|w| match &w.payload {
-                WitnessPayload::Observation(TypeObservation::BranchArm(t)) => Some(t),
-                _ => None,
-            })
-            .collect();
-        if !ternary_arms.is_empty() {
-            let first = ternary_arms[0];
-            if ternary_arms.iter().all(|t| *t == first) {
-                return ReducedValue::Type(first.clone());
-            }
-            // Disagreement — Union support is a separate reducer.
-            return ReducedValue::None;
-        }
-
         // Part 5b — narrowing. If the query has a `point`, pick the
         // narrowest-span InferredType witness whose span *contains*
         // that point; if any exists, return it directly (it already
@@ -515,41 +502,8 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                     TypeObservation::NumericUse => num = true,
                     TypeObservation::StringUse => str_ = true,
                     TypeObservation::RegexpUse => re = true,
-                    TypeObservation::ReturnOf(sym) => {
-                        if let Some(f) = q.return_of {
-                            if let Some(t) = f(&ReturnOfKey::Symbol(*sym)) {
-                                if let InferredType::ClassName(n) = t {
-                                    class_assertion = Some(n);
-                                } else {
-                                    plain_type = Some(t);
-                                }
-                            }
-                        }
-                    }
-                    TypeObservation::BranchArm(_) => {
-                        // Handled above in the ternary-descent block;
-                        // if we reach here, the ternary path was
-                        // skipped (no arms detected), so just fall
-                        // through as a plain InferredType.
-                    }
                     TypeObservation::ArityReturn { .. } => {
                         // Arity dispatch is a separate reducer.
-                    }
-                    TypeObservation::ReturnDelegation(_)
-                    | TypeObservation::SelfMethodTail(_) => {
-                        // Sub-return delegation chains have their own
-                        // reducers (DelegationReducer / SelfMethodTailReducer).
-                    }
-                    TypeObservation::ReturnOfName(n) => {
-                        if let Some(f) = q.return_of {
-                            if let Some(t) = f(&ReturnOfKey::Name(n.clone())) {
-                                if let InferredType::ClassName(nm) = t {
-                                    class_assertion = Some(nm);
-                                } else {
-                                    plain_type = Some(t);
-                                }
-                            }
-                        }
                     }
                 },
                 _ => {}
@@ -665,17 +619,24 @@ impl WitnessReducer for BranchArmFold {
     }
 
     fn claims(&self, w: &Witness) -> bool {
-        matches!(
-            w.payload,
-            WitnessPayload::Observation(TypeObservation::BranchArm(_))
-        )
+        // Source-tag claim — the walker (and any downstream pass that
+        // wants to contribute a branch-arm fact) emits with source
+        // `Builder("branch_arm")`. After registry materialization,
+        // every claimed witness has an `InferredType` payload (the
+        // walker pushed `Type(t)` directly for bakeable arms; the
+        // registry chased `Edge(target)` arms through to a resolved
+        // type and replaced them with synthetic `InferredType`
+        // witnesses preserving source + span). Reducer needs only
+        // the values.
+        matches!(&w.source, WitnessSource::Builder(s) if s == "branch_arm")
+            && matches!(w.payload, WitnessPayload::InferredType(_))
     }
 
     fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
         let arms: Vec<&InferredType> = ws
             .iter()
             .filter_map(|w| match &w.payload {
-                WitnessPayload::Observation(TypeObservation::BranchArm(t)) => Some(t),
+                WitnessPayload::InferredType(t) => Some(t),
                 _ => None,
             })
             .collect();
@@ -765,98 +726,19 @@ impl WitnessReducer for FluentArityDispatch {
     }
 }
 
-// ---- Sub-return delegation reducers ----
-//
-// These two reducers turn the `Builder.sub_return_delegations` and
-// `Builder.self_method_tails` maps into bag-side facts that the
-// registry can fold uniformly with everything else. Phase 4 of the
-// worklist refactor (docs/prompt-type-inference-worklist-refactor.md):
-// the procedural fixed-point loops in `resolve_return_types` push the
-// same maps as `ReturnDelegation` / `SelfMethodTail` observations on
-// `Symbol(sub_id)`. The reducers chase them via
-// `ReducerQuery::return_of`, which the registry caller must install
-// (Phase 6 will wire it in the worklist driver). Today the procedural
-// loops still own the build-time fixed point; the reducers stand
-// ready for the worklist driver to consume them without further
-// changes to the bag's contents.
-//
-// They claim narrowly (only their specific observation variant) so
-// they don't conflict with FluentArityDispatch / BranchArmFold on
-// the same `Symbol(_)` attachment.
-
-/// Sub X's body is `return Y(...)` — X returns whatever Y returns.
-pub struct DelegationReducer;
-
-impl WitnessReducer for DelegationReducer {
-    fn name(&self) -> &str {
-        "delegation"
-    }
-
-    fn claims(&self, w: &Witness) -> bool {
-        matches!(w.attachment, WitnessAttachment::Symbol(_))
-            && matches!(
-                w.payload,
-                WitnessPayload::Observation(TypeObservation::ReturnDelegation(_))
-            )
-    }
-
-    fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
-        // Multiple ReturnDelegation observations on one symbol shouldn't
-        // happen (a sub has one tail expression), but if they do, take
-        // the first that resolves — matches the procedural loop's
-        // "first delegation that lands a type wins" behavior.
-        let lookup = match q.return_of {
-            Some(f) => f,
-            None => return ReducedValue::None,
-        };
-        for w in ws {
-            if let WitnessPayload::Observation(TypeObservation::ReturnDelegation(name)) =
-                &w.payload
-            {
-                if let Some(t) = lookup(&ReturnOfKey::Name(name.clone())) {
-                    return ReducedValue::Type(t);
-                }
-            }
-        }
-        ReducedValue::None
-    }
-}
-
-/// Sub X's body tail is `shift->method(...)` / `$self->method(...)` —
-/// Perl's last-statement-returns rule means X returns whatever
-/// `method` returns on the same receiver class.
-pub struct SelfMethodTailReducer;
-
-impl WitnessReducer for SelfMethodTailReducer {
-    fn name(&self) -> &str {
-        "self_method_tail"
-    }
-
-    fn claims(&self, w: &Witness) -> bool {
-        matches!(w.attachment, WitnessAttachment::Symbol(_))
-            && matches!(
-                w.payload,
-                WitnessPayload::Observation(TypeObservation::SelfMethodTail(_))
-            )
-    }
-
-    fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
-        let lookup = match q.return_of {
-            Some(f) => f,
-            None => return ReducedValue::None,
-        };
-        for w in ws {
-            if let WitnessPayload::Observation(TypeObservation::SelfMethodTail(method)) =
-                &w.payload
-            {
-                if let Some(t) = lookup(&ReturnOfKey::Name(method.clone())) {
-                    return ReducedValue::Type(t);
-                }
-            }
-        }
-        ReducedValue::None
-    }
-}
+// Sub-return delegation chains (`return other()`,
+// `shift->method(...)`) used to be represented as
+// `ReturnDelegation(name)` / `SelfMethodTail(name)` observations
+// chased via `ReducerQuery::return_of`. After the edge-fact
+// migration (May 2026) the bag-side representation is
+// `Edge(NamedSub(name))` — registry materialization handles the
+// chase transparently, so dedicated reducers are no longer
+// needed. The procedural fixed-point loops in
+// `Builder::propagate_via_delegation` /
+// `Builder::propagate_via_self_method_tails` continue to own
+// build-time delegation propagation (they read the
+// `sub_return_delegations` / `self_method_tails` maps directly,
+// not the bag).
 
 // ---- Named-sub return reducer ----
 //
@@ -882,6 +764,40 @@ impl WitnessReducer for NamedSubReturn {
         // One witness per import — the latest one wins (enrichment
         // truncates back to baseline before re-deriving, so there's
         // never accumulated stale state).
+        for w in ws.iter().rev() {
+            if let WitnessPayload::InferredType(t) = &w.payload {
+                return ReducedValue::Type(t.clone());
+            }
+        }
+        ReducedValue::None
+    }
+}
+
+// ---- Return-arm reducer ----
+//
+// Claims `InferredType` payloads on `ReturnArm(_)` attachments —
+// the per-arm storage that every `return X` in a sub body
+// publishes. The walker pushes either `Type(t)` directly (literals,
+// constructors) or `Edge(target)` (variable returns). Edge witnesses
+// get materialized by the registry into synthetic `Type` witnesses
+// before any reducer claims, so this reducer always sees plain
+// types. Latest-wins: chain typing's post-walk refresh pass pushes
+// updated `Type` witnesses on a different source tag, and we want
+// that latest value to dominate the original walk-time push.
+
+pub struct ReturnArmReturn;
+
+impl WitnessReducer for ReturnArmReturn {
+    fn name(&self) -> &str {
+        "return_arm_return"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::ReturnArm(_))
+            && matches!(w.payload, WitnessPayload::InferredType(_))
+    }
+
+    fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
         for w in ws.iter().rev() {
             if let WitnessPayload::InferredType(t) = &w.payload {
                 return ReducedValue::Type(t.clone());
@@ -963,19 +879,19 @@ impl ReducerRegistry {
         // Plugin overrides short-circuit before any inferred fold —
         // registered first so it sees Symbol+InferredType witnesses
         // before FrameworkAwareTypeFold or BranchArmFold get a chance.
+        // BranchArmFold runs before FrameworkAwareTypeFold so the
+        // agreement / disagreement rule for branch_arm-source
+        // witnesses applies before the multi-axis fold's latest-wins
+        // accumulator could pick one of two disagreeing arms. Plugin
+        // overrides still dominate (priority short-circuit on
+        // `Symbol(_)` attachments — different attachment shape than
+        // BranchArmFold's typical Variable / Symbol-via-edge claims).
         r.register(Box::new(PluginOverrideReducer));
-        r.register(Box::new(FrameworkAwareTypeFold));
         r.register(Box::new(BranchArmFold));
+        r.register(Box::new(FrameworkAwareTypeFold));
         r.register(Box::new(FluentArityDispatch));
-        // Phase 4: Symbol-attached delegation reducers. They only fire
-        // when `ReducerQuery::return_of` is installed; today's query
-        // sites don't install one, so they're dormant — Phase 6's
-        // worklist driver activates them. Registered now so the
-        // priority order is locked in (chained delegation → arity →
-        // arms) before the driver lands.
-        r.register(Box::new(DelegationReducer));
-        r.register(Box::new(SelfMethodTailReducer));
         r.register(Box::new(NamedSubReturn));
+        r.register(Box::new(ReturnArmReturn));
         r
     }
 
@@ -986,13 +902,37 @@ impl ReducerRegistry {
     /// Query the registry for the first reducer that returns a
     /// non-`None` value. For the type-fold there's only one claimant;
     /// for fact families you'd scan all.
+    ///
+    /// Edge materialization runs first: any `WitnessPayload::Edge(target)`
+    /// witnesses on the queried attachment are chased via recursive
+    /// query and replaced by synthetic `InferredType` witnesses
+    /// (preserving the original source + span) before reducers see the
+    /// witness list. This lets edges compose with existing reducers
+    /// without reducer-side awareness — `FrameworkAwareTypeFold` reads
+    /// a chased class as a plain `InferredType::ClassName`, same as if
+    /// the walker had baked it directly. Cycle guard via the visited
+    /// set breaks `A → B → A`.
     pub fn query(&self, bag: &WitnessBag, q: &ReducerQuery) -> ReducedValue {
+        let mut visited: std::collections::HashSet<WitnessAttachment> =
+            std::collections::HashSet::new();
+        self.query_rec(bag, q, &mut visited)
+    }
+
+    fn query_rec(
+        &self,
+        bag: &WitnessBag,
+        q: &ReducerQuery,
+        visited: &mut std::collections::HashSet<WitnessAttachment>,
+    ) -> ReducedValue {
+        if !visited.insert(q.attachment.clone()) {
+            return ReducedValue::None;
+        }
+        let materialized = self.materialize(bag, q, visited);
+        visited.remove(q.attachment);
+
         for r in &self.reducers {
-            let claimed: Vec<&Witness> = bag
-                .for_attachment(q.attachment)
-                .into_iter()
-                .filter(|w| r.claims(w))
-                .collect();
+            let claimed: Vec<&Witness> =
+                materialized.iter().filter(|w| r.claims(w)).collect();
             if claimed.is_empty() {
                 continue;
             }
@@ -1003,6 +943,91 @@ impl ReducerRegistry {
         }
         ReducedValue::None
     }
+
+    /// Resolve every Edge witness on `q.attachment` to an
+    /// `InferredType` witness via recursive query; non-edge witnesses
+    /// pass through unchanged. The returned list is fresh-owned so
+    /// reducers can take `&Witness` references into it.
+    ///
+    /// `Edge(Variable{...})` targets are special-cased: variable
+    /// resolution requires walking the scope chain and using the
+    /// scope's package framework. When the query carries a
+    /// `BagContext`, materialize delegates to `query_variable_type`
+    /// (the same helper file-side variable lookups use). Without a
+    /// context the chase is a flat single-attachment query —
+    /// adequate for tests and for cases where the witness exists at
+    /// the exact scope.
+    fn materialize(
+        &self,
+        bag: &WitnessBag,
+        q: &ReducerQuery,
+        visited: &mut std::collections::HashSet<WitnessAttachment>,
+    ) -> Vec<Witness> {
+        let raw = bag.for_attachment(q.attachment);
+        let mut out: Vec<Witness> = Vec::with_capacity(raw.len());
+        for w in raw {
+            match &w.payload {
+                WitnessPayload::Edge(target) => {
+                    let resolved = match (target, q.context) {
+                        (
+                            WitnessAttachment::Variable { name, scope },
+                            Some(ctx),
+                        ) => {
+                            let point = scope_point(ctx.scopes, *scope);
+                            query_variable_type(
+                                bag,
+                                ctx.scopes,
+                                ctx.package_framework,
+                                name,
+                                *scope,
+                                point,
+                            )
+                        }
+                        _ => {
+                            let sub_q = ReducerQuery {
+                                attachment: target,
+                                point: q.point,
+                                framework: q.framework,
+                                arity_hint: q.arity_hint,
+                                context: q.context,
+                            };
+                            if let ReducedValue::Type(t) = self.query_rec(bag, &sub_q, visited) {
+                                Some(t)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some(t) = resolved {
+                        out.push(Witness {
+                            attachment: w.attachment.clone(),
+                            source: w.source.clone(),
+                            payload: WitnessPayload::InferredType(t),
+                            span: w.span,
+                        });
+                    }
+                    // Edge that didn't resolve drops out — same as a
+                    // witness no reducer claims.
+                }
+                _ => out.push(w.clone()),
+            }
+        }
+        out
+    }
+}
+
+/// Pick a `Point` to use as the "where am I asking from?" for a
+/// scope-chained Variable query. The scope's start position works —
+/// `query_variable_type` uses it for temporal narrowing
+/// (witnesses past this point are excluded). For Edge chases the
+/// emitting witness's span is the right answer, but materialize
+/// doesn't have access to the chasing witness's span here; the
+/// scope start is a safe approximation.
+fn scope_point(scopes: &[Scope], scope: ScopeId) -> tree_sitter::Point {
+    scopes
+        .get(scope.0 as usize)
+        .map(|s| s.span.end)
+        .unwrap_or(tree_sitter::Point { row: 0, column: 0 })
 }
 
 // ---- Single shared query entrypoint ----
@@ -1025,6 +1050,7 @@ pub fn query_sub_return_type(
     symbols: &[crate::file_analysis::Symbol],
     sub_name: &str,
     arity_hint: Option<u32>,
+    context: Option<&BagContext>,
 ) -> Option<InferredType> {
     // Local-symbol bag query first — picks up arity-discriminated
     // dispatch via FluentArityDispatch.
@@ -1042,8 +1068,8 @@ pub fn query_sub_return_type(
             attachment: &att,
             point: None,
             framework: FrameworkFact::Plain,
-            return_of: None,
             arity_hint,
+            context,
         };
         if let ReducedValue::Type(t) = reg.query(bag, &q) {
             return Some(t);
@@ -1063,8 +1089,8 @@ pub fn query_sub_return_type(
         attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
-        return_of: None,
         arity_hint,
+        context,
     };
     if let ReducedValue::Type(t) = reg.query(bag, &q) {
         return Some(t);
@@ -1109,6 +1135,7 @@ pub fn query_variable_type(
         .unwrap_or(FrameworkFact::Plain);
 
     let reg = ReducerRegistry::with_defaults();
+    let ctx = BagContext { scopes, package_framework };
     for sid in chain {
         let att = WitnessAttachment::Variable {
             name: var.to_string(),
@@ -1118,8 +1145,8 @@ pub fn query_variable_type(
             attachment: &att,
             point: Some(point),
             framework,
-            return_of: None,
             arity_hint: None,
+            context: Some(&ctx),
         };
         if let ReducedValue::Type(t) = reg.query(bag, &q) {
             return Some(t);
