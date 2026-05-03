@@ -42,6 +42,12 @@ pub fn default_plugin_registry() -> Arc<PluginRegistry> {
 /// - `invocant_nodes` — every `method_call_expression`'s invocant,
 ///   indexed by span so the post-fold invocant-class refresh can
 ///   find the right node for a `MethodCall` ref's `invocant_span`.
+/// - `method_call_args` — every `method_call_expression`'s args
+///   node, indexed by the call-expression span. Lets the post-walk
+///   keys-as-HashKeyAccess emission look up the args from a
+///   MethodCall ref instead of stashing them on the ref itself or
+///   running emit at walk time (where invocant_class is still
+///   getting refined).
 ///
 /// Built once per `build_with_plugins_inner` call and consumed by both
 /// `ChainPassMode::PreFold` and `ChainPassMode::PostFold` invocations
@@ -50,6 +56,7 @@ struct ChainTypingIndex<'a> {
     assignment_nodes: Vec<Node<'a>>,
     return_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
     invocant_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
+    method_call_args: std::collections::HashMap<(Point, Point), Node<'a>>,
 }
 
 /// Which chain-typing tasks the reducer should apply on this call.
@@ -79,6 +86,7 @@ fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
         assignment_nodes: Vec::new(),
         return_nodes: std::collections::HashMap::new(),
         invocant_nodes: std::collections::HashMap::new(),
+        method_call_args: std::collections::HashMap::new(),
     };
     fn walk<'t>(node: Node<'t>, idx: &mut ChainTypingIndex<'t>) {
         match node.kind() {
@@ -93,6 +101,10 @@ fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
                 if let Some(inv) = node.child_by_field_name("invocant") {
                     idx.invocant_nodes
                         .insert((inv.start_position(), inv.end_position()), inv);
+                }
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    idx.method_call_args
+                        .insert((node.start_position(), node.end_position()), args);
                 }
             }
             _ => {}
@@ -285,6 +297,15 @@ fn build_with_plugins_inner(
     if extra_re_fold {
         b.fold_to_fixed_point(&chain_idx);
     }
+
+    // Post-pass: emit `HashKeyAccess` refs for even-position stringy
+    // args on every resolved `MethodCall` ref (`MooApp->new(name => 'alice')`,
+    // helper-emitted controllers, etc.). Runs after `fold_to_fixed_point`
+    // so `invocant_class` is canonical against the bag — was a walk-time
+    // emission gated on the partially-resolved walk-time class, now it's
+    // a single post-walk pass that joins refs to args via the chain
+    // typing index.
+    b.emit_method_call_arg_keys(&chain_idx);
 
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
     b.resolve_tail_pod_docs();
@@ -979,6 +1000,27 @@ impl<'a> Builder<'a> {
         *self.scope_stack.last().expect("scope stack empty")
     }
 
+    /// Package/class name surrounding `node`. Reads the innermost
+    /// containing scope's `package` field — set on both
+    /// `package Foo;` and `class Foo { … }` entries, so this works
+    /// for either flavor of class declaration. Used by
+    /// `invocant_type_at_node` for `$self` / `shift` / `__PACKAGE__`
+    /// resolution post-walk, where `self.current_package` is stale
+    /// (it holds the walk's last-opened package, not the one
+    /// containing the node we're querying).
+    fn package_for_node(&self, node: Node<'a>) -> Option<String> {
+        let scope_id = self.scope_at_point(node.start_position());
+        let mut cur = Some(scope_id);
+        while let Some(sid) = cur {
+            let s = &self.scopes[sid.0 as usize];
+            if let Some(ref pkg) = s.package {
+                return Some(pkg.clone());
+            }
+            cur = s.parent;
+        }
+        None
+    }
+
     /// Innermost scope containing `point`. Mirrors
     /// `FileAnalysis::scope_at` but reads `&self.scopes` directly so
     /// it's callable from within Builder during and after the walk.
@@ -1257,90 +1299,92 @@ impl<'a> Builder<'a> {
         None
     }
 
-    /// Resolve a method-call invocant NODE to a class name. Routes
-    /// through the bag for everything that's not closed under syntax;
-    /// the recursive name-chasing branches that used to read
-    /// `Symbol.return_type` directly are gone.
-    ///
-    /// Caller contract: only callable AFTER `populate_witness_bag`
-    /// has run. The walk-time MethodCall ref construction handles
-    /// closed-under-syntax cases inline (constructor pattern,
-    /// `__PACKAGE__`); everything else stays None until
-    /// `apply_chain_typing_invocants` runs post-walk and calls this.
+    /// Type any expression node in invocant position. Single
+    /// kind-dispatch shared between `resolve_invocant_class_tree`
+    /// (which projects to a class name string) and
+    /// `receiver_type_for` (which uses the InferredType directly for
+    /// plugin trigger matching). Routes everything through the bag
+    /// where the bag has the answer; falls back to walk-time
+    /// canonical sources (TCs, current_package) only where the bag
+    /// can't (variable invocants whose TC mirror happens post-walk).
     ///
     /// Resolves:
-    ///   - bareword `Foo` (zero-arg call returning a class)  → that class
-    ///   - bareword `Foo` (no such sub)                       → `Foo`
-    ///   - `__PACKAGE__`                                      → current package
-    ///   - typed `$var`                                       → ClassName via bag
-    ///   - `$self`                                            → current package fallback
-    ///   - `Foo->new` (constructor)                           → `Foo`
-    ///   - `X->method(...)` chain                             → return type via bag
-    ///                                                          (Edge chase through
-    ///                                                          `Expression(refidx)`)
-    ///   - `shift` / `$_[0]` in method body                   → current package
-    ///   - `get_foo()->bar()` chain                           → `get_foo`'s return via bag
-    /// Unresolvable cases return `None`.
-    fn resolve_invocant_class_tree(&self, node: Node<'a>) -> Option<String> {
+    ///   - `Foo->new(...)` (constructor)                       → ClassName(Foo)
+    ///   - `X->method(...)` chain                              → bag chase via Expression(refidx)
+    ///   - `$self`                                             → ClassName(current_package)
+    ///   - `__PACKAGE__`                                       → ClassName(current_package)
+    ///   - `$var`                                              → TC for `$var`, then bag
+    ///   - bareword `Foo` (sub with ClassName return)          → that class
+    ///   - bareword `Foo` (no such sub)                        → ClassName(Foo)
+    ///   - `shift` / `$_[0]` in method body                    → ClassName(current_package)
+    ///   - `get_foo()->bar()` outer's invocant                 → bag query NamedSub(get_foo, arity)
+    /// `@`/`%` containers and unrecognized kinds return `None`.
+    fn invocant_type_at_node(&self, node: Node<'a>) -> Option<InferredType> {
         match node.kind() {
             "method_call_expression" => {
                 // Constructor pattern is closed under syntax — bake
                 // before consulting the bag. Same shape the walker's
                 // `arm_payload` uses for return arms.
                 if let Some(class) = self.extract_constructor_class(node) {
-                    return Some(class);
+                    return Some(InferredType::ClassName(class));
                 }
                 let span = node_to_span(node);
                 let idx = self.refs.iter().position(|r| {
                     matches!(r.kind, RefKind::MethodCall { .. }) && r.span == span
                 })?;
-                let t = self.bag_query_expression(crate::witnesses::RefIdx(idx as u32))?;
-                t.class_name().map(|s| s.to_string())
+                self.bag_query_expression(crate::witnesses::RefIdx(idx as u32))
             }
             "scalar" => {
                 let text = node.utf8_text(self.source).ok()?;
-                // Resolve scope from the node's position, not from
-                // `scope_stack` — `scope_stack` only contains active
-                // scopes during the live walk, but this function runs
-                // post-walk too (apply_chain_typing_*) when the stack
-                // is empty.
-                let scope = self.scope_at_point(node.start_position());
-                if let Some(t) = self.bag_query_variable(text, scope, node.start_position()) {
-                    if let Some(c) = t.class_name() {
-                        return Some(c.to_string());
-                    }
-                }
-                // `$self` fallback to current_package — covers the
-                // case where TCs haven't been seeded yet (early walk
-                // queries) or the bag's scope-chain walk finds
-                // nothing.
+                // `$self` short-circuit — the value of the package
+                // CONTAINING this node is the canonical answer
+                // regardless of whether a TC was seeded for `$self`
+                // yet. Use the innermost scope's `package` field
+                // (set on package_statement AND class_statement
+                // entries) so post-walk callers — where
+                // `self.current_package` is stale, holding the
+                // walk's last-opened package, not the one
+                // surrounding this node — get the right answer.
                 if text == "$self" {
-                    return self.current_package.clone();
+                    return self.package_for_node(node).map(InferredType::ClassName);
                 }
-                None
+                // TCs are the canonical store at walk-time (the bag's
+                // Variable witnesses don't mirror until
+                // populate_witness_bag runs post-walk). Read TCs first
+                // — they have whatever was just seeded by an earlier
+                // visit. Fall back to the bag, which has TCs mirrored
+                // post-walk + framework-aware projection
+                // (`FirstParam → ClassName`).
+                if let Some(t) = self.type_constraints.iter().rev().find_map(|tc| {
+                    if tc.variable == text { Some(tc.inferred_type.clone()) } else { None }
+                }) {
+                    return Some(t);
+                }
+                let scope = self.scope_at_point(node.start_position());
+                self.bag_query_variable(text, scope, node.start_position())
             }
             "bareword" | "package" => {
                 let text = node.utf8_text(self.source).ok()?;
                 if text == "__PACKAGE__" {
-                    return self.current_package.clone();
+                    return self.package_for_node(node).map(InferredType::ClassName);
                 }
                 let bare = text.rsplit("::").next().unwrap_or(text);
                 // Bareword invocant is ambiguous: class-name reference
-                // OR zero-arg function call whose return type seeds the
-                // chain (`app->routes` where `sub app :: Mojolicious`).
+                // OR zero-arg function call whose return type seeds
+                // the chain (`app->routes` where `sub app :: Mojolicious`).
                 // Prefer the function-call interpretation; fall back
                 // to treating the text as a class.
                 if let Some(t) = self.bag_query_named_sub(bare, Some(0)) {
-                    if let Some(c) = t.class_name() {
-                        return Some(c.to_string());
-                    }
+                    return Some(t);
                 }
-                Some(text.to_string())
+                Some(InferredType::ClassName(text.to_string()))
             }
             // `shift` / `shift()` / `$_[0]` in method-body invocant
-            // position all mean `$self`. Trust the shape unconditionally.
+            // position all mean `$self`. Use `package_at_pos` for
+            // post-walk correctness; same reason as the `$self`
+            // case above.
             "func1op_call_expression" if self.is_shift_call(node) => {
-                self.current_package.clone()
+                self.package_for_node(node).map(InferredType::ClassName)
             }
             "array_element_expression" => {
                 let array = node.child_by_field_name("array")?;
@@ -1349,70 +1393,63 @@ impl<'a> Builder<'a> {
                 if varname.utf8_text(self.source).ok() != Some("_") { return None; }
                 let index = node.child_by_field_name("index")?;
                 if index.utf8_text(self.source).ok() != Some("0") { return None; }
-                self.current_package.clone()
+                self.package_for_node(node).map(InferredType::ClassName)
             }
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 if self.is_shift_call(node) {
-                    return self.current_package.clone();
+                    return self.package_for_node(node).map(InferredType::ClassName);
                 }
                 let func = node.child_by_field_name("function")?;
                 let name = func.utf8_text(self.source).ok()?;
                 let bare = name.rsplit("::").next().unwrap_or(name);
                 let arg_count = self.extract_call_args(node).len() as u32;
-                if let Some(t) = self.bag_query_named_sub(bare, Some(arg_count)) {
-                    if let Some(c) = t.class_name() {
-                        return Some(c.to_string());
-                    }
-                }
-                None
+                self.bag_query_named_sub(bare, Some(arg_count))
             }
             _ => None,
         }
     }
 
-    /// Walk-time helper for plugin emit hooks that need to know the
-    /// receiver's type to decide whether to fire (e.g. mojo-events'
-    /// on_method_call hook only matches `$emitter->on(...)` when
-    /// `$emitter` types as a Mojo::EventEmitter subclass).
+    /// Resolve a method-call invocant NODE to a class name. Thin
+    /// wrapper over `invocant_type_at_node` that projects the
+    /// resulting `InferredType` to a class string. Same caller
+    /// contract: callable both walk-time (variable arms read TCs,
+    /// the bag has plugin/framework synthesis answers) and
+    /// post-walk (the bag is canonical for everything).
+    fn resolve_invocant_class_tree(&self, node: Node<'a>) -> Option<String> {
+        let t = self.invocant_type_at_node(node)?;
+        if let Some(c) = t.class_name() {
+            return Some(c.to_string());
+        }
+        // `FirstParam` projection: a TC carrying `FirstParam{package}`
+        // (the `my $self = shift;` idiom) pins the package even
+        // when `class_name()` doesn't recognize the variant.
+        if let InferredType::FirstParam { package } = t {
+            return Some(package);
+        }
+        // Last fallback for bareword nodes: if the bag returned
+        // something non-class, treat the syntactic text as the class.
+        // Pre-bag-routing this was the bareword arm's `Some(text.to_string())`
+        // tail; preserved here so unrelated InferredType variants
+        // (Numeric / String / etc.) on a bareword still degrade to
+        // the class-name interpretation rather than vanishing.
+        if matches!(node.kind(), "bareword" | "package") {
+            return node.utf8_text(self.source).ok().map(|s| s.to_string());
+        }
+        None
+    }
+    /// Walk-time helper for plugin emit hooks that need the
+    /// receiver's type to decide whether to fire (mojo-events'
+    /// `on_method_call` only matches `$emitter->on(...)` when
+    /// `$emitter` types as a Mojo::EventEmitter subclass, etc.).
     ///
-    /// Variable invocants read `type_constraints` directly. At walk
-    /// time the bag's `Variable` witnesses don't exist yet — TCs
-    /// only mirror to the bag in `populate_witness_bag`, which
-    /// runs post-walk. TCs ARE the canonical store while the walk
-    /// is in progress; reading them here isn't a parallel path
-    /// with the bag, it's reading the bag's input.
-    ///
-    /// Bareword invocants route through `bag_query_named_sub`. The
-    /// bag has the answer at walk time for plugin-synthesized subs
-    /// (apply_emit_action's Symbol+NamedSub push runs synchronously
-    /// during the visit) and for Mojo::Base / Moo `has` accessors
-    /// (record_framework_accessor_witness pushes ArityReturn obs;
-    /// FluentArityDispatch claims at arity=0). For plain user
-    /// subs whose return type isn't yet resolved, the bag returns
-    /// None and we fall through to "treat the bareword as a class
-    /// name" — same answer the legacy field-reading version
-    /// gave.
-    fn receiver_type_for(&self, invocant_text: Option<&str>) -> Option<InferredType> {
-        let text = invocant_text?;
-        if text == "$self" || text == "__PACKAGE__" {
-            return self.current_package.clone().map(InferredType::ClassName);
-        }
-        if text.starts_with('$') {
-            return self.type_constraints.iter().rev().find_map(|tc| {
-                if tc.variable == text { Some(tc.inferred_type.clone()) } else { None }
-            });
-        }
-        if text.starts_with('@') || text.starts_with('%') {
-            return None;
-        }
-        // Bareword invocant: zero-arg call interpretation first
-        // (`app->routes` where `app` returns Mojolicious), then
-        // class-name fallback.
-        let bare = text.rsplit("::").next().unwrap_or(text);
-        if let Some(t) = self.bag_query_named_sub(bare, Some(0)) {
-            return Some(t);
-        }
-        Some(InferredType::ClassName(text.to_string()))
+    /// Thin wrapper over `invocant_type_at_node`. Same node-kind
+    /// dispatch the post-walk chain typer uses — variable arms read
+    /// TCs (canonical at walk time, mirrored to the bag post-walk),
+    /// bareword arms query NamedSub, method-call arms query
+    /// Expression(refidx), shift / `$_[0]` / `__PACKAGE__` use
+    /// current_package. One function, one dispatch.
+    fn receiver_type_for(&self, invocant_node: Option<Node<'a>>) -> Option<InferredType> {
+        self.invocant_type_at_node(invocant_node?)
     }
 
     /// Transitive parent walk within the current file. Depth-limited like
@@ -4874,23 +4911,28 @@ impl<'a> Builder<'a> {
         // too broadly.
         let invocant_span = invocant_node.map(node_to_span);
 
-        // Walk-time invocant_class — call the same bag-routed
-        // resolver post-walk uses. At walk-time the bag is sparser
-        // (plugin synthesis has pushed its witnesses; framework
-        // accessor synthesis has pushed ArityReturn observations;
-        // user-sub return types and TC mirrors haven't landed yet),
-        // so cases the bag can't answer here come back None and
-        // PostFold's `apply_chain_typing_invocants` refines them
-        // against the canonical bag.
+        // Walk-time invocant_class — closed-under-syntax cases only:
+        //   - constructor pattern (`Sner->new->hi`)
+        //   - `__PACKAGE__->method(...)`
         //
-        // For bareword invocants this is the only correct shape:
-        // `app->routes` needs `app` to resolve to Mojolicious (the
-        // plugin's NamedSub witness), not to the literal string
-        // "app". A walk-time syntactic-only guess would set
-        // `invocant_class = Some("app")` and PostFold's
-        // "skip if Some" check would never refine it.
-        let invocant_class =
-            invocant_node.and_then(|n| self.resolve_invocant_class_tree(n));
+        // Both are determined by syntax alone — no inference, no
+        // bag lookup. Everything else (variable invocants, bareword
+        // invocants whose canonical class only the bag knows like
+        // `app`, call-chain invocants whose return type is
+        // mid-fold) stays None and gets filled by PostFold's
+        // `apply_chain_typing_invocants` against the canonical bag.
+        // Now that `emit_method_call_arg_keys` runs post-walk, no
+        // walk-time consumer reads `invocant_class` — leaving it
+        // None at walk-time costs nothing.
+        let invocant_class = invocant_node.and_then(|n| match n.kind() {
+            "method_call_expression" => self.extract_constructor_class(n),
+            "bareword" | "package"
+                if n.utf8_text(self.source).ok() == Some("__PACKAGE__") =>
+            {
+                self.current_package.clone()
+            }
+            _ => None,
+        });
 
         if let Some(ref name) = method_name {
             // Dynamic method dispatch: $self->$method() — resolve $method if known
@@ -4976,21 +5018,17 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Even-position stringy args become HashKeyAccess refs owned
-        // by `Sub{invocant_class, method_name}`. Pairs with the
-        // HashKeyDef symbols `has`/`bless { … }` synthesize on the
-        // callee side. Without these refs, `ref_at` on a constructor
-        // arg only finds the broad MethodCall ref and rename clobbers
-        // the wrong token.
-        if let (Some(cls), Some(method)) = (invocant_class.as_ref(), method_name.as_ref()) {
-            if let Some(args) = node.child_by_field_name("arguments") {
-                let owner = HashKeyOwner::Sub {
-                    package: Some(cls.clone()),
-                    name: method.clone(),
-                };
-                self.emit_call_arg_key_accesses(args, &owner);
-            }
-        }
+        // Even-position stringy args become `HashKeyAccess` refs
+        // owned by `Sub{invocant_class, method_name}` — pairs with
+        // the HashKeyDef symbols that `has` / `bless { … }`
+        // synthesize on the callee side. Emission is deferred to
+        // post-walk (`emit_method_call_arg_keys`) so the owner's
+        // class can be read off the canonical `invocant_class`
+        // (filled by `apply_chain_typing_invocants` against the
+        // bag) instead of the partially-resolved walk-time value.
+        // The chain-typing index records the args node by call
+        // span; the post-walk pass joins refs to args via that
+        // span.
 
         // Framework plugin dispatch. Runs after native handlers so plugin
         // emissions are purely additive — a third-party plugin targeting
@@ -5006,7 +5044,7 @@ impl<'a> Builder<'a> {
                 ctx.call_kind = plugin::CallKind::Method;
                 ctx.method_name = Some(name.clone());
                 ctx.receiver_text = invocant_text.clone();
-                ctx.receiver_type = self.receiver_type_for(invocant_text.as_deref());
+                ctx.receiver_type = self.receiver_type_for(invocant_node);
                 self.dispatch_method_call_plugins(ctx);
             }
         }
@@ -5634,15 +5672,26 @@ impl<'a> Builder<'a> {
                 if let Some((key, is_dynamic)) = self.extract_key_text(*child) {
                     if !is_dynamic && self.has_hash_key_def(&key, owner) {
                         let access = self.determine_access(*child);
-                        self.add_ref(
-                            RefKind::HashKeyAccess {
+                        // `scope_at_point` instead of `current_scope`
+                        // so this works both inside the walk
+                        // (function-call args path) and post-walk
+                        // (method-call args path; the walk has
+                        // unwound by then and `scope_stack` is empty).
+                        // Equivalent at walk-time because a node's
+                        // innermost containing scope IS what
+                        // `current_scope` would return at that point.
+                        let span = node_to_span(*child);
+                        self.refs.push(Ref {
+                            kind: RefKind::HashKeyAccess {
                                 var_text: String::new(),
                                 owner: Some(owner.clone()),
                             },
-                            node_to_span(*child),
-                            key,
+                            span,
+                            scope: self.scope_at_point(span.start),
+                            target_name: key,
                             access,
-                        );
+                            resolves_to: None,
+                        });
                     }
                 }
             }
@@ -6170,6 +6219,44 @@ impl<'a> Builder<'a> {
                     *invocant_class = Some(class);
                 }
             }
+        }
+    }
+
+    /// Post-walk: emit even-position stringy args of every resolved
+    /// `MethodCall` ref as `HashKeyAccess` refs owned by
+    /// `Sub{invocant_class, method_name}`. Pairs with the
+    /// `HashKeyDef` symbols that `has` / `bless { … }` synthesize on
+    /// the callee side; without these refs, `ref_at` on a constructor
+    /// arg only finds the broad `MethodCall` ref and rename clobbers
+    /// the wrong token.
+    ///
+    /// Runs post-PostFold so `invocant_class` is already filled
+    /// against the canonical bag — moves the keys-emission gating
+    /// off the walk-time `invocant_class.is_some()` shortcut that
+    /// previously forced syntactic walk-time class resolution to
+    /// keep working.
+    fn emit_method_call_arg_keys(&mut self, idx: &ChainTypingIndex<'a>) {
+        // Snapshot first so we can `&mut self` the emit loop below.
+        let mut pending: Vec<(HashKeyOwner, Node<'a>)> = Vec::new();
+        for r in &self.refs {
+            let RefKind::MethodCall { invocant_class: Some(cls), .. } = &r.kind else {
+                continue;
+            };
+            let Some(args) = idx
+                .method_call_args
+                .get(&(r.span.start, r.span.end))
+                .copied()
+            else {
+                continue;
+            };
+            let owner = HashKeyOwner::Sub {
+                package: Some(cls.clone()),
+                name: r.target_name.clone(),
+            };
+            pending.push((owner, args));
+        }
+        for (owner, args) in pending {
+            self.emit_call_arg_key_accesses(args, &owner);
         }
     }
 

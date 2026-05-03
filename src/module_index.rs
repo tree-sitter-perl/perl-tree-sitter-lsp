@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use dashmap::DashMap;
 use tower_lsp::Client;
 
-use crate::file_analysis::{FileAnalysis, HashKeyOwner, InferredType, ParamInfo, SymKind, Symbol, SymbolDetail};
+use crate::file_analysis::{FileAnalysis, HashKeyOwner, InferredType, ParamInfo, SymKind, Symbol, SymbolDetail, SymbolId};
 use crate::module_resolver;
 
 // ---- Public types ----
@@ -149,6 +149,28 @@ impl<'a> SubInfo<'a> {
             if let SymbolDetail::Sub { params, return_type, .. } = &sym.detail {
                 if params.len() == arity {
                     return return_type.as_ref();
+                }
+            }
+        }
+        None
+    }
+
+    /// SymbolId of the primary (first matching) sym. Cross-file
+    /// callers use this to bag-query the cached module's bag for the
+    /// per-sym return type, instead of reading `primary.detail.return_type`
+    /// directly.
+    pub fn primary_id(&self) -> SymbolId {
+        self.primary.id
+    }
+
+    /// SymbolId of the overload whose param count matches `arity`,
+    /// if any. Used for arity-aware cross-file dispatch — the caller
+    /// can then bag-query the cached module for that specific sym.
+    pub fn id_for_arity(&self, arity: usize) -> Option<SymbolId> {
+        for sym in std::iter::once(self.primary).chain(self.overloads.iter().copied()) {
+            if let SymbolDetail::Sub { params, .. } = &sym.detail {
+                if params.len() == arity {
+                    return Some(sym.id);
                 }
             }
         }

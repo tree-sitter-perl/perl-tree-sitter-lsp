@@ -2244,14 +2244,32 @@ impl FileAnalysis {
                 module_index.and_then(|idx| {
                     // Primary path: the class's own cached module has
                     // the sub. That's the CPAN/user-module case.
+                    // Bridges did the class-scoped dispatch (resolve_method_in_ancestors
+                    // returned this CrossFile); per-sym answer routes
+                    // through the cached module's bag via
+                    // `symbol_return_type_via_bag`. Plugin overrides on
+                    // a cross-file sym dominate via PluginOverrideReducer
+                    // there.
                     if let Some(cached) = idx.get_cached(class) {
                         if let Some(sub) = cached.sub_info(method_name) {
                             let counts = sub.param_counts();
                             let has_overloads = counts.len() > 1;
                             let target = match arg_count {
                                 Some(n) if has_overloads => n,
-                                _ => return sub.return_type().cloned(),
+                                _ => {
+                                    return cached
+                                        .analysis
+                                        .symbol_return_type_via_bag(sub.primary_id(), arg_count)
+                                        .or_else(|| sub.return_type().cloned());
+                                }
                             };
+                            if let Some(sid) = sub.id_for_arity(target) {
+                                return cached
+                                    .analysis
+                                    .symbol_return_type_via_bag(sid, Some(target))
+                                    .or_else(|| sub.return_type_for_arity(target).cloned())
+                                    .or_else(|| sub.return_type().cloned());
+                            }
                             return sub.return_type_for_arity(target).cloned()
                                 .or_else(|| sub.return_type().cloned());
                         }
@@ -2260,13 +2278,23 @@ impl FileAnalysis {
                     // through a PluginNamespace bridge but declared in
                     // another module (helper chain roots, DBIC
                     // relationship accessors emitted from the resultset,
-                    // etc.). Walk the namespace entities, not the raw
-                    // symbol table — that's what explicit bridges buy us.
+                    // etc.). Walk the namespace entities; for each
+                    // matching sym, query its cached module's bag for
+                    // the per-sym return type. Same shape the LOCAL
+                    // arm uses — bridges do class-scoped dispatch,
+                    // bag answers per-sym.
                     let mut found: Option<InferredType> = None;
-                    idx.for_each_entity_bridged_to(class, |_cached, sym| {
+                    idx.for_each_entity_bridged_to(class, |cached, sym| {
                         if found.is_some() { return; }
                         if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
                         if sym.name != method_name { return; }
+                        if let Some(t) = cached
+                            .analysis
+                            .symbol_return_type_via_bag(sym.id, arg_count)
+                        {
+                            found = Some(t);
+                            return;
+                        }
                         if let SymbolDetail::Sub { return_type, .. } = &sym.detail {
                             found = return_type.clone();
                         }
