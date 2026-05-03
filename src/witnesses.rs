@@ -1050,6 +1050,7 @@ pub fn query_sub_return_type(
     symbols: &[crate::file_analysis::Symbol],
     sub_name: &str,
     arity_hint: Option<u32>,
+    context: Option<&BagContext>,
 ) -> Option<InferredType> {
     // Local-symbol bag query first — picks up arity-discriminated
     // dispatch via FluentArityDispatch.
@@ -1068,7 +1069,7 @@ pub fn query_sub_return_type(
             point: None,
             framework: FrameworkFact::Plain,
             arity_hint,
-            context: None,
+            context,
         };
         if let ReducedValue::Type(t) = reg.query(bag, &q) {
             return Some(t);
@@ -1089,7 +1090,7 @@ pub fn query_sub_return_type(
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint,
-        context: None,
+        context,
     };
     if let ReducedValue::Type(t) = reg.query(bag, &q) {
         return Some(t);

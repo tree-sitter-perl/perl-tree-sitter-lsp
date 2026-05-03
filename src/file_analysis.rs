@@ -1487,11 +1487,16 @@ impl FileAnalysis {
         sub_name: &str,
         arity: Option<u32>,
     ) -> Option<InferredType> {
+        let ctx = crate::witnesses::BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
         crate::witnesses::query_sub_return_type(
             &self.witnesses,
             &self.symbols,
             sub_name,
             arity,
+            Some(&ctx),
         )
     }
 
