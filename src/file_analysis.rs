@@ -1113,12 +1113,21 @@ impl FileAnalysis {
 
     /// Mirror every existing `TypeConstraint` into the witness bag as
     /// a `Variable` witness (with class-assertion / FirstParam
-    /// observations for class-identity types). The Builder runs an
-    /// equivalent pass via `populate_witness_bag`; this method is the
-    /// fa-construction-time counterpart for code that builds a
-    /// FileAnalysis without going through `builder::build`. Called
-    /// from `FileAnalysis::new` and `after_deserialize` to keep the
-    /// invariant: bag and `type_constraints` are always in sync.
+    /// observations for class-identity types), and every Sub/Method
+    /// symbol with a stored `return_type` as a `NamedSub` witness.
+    ///
+    /// The Builder runs equivalent passes (`populate_witness_bag` for
+    /// constraints, `write_back_sub_return_types`'s NamedSub publish
+    /// for return types). This method is the fa-construction-time
+    /// counterpart for code that builds a FileAnalysis without going
+    /// through `builder::build` — hand-crafted FAs in tests, ad-hoc
+    /// FA assembly. Called from `FileAnalysis::new` and
+    /// `after_deserialize` to keep the invariant: bag and the
+    /// `Symbol.return_type` / `type_constraints` fields are always in
+    /// sync after a constructor returns. Without this, the bag's
+    /// canonical query path (`query_sub_return_type` etc.) silently
+    /// returns `None` for symbols whose return_type is set on the
+    /// field but never reached the bag.
     pub(crate) fn seed_bag_from_constraints(&mut self) {
         use crate::witnesses::{
             TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
@@ -1161,12 +1170,50 @@ impl FileAnalysis {
                 _ => {}
             }
         }
+        // Mirror every Sub/Method with a stored `return_type` as a
+        // `NamedSub(name) → InferredType(t)` witness — same shape
+        // `write_back_sub_return_types` publishes at the end of the
+        // worklist. The builder transfers its already-populated bag
+        // into `fa.witnesses` AFTER `FileAnalysis::new` returns, so on
+        // the build path these pushes are redundant duplicates of the
+        // builder's emissions; that's fine because `NamedSubReturn`
+        // takes the latest. On the non-build paths (hand-crafted FAs,
+        // bincode-deserialized blobs without a populated bag) this is
+        // the only seeding step that closes the "field set, bag empty"
+        // gap.
+        for sym in &self.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                continue;
+            }
+            let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail else {
+                continue;
+            };
+            self.witnesses.push(Witness {
+                attachment: WitnessAttachment::NamedSub(sym.name.clone()),
+                source: WitnessSource::Builder("local_return".into()),
+                payload: WitnessPayload::InferredType(rt.clone()),
+                span: sym.span,
+            });
+            self.witnesses.push(Witness {
+                attachment: WitnessAttachment::Symbol(sym.id),
+                source: WitnessSource::Builder("local_return".into()),
+                payload: WitnessPayload::InferredType(rt.clone()),
+                span: sym.span,
+            });
+        }
     }
 
     /// Run the local-only method-call-binding resolution and seal
     /// baseline counts. Called by `builder::build` after the witness
     /// bag has been moved in. Keeps the bag canonical: every new
     /// `TypeConstraint` pushed here lands as a `Witness` too.
+    ///
+    /// `NamedSub(name) → InferredType(t)` witnesses for every local
+    /// Sub/Method are already in the bag — published by
+    /// `Builder::write_back_sub_return_types` at the end of the
+    /// worklist (single emission point for "this sub's return type
+    /// is known," same shape `enrich_imported_types_with_keys` uses
+    /// for imports).
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
         self.base_type_constraint_count = self.type_constraints.len();
@@ -1436,38 +1483,22 @@ impl FileAnalysis {
     #[allow(dead_code)] // documented type-query entry point; CLAUDE.md
     pub fn method_call_return_type_via_bag(&self, ref_idx: usize) -> Option<InferredType> {
         use crate::witnesses::{
-            FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry, ReturnOfKey,
+            BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
             WitnessAttachment,
         };
 
         let att = WitnessAttachment::Expression(crate::witnesses::RefIdx(ref_idx as u32));
-        let return_of = |k: &ReturnOfKey| -> Option<InferredType> {
-            match k {
-                ReturnOfKey::Name(n) => self.sub_return_type(n).cloned(),
-                ReturnOfKey::Symbol(sym) => {
-                    self.symbols.get(sym.0 as usize).and_then(|s| {
-                        if let SymbolDetail::Sub { return_type, .. } = &s.detail {
-                            return_type.clone()
-                        } else {
-                            None
-                        }
-                    })
-                }
-                ReturnOfKey::MethodOnClass { class: _, method } => {
-                    // For the spike: name-only lookup. A follow-up
-                    // pass will thread the receiver class through
-                    // inherited resolution.
-                    self.sub_return_type(method).cloned()
-                }
-            }
-        };
         let reg = ReducerRegistry::with_defaults();
+        let ctx = BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
         let q = ReducerQuery {
             attachment: &att,
             point: None,
             framework: FrameworkFact::Plain,
-            return_of: Some(&return_of),
             arity_hint: None,
+            context: Some(&ctx),
         };
         match reg.query(&self.witnesses, &q) {
             ReducedValue::Type(t) => {
@@ -1496,11 +1527,16 @@ impl FileAnalysis {
         sub_name: &str,
         arity: Option<u32>,
     ) -> Option<InferredType> {
+        let ctx = crate::witnesses::BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
         crate::witnesses::query_sub_return_type(
             &self.witnesses,
             &self.symbols,
             sub_name,
             arity,
+            Some(&ctx),
         )
     }
 
@@ -2013,6 +2049,40 @@ impl FileAnalysis {
         }
     }
 
+    /// Bag-routed query: "what does `Symbol(sym_id)` return at this
+    /// arity?" Runs through the full reducer registry — Plugin
+    /// overrides dominate, then arity dispatch, then `SubReturnReducer`
+    /// (which claims plain writeback-pushed `InferredType` witnesses).
+    /// Returns `None` when nothing in the bag answers; callers fall
+    /// back to the field for safety.
+    fn symbol_return_type_via_bag(
+        &self,
+        sym_id: SymbolId,
+        arg_count: Option<usize>,
+    ) -> Option<InferredType> {
+        use crate::witnesses::{
+            BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
+            WitnessAttachment,
+        };
+        let att = WitnessAttachment::Symbol(sym_id);
+        let reg = ReducerRegistry::with_defaults();
+        let ctx = BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            arity_hint: arg_count.map(|n| n as u32),
+            context: Some(&ctx),
+        };
+        match reg.query(&self.witnesses, &q) {
+            ReducedValue::Type(t) => Some(t),
+            _ => None,
+        }
+    }
+
     /// Find a method's return type within a class/package, walking inheritance.
     pub(crate) fn find_method_return_type(
         &self,
@@ -2126,23 +2196,44 @@ impl FileAnalysis {
                     .collect();
 
                 if candidates.len() <= 1 || arg_count.is_none() {
-                    // Single symbol or no arity info — primary (first match)
+                    // Single symbol or no arity info — primary (first match).
+                    // Route through the bag: `SubReturnReducer` claims
+                    // local-source `InferredType` on `Symbol(sym_id)` (pushed
+                    // by writeback). Plugin overrides on the same symbol
+                    // dominate via `PluginOverrideReducer`. Falls back to
+                    // the field if neither writeback nor synthesis seeded
+                    // the bag (legacy hand-crafted FAs without
+                    // `seed_bag_from_constraints` running — shouldn't
+                    // happen in practice but kept for safety).
+                    if let Some(t) = self.symbol_return_type_via_bag(sym_id, arg_count) {
+                        return Some(t);
+                    }
                     if let SymbolDetail::Sub { ref return_type, .. } = self.symbol(sym_id).detail {
                         return return_type.clone();
                     }
                     return None;
                 }
 
-                // Multiple overloads: pick by param count
+                // Multiple overloads: pick by param count. Each candidate
+                // has its own Symbol(sid) bag attachment, so the same
+                // bag-routed lookup applies — the dispatch picks the sid
+                // whose params.len() matches and asks the bag what
+                // sid returns.
                 let target = arg_count.unwrap();
                 for sid in &candidates {
                     if let SymbolDetail::Sub { ref params, ref return_type, .. } = self.symbol(*sid).detail {
                         if params.len() == target {
+                            if let Some(t) = self.symbol_return_type_via_bag(*sid, arg_count) {
+                                return Some(t);
+                            }
                             return return_type.clone();
                         }
                     }
                 }
                 // No exact match — fall back to primary
+                if let Some(t) = self.symbol_return_type_via_bag(sym_id, arg_count) {
+                    return Some(t);
+                }
                 if let SymbolDetail::Sub { ref return_type, .. } = self.symbol(sym_id).detail {
                     return_type.clone()
                 } else {
@@ -2153,14 +2244,32 @@ impl FileAnalysis {
                 module_index.and_then(|idx| {
                     // Primary path: the class's own cached module has
                     // the sub. That's the CPAN/user-module case.
+                    // Bridges did the class-scoped dispatch (resolve_method_in_ancestors
+                    // returned this CrossFile); per-sym answer routes
+                    // through the cached module's bag via
+                    // `symbol_return_type_via_bag`. Plugin overrides on
+                    // a cross-file sym dominate via PluginOverrideReducer
+                    // there.
                     if let Some(cached) = idx.get_cached(class) {
                         if let Some(sub) = cached.sub_info(method_name) {
                             let counts = sub.param_counts();
                             let has_overloads = counts.len() > 1;
                             let target = match arg_count {
                                 Some(n) if has_overloads => n,
-                                _ => return sub.return_type().cloned(),
+                                _ => {
+                                    return cached
+                                        .analysis
+                                        .symbol_return_type_via_bag(sub.primary_id(), arg_count)
+                                        .or_else(|| sub.return_type().cloned());
+                                }
                             };
+                            if let Some(sid) = sub.id_for_arity(target) {
+                                return cached
+                                    .analysis
+                                    .symbol_return_type_via_bag(sid, Some(target))
+                                    .or_else(|| sub.return_type_for_arity(target).cloned())
+                                    .or_else(|| sub.return_type().cloned());
+                            }
                             return sub.return_type_for_arity(target).cloned()
                                 .or_else(|| sub.return_type().cloned());
                         }
@@ -2169,13 +2278,23 @@ impl FileAnalysis {
                     // through a PluginNamespace bridge but declared in
                     // another module (helper chain roots, DBIC
                     // relationship accessors emitted from the resultset,
-                    // etc.). Walk the namespace entities, not the raw
-                    // symbol table — that's what explicit bridges buy us.
+                    // etc.). Walk the namespace entities; for each
+                    // matching sym, query its cached module's bag for
+                    // the per-sym return type. Same shape the LOCAL
+                    // arm uses — bridges do class-scoped dispatch,
+                    // bag answers per-sym.
                     let mut found: Option<InferredType> = None;
-                    idx.for_each_entity_bridged_to(class, |_cached, sym| {
+                    idx.for_each_entity_bridged_to(class, |cached, sym| {
                         if found.is_some() { return; }
                         if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
                         if sym.name != method_name { return; }
+                        if let Some(t) = cached
+                            .analysis
+                            .symbol_return_type_via_bag(sym.id, arg_count)
+                        {
+                            found = Some(t);
+                            return;
+                        }
                         if let SymbolDetail::Sub { return_type, .. } = &sym.detail {
                             found = return_type.clone();
                         }

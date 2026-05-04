@@ -42,6 +42,12 @@ pub fn default_plugin_registry() -> Arc<PluginRegistry> {
 /// - `invocant_nodes` — every `method_call_expression`'s invocant,
 ///   indexed by span so the post-fold invocant-class refresh can
 ///   find the right node for a `MethodCall` ref's `invocant_span`.
+/// - `method_call_args` — every `method_call_expression`'s args
+///   node, indexed by the call-expression span. Lets the post-walk
+///   keys-as-HashKeyAccess emission look up the args from a
+///   MethodCall ref instead of stashing them on the ref itself or
+///   running emit at walk time (where invocant_class is still
+///   getting refined).
 ///
 /// Built once per `build_with_plugins_inner` call and consumed by both
 /// `ChainPassMode::PreFold` and `ChainPassMode::PostFold` invocations
@@ -50,6 +56,7 @@ struct ChainTypingIndex<'a> {
     assignment_nodes: Vec<Node<'a>>,
     return_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
     invocant_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
+    method_call_args: std::collections::HashMap<(Point, Point), Node<'a>>,
 }
 
 /// Which chain-typing tasks the reducer should apply on this call.
@@ -79,6 +86,7 @@ fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
         assignment_nodes: Vec::new(),
         return_nodes: std::collections::HashMap::new(),
         invocant_nodes: std::collections::HashMap::new(),
+        method_call_args: std::collections::HashMap::new(),
     };
     fn walk<'t>(node: Node<'t>, idx: &mut ChainTypingIndex<'t>) {
         match node.kind() {
@@ -93,6 +101,10 @@ fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
                 if let Some(inv) = node.child_by_field_name("invocant") {
                     idx.invocant_nodes
                         .insert((inv.start_position(), inv.end_position()), inv);
+                }
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    idx.method_call_args
+                        .insert((node.start_position(), node.end_position()), args);
                 }
             }
             _ => {}
@@ -286,6 +298,15 @@ fn build_with_plugins_inner(
         b.fold_to_fixed_point(&chain_idx);
     }
 
+    // Post-pass: emit `HashKeyAccess` refs for even-position stringy
+    // args on every resolved `MethodCall` ref (`MooApp->new(name => 'alice')`,
+    // helper-emitted controllers, etc.). Runs after `fold_to_fixed_point`
+    // so `invocant_class` is canonical against the bag — was a walk-time
+    // emission gated on the partially-resolved walk-time class, now it's
+    // a single post-walk pass that joins refs to args via the chain
+    // typing index.
+    b.emit_method_call_arg_keys(&chain_idx);
+
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
     b.resolve_tail_pod_docs();
 
@@ -329,8 +350,11 @@ impl<'a> Builder<'a> {
     ///   - one `InferredType` payload + (optional) class-assertion
     ///     observation per `TypeConstraint`,
     ///   - `HashRefAccess` observations per `$v->{k}` ref,
-    ///   - `ReturnOfName` observations per method-call ref (for the
-    ///     fluent-chain Expression-attached fold),
+    ///   - `Edge(NamedSub(method))` payloads per method-call ref so
+    ///     the fluent-chain Expression-attached fold sees the chased
+    ///     return type as a plain `InferredType` after registry
+    ///     materialization (replaces the closure-driven
+    ///     `TypeObservation::ReturnOfName` path),
     ///   - `mutation` facts on each Class/Sub-owned hash-key write,
     ///   - everything `pending_witnesses` collected during the walk
     ///     (branch arms, arity gating).
@@ -418,7 +442,7 @@ impl<'a> Builder<'a> {
             self.bag.push(Witness {
                 attachment: WitnessAttachment::Expression(crate::witnesses::RefIdx(idx as u32)),
                 source: WitnessSource::Builder("method_call_return".into()),
-                payload: WitnessPayload::Observation(TypeObservation::ReturnOfName(method)),
+                payload: WitnessPayload::Edge(WitnessAttachment::NamedSub(method)),
                 span,
             });
         }
@@ -465,25 +489,6 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Bag-aware variable type lookup during build. Thin pass-through
-    /// to the single shared `witnesses::query_variable_type` — same
-    /// helper `FileAnalysis::inferred_type` calls at query time. One
-    /// query path, one set of rules.
-    fn var_type_via_bag(
-        &self,
-        var: &str,
-        scope: ScopeId,
-        point: Point,
-    ) -> Option<InferredType> {
-        crate::witnesses::query_variable_type(
-            &self.bag,
-            &self.scopes,
-            &self.package_framework,
-            var,
-            scope,
-            point,
-        )
-    }
 }
 
 /// Which arity branch a `return_expression` represents. Computed
@@ -704,25 +709,26 @@ fn raw_mid_op(node: tree_sitter::Node, source: &[u8]) -> String {
         .to_string()
 }
 
-/// A return value type collected during the walk, before post-pass resolution.
+/// Structural index of one return-expression in a sub body. Type
+/// information has moved to the bag — per-arm via
+/// `ReturnArm(span)`, per-sub via `Symbol(sub_id)`'s `branch_arm`
+/// witnesses (which are `Edge`s pointing at the per-arm attachment,
+/// chased by registry materialization at query time). What's left
+/// in this struct is the structure consumers still need to see at a
+/// glance: which sub the return belongs to, where it is, and which
+/// arity bucket it gates on (so `emit_arity_return_witnesses` can
+/// pair each arm's bag-resolved type with its arg-count).
 struct ReturnInfo {
     /// The scope (Sub/Method) this return belongs to.
     scope: ScopeId,
-    /// The inferred type of the return value, if determinable from literals/constructors.
-    inferred_type: Option<InferredType>,
-    /// When the return body is `return $var`, the variable's name and the
-    /// return point. Used by the post-bag-seed re-fold pass to defer the
-    /// type lookup to the framework-aware resolver — collection just
-    /// records WHICH variable was returned; reduction asks the bag.
-    deferred_var: Option<(String, Point)>,
     /// Arity-dispatch classification (`unless @_`, `if @_ == N`, …) so
-    /// `resolve_return_types` can emit `ArityReturn` witnesses with the
-    /// bag-folded arm type AT REDUCTION TIME — rather than the walk
-    /// emitting them with a collection-time-folded type embedded.
-    /// `None` for returns that aren't arity-gated.
+    /// `resolve_return_types` can emit `ArityReturn` witnesses with
+    /// the bag-resolved arm type AT REDUCTION TIME. `None` for
+    /// returns that aren't arity-gated.
     arity_branch: Option<ArityBranch>,
-    /// Span of the return-expression node — carried so the deferred
-    /// witness emission has the right `span` to attach.
+    /// Span of the return-expression node. Doubles as the
+    /// `WitnessAttachment::ReturnArm(span)` key for per-arm bag
+    /// queries (collect_return_arm_types reads this).
     span: Span,
 }
 
@@ -994,6 +1000,53 @@ impl<'a> Builder<'a> {
         *self.scope_stack.last().expect("scope stack empty")
     }
 
+    /// Package/class name surrounding `node`. Reads the innermost
+    /// containing scope's `package` field — set on both
+    /// `package Foo;` and `class Foo { … }` entries, so this works
+    /// for either flavor of class declaration. Used by
+    /// `invocant_type_at_node` for `$self` / `shift` / `__PACKAGE__`
+    /// resolution post-walk, where `self.current_package` is stale
+    /// (it holds the walk's last-opened package, not the one
+    /// containing the node we're querying).
+    fn package_for_node(&self, node: Node<'a>) -> Option<String> {
+        let scope_id = self.scope_at_point(node.start_position());
+        let mut cur = Some(scope_id);
+        while let Some(sid) = cur {
+            let s = &self.scopes[sid.0 as usize];
+            if let Some(ref pkg) = s.package {
+                return Some(pkg.clone());
+            }
+            cur = s.parent;
+        }
+        None
+    }
+
+    /// Innermost scope containing `point`. Mirrors
+    /// `FileAnalysis::scope_at` but reads `&self.scopes` directly so
+    /// it's callable from within Builder during and after the walk.
+    /// Falls back to `ScopeId(0)` (the file scope) if no scope
+    /// matches — a defensive default for cases where the walk hasn't
+    /// produced any scope containing the point yet.
+    fn scope_at_point(&self, point: Point) -> ScopeId {
+        let mut best: Option<(ScopeId, u64)> = None;
+        for scope in &self.scopes {
+            if !crate::file_analysis::contains_point(&scope.span, point) {
+                continue;
+            }
+            let r = scope.span.end.row.saturating_sub(scope.span.start.row) as u64;
+            let c = if scope.span.start.row == scope.span.end.row {
+                scope.span.end.column.saturating_sub(scope.span.start.column) as u64
+            } else {
+                0
+            };
+            let size = r * 1_000_000 + c;
+            if best.is_none() || size <= best.unwrap().1 {
+                best = Some((scope.id, size));
+            }
+        }
+        best.map(|(id, _)| id).unwrap_or(ScopeId(0))
+    }
+
     // ---- Symbol/Ref creation ----
 
     fn add_symbol(&mut self, name: String, kind: SymKind, span: Span, selection_span: Span, detail: SymbolDetail) -> SymbolId {
@@ -1170,7 +1223,7 @@ impl<'a> Builder<'a> {
             }
             _ => None,
         };
-        let inferred_type = self.infer_expression_type(arg, false);
+        let inferred_type = self.infer_expression_type(arg);
         let sub_params = if arg.kind() == "anonymous_subroutine_expression" {
             self.extract_anonymous_sub_params(arg)
         } else {
@@ -1246,121 +1299,102 @@ impl<'a> Builder<'a> {
         None
     }
 
-    /// Resolve a method-call invocant NODE to a class name, using the
-    /// tree so chain invocants (`Sner->new->hi`) work. Returns the
-    /// resolved class for:
-    ///   - bareword `Foo`            → `Foo`
-    ///   - `__PACKAGE__`             → current package
-    ///   - typed `$var`              → ClassName from the type constraint
-    ///   - `$self`                   → current package
-    ///   - `Foo->new` (chain)        → `Foo` (constructor)
-    ///   - `X->method()` chain       → return type of `X::method` if it's
-    ///                                 a ClassName (via the same recursion
-    ///                                 + return_type-on-Sub lookup)
-    /// Unresolvable cases return `None` — refs_to treats that as no
-    /// match rather than cross-linking unrelated classes.
-    fn resolve_invocant_class_tree(&self, node: Node<'a>) -> Option<String> {
+    /// Type any expression node in invocant position. Single
+    /// kind-dispatch shared between `resolve_invocant_class_tree`
+    /// (which projects to a class name string) and
+    /// `receiver_type_for` (which uses the InferredType directly for
+    /// plugin trigger matching). Routes everything through the bag
+    /// where the bag has the answer; falls back to walk-time
+    /// canonical sources (TCs, current_package) only where the bag
+    /// can't (variable invocants whose TC mirror happens post-walk).
+    ///
+    /// Resolves:
+    ///   - `Foo->new(...)` (constructor)                       → ClassName(Foo)
+    ///   - `X->method(...)` chain                              → bag chase via Expression(refidx)
+    ///   - `$self`                                             → ClassName(current_package)
+    ///   - `__PACKAGE__`                                       → ClassName(current_package)
+    ///   - `$var`                                              → TC for `$var`, then bag
+    ///   - bareword `Foo` (sub with ClassName return)          → that class
+    ///   - bareword `Foo` (no such sub)                        → ClassName(Foo)
+    ///   - `shift` / `$_[0]` in method body                    → ClassName(current_package)
+    ///   - `get_foo()->bar()` outer's invocant                 → bag query NamedSub(get_foo, arity)
+    /// `@`/`%` containers and unrecognized kinds return `None`.
+    fn invocant_type_at_node(&self, node: Node<'a>) -> Option<InferredType> {
         match node.kind() {
             "method_call_expression" => {
-                // Chain case. Recurse into the inner invocant to get
-                // the inner call's receiver class, then look up the
-                // inner method's return type on that class.
-                let inner_invocant = node.child_by_field_name("invocant")?;
-                let method = node.child_by_field_name("method")?;
-                let method_name = method.utf8_text(self.source).ok()?;
-                // `Foo->new` — cheap special-case: constructor on a
-                // bareword class returns that class. Handles the
-                // overwhelmingly common `Class->new->chain...` shape
-                // without needing Sub return_type lookups on `new`.
-                if method_name == "new" {
-                    if let Some(c) = self.extract_constructor_class(node) {
-                        return Some(c);
-                    }
+                // Constructor pattern is closed under syntax — bake
+                // before consulting the bag. Same shape the walker's
+                // `arm_payload` uses for return arms.
+                if let Some(class) = self.extract_constructor_class(node) {
+                    return Some(InferredType::ClassName(class));
                 }
-                let inner_class = self.resolve_invocant_class_tree(inner_invocant)?;
-                // Look up `inner_class::method_name` locally. Only
-                // resolve when its return type is a ClassName — we're
-                // building a class path, so non-class returns break
-                // the chain.
-                for sym in &self.symbols {
-                    if sym.name != method_name { continue; }
-                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                    if sym.package.as_deref() != Some(inner_class.as_str()) { continue; }
-                    if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
-                        return Some(c.clone());
-                    }
-                }
-                None
+                let span = node_to_span(node);
+                let idx = self.refs.iter().position(|r| {
+                    matches!(r.kind, RefKind::MethodCall { .. }) && r.span == span
+                })?;
+                // Arity from the method-call node disambiguates fluent
+                // accessors (Mojo::Base `has 'title' => 'default'`
+                // synthesizes a 0-arg getter returning String AND a
+                // 1-arg writer returning $self). Without it the Edge
+                // chase to NamedSub(method) falls through
+                // FluentArityDispatch (no matching arm without a hint)
+                // to NamedSubReturn — latest-wins picks the writer's
+                // ClassName instead of the getter's String.
+                let arity = self.extract_call_args(node).len() as u32;
+                self.bag_query_expression(crate::witnesses::RefIdx(idx as u32), Some(arity))
             }
             "scalar" => {
                 let text = node.utf8_text(self.source).ok()?;
-                // Variable's type from a TypeConstraint. Accept both
-                // ClassName (explicit assertion) and FirstParam (the
-                // `my $self = shift` idiom) — both pin a class. Without
-                // FirstParam here, post-pass chain typing can't see
-                // through `$self->_route(...)->...` because $self's TC
-                // is FirstParam, not ClassName.
-                let from_tc = self.type_constraints.iter().rev().find_map(|tc| {
-                    if tc.variable != text { return None; }
-                    match &tc.inferred_type {
-                        InferredType::ClassName(c) => Some(c.clone()),
-                        InferredType::FirstParam { package } => Some(package.clone()),
-                        _ => None,
-                    }
-                });
-                from_tc.or_else(|| {
-                    // Fall back to walk-state `current_package` for
-                    // `$self` in case TC seeding is incomplete (e.g.
-                    // `my $self = shift` not yet processed). Live-walk
-                    // callers depend on this; post-walk callers
-                    // generally hit the TC path above.
-                    if text == "$self" { self.current_package.clone() } else { None }
-                })
+                // `$self` short-circuit — the value of the package
+                // CONTAINING this node is the canonical answer
+                // regardless of whether a TC was seeded for `$self`
+                // yet. Use the innermost scope's `package` field
+                // (set on package_statement AND class_statement
+                // entries) so post-walk callers — where
+                // `self.current_package` is stale, holding the
+                // walk's last-opened package, not the one
+                // surrounding this node — get the right answer.
+                if text == "$self" {
+                    return self.package_for_node(node).map(InferredType::ClassName);
+                }
+                // TCs are the canonical store at walk-time (the bag's
+                // Variable witnesses don't mirror until
+                // populate_witness_bag runs post-walk). Read TCs first
+                // — they have whatever was just seeded by an earlier
+                // visit. Fall back to the bag, which has TCs mirrored
+                // post-walk + framework-aware projection
+                // (`FirstParam → ClassName`).
+                if let Some(t) = self.type_constraints.iter().rev().find_map(|tc| {
+                    if tc.variable == text { Some(tc.inferred_type.clone()) } else { None }
+                }) {
+                    return Some(t);
+                }
+                let scope = self.scope_at_point(node.start_position());
+                self.bag_query_variable(text, scope, node.start_position())
             }
             "bareword" | "package" => {
                 let text = node.utf8_text(self.source).ok()?;
                 if text == "__PACKAGE__" {
-                    return self.current_package.clone();
+                    return self.package_for_node(node).map(InferredType::ClassName);
                 }
-                // A bareword invocant is ambiguous: it could be a
-                // class-name reference (`Foo->method`) OR a zero-arg
-                // function call whose return type seeds the chain
-                // (`app->routes` where `sub app :: Mojolicious`).
-                //
-                // Prefer the function-call interpretation when a local
-                // Sub/Method with that name carries a ClassName return
-                // type — otherwise fall back to treating the text as
-                // a class. This is what `receiver_type_for` does for
-                // the plugin hook; mirroring it here fixes the same
-                // resolution gap for the chain-invocant path.
                 let bare = text.rsplit("::").next().unwrap_or(text);
-                for sym in &self.symbols {
-                    if sym.name != bare { continue; }
-                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                    if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
-                        return Some(c.clone());
-                    }
+                // Bareword invocant is ambiguous: class-name reference
+                // OR zero-arg function call whose return type seeds
+                // the chain (`app->routes` where `sub app :: Mojolicious`).
+                // Prefer the function-call interpretation; fall back
+                // to treating the text as a class.
+                if let Some(t) = self.bag_query_named_sub(bare, Some(0)) {
+                    return Some(t);
                 }
-                Some(text.to_string())
+                Some(InferredType::ClassName(text.to_string()))
             }
-            // `shift` in method-body invocant position is the classic
-            // `$self` idiom: `sub get { shift->_generate_route(GET => @_) }`.
-            // Mojo's Route.pm uses it on every HTTP-verb method. We
-            // trust the shape unconditionally — silent inference beats
-            // no inference. If false positives surface, narrow with a
-            // method-like-signal heuristic (declared `method`, first
-            // `my ($self, ...) = @_`, `sub new { bless … }` in the
-            // same package).
+            // `shift` / `shift()` / `$_[0]` in method-body invocant
+            // position all mean `$self`. Use `package_at_pos` for
+            // post-walk correctness; same reason as the `$self`
+            // case above.
             "func1op_call_expression" if self.is_shift_call(node) => {
-                self.current_package.clone()
+                self.package_for_node(node).map(InferredType::ClassName)
             }
-            // `$_[0]` is the other first-arg idiom — used on hot code
-            // paths where the shift is too expensive. Same meaning as
-            // `shift`: the invocant (i.e. `$self`). Shape:
-            //   (array_element_expression
-            //     array:(container_variable (varname "_"))
-            //     index:(number "0"))
-            // Same trust-the-shape policy as `shift`.
             "array_element_expression" => {
                 let array = node.child_by_field_name("array")?;
                 if array.kind() != "container_variable" { return None; }
@@ -1368,59 +1402,63 @@ impl<'a> Builder<'a> {
                 if varname.utf8_text(self.source).ok() != Some("_") { return None; }
                 let index = node.child_by_field_name("index")?;
                 if index.utf8_text(self.source).ok() != Some("0") { return None; }
-                self.current_package.clone()
+                self.package_for_node(node).map(InferredType::ClassName)
             }
             "function_call_expression" | "ambiguous_function_call_expression" => {
-                // Paren'd `shift()` as invocant also means `$self`.
                 if self.is_shift_call(node) {
-                    return self.current_package.clone();
+                    return self.package_for_node(node).map(InferredType::ClassName);
                 }
-                // `get_foo()->bar()` — the invocant of `->bar` is a
-                // function call. Look up the called sub locally and
-                // read its ClassName return type.
                 let func = node.child_by_field_name("function")?;
                 let name = func.utf8_text(self.source).ok()?;
                 let bare = name.rsplit("::").next().unwrap_or(name);
-                for sym in &self.symbols {
-                    if sym.name != bare { continue; }
-                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                    if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
-                        return Some(c.clone());
-                    }
-                }
-                None
+                let arg_count = self.extract_call_args(node).len() as u32;
+                self.bag_query_named_sub(bare, Some(arg_count))
             }
             _ => None,
         }
     }
 
-    fn receiver_type_for(&self, invocant_text: Option<&str>) -> Option<InferredType> {
-        let text = invocant_text?;
-        if text == "$self" || text == "__PACKAGE__" {
-            return self.current_package.clone().map(InferredType::ClassName);
+    /// Resolve a method-call invocant NODE to a class name. Thin
+    /// wrapper over `invocant_type_at_node` that projects the
+    /// resulting `InferredType` to a class string. Same caller
+    /// contract: callable both walk-time (variable arms read TCs,
+    /// the bag has plugin/framework synthesis answers) and
+    /// post-walk (the bag is canonical for everything).
+    fn resolve_invocant_class_tree(&self, node: Node<'a>) -> Option<String> {
+        let t = self.invocant_type_at_node(node)?;
+        if let Some(c) = t.class_name() {
+            return Some(c.to_string());
         }
-        if text.starts_with('$') {
-            return self.type_constraints.iter().rev().find_map(|tc| {
-                if tc.variable == text { Some(tc.inferred_type.clone()) } else { None }
-            });
+        // `FirstParam` projection: a TC carrying `FirstParam{package}`
+        // (the `my $self = shift;` idiom) pins the package even
+        // when `class_name()` doesn't recognize the variant.
+        if let InferredType::FirstParam { package } = t {
+            return Some(package);
         }
-        if text.starts_with('@') || text.starts_with('%') {
-            return None;
+        // Last fallback for bareword nodes: if the bag returned
+        // something non-class, treat the syntactic text as the class.
+        // Pre-bag-routing this was the bareword arm's `Some(text.to_string())`
+        // tail; preserved here so unrelated InferredType variants
+        // (Numeric / String / etc.) on a bareword still degrade to
+        // the class-name interpretation rather than vanishing.
+        if matches!(node.kind(), "bareword" | "package") {
+            return node.utf8_text(self.source).ok().map(|s| s.to_string());
         }
-        // Bareword invocant. Perl lets `foo->bar` mean either
-        // "method bar on package foo" OR "result of calling foo()"
-        // if `foo` is a declared sub. When we know about a local
-        // Sub/Method named `foo` with a return_type, that wins —
-        // `app->routes` in a Mojolicious::Lite script resolves to
-        // the plugin-synthesized `sub app() :: Mojolicious`.
-        for sym in &self.symbols {
-            if sym.name != text { continue; }
-            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-            if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
-                return Some(rt.clone());
-            }
-        }
-        Some(InferredType::ClassName(text.to_string()))
+        None
+    }
+    /// Walk-time helper for plugin emit hooks that need the
+    /// receiver's type to decide whether to fire (mojo-events'
+    /// `on_method_call` only matches `$emitter->on(...)` when
+    /// `$emitter` types as a Mojo::EventEmitter subclass, etc.).
+    ///
+    /// Thin wrapper over `invocant_type_at_node`. Same node-kind
+    /// dispatch the post-walk chain typer uses — variable arms read
+    /// TCs (canonical at walk time, mirrored to the bag post-walk),
+    /// bareword arms query NamedSub, method-call arms query
+    /// Expression(refidx), shift / `$_[0]` / `__PACKAGE__` use
+    /// current_package. One function, one dispatch.
+    fn receiver_type_for(&self, invocant_node: Option<Node<'a>>) -> Option<InferredType> {
+        self.invocant_type_at_node(invocant_node?)
     }
 
     /// Transitive parent walk within the current file. Depth-limited like
@@ -1577,6 +1615,9 @@ impl<'a> Builder<'a> {
                 opaque_return,
                 outline_label,
             } => {
+                let return_type_for_bag = return_type.clone();
+                let name_for_bag = name.clone();
+                let is_class_scoped = on_class.is_some();
                 let detail = SymbolDetail::Sub {
                     params: params.into_iter().map(Into::into).collect(),
                     is_method,
@@ -1614,6 +1655,62 @@ impl<'a> Builder<'a> {
                     if let Some(s) = self.symbols.iter_mut().find(|s| s.id == sid) {
                         s.outline_label = outline_label;
                     }
+                }
+                // Mirror the return type into the bag so walk-time and
+                // post-walk consumers see the plugin-synthesized sub
+                // through the same bag-query path locals + imports
+                // already use. Symbol(sid) always; NamedSub(name) only
+                // for free-function-style synth (`on_class.is_none()`).
+                // Class-scoped methods MUST stay class-scoped: pushing
+                // them on NamedSub would conflate same-named methods
+                // across classes (e.g. helper `users` namespace method
+                // on Mojolicious::Controller emitted by multiple
+                // unrelated `helper('users.X' => ...)` calls would
+                // collapse via NamedSubReturn-latest-wins, breaking
+                // class-scoped completion / hover).
+                if let Some(rt) = return_type_for_bag {
+                    use crate::witnesses::{
+                        Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+                    };
+                    if !is_class_scoped {
+                        // Top-level (free-function-style) plugin
+                        // synth: push Symbol + NamedSub. The bareword
+                        // invocant resolver in
+                        // `resolve_invocant_class_tree` queries
+                        // `NamedSub(name)` to type `app->routes` etc.,
+                        // so the push is required for that path.
+                        self.bag.push(Witness {
+                            attachment: WitnessAttachment::Symbol(sid),
+                            source: WitnessSource::Plugin(plugin_id.clone()),
+                            payload: WitnessPayload::InferredType(rt.clone()),
+                            span,
+                        });
+                        self.bag.push(Witness {
+                            attachment: WitnessAttachment::NamedSub(name_for_bag),
+                            source: WitnessSource::Plugin(plugin_id),
+                            payload: WitnessPayload::InferredType(rt),
+                            span,
+                        });
+                    }
+                    // Class-scoped plugin synth (`on_class: Some(_)`):
+                    // skip the bag push entirely. Same-named methods
+                    // across unrelated namespaces (mojo-helpers
+                    // emits a `users` proxy on Controller AND inside
+                    // `admin`'s nested namespace, both sharing the
+                    // method name) are dispatched through plugin
+                    // namespace bridges via
+                    // `resolve_method_in_ancestors`, not the bag.
+                    // Pushing on Symbol(sid) for class-scoped methods
+                    // is technically id-unique, but
+                    // `find_method_return_type_raw`'s SubReturnReducer
+                    // route picks up these pushes and answers from
+                    // the bag in cases where the legacy field-based
+                    // path would have walked the bridge — which
+                    // surfaces the wrong same-named entity when the
+                    // namespace bridge has multiple competing
+                    // entities. Bridges remain the dispatch
+                    // mechanism for class-scoped plugin synth (per
+                    // CLAUDE.md rule #8).
                 }
             }
             plugin::EmitAction::HashKeyDef { name, owner, span, selection_span } => {
@@ -1699,7 +1796,41 @@ impl<'a> Builder<'a> {
                 });
             }
             plugin::EmitAction::Symbol { name, kind, span, selection_span, detail } => {
-                self.add_symbol_ns(name, kind, span, selection_span, detail, ns);
+                // Capture return type before detail moves into
+                // add_symbol_ns. Pushed below to mirror the field on
+                // the bag so the chain typer's bag-routed queries see
+                // plugin-synthesized callables (e.g. Mojolicious::Lite's
+                // `app` → ClassName(Mojolicious)). Only `SymKind::Sub`
+                // (free-function-style) gets the NamedSub push; methods
+                // stay class-scoped via Symbol(sid).
+                let return_type_for_bag = match (&kind, &detail) {
+                    (SymKind::Sub | SymKind::Method, SymbolDetail::Sub { return_type, .. }) => {
+                        return_type.clone()
+                    }
+                    _ => None,
+                };
+                let push_named_sub = matches!(kind, SymKind::Sub);
+                let name_for_bag = name.clone();
+                let sid = self.add_symbol_ns(name, kind, span, selection_span, detail, ns);
+                if let Some(rt) = return_type_for_bag {
+                    use crate::witnesses::{
+                        Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+                    };
+                    self.bag.push(Witness {
+                        attachment: WitnessAttachment::Symbol(sid),
+                        source: WitnessSource::Plugin(plugin_id.clone()),
+                        payload: WitnessPayload::InferredType(rt.clone()),
+                        span,
+                    });
+                    if push_named_sub {
+                        self.bag.push(Witness {
+                            attachment: WitnessAttachment::NamedSub(name_for_bag),
+                            source: WitnessSource::Plugin(plugin_id),
+                            payload: WitnessPayload::InferredType(rt),
+                            span,
+                        });
+                    }
+                }
             }
             plugin::EmitAction::PackageParent { package, parent } => {
                 self.package_parents.entry(package).or_default().push(parent);
@@ -1889,29 +2020,22 @@ impl<'a> Builder<'a> {
                 self.visit_children(node);
             }
 
-            // Return expressions → collect return types for post-pass
+            // Return expressions → record structural facts pre-visit
+            // (scope, arity branch, span); emit per-arm + per-sub
+            // witnesses POST visit_children so the body's refs are
+            // already allocated. `arm_payload` for method-call arms
+            // returns `Edge(Expression(refidx))`; finding refidx
+            // requires the ref to exist, which requires the walker
+            // to have visited the method-call expression.
             "return_expression" => {
-                if let Some(scope) = self.enclosing_sub_scope() {
-                    let ret_type = self.infer_return_value_type(node);
-                    // Capture `return $var` for the post-bag-seed re-fold.
-                    // Collection records the raw variable identity; the
-                    // reducer at query time picks the right type under
-                    // the enclosing package's framework rules.
-                    let deferred_var = node
-                        .named_child(0)
-                        .filter(|c| c.kind() == "scalar")
-                        .and_then(|c| c.utf8_text(self.source).ok().map(|s| (s.to_string(), c.start_position())));
-                    // Arity-dispatch classification — recorded raw, no
-                    // type fold here. The deferred witness emission in
-                    // `resolve_return_types` will pair the branch with
-                    // the bag-resolved arm type.
+                let span = node_to_span(node);
+                let scope = self.enclosing_sub_scope();
+                if let Some(scope) = scope {
                     let arity_branch = classify_arity_branch(node, self.source);
                     self.return_infos.push(ReturnInfo {
                         scope,
-                        inferred_type: ret_type.clone(),
-                        deferred_var,
                         arity_branch,
-                        span: node_to_span(node),
+                        span,
                     });
                     // If the return body is `return other()` (a direct call),
                     // record the delegation so hash-key ownership can walk
@@ -1921,12 +2045,15 @@ impl<'a> Builder<'a> {
                             self.sub_return_delegations.insert(sub_name, delegated);
                         }
                     }
-                    // If-arm BranchArm: return inside `if { … } else { … }`.
-                    self.emit_branch_arm_for_if_arm_return(node, scope, ret_type);
-                    // Ternary-return BranchArm: `return $c ? A : B;` —
-                    // emit a BranchArm observation per arm on the
-                    // enclosing sub's Symbol, same reducer as RHS-
-                    // ternary and if-else-arm paths.
+                }
+                self.visit_children(node);
+                if let Some(scope) = scope {
+                    self.publish_return_arm_witnesses(node, scope, span);
+                    // Ternary returns: `return $c ? A : B;` — emit
+                    // per-arm branch_arm witnesses on the sub's
+                    // Symbol so BranchArmFold sees both arms
+                    // explicitly (agreement / disagreement surface
+                    // even when arm types are bag-resolved Edges).
                     if let Some(child) = node.named_child(0) {
                         if child.kind() == "conditional_expression" {
                             if let Some(sub_name) = self.enclosing_sub_name() {
@@ -1941,7 +2068,6 @@ impl<'a> Builder<'a> {
                         }
                     }
                 }
-                self.visit_children(node);
             }
 
             // Expression statements inside sub bodies → track last
@@ -1972,7 +2098,7 @@ impl<'a> Builder<'a> {
                         .unwrap_or(false);
                     if is_body_top_level {
                         let child = node.named_child(0);
-                        let expr_type = child.and_then(|c| self.infer_returned_value_type(c));
+                        let expr_type = child.and_then(|c| self.infer_expression_type(c));
                         self.last_expr_type.insert(scope, expr_type);
                         if let Some(c) = child {
                             if let Some(method_name) = self.self_method_call_name(c) {
@@ -3285,19 +3411,8 @@ impl<'a> Builder<'a> {
                 self.visit_variable_decl(left);
             }
             if let Some(right) = node.child_by_field_name("right") {
-                // Branch-arm detection: if RHS is a ternary, emit one
-                // BranchArm witness per arm on the LHS variable. The
-                // reducer folds them (agreement → type; disagreement
-                // → None — future: Union). Same reduction works for
-                // explicit if/else return arms (see resolve_return_types).
-                if right.kind() == "conditional_expression" {
-                    if let Some(vt) = self.get_var_text_from_lhs(left) {
-                        self.emit_branch_arm_witnesses_for_ternary(&vt, right, node);
-                    }
-                }
-
                 // Try constructor class first, then literal types, then expression type
-                let inferred = self.infer_expression_type(right, false)
+                let inferred = self.infer_expression_type(right)
                     .or_else(|| self.infer_expression_result_type(right));
                 if let Some(it) = inferred {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
@@ -3353,6 +3468,17 @@ impl<'a> Builder<'a> {
                 }
                 // Visit the RHS (may contain refs, calls, etc.)
                 self.visit_node(right);
+
+                // Branch-arm detection: if RHS is a ternary, emit one
+                // BranchArm witness per arm on the LHS variable. POST
+                // visit_node — needs the arms' refs to exist so
+                // arm_payload can resolve `Edge(Expression(refidx))`
+                // for method-call arms.
+                if right.kind() == "conditional_expression" {
+                    if let Some(vt) = self.get_var_text_from_lhs(left) {
+                        self.emit_branch_arm_witnesses_for_ternary(&vt, right, node);
+                    }
+                }
             }
             // Visit LHS children (except the variable_declaration we already handled)
             if left.kind() != "variable_declaration" {
@@ -3362,53 +3488,6 @@ impl<'a> Builder<'a> {
             // No left field — just visit children
             self.visit_children(node);
         }
-    }
-
-    /// Infer a type from a literal RHS node (no CST walk, just node kind check).
-    /// Infer type from an expression node: literals, constructors, sub-body last expr.
-    /// When `unwrap_sub_body` is true (Mojo default context), recurses into sub bodies.
-    /// When false (literal/return context), anonymous subs return CodeRef.
-    /// Emit a BranchArm observation on the enclosing sub's Symbol
-    /// when this `return_expression` is inside a
-    /// `conditional_statement` arm (if / elsif / else). Reuses the
-    /// same reduction as ternary descent — agreement → type;
-    /// disagreement → None.
-    fn emit_branch_arm_for_if_arm_return(
-        &mut self,
-        return_node: Node<'a>,
-        scope: ScopeId,
-        ret_type: Option<InferredType>,
-    ) {
-        use crate::witnesses::{
-            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
-        };
-        let Some(ty) = ret_type else { return };
-        // Walk up: expression_statement → block → conditional_statement.
-        let mut cur = return_node;
-        let mut seen_conditional = false;
-        for _ in 0..4 {
-            match cur.parent() {
-                Some(p) => {
-                    if p.kind() == "conditional_statement" || p.kind() == "else" {
-                        seen_conditional = true;
-                        break;
-                    }
-                    cur = p;
-                }
-                None => break,
-            }
-        }
-        if !seen_conditional {
-            return;
-        }
-        let Some(sub_name) = self.enclosing_sub_name() else { return };
-        let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) else { return };
-        self.pending_witnesses.push(Witness {
-            attachment: WitnessAttachment::Symbol(sym_id),
-            source: WitnessSource::Builder("branch_arm".into()),
-            payload: WitnessPayload::Observation(TypeObservation::BranchArm(ty)),
-            span: node_to_span(return_node),
-        });
     }
 
     /// Locate the SymbolId for a Sub/Method named `name` whose body's
@@ -3484,17 +3563,160 @@ impl<'a> Builder<'a> {
         attachment: crate::witnesses::WitnessAttachment,
         context: Node<'a>,
     ) {
-        use crate::witnesses::{TypeObservation, Witness, WitnessPayload, WitnessSource};
+        use crate::witnesses::{Witness, WitnessSource};
         let consequent = cond_expr.child_by_field_name("consequent");
         let alternative = cond_expr.child_by_field_name("alternative");
         let span = node_to_span(context);
         for arm in [consequent, alternative].into_iter().flatten() {
-            let ty = self.infer_returned_value_type(arm);
-            if let Some(t) = ty {
+            let payload = self.arm_payload(arm);
+            if let Some(p) = payload {
                 self.pending_witnesses.push(Witness {
                     attachment: attachment.clone(),
                     source: WitnessSource::Builder("branch_arm".into()),
-                    payload: WitnessPayload::Observation(TypeObservation::BranchArm(t)),
+                    payload: p,
+                    span,
+                });
+            }
+        }
+    }
+
+    /// Compute the right `WitnessPayload` shape for one arm of a
+    /// branch (ternary / if-else / arity-gated return). Direct
+    /// dispatch on node kind — no recursion through walker
+    /// inference. Three categories:
+    ///
+    /// - **Closed under syntax** (literals, constructors, arithmetic,
+    ///   regexp): walker bakes `InferredType(t)` from the node kind
+    ///   alone. There's nothing to resolve — `42` is `Numeric` no
+    ///   matter what.
+    /// - **Name-dependent** (variables, method calls, function
+    ///   calls): walker emits `Edge(...)` to the attachment that
+    ///   carries the resolved type. Registry materialization
+    ///   chases.
+    /// - **Compound** (ternary): returns `None`; the per-arm
+    ///   emission is handled by the caller via
+    ///   `emit_branch_arm_witnesses` (which loops over arms calling
+    ///   `arm_payload` recursively).
+    fn arm_payload(&self, arm: Node<'a>) -> Option<crate::witnesses::WitnessPayload> {
+        use crate::witnesses::{RefIdx, WitnessAttachment, WitnessPayload};
+        match arm.kind() {
+            // Closed-under-syntax — bake.
+            "string_literal" | "interpolated_string_literal" => {
+                Some(WitnessPayload::InferredType(InferredType::String))
+            }
+            "number" => Some(WitnessPayload::InferredType(InferredType::Numeric)),
+            "anonymous_hash_expression" => {
+                Some(WitnessPayload::InferredType(InferredType::HashRef))
+            }
+            "anonymous_array_expression" => {
+                Some(WitnessPayload::InferredType(InferredType::ArrayRef))
+            }
+            "quoted_regexp" => Some(WitnessPayload::InferredType(InferredType::Regexp)),
+            "anonymous_subroutine_expression" => {
+                Some(WitnessPayload::InferredType(InferredType::CodeRef))
+            }
+            "binary_expression"
+            | "equality_expression"
+            | "relational_expression"
+            | "postinc_expression"
+            | "preinc_expression"
+            | "func0op_call_expression"
+            | "func1op_call_expression" => self
+                .infer_expression_result_type(arm)
+                .map(WitnessPayload::InferredType),
+
+            // Variable — Edge to its Variable attachment. Registry
+            // materialization routes through `query_variable_type`
+            // (scope-walking + framework-aware fold).
+            "scalar" => {
+                let name = arm.utf8_text(self.source).ok()?;
+                Some(WitnessPayload::Edge(WitnessAttachment::Variable {
+                    name: name.to_string(),
+                    scope: self.current_scope(),
+                }))
+            }
+
+            // Method call — constructor pattern is closed under
+            // syntax (`Foo->new` → `ClassName("Foo")`), bake. Otherwise
+            // Edge to the call's `Expression(refidx)` attachment;
+            // populate_witness_bag has pushed `Edge(NamedSub(method))`
+            // there, so the chase resolves through.
+            "method_call_expression" => {
+                if let Some(class) = self.extract_constructor_class(arm) {
+                    return Some(WitnessPayload::InferredType(InferredType::ClassName(class)));
+                }
+                let span = node_to_span(arm);
+                let idx = self.refs.iter().position(|r| {
+                    matches!(r.kind, RefKind::MethodCall { .. }) && r.span == span
+                })?;
+                Some(WitnessPayload::Edge(WitnessAttachment::Expression(RefIdx(
+                    idx as u32,
+                ))))
+            }
+
+            // Function call — Edge to NamedSub(name). Materialize
+            // chases NamedSub which carries InferredType from
+            // writeback (locals) or enrichment (imports).
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                let func = arm.child_by_field_name("function")?;
+                let name = func.utf8_text(self.source).ok()?;
+                Some(WitnessPayload::Edge(WitnessAttachment::NamedSub(
+                    name.to_string(),
+                )))
+            }
+
+            // Bareword / scoped-identifier as expression — same as
+            // function call (calling a sub by name without parens).
+            "bareword" | "scoped_identifier" => {
+                let name = arm.utf8_text(self.source).ok()?;
+                Some(WitnessPayload::Edge(WitnessAttachment::NamedSub(
+                    name.to_string(),
+                )))
+            }
+
+            // Ternary — caller handles per-arm via
+            // `emit_branch_arm_witnesses`.
+            "conditional_expression" => None,
+
+            _ => None,
+        }
+    }
+
+    /// Publish bag witnesses for one return: per-arm type on
+    /// `ReturnArm(span)` if the walker can bake it (`arm_payload`),
+    /// and an unconditional per-sub `branch_arm`-source
+    /// `Edge(ReturnArm(span))` on `Symbol(sub_id)`. The per-sub edge
+    /// is unconditional so post-walk refresh
+    /// (`apply_chain_typing_return_arms`) can fill in the
+    /// `ReturnArm` later — the edge resolves to the eventual type
+    /// once chain typing or variable lookup completes.
+    /// `BranchArmFold` claims by `branch_arm` source; registry
+    /// materialization chases the edge through `ReturnArm(span)` so
+    /// the reducer sees a resolved `InferredType` after the bag
+    /// converges.
+    fn publish_return_arm_witnesses(
+        &mut self,
+        return_node: Node<'a>,
+        scope: ScopeId,
+        span: Span,
+    ) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+        if let Some(body) = return_node.named_child(0) {
+            if let Some(payload) = self.arm_payload(body) {
+                self.pending_witnesses.push(Witness {
+                    attachment: WitnessAttachment::ReturnArm(span),
+                    source: WitnessSource::Builder("return_arm".into()),
+                    payload,
+                    span,
+                });
+            }
+        }
+        if let Some(sub_name) = self.enclosing_sub_name() {
+            if let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) {
+                self.pending_witnesses.push(Witness {
+                    attachment: WitnessAttachment::Symbol(sym_id),
+                    source: WitnessSource::Builder("branch_arm".into()),
+                    payload: WitnessPayload::Edge(WitnessAttachment::ReturnArm(span)),
                     span,
                 });
             }
@@ -3520,196 +3742,48 @@ impl<'a> Builder<'a> {
         );
     }
 
-    fn infer_expression_type(&self, node: Node<'a>, unwrap_sub_body: bool) -> Option<InferredType> {
+    /// Closed-under-syntax type observation for an expression node.
+    /// The walker observes; it does not chase names. Only kinds whose
+    /// type is determined by the syntax alone:
+    ///
+    /// - Literals (`"foo"`, `42`, `{}`, `[]`, `qr//`).
+    /// - Anonymous subs → `CodeRef`.
+    /// - Constructor pattern `Bareword->new` → `ClassName`.
+    ///
+    /// Variables, function calls, name-driven method calls — all
+    /// excluded. They go through `arm_payload` as `Edge` payloads
+    /// pointing at attachments the bag knows.
+    fn infer_expression_type(&self, node: Node<'a>) -> Option<InferredType> {
         match node.kind() {
             "string_literal" | "interpolated_string_literal" => Some(InferredType::String),
             "number" => Some(InferredType::Numeric),
             "anonymous_hash_expression" => Some(InferredType::HashRef),
             "anonymous_array_expression" => Some(InferredType::ArrayRef),
             "quoted_regexp" => Some(InferredType::Regexp),
-            "anonymous_subroutine_expression" => {
-                if unwrap_sub_body {
-                    // Look at the last expression in the block for the return type
-                    let body = node.child_by_field_name("body")?;
-                    let last_stmt = body.named_child(body.named_child_count().checked_sub(1)?)?;
-                    let expr = if last_stmt.kind() == "expression_statement" {
-                        last_stmt.named_child(0)?
-                    } else if last_stmt.kind() == "return_expression" {
-                        last_stmt.named_child(0)?
-                    } else {
-                        last_stmt
-                    };
-                    self.infer_expression_type(expr, true)
-                } else {
-                    Some(InferredType::CodeRef)
-                }
-            }
+            "anonymous_subroutine_expression" => Some(InferredType::CodeRef),
             "method_call_expression" => {
                 self.extract_constructor_class(node).map(InferredType::ClassName)
-            }
-            // Named sub call (with or without parens) that resolves to a
-            // locally known Sub/Method with a declared return type.
-            //
-            //   sub foo :: Bar { … }        my $x = foo;          → $x : Bar
-            //   Mojo::Lite emits `sub app :: Mojolicious`, so:
-            //                                my $x = app;         → $x : Mojolicious
-            //                                app->routes->…       → chain seeded with Mojolicious
-            //
-            // Imported calls (no local symbol, return type unknown at
-            // build time) stay with the caller's CallBinding fallback
-            // so enrichment can fill them in when the module resolves.
-            "bareword" | "scoped_identifier"
-            | "function_call_expression" | "ambiguous_function_call_expression" => {
-                let name = match node.kind() {
-                    "bareword" | "scoped_identifier" => node.utf8_text(self.source).ok()?,
-                    _ => {
-                        let func = node.child_by_field_name("function")?;
-                        func.utf8_text(self.source).ok()?
-                    }
-                };
-                self.symbols.iter().find_map(|sym| {
-                    if sym.name != name { return None; }
-                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return None; }
-                    if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
-                        Some(rt.clone())
-                    } else {
-                        None
-                    }
-                })
             }
             _ => None,
         }
     }
 
-    /// Infer the type of a return expression's value (explicit
-    /// `return EXPR`). Delegates to `infer_returned_value_type`.
-    fn infer_return_value_type(&self, return_node: Node<'a>) -> Option<InferredType> {
-        let child = match return_node.named_child(0) {
-            Some(c) => c,
-            None => return None, // bare `return` — skip signal
-        };
-        self.infer_returned_value_type(child)
-    }
-
-    /// Infer the type of a value being returned — explicit
-    /// `return EXPR` OR an implicit last-expression-statement in a
-    /// sub body. Perl's last statement returns, so both shapes feed
-    /// here. Handles:
-    ///   - `undef` → None
-    ///   - literal/constructor expressions (via infer_expression_type)
-    ///   - arithmetic / string result types (infer_expression_result_type)
-    ///   - `$var` scalar returns resolved against type_constraints
-    ///     (prefers class-identity over rep constraints; see Part 6)
-    ///   - `shift->M(...)` / `$self->M(...)` → recurse via the
-    ///     locally-defined M's return type (same-package method
-    ///     lookup). Cycle-broken by a `seen` set on the recursion.
-    fn infer_returned_value_type(&self, child: Node<'a>) -> Option<InferredType> {
-        self.infer_returned_value_type_seen(child, &mut std::collections::HashSet::new())
-    }
-
-    fn infer_returned_value_type_seen(
-        &self,
-        child: Node<'a>,
-        seen: &mut std::collections::HashSet<String>,
-    ) -> Option<InferredType> {
-        if child.kind() == "undef" {
+    /// What does this anonymous-sub return, by inspecting the body's
+    /// last expression? Closed under syntax — recurses through
+    /// `infer_expression_type` only, no name lookup. Used by Mojo
+    /// `has 'x' => sub { [] }` to type the getter's return.
+    fn infer_anonymous_sub_return_type(&self, node: Node<'a>) -> Option<InferredType> {
+        if node.kind() != "anonymous_subroutine_expression" {
             return None;
         }
-        // Ternary: `return $cond ? A : B;` — recurse into both
-        // arms and agree-or-None. Same reduction the
-        // RHS-ternary / if-else-arm paths use; no reason to
-        // limit it artificially to any one syntactic shape.
-        if child.kind() == "conditional_expression" {
-            let consequent = child.child_by_field_name("consequent");
-            let alternative = child.child_by_field_name("alternative");
-            if let (Some(c), Some(a)) = (consequent, alternative) {
-                let ct = self.infer_returned_value_type_seen(c, seen);
-                let at = self.infer_returned_value_type_seen(a, seen);
-                match (ct, at) {
-                    (Some(t1), Some(t2)) if t1 == t2 => return Some(t1),
-                    _ => return None,
-                }
-            }
-        }
-        // Try expression type (literals, constructors)
-        if let Some(t) = self.infer_expression_type(child, false) {
-            return Some(t);
-        }
-        // Try expression result type: return $a + $b → Numeric
-        if let Some(t) = self.infer_expression_result_type(child) {
-            return Some(t);
-        }
-        // Implicit-return shape: `shift->METHOD(...)` or
-        // `$self->METHOD(...)`. The invocant is the enclosing class's
-        // instance; the return type is whatever METHOD returns when
-        // it's locally defined in the same package. Recurses through
-        // the LOCAL return_infos (we can see them because they're
-        // collected during the walk; we look up via current symbol
-        // state). Cross-file chains fall through to query-time
-        // resolution via `find_method_return_type`.
-        if child.kind() == "method_call_expression" {
-            // Self-method shortcut first (cycle-safe via `seen`).
-            if let Some(rt) = self.infer_self_method_call_return(child, seen) {
-                return Some(rt);
-            }
-            // General chain typing — same recursion every chain
-            // consumer uses. Type the receiver via
-            // `resolve_invocant_class_tree`, then look up the
-            // method's return type on that class. No special case
-            // for "self vs $var": the typer descends into whatever
-            // it gets.
-            if let (Some(invocant), Some(method_node)) = (
-                child.child_by_field_name("invocant"),
-                child.child_by_field_name("method"),
-            ) {
-                if let (Some(class), Ok(method_name)) = (
-                    self.resolve_invocant_class_tree(invocant),
-                    method_node.utf8_text(self.source),
-                ) {
-                    for sym in &self.symbols {
-                        if sym.name != method_name { continue; }
-                        if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                        if sym.package.as_deref() != Some(class.as_str()) { continue; }
-                        if let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail {
-                            return Some(rt.clone());
-                        }
-                    }
-                }
-            }
-        }
-        // Try variable lookup: return $self, return $var. Collection
-        // is deliberately dumb here — pick the LATEST constraint in
-        // scope before the return point and call it. No framework
-        // rules, no class-identity preference, no rep tournament.
-        // Those are reduction-time decisions; Part 6's
-        // `FrameworkAwareTypeFold` runs them at query time over the
-        // witness bag. The post-bag-seeding pass
-        // `refold_sub_return_types_via_bag` overwrites
-        // `Symbol.return_type` using the bag-aware fold, so consumers
-        // reading the field directly (e.g. `find_method_return_type`)
-        // still get the framework-correct answer.
-        if child.kind() == "scalar" {
-            if let Ok(var_text) = child.utf8_text(self.source) {
-                let point = child.start_position();
-                let mut latest: Option<InferredType> = None;
-                let mut latest_at = Point { row: 0, column: 0 };
-                for tc in &self.type_constraints {
-                    if tc.variable != var_text || tc.constraint_span.start > point {
-                        continue;
-                    }
-                    let scope = &self.scopes[tc.scope.0 as usize];
-                    if !contains_point(&scope.span, point) {
-                        continue;
-                    }
-                    if tc.constraint_span.start >= latest_at {
-                        latest = Some(tc.inferred_type.clone());
-                        latest_at = tc.constraint_span.start;
-                    }
-                }
-                return latest;
-            }
-        }
-        None
+        let body = node.child_by_field_name("body")?;
+        let last_stmt = body.named_child(body.named_child_count().checked_sub(1)?)?;
+        let expr = match last_stmt.kind() {
+            "expression_statement" | "return_expression" => last_stmt.named_child(0)?,
+            _ => last_stmt,
+        };
+        self.infer_expression_type(expr)
+            .or_else(|| self.infer_anonymous_sub_return_type(expr))
     }
 
     /// Does `node` look like `shift->M(...)` or `$self->M(...)`?
@@ -3739,19 +3813,6 @@ impl<'a> Builder<'a> {
             .utf8_text(self.source)
             .ok()
             .map(|s| s.to_string())
-    }
-
-    /// Called from the recursive return-type inference. Not yet
-    /// usable during the walk (sub return_types aren't populated
-    /// until resolve_return_types). Placeholder that always returns
-    /// None — the real chaining happens in resolve_return_types via
-    /// `self_method_tails`.
-    fn infer_self_method_call_return(
-        &self,
-        _node: Node<'a>,
-        _seen: &mut std::collections::HashSet<String>,
-    ) -> Option<InferredType> {
-        None
     }
 
     /// Push a type constraint on a variable node if it's a scalar.
@@ -4556,8 +4617,13 @@ impl<'a> Builder<'a> {
             }
             FrameworkMode::MojoBase => {
                 // Infer getter return type from default value if present
-                let getter_type = mojo_default_node
-                    .and_then(|n| self.infer_expression_type(n, true));
+                let getter_type = mojo_default_node.and_then(|n| {
+                    if n.kind() == "anonymous_subroutine_expression" {
+                        self.infer_anonymous_sub_return_type(n)
+                    } else {
+                        self.infer_expression_type(n)
+                    }
+                });
                 let fluent_type = self
                     .current_package
                     .as_ref()
@@ -4843,17 +4909,39 @@ impl<'a> Builder<'a> {
                 s.to_string()
             }
         });
-        // Store invocant span for complex expressions (call chains etc.)
-        let invocant_span = invocant_node
-            .filter(|n| !matches!(n.kind(), "scalar" | "array" | "hash" | "bareword" | "package"))
-            .map(|n| node_to_span(n));
+        // Always store the invocant span so post-walk refinement
+        // (`apply_chain_typing_invocants`) can find the node and
+        // fill `invocant_class` for refs that walk-time couldn't
+        // resolve (variable invocants whose TC isn't yet seeded,
+        // call-chain invocants whose inner sub return type isn't
+        // resolved). Without this, a `$obj->method` ref whose
+        // walk-time invocant_class was None would stay None
+        // forever and class-scoped `refs_to` would silently match
+        // too broadly.
+        let invocant_span = invocant_node.map(node_to_span);
 
-        // Resolve invocant to a class at build time using the tree —
-        // handles simple shapes directly, and chain invocants like
-        // `Sner->new->hi` via `resolve_invocant_class_tree`. Stored on
-        // the ref so downstream (refs_to / rename) matches class-scoped
-        // without re-resolving.
-        let invocant_class = invocant_node.and_then(|n| self.resolve_invocant_class_tree(n));
+        // Walk-time invocant_class — closed-under-syntax cases only:
+        //   - constructor pattern (`Sner->new->hi`)
+        //   - `__PACKAGE__->method(...)`
+        //
+        // Both are determined by syntax alone — no inference, no
+        // bag lookup. Everything else (variable invocants, bareword
+        // invocants whose canonical class only the bag knows like
+        // `app`, call-chain invocants whose return type is
+        // mid-fold) stays None and gets filled by PostFold's
+        // `apply_chain_typing_invocants` against the canonical bag.
+        // Now that `emit_method_call_arg_keys` runs post-walk, no
+        // walk-time consumer reads `invocant_class` — leaving it
+        // None at walk-time costs nothing.
+        let invocant_class = invocant_node.and_then(|n| match n.kind() {
+            "method_call_expression" => self.extract_constructor_class(n),
+            "bareword" | "package"
+                if n.utf8_text(self.source).ok() == Some("__PACKAGE__") =>
+            {
+                self.current_package.clone()
+            }
+            _ => None,
+        });
 
         if let Some(ref name) = method_name {
             // Dynamic method dispatch: $self->$method() — resolve $method if known
@@ -4939,21 +5027,17 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Even-position stringy args become HashKeyAccess refs owned
-        // by `Sub{invocant_class, method_name}`. Pairs with the
-        // HashKeyDef symbols `has`/`bless { … }` synthesize on the
-        // callee side. Without these refs, `ref_at` on a constructor
-        // arg only finds the broad MethodCall ref and rename clobbers
-        // the wrong token.
-        if let (Some(cls), Some(method)) = (invocant_class.as_ref(), method_name.as_ref()) {
-            if let Some(args) = node.child_by_field_name("arguments") {
-                let owner = HashKeyOwner::Sub {
-                    package: Some(cls.clone()),
-                    name: method.clone(),
-                };
-                self.emit_call_arg_key_accesses(args, &owner);
-            }
-        }
+        // Even-position stringy args become `HashKeyAccess` refs
+        // owned by `Sub{invocant_class, method_name}` — pairs with
+        // the HashKeyDef symbols that `has` / `bless { … }`
+        // synthesize on the callee side. Emission is deferred to
+        // post-walk (`emit_method_call_arg_keys`) so the owner's
+        // class can be read off the canonical `invocant_class`
+        // (filled by `apply_chain_typing_invocants` against the
+        // bag) instead of the partially-resolved walk-time value.
+        // The chain-typing index records the args node by call
+        // span; the post-walk pass joins refs to args via that
+        // span.
 
         // Framework plugin dispatch. Runs after native handlers so plugin
         // emissions are purely additive — a third-party plugin targeting
@@ -4969,7 +5053,7 @@ impl<'a> Builder<'a> {
                 ctx.call_kind = plugin::CallKind::Method;
                 ctx.method_name = Some(name.clone());
                 ctx.receiver_text = invocant_text.clone();
-                ctx.receiver_type = self.receiver_type_for(invocant_text.as_deref());
+                ctx.receiver_type = self.receiver_type_for(invocant_node);
                 self.dispatch_method_call_plugins(ctx);
             }
         }
@@ -5597,15 +5681,26 @@ impl<'a> Builder<'a> {
                 if let Some((key, is_dynamic)) = self.extract_key_text(*child) {
                     if !is_dynamic && self.has_hash_key_def(&key, owner) {
                         let access = self.determine_access(*child);
-                        self.add_ref(
-                            RefKind::HashKeyAccess {
+                        // `scope_at_point` instead of `current_scope`
+                        // so this works both inside the walk
+                        // (function-call args path) and post-walk
+                        // (method-call args path; the walk has
+                        // unwound by then and `scope_stack` is empty).
+                        // Equivalent at walk-time because a node's
+                        // innermost containing scope IS what
+                        // `current_scope` would return at that point.
+                        let span = node_to_span(*child);
+                        self.refs.push(Ref {
+                            kind: RefKind::HashKeyAccess {
                                 var_text: String::new(),
                                 owner: Some(owner.clone()),
                             },
-                            node_to_span(*child),
-                            key,
+                            span,
+                            scope: self.scope_at_point(span.start),
+                            target_name: key,
                             access,
-                        );
+                            resolves_to: None,
+                        });
                     }
                 }
             }
@@ -5886,7 +5981,6 @@ impl<'a> Builder<'a> {
         match mode {
             ChainPassMode::PreFold => {
                 self.apply_chain_typing_assignments(idx);
-                self.apply_chain_typing_return_arms(idx);
             }
             ChainPassMode::PostFold => {
                 self.apply_chain_typing_invocants(idx);
@@ -6099,36 +6193,6 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Re-evaluate `ReturnInfo.inferred_type` for every return
-    /// expression against the current `type_constraints` /
-    /// `Symbol.return_type` state. Walk-time inference runs against
-    /// an empty world — `return $route->name(...)` can't be typed
-    /// when `$route` doesn't yet have a TC and `name`'s return type
-    /// hasn't been folded. After the chain pass + first fold, both
-    /// hold; running the same typer again upgrades stale `None`
-    /// entries to the now-correct type.
-    ///
-    /// Only upgrades `None` → `Some` — never downgrades. The walk
-    /// already pinned literal/constructor/agree-arm cases; we don't
-    /// want a partial second-pass result to overwrite them.
-    ///
-    /// Reads from the shared `ChainTypingIndex.return_nodes`.
-    fn apply_chain_typing_return_arms(&mut self, idx: &ChainTypingIndex<'a>) {
-        let mut infos = std::mem::take(&mut self.return_infos);
-        for ri in &mut infos {
-            if ri.inferred_type.is_some() {
-                continue;
-            }
-            if let Some(node) = idx.return_nodes.get(&(ri.span.start, ri.span.end)) {
-                let new_type = self.infer_return_value_type(*node);
-                if new_type.is_some() {
-                    ri.inferred_type = new_type;
-                }
-            }
-        }
-        self.return_infos = infos;
-    }
-
     /// Re-resolve `invocant_class` on every MethodCall ref using the
     /// tree + the now-final symbol table (return types have been
     /// filled in by the second `resolve_return_types`). This catches
@@ -6140,8 +6204,8 @@ impl<'a> Builder<'a> {
     /// whose class was already pinned during the walk keep their value.
     fn apply_chain_typing_invocants(&mut self, idx: &ChainTypingIndex<'a>) {
         // Collect ref indices + their invocant nodes first so we
-        // don't borrow `self.refs` mutably while also calling
-        // `resolve_invocant_class_tree` (which reads `&self`).
+        // don't borrow `self.refs` mutably while also calling the
+        // bag-routed resolver (which reads `&self`).
         let mut pending: Vec<(usize, Node<'a>)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
             if let RefKind::MethodCall {
@@ -6167,6 +6231,44 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Post-walk: emit even-position stringy args of every resolved
+    /// `MethodCall` ref as `HashKeyAccess` refs owned by
+    /// `Sub{invocant_class, method_name}`. Pairs with the
+    /// `HashKeyDef` symbols that `has` / `bless { … }` synthesize on
+    /// the callee side; without these refs, `ref_at` on a constructor
+    /// arg only finds the broad `MethodCall` ref and rename clobbers
+    /// the wrong token.
+    ///
+    /// Runs post-PostFold so `invocant_class` is already filled
+    /// against the canonical bag — moves the keys-emission gating
+    /// off the walk-time `invocant_class.is_some()` shortcut that
+    /// previously forced syntactic walk-time class resolution to
+    /// keep working.
+    fn emit_method_call_arg_keys(&mut self, idx: &ChainTypingIndex<'a>) {
+        // Snapshot first so we can `&mut self` the emit loop below.
+        let mut pending: Vec<(HashKeyOwner, Node<'a>)> = Vec::new();
+        for r in &self.refs {
+            let RefKind::MethodCall { invocant_class: Some(cls), .. } = &r.kind else {
+                continue;
+            };
+            let Some(args) = idx
+                .method_call_args
+                .get(&(r.span.start, r.span.end))
+                .copied()
+            else {
+                continue;
+            };
+            let owner = HashKeyOwner::Sub {
+                package: Some(cls.clone()),
+                name: r.target_name.clone(),
+            };
+            pending.push((owner, args));
+        }
+        for (owner, args) in pending {
+            self.emit_call_arg_key_accesses(args, &owner);
+        }
+    }
+
     /// Phase 4 of the worklist refactor: this is the tiny driver. Each
     /// step is a named helper below. The call-binding propagator and
     /// hash-key-owner fixup are post-fold sync passes — they're
@@ -6179,26 +6281,25 @@ impl<'a> Builder<'a> {
     fn resolve_return_types(&mut self) {
         let (returns_by_scope, arm_types_per_ri) = self.collect_return_arm_types();
         self.emit_arity_return_witnesses(&arm_types_per_ri);
+        self.emit_delegation_edges();
         let (mut return_types, mut return_provenance) =
             self.fold_per_sub_return_arms(&returns_by_scope);
         self.seed_plugin_overrides_into_return_types(&mut return_types, &mut return_provenance);
-        self.propagate_via_delegation(&mut return_types, &mut return_provenance);
-        self.propagate_via_self_method_tails(&mut return_types, &mut return_provenance);
+        self.fill_returns_via_bag_chase(&mut return_types, &mut return_provenance);
         self.write_back_sub_return_types(&return_types, &return_provenance);
         self.propagate_call_bindings_to_constraints(&return_types);
         self.fixup_call_bound_hash_key_owners(&return_types);
     }
 
-    /// Step 1: walk every recorded `ReturnInfo` and resolve each arm's
-    /// type — `return $var` consults the bag (single, framework-aware
-    /// fold via `var_type_via_bag`); literals / constructors / arithmetic
-    /// use the type the walk read off directly. Returns
-    /// `returns_by_scope` for the per-Sub fold (step 3) and a
-    /// per-`ReturnInfo` view for the arity-witness emitter (step 2).
-    /// Restores `self.return_infos` before returning so later steps can
-    /// iterate it again.
+    /// Step 1: read each return arm's resolved type from the bag.
+    /// The walker already published per-arm payloads on
+    /// `ReturnArm(span)` (Type for bakeable arms, Edge for variable
+    /// arms); registry materialization chases the edges through
+    /// `Variable{...}` to a framework-aware fold every time we ask.
+    /// `returns_by_scope` feeds step 3's per-sub agreement fold;
+    /// `arm_types_per_ri` feeds step 2's arity-witness emission.
     fn collect_return_arm_types(
-        &mut self,
+        &self,
     ) -> (
         std::collections::HashMap<ScopeId, Vec<InferredType>>,
         Vec<Option<InferredType>>,
@@ -6207,22 +6308,124 @@ impl<'a> Builder<'a> {
             std::collections::HashMap::new();
         let mut arm_types_per_ri: Vec<Option<InferredType>> =
             Vec::with_capacity(self.return_infos.len());
-        let return_infos = std::mem::take(&mut self.return_infos);
-        for ri in &return_infos {
-            let arm_type = match &ri.deferred_var {
-                Some((var, point)) => self
-                    .var_type_via_bag(var, ri.scope, *point)
-                    .or_else(|| ri.inferred_type.clone()),
-                None => ri.inferred_type.clone(),
-            };
+        for ri in &self.return_infos {
+            let arm_type = self.bag_query_return_arm(ri.span);
             if let Some(t) = arm_type.clone() {
                 returns_by_scope.entry(ri.scope).or_default().push(t);
             }
             arm_types_per_ri.push(arm_type);
         }
-        self.return_infos = return_infos;
         (returns_by_scope, arm_types_per_ri)
     }
+
+    /// Single-attachment registry query for `ReturnArm(span)`. Used
+    /// by `collect_return_arm_types` and the chain-typing return-arm
+    /// refresh to read whatever the bag currently knows about an
+    /// arm. Threads the file's scope topology + per-package
+    /// framework as a `BagContext` so Edge chases through
+    /// `Variable{...}` use scope-chain + framework-aware semantics.
+    fn bag_query_return_arm(&self, span: Span) -> Option<InferredType> {
+        use crate::witnesses::{
+            BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
+            WitnessAttachment,
+        };
+        let att = WitnessAttachment::ReturnArm(span);
+        let reg = ReducerRegistry::with_defaults();
+        let ctx = BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            arity_hint: None,
+            context: Some(&ctx),
+        };
+        match reg.query(&self.bag, &q) {
+            ReducedValue::Type(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Bag-routed lookup for a variable's type at a point. Walks the
+    /// scope chain via `query_variable_type` (FrameworkAwareTypeFold,
+    /// branch-arm fold, etc. all apply). Used by the post-walk chain
+    /// typer once the bag is fully populated by `populate_witness_bag`.
+    fn bag_query_variable(
+        &self,
+        name: &str,
+        scope: ScopeId,
+        point: Point,
+    ) -> Option<InferredType> {
+        crate::witnesses::query_variable_type(
+            &self.bag,
+            &self.scopes,
+            &self.package_framework,
+            name,
+            scope,
+            point,
+        )
+    }
+
+    /// Bag-routed lookup for a sub's return type by name. Goes through
+    /// `query_sub_return_type` so arity dispatch / NamedSubReturn /
+    /// imported-return all compose. `arity_hint` is `None` for the
+    /// chain-typer's invocant resolution since chain typing wants
+    /// "what does this sub return when called as I see it being
+    /// called" — for invocant resolution that's typically the
+    /// zero-arg form (a chain like `app->routes` calls `app()` then
+    /// `routes()` on its return).
+    fn bag_query_named_sub(&self, name: &str, arity_hint: Option<u32>) -> Option<InferredType> {
+        let ctx = crate::witnesses::BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
+        crate::witnesses::query_sub_return_type(
+            &self.bag,
+            &self.symbols,
+            name,
+            arity_hint,
+            Some(&ctx),
+        )
+    }
+
+    /// Bag-routed lookup for a method-call expression's return type
+    /// via its ref index. Mirrors `FileAnalysis::method_call_return_type_via_bag`
+    /// but reads `&self.bag` (the in-progress builder bag). Includes
+    /// the `FirstParam → ClassName` projection so chain-typer
+    /// consumers see a concrete class instead of a parametric type.
+    fn bag_query_expression(
+        &self,
+        ref_idx: crate::witnesses::RefIdx,
+        arity_hint: Option<u32>,
+    ) -> Option<InferredType> {
+        use crate::witnesses::{
+            BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
+            WitnessAttachment,
+        };
+        let att = WitnessAttachment::Expression(ref_idx);
+        let reg = ReducerRegistry::with_defaults();
+        let ctx = BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            arity_hint,
+            context: Some(&ctx),
+        };
+        match reg.query(&self.bag, &q) {
+            ReducedValue::Type(InferredType::FirstParam { package }) => {
+                Some(InferredType::ClassName(package))
+            }
+            ReducedValue::Type(t) => Some(t),
+            _ => None,
+        }
+    }
+
 
     /// Step 2: emit `ArityReturn` witnesses on `Symbol(sub_id)` — the
     /// payload `FluentArityDispatch` (the spec's "ArityReturnReducer")
@@ -6299,6 +6502,10 @@ impl<'a> Builder<'a> {
         std::collections::HashMap<String, InferredType>,
         std::collections::HashMap<String, crate::file_analysis::TypeProvenance>,
     ) {
+        use crate::witnesses::{
+            BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
+            WitnessAttachment,
+        };
         let mut return_types: std::collections::HashMap<String, InferredType> =
             std::collections::HashMap::new();
         let mut return_provenance: std::collections::HashMap<
@@ -6306,19 +6513,62 @@ impl<'a> Builder<'a> {
             crate::file_analysis::TypeProvenance,
         > = std::collections::HashMap::new();
 
+        let reg = ReducerRegistry::with_defaults();
+        let ctx = BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
+
         for scope in &self.scopes {
             let sub_name = match &scope.kind {
                 ScopeKind::Sub { name } | ScopeKind::Method { name } => name.clone(),
                 _ => continue,
             };
 
-            let (resolved, evidence) = match returns_by_scope.get(&scope.id) {
-                Some(arms) if !arms.is_empty() => {
-                    let r = resolve_return_type(arms);
-                    let ev = vec![format!("return_arms={}", arms.len())];
-                    (r, ev)
-                }
-                _ => {
+            // Three sources, in priority order:
+            //   1. Per-arm fold via `returns_by_scope` — direct arms
+            //      from explicit `return EXPR` statements, agreed via
+            //      `resolve_return_type`. Wins when present.
+            //   2. Bag query on `Symbol(sub_id)` — picks up arms
+            //      pushed by `emit_branch_arm_witnesses` (ternary
+            //      arms, if/else arms) that don't naturally land in
+            //      `returns_by_scope`. `BranchArmFold` agrees them.
+            //   3. `last_expr_type` for subs without explicit returns.
+            let (resolved, evidence) = if let Some(arms) =
+                returns_by_scope.get(&scope.id).filter(|a| !a.is_empty())
+            {
+                let r = resolve_return_type(arms);
+                let ev = vec![format!("return_arms={}", arms.len())];
+                (r, ev)
+            } else {
+                let sym_id = self
+                    .symbols
+                    .iter()
+                    .find(|s| {
+                        s.name == sub_name
+                            && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                            && s.span.start <= scope.span.start
+                            && scope.span.end <= s.span.end
+                    })
+                    .map(|s| s.id);
+                let bag_answer = sym_id.and_then(|id| {
+                    let att = WitnessAttachment::Symbol(id);
+                    let q = ReducerQuery {
+                        attachment: &att,
+                        point: None,
+                        framework: FrameworkFact::Plain,
+                        arity_hint: None,
+                        context: Some(&ctx),
+                    };
+                    if let ReducedValue::Type(t) = reg.query(&self.bag, &q) {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(t) = bag_answer {
+                    (Some(t), vec!["symbol_bag".into()])
+                } else {
                     let r = self.last_expr_type.get(&scope.id).and_then(|t| t.clone());
                     let ev = if r.is_some() {
                         vec!["last_expr".into()]
@@ -6344,16 +6594,11 @@ impl<'a> Builder<'a> {
     }
 
     /// Step 4: seed Plugin overrides into `return_types` before
-    /// delegation / self_method_tail propagation. Plugin-source
-    /// `InferredType` witnesses on `Symbol(sym_id)` (pushed by
-    /// `apply_type_overrides`) carry priority > Builder; the
-    /// `PluginOverrideReducer` short-circuit dominates the per-arm
-    /// fold above. Provenance was already written as `PluginOverride`
-    /// by `apply_type_overrides`; clear any conflicting
-    /// `return_provenance` entry so the writeback can't clobber that
-    /// with `ReducerFold`. Subs that delegate to an overridden sub
-    /// inherit the override (the delegation pass sees
-    /// `return_types[overridden] = override`).
+    /// delegation / self_method_tail propagation. Routes through
+    /// `PluginOverrideReducer`'s own `claims` + `reduce` so the
+    /// predicate stays in lock-step with the registry — if the reducer
+    /// gains a tie-breaker or attachment-shape filter, the seed pass
+    /// inherits it for free instead of silently disagreeing.
     fn seed_plugin_overrides_into_return_types(
         &self,
         return_types: &mut std::collections::HashMap<String, InferredType>,
@@ -6362,89 +6607,86 @@ impl<'a> Builder<'a> {
             crate::file_analysis::TypeProvenance,
         >,
     ) {
-        use crate::witnesses::{WitnessAttachment, WitnessPayload};
+        use crate::witnesses::{
+            FrameworkFact, PluginOverrideReducer, ReducedValue, ReducerQuery, Witness,
+            WitnessAttachment, WitnessReducer,
+        };
 
+        let plugin_reducer = PluginOverrideReducer;
         for sym in &self.symbols {
             if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                 continue;
             }
             let att = WitnessAttachment::Symbol(sym.id);
-            let bag_override = self
+            let claimed: Vec<&Witness> = self
                 .bag
                 .for_attachment(&att)
-                .iter()
-                .filter_map(|w| match (w.source.priority(), &w.payload) {
-                    (p, WitnessPayload::InferredType(t)) if p > 10 => Some((p, t.clone())),
-                    _ => None,
-                })
-                .max_by_key(|(p, _)| *p)
-                .map(|(_, t)| t);
-            if let Some(t) = bag_override {
+                .into_iter()
+                .filter(|w| plugin_reducer.claims(w))
+                .collect();
+            if claimed.is_empty() {
+                continue;
+            }
+            let q = ReducerQuery {
+                attachment: &att,
+                point: None,
+                framework: FrameworkFact::Plain,
+                arity_hint: None,
+                context: None,
+            };
+            if let ReducedValue::Type(t) = plugin_reducer.reduce(&claimed, &q) {
                 return_types.insert(sym.name.clone(), t);
                 return_provenance.remove(&sym.name);
             }
         }
     }
 
-    /// Step 5: propagate return types through delegation chains. If
-    /// sub X's body is `return Y()` (recorded in
-    /// `sub_return_delegations`) and Y has a known return type, X
-    /// inherits it. Iterate until no changes — chains converge in at
-    /// most `delegations.len()` passes; the 20-iter cap is a safety
-    /// net for unforeseen cycles. Mirrors `DelegationReducer` in
-    /// `witnesses.rs` (which uses `ReducerQuery::return_of` instead of
-    /// the in-progress `return_types` map).
-    fn propagate_via_delegation(
-        &self,
-        return_types: &mut std::collections::HashMap<String, InferredType>,
-        return_provenance: &mut std::collections::HashMap<
-            String,
-            crate::file_analysis::TypeProvenance,
-        >,
-    ) {
-        let mut changed = true;
-        let mut iters = 0;
-        while changed && iters < 20 {
-            changed = false;
-            iters += 1;
-            let pairs: Vec<(String, String)> = self
-                .sub_return_delegations
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            for (delegator, delegate) in pairs {
-                if return_types.contains_key(&delegator) {
-                    continue;
-                }
-                if let Some(t) = return_types.get(&delegate).cloned() {
-                    return_types.insert(delegator.clone(), t);
-                    return_provenance.insert(
-                        delegator,
-                        crate::file_analysis::TypeProvenance::Delegation {
-                            kind: "sub_return".into(),
-                            via: delegate,
-                        },
-                    );
-                    changed = true;
-                }
-            }
-        }
-    }
+    /// Re-emittable: push edge facts for every recorded sub-return
+    /// delegation (`return other()` shape) and every self-method-tail
+    /// (`sub get { shift->method(...) }` shape) into the bag. Each
+    /// becomes `NamedSub(delegator) → Edge(NamedSub(delegate))`,
+    /// tagged so provenance attribution can later distinguish the two.
+    ///
+    /// Replaces the old hand-rolled fixed-point loops
+    /// (`propagate_via_delegation` / `propagate_via_self_method_tails`).
+    /// The registry's edge-chase resolves transitively, so multi-hop
+    /// chains converge as fast as the worklist's outer fold runs —
+    /// no inner iter cap to maintain.
+    ///
+    /// Clear-and-emit on tags `delegation` and `self_method_tail` so
+    /// repeat calls inside the worklist driver stay idempotent (no
+    /// duplicate edges accumulate).
+    ///
+    /// Self-recursion (a sub whose tail is its own name) is skipped —
+    /// can't infer your own return from yourself, and emitting the
+    /// edge would only contribute a `NamedSub(name) → Edge(NamedSub(name))`
+    /// that the registry's cycle guard would short-circuit on anyway.
+    fn emit_delegation_edges(&mut self) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
 
-    /// Step 6: self-method-tail propagation. Perl's last statement
-    /// returns, so `sub get { shift->_generate_route(GET => @_) }`
-    /// returns whatever `_generate_route` returns. Same fixed-point
-    /// shape as delegation; mirrors `SelfMethodTailReducer`.
-    /// Self-recursion (`sub_name == tail_method`) is skipped — can't
-    /// infer your own return type from yourself.
-    fn propagate_via_self_method_tails(
-        &self,
-        return_types: &mut std::collections::HashMap<String, InferredType>,
-        return_provenance: &mut std::collections::HashMap<
-            String,
-            crate::file_analysis::TypeProvenance,
-        >,
-    ) {
+        self.bag.remove_by_source_tag("delegation");
+        self.bag.remove_by_source_tag("self_method_tail");
+
+        let zero = Span {
+            start: Point { row: 0, column: 0 },
+            end: Point { row: 0, column: 0 },
+        };
+
+        let delegation_edges: Vec<Witness> = self
+            .sub_return_delegations
+            .iter()
+            .filter(|(delegator, delegate)| delegator != delegate)
+            .map(|(delegator, delegate)| Witness {
+                attachment: WitnessAttachment::NamedSub(delegator.clone()),
+                source: WitnessSource::Builder("delegation".into()),
+                payload: WitnessPayload::Edge(WitnessAttachment::NamedSub(delegate.clone())),
+                span: zero,
+            })
+            .collect();
+        for w in delegation_edges {
+            self.bag.push(w);
+        }
+
         let scope_to_sub: std::collections::HashMap<ScopeId, String> = self
             .scopes
             .iter()
@@ -6455,52 +6697,161 @@ impl<'a> Builder<'a> {
                 _ => None,
             })
             .collect();
-        let mut changed = true;
-        let mut iters = 0;
-        while changed && iters < 20 {
-            changed = false;
-            iters += 1;
-            let tails: Vec<(ScopeId, String)> = self
-                .self_method_tails
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-            for (scope_id, tail_method) in tails {
-                let sub_name = match scope_to_sub.get(&scope_id) {
-                    Some(n) => n.clone(),
-                    None => continue,
-                };
-                if return_types.contains_key(&sub_name) {
-                    continue;
-                }
+        let tail_edges: Vec<Witness> = self
+            .self_method_tails
+            .iter()
+            .filter_map(|(scope_id, tail_method)| {
+                let sub_name = scope_to_sub.get(scope_id)?;
                 if sub_name == tail_method {
-                    continue;
+                    return None;
                 }
-                if let Some(t) = return_types.get(&tail_method).cloned() {
-                    return_types.insert(sub_name.clone(), t);
-                    return_provenance.insert(
-                        sub_name,
-                        crate::file_analysis::TypeProvenance::Delegation {
-                            kind: "self_method_tail".into(),
-                            via: tail_method,
-                        },
-                    );
-                    changed = true;
+                Some(Witness {
+                    attachment: WitnessAttachment::NamedSub(sub_name.clone()),
+                    source: WitnessSource::Builder("self_method_tail".into()),
+                    payload: WitnessPayload::Edge(WitnessAttachment::NamedSub(
+                        tail_method.clone(),
+                    )),
+                    span: zero,
+                })
+            })
+            .collect();
+        for w in tail_edges {
+            self.bag.push(w);
+        }
+    }
+
+    /// For Sub/Method symbols whose return type didn't surface from
+    /// the per-arm fold or plugin overrides, AND who are recorded as
+    /// delegators (`return X()`) or self-method-tail callers
+    /// (`shift->M` last expr), query the bag's `NamedSub(name)`
+    /// attachment via the registry and accept its answer.
+    ///
+    /// Replaces the work the old `propagate_via_delegation` and
+    /// `propagate_via_self_method_tails` loops did, but goes through
+    /// the bag instead of the in-progress `return_types` map. Multi-hop
+    /// resolution converges across worklist iterations (each
+    /// iteration's writeback publishes a NamedSub witness that the
+    /// next iteration's chase can resolve through). The bag's
+    /// monotone-append + finite lattice argument carries termination;
+    /// no inner cap needed.
+    ///
+    /// Restricted to subs that actually appear in the delegation /
+    /// self-method-tail bookkeeping. Without this guard, a
+    /// framework-synthesized accessor with multiple symbols sharing a
+    /// name (Mojo::Base `has` getter+writer for `routes` —
+    /// returning `Mojolicious::Routes` and `Mojolicious` respectively)
+    /// would have its first-symbol getter type silently overwritten
+    /// by the writer's type: `NamedSubReturn` returns the latest
+    /// `InferredType` witness on the attachment, and writeback pushes
+    /// one per symbol.  The old propagation passes never touched
+    /// these — they only filled in delegators/tails, which is what
+    /// this restricted pass also does.
+    fn fill_returns_via_bag_chase(
+        &self,
+        return_types: &mut std::collections::HashMap<String, InferredType>,
+        return_provenance: &mut std::collections::HashMap<
+            String,
+            crate::file_analysis::TypeProvenance,
+        >,
+    ) {
+        use crate::witnesses::{
+            BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
+            WitnessAttachment,
+        };
+
+        let scope_to_sub: std::collections::HashMap<ScopeId, String> = self
+            .scopes
+            .iter()
+            .filter_map(|s| match &s.kind {
+                ScopeKind::Sub { name } | ScopeKind::Method { name } => {
+                    Some((s.id, name.clone()))
                 }
+                _ => None,
+            })
+            .collect();
+        let tail_by_sub: std::collections::HashMap<&str, &str> = self
+            .self_method_tails
+            .iter()
+            .filter_map(|(scope_id, tail_method)| {
+                scope_to_sub
+                    .get(scope_id)
+                    .map(|name| (name.as_str(), tail_method.as_str()))
+            })
+            .collect();
+
+        let reg = ReducerRegistry::with_defaults();
+        let ctx = BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+        };
+        let mut updates: Vec<(String, InferredType, crate::file_analysis::TypeProvenance)> =
+            Vec::new();
+        for sym in &self.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                continue;
             }
+            if return_types.contains_key(&sym.name) {
+                continue;
+            }
+            let delegate = self.sub_return_delegations.get(&sym.name);
+            let tail = tail_by_sub.get(sym.name.as_str()).copied();
+            if delegate.is_none() && tail.is_none() {
+                continue;
+            }
+            let att = WitnessAttachment::NamedSub(sym.name.clone());
+            let q = ReducerQuery {
+                attachment: &att,
+                point: None,
+                framework: FrameworkFact::Plain,
+                arity_hint: None,
+                context: Some(&ctx),
+            };
+            let resolved = match reg.query(&self.bag, &q) {
+                ReducedValue::Type(t) => t,
+                _ => continue,
+            };
+            let provenance = if let Some(via) = delegate {
+                crate::file_analysis::TypeProvenance::Delegation {
+                    kind: "sub_return".into(),
+                    via: via.clone(),
+                }
+            } else if let Some(via) = tail {
+                crate::file_analysis::TypeProvenance::Delegation {
+                    kind: "self_method_tail".into(),
+                    via: via.to_string(),
+                }
+            } else {
+                unreachable!("delegate or tail must be Some — we filtered above")
+            };
+            updates.push((sym.name.clone(), resolved, provenance));
+        }
+        for (name, t, prov) in updates {
+            return_types.insert(name.clone(), t);
+            return_provenance.insert(name, prov);
         }
     }
 
     /// Step 7: writeback. Set `return_type` on matching Sub/Method
-    /// symbols, and record `return_self_method` for subs whose return
-    /// type couldn't be collapsed in-file (the consumer side chains
-    /// through `return_self_method` when `return_type` is None).
-    /// Plugin overrides flow through `return_types` via the bag-priority
-    /// seeding step, with `return_provenance` cleared so we don't
-    /// clobber the existing `PluginOverride` entry written by
-    /// `apply_type_overrides`. No special-case skip needed — overrides
-    /// win because they're higher-priority bag witnesses, not because
-    /// the writeback knows about them.
+    /// symbols, push a `NamedSub(name) → InferredType(t)` witness for
+    /// each resolved return so the bag publishes the answer to every
+    /// consumer (chain typer's `Edge(NamedSub(_))` chase, cross-file
+    /// callers via `query_sub_return_type`'s NamedSub branch — same
+    /// shape `enrich_imported_types_with_keys` uses for imports), and
+    /// record `return_self_method` for subs whose return type couldn't
+    /// be collapsed in-file. Plugin overrides flow through
+    /// `return_types` via the bag-priority seeding step, with
+    /// `return_provenance` cleared so we don't clobber the existing
+    /// `PluginOverride` entry written by `apply_type_overrides`. No
+    /// special-case skip needed — overrides win because they're
+    /// higher-priority bag witnesses, not because the writeback knows
+    /// about them.
+    ///
+    /// Idempotent across re-runs: `bag.remove_by_source_tag("local_return")`
+    /// at the start of every call drops the prior pass's NamedSub
+    /// witnesses before re-emitting. The worklist driver calls
+    /// `resolve_return_types` repeatedly until fixed point; without
+    /// this clear-and-emit, each iteration would duplicate every
+    /// sub's NamedSub witness.
     fn write_back_sub_return_types(
         &mut self,
         return_types: &std::collections::HashMap<String, InferredType>,
@@ -6509,6 +6860,10 @@ impl<'a> Builder<'a> {
             crate::file_analysis::TypeProvenance,
         >,
     ) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+
+        self.bag.remove_by_source_tag("local_return");
+
         for sym in &mut self.symbols {
             if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                 continue;
@@ -6545,6 +6900,47 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
+        }
+
+        // Publish every Sub/Method's resolved return type to the bag
+        // on TWO attachments:
+        //   - `NamedSub(name)` — name-keyed lookup (cross-file imports
+        //     ride the same shape via `enrich_imported_types_with_keys`,
+        //     so this is the universal "what does sub `name` return?"
+        //     answer regardless of locality).
+        //   - `Symbol(sym_id)` — id-keyed lookup. Class-scoped dispatch
+        //     (`find_method_return_type_raw` resolves to a sym_id via
+        //     ancestor walk, then asks the bag what THAT sym returns)
+        //     rides this — name-keyed `NamedSub` would conflate
+        //     getter+writer pairs that share a method name.
+        // Catches both worklist-resolved returns (set above) and
+        // framework-pinned ones (Mojo::Base accessors, Moo `has`,
+        // DBIC column accessors — these set `return_type` in the
+        // SymbolDetail constructor at walk-time synthesis, never flow
+        // through `return_types`).
+        let mut writeback_witnesses: Vec<Witness> = Vec::new();
+        for sym in &self.symbols {
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                continue;
+            }
+            let SymbolDetail::Sub { return_type: Some(rt), .. } = &sym.detail else {
+                continue;
+            };
+            writeback_witnesses.push(Witness {
+                attachment: WitnessAttachment::NamedSub(sym.name.clone()),
+                source: WitnessSource::Builder("local_return".into()),
+                payload: WitnessPayload::InferredType(rt.clone()),
+                span: sym.span,
+            });
+            writeback_witnesses.push(Witness {
+                attachment: WitnessAttachment::Symbol(sym.id),
+                source: WitnessSource::Builder("local_return".into()),
+                payload: WitnessPayload::InferredType(rt.clone()),
+                span: sym.span,
+            });
+        }
+        for w in writeback_witnesses {
+            self.bag.push(w);
         }
     }
 
