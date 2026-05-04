@@ -19,48 +19,75 @@ backburner: ship when types + architecture are in a healthy place.
 
 ## Primary arc: type inference
 
-Three docs, three axes, one engine:
+Four docs, one engine:
 
 | Doc | Axis | Status |
 |---|---|---|
-| `prompt-type-inference-unification.md` | **HOW** — collapse walker + bag into one path | 4-step staircase, each ships green |
+| `prompt-type-inference-unification.md` | **HOW** — collapse walker + bag into one path | **Steps 1–4 landed (PR #27)** — historical |
+| `working-bag-residual.md` | **FINISH THE COLLAPSE** — four directives for "bag is the only truth" | **Active queue.** Each directive = one PR |
 | `prompt-type-inference-residual.md` | **WHAT'S MISSING** — Parts 1–5 fact classes | each is a reducer+emitter pair |
 | `prompt-sequence-types.md` | **FIRST BIG CONSUMER** — sequence type lattice | 5 phases; ~half the spike's diff on a clean foundation |
 
 ### Dependency map
 
 ```
-unification step 1 ─┐
-                    ├─▶ step 2 ─▶ step 3 ─┬─▶ step 4 (full collapse)
-                    │                     │
-                    │                     └─▶ sequence-types phases 1-3
-                    │
-                    └─▶ residual Parts 1-5  (independent of the staircase)
+staircase 1–4 (LANDED, PR #27) ─┐
+                                 ├─▶ bag-residual D1 (methods in the bag)
+                                 ├─▶ bag-residual D2 (one expression attachment)
+                                 ├─▶ bag-residual D3 (one attachment per fact)
+                                 ├─▶ bag-residual D4 (one canonical store)
+                                 │       │
+                                 │       └─▶ sequence-types phases 1-3
+                                 │
+                                 └─▶ residual Parts 1-5 (independent)
 ```
 
-- **Unification steps 1+2** are small (~50 + ~150 lines, mostly deletions). No new
-  capability; debt service that makes everything after it cheaper.
-- **Unification step 3** retires the `ReducerQuery` closures and replaces them
-  with `ReducerContext`. Enforces "the bag is canonical" *by construction*.
-  Unblocks sequence-types proper.
-- **Step 4** is the full collapse (delete `infer_returned_value_type_seen` etc.).
-  Optional in the sense that 1-3 already pay for themselves.
-- **Sequence-types phases 1-3** depend on step 3 for the closure-free
-  `ReducerContext`. Phase 4-5 (cross-file mutation effects, pipelines) are
-  separate design surfaces that compose on top.
+- **Unification staircase** is done. PR #27 subsumed Steps 1–4: the walker only
+  observes, edge-payload witnesses replace closure-driven chase, deferred-var /
+  BranchArm / ReturnOf observations are gone, chain typer + receiver typing go
+  through the bag.
+- **Bag-residual directives** (D1–D4) are the new keystone. Each one closes a
+  remaining dual-path or syntactic-bake hack. They are sequenced because D1
+  unblocks the cleanups in D3/D4 (`MethodOnClass` attachment is the shape
+  cross-file dispatch + the "no source-tag claims" rule both need). Land in
+  order; do not split a directive across PRs — partial lands recreate the
+  two-paths-coexist state we just left.
+- **Sequence-types phases 1-3** can start once D2 lands (the unified
+  `Expr(Span)` attachment is what sequence types thread their lattice through).
+  Phases 4-5 (cross-file mutation effects, pipelines) compose on top.
 - **Residual Parts 1-5** (invocant mutations, hash-key unions, method loops,
   functional operators, value-indexed returns / sum types / parametric types)
-  are each independent reducer+emitter pairs. Order by value; pick what hurts
+  remain independent reducer+emitter pairs. Order by value; pick what hurts
   most when missing.
 
 ### Recommended sequencing
 
-1. Steps 1+2 of the unification staircase (debt service, fast).
-2. Step 3 (canonicality enforcement). The keystone for what follows.
-3. Sequence-types phases 1-3, fresh on the clean foundation.
-4. Residual Parts (start with whichever is hurting most — likely Part 5b
+1. **Bag-residual D1** — `MethodOnClass{class, name}` attachment + inheritance
+   edge emitter + cross-file bridges as edges. Replaces
+   `find_method_return_type_seen`'s recursive ancestor walk. Unlocks D3/D4.
+2. **Bag-residual D2** — one `Expr(Span)` attachment for every expression value.
+   Kills `arm_payload`'s node-kind dispatch, `ReturnArm`, `last_expr_type`.
+   Unblocks sequence-types.
+3. **Bag-residual D3** — one attachment per fact, no source-tag claims. Kills
+   `WitnessAttachment::NamedSub` and the source-tag claim filters in
+   `SubReturnReducer` / `FrameworkAwareTypeFold`.
+4. **Bag-residual D4** — `Symbol.return_type` becomes a lazy cache,
+   `imported_return_types` dies, walk-time bag is live (no `pending_witnesses`
+   staging, no walk-time TC-first read).
+5. **Sequence-types phases 1-3** on the clean foundation.
+6. **Residual Parts** (start with whichever is hurting most — likely Part 5b
    narrowing or Part 5c parametric types for DBIC, depending on workload).
-5. Step 4 of the staircase, when convenient.
+
+### Hardening, slot anywhere
+
+- `MAX_FOLD_ITERATIONS` is `debug_assert!`-only; release builds have no cap and
+  rely entirely on the lattice argument. Pick: real release-mode bound with
+  `tracing::error!` and break, or trust the lattice and remove the debug check.
+- Arity is bolted on (own `ReducerQuery` field, own observation variant, own
+  reducer, own `ArityBranch` enum). Generalizing to a `Vec<Guard>` shape is
+  premature until a second guard kind appears (type-of-arg dispatch,
+  truthiness, `wantarray`). Do **not** ship more arity-shaped facts that need
+  their own reducer in the meantime.
 
 ---
 
@@ -82,9 +109,10 @@ function. Today's bespoke walkers collapse into `walk` calls with
 different masks. Lives as an isolated module that consumes
 `&FileAnalysis` — the builder doesn't grow this responsibility.
 
-**Scheduled after the type-inference triplet.** Type intelligence is the
-priority; graph rework is the next pillar. Migration is strangler fig —
-port one query at a time.
+**Scheduled after the type-inference quad** (staircase + bag-residual +
+sequence-types + residual Parts). Type intelligence is the priority; graph
+rework is the next pillar. Migration is strangler fig — port one query at
+a time.
 
 ### Eager Ref targets (Phase 5 of the original unification)
 
@@ -95,12 +123,12 @@ already exists; just the eager-target invariant is missing.
 
 ### Why this matters
 
-The type-inference unification staircase is the immediate priority. Graph
-rework is what unblocks Phase 6 (Openness diagnostic), multi-app Mojo
-support, and the eventual `Symbol.home_scope` move (was: phase 7's
-`home_namespace`). All three follow the same pattern: collapse ad-hoc
-code paths doing morally-similar work into one canonical mechanism;
-enforce the invariant by construction.
+The bag-residual directives are the immediate priority — finishing the
+collapse the staircase started. Graph rework is what unblocks Phase 6
+(Openness diagnostic), multi-app Mojo support, and the eventual
+`Symbol.home_scope` move (was: phase 7's `home_namespace`). All follow the
+same pattern: collapse ad-hoc code paths doing morally-similar work into
+one canonical mechanism; enforce the invariant by construction.
 
 ---
 
