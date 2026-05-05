@@ -213,10 +213,13 @@ pub fn spawn_resolver(
                         // These are the chain-invisible-but-reachable classes
                         // the user's chain walks through at query time.
                         for sym in &m.analysis.symbols {
-                            use crate::file_analysis::{SymKind, SymbolDetail, InferredType};
+                            use crate::file_analysis::{InferredType, SymKind, SymbolDetail};
                             if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                            if let SymbolDetail::Sub { return_type: Some(InferredType::ClassName(c)), .. } = &sym.detail {
-                                enqueue(&mut pending, c.clone());
+                            if !matches!(sym.detail, SymbolDetail::Sub { .. }) { continue; }
+                            if let Some(InferredType::ClassName(c)) =
+                                m.analysis.symbol_return_type_via_bag(sym.id, None)
+                            {
+                                enqueue(&mut pending, c);
                             }
                         }
                         if !pending.is_empty() {

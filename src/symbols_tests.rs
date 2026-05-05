@@ -1856,11 +1856,11 @@ fn test_route_pm_chain_decomposition() {
                 continue;
             }
             if let crate::file_analysis::SymbolDetail::Sub {
-                return_type,
                 return_self_method,
                 ..
             } = &sym.detail
             {
+                let return_type = analysis.symbol_return_type_via_bag(sym.id, None);
                 eprintln!(
                     "  sym[{:24}] return_type={:?}  return_self_method={:?}",
                     name, return_type, return_self_method
@@ -2182,12 +2182,11 @@ fn test_demo_chain_empirical_truth_table() {
                 continue;
             }
             if let crate::file_analysis::SymbolDetail::Sub {
-                return_type,
                 return_self_method,
                 ..
             } = &sym.detail
             {
-                rt = return_type.clone();
+                rt = route_cached.analysis.symbol_return_type_via_bag(sym.id, None);
                 sm = return_self_method.clone();
                 break;
             }

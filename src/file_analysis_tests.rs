@@ -118,8 +118,12 @@ fn test_resolve_reassignment_changes_type() {
 
 #[test]
 fn test_resolve_sub_return_type() {
-    // Hand-craft a FileAnalysis with a sub that has a return type
-    let fa = FileAnalysis::new(
+    use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+    // Hand-craft a FileAnalysis with a sub that has a return type.
+    // Post-D1, return types live in the bag — seed `Symbol(0)` and
+    // `NamedSub("get_config")` directly so the bag-routed query
+    // picks them up.
+    let mut fa = FileAnalysis::new(
         vec![Scope {
             id: ScopeId(0),
             parent: None,
@@ -147,7 +151,6 @@ fn test_resolve_sub_return_type() {
             detail: SymbolDetail::Sub {
                 params: vec![],
                 is_method: false,
-                return_type: Some(InferredType::HashRef),
                 doc: None,
                 display: None,
                 hide_in_outline: false,
@@ -172,6 +175,22 @@ fn test_resolve_sub_return_type() {
         HashMap::new(),
         vec![],
     );
+    let zero_span = Span {
+        start: Point::new(0, 0),
+        end: Point::new(0, 0),
+    };
+    fa.witnesses.push(Witness {
+        attachment: WitnessAttachment::Symbol(SymbolId(0)),
+        source: WitnessSource::Builder("local_return".into()),
+        payload: WitnessPayload::InferredType(InferredType::HashRef),
+        span: zero_span,
+    });
+    fa.witnesses.push(Witness {
+        attachment: WitnessAttachment::NamedSub("get_config".to_string()),
+        source: WitnessSource::Builder("local_return".into()),
+        payload: WitnessPayload::InferredType(InferredType::HashRef),
+        span: zero_span,
+    });
     assert_eq!(
         fa.sub_return_type_at_arity("get_config", None),
         Some(InferredType::HashRef)
@@ -1128,39 +1147,36 @@ sub disagree {
         .iter()
         .find(|s| s.name == "choose" && matches!(s.kind, SymKind::Sub))
         .expect("sub choose");
-    if let SymbolDetail::Sub { return_type, .. } = &choose.detail {
-        assert!(
-            matches!(return_type, Some(InferredType::FirstParam { package }) if package == "MyApp::Widget")
-                || matches!(return_type, Some(InferredType::ClassName(n)) if n == "MyApp::Widget"),
-            "choose's return: ternary arms both $self → class; got {:?}",
-            return_type
-        );
-    }
+    let return_type = fa.symbol_return_type_via_bag(choose.id, None);
+    assert!(
+        matches!(&return_type, Some(InferredType::FirstParam { package }) if package == "MyApp::Widget")
+            || matches!(&return_type, Some(InferredType::ClassName(n)) if n == "MyApp::Widget"),
+        "choose's return: ternary arms both $self → class; got {:?}",
+        return_type
+    );
 
     let literal = fa
         .symbols
         .iter()
         .find(|s| s.name == "literal_mix" && matches!(s.kind, SymKind::Sub))
         .expect("sub literal_mix");
-    if let SymbolDetail::Sub { return_type, .. } = &literal.detail {
-        assert_eq!(
-            return_type,
-            &Some(InferredType::Numeric),
-            "literal_mix: both arms Numeric"
-        );
-    }
+    let return_type = fa.symbol_return_type_via_bag(literal.id, None);
+    assert_eq!(
+        return_type,
+        Some(InferredType::Numeric),
+        "literal_mix: both arms Numeric"
+    );
 
     let disagree = fa
         .symbols
         .iter()
         .find(|s| s.name == "disagree" && matches!(s.kind, SymKind::Sub))
         .expect("sub disagree");
-    if let SymbolDetail::Sub { return_type, .. } = &disagree.detail {
-        assert_eq!(
-            return_type, &None,
-            "disagree: arms Numeric vs String → None"
-        );
-    }
+    let return_type = fa.symbol_return_type_via_bag(disagree.id, None);
+    assert_eq!(
+        return_type, None,
+        "disagree: arms Numeric vs String → None"
+    );
 }
 
 /// Ternary: `my $n = $c ? 1 : 2;` → both arms are Numeric, so

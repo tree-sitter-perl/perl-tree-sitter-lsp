@@ -279,12 +279,22 @@ pub enum EmitAction {
         invocant_span: Option<Span>,
     },
     /// Full control: emit an arbitrary Symbol.
+    ///
+    /// `return_type` lives at the action level (not on the
+    /// `SymbolDetail`) since D1 of the bag-residual refactor: the
+    /// per-symbol return type is bag-resident now, not a field on
+    /// `SymbolDetail::Sub`. Plugins synthesizing typed callables
+    /// (Mojolicious::Lite's `app`, etc.) populate this so the
+    /// builder publishes the type into the bag at the same time it
+    /// adds the symbol.
     Symbol {
         name: String,
         kind: SymKind,
         span: Span,
         selection_span: Span,
         detail: SymbolDetail,
+        #[serde(default)]
+        return_type: Option<InferredType>,
     },
     /// Declare a plugin namespace — a scope the plugin owns, with
     /// bridges describing how Perl-space expressions reach it. The

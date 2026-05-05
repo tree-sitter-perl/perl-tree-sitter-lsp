@@ -13,12 +13,10 @@
 //!   (Part 6 from the spec).
 //!
 //! `#[allow(dead_code)]` on a few API surfaces (`WitnessBag::all`,
-//! `filter`, `is_empty`; `ReturnOfKey::{Symbol, Name, MethodOnClass}`
-//! payloads; `ReducedValue::FactMap`; `WitnessReducer::name`) — these
-//! are part of the bag's stable contract for plugins and future
-//! reducers (e.g. dispatch chain folding via `MethodOnClass`,
-//! payload-bearing reductions via `FactMap`). They're held in the
-//! public surface deliberately rather than chased dead.
+//! `filter`, `is_empty`; `ReducedValue::FactMap`; `WitnessReducer::name`) —
+//! these are part of the bag's stable contract for plugins and future
+//! reducers (payload-bearing reductions via `FactMap`). They're held
+//! in the public surface deliberately rather than chased dead.
 
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
@@ -77,6 +75,16 @@ pub enum WitnessAttachment {
     /// uniformly. Arity dispatch (`emit_arity_return_witnesses`)
     /// queries each `ReturnArm` directly to read per-arm types.
     ReturnArm(Span),
+    /// Class-keyed method dispatch: "what does method `name` return on
+    /// class `class`?" — the cross-class disambiguation `NamedSub(name)`
+    /// can't carry. Inheritance composes through `Edge(MethodOnClass(parent, name))`
+    /// witnesses emitted by the builder for each `package_parents[C] = [P, ...]`,
+    /// so the registry's cycle-guarded edge chase walks the MRO without
+    /// any procedural ancestor walker. Cross-file resolution: when the
+    /// query carries a `BagContext.module_index`, the materialize step
+    /// recurses into the cached module's bag for `class` — same shape,
+    /// different bag.
+    MethodOnClass { class: String, name: String },
 }
 
 /// Index into `FileAnalysis::refs`.
@@ -371,9 +379,24 @@ pub struct ReducerQuery<'a> {
 /// materialization can run `query_variable_type` for `Variable`
 /// targets — which is the only edge target whose resolution
 /// fundamentally requires more than the bag itself.
+///
+/// `module_index` lets the materialize step recurse into cached
+/// modules' bags when a `MethodOnClass{class,...}` target names a
+/// class defined in another file. `None` for in-file callers
+/// (build-time, isolated tests where cross-file inheritance can't
+/// be reached).
+///
+/// `package_parents` is the per-class inheritance graph (Perl's
+/// default DFS-MRO). The registry walks it for `MethodOnClass{C, m}`
+/// queries that the local bag can't answer — chasing
+/// `MethodOnClass{P, m}` for each parent `P`. Cross-file parents are
+/// resolved through `module_index`. Single recursive lookup on the
+/// same attachment shape, not a procedural method-dispatch walker.
 pub struct BagContext<'a> {
     pub scopes: &'a [Scope],
     pub package_framework: &'a HashMap<String, FrameworkFact>,
+    pub module_index: Option<&'a crate::module_index::ModuleIndex>,
+    pub package_parents: &'a HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -677,7 +700,7 @@ impl WitnessReducer for FluentArityDispatch {
     }
 
     fn claims(&self, w: &Witness) -> bool {
-        // Two attachment shapes carry `ArityReturn` observations:
+        // Three attachment shapes carry `ArityReturn` observations:
         //   - `Symbol(_)` — single sub with internal arity branches
         //     (`return X unless @_; return Y;`), one Symbol id, one
         //     witness per arm.
@@ -687,9 +710,15 @@ impl WitnessReducer for FluentArityDispatch {
         //     dispatch across distinct symbols, so the framework
         //     synthesis publishes name-keyed observations and this
         //     reducer folds them at query time.
+        //   - `MethodOnClass{...}` — class-scoped variant of NamedSub
+        //     for cross-class dispatch (`Sweet::flavor` vs `Sour::flavor`
+        //     can't share the same NamedSub bucket without
+        //     last-write-wins clobbering).
         matches!(
             w.attachment,
-            WitnessAttachment::Symbol(_) | WitnessAttachment::NamedSub(_)
+            WitnessAttachment::Symbol(_)
+                | WitnessAttachment::NamedSub(_)
+                | WitnessAttachment::MethodOnClass { .. }
         ) && matches!(
             w.payload,
             WitnessPayload::Observation(TypeObservation::ArityReturn { .. })
@@ -856,6 +885,8 @@ impl WitnessReducer for SubReturnReducer {
         }
         match &w.source {
             WitnessSource::Builder(s) if s == "local_return" => true,
+            WitnessSource::Builder(s) if s == "delegation" => true,
+            WitnessSource::Builder(s) if s == "self_method_tail" => true,
             WitnessSource::Enrichment(s) if s == "imported_return" => true,
             _ => false,
         }
@@ -875,6 +906,44 @@ impl WitnessReducer for SubReturnReducer {
         if q.arity_hint.is_some() {
             return ReducedValue::None;
         }
+        for w in ws.iter().rev() {
+            if let WitnessPayload::InferredType(t) = &w.payload {
+                return ReducedValue::Type(t.clone());
+            }
+        }
+        ReducedValue::None
+    }
+}
+
+// ---- Class-keyed method-on-class reducer ----
+//
+// Claims `MethodOnClass{class, name}` attachments carrying a plain
+// `InferredType` payload — the class-scoped equivalent of
+// `NamedSubReturn`. Pushed by `Builder::emit_method_on_class_facts`
+// for the primary symbol of each `(class, method)` pair: that's the
+// "default" return type when the caller doesn't constrain by arity.
+// `FluentArityDispatch` runs first and handles per-arity dispatch
+// from `ArityReturn` observations; this reducer only fires when no
+// arity-specific fact answers (no arity hint, or no observation
+// matches the hint) — and produces the primary's stored return.
+//
+// Latest-wins: the worklist clears `method_on_class` source witnesses
+// each iteration and re-pushes from current state. The last witness
+// represents the converged answer.
+
+pub struct MethodOnClassReducer;
+
+impl WitnessReducer for MethodOnClassReducer {
+    fn name(&self) -> &str {
+        "method_on_class"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::MethodOnClass { .. })
+            && matches!(w.payload, WitnessPayload::InferredType(_))
+    }
+
+    fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
         for w in ws.iter().rev() {
             if let WitnessPayload::InferredType(t) = &w.payload {
                 return ReducedValue::Type(t.clone());
@@ -941,6 +1010,30 @@ impl WitnessReducer for PluginOverrideReducer {
 
 // ---- Reducer registry ----
 
+/// Cycle guard for recursive bag queries. Keyed by `(bag_ptr, attachment)`
+/// so re-entries into the same bag for the same attachment close
+/// cross-file mutual-inheritance loops; per-bag entries stay separate
+/// so a legitimate cross-bag query for the same attachment shape (the
+/// common case for `MethodOnClass{C, m}` jumping into C's own bag) is
+/// not misidentified as a cycle.
+type VisitedSet = std::collections::HashSet<(usize, WitnessAttachment)>;
+
+/// Depth backstop for `query_rec`. The `(bag, attachment)` visited set
+/// is the primary cycle guard; this cap is a belt-and-braces safeguard
+/// against any *new* recursion shape we haven't accounted for blowing
+/// the stack on real-world `@INC`. When the cap is hit we log the
+/// offending attachment once per process and return `None` — the query
+/// gives up cleanly instead of aborting. Set high enough that legit
+/// inheritance + edge chases never trip it; tune down only with
+/// evidence that a deeper walk is needed.
+const QUERY_REC_DEPTH_CAP: u32 = 512;
+
+thread_local! {
+    static QUERY_REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// One-shot so we don't flood stderr while a deep walk unwinds.
+    static QUERY_REC_DEPTH_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Default)]
 pub struct ReducerRegistry {
     reducers: Vec<Box<dyn WitnessReducer>>,
@@ -969,6 +1062,12 @@ impl ReducerRegistry {
         r.register(Box::new(FluentArityDispatch));
         r.register(Box::new(NamedSubReturn));
         r.register(Box::new(ReturnArmReturn));
+        // MethodOnClass primary-fallback runs after the arity-aware
+        // dispatch (FluentArityDispatch claims MethodOnClass +
+        // ArityReturn) so per-arity facts win when the caller has an
+        // arity hint that matches; only when nothing more precise
+        // answers does the primary's plain `InferredType` surface.
+        r.register(Box::new(MethodOnClassReducer));
         // Last — fallback for "this Symbol's stored return type"
         // queries that none of the more-precise reducers claimed.
         r.register(Box::new(SubReturnReducer));
@@ -990,11 +1089,18 @@ impl ReducerRegistry {
     /// witness list. This lets edges compose with existing reducers
     /// without reducer-side awareness — `FrameworkAwareTypeFold` reads
     /// a chased class as a plain `InferredType::ClassName`, same as if
-    /// the walker had baked it directly. Cycle guard via the visited
-    /// set breaks `A → B → A`.
+    /// the walker had baked it directly.
+    ///
+    /// The cycle guard keys on `(bag_ptr, attachment)` and is threaded
+    /// across both edge chases (within one bag) and the inheritance
+    /// fallback (which crosses bags). Re-entering the same bag for the
+    /// same attachment closes mutual-inheritance loops that span files
+    /// (`package A; use parent 'B'; package B; use parent 'A';`) — a
+    /// per-bag-only set would let the walk reset visited every time it
+    /// crossed `module_index.get_cached(...)`, recursing until the
+    /// stack overflows.
     pub fn query(&self, bag: &WitnessBag, q: &ReducerQuery) -> ReducedValue {
-        let mut visited: std::collections::HashSet<WitnessAttachment> =
-            std::collections::HashSet::new();
+        let mut visited: VisitedSet = std::collections::HashSet::new();
         self.query_rec(bag, q, &mut visited)
     }
 
@@ -1002,13 +1108,47 @@ impl ReducerRegistry {
         &self,
         bag: &WitnessBag,
         q: &ReducerQuery,
-        visited: &mut std::collections::HashSet<WitnessAttachment>,
+        visited: &mut VisitedSet,
     ) -> ReducedValue {
-        if !visited.insert(q.attachment.clone()) {
+        let depth = QUERY_REC_DEPTH.with(|c| {
+            let d = c.get();
+            c.set(d + 1);
+            d
+        });
+        if depth >= QUERY_REC_DEPTH_CAP {
+            QUERY_REC_DEPTH_WARNED.with(|w| {
+                if !w.get() {
+                    w.set(true);
+                    eprintln!(
+                        "perl-lsp: query_rec depth cap ({}) hit on attachment {:?} — \
+                         returning None to avoid stack overflow. \
+                         This indicates an un-broken recursion path; \
+                         please report.",
+                        QUERY_REC_DEPTH_CAP, q.attachment,
+                    );
+                }
+            });
+            QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
             return ReducedValue::None;
         }
+        let key = (bag as *const _ as usize, q.attachment.clone());
+        if !visited.insert(key.clone()) {
+            QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
+            return ReducedValue::None;
+        }
+        let result = self.query_rec_body(bag, q, visited);
+        visited.remove(&key);
+        QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
+        result
+    }
+
+    fn query_rec_body(
+        &self,
+        bag: &WitnessBag,
+        q: &ReducerQuery,
+        visited: &mut VisitedSet,
+    ) -> ReducedValue {
         let materialized = self.materialize(bag, q, visited);
-        visited.remove(q.attachment);
 
         for r in &self.reducers {
             let claimed: Vec<&Witness> =
@@ -1021,6 +1161,142 @@ impl ReducerRegistry {
                 return v;
             }
         }
+
+        // Inheritance walk for `MethodOnClass{C, m}` queries the local
+        // bag couldn't answer. Two structural facts compose:
+        //
+        //   1. `module_index.get_cached(C)` — when `C` lives in
+        //      another file, its cached `FileAnalysis` carries the
+        //      direct facts for C (its synthesized accessors, its own
+        //      writeback witnesses). Recurse with C's cached bag.
+        //   2. `package_parents[C]` (local) ∪
+        //      `module_index.parents_cached(C)` (cross-file) — the
+        //      inheritance chain in Perl-default DFS-MRO order
+        //      (left-to-right `@ISA`). Recurse on
+        //      `MethodOnClass{P, m}` for each parent until one
+        //      answers. Cross-file P resolves through (1) on the
+        //      recursive call.
+        //
+        // The shared `(bag, attachment)`-keyed visited set breaks both
+        // local cycles (`class :isa Self`) and cross-file loops
+        // (`A use parent B; B use parent A`) — see the doc on `query`.
+        if let WitnessAttachment::MethodOnClass { class, name } = q.attachment {
+            if let Some(ctx) = q.context {
+                // (1) Cross-file primary: cached module for class C.
+                // Skip when the current bag IS already the cached
+                // module's bag — `query_rec`'s entry guard would
+                // bounce us anyway, but the explicit check avoids
+                // even building `cached_ctx` and `sub_q`.
+                if let Some(idx) = ctx.module_index {
+                    if let Some(cached) = idx.get_cached(class) {
+                        if !std::ptr::eq(bag, &cached.analysis.witnesses) {
+                            // Reuse cached's own package_parents /
+                            // scopes / package_framework so further
+                            // parent walks and Variable edge chases
+                            // happen in the cached file's context,
+                            // not ours.
+                            let cached_ctx = BagContext {
+                                scopes: &cached.analysis.scopes,
+                                package_framework: &cached.analysis.package_framework,
+                                module_index: Some(idx),
+                                package_parents: &cached.analysis.package_parents,
+                            };
+                            let sub_q = ReducerQuery {
+                                attachment: q.attachment,
+                                point: q.point,
+                                framework: q.framework,
+                                arity_hint: q.arity_hint,
+                                context: Some(&cached_ctx),
+                            };
+                            let v = self.query_rec(
+                                &cached.analysis.witnesses,
+                                &sub_q,
+                                visited,
+                            );
+                            if v != ReducedValue::None {
+                                return v;
+                            }
+                        }
+                    }
+                }
+                // (2) Inheritance walk via package_parents.
+                let mut parents: Vec<String> =
+                    ctx.package_parents.get(class).cloned().unwrap_or_default();
+                if let Some(idx) = ctx.module_index {
+                    for p in idx.parents_cached(class) {
+                        if !parents.contains(&p) {
+                            parents.push(p);
+                        }
+                    }
+                }
+                for p in parents {
+                    let parent_att = WitnessAttachment::MethodOnClass {
+                        class: p,
+                        name: name.clone(),
+                    };
+                    let sub_q = ReducerQuery {
+                        attachment: &parent_att,
+                        point: q.point,
+                        framework: q.framework,
+                        arity_hint: q.arity_hint,
+                        context: q.context,
+                    };
+                    let v = self.query_rec(bag, &sub_q, visited);
+                    if v != ReducedValue::None {
+                        return v;
+                    }
+                }
+                // (3) Cross-file plugin-namespace bridges. Plugin
+                // namespaces in OTHER files may bridge entities to
+                // `class` (mojo-helpers emits `helper` Methods with
+                // a `Bridge::Class("Mojolicious::Controller")` so
+                // any controller's method dispatch picks them up).
+                // The local file's `plugin_namespaces` already gets
+                // edges emitted at build time
+                // (`Builder::write_back_sub_return_types`'s bridge
+                // pass); cross-file ones need module_index walking.
+                //
+                // For each matching entity, query the cached
+                // module's bag for `Symbol(sym.id)` at arity=None.
+                // Plugin-emitted Methods aren't arity-discriminated
+                // (each helper has one signature), so the writeback's
+                // plain `InferredType` answer is the right one
+                // regardless of how many args the caller passed.
+                // SubReturnReducer's `arity_hint=Some` short-circuit
+                // would silently zero this out — the arity-aware
+                // gate exists for Mojo accessor getter/writer
+                // dispatch, where multiple syms share a name and
+                // arity disambiguates; it doesn't apply here.
+                if let Some(idx) = ctx.module_index {
+                    let mut found: Option<InferredType> = None;
+                    idx.for_each_entity_bridged_to(class, |cached, sym| {
+                        if found.is_some() {
+                            return;
+                        }
+                        if !matches!(
+                            sym.kind,
+                            crate::file_analysis::SymKind::Sub
+                                | crate::file_analysis::SymKind::Method
+                        ) {
+                            return;
+                        }
+                        if &sym.name != name {
+                            return;
+                        }
+                        if let Some(t) = cached
+                            .analysis
+                            .symbol_return_type_via_bag(sym.id, None)
+                        {
+                            found = Some(t);
+                        }
+                    });
+                    if let Some(t) = found {
+                        return ReducedValue::Type(t);
+                    }
+                }
+            }
+        }
+
         ReducedValue::None
     }
 
@@ -1032,16 +1308,16 @@ impl ReducerRegistry {
     /// `Edge(Variable{...})` targets are special-cased: variable
     /// resolution requires walking the scope chain and using the
     /// scope's package framework. When the query carries a
-    /// `BagContext`, materialize delegates to `query_variable_type`
-    /// (the same helper file-side variable lookups use). Without a
-    /// context the chase is a flat single-attachment query —
-    /// adequate for tests and for cases where the witness exists at
-    /// the exact scope.
+    /// `BagContext`, materialize delegates to
+    /// `query_variable_with_visited` so the recursion shares the
+    /// caller's cycle guard — calling the public `query_variable_type`
+    /// from here would reset visited and leave us open to mutual
+    /// `Edge(Variable{a}) ↔ Edge(Variable{b})` loops.
     fn materialize(
         &self,
         bag: &WitnessBag,
         q: &ReducerQuery,
-        visited: &mut std::collections::HashSet<WitnessAttachment>,
+        visited: &mut VisitedSet,
     ) -> Vec<Witness> {
         let raw = bag.for_attachment(q.attachment);
         let mut out: Vec<Witness> = Vec::with_capacity(raw.len());
@@ -1054,13 +1330,14 @@ impl ReducerRegistry {
                             Some(ctx),
                         ) => {
                             let point = scope_point(ctx.scopes, *scope);
-                            query_variable_type(
+                            self.query_variable_with_visited(
                                 bag,
                                 ctx.scopes,
                                 ctx.package_framework,
                                 name,
                                 *scope,
                                 point,
+                                visited,
                             )
                         }
                         _ => {
@@ -1093,6 +1370,60 @@ impl ReducerRegistry {
             }
         }
         out
+    }
+
+    /// Scope-chain variable lookup with an explicit visited set.
+    /// `query_variable_type` is the public entry; this is the inner
+    /// loop, factored out so callers already inside a `query_rec`
+    /// recursion (currently only `materialize` for `Edge(Variable)`)
+    /// can thread their cycle guard through. Each scope on the chain
+    /// goes through `query_rec` with the *same* visited set, so a
+    /// mutual `$a → $b → $a` edge cycle closes.
+    fn query_variable_with_visited(
+        &self,
+        bag: &WitnessBag,
+        scopes: &[Scope],
+        package_framework: &HashMap<String, FrameworkFact>,
+        var: &str,
+        scope: ScopeId,
+        point: Point,
+        visited: &mut VisitedSet,
+    ) -> Option<InferredType> {
+        let mut chain: Vec<ScopeId> = Vec::new();
+        let mut cur = Some(scope);
+        while let Some(sid) = cur {
+            chain.push(sid);
+            cur = scopes[sid.0 as usize].parent;
+        }
+        let framework = chain
+            .iter()
+            .find_map(|sid| scopes[sid.0 as usize].package.as_ref())
+            .and_then(|pkg| package_framework.get(pkg).copied())
+            .unwrap_or(FrameworkFact::Plain);
+        let empty_parents: HashMap<String, Vec<String>> = HashMap::new();
+        let ctx = BagContext {
+            scopes,
+            package_framework,
+            module_index: None,
+            package_parents: &empty_parents,
+        };
+        for sid in chain {
+            let att = WitnessAttachment::Variable {
+                name: var.to_string(),
+                scope: sid,
+            };
+            let q = ReducerQuery {
+                attachment: &att,
+                point: Some(point),
+                framework,
+                arity_hint: None,
+                context: Some(&ctx),
+            };
+            if let ReducedValue::Type(t) = self.query_rec(bag, &q, visited) {
+                return Some(t);
+            }
+        }
+        None
     }
 }
 
@@ -1189,6 +1520,12 @@ pub fn query_sub_return_type(
 /// registry to fold every Variable witness for `var`. Returns the
 /// first scope that produces a typed answer; `None` if no scope on
 /// the chain has any matching witness or the reducer rejects them all.
+///
+/// Public entry: starts a fresh cycle-guard set. Recursive callers
+/// already inside `query_rec` must use
+/// `ReducerRegistry::query_variable_with_visited` instead so the
+/// shared visited set catches mutual `Edge(Variable{a})` ↔
+/// `Edge(Variable{b})` loops.
 pub fn query_variable_type(
     bag: &WitnessBag,
     scopes: &[Scope],
@@ -1197,38 +1534,17 @@ pub fn query_variable_type(
     scope: ScopeId,
     point: Point,
 ) -> Option<InferredType> {
-    let mut chain: Vec<ScopeId> = Vec::new();
-    let mut cur = Some(scope);
-    while let Some(sid) = cur {
-        chain.push(sid);
-        cur = scopes[sid.0 as usize].parent;
-    }
-
-    let framework = chain
-        .iter()
-        .find_map(|sid| scopes[sid.0 as usize].package.as_ref())
-        .and_then(|pkg| package_framework.get(pkg).copied())
-        .unwrap_or(FrameworkFact::Plain);
-
     let reg = ReducerRegistry::with_defaults();
-    let ctx = BagContext { scopes, package_framework };
-    for sid in chain {
-        let att = WitnessAttachment::Variable {
-            name: var.to_string(),
-            scope: sid,
-        };
-        let q = ReducerQuery {
-            attachment: &att,
-            point: Some(point),
-            framework,
-            arity_hint: None,
-            context: Some(&ctx),
-        };
-        if let ReducedValue::Type(t) = reg.query(bag, &q) {
-            return Some(t);
-        }
-    }
-    None
+    let mut visited: VisitedSet = std::collections::HashSet::new();
+    reg.query_variable_with_visited(
+        bag,
+        scopes,
+        package_framework,
+        var,
+        scope,
+        point,
+        &mut visited,
+    )
 }
 
 // ---------------------------------------------------------------

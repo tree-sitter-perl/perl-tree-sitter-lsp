@@ -32,14 +32,17 @@ Four docs, one engine:
 
 ```
 staircase 1–4 (LANDED, PR #27) ─┐
-                                 ├─▶ bag-residual D1 (methods in the bag)
+                                 ├─▶ bag-residual D1 redo (LANDED dc4315f, with residue → D3)
                                  ├─▶ bag-residual D2 (one expression attachment)
-                                 ├─▶ bag-residual D3 (one attachment per fact)
-                                 ├─▶ bag-residual D4 (one canonical store)
+                                 ├─▶ bag-residual D3 (one attachment per fact, +D1 residue)
+                                 ├─▶ bag-residual D4 (residual canonical-store cleanup)
                                  │       │
                                  │       └─▶ sequence-types phases 1-3
                                  │
-                                 └─▶ residual Parts 1-5 (independent)
+                                 ├─▶ residual Parts 1-5 (independent)
+                                 │
+                                 └─▶ docs/prompt-cleanups.md (small, parallel,
+                                       independent — pick anytime)
 ```
 
 - **Unification staircase** is done. PR #27 subsumed Steps 1–4: the walker only
@@ -52,6 +55,13 @@ staircase 1–4 (LANDED, PR #27) ─┐
   cross-file dispatch + the "no source-tag claims" rule both need). Land in
   order; do not split a directive across PRs — partial lands recreate the
   two-paths-coexist state we just left.
+  - **D1 landed in `dc4315f`** with two bullets routed forward to D3:
+    inheritance via `Edge(MethodOnClass(parent, name))` witnesses (the
+    structural walk landed in `query_rec` instead) and deleting
+    `build_imported_return_types` (the FA field went, the function survived
+    with bag-routed reads). The residue is explicit in
+    `docs/working-bag-residual.md` D3 — D3 is now larger than originally
+    scoped.
 - **Sequence-types phases 1-3** can start once D2 lands (the unified
   `Expr(Span)` attachment is what sequence types thread their lattice through).
   Phases 4-5 (cross-file mutation effects, pipelines) compose on top.
@@ -62,18 +72,32 @@ staircase 1–4 (LANDED, PR #27) ─┐
 
 ### Recommended sequencing
 
-1. **Bag-residual D1** — `MethodOnClass{class, name}` attachment + inheritance
-   edge emitter + cross-file bridges as edges. Replaces
-   `find_method_return_type_seen`'s recursive ancestor walk. Unlocks D3/D4.
+1. **Bag-residual D1 (redo)** — **LANDED in `dc4315f`.** Deleted
+   `SymbolDetail::Sub.return_type`, `find_method_return_type_seen` /
+   `_raw` / `self_method_tail`, the build-time chase, the
+   `imported_return_types` FA field. Added `MethodOnClass{class, name}`
+   attachment + `MethodOnClassReducer` + `BagContext.module_index` /
+   `package_parents`. Fixed DFS-MRO order. Two bullets did not land
+   as written: edge-witness emission for inheritance, and deletion of
+   `build_imported_return_types`. Both routed to D3 with explicit
+   tracking in `working-bag-residual.md`. Tests: 508 unit (was 506,
+   +2 regressions). First attempt
+   (`refactor/bag-residual-d1-method-on-class`, commit `c322178`) was
+   abandoned for being additive — its cautionary value preserved in
+   the directive's "what NOT to repeat" section.
 2. **Bag-residual D2** — one `Expr(Span)` attachment for every expression value.
    Kills `arm_payload`'s node-kind dispatch, `ReturnArm`, `last_expr_type`.
    Unblocks sequence-types.
 3. **Bag-residual D3** — one attachment per fact, no source-tag claims. Kills
    `WitnessAttachment::NamedSub` and the source-tag claim filters in
    `SubReturnReducer` / `FrameworkAwareTypeFold`.
-4. **Bag-residual D4** — `Symbol.return_type` becomes a lazy cache,
-   `imported_return_types` dies, walk-time bag is live (no `pending_witnesses`
-   staging, no walk-time TC-first read).
+4. **Bag-residual D4** (now smaller) — kill `FileAnalysis.type_constraints`
+   as a write target, walk-time bag is live (no `pending_witnesses` staging,
+   no walk-time TC-first read), kill `last_expr_type` /
+   `sub_return_delegations` / `self_method_tails` Builder maps as
+   bag-emit inputs. The field-deletion bullets that lived here moved
+   to D1 (and a "lazy cache" rebuild is explicitly **not** scheduled —
+   only add if profiling later shows the bag query is hot).
 5. **Sequence-types phases 1-3** on the clean foundation.
 6. **Residual Parts** (start with whichever is hurting most — likely Part 5b
    narrowing or Part 5c parametric types for DBIC, depending on workload).

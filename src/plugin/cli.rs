@@ -310,7 +310,11 @@ fn symbol_to_snapshot(s: &Symbol) -> Value {
     }
     use crate::file_analysis::SymbolDetail;
     match &s.detail {
-        SymbolDetail::Sub { params, is_method, return_type, display, hide_in_outline, opaque_return, .. } => {
+        SymbolDetail::Sub { params, is_method, display, hide_in_outline, opaque_return, .. } => {
+            // `return_type` was a `SymbolDetail` field; D1 of the
+            // bag-residual refactor moved it to the bag. The snapshot
+            // omits it from the symbol-shape dump — callers that
+            // need return-type info can read the bag separately.
             entry["detail"] = json!({
                 "kind": "Sub",
                 "params": params.iter().map(|p| json!({
@@ -320,7 +324,6 @@ fn symbol_to_snapshot(s: &Symbol) -> Value {
                     "default": p.default,
                 })).collect::<Vec<_>>(),
                 "is_method": is_method,
-                "return_type": return_type.as_ref().map(|t| format!("{:?}", t)),
                 "display": display.as_ref().map(|d| format!("{:?}", d)),
                 "hide_in_outline": hide_in_outline,
                 "opaque_return": opaque_return,
