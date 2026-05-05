@@ -1010,6 +1010,30 @@ impl WitnessReducer for PluginOverrideReducer {
 
 // ---- Reducer registry ----
 
+/// Cycle guard for recursive bag queries. Keyed by `(bag_ptr, attachment)`
+/// so re-entries into the same bag for the same attachment close
+/// cross-file mutual-inheritance loops; per-bag entries stay separate
+/// so a legitimate cross-bag query for the same attachment shape (the
+/// common case for `MethodOnClass{C, m}` jumping into C's own bag) is
+/// not misidentified as a cycle.
+type VisitedSet = std::collections::HashSet<(usize, WitnessAttachment)>;
+
+/// Depth backstop for `query_rec`. The `(bag, attachment)` visited set
+/// is the primary cycle guard; this cap is a belt-and-braces safeguard
+/// against any *new* recursion shape we haven't accounted for blowing
+/// the stack on real-world `@INC`. When the cap is hit we log the
+/// offending attachment once per process and return `None` — the query
+/// gives up cleanly instead of aborting. Set high enough that legit
+/// inheritance + edge chases never trip it; tune down only with
+/// evidence that a deeper walk is needed.
+const QUERY_REC_DEPTH_CAP: u32 = 512;
+
+thread_local! {
+    static QUERY_REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// One-shot so we don't flood stderr while a deep walk unwinds.
+    static QUERY_REC_DEPTH_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Default)]
 pub struct ReducerRegistry {
     reducers: Vec<Box<dyn WitnessReducer>>,
@@ -1065,11 +1089,18 @@ impl ReducerRegistry {
     /// witness list. This lets edges compose with existing reducers
     /// without reducer-side awareness — `FrameworkAwareTypeFold` reads
     /// a chased class as a plain `InferredType::ClassName`, same as if
-    /// the walker had baked it directly. Cycle guard via the visited
-    /// set breaks `A → B → A`.
+    /// the walker had baked it directly.
+    ///
+    /// The cycle guard keys on `(bag_ptr, attachment)` and is threaded
+    /// across both edge chases (within one bag) and the inheritance
+    /// fallback (which crosses bags). Re-entering the same bag for the
+    /// same attachment closes mutual-inheritance loops that span files
+    /// (`package A; use parent 'B'; package B; use parent 'A';`) — a
+    /// per-bag-only set would let the walk reset visited every time it
+    /// crossed `module_index.get_cached(...)`, recursing until the
+    /// stack overflows.
     pub fn query(&self, bag: &WitnessBag, q: &ReducerQuery) -> ReducedValue {
-        let mut visited: std::collections::HashSet<WitnessAttachment> =
-            std::collections::HashSet::new();
+        let mut visited: VisitedSet = std::collections::HashSet::new();
         self.query_rec(bag, q, &mut visited)
     }
 
@@ -1077,13 +1108,47 @@ impl ReducerRegistry {
         &self,
         bag: &WitnessBag,
         q: &ReducerQuery,
-        visited: &mut std::collections::HashSet<WitnessAttachment>,
+        visited: &mut VisitedSet,
     ) -> ReducedValue {
-        if !visited.insert(q.attachment.clone()) {
+        let depth = QUERY_REC_DEPTH.with(|c| {
+            let d = c.get();
+            c.set(d + 1);
+            d
+        });
+        if depth >= QUERY_REC_DEPTH_CAP {
+            QUERY_REC_DEPTH_WARNED.with(|w| {
+                if !w.get() {
+                    w.set(true);
+                    eprintln!(
+                        "perl-lsp: query_rec depth cap ({}) hit on attachment {:?} — \
+                         returning None to avoid stack overflow. \
+                         This indicates an un-broken recursion path; \
+                         please report.",
+                        QUERY_REC_DEPTH_CAP, q.attachment,
+                    );
+                }
+            });
+            QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
             return ReducedValue::None;
         }
+        let key = (bag as *const _ as usize, q.attachment.clone());
+        if !visited.insert(key.clone()) {
+            QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
+            return ReducedValue::None;
+        }
+        let result = self.query_rec_body(bag, q, visited);
+        visited.remove(&key);
+        QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
+        result
+    }
+
+    fn query_rec_body(
+        &self,
+        bag: &WitnessBag,
+        q: &ReducerQuery,
+        visited: &mut VisitedSet,
+    ) -> ReducedValue {
         let materialized = self.materialize(bag, q, visited);
-        visited.remove(q.attachment);
 
         for r in &self.reducers {
             let claimed: Vec<&Witness> =
@@ -1112,17 +1177,16 @@ impl ReducerRegistry {
         //      answers. Cross-file P resolves through (1) on the
         //      recursive call.
         //
-        // The visited set is shared so a cycle (`class :isa Self`,
-        // `package A; use parent 'B'; package B; use parent 'A'`)
-        // breaks instead of looping. Same machinery as edge chases —
-        // one query, structural lookup on the same attachment shape.
+        // The shared `(bag, attachment)`-keyed visited set breaks both
+        // local cycles (`class :isa Self`) and cross-file loops
+        // (`A use parent B; B use parent A`) — see the doc on `query`.
         if let WitnessAttachment::MethodOnClass { class, name } = q.attachment {
             if let Some(ctx) = q.context {
                 // (1) Cross-file primary: cached module for class C.
                 // Skip when the current bag IS already the cached
-                // module's bag — re-entering the same bag with a
-                // fresh visited set would loop forever (the
-                // recursive call would hit this same fallback again).
+                // module's bag — `query_rec`'s entry guard would
+                // bounce us anyway, but the explicit check avoids
+                // even building `cached_ctx` and `sub_q`.
                 if let Some(idx) = ctx.module_index {
                     if let Some(cached) = idx.get_cached(class) {
                         if !std::ptr::eq(bag, &cached.analysis.witnesses) {
@@ -1144,20 +1208,10 @@ impl ReducerRegistry {
                                 arity_hint: q.arity_hint,
                                 context: Some(&cached_ctx),
                             };
-                            // Crossing the bag boundary needs a
-                            // fresh visited set: the same attachment
-                            // in a different file's bag is not a
-                            // cycle. Cycle detection is per-bag (Edge
-                            // cycles within one file, package_parents
-                            // loops within one file's inheritance
-                            // graph).
-                            let mut sub_visited: std::collections::HashSet<
-                                WitnessAttachment,
-                            > = std::collections::HashSet::new();
                             let v = self.query_rec(
                                 &cached.analysis.witnesses,
                                 &sub_q,
-                                &mut sub_visited,
+                                visited,
                             );
                             if v != ReducedValue::None {
                                 return v;
@@ -1254,16 +1308,16 @@ impl ReducerRegistry {
     /// `Edge(Variable{...})` targets are special-cased: variable
     /// resolution requires walking the scope chain and using the
     /// scope's package framework. When the query carries a
-    /// `BagContext`, materialize delegates to `query_variable_type`
-    /// (the same helper file-side variable lookups use). Without a
-    /// context the chase is a flat single-attachment query —
-    /// adequate for tests and for cases where the witness exists at
-    /// the exact scope.
+    /// `BagContext`, materialize delegates to
+    /// `query_variable_with_visited` so the recursion shares the
+    /// caller's cycle guard — calling the public `query_variable_type`
+    /// from here would reset visited and leave us open to mutual
+    /// `Edge(Variable{a}) ↔ Edge(Variable{b})` loops.
     fn materialize(
         &self,
         bag: &WitnessBag,
         q: &ReducerQuery,
-        visited: &mut std::collections::HashSet<WitnessAttachment>,
+        visited: &mut VisitedSet,
     ) -> Vec<Witness> {
         let raw = bag.for_attachment(q.attachment);
         let mut out: Vec<Witness> = Vec::with_capacity(raw.len());
@@ -1276,13 +1330,14 @@ impl ReducerRegistry {
                             Some(ctx),
                         ) => {
                             let point = scope_point(ctx.scopes, *scope);
-                            query_variable_type(
+                            self.query_variable_with_visited(
                                 bag,
                                 ctx.scopes,
                                 ctx.package_framework,
                                 name,
                                 *scope,
                                 point,
+                                visited,
                             )
                         }
                         _ => {
@@ -1315,6 +1370,60 @@ impl ReducerRegistry {
             }
         }
         out
+    }
+
+    /// Scope-chain variable lookup with an explicit visited set.
+    /// `query_variable_type` is the public entry; this is the inner
+    /// loop, factored out so callers already inside a `query_rec`
+    /// recursion (currently only `materialize` for `Edge(Variable)`)
+    /// can thread their cycle guard through. Each scope on the chain
+    /// goes through `query_rec` with the *same* visited set, so a
+    /// mutual `$a → $b → $a` edge cycle closes.
+    fn query_variable_with_visited(
+        &self,
+        bag: &WitnessBag,
+        scopes: &[Scope],
+        package_framework: &HashMap<String, FrameworkFact>,
+        var: &str,
+        scope: ScopeId,
+        point: Point,
+        visited: &mut VisitedSet,
+    ) -> Option<InferredType> {
+        let mut chain: Vec<ScopeId> = Vec::new();
+        let mut cur = Some(scope);
+        while let Some(sid) = cur {
+            chain.push(sid);
+            cur = scopes[sid.0 as usize].parent;
+        }
+        let framework = chain
+            .iter()
+            .find_map(|sid| scopes[sid.0 as usize].package.as_ref())
+            .and_then(|pkg| package_framework.get(pkg).copied())
+            .unwrap_or(FrameworkFact::Plain);
+        let empty_parents: HashMap<String, Vec<String>> = HashMap::new();
+        let ctx = BagContext {
+            scopes,
+            package_framework,
+            module_index: None,
+            package_parents: &empty_parents,
+        };
+        for sid in chain {
+            let att = WitnessAttachment::Variable {
+                name: var.to_string(),
+                scope: sid,
+            };
+            let q = ReducerQuery {
+                attachment: &att,
+                point: Some(point),
+                framework,
+                arity_hint: None,
+                context: Some(&ctx),
+            };
+            if let ReducedValue::Type(t) = self.query_rec(bag, &q, visited) {
+                return Some(t);
+            }
+        }
+        None
     }
 }
 
@@ -1411,6 +1520,12 @@ pub fn query_sub_return_type(
 /// registry to fold every Variable witness for `var`. Returns the
 /// first scope that produces a typed answer; `None` if no scope on
 /// the chain has any matching witness or the reducer rejects them all.
+///
+/// Public entry: starts a fresh cycle-guard set. Recursive callers
+/// already inside `query_rec` must use
+/// `ReducerRegistry::query_variable_with_visited` instead so the
+/// shared visited set catches mutual `Edge(Variable{a})` ↔
+/// `Edge(Variable{b})` loops.
 pub fn query_variable_type(
     bag: &WitnessBag,
     scopes: &[Scope],
@@ -1419,48 +1534,17 @@ pub fn query_variable_type(
     scope: ScopeId,
     point: Point,
 ) -> Option<InferredType> {
-    let mut chain: Vec<ScopeId> = Vec::new();
-    let mut cur = Some(scope);
-    while let Some(sid) = cur {
-        chain.push(sid);
-        cur = scopes[sid.0 as usize].parent;
-    }
-
-    let framework = chain
-        .iter()
-        .find_map(|sid| scopes[sid.0 as usize].package.as_ref())
-        .and_then(|pkg| package_framework.get(pkg).copied())
-        .unwrap_or(FrameworkFact::Plain);
-
     let reg = ReducerRegistry::with_defaults();
-    // Variable lookups don't normally chase MethodOnClass attachments,
-    // but materialize-side Edge resolution may need
-    // `package_parents` / `module_index` for chained queries. Empty
-    // map is the safe default for callers without that context.
-    let empty_parents: HashMap<String, Vec<String>> = HashMap::new();
-    let ctx = BagContext {
+    let mut visited: VisitedSet = std::collections::HashSet::new();
+    reg.query_variable_with_visited(
+        bag,
         scopes,
         package_framework,
-        module_index: None,
-        package_parents: &empty_parents,
-    };
-    for sid in chain {
-        let att = WitnessAttachment::Variable {
-            name: var.to_string(),
-            scope: sid,
-        };
-        let q = ReducerQuery {
-            attachment: &att,
-            point: Some(point),
-            framework,
-            arity_hint: None,
-            context: Some(&ctx),
-        };
-        if let ReducedValue::Type(t) = reg.query(bag, &q) {
-            return Some(t);
-        }
-    }
-    None
+        var,
+        scope,
+        point,
+        &mut visited,
+    )
 }
 
 // ---------------------------------------------------------------

@@ -2871,6 +2871,53 @@ fn test_parents_cached() {
     assert!(idx.parents_cached("Unknown::Mod").is_empty());
 }
 
+#[test]
+fn test_cross_bag_inheritance_cycle_does_not_overflow() {
+    // A → B and B → A across separate cached bags. Each bag's
+    // package_parents only knows the local-side edge of the loop,
+    // so the cycle only closes once the inheritance fallback in
+    // `query_rec` crosses bags. A per-bag-only visited set lets the
+    // walk re-enter A's bag for `MethodOnClass{A, _}` after going
+    // through B, then re-enter B for `MethodOnClass{B, _}`, ad
+    // infinitum until the stack overflows. Visited must compose
+    // (bag, attachment) so the loop closes.
+    use crate::module_index::ModuleIndex;
+    use std::path::PathBuf;
+
+    let idx = ModuleIndex::new_for_test();
+    idx.set_workspace_root(None);
+
+    idx.insert_cache(
+        "Cycle::A",
+        Some(fake_cached_for_class(
+            "Cycle::A",
+            &PathBuf::from("/fake/Cycle/A.pm"),
+            &[],
+            &["Cycle::B"],
+        )),
+    );
+    idx.insert_cache(
+        "Cycle::B",
+        Some(fake_cached_for_class(
+            "Cycle::B",
+            &PathBuf::from("/fake/Cycle/B.pm"),
+            &[],
+            &["Cycle::A"],
+        )),
+    );
+
+    let fa = build_fa("package main; 1;");
+
+    assert_eq!(
+        fa.find_method_return_type("Cycle::A", "no_such_method", Some(&idx), None),
+        None,
+    );
+    assert_eq!(
+        fa.find_method_return_type("Cycle::B", "no_such_method", Some(&idx), None),
+        None,
+    );
+}
+
 // ---- Method call return type propagation tests ----
 
 #[test]
