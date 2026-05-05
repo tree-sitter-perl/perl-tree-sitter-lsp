@@ -10,57 +10,171 @@ unrelated chores.
 
 ---
 
-## Directive 1 — Methods belong in the bag
+## Directive 1 — Delete `Symbol.return_type` and the FA-side method-typing
 
-Today `find_method_return_type_seen` (file_analysis.rs:2103) chases
-`return_self_method` recursively at FA query time, calling
-`resolve_method_in_ancestors` to thread class context through the
-inheritance chain. The bag's `Edge(NamedSub(b))` for the same shape is
-name-keyed only — it can't represent "method `b` on class `C`."
+The bag is the only type-query path in principle (CLAUDE.md: "the bag
+is THE single type-query path"). In practice today, `Symbol.return_type`
+is a load-bearing field that consumers read directly, and
+`find_method_return_type_seen` is an FA-side recursive ancestor walk
+that exists in parallel to the bag. Method dispatch is split: the bag
+answers `NamedSub(name)` (name-keyed, conflates classes), the FA-side
+walks the ancestor chain, and the seam is maintained by hand
+(`fill_returns_via_bag_chase` is "restricted to delegators/tails"
+precisely to dodge that conflation; that guard is the visible scar).
 
-Result: cross-class dispatch has its own typer. The bag answers some
-questions and the FA-side recursion answers the rest. The seam is
-maintained by hand (`fill_returns_via_bag_chase` is "restricted to
-delegators/tails" precisely to avoid colliding with what the FA-side
-will answer differently).
+This directive **deletes the dual path**. The framing is subtractive,
+not additive. Don't add a `MethodOnClass` attachment "alongside" the
+field — delete the field, let the compiler enumerate the consumers,
+and route every one of them through the bag's class-keyed query.
 
-**Action items.** Treat as one design pass; do not split.
+### The first attempt: what NOT to repeat
 
-- [ ] **Add `MethodOnClass { class, name }` attachment.** A reserved
-      `ReturnOfKey::MethodOnClass` payload already exists (`witnesses.rs:18-21`,
-      held under `#[allow(dead_code)]`) — the design saw this coming.
-      Pick the final shape now (struct vs tuple, `Arc<str>` vs `String`)
-      and commit.
+`refactor/bag-residual-d1-method-on-class` (commit `c322178`) was an
+additive landing. It added `WitnessAttachment::MethodOnClass{class,
+name}` and a procedural `walk_dispatch_chain` helper, routed
+`find_method_return_type` through them, and kept everything else.
+The build-time chase + guard stayed (under a confession comment
+acknowledging it). The PR was abandoned because the residue
+(field-still-load-bearing, build-time chase still fires `NamedSub`)
+would have re-infected D3 and forced a follow-up PR to undo work.
 
-- [ ] **Inheritance edge emitter.** For each `package_parents[C] = [P1, P2]`
-      and each method `m` resolvable on `P1`, push
-      `MethodOnClass(C, m) → Edge(MethodOnClass(P1, m))`. The registry's
-      cycle-guarded materialize gives MRO walking for free. Emitter
-      lives in builder.rs (rule #1 stays intact — it consumes
-      `package_parents`, doesn't walk the tree).
+Three specific traps from that attempt — name them so the redo
+doesn't repeat them:
 
-- [ ] **Cross-file bridges become edges, not callback walks.**
-      `for_each_entity_bridged_to` and the plugin-namespace dispatch
-      walk both fold into the same Edge(MethodOnClass(...)) shape.
-      `BagContext` extends to carry `&ModuleIndex` so cross-file edges
-      materialize through the registry just like in-file ones.
+1. **Don't teach Builder to ask `MethodOnClass` while keeping the
+   build-time chase.** That's the additive temptation: it makes the
+   guard removable without deleting the field. It also locks in the
+   chase as a permanent code path. Delete the chase instead. The
+   chase only exists because `Symbol.return_type` is a field that
+   consumers read; delete the field and the chase has no consumer.
 
-- [ ] **Replace `find_method_return_type_seen`** with
-      `MethodOnClass(C, m)` queries. Drop `find_method_return_type_raw`'s
-      ancestor walk + procedural overload picking — the registry handles
-      both via edges. Drop `self_method_tail` (the FA helper, not the
-      Builder map) entirely.
+2. **Don't reach for procedural walkers in the registry's
+   `materialize`.** The first attempt added `walk_dispatch_chain`
+   and called it from inside the reducer. Inheritance is supposed to
+   compose through `Edge(MethodOnClass(parent, name))` witnesses
+   emitted at build time — the registry's cycle-guarded edge chase
+   gives MRO walking for free. If you find yourself writing a
+   procedural walker that the materialize calls, stop and ask why the
+   edge-witness path doesn't work. Cross-file bridges are not an
+   exception — `BagContext` carries `&ModuleIndex` and the registry
+   chases edges into cached modules' bags the same way it chases
+   in-file edges.
 
-- [ ] **Drop the "restricted to delegators/tails" guard** in
-      `fill_returns_via_bag_chase` (builder.rs:6736). With class-aware
-      edges, `NamedSubReturn`'s name conflation problem goes away — the
-      bag can ask `MethodOnClass(C, m)` directly and never confuse a
-      Mojo `level` getter with its writer pair.
+3. **Don't shape helpers around borrow-bearing structs that escape
+   closures.** The first attempt's `DispatchHit<'a>` carried
+   `&Arc<CachedModule>` borrowed from
+   `for_each_entity_bridged_to`'s loop body, which forced
+   `dispatch_method_on_class` into a two-walk-then-find-by-sym-id
+   shape (fragile: `SymbolId` is per-FA, so the second walk's
+   sym-id lookup happens to work only because both walks iterate in
+   identical order). If a helper is needed, hits are owned —
+   `Arc<CachedModule>` clone is cheap, owned class names are fine.
+   Or, if edge-witnesses replace the walker, no helper is needed at
+   all.
 
-**Why one design pass.** The attachment shape, the edge emitter, the
-`BagContext` extension, and the `find_method_return_type_seen` rewrite
-are interlocked. Doing them piecemeal means living with two code paths
-mid-refactor and another "remember to migrate" hack.
+### Concrete deletions (the directive's actual content)
+
+Each bullet names a delete-able thing. The order is "delete biggest
+first, let the compiler tell you what's missing, fix exactly that —
+do not pre-emptively rewrite consumers."
+
+- [ ] **Delete `SymbolDetail::Sub.return_type` field.** This is the
+      forcing function for the rest. Pre-measured blast radius:
+      ~55 `cargo check --tests` errors across 14 files. Distribution:
+      builder.rs ~17 (construction sites — drop the field, push a
+      `Symbol(sid) → InferredType(t)` witness in its place),
+      builder_tests.rs ~17 (test fixtures — drop the field from
+      literals; tests asserting on the field route through bag query
+      methods), file_analysis.rs ~5 (internal field-fallback reads
+      inside bag-routed query methods — these are exactly the code
+      paths to delete, not patch), backend.rs ~2 (the
+      `build_imported_return_types` machinery — see next bullet),
+      and ~14 elsewhere across symbols.rs, main.rs, plugin/cli.rs,
+      module_resolver.rs, module_index.rs, witnesses.rs, tests.
+
+- [ ] **Delete `imported_return_types`** (backend.rs's
+      `build_imported_return_types` plus the FA field it populates).
+      The cross-file `MethodOnClass` query subsumes it — Symbol(sid)
+      witnesses on a cached module's bag are reachable via the
+      registry once `BagContext` carries `&ModuleIndex`. The field
+      deletion above will surface this code path as compile errors
+      that should be deleted, not patched.
+
+- [ ] **Delete `find_method_return_type_seen`,
+      `find_method_return_type_raw`, and `self_method_tail`.** The
+      sole public entry point `find_method_return_type` becomes a
+      thin wrapper that routes through `MethodOnClass(class, name)`
+      with the caller's `arity_hint`. No procedural ancestor walk;
+      no procedural overload picking. The registry's
+      `Edge(MethodOnClass(parent, name))` chase handles MRO; arity
+      is selected by the existing `FluentArityDispatch` reducer
+      claiming `Symbol(_)`.
+
+- [ ] **Delete `fill_returns_via_bag_chase`'s
+      "delegators-and-tails-only" guard** (currently
+      builder.rs:6738-6756). Once the field is gone, the chase has
+      no consumer and the function itself is deletable.
+      `sub_return_delegations` and `self_method_tails` Builder maps
+      may stay as walk-time bookkeeping for the bag-emit path
+      (they're inputs, not outputs), but their use as inputs to a
+      build-time chase ends here.
+
+- [ ] **Add `WitnessAttachment::MethodOnClass { class, name }`.**
+      Stable shape, owned strings (cache blob serializes via
+      bincode+zstd; `Arc<str>` is fine if you want the
+      space saving, but `String` matches every other attachment
+      payload and keeps the diff smaller).
+
+- [ ] **Emit `MethodOnClass(C, m) → Edge(MethodOnClass(P, m))`
+      witnesses for inheritance.** For each
+      `package_parents[C] = [P1, P2, ...]`, for each method `m`
+      defined locally on `C` or accessible on `P_i`, emit the edge.
+      Cross-file bridges (`for_each_entity_bridged_to` consumers) and
+      cross-file primary cached modules become the same edge shape —
+      the registry walks them through `BagContext.module_index`. No
+      callback walkers in the registry's materialize.
+
+- [ ] **Extend `BagContext` to carry `Option<&ModuleIndex>`.** The
+      registry uses it to chase edges into cached modules' bags
+      during `MethodOnClass` resolution. In-file callers
+      (build-time, isolated tests) pass `None`.
+
+- [ ] **Fix `for_each_ancestor_class`'s DFS to left-to-right
+      `@ISA` order.** Currently it pushes parents left-to-right then
+      `stack.pop()`s, traversing in reverse `@ISA` order — wrong for
+      Perl's default DFS-MRO. Add a regression test:
+      `@ISA = (A, B)` where both `A::m` and `B::m` exist with
+      different return types; `find_method_return_type(C, "m", _, _)`
+      must return `A`'s.
+
+- [ ] **Keep this test green:**
+      `method_on_class_disambiguates_same_name_across_classes`
+      (builder_tests.rs, lifted from the abandoned attempt). It's
+      the structural pin: same-named methods on unrelated classes
+      resolve to their own per-class types at every arity.
+
+### Non-goals (explicit)
+
+- **Symbol.return_type as lazy cache.** The original D4 framing was
+  "make `return_type` a lazy cache filled by reading the bag." After
+  this directive deletes the field outright, the cache step is
+  unnecessary unless profiling later shows the bag query is hot. Do
+  not add the cache pre-emptively.
+
+- **Procedural `walk_dispatch_chain` helper.** Tempting to lift from
+  c322178; resist. If you find a consumer that genuinely cannot be
+  expressed as an edge chase (e.g. completion enumerating *all*
+  methods on a class, not resolving one), name it and we'll discuss —
+  but the default is no procedural helper.
+
+### Why one PR
+
+The field deletion, the edge emitter, the `BagContext` extension, the
+`find_method_return_type_seen` rewrite, and the chase-guard removal
+are interlocked: any one of them landed alone leaves a dual path that
+the next one has to undo. The first attempt proved this — it landed
+the additive half and the residue was non-removable without redoing
+work. ROADMAP.md's rule applies: do not split a directive across PRs.
 
 ---
 
@@ -200,17 +314,16 @@ everything else is at most a derived index rebuilt from it.
 
 **Action items, ordered by leverage.**
 
-- [ ] **Kill `Symbol.return_type` as load-bearing state.** Today
-      `write_back_sub_return_types` sets it inside the worklist, and
-      the worklist's snapshot tracks it for fixed-point detection.
-      Make it a pure cache filled lazily by reading the bag at first
-      access (or at FA construction time, post-finalize). The worklist
-      snapshot tracks bag content directly — every Symbol(sid) answer
-      from the registry, hashed.
+- [x] **Kill `Symbol.return_type`** — absorbed into Directive 1.
+      Originally framed here as "lazy cache"; D1's redo deletes the
+      field outright. Worklist snapshot needs a parallel update — it
+      currently tracks `Symbol.return_type` for fixed-point detection
+      and must switch to hashing `Symbol(sid)` registry answers
+      directly. That switch lands in D1 with the deletion.
 
-- [ ] **Kill `imported_return_types`** (file_analysis.rs:1668). Bag's
-      sub-return witnesses (whatever attachment shape we settle on
-      after Directive 3) are the one source.
+- [x] **Kill `imported_return_types`** — also absorbed into Directive 1.
+      Cross-file `MethodOnClass` queries through `BagContext.module_index`
+      replace the explicit copy.
 
 - [ ] **Kill `FileAnalysis.type_constraints` as a write target.** It
       can survive as a derived projection over Variable witnesses

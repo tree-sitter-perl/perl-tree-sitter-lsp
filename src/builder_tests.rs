@@ -3651,6 +3651,83 @@ has 'name' => (is => 'rw', isa => 'Str');
     assert_eq!(rt_default, Some(InferredType::String));
 }
 
+/// Regression guard for bag-residual D1: same-named methods on
+/// unrelated classes must resolve to their own per-class types, no
+/// matter what name-keyed cache or "latest-wins" witness landed last.
+///
+/// Two unrelated classes (`Sweet`, `Sour`) ship a method `flavor` via
+/// Mojo::Base `has`, with different defaults. Class-keyed dispatch is
+/// required to disambiguate them — any code path that resolves
+/// methods by name alone (`return_types: HashMap<String, _>`,
+/// `WitnessAttachment::NamedSub(name)`, etc.) will silently shadow
+/// one class's getter with the other's whenever the second
+/// declaration overwrites the first.
+///
+/// The arity=1 (fluent writer) assertions extend the same guarantee
+/// to overload dispatch: `Sweet`'s writer returns `Sweet`, `Sour`'s
+/// returns `Sour`, even though both subs share the name `flavor`.
+///
+/// D1 (lifted from the abandoned `refactor/bag-residual-d1-method-on-class`
+/// branch — see commit c322178 for the original attempt). The redo
+/// must keep this test passing while routing every method-type query
+/// through the bag.
+#[test]
+fn method_on_class_disambiguates_same_name_across_classes() {
+    let fa = build_fa(
+        "
+package Sweet;
+use Mojo::Base -base;
+has flavor => 'caramel';
+
+package Sour;
+use Mojo::Base -base;
+has flavor => sub { [1, 2, 3] };
+",
+    );
+    let sweet_getter_sym = fa
+        .symbols
+        .iter()
+        .find(|s| {
+            s.name == "flavor"
+                && s.package.as_deref() == Some("Sweet")
+                && matches!(&s.detail, SymbolDetail::Sub { params, .. } if params.is_empty())
+        })
+        .map(|s| s.id);
+    let sour_getter_sym = fa
+        .symbols
+        .iter()
+        .find(|s| {
+            s.name == "flavor"
+                && s.package.as_deref() == Some("Sour")
+                && matches!(&s.detail, SymbolDetail::Sub { params, .. } if params.is_empty())
+        })
+        .map(|s| s.id);
+    assert!(sweet_getter_sym.is_some(), "Sweet getter sym must exist");
+    assert!(sour_getter_sym.is_some(), "Sour getter sym must exist");
+    assert_ne!(sweet_getter_sym, sour_getter_sym);
+
+    assert_eq!(
+        fa.find_method_return_type("Sweet", "flavor", None, Some(0)),
+        Some(InferredType::String),
+        "Sweet::flavor getter returns String (from 'caramel' default), \
+         not Sour's ArrayRef"
+    );
+    assert_eq!(
+        fa.find_method_return_type("Sour", "flavor", None, Some(0)),
+        Some(InferredType::ArrayRef),
+        "Sour::flavor getter returns ArrayRef (from sub-returning-array \
+         default), not Sweet's String"
+    );
+    assert_eq!(
+        fa.find_method_return_type("Sweet", "flavor", None, Some(1)),
+        Some(InferredType::ClassName("Sweet".into())),
+    );
+    assert_eq!(
+        fa.find_method_return_type("Sour", "flavor", None, Some(1)),
+        Some(InferredType::ClassName("Sour".into())),
+    );
+}
+
 #[test]
 fn test_mojo_arity_resolution() {
     let fa = build_fa(

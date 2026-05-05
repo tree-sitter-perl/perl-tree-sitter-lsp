@@ -32,10 +32,10 @@ Four docs, one engine:
 
 ```
 staircase 1–4 (LANDED, PR #27) ─┐
-                                 ├─▶ bag-residual D1 (methods in the bag)
+                                 ├─▶ bag-residual D1 redo (delete Symbol.return_type + FA-side method typing)
                                  ├─▶ bag-residual D2 (one expression attachment)
                                  ├─▶ bag-residual D3 (one attachment per fact)
-                                 ├─▶ bag-residual D4 (one canonical store)
+                                 ├─▶ bag-residual D4 (residual canonical-store cleanup)
                                  │       │
                                  │       └─▶ sequence-types phases 1-3
                                  │
@@ -62,18 +62,34 @@ staircase 1–4 (LANDED, PR #27) ─┐
 
 ### Recommended sequencing
 
-1. **Bag-residual D1** — `MethodOnClass{class, name}` attachment + inheritance
-   edge emitter + cross-file bridges as edges. Replaces
-   `find_method_return_type_seen`'s recursive ancestor walk. Unlocks D3/D4.
+1. **Bag-residual D1 (redo)** — Delete `SymbolDetail::Sub.return_type`,
+   delete `find_method_return_type_seen` + `_raw` + `self_method_tail`,
+   delete the build-time chase guard, delete `imported_return_types`.
+   Add `MethodOnClass{class, name}` attachment + inheritance edge
+   emitter + `BagContext.module_index` for cross-file bridges. Fix
+   the DFS-MRO order. **Subtractive framing — delete first, let the
+   compiler enumerate the consumers.** Pre-measured blast: ~55 cargo
+   errors across 14 files. First attempt (`refactor/bag-residual-d1-method-on-class`,
+   commit `c322178`) was abandoned for being additive; that branch's
+   residue (build-time chase + guard, two-walk dispatch, borrow-bearing
+   helper) re-infects D3 if shipped. Lifted from it: the regression
+   test `method_on_class_disambiguates_same_name_across_classes`
+   already on this branch as a forward-going pin. Absorbs the field
+   deletion + `imported_return_types` deletion that were originally
+   D4. Unlocks D3/D4.
 2. **Bag-residual D2** — one `Expr(Span)` attachment for every expression value.
    Kills `arm_payload`'s node-kind dispatch, `ReturnArm`, `last_expr_type`.
    Unblocks sequence-types.
 3. **Bag-residual D3** — one attachment per fact, no source-tag claims. Kills
    `WitnessAttachment::NamedSub` and the source-tag claim filters in
    `SubReturnReducer` / `FrameworkAwareTypeFold`.
-4. **Bag-residual D4** — `Symbol.return_type` becomes a lazy cache,
-   `imported_return_types` dies, walk-time bag is live (no `pending_witnesses`
-   staging, no walk-time TC-first read).
+4. **Bag-residual D4** (now smaller) — kill `FileAnalysis.type_constraints`
+   as a write target, walk-time bag is live (no `pending_witnesses` staging,
+   no walk-time TC-first read), kill `last_expr_type` /
+   `sub_return_delegations` / `self_method_tails` Builder maps as
+   bag-emit inputs. The field-deletion bullets that lived here moved
+   to D1 (and a "lazy cache" rebuild is explicitly **not** scheduled —
+   only add if profiling later shows the bag query is hot).
 5. **Sequence-types phases 1-3** on the clean foundation.
 6. **Residual Parts** (start with whichever is hurting most — likely Part 5b
    narrowing or Part 5c parametric types for DBIC, depending on workload).
