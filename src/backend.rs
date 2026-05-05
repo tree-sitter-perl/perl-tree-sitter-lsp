@@ -154,9 +154,9 @@ pub(crate) fn build_imported_return_types(
             {
                 continue;
             }
-            if let SymbolDetail::Sub { ref return_type, .. } = sym.detail {
-                if let Some(ref ty) = return_type {
-                    type_map.insert(sym.name.clone(), ty.clone());
+            if matches!(sym.detail, SymbolDetail::Sub { .. }) {
+                if let Some(ty) = cached.analysis.symbol_return_type_via_bag(sym.id, None) {
+                    type_map.insert(sym.name.clone(), ty);
                 }
             }
             if let Some(sub_info) = cached.sub_info(&sym.name) {

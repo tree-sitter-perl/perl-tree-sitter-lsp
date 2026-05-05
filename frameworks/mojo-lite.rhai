@@ -67,12 +67,12 @@ fn on_use(ctx) {
                 Sub: #{
                     params: [],
                     is_method: false,
-                    return_type: #{ ClassName: "Mojolicious" },
                     doc: "The Mojolicious application instance.",
                     display: "Function",
                     hide_in_outline: true,
                 }
             },
+            return_type: #{ ClassName: "Mojolicious" },
         }
     };
 
@@ -88,7 +88,6 @@ fn on_use(ctx) {
                 Sub: #{
                     params: [],
                     is_method: false,
-                    return_type: (),
                     doc: "Group routes so common prefixes/middlewares apply to all of them.",
                     display: "Function",
                     hide_in_outline: true,

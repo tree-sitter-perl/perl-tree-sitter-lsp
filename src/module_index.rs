@@ -88,6 +88,7 @@ impl CachedModule {
 pub struct SubInfo<'a> {
     analysis: &'a FileAnalysis,
     primary: &'a Symbol,
+    #[allow(dead_code)] // retained for the `param_counts` / `return_type_for_arity` API surface
     overloads: Vec<&'a Symbol>,
     hash_keys: Vec<String>,
 }
@@ -114,9 +115,11 @@ impl<'a> SubInfo<'a> {
         )
     }
 
-    pub fn return_type(&self) -> Option<&'a InferredType> {
+    pub fn return_type(&self) -> Option<InferredType> {
         match &self.primary.detail {
-            SymbolDetail::Sub { return_type, .. } => return_type.as_ref(),
+            SymbolDetail::Sub { .. } => {
+                self.analysis.symbol_return_type_via_bag(self.primary.id, None)
+            }
             _ => None,
         }
     }
@@ -133,6 +136,7 @@ impl<'a> SubInfo<'a> {
     }
 
     /// Arity list covering the primary and overloads, in declaration order.
+    #[allow(dead_code)] // public SubInfo accessor; consumed by tooling/future cross-file callers
     pub fn param_counts(&self) -> Vec<usize> {
         std::iter::once(self.primary)
             .chain(self.overloads.iter().copied())
@@ -144,28 +148,27 @@ impl<'a> SubInfo<'a> {
     }
 
     /// Return type for an overload with the given arity, if any matches.
-    pub fn return_type_for_arity(&self, arity: usize) -> Option<&'a InferredType> {
+    #[allow(dead_code)] // public SubInfo accessor; consumed by tooling/future cross-file callers
+    pub fn return_type_for_arity(&self, arity: usize) -> Option<InferredType> {
         for sym in std::iter::once(self.primary).chain(self.overloads.iter().copied()) {
-            if let SymbolDetail::Sub { params, return_type, .. } = &sym.detail {
+            if let SymbolDetail::Sub { params, .. } = &sym.detail {
                 if params.len() == arity {
-                    return return_type.as_ref();
+                    return self.analysis.symbol_return_type_via_bag(sym.id, Some(arity));
                 }
             }
         }
         None
     }
 
-    /// SymbolId of the primary (first matching) sym. Cross-file
-    /// callers use this to bag-query the cached module's bag for the
-    /// per-sym return type, instead of reading `primary.detail.return_type`
-    /// directly.
+    /// SymbolId of the primary (first matching) sym.
+    #[allow(dead_code)] // public SubInfo accessor; consumed by tooling/future cross-file callers
     pub fn primary_id(&self) -> SymbolId {
         self.primary.id
     }
 
     /// SymbolId of the overload whose param count matches `arity`,
-    /// if any. Used for arity-aware cross-file dispatch — the caller
-    /// can then bag-query the cached module for that specific sym.
+    /// if any.
+    #[allow(dead_code)] // public SubInfo accessor; consumed by tooling/future cross-file callers
     pub fn id_for_arity(&self, arity: usize) -> Option<SymbolId> {
         for sym in std::iter::once(self.primary).chain(self.overloads.iter().copied()) {
             if let SymbolDetail::Sub { params, .. } = &sym.detail {

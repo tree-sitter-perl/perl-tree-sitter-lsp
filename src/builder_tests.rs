@@ -2994,11 +2994,10 @@ has 'count' => (is => 'ro', isa => 'Int');
         .filter(|s| s.name == "count" && s.kind == SymKind::Method)
         .collect();
     assert_eq!(methods.len(), 1);
-    if let SymbolDetail::Sub {
-        ref return_type, ..
-    } = methods[0].detail
-    {
-        assert_eq!(return_type.as_ref(), Some(&InferredType::Numeric));
+    let __r = fa.symbol_return_type_via_bag(methods[0].id, None);
+    let return_type = __r.as_ref();
+    if matches!(methods[0].detail, SymbolDetail::Sub { .. }) {
+        assert_eq!(return_type, Some(&InferredType::Numeric));
     }
 }
 
@@ -3074,12 +3073,11 @@ has 'db' => (is => 'ro', isa => 'DBI::db');
         .filter(|s| s.name == "db" && s.kind == SymKind::Method)
         .collect();
     assert_eq!(methods.len(), 1);
-    if let SymbolDetail::Sub {
-        ref return_type, ..
-    } = methods[0].detail
-    {
+    let __r = fa.symbol_return_type_via_bag(methods[0].id, None);
+    let return_type = __r.as_ref();
+    if matches!(methods[0].detail, SymbolDetail::Sub { .. }) {
         assert_eq!(
-            return_type.as_ref(),
+            return_type,
             Some(&InferredType::ClassName("DBI::db".into()))
         );
     }
@@ -3100,12 +3098,11 @@ has 'logger' => (is => 'ro', isa => \"InstanceOf['Log::Any']\");
         .filter(|s| s.name == "logger" && s.kind == SymKind::Method)
         .collect();
     assert_eq!(methods.len(), 1);
-    if let SymbolDetail::Sub {
-        ref return_type, ..
-    } = methods[0].detail
-    {
+    let __r = fa.symbol_return_type_via_bag(methods[0].id, None);
+    let return_type = __r.as_ref();
+    if matches!(methods[0].detail, SymbolDetail::Sub { .. }) {
         assert_eq!(
-            return_type.as_ref(),
+            return_type,
             Some(&InferredType::ClassName("Log::Any".into()))
         );
     }
@@ -3160,12 +3157,9 @@ has 'name';
             }
         })
         .expect("should have getter");
-    if let SymbolDetail::Sub {
-        ref return_type,
-        is_method,
-        ..
-    } = getter.detail
-    {
+    let __r = fa.symbol_return_type_via_bag(getter.id, None);
+    let return_type = __r.as_ref();
+    if let SymbolDetail::Sub { is_method, .. } = getter.detail {
         assert!(is_method);
         assert!(return_type.is_none(), "getter has no return type");
     }
@@ -3180,15 +3174,12 @@ has 'name';
             }
         })
         .expect("should have setter");
-    if let SymbolDetail::Sub {
-        ref return_type,
-        is_method,
-        ..
-    } = setter.detail
-    {
+    let __r = fa.symbol_return_type_via_bag(setter.id, None);
+    let return_type = __r.as_ref();
+    if let SymbolDetail::Sub { is_method, .. } = setter.detail {
         assert!(is_method);
         assert_eq!(
-            return_type.as_ref(),
+            return_type,
             Some(&InferredType::ClassName("Foo".into()))
         );
     }
@@ -3441,12 +3432,11 @@ __PACKAGE__->has_many(comments => 'Schema::Result::Comment', 'post_id');
         .filter(|s| s.name == "comments" && s.kind == SymKind::Method)
         .collect();
     assert_eq!(methods.len(), 1);
-    if let SymbolDetail::Sub {
-        ref return_type, ..
-    } = methods[0].detail
-    {
+    let __r = fa.symbol_return_type_via_bag(methods[0].id, None);
+    let return_type = __r.as_ref();
+    if matches!(methods[0].detail, SymbolDetail::Sub { .. }) {
         assert_eq!(
-            return_type.as_ref(),
+            return_type,
             Some(&InferredType::ClassName("DBIx::Class::ResultSet".into()))
         );
     }
@@ -3467,12 +3457,11 @@ __PACKAGE__->belongs_to(author => 'Schema::Result::User', 'author_id');
         .filter(|s| s.name == "author" && s.kind == SymKind::Method)
         .collect();
     assert_eq!(methods.len(), 1);
-    if let SymbolDetail::Sub {
-        ref return_type, ..
-    } = methods[0].detail
-    {
+    let __r = fa.symbol_return_type_via_bag(methods[0].id, None);
+    let return_type = __r.as_ref();
+    if matches!(methods[0].detail, SymbolDetail::Sub { .. }) {
         assert_eq!(
-            return_type.as_ref(),
+            return_type,
             Some(&InferredType::ClassName("Schema::Result::User".into()))
         );
     }
@@ -3505,12 +3494,11 @@ sub run {
         .collect();
     assert_eq!(config_methods.len(), 1, "should have 1 config accessor");
     assert_eq!(config_methods[0].package.as_deref(), Some("Moo::Service"));
-    if let SymbolDetail::Sub {
-        ref return_type, ..
-    } = config_methods[0].detail
-    {
+    let __r = fa.symbol_return_type_via_bag(config_methods[0].id, None);
+    let return_type = __r.as_ref();
+    if matches!(config_methods[0].detail, SymbolDetail::Sub { .. }) {
         assert_eq!(
-            return_type.as_ref(),
+            return_type,
             Some(&InferredType::ClassName("Moo::Config".into())),
             "config accessor should return Moo::Config"
         );
@@ -3586,19 +3574,17 @@ has 'name';
     assert!(setter.is_some(), "should have a 1-param setter");
 
     // Getter: no return type (inferable from usage)
-    if let SymbolDetail::Sub {
-        ref return_type, ..
-    } = getter.unwrap().detail
-    {
+    let __r = fa.symbol_return_type_via_bag(getter.unwrap().id, None);
+    let return_type = __r.as_ref();
+    if let SymbolDetail::Sub { .. } = getter.unwrap().detail {
         assert!(return_type.is_none());
     }
     // Setter: fluent return
-    if let SymbolDetail::Sub {
-        ref return_type, ..
-    } = setter.unwrap().detail
-    {
+    let __r = fa.symbol_return_type_via_bag(setter.unwrap().id, None);
+    let return_type = __r.as_ref();
+    if let SymbolDetail::Sub { .. } = setter.unwrap().detail {
         assert_eq!(
-            return_type.as_ref(),
+            return_type,
             Some(&InferredType::ClassName("Foo".into()))
         );
     }
@@ -3725,6 +3711,34 @@ has flavor => sub { [1, 2, 3] };
     assert_eq!(
         fa.find_method_return_type("Sour", "flavor", None, Some(1)),
         Some(InferredType::ClassName("Sour".into())),
+    );
+}
+
+/// Regression for the DFS-MRO order fix in
+/// `for_each_ancestor_class`. Perl's default MRO is left-to-right
+/// depth-first: for `@ISA = (A, B)` where A and B both define `m`,
+/// `C->m` resolves to A's. Pre-fix, the stack-based walker pushed
+/// parents left-to-right and `pop()`'d, traversing in REVERSE
+/// `@ISA` order — so B::m silently won. The fix pushes parents in
+/// reverse order so LIFO pops them in `@ISA` order.
+#[test]
+fn for_each_ancestor_class_walks_left_to_right_isa_order() {
+    let fa = build_fa(
+        "
+package A;
+sub m { return 'a' }
+package B;
+sub m { return 1 }
+package C;
+our @ISA = ('A', 'B');
+",
+    );
+    // A::m returns String ('a'), B::m returns Numeric (1).
+    // C->m must resolve to A's String — A is first in @ISA.
+    assert_eq!(
+        fa.find_method_return_type("C", "m", None, None),
+        Some(InferredType::String),
+        "C->m must walk @ISA left-to-right and pick A::m, not B::m"
     );
 }
 
@@ -4492,14 +4506,11 @@ $app->helper('thing.there' => sub { my ($c, $arg_b) = @_; });
     );
 
     // Its return_type is the shared proxy class.
-    if let SymbolDetail::Sub {
-        return_type: Some(InferredType::ClassName(n)),
-        ..
-    } = &thing_syms[0].detail
-    {
-        assert_eq!(n, "Mojolicious::Controller::_Helper::thing");
-    } else {
-        panic!("thing's return type should be the shared proxy class");
+    match fa.symbol_return_type_via_bag(thing_syms[0].id, None) {
+        Some(InferredType::ClassName(n)) => {
+            assert_eq!(n, "Mojolicious::Controller::_Helper::thing");
+        }
+        _ => panic!("thing's return type should be the shared proxy class"),
     }
 
     // Both leaves exist on the shared proxy class, each with its own params.
@@ -4574,17 +4585,13 @@ $app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
         .expect("purge leaf on admin.users proxy");
 
     // Each non-leaf returns the next proxy in the chain.
-    if let SymbolDetail::Sub {
-        return_type: Some(InferredType::ClassName(n)),
-        ..
-    } = &admin.detail
+    if let Some(InferredType::ClassName(n)) =
+        fa.symbol_return_type_via_bag(admin.id, None)
     {
         assert_eq!(n, "Mojolicious::Controller::_Helper::admin");
     }
-    if let SymbolDetail::Sub {
-        return_type: Some(InferredType::ClassName(n)),
-        ..
-    } = &users.detail
+    if let Some(InferredType::ClassName(n)) =
+        fa.symbol_return_type_via_bag(users.id, None)
     {
         assert_eq!(n, "Mojolicious::Controller::_Helper::admin::users");
     }
@@ -5279,19 +5286,14 @@ sub to  { my $self = shift; return $self; }
                 && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-lite")
         })
         .expect("mojo-lite plugin must synthesize `app`");
-    if let SymbolDetail::Sub {
-        return_type: Some(rt),
-        ..
-    } = &app_sym.detail
-    {
-        assert_eq!(
-            rt.class_name(),
-            Some("Mojolicious"),
-            "hop 1: `app` must type as Mojolicious — the one plugin stub the chain leans on"
-        );
-    } else {
-        panic!("hop 1: `app` must carry a typed return");
-    }
+    let rt = app_fa
+        .symbol_return_type_via_bag(app_sym.id, None)
+        .expect("hop 1: `app` must carry a typed return");
+    assert_eq!(
+        rt.class_name(),
+        Some("Mojolicious"),
+        "hop 1: `app` must type as Mojolicious — the one plugin stub the chain leans on"
+    );
 
     // Hop 2: Mojolicious::routes → Mojolicious::Routes. Real
     // cross-file Mojo::Base accessor; the anon-sub default's
@@ -8081,10 +8083,10 @@ sub _route {
         .find(|s| s.name == "_route" && matches!(s.kind, SymKind::Sub | SymKind::Method))
         .expect("_route must be parsed as a sub");
     match &route_sym.detail {
-        SymbolDetail::Sub { return_type, .. } => {
+        SymbolDetail::Sub { .. } => {
             assert_eq!(
-                return_type.as_ref(),
-                Some(&InferredType::ClassName(
+                fa.symbol_return_type_via_bag(route_sym.id, None),
+                Some(InferredType::ClassName(
                     "Mojolicious::Routes::Route".into()
                 )),
                 "override must rewrite return_type to ClassName(Mojolicious::Routes::Route)",
@@ -8225,10 +8227,10 @@ sub _route {
         .find(|s| s.name == "_route")
         .expect("_route present");
     match &sym.detail {
-        SymbolDetail::Sub { return_type, .. } => {
+        SymbolDetail::Sub { .. } => {
             assert_eq!(
-                return_type.as_ref(),
-                Some(&InferredType::ClassName(
+                fa.symbol_return_type_via_bag(sym.id, None),
+                Some(InferredType::ClassName(
                     "Mojolicious::Routes::Route".into()
                 )),
                 "override must replace inferred HashRef, not be skipped",

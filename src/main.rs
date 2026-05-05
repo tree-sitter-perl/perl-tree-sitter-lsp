@@ -358,7 +358,7 @@ fn cli_outline(file: &str) {
         if let Some(ref pkg) = sym.package {
             entry["package"] = serde_json::json!(pkg);
         }
-        if let file_analysis::SymbolDetail::Sub { ref params, ref return_type, is_method, ref display, .. } = sym.detail {
+        if let file_analysis::SymbolDetail::Sub { ref params, is_method, ref display, .. } = sym.detail {
             if params.iter().any(|p| !p.is_invocant) {
                 let param_names: Vec<&str> = params.iter()
                     .filter(|p| !p.is_invocant)
@@ -366,8 +366,8 @@ fn cli_outline(file: &str) {
                     .collect();
                 entry["params"] = serde_json::json!(param_names);
             }
-            if let Some(ref rt) = return_type {
-                entry["return_type"] = serde_json::json!(file_analysis::format_inferred_type(rt));
+            if let Some(rt) = analysis.symbol_return_type_via_bag(sym.id, None) {
+                entry["return_type"] = serde_json::json!(file_analysis::format_inferred_type(&rt));
             }
             if is_method {
                 entry["is_method"] = serde_json::json!(true);
@@ -730,7 +730,6 @@ fn cli_dump_package(root: &str, package_name: &str) {
         let SymbolDetail::Sub {
             ref params,
             is_method,
-            ref return_type,
             ref display,
             hide_in_outline,
             opaque_return,
@@ -760,7 +759,8 @@ fn cli_dump_package(root: &str, package_name: &str) {
             }
         }
 
-        let raw_return = return_type
+        let raw_return = analysis
+            .symbol_return_type_via_bag(sym.id, None)
             .as_ref()
             .map(file_analysis::format_inferred_type);
 

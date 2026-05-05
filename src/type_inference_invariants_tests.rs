@@ -240,10 +240,7 @@ fn post_walk_fold_is_observably_idempotent() {
             .iter()
             .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
             .map(|s| {
-                let rt = match &s.detail {
-                    SymbolDetail::Sub { return_type, .. } => return_type.clone(),
-                    _ => None,
-                };
+                let rt = fa.symbol_return_type_via_bag(s.id, None);
                 (s.name.clone(), s.package.clone(), rt)
             })
             .collect()
