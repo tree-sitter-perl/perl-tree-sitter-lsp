@@ -546,6 +546,45 @@ everything else is at most a derived index rebuilt from it.
   short-circuit) and is tracked in the D4 list above; the rule
   becomes unconditional once that item lands.
 
+- **Post-D4-G: delete `SubReturnReducer` entirely by unifying
+  synthesis into the arm-fold protocol.** D4-G's endgame leaves
+  `SubReturnReducer` alive as a passthrough — it claims
+  `Symbol + InferredType` and returns the writeback's primary
+  stored return. That witness only exists because synthesized
+  accessors (Mojo `has`, DBIC columns, plugin overrides, framework
+  accessor synth) emit a *direct* `InferredType` on `Symbol(sid)`
+  instead of going through the arm-fold shape. With no `return X`
+  source-level statements, there's no `branch_arm` Edge for
+  `SymbolReturnArmFold` to chase — so the direct witness is the
+  only record.
+
+  The unification: every synthesis site emits a synthetic
+  `Expr(synth_span) + expression: InferredType(t)` plus a
+  `Symbol(sid) ← branch_arm Edge → Expr(synth_span)`. Then
+  `SymbolReturnArmFold`'s `resolve_return_type([t])` returns `t`
+  exactly the same way it handles a real one-arm sub. Plugin
+  overrides keep their priority short-circuit, just relocated to
+  whichever attachment carries the synth Edge.
+
+  After unification, `Symbol(_)` carries no direct InferredType
+  witnesses at all — it's purely a query handle that Edges through
+  to the arm-fold attachment. `SubReturnReducer` becomes dead code
+  (no claimable witnesses) and gets deleted. The registry shrinks
+  to one per-sym fold reducer.
+
+  Cost: ~8–12 synthesis sites switch from "write `resolved_returns`"
+  / "push direct `Symbol + InferredType`" to "emit synth Expr + arm
+  Edge." Slight verbosity at the emit site, dramatic simplification
+  on the read side. Stacks on top of D4-G + `prompt-cleanups.md` #1
+  (which kills the `resolved_returns` intermediate but keeps the
+  direct-witness shape). The Mojo getter+writer pair on
+  `MethodOnClass{class, name}` stays primary-deduped — that part
+  is orthogonal.
+
+  **Schedule:** after D4-G ships and the rule is unconditional. The
+  unification turns "rule has zero exceptions" into "rule has zero
+  exceptions AND the registry has no fallback reducer for Symbol."
+
 ---
 
 ## Hardening (not principle-driven, but should land alongside)
