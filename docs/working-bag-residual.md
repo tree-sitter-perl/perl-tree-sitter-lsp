@@ -485,6 +485,39 @@ everything else is at most a derived index rebuilt from it.
       `emit_branch_arm_witnesses_for_ternary` becomes one Edge from
       `Variable($x)` to `Expr(ternary_span)`.
 
+- [ ] **Drop `SubReturnReducer`'s `arity_hint.is_some()` short-circuit
+      and the matching `branch_arm` source-tag exclusion**
+      (witnesses.rs:863-902). These are the last source-tag claim
+      filters in the registry — D3 collapsed four to one for
+      `SubReturnReducer`, but the one stayed because two distinct
+      facts still share `Symbol(_)`:
+
+      1. The per-symbol stored return ("if you ask THIS sym, ignoring
+         arity, this is the answer").
+      2. Per-arm `branch_arm` witnesses materialized onto `Symbol(_)`
+         after edge chase (one synthetic `InferredType` per arm,
+         source preserved). `SymbolReturnArmFold` claims those for
+         agreement / disagreement; `SubReturnReducer` must NOT
+         paper-over their `None` with a latest-wins pick.
+
+      The `arity_hint.is_some()` guard is the same compromise on the
+      other axis: at `arity=Some`, we want the per-class arm dispatch
+      via `MethodOnClass{class, name}`, not a single sym's stored
+      return (otherwise Mojo getter-vs-writer wrong-answers — the
+      getter sym surfaces String when level(1) was asked).
+
+      **Real fix:** move per-arm branch witnesses off `Symbol(_)` to
+      a dedicated attachment shape (`SymbolReturnArm(SymbolId)` or
+      reuse `Expr(body_span)` per the per-arm-Edge collapse above),
+      and route arity dispatch through `MethodOnClass` exclusively
+      so `Symbol(_)` carries only one fact family. After that, both
+      the source-tag filter and the arity_hint short-circuit can
+      go — `SubReturnReducer::claims` becomes plain
+      "Symbol + InferredType, period" and `reduce` becomes
+      unconditional latest-wins. **Until this lands the
+      "claim by attachment shape, not source tag" rule has one
+      documented exception.**
+
 ---
 
 ## Roadmap — separate design session
@@ -502,10 +535,13 @@ everything else is at most a derived index rebuilt from it.
   context). Until then, leave the bolt-on alone — but do NOT ship more
   arity-shaped facts that need their own reducer.
 
-- **Reducer-claim discipline.** After Directive 3 lands, write down
-  the rule: "a reducer claims by attachment-shape, not by source tag.
+- **Reducer-claim discipline.** D3 landed with the rule almost
+  enforced: "a reducer claims by attachment-shape, not by source tag.
   If you need source-tag disambiguation, you're modeling two facts —
-  give them two attachments."
+  give them two attachments." One documented exception remains
+  (`SubReturnReducer`'s `branch_arm` filter + `arity_hint`
+  short-circuit) and is tracked in the D4 list above; the rule
+  becomes unconditional once that item lands.
 
 ---
 

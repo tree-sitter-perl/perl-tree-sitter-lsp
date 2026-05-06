@@ -1107,21 +1107,18 @@ impl FileAnalysis {
 
     /// Mirror every existing `TypeConstraint` into the witness bag as
     /// a `Variable` witness (with class-assertion / FirstParam
-    /// observations for class-identity types), and every Sub/Method
-    /// symbol with a stored `return_type` as a `NamedSub` witness.
+    /// observations for class-identity types).
     ///
-    /// The Builder runs equivalent passes (`populate_witness_bag` for
-    /// constraints, `write_back_sub_return_types`'s NamedSub publish
-    /// for return types). This method is the fa-construction-time
+    /// Per-symbol return types are NOT seeded here — `Symbol.return_type`
+    /// was deleted in D1, and the bag carries those facts directly
+    /// (`Symbol(sym_id)` / `MethodOnClass{class, name}`) via the
+    /// builder's `write_back_sub_return_types` and round-trip through
+    /// the bincode blob. This method is the fa-construction-time
     /// counterpart for code that builds a FileAnalysis without going
     /// through `builder::build` — hand-crafted FAs in tests, ad-hoc
     /// FA assembly. Called from `FileAnalysis::new` and
-    /// `after_deserialize` to keep the invariant: bag and the
-    /// `Symbol.return_type` / `type_constraints` fields are always in
-    /// sync after a constructor returns. Without this, the bag's
-    /// canonical query path (`query_sub_return_type` etc.) silently
-    /// returns `None` for symbols whose return_type is set on the
-    /// field but never reached the bag.
+    /// `after_deserialize` to keep the invariant: bag and
+    /// `type_constraints` are in sync after a constructor returns.
     pub(crate) fn seed_bag_from_constraints(&mut self) {
         use crate::witnesses::{
             TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
@@ -1164,17 +1161,6 @@ impl FileAnalysis {
                 _ => {}
             }
         }
-        // Mirror every Sub/Method with a stored `return_type` as a
-        // `NamedSub(name) → InferredType(t)` witness — same shape
-        // `write_back_sub_return_types` publishes at the end of the
-        // worklist. The builder transfers its already-populated bag
-        // into `fa.witnesses` AFTER `FileAnalysis::new` returns, so on
-        // the build path these pushes are redundant duplicates of the
-        // builder's emissions; that's fine because `NamedSubReturn`
-        // takes the latest. On the non-build paths (hand-crafted FAs,
-        // bincode-deserialized blobs without a populated bag) this is
-        // the only seeding step that closes the "field set, bag empty"
-        // gap.
         // Sub/Method return-type seeding from `Symbol.return_type` is
         // gone: the field was deleted in D1 of the bag-residual
         // refactor. The bag is the single durable carrier of
@@ -1189,12 +1175,12 @@ impl FileAnalysis {
     /// bag has been moved in. Keeps the bag canonical: every new
     /// `TypeConstraint` pushed here lands as a `Witness` too.
     ///
-    /// `NamedSub(name) → InferredType(t)` witnesses for every local
-    /// Sub/Method are already in the bag — published by
-    /// `Builder::write_back_sub_return_types` at the end of the
-    /// worklist (single emission point for "this sub's return type
-    /// is known," same shape `enrich_imported_types_with_keys` uses
-    /// for imports).
+    /// `Symbol(sym_id)` and `MethodOnClass{class, name}` return-type
+    /// witnesses for every local Sub/Method are already in the bag —
+    /// published by `Builder::write_back_sub_return_types` at the
+    /// end of the worklist (single emission point for "this sub's
+    /// return type is known"). Cross-file imports do not get a local
+    /// mirror; they resolve lazily through `query_sub_return_type`.
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
         self.base_type_constraint_count = self.type_constraints.len();
@@ -1571,9 +1557,10 @@ impl FileAnalysis {
     }
 
     /// Get the return type of a named sub/method. Local definitions
-    /// first (via the bag), then imported sub returns (also via the
-    /// bag's `NamedSub` attachment, which `enrich_imported_types_with_keys`
-    /// populates from module_index).
+    /// first (via the bag's `Symbol(sym_id)` writeback), then imported
+    /// sub returns (resolved lazily through `query_sub_return_type`'s
+    /// walk of `module_index.find_exporters` into the cached module's
+    /// own `Symbol(_)` witnesses).
     #[allow(dead_code)] // public type-query API; used by tooling/tests
     pub fn sub_return_type(&self, name: &str) -> Option<InferredType> {
         self.sub_return_type_at_arity(name, None)

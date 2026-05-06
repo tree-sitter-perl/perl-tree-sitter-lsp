@@ -351,14 +351,13 @@ impl<'a> Builder<'a> {
     ///   - one `InferredType` payload + (optional) class-assertion
     ///     observation per `TypeConstraint`,
     ///   - `HashRefAccess` observations per `$v->{k}` ref,
-    ///   - `Edge(NamedSub(method))` payloads per method-call ref so
-    ///     the fluent-chain Expression-attached fold sees the chased
-    ///     return type as a plain `InferredType` after registry
-    ///     materialization (replaces the closure-driven
-    ///     `TypeObservation::ReturnOfName` path),
     ///   - `mutation` facts on each Class/Sub-owned hash-key write,
     ///   - everything `pending_witnesses` collected during the walk
     ///     (branch arms, arity gating).
+    ///
+    /// Method-call return edges (`Expression(refidx) → Edge(MethodOnClass{class, method})`)
+    /// are emitted later — by `emit_method_call_return_edges` from
+    /// inside the worklist, once `invocant_class` is filled.
     ///
     /// After this point the bag is the source of truth. Subsequent
     /// passes that introduce new facts (call-binding propagation in
@@ -702,7 +701,7 @@ fn raw_mid_op(node: tree_sitter::Node, source: &[u8]) -> String {
 /// Structural index of one return-expression in a sub body. Type
 /// information lives in the bag: the body expression carries its own
 /// `Expr(body_span)` witnesses (literal types, Edges to Variable /
-/// NamedSub / Expression / nested Expr), and `Symbol(sub_id)` collects
+/// Symbol / Expression / nested Expr), and `Symbol(sub_id)` collects
 /// per-arm `branch_arm`-source `Edge(Expr(...))` witnesses. What's
 /// left in this struct is what consumers still need at a glance:
 /// which sub the return belongs to, where it is, the arity bucket it
@@ -903,10 +902,15 @@ struct Builder<'a> {
     /// (deleted in D1 of the bag-residual refactor). Walk-time synthesis
     /// (Mojo/Moo/DBIC accessors) writes here; worklist's `return_types`
     /// fold writes here; the final writeback iterates this map to push
-    /// `Symbol(sid)` / `NamedSub(name)` / `MethodOnClass{class, name}`
+    /// `Symbol(sid)` and (for first-seen `(class, name)`) `MethodOnClass`
     /// witnesses into the bag. Lives only inside the builder — never
     /// makes it into `FileAnalysis`. The bag is the single durable
     /// authority on return types post-build.
+    ///
+    /// Scheduled for deletion: see `docs/prompt-cleanups.md` #1. Direct
+    /// emit at synthesis time would remove this sidecar; what blocks it
+    /// is `MethodOnClass` primary-dedup, which currently needs the full
+    /// symbol list visible at writeback.
     resolved_returns: std::collections::HashMap<SymbolId, InferredType>,
     /// Framework mode per package (Moo, Moose, MojoBase) for accessor synthesis.
     framework_modes: std::collections::HashMap<String, FrameworkMode>,
@@ -1327,7 +1331,7 @@ impl<'a> Builder<'a> {
     ///   - bareword `Foo` (sub with ClassName return)          → that class
     ///   - bareword `Foo` (no such sub)                        → ClassName(Foo)
     ///   - `shift` / `$_[0]` in method body                    → ClassName(current_package)
-    ///   - `get_foo()->bar()` outer's invocant                 → bag query NamedSub(get_foo, arity)
+    ///   - `get_foo()->bar()` outer's invocant                 → bag query Symbol(get_foo, arity)
     /// `@`/`%` containers and unrecognized kinds return `None`.
     fn invocant_type_at_node(&self, node: Node<'a>) -> Option<InferredType> {
         match node.kind() {
@@ -1345,11 +1349,12 @@ impl<'a> Builder<'a> {
                 // Arity from the method-call node disambiguates fluent
                 // accessors (Mojo::Base `has 'title' => 'default'`
                 // synthesizes a 0-arg getter returning String AND a
-                // 1-arg writer returning $self). Without it the Edge
-                // chase to NamedSub(method) falls through
-                // FluentArityDispatch (no matching arm without a hint)
-                // to NamedSubReturn — latest-wins picks the writer's
-                // ClassName instead of the getter's String.
+                // 1-arg writer returning $self). Without it the
+                // MethodOnClass chase falls through FluentArityDispatch
+                // (no matching arm without a hint) and the primary
+                // (first-seen sym for the (class, name) pair) wins —
+                // which can be the writer's ClassName instead of the
+                // getter's String depending on declaration order.
                 let arity = self.extract_call_args(node).len() as u32;
                 self.bag_query_expression(crate::witnesses::RefIdx(idx as u32), Some(arity))
             }
@@ -1464,8 +1469,8 @@ impl<'a> Builder<'a> {
     /// Thin wrapper over `invocant_type_at_node`. Same node-kind
     /// dispatch the post-walk chain typer uses — variable arms read
     /// TCs (canonical at walk time, mirrored to the bag post-walk),
-    /// bareword arms query NamedSub, method-call arms query
-    /// Expression(refidx), shift / `$_[0]` / `__PACKAGE__` use
+    /// bareword arms query the local Symbol's return, method-call arms
+    /// query Expression(refidx), shift / `$_[0]` / `__PACKAGE__` use
     /// current_package. One function, one dispatch.
     fn receiver_type_for(&self, invocant_node: Option<Node<'a>>) -> Option<InferredType> {
         self.invocant_type_at_node(invocant_node?)
@@ -3560,8 +3565,9 @@ impl<'a> Builder<'a> {
             // Method call — constructor pattern is closed under
             // syntax (`Foo->new` → `ClassName("Foo")`), bake. Otherwise
             // Edge to the call's `Expression(refidx)` attachment;
-            // populate_witness_bag has pushed `Edge(NamedSub(method))`
-            // there, so the chase resolves through.
+            // `emit_method_call_return_edges` re-emits
+            // `Edge(MethodOnClass{class, method})` there once
+            // `invocant_class` is filled, so the chase resolves through.
             "method_call_expression" => {
                 if let Some(class) = self.extract_constructor_class(node) {
                     return Some(WitnessPayload::InferredType(InferredType::ClassName(class)));
@@ -3619,7 +3625,7 @@ impl<'a> Builder<'a> {
     /// Emit the `Expr(span)` witnesses for `node` and (recursively)
     /// its sub-arms. For a non-ternary node: one witness on
     /// `Expr(span)` with the node's `expr_payload` (literal type, or
-    /// Edge to Variable/NamedSub/Expression). For a ternary: two
+    /// Edge to Variable/Symbol/Expression). For a ternary: two
     /// `branch_arm`-source `Edge(Expr(arm_span))` witnesses on
     /// `Expr(span)`, plus a recursive call per arm so each arm's own
     /// `Expr(span)` is populated. Idempotent on span — multiple
@@ -6410,8 +6416,9 @@ impl<'a> Builder<'a> {
     }
 
     /// Bag-routed lookup for a sub's return type by name. Goes through
-    /// `query_sub_return_type` so arity dispatch / NamedSubReturn /
-    /// imported-return all compose. `arity_hint` is `None` for the
+    /// `query_sub_return_type` so arity dispatch (FluentArityDispatch),
+    /// the per-Symbol stored return (SubReturnReducer), and cross-file
+    /// imports (recurse into the cached module's bag) all compose. `arity_hint` is `None` for the
     /// chain-typer's invocant resolution since chain typing wants
     /// "what does this sub return when called as I see it being
     /// called" — for invocant resolution that's typically the
@@ -6876,27 +6883,40 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Step 7: writeback. Set `return_type` on matching Sub/Method
-    /// symbols, push a `NamedSub(name) → InferredType(t)` witness for
-    /// each resolved return so the bag publishes the answer to every
-    /// consumer (chain typer's `Edge(NamedSub(_))` chase, cross-file
-    /// callers via `query_sub_return_type`'s NamedSub branch — same
-    /// shape `enrich_imported_types_with_keys` uses for imports), and
-    /// record `return_self_method` for subs whose return type couldn't
+    /// Step 7: writeback. Iterate `resolved_returns` and publish each
+    /// resolved per-symbol return type to the bag on two attachments:
+    ///
+    ///   - `Symbol(sym_id)` — id-keyed answer, claimed by
+    ///     `SubReturnReducer`. Used by per-symbol queries that already
+    ///     know which sym they're asking about (cross-file imports
+    ///     recursing into a cached bag, dump-package iteration).
+    ///   - `MethodOnClass{class, name}` — class-keyed answer, claimed
+    ///     by `MethodOnClassReducer`. Only the FIRST sym for a given
+    ///     `(class, name)` pair publishes here (the "primary"); later
+    ///     syms participate via `ArityReturn` observations only. This
+    ///     is what `find_method_return_type` queries for the no-arity
+    ///     fallback.
+    ///
+    /// Cross-file imports do not get a writeback push here — they
+    /// resolve lazily via `query_sub_return_type` walking
+    /// `module_index.find_exporters` and recursing into the cached
+    /// module's `Symbol(cached_sid)`. Same registry, same rules; no
+    /// local mirror needed.
+    ///
+    /// `return_self_method` is set for subs whose return couldn't
     /// be collapsed in-file. Plugin overrides flow through
     /// `return_types` via the bag-priority seeding step, with
     /// `return_provenance` cleared so we don't clobber the existing
     /// `PluginOverride` entry written by `apply_type_overrides`. No
     /// special-case skip needed — overrides win because they're
-    /// higher-priority bag witnesses, not because the writeback knows
-    /// about them.
+    /// higher-priority bag witnesses.
     ///
     /// Idempotent across re-runs: `bag.remove_by_source_tag("local_return")`
-    /// at the start of every call drops the prior pass's NamedSub
-    /// witnesses before re-emitting. The worklist driver calls
-    /// `resolve_return_types` repeatedly until fixed point; without
-    /// this clear-and-emit, each iteration would duplicate every
-    /// sub's NamedSub witness.
+    /// (and `"plugin_bridge"` / `"inheritance"`) at the start of every
+    /// call drops the prior pass's witnesses before re-emitting. The
+    /// worklist driver calls `resolve_return_types` repeatedly until
+    /// fixed point; without this clear-and-emit, each iteration would
+    /// duplicate every sub's writeback witnesses.
     fn write_back_sub_return_types(
         &mut self,
         return_types: &std::collections::HashMap<String, InferredType>,
@@ -6975,17 +6995,14 @@ impl<'a> Builder<'a> {
         }
 
         // Publish every Sub/Method's resolved return type to the bag
-        // on THREE attachments:
-        //   - `NamedSub(name)` — name-keyed lookup. Cross-file imports
-        //     ride the same shape via `enrich_imported_types_with_keys`.
-        //     Used by chain typing's `Edge(NamedSub(_))` chases. This
-        //     attachment is going away in D3 (collapsed into
-        //     `MethodOnClass`); writes here will move with it.
+        // on TWO attachments:
         //   - `Symbol(sym_id)` — id-keyed lookup. The Symbol attachment
         //     carries every per-symbol fact in the bag (arity arms,
         //     plugin overrides). Writeback's value here is the
         //     "if you ask THIS sym what it returns, ignoring class
-        //     context, here's the inferred answer."
+        //     context, here's the inferred answer." Cross-file imports
+        //     reach this same shape by recursing into the cached
+        //     module's bag with `Symbol(cached_sid)`.
         //   - `MethodOnClass{class, name}` — class-keyed lookup. The
         //     authoritative class-scoped answer that
         //     `find_method_return_type` queries through. Multiple
@@ -6998,8 +7015,8 @@ impl<'a> Builder<'a> {
         //     `emit_arity_return_witnesses`'s mirror below).
         // Catches both worklist-resolved returns (set above) and
         // framework-pinned ones (Mojo::Base accessors, Moo `has`,
-        // DBIC column accessors — these set `return_type` in the
-        // SymbolDetail constructor at walk-time synthesis, never flow
+        // DBIC column accessors — these write directly into
+        // `resolved_returns` at walk-time synthesis, never flow
         // through `return_types`).
         let mut writeback_witnesses: Vec<Witness> = Vec::new();
         // Track primary for each (class, method_name) — the first

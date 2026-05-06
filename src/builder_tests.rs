@@ -3247,12 +3247,12 @@ has 'name';
 /// `$ua->ca($f)->cert(...)` chain lost its receiver type at the second
 /// hop.
 ///
-/// Fix: framework synthesis now publishes per-arity `ArityReturn`
-/// observations on `NamedSub(name)`, and `FluentArityDispatch` claims
-/// `NamedSub` so the right arm wins regardless of which sister
-/// `find()` returned. Also publishes the same observations on
-/// `Symbol(id)` so per-symbol introspection (`witness_count`,
-/// arity-aware queries on a specific id) works.
+/// Fix: framework synthesis publishes per-arity `ArityReturn`
+/// observations on both `Symbol(sym_id)` (per-symbol introspection)
+/// and `MethodOnClass{class, name}` (cross-symbol arity dispatch
+/// scoped to the declaring class), and `FluentArityDispatch` claims
+/// either attachment so the right arm wins regardless of which
+/// sister sym `find()` returned.
 #[test]
 fn test_mojo_base_writer_returns_invocant_via_bag() {
     use crate::file_analysis::TypeProvenance;
@@ -3691,10 +3691,10 @@ has 'name' => (is => 'rw', isa => 'Str');
 /// Two unrelated classes (`Sweet`, `Sour`) ship a method `flavor` via
 /// Mojo::Base `has`, with different defaults. Class-keyed dispatch is
 /// required to disambiguate them — any code path that resolves
-/// methods by name alone (`return_types: HashMap<String, _>`,
-/// `WitnessAttachment::NamedSub(name)`, etc.) will silently shadow
-/// one class's getter with the other's whenever the second
-/// declaration overwrites the first.
+/// methods by name alone (a `return_types: HashMap<String, _>` mirror,
+/// or the now-deleted `WitnessAttachment::NamedSub(name)` shape)
+/// will silently shadow one class's getter with the other's whenever
+/// the second declaration overwrites the first.
 ///
 /// The arity=1 (fluent writer) assertions extend the same guarantee
 /// to overload dispatch: `Sweet`'s writer returns `Sweet`, `Sour`'s

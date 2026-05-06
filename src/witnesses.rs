@@ -63,7 +63,7 @@ pub enum WitnessAttachment {
     /// statements. Witnesses on an `Expr` are either a direct
     /// `InferredType(t)` (literals, constructors, builtin returns) or
     /// an `Edge` to the resolution target (`Variable{name, scope}` for
-    /// `$foo`, `NamedSub(name)` for a function call,
+    /// `$foo`, `Symbol(sym_id)` for a resolved local sub call,
     /// `Expression(refidx)` for a method call's
     /// receiver-and-method-resolved type, or another `Expr(inner_span)`
     /// for compound expressions). Replaces both the old
@@ -72,8 +72,8 @@ pub enum WitnessAttachment {
     /// per-sub fold reads `Edge(Expr(span))` arms via Symbol(sub_id).
     Expr(Span),
     /// Class-keyed method dispatch: "what does method `name` return on
-    /// class `class`?" — the cross-class disambiguation `NamedSub(name)`
-    /// can't carry. Inheritance composes through `Edge(MethodOnClass(parent, name))`
+    /// class `class`?" — the cross-class disambiguation a name-keyed
+    /// attachment can't carry. Inheritance composes through `Edge(MethodOnClass(parent, name))`
     /// witnesses emitted by the builder for each `package_parents[C] = [P, ...]`,
     /// so the registry's cycle-guarded edge chase walks the MRO without
     /// any procedural ancestor walker. Cross-file resolution: when the
@@ -797,9 +797,9 @@ impl WitnessReducer for FluentArityDispatch {
 // expression-result attachment that every rvalue node publishes
 // through. The walker pushes either `Type(t)` directly (literals,
 // constructors, builtin-determined returns) or `Edge(target)` for
-// name-keyed resolution (Variable lookups, NamedSub for plain-named
-// calls, Expression for method-call receivers, or recursive Expr edges
-// for compound expressions). Edge witnesses get materialized by the
+// resolution (Variable lookups for `$x`, Symbol(sym_id) for resolved
+// local sub calls, Expression for method-call receivers, or recursive
+// Expr edges for compound expressions). Edge witnesses get materialized by the
 // registry into synthetic `Type` witnesses before any reducer claims,
 // so this reducer always sees plain types. Latest-wins:
 // `emit_expr_witness` is called from multiple walk sites (return
@@ -837,19 +837,16 @@ impl WitnessReducer for ExprReturn {
 // ---- Symbol return reducer ----
 //
 // Claims plain `InferredType` payloads on `Symbol(_)` attachments —
-// the per-symbol equivalent of `NamedSubReturn`. Pushed by writeback
-// (local subs/methods) and `seed_bag_from_constraints` (hand-crafted
-// FAs / cache-loaded blobs) so any caller asking "what does THIS
-// specific sym return?" routes through the bag instead of reading
-// `Symbol.return_type` directly. Class-scoped multi-overload
-// dispatch (e.g. `find_method_return_type_raw`'s arity-bound lookup
-// against a candidate set) uses this — the dispatch pre-resolves to
-// a sym_id, then the bag answers what that sym's stored return type
-// is.
+// the id-keyed answer for "what does THIS specific sym return?".
+// Pushed by writeback (local subs/methods) and
+// `seed_bag_from_constraints` (hand-crafted FAs / cache-loaded blobs).
+// Class-scoped multi-overload dispatch goes through
+// `MethodOnClass{class, name}` instead — see `MethodOnClassReducer`
+// and the `arity_hint` short-circuit in `reduce` below.
 //
 // Latest wins so a later writeback re-publish (the worklist clears
 // `local_return` on every iteration and re-pushes from
-// `Symbol.return_type`) dominates an older value. Registered AFTER
+// `resolved_returns`) dominates an older value. Registered AFTER
 // every more-precise reducer (Plugin override, branch-arm fold,
 // arity dispatch) so those still get to claim first.
 
@@ -905,10 +902,10 @@ impl WitnessReducer for SubReturnReducer {
 // ---- Class-keyed method-on-class reducer ----
 //
 // Claims `MethodOnClass{class, name}` attachments carrying a plain
-// `InferredType` payload — the class-scoped equivalent of
-// `NamedSubReturn`. Pushed by `Builder::emit_method_on_class_facts`
-// for the primary symbol of each `(class, method)` pair: that's the
-// "default" return type when the caller doesn't constrain by arity.
+// `InferredType` payload — the class-scoped, name-keyed answer.
+// Pushed by `write_back_sub_return_types` for the primary symbol of
+// each `(class, method)` pair: that's the "default" return type when
+// the caller doesn't constrain by arity.
 // `FluentArityDispatch` runs first and handles per-arity dispatch
 // from `ArityReturn` observations; this reducer only fires when no
 // arity-specific fact answers (no arity hint, or no observation
@@ -1502,11 +1499,9 @@ pub fn query_sub_return_type(
     }
     // Cross-file imports: walk the module_index for exporters of
     // `sub_name` and recurse into each cached module's bag for the
-    // matching `Symbol(cached_sid)`. Replaces the legacy
-    // `NamedSub` attachment that enrichment used to mirror imports
-    // onto. The recursion shares the registry — same arity dispatch,
-    // same plugin overrides, same fold rules — only the bag and
-    // symbols change.
+    // matching `Symbol(cached_sid)`. The recursion shares the
+    // registry — same arity dispatch, same plugin overrides, same
+    // fold rules — only the bag and symbols change.
     if let Some(ctx) = context {
         if let Some(idx) = ctx.module_index {
             for module_name in idx.find_exporters(sub_name) {

@@ -30,18 +30,32 @@ which means we maintain bag-and-map in sync inside the worklist.
 
 **How to apply:** at every site that currently writes
 `resolved_returns.insert(sid, rt)`, push the bag witness directly
-(`Symbol(sid)` plain `InferredType`, plus the matching `NamedSub` /
-`MethodOnClass{class, name}` mirrors). Writeback's job becomes
-"ensure the canonical witnesses are present" rather than "iterate the
-map." `fold_state_snapshot`'s second tuple element switches from
-"reading the map" to "querying `Symbol(sid)` via the registry" — the
-worklist's fixed-point detection then watches what consumers actually
-see, which is the snapshot's intent.
+(`Symbol(sid)` plain `InferredType`; plus the `MethodOnClass{class,
+name}` primary-slot mirror — see "Watch out for" #2 for the
+primary-dedup question that blocked this in D3). Writeback's job
+becomes "ensure the canonical witnesses are present" rather than
+"iterate the map." `fold_state_snapshot`'s first tuple element
+switches from "reading the map" to "querying `Symbol(sid)` via the
+registry" — the worklist's fixed-point detection then watches what
+consumers actually see, which is the snapshot's intent.
 
-**Watch out for:** the worklist re-runs each iteration. The bag
-already has `remove_by_source_tag` for re-emittable passes — use it
-before pushing the writeback witnesses on every iteration so we don't
-accumulate stale `Symbol(sid)` entries from earlier rounds.
+**Watch out for:**
+
+1. The worklist re-runs each iteration. The bag already has
+   `remove_by_source_tag` for re-emittable passes — use it before
+   pushing the writeback witnesses on every iteration so we don't
+   accumulate stale `Symbol(sid)` entries from earlier rounds.
+
+2. `MethodOnClass` primary-dedup is what kept `resolved_returns` alive
+   through D3. The current writeback walks symbols in declaration
+   order and the FIRST `(class, name)` pair wins the primary slot.
+   Walk-time direct emit needs an equivalent rule. Two viable shapes:
+   (a) push at synthesis but stamp the witness with a sequence number
+   the reducer reads to pick first-seen, or (b) accept latest-wins on
+   `MethodOnClass` and ensure the primary's witness is published last
+   by ordering the synthesis sites. (b) is simpler if it works for the
+   Mojo getter/writer test (`builder_tests.rs::test_mojo_arity_resolution`)
+   — verify before committing to it.
 
 ---
 
@@ -65,11 +79,12 @@ reads are:
 - `src/symbols_tests.rs` — test assertions on the dump format.
 
 **How to apply:** delete the field. Replace `--dump-package` JSON
-output with a query to the bag for `Edge(NamedSub(_))` /
-`Edge(MethodOnClass{...})` payloads on the sub's `Symbol(sid)`
-attachment — that's where the tail-call edge actually lives now.
-Tests that assert on the field move to asserting on the edge witness
-in the bag.
+output with a query to the bag for `Edge(MethodOnClass{...})`
+payloads on the sub's `Symbol(sid)` attachment — that's where the
+tail-call edge actually lives now (post-D3, name-keyed sub edges
+were collapsed into the class-keyed `MethodOnClass` shape). Tests
+that assert on the field move to asserting on the edge witness in
+the bag.
 
 **Watch out for:** `fold_state_snapshot` currently includes
 `return_self_method` as the third tuple element. Drop it from the
@@ -127,6 +142,44 @@ and the diff churn is easier to land while these sites are fresh.
 
 **How to apply:** run `cargo fmt` and inspect the diff to ensure no
 unrelated changes; commit just the indentation fix.
+
+---
+
+## 5. Replace `fold_state_snapshot` ad-hoc tuple with bag generation counter
+
+**Where:** `src/builder.rs:6075-6103` — the hand-coded
+`(answers, type_constraints.len(), invocant_filled)` tuple that
+`fold_to_fixed_point` uses to detect convergence.
+
+**Why:** the snapshot is a maintainability hazard. Every re-emittable
+pass that produces an observable signal needs a manual entry in the
+tuple, or the worklist terminates early. D3 had to add the
+`invocant_filled` term specifically because
+`emit_method_call_return_edges` produced no other change visible to
+the snapshot — an iteration that only filled new `invocant_class`
+slots would otherwise return the same `(answers, tc_len)` and the
+loop would exit before chain typing finished propagating. This is the
+kind of trap that bites later, after the person who knew about it
+moves on.
+
+**How to apply:** replace the tuple with a single monotonically
+increasing `bag_generation: u64` on `WitnessBag`, bumped by every
+`push` and `remove_by_source_tag`. `fold_state_snapshot` returns
+`(generation, type_constraints.len())` and convergence is
+"two consecutive iterations with the same pair." Any future
+re-emittable pass automatically participates because every bag write
+bumps the counter; no per-pass bookkeeping. The existing comment at
+`fold_state_snapshot` documenting the "what registers as movement?"
+trap can then be deleted — the structure prevents the trap.
+
+**Watch out for:** `populate_witness_bag` runs once before the loop,
+so the loop's first iteration already sees the seeded generation.
+`apply_type_overrides` runs even earlier — same. The fixed point
+detector compares only across loop iterations, so initial pushes
+don't matter. But re-emittable passes that `remove_by_source_tag`
+before re-pushing will bump the generation TWICE per iteration
+(remove + push); that's still fine — it just means the snapshot
+strictly grows when work happens. The convergence rule is unchanged.
 
 ---
 
