@@ -1853,16 +1853,9 @@ fn test_route_pm_chain_decomposition() {
             ) {
                 continue;
             }
-            if let crate::file_analysis::SymbolDetail::Sub {
-                return_self_method,
-                ..
-            } = &sym.detail
-            {
+            if matches!(&sym.detail, crate::file_analysis::SymbolDetail::Sub { .. }) {
                 let return_type = analysis.symbol_return_type_via_bag(sym.id, None);
-                eprintln!(
-                    "  sym[{:24}] return_type={:?}  return_self_method={:?}",
-                    name, return_type, return_self_method
-                );
+                eprintln!("  sym[{:24}] return_type={:?}", name, return_type);
                 return;
             }
         }
@@ -2165,9 +2158,7 @@ fn test_demo_chain_empirical_truth_table() {
     // return types + self-method tails for each method on the
     // chain's path.
     let route_cached = idx.get_cached("Mojolicious::Routes::Route").unwrap();
-    let inspect = |name: &str| -> (Option<InferredType>, Option<String>) {
-        let mut rt = None;
-        let mut sm = None;
+    let inspect = |name: &str| -> Option<InferredType> {
         for sym in &route_cached.analysis.symbols {
             if sym.name != name {
                 continue;
@@ -2178,23 +2169,17 @@ fn test_demo_chain_empirical_truth_table() {
             ) {
                 continue;
             }
-            if let crate::file_analysis::SymbolDetail::Sub {
-                return_self_method,
-                ..
-            } = &sym.detail
-            {
-                rt = route_cached.analysis.symbol_return_type_via_bag(sym.id, None);
-                sm = return_self_method.clone();
-                break;
+            if matches!(&sym.detail, crate::file_analysis::SymbolDetail::Sub { .. }) {
+                return route_cached.analysis.symbol_return_type_via_bag(sym.id, None);
             }
         }
-        (rt, sm)
+        None
     };
-    let (gen_rt, gen_tail) = inspect("_generate_route");
-    let (get_rt, get_tail) = inspect("get");
-    let (to_rt, to_tail) = inspect("to");
-    let (requires_rt, requires_tail) = inspect("requires");
-    let (_route_rt, _route_tail) = inspect("_route");
+    let gen_rt = inspect("_generate_route");
+    let get_rt = inspect("get");
+    let to_rt = inspect("to");
+    let requires_rt = inspect("requires");
+    let _route_rt = inspect("_route");
 
     eprintln!("======== chain truth table ========");
     eprintln!("  $r              class = {:?}", r_class);
@@ -2202,17 +2187,11 @@ fn test_demo_chain_empirical_truth_table() {
     eprintln!("  ->get RETURN    type  = {:?}", get_return_ty);
     eprintln!("  ->to  invocant  class = {:?}", to_invocant_class);
     eprintln!("  ---- cached Route symbols ----");
-    eprintln!("  get             rt={:?}  tail={:?}", get_rt, get_tail);
-    eprintln!("  _generate_route rt={:?}  tail={:?}", gen_rt, gen_tail);
-    eprintln!(
-        "  requires        rt={:?}  tail={:?}",
-        requires_rt, requires_tail
-    );
-    eprintln!("  to              rt={:?}  tail={:?}", to_rt, to_tail);
-    eprintln!(
-        "  _route          rt={:?}  tail={:?}",
-        _route_rt, _route_tail
-    );
+    eprintln!("  get             rt={:?}", get_rt);
+    eprintln!("  _generate_route rt={:?}", gen_rt);
+    eprintln!("  requires        rt={:?}", requires_rt);
+    eprintln!("  to              rt={:?}", to_rt);
+    eprintln!("  _route          rt={:?}", _route_rt);
     eprintln!("====================================");
 
     // The chain pin. With:

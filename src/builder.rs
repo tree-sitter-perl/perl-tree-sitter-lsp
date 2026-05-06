@@ -173,7 +173,6 @@ fn build_with_plugins_inner(
         imports: Vec::new(),
         return_infos: Vec::new(),
         last_expr_span: std::collections::HashMap::new(),
-        self_method_tails: std::collections::HashMap::new(),
         call_bindings: Vec::new(),
         method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
@@ -188,7 +187,6 @@ fn build_with_plugins_inner(
         export_ok: Vec::new(),
         plugin_namespaces: Vec::new(),
         type_provenance: std::collections::HashMap::new(),
-        pending_witnesses: Vec::new(),
         bag: crate::witnesses::WitnessBag::new(),
         package_framework: std::collections::HashMap::new(),
         scope_stack: Vec::new(),
@@ -219,7 +217,7 @@ fn build_with_plugins_inner(
             .find(|s| crate::file_analysis::contains_point(&s.span, d.at.start))
             .map(|s| s.id)
             .unwrap_or(ScopeId(0));
-        b.type_constraints.push(TypeConstraint {
+        b.push_type_constraint(TypeConstraint {
             variable: d.variable,
             scope,
             constraint_span: d.at,
@@ -256,11 +254,12 @@ fn build_with_plugins_inner(
     // `--dump-package` can answer "why does this return X?".
     b.apply_type_overrides();
 
-    // Single bag-population pass: mirror walk-time data
-    // (`type_constraints`, refs producing rep observations + method
-    // call return witnesses, write-mutations on hash keys) plus drain
-    // walk-emitted witnesses (`pending_witnesses`) into `b.bag`. After
-    // this point the bag is the source of truth for the witness pipeline.
+    // Post-walk bag-population pass: ref-derived facts that don't
+    // need walk-time visibility — `HashRefAccess` observations from
+    // `$v->{k}` refs and invocant-mutation facts from hash-key
+    // writes. Variable witnesses for TCs and walk-time idiom witnesses
+    // (branch arms, arity gating) are already in `b.bag` — pushed
+    // live during the walk.
     b.populate_witness_bag();
 
     // Phase 6: worklist driver. Replaces the manually-ordered
@@ -345,73 +344,66 @@ fn build_with_plugins_inner(
 }
 
 impl<'a> Builder<'a> {
-    /// Mirror walk-time data into the witness bag. Runs ONCE before
-    /// `resolve_return_types`, populates the bag with:
-    ///
-    ///   - one `InferredType` payload + (optional) class-assertion
-    ///     observation per `TypeConstraint`,
-    ///   - `HashRefAccess` observations per `$v->{k}` ref,
-    ///   - `mutation` facts on each Class/Sub-owned hash-key write,
-    ///   - everything `pending_witnesses` collected during the walk
-    ///     (branch arms, arity gating).
+    /// Push a `TypeConstraint` and mirror it into the witness bag in
+    /// one step. Mirrors `FileAnalysis::push_type_constraint`'s
+    /// invariant: bag-and-TC stay in sync. Every code path that adds a
+    /// constraint during the walk or worklist must call this so
+    /// `bag_query_variable` sees the seeded type immediately —
+    /// post-walk queries (`invocant_type_at_node`'s scalar arm, chain
+    /// typing) read the bag, not the TC vec.
+    pub(crate) fn push_type_constraint(&mut self, tc: TypeConstraint) {
+        use crate::witnesses::{
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+        };
+        let var = tc.variable.clone();
+        let scope = tc.scope;
+        let span = tc.constraint_span;
+        let ty = tc.inferred_type.clone();
+        self.type_constraints.push(tc);
+        self.bag.push(Witness {
+            attachment: WitnessAttachment::Variable { name: var.clone(), scope },
+            source: WitnessSource::Builder("type_constraint".into()),
+            payload: WitnessPayload::InferredType(ty.clone()),
+            span: Span { start: span.start, end: span.start },
+        });
+        match ty {
+            InferredType::ClassName(n) => {
+                self.bag.push(Witness {
+                    attachment: WitnessAttachment::Variable { name: var, scope },
+                    source: WitnessSource::Builder("type_constraint".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(n)),
+                    span,
+                });
+            }
+            InferredType::FirstParam { package } => {
+                self.bag.push(Witness {
+                    attachment: WitnessAttachment::Variable { name: var, scope },
+                    source: WitnessSource::Builder("type_constraint".into()),
+                    payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
+                        package,
+                    }),
+                    span,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Post-walk pass: ref-derived facts that don't need walk-time
+    /// visibility — `HashRefAccess` observations from `$v->{k}` refs
+    /// and invocant-mutation facts on hash-key writes. Variable
+    /// witnesses for TCs and walk-time idiom witnesses (branch arms,
+    /// arity gating) are already in the bag — pushed live during the
+    /// walk via `push_type_constraint` and `bag.push` from the emit
+    /// sites.
     ///
     /// Method-call return edges (`Expression(refidx) → Edge(MethodOnClass{class, method})`)
     /// are emitted later — by `emit_method_call_return_edges` from
     /// inside the worklist, once `invocant_class` is filled.
-    ///
-    /// After this point the bag is the source of truth. Subsequent
-    /// passes that introduce new facts (call-binding propagation in
-    /// `resolve_return_types`) push directly into `self.bag` to keep
-    /// the bag and `self.type_constraints` in sync.
     fn populate_witness_bag(&mut self) {
         use crate::witnesses::{
             TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
         };
-
-        // Mirror every TypeConstraint as a Variable-attachment
-        // InferredType witness (and a class-assertion observation when
-        // the type is a class identity).
-        let constraints = self.type_constraints.clone();
-        for tc in &constraints {
-            self.bag.push(Witness {
-                attachment: WitnessAttachment::Variable {
-                    name: tc.variable.clone(),
-                    scope: tc.scope,
-                },
-                source: WitnessSource::Builder("type_constraint".into()),
-                payload: WitnessPayload::InferredType(tc.inferred_type.clone()),
-                span: Span { start: tc.constraint_span.start, end: tc.constraint_span.start },
-            });
-            match tc.inferred_type {
-                InferredType::ClassName(ref n) => {
-                    self.bag.push(Witness {
-                        attachment: WitnessAttachment::Variable {
-                            name: tc.variable.clone(),
-                            scope: tc.scope,
-                        },
-                        source: WitnessSource::Builder("type_constraint".into()),
-                        payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(
-                            n.clone(),
-                        )),
-                        span: tc.constraint_span,
-                    });
-                }
-                InferredType::FirstParam { ref package } => {
-                    self.bag.push(Witness {
-                        attachment: WitnessAttachment::Variable {
-                            name: tc.variable.clone(),
-                            scope: tc.scope,
-                        },
-                        source: WitnessSource::Builder("type_constraint".into()),
-                        payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
-                            package: package.clone(),
-                        }),
-                        span: tc.constraint_span,
-                    });
-                }
-                _ => {}
-            }
-        }
 
         // Rep observations from `$v->{k}` access. Method-call return
         // edges on `Expression(refidx)` are emitted later — by the
@@ -469,12 +461,6 @@ impl<'a> Builder<'a> {
                 },
                 span,
             });
-        }
-
-        // Drain walk-emitted witnesses (branch arms, arity gating).
-        let pending = std::mem::take(&mut self.pending_witnesses);
-        for w in pending {
-            self.bag.push(w);
         }
     }
 
@@ -874,14 +860,6 @@ struct Builder<'a> {
     /// this map only carries the structural pointer to the source
     /// span.
     last_expr_span: std::collections::HashMap<ScopeId, Span>,
-    /// For each Sub/Method scope whose last body statement is
-    /// `shift->M(...)` or `$self->M(...)`: the method name M.
-    /// Perl's last statement returns, so if M is another method on
-    /// the same class, this sub's return type IS M's return type.
-    /// Resolved in the return-type post-pass via fixed-point
-    /// iteration — captures the Mojo `sub get { shift->_generate_route(...) }`
-    /// shape without hardcoding any framework knowledge.
-    self_method_tails: std::collections::HashMap<ScopeId, String>,
     /// Assignments where RHS is a function call — resolved in return-type post-pass.
     call_bindings: Vec<CallBinding>,
     /// Assignments where RHS is a method call — resolved in FileAnalysis post-pass.
@@ -932,19 +910,12 @@ struct Builder<'a> {
     /// (ReducerFold). Empty entry == `TypeProvenance::Inferred`.
     /// Flushed into `FileAnalysis.type_provenance` at construction.
     type_provenance: std::collections::HashMap<SymbolId, TypeProvenance>,
-    /// Witnesses emitted during the walk — drained into the unified
-    /// `bag` at populate time. Populated by idiom detectors (branch
-    /// arms, arity gating, …) that need the CST during the walk.
-    pending_witnesses: Vec<crate::witnesses::Witness>,
-    /// The single, unified witness bag. Walk-time observations land in
-    /// `pending_witnesses`; post-walk seeding from `type_constraints`
-    /// + refs runs into this bag once via `populate_witness_bag()`.
-    /// `resolve_return_types` then queries this bag for return-arm
-    /// folding (the only fold), and any new TypeConstraints it pushes
-    /// (call-binding propagation) get mirrored back into the same bag
-    /// so it stays the source of truth. Moved into
-    /// `FileAnalysis.witnesses` when the analysis is constructed —
-    /// no second seeding pass.
+    /// The single, unified witness bag — canonical at every phase,
+    /// walk-time included. Idiom detectors (branch arms, arity
+    /// gating), TC seeding (`push_type_constraint`), and post-walk
+    /// passes (hash-key obs, mutations, call-binding propagation) all
+    /// push directly here. Moved into `FileAnalysis.witnesses` when
+    /// the analysis is constructed — no second seeding pass.
     bag: crate::witnesses::WitnessBag,
     /// Per-package framework fact, computed from `framework_modes` once
     /// the walk finishes. Available before `resolve_return_types` so
@@ -1372,18 +1343,12 @@ impl<'a> Builder<'a> {
                 if text == "$self" {
                     return self.package_for_node(node).map(InferredType::ClassName);
                 }
-                // TCs are the canonical store at walk-time (the bag's
-                // Variable witnesses don't mirror until
-                // populate_witness_bag runs post-walk). Read TCs first
-                // — they have whatever was just seeded by an earlier
-                // visit. Fall back to the bag, which has TCs mirrored
-                // post-walk + framework-aware projection
-                // (`FirstParam → ClassName`).
-                if let Some(t) = self.type_constraints.iter().rev().find_map(|tc| {
-                    if tc.variable == text { Some(tc.inferred_type.clone()) } else { None }
-                }) {
-                    return Some(t);
-                }
+                // The bag is canonical at every phase, walk-time
+                // included: `push_type_constraint` mirrors every TC
+                // into a Variable witness live during the walk, so
+                // `bag_query_variable` always sees whatever was just
+                // seeded by an earlier visit (plus the framework-aware
+                // `FirstParam → ClassName` projection).
                 let scope = self.scope_at_point(node.start_position());
                 self.bag_query_variable(text, scope, node.start_position())
             }
@@ -1639,7 +1604,6 @@ impl<'a> Builder<'a> {
                     display,
                     hide_in_outline,
                     opaque_return,
-                    return_self_method: None,
                 };
                 let target_pkg = on_class.clone().or_else(|| self.current_package.clone());
 
@@ -2033,11 +1997,10 @@ impl<'a> Builder<'a> {
             // map points at the genuinely-last statement.
             //
             // IMPORTANT: only statements at the sub body's TOP
-            // level count. A `$self->M(...)` call buried inside a
-            // `grep { … }` or an `if`-block is not the sub's
-            // return. Both `last_expr_span` and `self_method_tails`
-            // are gated on this — the outer block must be the
-            // sub/method's direct body.
+            // level count — the outer block must be the sub/method's
+            // direct body. The bag-routed delegation chain (`Symbol(_) ←
+            // branch_arm Edge → Expr(body) → Edge(call_target)`) handles
+            // self-method tails for type inference; no separate map.
             "expression_statement" => {
                 self.visit_children(node);
                 if let Some(scope) = self.enclosing_sub_scope() {
@@ -2063,15 +2026,6 @@ impl<'a> Builder<'a> {
                             // payload doesn't bake to a witness shape.
                             self.emit_expr_witness(child);
                             self.last_expr_span.insert(scope, node_to_span(child));
-                            if let Some(method_name) = self.self_method_call_name(child) {
-                                self.self_method_tails.insert(scope, method_name);
-                            } else {
-                                // A non-self-method-tail top-level
-                                // expression overrides any prior
-                                // self-method tail we may have
-                                // recorded (defensive).
-                                self.self_method_tails.remove(&scope);
-                            }
                         }
                     }
                 }
@@ -2367,7 +2321,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, doc, display: None, hide_in_outline: false, opaque_return: false, return_self_method: None },
+            SymbolDetail::Sub { params: params.clone(), is_method, doc, display: None, hide_in_outline: false, opaque_return: false },
         );
 
         // Push sub scope
@@ -2392,7 +2346,7 @@ impl<'a> Builder<'a> {
                     span,
                     SymbolDetail::Variable { sigil: '$', decl_kind: DeclKind::Param },
                 );
-                self.type_constraints.push(TypeConstraint {
+                self.push_type_constraint(TypeConstraint {
                     variable: "$self".to_string(),
                     scope: self.current_scope(),
                     inferred_type: InferredType::ClassName(pkg),
@@ -2647,7 +2601,7 @@ impl<'a> Builder<'a> {
         if !first.is_invocant { return; }
 
         if let Some(ref pkg) = self.current_package {
-            self.type_constraints.push(TypeConstraint {
+            self.push_type_constraint(TypeConstraint {
                 variable: first.name.clone(),
                 scope: self.current_scope(),
                 constraint_span: node_to_span(node),
@@ -2715,7 +2669,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, doc: None, display: None, hide_in_outline: false, opaque_return: false, return_self_method: None },
+                        SymbolDetail::Sub { params: vec![], is_method: true, doc: None, display: None, hide_in_outline: false, opaque_return: false },
                     );
                 }
                 if has_writer {
@@ -2737,7 +2691,6 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
-                    return_self_method: None,
                         },
                     );
                 }
@@ -3377,7 +3330,7 @@ impl<'a> Builder<'a> {
                     .or_else(|| self.infer_expression_result_type(right));
                 if let Some(it) = inferred {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
-                        self.type_constraints.push(TypeConstraint {
+                        self.push_type_constraint(TypeConstraint {
                             variable: vt,
                             scope: self.current_scope(),
                             constraint_span: node_to_span(node),
@@ -3647,7 +3600,7 @@ impl<'a> Builder<'a> {
                 // Variable($n)/Symbol(sid) for the `my $n = $c ? A : B`
                 // and ternary-return paths.
                 self.emit_expr_witness(arm);
-                self.pending_witnesses.push(Witness {
+                self.bag.push(Witness {
                     attachment: WitnessAttachment::Expr(span),
                     source: WitnessSource::Builder("branch_arm".into()),
                     payload: WitnessPayload::Edge(WitnessAttachment::Expr(node_to_span(arm))),
@@ -3657,7 +3610,7 @@ impl<'a> Builder<'a> {
             return;
         }
         if let Some(payload) = self.expr_payload(node) {
-            self.pending_witnesses.push(Witness {
+            self.bag.push(Witness {
                 attachment: WitnessAttachment::Expr(span),
                 source: WitnessSource::Builder("expression".into()),
                 payload,
@@ -3667,16 +3620,15 @@ impl<'a> Builder<'a> {
     }
 
     /// Publish witnesses for one explicit `return EXPR`:
-    /// - `Expr(expr_span)` carries the return body's resolved type
-    ///   (literal, variable Edge, call Edge, or recursively-emitted
-    ///   ternary).
-    /// - `Symbol(sub_id)` gets one or more `branch_arm`-source
-    ///   `Edge(Expr(arm_span))` witnesses. Ternary returns expand to
-    ///   per-arm Edges so BranchArmFold sees ≥2 arms; non-ternary
-    ///   returns produce a single Edge that the per-RI fold reads via
-    ///   `bag_query_expr` (single-arm + multi-arm both go through
-    ///   `resolve_return_type`, which accepts the single-arm case
-    ///   that BranchArmFold deliberately rejects).
+    /// - `Expr(body_span)` is populated by `emit_expr_witness` —
+    ///   directly with the body's payload for non-ternary, or
+    ///   recursively with per-arm `branch_arm` Edges for ternary.
+    /// - `Symbol(sub_id)` gets a single `branch_arm`-source
+    ///   `Edge(Expr(body_span))` witness. The registry's edge chase +
+    ///   per-attachment reducer (BranchArmFold for ternary `Expr`,
+    ///   straight payload otherwise) folds the body. No ternary
+    ///   special-case here — `emit_expr_witness` owns it on the `Expr`
+    ///   side.
     fn publish_return_arm_witnesses(&mut self, return_node: Node<'a>, scope: ScopeId) {
         use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
         let body = match return_node.named_child(0) {
@@ -3684,46 +3636,28 @@ impl<'a> Builder<'a> {
             None => return,
         };
         let body_span = node_to_span(body);
-        // Always emit the body's own Expr witnesses first so anything
-        // pointing here resolves.
         self.emit_expr_witness(body);
 
         let Some(sub_name) = self.enclosing_sub_name() else { return };
         let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) else { return };
 
-        if body.kind() == "conditional_expression" {
-            // Ternary return: per-arm Edges on Symbol(sid) so
-            // BranchArmFold can disambiguate the ≥2 arms that the
-            // syntax guarantees exist.
-            let arms = [
-                body.child_by_field_name("consequent"),
-                body.child_by_field_name("alternative"),
-            ];
-            for arm in arms.into_iter().flatten() {
-                self.pending_witnesses.push(Witness {
-                    attachment: WitnessAttachment::Symbol(sym_id),
-                    source: WitnessSource::Builder("branch_arm".into()),
-                    payload: WitnessPayload::Edge(WitnessAttachment::Expr(node_to_span(arm))),
-                    span: body_span,
-                });
-            }
-        } else {
-            // Plain return: one Edge to the body's Expr(span). The
-            // per-RI fold (`bag_query_expr` + `resolve_return_type`)
-            // handles single-arm and multi-arm uniformly.
-            self.pending_witnesses.push(Witness {
-                attachment: WitnessAttachment::Symbol(sym_id),
-                source: WitnessSource::Builder("branch_arm".into()),
-                payload: WitnessPayload::Edge(WitnessAttachment::Expr(body_span)),
-                span: body_span,
-            });
-        }
+        self.bag.push(Witness {
+            attachment: WitnessAttachment::Symbol(sym_id),
+            source: WitnessSource::Builder("branch_arm".into()),
+            payload: WitnessPayload::Edge(WitnessAttachment::Expr(body_span)),
+            span: body_span,
+        });
     }
 
-    /// RHS-ternary convenience: `my $x = $c ? A : B` → per-arm
-    /// `branch_arm` Edges on Variable($x). Each Edge points at the
-    /// arm's `Expr(arm_span)`, which `emit_expr_witness` populates
-    /// with the arm's resolved payload.
+    /// RHS-ternary convenience: `my $x = $c ? A : B` → one
+    /// `chain_assignment`-source `Edge(Expr(ternary_span))` on
+    /// Variable($x). `emit_expr_witness(cond_expr)` recurses to
+    /// populate the ternary's per-arm `branch_arm` Edges on
+    /// `Expr(ternary_span)`; BranchArmFold reduces them during edge
+    /// chase, and the materialized Variable witness goes through
+    /// FrameworkAwareTypeFold (which excludes `branch_arm` sources).
+    /// Source must NOT be `branch_arm` here — there's only one Edge
+    /// from the variable, BranchArmFold's ≥2-arm rule would reject it.
     fn emit_branch_arm_witnesses_for_ternary(
         &mut self,
         lhs_var: &str,
@@ -3732,27 +3666,19 @@ impl<'a> Builder<'a> {
     ) {
         use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
         let scope = self.current_scope();
-        let attachment = WitnessAttachment::Variable {
-            name: lhs_var.to_string(),
-            scope,
-        };
         let context_span = node_to_span(context);
-        // Make sure the ternary's Expr(span) is populated even though
-        // the per-arm Edges below skip it — keeps query points
-        // resolving against the ternary span working downstream.
         self.emit_expr_witness(cond_expr);
-        let arms = [
-            cond_expr.child_by_field_name("consequent"),
-            cond_expr.child_by_field_name("alternative"),
-        ];
-        for arm in arms.into_iter().flatten() {
-            self.pending_witnesses.push(Witness {
-                attachment: attachment.clone(),
-                source: WitnessSource::Builder("branch_arm".into()),
-                payload: WitnessPayload::Edge(WitnessAttachment::Expr(node_to_span(arm))),
-                span: context_span,
-            });
-        }
+        // Zero-span at the assignment start: the synthetic InferredType
+        // witness produced by edge materialization inherits this span,
+        // and `FrameworkAwareTypeFold`'s point-contains filter only
+        // skips *non-zero* spans that miss the query point. Using the
+        // same convention as TC-mirror Variable witnesses.
+        self.bag.push(Witness {
+            attachment: WitnessAttachment::Variable { name: lhs_var.to_string(), scope },
+            source: WitnessSource::Builder("chain_assignment".into()),
+            payload: WitnessPayload::Edge(WitnessAttachment::Expr(node_to_span(cond_expr))),
+            span: Span { start: context_span.start, end: context_span.start },
+        });
     }
 
     /// Closed-under-syntax type observation for an expression node.
@@ -3799,40 +3725,11 @@ impl<'a> Builder<'a> {
             .or_else(|| self.infer_anonymous_sub_return_type(expr))
     }
 
-    /// Does `node` look like `shift->M(...)` or `$self->M(...)`?
-    /// Used both during the walk (to record an implicit self-method
-    /// return shape) and in the return-type post-pass (to resolve
-    /// the sub's return once M's own return is known).
-    fn self_method_call_name(&self, node: Node<'a>) -> Option<String> {
-        if node.kind() != "method_call_expression" {
-            return None;
-        }
-        let invocant = node.child_by_field_name("invocant")?;
-        let is_self = match invocant.kind() {
-            "func0op_call_expression" | "func1op_call_expression" => {
-                invocant
-                    .child(0)
-                    .and_then(|c| c.utf8_text(self.source).ok())
-                    == Some("shift")
-            }
-            "scalar" => invocant.utf8_text(self.source).ok() == Some("$self"),
-            _ => false,
-        };
-        if !is_self {
-            return None;
-        }
-        let method_node = node.child_by_field_name("method")?;
-        method_node
-            .utf8_text(self.source)
-            .ok()
-            .map(|s| s.to_string())
-    }
-
     /// Push a type constraint on a variable node if it's a scalar.
     fn push_var_type_constraint(&mut self, var_node: Node<'a>, context_node: Node<'a>, inferred_type: InferredType) {
         if var_node.kind() == "scalar" {
             if let Ok(text) = var_node.utf8_text(self.source) {
-                self.type_constraints.push(TypeConstraint {
+                self.push_type_constraint(TypeConstraint {
                     variable: text.to_string(),
                     scope: self.current_scope(),
                     constraint_span: node_to_span(context_node),
@@ -4562,7 +4459,6 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
-                    return_self_method: None,
                         },
                     );
                     self.record_framework_accessor_witness(
@@ -4592,7 +4488,6 @@ impl<'a> Builder<'a> {
                                 display: None,
                     hide_in_outline: false,
                     opaque_return: false,
-                    return_self_method: None,
                             },
                         );
                         self.record_framework_accessor_witness(
@@ -4624,7 +4519,6 @@ impl<'a> Builder<'a> {
                                 display: None,
                     hide_in_outline: false,
                     opaque_return: false,
-                    return_self_method: None,
                             },
                         );
                         self.record_framework_accessor_witness(
@@ -4668,7 +4562,6 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
-                    return_self_method: None,
                         },
                     );
                     self.record_framework_accessor_witness(
@@ -4697,7 +4590,6 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
-                    return_self_method: None,
                         },
                     );
                     self.record_framework_accessor_witness(
@@ -5148,7 +5040,6 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
-                    return_self_method: None,
                 },
             );
         }
@@ -5236,7 +5127,6 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
-                    return_self_method: None,
                 },
             );
             self.record_framework_accessor_witness(
@@ -6078,21 +5968,14 @@ impl<'a> Builder<'a> {
     /// clear-and-emit, so their bag contribution is stable across
     /// iterations. The only monotonic-grower is chain typing's TCs,
     /// which the `type_constraints.len()` term captures.
-    fn fold_state_snapshot(&self) -> (Vec<(SymbolId, Option<InferredType>, Option<String>)>, usize, usize) {
-        let mut answers: Vec<(SymbolId, Option<InferredType>, Option<String>)> = self
+    fn fold_state_snapshot(&self) -> (Vec<(SymbolId, Option<InferredType>)>, usize, usize) {
+        let mut answers: Vec<(SymbolId, Option<InferredType>)> = self
             .symbols
             .iter()
             .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
-            .map(|s| {
-                let rt = self.resolved_returns.get(&s.id).cloned();
-                let rsm = match &s.detail {
-                    SymbolDetail::Sub { return_self_method, .. } => return_self_method.clone(),
-                    _ => None,
-                };
-                (s.id, rt, rsm)
-            })
+            .map(|s| (s.id, self.resolved_returns.get(&s.id).cloned()))
             .collect();
-        answers.sort_by_key(|(id, _, _)| id.0);
+        answers.sort_by_key(|(id, _)| id.0);
         // Count refs with filled `invocant_class` so progressive
         // chain-typing inside the loop registers as movement —
         // without this, an iteration that only newly fills
@@ -6148,10 +6031,6 @@ impl<'a> Builder<'a> {
     /// populated at walk time and trimmed by successor decls;
     /// a point-query gives the right answer at any byte.
     fn apply_chain_typing_assignments(&mut self, idx: &ChainTypingIndex<'a>) {
-        use crate::witnesses::{
-            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
-        };
-
         let mut to_push: Vec<(String, ScopeId, Span, InferredType)> = Vec::new();
         for &node in &idx.assignment_nodes {
             let (Some(left), Some(right)) = (
@@ -6200,34 +6079,12 @@ impl<'a> Builder<'a> {
         }
 
         for (variable, scope, constraint_span, ty) in to_push {
-            self.type_constraints.push(TypeConstraint {
-                variable: variable.clone(),
+            self.push_type_constraint(TypeConstraint {
+                variable,
                 scope,
                 constraint_span,
-                inferred_type: ty.clone(),
+                inferred_type: ty,
             });
-            self.bag.push(Witness {
-                attachment: WitnessAttachment::Variable {
-                    name: variable.clone(),
-                    scope,
-                },
-                source: WitnessSource::Builder("chain_assignment".into()),
-                payload: WitnessPayload::InferredType(ty.clone()),
-                span: Span { start: constraint_span.start, end: constraint_span.start },
-            });
-            if let InferredType::ClassName(ref n) = ty {
-                self.bag.push(Witness {
-                    attachment: WitnessAttachment::Variable {
-                        name: variable,
-                        scope,
-                    },
-                    source: WitnessSource::Builder("chain_assignment".into()),
-                    payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(
-                        n.clone(),
-                    )),
-                    span: constraint_span,
-                });
-            }
         }
     }
 
@@ -6318,11 +6175,10 @@ impl<'a> Builder<'a> {
     /// driver will switch the loop bodies below to registry calls.
     fn resolve_return_types(&mut self) {
         self.emit_arity_return_witnesses();
-        self.emit_delegation_edges();
         self.emit_method_call_return_edges();
         let (mut return_types, mut return_provenance) = self.fold_per_sub_return_arms();
         self.seed_plugin_overrides_into_return_types(&mut return_types, &mut return_provenance);
-        self.write_back_sub_return_types(&return_types, &return_provenance);
+        self.write_back_sub_return_types(&return_provenance);
         self.propagate_call_bindings_to_constraints(&return_types);
         self.fixup_call_bound_hash_key_owners(&return_types);
     }
@@ -6745,144 +6601,6 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Re-emittable: push edge facts for every recorded sub-return
-    /// delegation (`return other()` shape) and every self-method-tail
-    /// (`sub get { shift->method(...) }` shape) into the bag.
-    /// Edges live on `Symbol(delegator_sid)` (id-keyed) and
-    /// `MethodOnClass{class, delegator}` (class-keyed). The registry's
-    /// edge-chase resolves transitively, so multi-hop chains converge
-    /// as fast as the worklist's outer fold runs — no inner iter cap
-    /// to maintain.
-    ///
-    /// Replaces the old hand-rolled fixed-point loops
-    /// (`propagate_via_delegation` / `propagate_via_self_method_tails`).
-    ///
-    /// Clear-and-emit on tags `delegation` and `self_method_tail` so
-    /// repeat calls inside the worklist driver stay idempotent (no
-    /// duplicate edges accumulate).
-    ///
-    /// Self-recursion (a sub whose tail is its own name) is skipped —
-    /// can't infer your own return from yourself, and the registry's
-    /// cycle guard would short-circuit on the resulting self-edge
-    /// anyway.
-    fn emit_delegation_edges(&mut self) {
-        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
-
-        self.bag.remove_by_source_tag("delegation");
-        self.bag.remove_by_source_tag("self_method_tail");
-
-        let zero = Span {
-            start: Point { row: 0, column: 0 },
-            end: Point { row: 0, column: 0 },
-        };
-
-        let mut delegation_edges: Vec<Witness> = Vec::new();
-        for (delegator, delegate) in &self.sub_return_delegations {
-            if delegator == delegate {
-                continue;
-            }
-            // Resolve the delegate's first matching local sym for the
-            // id-keyed Edge target. `MethodOnClass` keeps the
-            // class-keyed edge name-based since class+name uniquely
-            // addresses the per-class dispatch slot.
-            let delegate_sid = self.symbols.iter().find(|s| {
-                s.name == *delegate
-                    && matches!(s.kind, SymKind::Sub | SymKind::Method)
-            }).map(|s| s.id);
-            for sym in &self.symbols {
-                if sym.name != *delegator {
-                    continue;
-                }
-                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                    continue;
-                }
-                if let Some(target_sid) = delegate_sid {
-                    delegation_edges.push(Witness {
-                        attachment: WitnessAttachment::Symbol(sym.id),
-                        source: WitnessSource::Builder("delegation".into()),
-                        payload: WitnessPayload::Edge(WitnessAttachment::Symbol(target_sid)),
-                        span: zero,
-                    });
-                }
-                let Some(class) = sym.package.as_ref() else { continue };
-                delegation_edges.push(Witness {
-                    attachment: WitnessAttachment::MethodOnClass {
-                        class: class.clone(),
-                        name: delegator.clone(),
-                    },
-                    source: WitnessSource::Builder("delegation".into()),
-                    payload: WitnessPayload::Edge(WitnessAttachment::MethodOnClass {
-                        class: class.clone(),
-                        name: delegate.clone(),
-                    }),
-                    span: zero,
-                });
-            }
-        }
-        for w in delegation_edges {
-            self.bag.push(w);
-        }
-
-        let scope_to_sub: std::collections::HashMap<ScopeId, String> = self
-            .scopes
-            .iter()
-            .filter_map(|s| match &s.kind {
-                ScopeKind::Sub { name } | ScopeKind::Method { name } => {
-                    Some((s.id, name.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        let mut tail_edges: Vec<Witness> = Vec::new();
-        for (scope_id, tail_method) in &self.self_method_tails {
-            let Some(sub_name) = scope_to_sub.get(scope_id) else { continue };
-            if sub_name == tail_method {
-                continue;
-            }
-            // Self-method-tails are class-scoped (`shift->M` calls M
-            // on the same class), so both the id-keyed and class-keyed
-            // edges stay inside the declaring class's namespace.
-            for sym in &self.symbols {
-                if sym.name != *sub_name {
-                    continue;
-                }
-                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                    continue;
-                }
-                let Some(class) = sym.package.as_ref() else { continue };
-                // Resolve the tail-target sym in the same class.
-                let target_sid = self.symbols.iter().find(|s| {
-                    s.name == *tail_method
-                        && matches!(s.kind, SymKind::Sub | SymKind::Method)
-                        && s.package.as_deref() == Some(class.as_str())
-                }).map(|s| s.id);
-                if let Some(tsid) = target_sid {
-                    tail_edges.push(Witness {
-                        attachment: WitnessAttachment::Symbol(sym.id),
-                        source: WitnessSource::Builder("self_method_tail".into()),
-                        payload: WitnessPayload::Edge(WitnessAttachment::Symbol(tsid)),
-                        span: zero,
-                    });
-                }
-                tail_edges.push(Witness {
-                    attachment: WitnessAttachment::MethodOnClass {
-                        class: class.clone(),
-                        name: sub_name.clone(),
-                    },
-                    source: WitnessSource::Builder("self_method_tail".into()),
-                    payload: WitnessPayload::Edge(WitnessAttachment::MethodOnClass {
-                        class: class.clone(),
-                        name: tail_method.clone(),
-                    }),
-                    span: zero,
-                });
-            }
-        }
-        for w in tail_edges {
-            self.bag.push(w);
-        }
-    }
-
     /// Step 7: writeback. Iterate `resolved_returns` and publish each
     /// resolved per-symbol return type to the bag on two attachments:
     ///
@@ -6919,7 +6637,6 @@ impl<'a> Builder<'a> {
     /// duplicate every sub's writeback witnesses.
     fn write_back_sub_return_types(
         &mut self,
-        return_types: &std::collections::HashMap<String, InferredType>,
         return_provenance: &std::collections::HashMap<
             String,
             crate::file_analysis::TypeProvenance,
@@ -6956,44 +6673,6 @@ impl<'a> Builder<'a> {
                 self.type_provenance.insert(sym.id, prov.clone());
             }
         }
-        // `return_self_method` bookkeeping: for subs that aren't
-        // worklist-resolved but tail on a self-method call, the
-        // SymbolDetail tracks the tail name so the post-walk chase
-        // can resolve through it. Only set when the sym has no
-        // resolved return — same gate the old field-write used.
-        for sym in &mut self.symbols {
-            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                continue;
-            }
-            let SymbolDetail::Sub {
-                ref mut return_self_method,
-                ..
-            } = sym.detail
-            else {
-                continue;
-            };
-            if return_types.contains_key(&sym.name) {
-                continue;
-            }
-            let sub_scope = self
-                .scopes
-                .iter()
-                .find(|s| {
-                    matches!(
-                        &s.kind,
-                        ScopeKind::Sub { name } | ScopeKind::Method { name }
-                            if name == &sym.name
-                    ) && s.span.start >= sym.span.start
-                        && s.span.end <= sym.span.end
-                })
-                .map(|s| s.id);
-            if let Some(sid) = sub_scope {
-                if let Some(m) = self.self_method_tails.get(&sid) {
-                    *return_self_method = Some(m.clone());
-                }
-            }
-        }
-
         // Publish every Sub/Method's resolved return type to the bag
         // on TWO attachments:
         //   - `Symbol(sym_id)` — id-keyed lookup. The Symbol attachment

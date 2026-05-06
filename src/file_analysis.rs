@@ -292,19 +292,6 @@ pub enum SymbolDetail {
         /// no core heuristic on the type name.
         #[serde(default)]
         opaque_return: bool,
-        /// Structural capture of the sub's implicit-last-statement
-        /// return when our in-file inference can't collapse it to a
-        /// concrete `InferredType`. Perl's last statement returns —
-        /// so `sub get { shift->_generate_route(GET => @_) }` has a
-        /// return equal to whatever `_generate_route` returns. We
-        /// can't compute that at walk time (cross-file return chains
-        /// aren't yet resolvable), but recording the method name lets
-        /// the consumer-side `find_method_return_type` chase it when
-        /// module_index IS available. Small, orthogonal to
-        /// `return_type` — populated only when `return_type` is None
-        /// after the walk.
-        #[serde(default)]
-        return_self_method: Option<String>,
     },
     Class {
         parent: Option<String>,
@@ -3612,23 +3599,17 @@ impl FileAnalysis {
                 })
         } else {
             // Bareword invocant: ambiguous between class-name and
-            // zero-arg function call. If a local Sub/Method with this
-            // name has a ClassName return type, treat it as the call
-            // and use its return type — that's what Perl does at
-            // runtime when the name resolves as a sub. Falls back to
-            // class-name interpretation when no such sub exists.
-            // Mirrors the same rule in `receiver_type_for` and
-            // `resolve_invocant_class_tree` so every bareword-invocant
-            // path sees the same answer.
+            // zero-arg function call. If a sub by this name resolves
+            // (locally or via a cross-file import) to a ClassName
+            // return type when called with zero args, treat the
+            // bareword as the call and use that class. Mirrors the
+            // same rule in `receiver_type_for` and
+            // `resolve_invocant_class_tree`.
             let bare = invocant.rsplit("::").next().unwrap_or(invocant);
-            for sym in &self.symbols {
-                if sym.name != bare { continue; }
-                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                if let Some(InferredType::ClassName(c)) =
-                    self.symbol_return_type_via_bag(sym.id, None)
-                {
-                    return Some(c);
-                }
+            if let Some(InferredType::ClassName(c)) =
+                self.sub_return_type_at_arity(bare, Some(0))
+            {
+                return Some(c);
             }
             Some(invocant.to_string())
         }

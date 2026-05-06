@@ -727,7 +727,6 @@ fn cli_dump_package(root: &str, package_name: &str) {
             ref display,
             hide_in_outline,
             opaque_return,
-            ref return_self_method,
             ref doc,
         } = sym.detail
         else {
@@ -859,7 +858,6 @@ fn cli_dump_package(root: &str, package_name: &str) {
             "raw_return_type": raw_return,
             "bag_return_type": bag_default,
             "bag_return_type_at_arity": serde_json::Value::Object(by_arity),
-            "return_self_method": return_self_method,
             "symbol_witness_count": symbol_witness_count,
             "vars_in_scope": vars_in_scope,
         });

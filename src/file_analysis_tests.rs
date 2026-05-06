@@ -154,7 +154,6 @@ fn test_resolve_sub_return_type() {
                 display: None,
                 hide_in_outline: false,
                 opaque_return: false,
-                return_self_method: None,
             },
             namespace: Namespace::Language,
             outline_label: None,
