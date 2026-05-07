@@ -37,7 +37,7 @@ pub enum ParametricType {
     // Future: Wrapped { class, inner } for Promise/Future/Lazy,
     // ListOf { class?, element } for Mojo::Collection/ArrayRef,
     // HashRef { key, value? }, Plugin { id, args } escape hatch.
-    // See docs/prompt-parametric-redesign.md.
+    // See docs/prompt-return-type-expressions.md.
 }
 ```
 
@@ -78,6 +78,36 @@ shape for `->all` when it lands.
 The "evil hardcoding list" of "method X returns Y" is structurally
 impossible — core knows projection rules (`RowOf<ResultSet>` → row
 class), not method tables. Plugins compose the rules.
+
+### Cross-file owner fix: build emits, enrichment fills
+
+`emit_method_call_arg_keys` runs at build time, where receiver
+types resolvable only via cross-file lookup come up empty —
+the builder doesn't carry `module_index`. The chain
+`$c->sner_r->search({KEY})` (helper synth + cross-file row
+class) is the canonical case.
+
+Three paths in the emitter:
+- **Parametric receiver claims the method.** Flavor's
+  `method_arg_owner(method)` returns Some — emit unconditionally,
+  the type is the gate.
+- **Locally-typed non-Parametric receiver.** Strict-eq
+  `has_hash_key_def` gate. Constructor keys via Mojo `has`, etc.
+- **Chain receiver, type unresolvable at build.** Emit
+  `HashKeyAccess { owner: None }` eagerly. `FileAnalysis::
+  fix_chain_receiver_hash_key_owners` runs from
+  `finalize_post_walk` (no module_index — fills in-file chain
+  receivers via `call_ref_by_start` recursion) and from
+  `enrich_imported_types_with_keys` (with module_index —
+  fills cross-file). Both routes share the same routine; the
+  `module_index` argument is the only difference. Idempotent —
+  only None-owner refs are touched, so a second run is a no-op.
+
+Same precedent as the cross-file invocant refresh: build emits
+what it can, enrichment fills cross-file gaps. The base-count
+machinery on `FileAnalysis` (already in place for plugin
+namespaces and inheritance edges) makes the two-phase fill
+work without re-emission churn.
 
 ### Match invariant: zero `_ => …` fall-throughs on `ParametricType`
 
@@ -137,18 +167,13 @@ v2 redesign. Bumping is free; old blobs re-resolve lazily.
 
 ## Where this is going
 
-- **Custom `resultset_class` discovery.** `$schema->resultset
-  ('Users')` should resolve `base` to `<Schema_NS>::ResultSet::
-  Users` if it exists, else fall back to `DBIx::Class::ResultSet`.
-  Hard-coded today. Pinned by `goto_def_offers_custom_resultset_method`
-  (`#[ignore]`).
 - **Receiver-relative return types.** `return_type: ReturnExpr`
   admitting `Receiver` placeholders + `UnionOnArgs` branches —
   subsumes per-method projection (`find` declares
   `RowOf(Receiver)` once on the symbol) AND arity dispatch
   (Mojo `has` accessors as `{ args.is_empty() => T, _ => Self }`,
   retiring `FluentArityDispatch`). Spec'd in
-  `docs/prompt-parametric-redesign.md` Section 2.
+  `docs/prompt-return-type-expressions.md`.
 - **DBIC out of core.** The `visit_dbic_*` family + Phase 1
   emission move to a plugin. Per-method projection table moves
   from "in core" to "operators emitted by the plugin." Spec:

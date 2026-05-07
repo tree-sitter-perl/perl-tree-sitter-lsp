@@ -1,13 +1,21 @@
 # Nested hash-key intelligence
 
-**Status:** queued. Three-tier rollout. Tier 1 may bundle into the
-Part 5c (parametric ResultSet) PR if convenient — the blast radius
-is the same. Tiers 2/3 are their own workstream.
+**Status:** Tier 1 partially landed in the parametric ResultSet
+PR — `add_columns` synthesizes `HashKeyDef` symbols on the row
+class, and `ParametricType::ResultSet`'s `hash_key_class()` /
+`method_arg_owner()` route hash-key access to the row class.
+What's NOT in Tier 1 yet: direct `$row->{name}` access on a
+typed row (DBIC's HRI shape; not currently supported anyway).
+Tiers 2/3 (structurally-typed hash literals, mixed array/hash
+drill) remain queued.
 
-Builds on the recursive `InferredType::Parametric { base, type_args:
-Vec<TypeArg> }` shape landed in Part 5c. Recursion via
-`TypeArg::Type(Box<InferredType>)` is already wired; this work is
-about *emitting* and *consuming* it for hash-shaped data.
+Builds on the sealed-enum `ParametricType` shape landed in
+Part 5c (`docs/adr/parametric-types.md`). Each flavor carries
+its own data fields, so recursive nesting (`HashRef<ArrayRef
+<Str>>` etc.) lives in flavor-specific `Box<InferredType>`
+slots — no `Vec<TypeArg>` shoehorning. This work is about
+*emitting* the right flavor for hash-shaped data and
+*consuming* it via narrowing.
 
 ## What "nested hash-key intelligence" means
 

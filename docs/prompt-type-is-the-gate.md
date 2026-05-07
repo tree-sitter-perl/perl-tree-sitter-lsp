@@ -1,6 +1,11 @@
 # Type-is-the-gate generalization
 
-**Status:** discussion. Open architectural question.
+**Status:** discussion. Two instances landed on the parametric
+ResultSet branch (`_open` emitter for Parametric-claimed
+receivers; cross-file deferred owner fix for chain receivers
+unresolvable at build). The general refactor — replacing every
+strict-eq local-symbol gate with a "the type knows" answer —
+remains open.
 
 ## Origin
 
@@ -17,12 +22,18 @@ consumer build time. Strict-eq blocks the emission, the
 HashKeyAccess never gets pushed, `refs_to(HashKeyOfClass(Users))`
 silently misses cross-file call sites.
 
-I added `emit_call_arg_key_accesses_open` as a sibling that skips
-the gate, called only when receiver types as Parametric. The
-reasoning: **the type itself is the gate**. A Parametric receiver
-already pinned the row class via the witness graph; a missing
-HashKeyDef in the consumer's symbol table doesn't change the fact
-that the user-typed key is column-keyed.
+The `_open` emitter sibling was the first instance: when the
+receiver types as Parametric, the *type* is the gate (the
+flavor's `method_arg_owner` returns Some only when it claims).
+Skip the strict local-symbol check; emit unconditionally with
+the flavor-pinned owner.
+
+The cross-file deferred owner fix was the second instance:
+chain receivers whose type only resolves cross-file get
+`HashKeyAccess { owner: None }` emitted at build, with
+post-walk + post-enrichment fixup filling the owner once the
+receiver's flavor is resolvable. Same pattern: build emits
+what it can, the type's eventual answer fills the gap.
 
 ## The pattern
 

@@ -25,16 +25,22 @@ Four docs, one engine:
 |---|---|---|
 | `prompt-type-inference-unification.md` | **HOW** — collapse walker + bag into one path | **Steps 1–4 landed (PR #27)** — historical |
 | `working-bag-residual.md` | **FINISH THE COLLAPSE** — four directives for "bag is the only truth" | **D1–D4 landed (PR #31).** D4-G follow-up open |
-| `prompt-forward-reference-resolution.md` | **REGRESSION** — walk-time sym lookups miss forward-defined callees | **LANDED** — post-walk resolver |
-| `prompt-cross-file-invocant-refresh.md` | **REGRESSION** — `invocant_class` cache stale after enrichment, cross-file refs under-match | **LANDED (PR #34)** — bag-only resolver |
 | `prompt-type-inference-residual.md` | **WHAT'S MISSING** — Parts 1–5 fact classes | each is a reducer+emitter pair |
-| `prompt-nested-hashkey.md` | **FOLLOW-UP TO 5C** — hash-key intelligence on Parametric values + structural hashes + array-element narrowing | three tiers (~30 / ~150 / ~50 LOC) |
-| `prompt-parametric-redesign.md` | **WORKING DOC** — Phase 1 sealed-enum redesign + receiver-relative return types (subsumes arity dispatch + per-method projection in one mechanism) | actively being implemented |
-| `prompt-parametric-semantics.md` | **(superseded)** original pluggable-semantics-registry proposal | retained for context; `prompt-parametric-redesign.md` carries the chosen design |
+| `prompt-nested-hashkey.md` | **FOLLOW-UP TO 5C** — hash-key intelligence on Parametric values + structural hashes + array-element narrowing | Tier 1 partially landed; Tiers 2/3 queued |
+| `prompt-return-type-expressions.md` | **NEXT PILLAR** — receiver-relative return types subsume per-method projection + arity dispatch | queued; ~200–300 LOC |
 | `prompt-type-system-encoding.md` | **TYPE-SAFE AXIS DISPATCH** — make wrong-axis class-name reads unrepresentable; covers the dual-class problem + the two-bag-attachments seam | discussion; partially deferred to graph-walking |
-| `prompt-type-is-the-gate.md` | **GENERALIZE STRICT-EQ GATES** — `type_says()` answers replace local-symbol-table presence checks; cross-file completeness story | defer until 2nd site arrives |
-| `prompt-dbic-as-plugin.md` | **MOVE DBIC OUT OF CORE** — port `visit_dbic_*` family + Parametric emission + custom resultset_class discovery to a plugin | queued behind parametric-semantics + type-system-encoding |
+| `prompt-type-is-the-gate.md` | **GENERALIZE STRICT-EQ GATES** — `type_says()` answers replace local-symbol-table presence checks; cross-file completeness story | two instances landed (Part 5c); general refactor open |
+| `prompt-dbic-as-plugin.md` | **MOVE DBIC OUT OF CORE** — port `visit_dbic_*` family + Parametric emission + custom resultset_class discovery to a plugin | queued behind ReturnExpr + type-system-encoding |
 | `prompt-sequence-types.md` | **FIRST BIG CONSUMER** — sequence type lattice | 5 phases; ~half the spike's diff on a clean foundation |
+
+Landed work has its durable record in the ADRs under `docs/adr/`
+(`parametric-types.md` for the Part 5c flavor enum + cross-file
+deferred owner fix; `plugin-system.md` for the
+`return_via_edge` lazy-return mechanism) and the commit history.
+Spec docs for completed work (cross-file invocant refresh,
+forward-reference resolution, Mojo helper-body inference,
+parametric-semantics proposal that the redesign superseded)
+have been removed.
 
 ### Dependency map
 
@@ -95,12 +101,13 @@ regression backlog gating them.
   ~30 LOC, may bundle into the 5c PR; (2) structurally-typed hash literals
   + chain narrowing (`$config->{db}->{host}`), ~150 LOC, own PR; (3)
   array-element narrowing for `$obj->{users}->[0]->{name}`, ~50 LOC on top.
-- **Per-flavor parametric semantics** (`docs/prompt-parametric-semantics.md`)
-  is the architectural follow-up that unblocks plugin-emitted parametric
-  flavors (Promise, Collection, GraphQL types). Today's hard-coded
-  `hash_key_class()` rule on `InferredType` is DBIC-shaped; non-DBIC
-  parametrics need pluggable per-base semantics (trait-shape recommended).
-  Queued before the DBIC-plugin port.
+- **Receiver-relative return types** (`docs/prompt-return-type-expressions.md`)
+  is the next architectural pillar — `return_type: ReturnExpr` admitting
+  `Receiver` placeholders + `UnionOnArgs` branches. Subsumes per-method
+  projection (DBIC `find` declares `RowOf(Receiver)` once on the symbol)
+  AND arity dispatch (Mojo `has` accessors as
+  `{ args.is_empty() => T, _ => Self }`). Retires the `FluentArityDispatch`
+  family. Queued before the DBIC-plugin port.
 - **Type-system encoding for axis dispatch** (`docs/prompt-type-system-encoding.md`)
   is the medium-term sharpening of Part 5c's dual-class lesson —
   `dispatch_class()` and `hash_key_class()` should be statically distinct so
@@ -109,14 +116,15 @@ regression backlog gating them.
   is known (Element, Wrapped, Effect on top of Dispatch + HashKey).
 - **Type-is-the-gate generalization** (`docs/prompt-type-is-the-gate.md`)
   retires strict-eq local-symbol-table gates in favor of "the type
-  carries the answer" — Part 5c's `_open` emitter sibling is the first
-  example. Defer until a second site arrives so the generalization shape
-  is empirically grounded.
+  carries the answer." Two instances landed on the parametric ResultSet
+  branch (`_open` emitter for Parametric-claimed receivers; cross-file
+  deferred owner fix for chain receivers). The general refactor remains
+  open.
 - **DBIC as a plugin** (`docs/prompt-dbic-as-plugin.md`) — port the
   in-builder `visit_dbic_*` family + Phase 1 Parametric emission +
   custom resultset_class discovery to a plugin (Rust, in-tree). Queued
-  behind parametric-semantics + type-system-encoding. The "everything
-  is a plugin" direction makes core's per-ORM specials a CLAUDE.md #10
+  behind ReturnExpr + type-system-encoding. The "everything is a
+  plugin" direction makes core's per-ORM specials a CLAUDE.md #10
   smell.
 
 ### Recommended sequencing
@@ -184,8 +192,9 @@ regression backlog gating them.
      e2e green; coverage expanded beyond the Carp shape to ternary
      arms, scoped-identifier calls, implicit returns, and
      self-method tails (see `forward_reference_*` in
-     `builder_tests.rs`). Spec:
-     `docs/prompt-forward-reference-resolution.md`.
+     `builder_tests.rs`). Spec retired post-landing; ADR-level
+     mechanism lives in `docs/adr/file-store-and-resolve.md`'s
+     "Lazy enrichment" section + the commit history.
    - **cross-file `invocant_class` refresh.** **LANDED in PR #34.**
      The hybrid (option 3) recommended in the original spec was
      superseded by option 2 (drop the cached field outright). The

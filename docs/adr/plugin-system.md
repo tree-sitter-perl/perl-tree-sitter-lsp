@@ -73,6 +73,36 @@ Application semantics:
   `--dump-package`. The free-form `reason` is how a future reader answers
   "why does the LSP think `_route` returns X?" without re-running the build.
 
+### Lazy return types via `Edge`
+
+Plugins synthesize callables (`mojo-helpers` for `$app->helper(name => sub
+{ ... })`, similar shapes elsewhere) whose return type lives inside the
+callback body. At plugin-call time the body hasn't been walked, so eager
+inference returns nothing useful — but `Expr(span)` for the body's last
+expression IS populated by the time anyone queries the synthesized
+callable's return type.
+
+Mechanism: `EmitAction::Method.return_via_edge: Option<Span>`. Plugin
+sets it to `args[N].sub_body_last_expr_span` (populated by the builder
+on anonymous-sub args). Builder pushes `Symbol(sid) → Edge(Expr(span))`
+instead of the usual `Symbol(sid) → InferredType(rt)`. The bag's edge-
+chase resolver follows it at query time. Class-scoped synth gets the
+edge mirrored to `MethodOnClass{class, name}` by
+`write_back_sub_return_types` so cross-file `find_method_return_type`
+queries reach it via the class-keyed attachment.
+
+For this to fire, anonymous subs push a Sub scope (`visit_anonymous_sub`)
+so `enclosing_sub_scope()` returns Some inside `sub { … }` arg literals
+— without it, `publish_return_arm_witnesses` skips and `Expr(body_last)`
+never gets its witness. Anon subs are still values, not symbols; the
+scope exists for return-arm semantics only.
+
+Same pattern composes cross-file. The synthesized Method's
+`MethodOnClass` edge resolves through the cached producer's bag, edge-
+chases back into the body's `Expr(span)`, and the bag's existing
+cross-file primary lookup carries the chain through. No special-case
+"is this a plugin synth from another file" logic.
+
 ### Reserved-keyword footgun (Rhai)
 
 Rhai parses `ctx.call` as a method call, not a field read. Reads that collide

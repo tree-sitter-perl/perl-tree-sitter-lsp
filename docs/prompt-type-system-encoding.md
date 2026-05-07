@@ -175,7 +175,7 @@ attachments anyway. Cost-benefit not in our favor right now.
    is a type" direction. Does each trait correspond to a TypeArg
    slot, or are some axes purely behavioral?
 2. If we do (1A) phantom types, does plugin-emitted `Custom(idx)`
-   parametric semantics (see `prompt-parametric-semantics.md`)
+   parametric semantics (see `prompt-return-type-expressions.md`)
    need a corresponding `Custom<Idx>` axis marker, or do plugins
    pick from the fixed set of axes?
 3. For (2), does the eventual collapse keep `Expr(span)` or

@@ -46,7 +46,7 @@ What it *doesn't* support yet:
   not "publish a Parametric InferredType on this call's
   Expression(refidx)."
 - Per-flavor parametric semantics (`hash_key_class`, dispatch class
-  override, etc.) — see `prompt-parametric-semantics.md`. Without
+  override, etc.) — see `prompt-return-type-expressions.md`. Without
   pluggable semantics, a DBIC plugin can emit Parametric but the
   core's hardcoded `hash_key_class()` behavior owns the read side.
 
@@ -117,7 +117,8 @@ through to the generic ResultSet method lookup.
 ### Semantics
 
 The plugin registers per-flavor semantics for the Parametric values
-it emits. Once `prompt-parametric-semantics.md` lands a registry,
+it emits. Once `prompt-return-type-expressions.md` lands the
+`ReturnExpr` machinery,
 DBIC's plugin contributes:
 
 ```rhai
@@ -159,7 +160,7 @@ Plugin infrastructure additions:
   Parametric witness on a call's Expression(refidx). Maybe 30 LOC
   in the plugin EmitAction enum + builder dispatch.
 - Plugin-side parametric semantics registry — see
-  `prompt-parametric-semantics.md`. ~50 LOC depending on which
+  `prompt-return-type-expressions.md`. ~50 LOC depending on which
   option lands.
 - Cross-file row-class enrichment hook — bigger; ~100 LOC of
   enrichment-pass extension. Could be cheaper if it piggybacks on
@@ -215,7 +216,7 @@ test migration. Multi-PR workstream. Worth doing in this order:
 ## Sequencing
 
 DBIC-as-plugin is queued behind:
-- `prompt-parametric-semantics.md` (registry needed for plugin to
+- `prompt-return-type-expressions.md` (machinery needed for plugin to
   contribute semantics)
 - `prompt-type-system-encoding.md` (axis traits clarify what the
   plugin's semantics return)
