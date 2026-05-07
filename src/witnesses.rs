@@ -838,8 +838,8 @@ impl WitnessReducer for ExprReturn {
 //
 // Claims plain `InferredType` payloads on `Symbol(_)` attachments —
 // the id-keyed answer for "what does THIS specific sym return?".
-// Pushed by writeback (local subs/methods) and
-// `seed_bag_from_constraints` (hand-crafted FAs / cache-loaded blobs).
+// Pushed by writeback (local subs/methods) and tests that hand-craft
+// a FileAnalysis without going through the builder.
 // Class-scoped multi-overload dispatch goes through
 // `MethodOnClass{class, name}` instead — see `MethodOnClassReducer`
 // and the `arity_hint` short-circuit in `reduce` below.

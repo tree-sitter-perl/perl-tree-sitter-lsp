@@ -5246,16 +5246,14 @@ my $x = app;
 
     // `$x = app` — $x should pick up the return type of the plugin's
     // `app` Sub (ClassName("Mojolicious")).
-    let tc = fa
-        .type_constraints
-        .iter()
-        .find(|tc| tc.variable == "$x")
-        .expect("$x must carry a type constraint sourced from `app`'s return type");
+    let ty = fa
+        .inferred_type("$x", tree_sitter::Point::new(4, 0))
+        .expect("$x must carry a type sourced from `app`'s return type");
     assert!(
-        matches!(&tc.inferred_type, InferredType::ClassName(c) if c == "Mojolicious"),
+        matches!(ty, InferredType::ClassName(c) if c == "Mojolicious"),
         "`$$x = app` must type as Mojolicious — bareword `app` resolves to the \
              plugin's typed Sub. got: {:?}",
-        tc.inferred_type,
+        ty,
     );
 }
 
@@ -6013,18 +6011,15 @@ $minion->add_task(send_email => sub {
 "#;
     let fa = build_fa(src);
 
-    // `$job` should have a type constraint inside the callback.
-    let tc = fa
-        .type_constraints
-        .iter()
-        .find(|t| {
-            t.variable == "$job"
-                && matches!(&t.inferred_type, InferredType::ClassName(c) if c == "Minion::Job")
-        })
-        .expect("$job must be typed Minion::Job inside add_task callback");
+    // `$job` should be typed Minion::Job inside the callback —
+    // plugin-declared ClassName, not builder's FirstParam.
+    let ty = fa
+        .inferred_type("$job", tree_sitter::Point::new(8, 0))
+        .expect("$job must carry a type inside add_task callback");
     assert!(
-        !matches!(tc.inferred_type, InferredType::FirstParam { .. }),
-        "type should be plugin-declared ClassName, not builder's FirstParam"
+        matches!(ty, InferredType::ClassName(c) if c == "Minion::Job"),
+        "type should be plugin-declared ClassName(Minion::Job), got {:?}",
+        ty,
     );
 }
 
@@ -8649,5 +8644,47 @@ my $m = MooApp->new('a', 1, 'b', 2);
         call_keys.len(),
         2,
         "both even-position args (`'a'`, `'b'`) must emit HashKeyAccess",
+    );
+}
+
+/// Red-pin: known regression introduced by D4-E (commit 80b2b88).
+/// `longmess` calls `longmess_heavy` which is defined later in the
+/// source. Both arms of the if/else return that call, so the chain
+/// should fold to String. It currently folds to None because
+/// `expr_payload`'s `function_call_expression` arm does a walk-time
+/// `self.symbols.iter().find(name)` that misses forward references —
+/// the post-walk `emit_delegation_edges` pass that used to cover this
+/// case in D3 was removed without an equivalent.
+///
+/// Spec: docs/prompt-forward-reference-resolution.md.
+/// Reverse the order of the two subs in the source and the test
+/// passes. When the spec lands, drop `#[ignore]` and add coverage for
+/// method calls + scoped-identifier calls.
+#[test]
+#[ignore = "forward-reference regression — see docs/prompt-forward-reference-resolution.md"]
+fn forward_reference_call_in_sub_return_resolves() {
+    let src = r#"
+package main;
+
+sub longmess {
+    if ($_[0]) {
+        return longmess_heavy(@_);
+    }
+    else {
+        return longmess_heavy(@_);
+    }
+}
+
+sub longmess_heavy { return "ouch"; }
+"#;
+    let fa = build_fa(src);
+    let rt = fa.sub_return_type_at_arity("longmess", None);
+    assert_eq!(
+        rt,
+        Some(InferredType::String),
+        "longmess must fold to String through both arms — \
+         got {:?}. Walk-order regression: longmess_heavy is \
+         defined after longmess.",
+        rt,
     );
 }

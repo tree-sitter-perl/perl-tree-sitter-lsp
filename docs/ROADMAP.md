@@ -24,7 +24,9 @@ Four docs, one engine:
 | Doc | Axis | Status |
 |---|---|---|
 | `prompt-type-inference-unification.md` | **HOW** — collapse walker + bag into one path | **Steps 1–4 landed (PR #27)** — historical |
-| `working-bag-residual.md` | **FINISH THE COLLAPSE** — four directives for "bag is the only truth" | **Active queue.** Each directive = one PR |
+| `working-bag-residual.md` | **FINISH THE COLLAPSE** — four directives for "bag is the only truth" | **D1–D4 landed (PR #31).** D4-G follow-up open |
+| `prompt-forward-reference-resolution.md` | **REGRESSION** — walk-time sym lookups miss forward-defined callees | **Top of queue.** Red-pinned |
+| `prompt-cross-file-invocant-refresh.md` | **REGRESSION** — `invocant_class` cache stale after enrichment, cross-file refs under-match | **Top of queue.** Red-pinned |
 | `prompt-type-inference-residual.md` | **WHAT'S MISSING** — Parts 1–5 fact classes | each is a reducer+emitter pair |
 | `prompt-sequence-types.md` | **FIRST BIG CONSUMER** — sequence type lattice | 5 phases; ~half the spike's diff on a clean foundation |
 
@@ -35,7 +37,11 @@ staircase 1–4 (LANDED, PR #27) ─┐
                                  ├─▶ bag-residual D1 redo (LANDED dc4315f, with residue → D3)
                                  ├─▶ bag-residual D2 (LANDED — one expression attachment)
                                  ├─▶ bag-residual D3 (LANDED — NamedSub variant gone)
-                                 ├─▶ bag-residual D4 (residual canonical-store cleanup)
+                                 ├─▶ bag-residual D4 + follow-up (LANDED, PR #31 —
+                                 │       FA.type_constraints gone, EXTRACT_VERSION 21)
+                                 │       │
+                                 │       ├─▶ ★ forward-reference resolution (red-pinned)
+                                 │       ├─▶ ★ cross-file invocant refresh (red-pinned)
                                  │       │
                                  │       └─▶ sequence-types phases 1-3
                                  │
@@ -44,6 +50,10 @@ staircase 1–4 (LANDED, PR #27) ─┐
                                  └─▶ docs/prompt-cleanups.md (small, parallel,
                                        independent — pick anytime)
 ```
+
+★ = known regression with a pinned `#[ignore]` test that fails until
+fixed. Both block downstream type-intelligence quality but don't block
+sequence-types architecturally — sequence types can land in parallel.
 
 - **Unification staircase** is done. PR #27 subsumed Steps 1–4: the walker only
   observes, edge-payload witnesses replace closure-driven chase, deferred-var /
@@ -113,25 +123,57 @@ staircase 1–4 (LANDED, PR #27) ─┐
    on `SubReturnReducer` collapsed to a single `branch_arm`
    exclusion. Cache `EXTRACT_VERSION` bumped 19 → 20. Tests: 507
    unit + 93 e2e green.
-4. **Bag-residual D4** (now smaller) — kill `FileAnalysis.type_constraints`
-   as a write target, walk-time bag is live (no `pending_witnesses` staging,
-   no walk-time TC-first read), kill the `last_expr_span` /
-   `sub_return_delegations` / `self_method_tails` Builder maps as
-   bag-emit inputs (D2 already replaced the type-typed `last_expr_type`
-   map with the structural `last_expr_span`; D4 routes that through
-   bag emissions too). The field-deletion bullets that lived here
-   moved to D1 (and a "lazy cache" rebuild is explicitly **not**
-   scheduled — only add if profiling later shows the bag query is
-   hot).
-5. **Sequence-types phases 1-3** on the clean foundation.
+4. **Bag-residual D4 + follow-up** — **LANDED in PR #31.** Killed
+   `pending_witnesses` staging, the walk-time TC-first read,
+   `self_method_tails` / `return_self_method`, and the per-arm Edge
+   expansion. Follow-up commits in the same PR deleted
+   `FileAnalysis.type_constraints` outright (cache `EXTRACT_VERSION`
+   bumped 20 → 21), migrated `--dump-package vars_in_scope` and the
+   plugin sandbox diff to bag reads, and pushed two known regressions
+   into red-pinned tests rather than leaving them undocumented:
+   - **★ forward-reference resolution.** D4-E's bag-routed `Symbol ←
+     branch_arm Edge → Expr(body) → Edge(call_target)` chain assumes
+     `expr_payload` can resolve `call_target` at walk time, but
+     `function_call_expression`'s arm does walk-time
+     `self.symbols.iter().find(name)` — silently emits nothing for
+     forward-defined callees. Real-world hit: Carp's `longmess` →
+     `longmess_heavy`. Fix surface = a single post-walk
+     "compile-esque" pass that performs all definedness-dependent
+     lookups against the final symbol table; spec in
+     `docs/prompt-forward-reference-resolution.md`. Pinned by
+     `forward_reference_call_in_sub_return_resolves`.
+   - **★ cross-file `invocant_class` refresh.** `Ref::MethodCall.invocant_class`
+     is set once at build time and never refreshed; when a consumer's
+     invocant only becomes typeable post-enrichment (cross-file
+     return type), `refs_to`'s `cn == pkg` filter excludes it. Fix
+     surface (recommended): hybrid cache + bag fallback — readers
+     consult the bag when `invocant_class` is `None`; spec in
+     `docs/prompt-cross-file-invocant-refresh.md`. Pinned by
+     `references_cross_file_invocant_resolved_post_enrichment`.
+
+   Both regressions are next on the queue before sequence-types
+   phases. They're independent of each other (different attachment
+   shapes, different fix surfaces) — order by which hurts user
+   workflows more. The forward-ref one is the higher-frequency hit
+   in real Perl code (Carp pattern is everywhere).
+
+5. **Sequence-types phases 1-3** on the clean foundation. Can land in
+   parallel with the regression fixes above; not architecturally
+   blocked, just lower priority because correctness regressions
+   should clear first.
 6. **Residual Parts** (start with whichever is hurting most — likely Part 5b
    narrowing or Part 5c parametric types for DBIC, depending on workload).
 
 ### Hardening, slot anywhere
 
-- `MAX_FOLD_ITERATIONS` is `debug_assert!`-only; release builds have no cap and
-  rely entirely on the lattice argument. Pick: real release-mode bound with
-  `tracing::error!` and break, or trust the lattice and remove the debug check.
+- `MAX_FOLD_ITERATIONS` got an all-builds bound in PR #31 (release `eprintln!`
+  + `break`). Open follow-ups: route through `tracing::error!` instead of
+  `eprintln!` (LSP stderr noise), and add a synthetic-oscillator test so the
+  release path doesn't bit-rot. See `docs/d4-review-followups.md` items 1, 4.
+- `apply_chain_typing_assignments` and `FileAnalysis::inferred_type` both do
+  full-bag scans now (the price of dropping `type_constraints` as a parallel
+  index). Cheap to fix with a `HashSet<(name, scope, point)>` if profiling
+  ever flags them. See `docs/d4-review-followups.md` items 2, 3.
 - Arity is bolted on (own `ReducerQuery` field, own observation variant, own
   reducer, own `ArityBranch` enum). Generalizing to a `Vec<Guard>` shape is
   premature until a second guard kind appears (type-of-arg dispatch,
@@ -172,12 +214,21 @@ already exists; just the eager-target invariant is missing.
 
 ### Why this matters
 
-The bag-residual directives are the immediate priority — finishing the
-collapse the staircase started. Graph rework is what unblocks Phase 6
-(Openness diagnostic), multi-app Mojo support, and the eventual
-`Symbol.home_scope` move (was: phase 7's `home_namespace`). All follow the
-same pattern: collapse ad-hoc code paths doing morally-similar work into
-one canonical mechanism; enforce the invariant by construction.
+The bag-residual directives are done — the bag is canonical. The two
+red-pinned regressions are the immediate priority because they're the
+only places where "more type intelligence" *doesn't* automatically
+flow through to user-visible features. Both are bag-canonical
+violations of different flavors: forward-ref is *emit-side* (witness
+never gets pushed for forward-defined callees), invocant-refresh is
+*cache-side* (witness exists, the cached projection on refs is stale).
+Fixing them keeps the audited claim — "all type intelligence routes
+through the bag" — actually true at every phase.
+
+Graph rework is what unblocks Phase 6 (Openness diagnostic), multi-app
+Mojo support, and the eventual `Symbol.home_scope` move (was: phase
+7's `home_namespace`). All follow the same pattern: collapse ad-hoc
+code paths doing morally-similar work into one canonical mechanism;
+enforce the invariant by construction.
 
 ---
 

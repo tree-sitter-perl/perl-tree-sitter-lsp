@@ -1110,3 +1110,109 @@ fn test_refs_to_role_mask_excludes_workspace() {
     );
     assert!(results.is_empty());
 }
+
+/// Red-pin: cross-file `invocant_class` is set once at build time and
+/// never refreshed. When a consumer file's `$b` invocant only becomes
+/// typeable post-enrichment (because the producer's return type lives
+/// in another file), the consumer's `$b->method()` MethodCall ref keeps
+/// `invocant_class: None` forever — the bag learns the type but the
+/// ref field doesn't get re-derived. `refs_to`'s
+/// `(invocant_class, scope) match (Some(cn), Some(pkg)) => cn == pkg`
+/// filter (resolve.rs:256-258) excludes unresolved invocants, so the
+/// cross-file call site silently doesn't show up in references for the
+/// target method.
+///
+/// Reproduces with two files:
+///   - Producer B: exports `make_b`, which returns `bless {}, 'B'`.
+///     `make_b`'s return type IS resolvable at build time (closed
+///     under syntax) → `Symbol(make_b) → ClassName('B')` lands in B's
+///     bag.
+///   - Consumer A: `use B qw(make_b); my $b = make_b(); $b->touch();`.
+///     At build time of A the imported sub's return type isn't
+///     visible → `$b` untyped → `$b->touch()` ref's `invocant_class`
+///     stays None.
+///   - `enrich_imported_types_with_keys` on A does push a Variable
+///     witness for `$b: ClassName('B')` (so `inferred_type_via_bag`
+///     answers correctly) but does NOT re-fill the MethodCall ref's
+///     `invocant_class`.
+///   - `refs_to` for `B::touch` then misses A's call site.
+///
+/// Fix surface: either invalidate-and-rebuild the consumer when
+/// upstream types arrive (heavy), or post-enrichment re-run
+/// `apply_chain_typing_invocants` (or its FA-side equivalent) so refs
+/// see the now-resolvable types. A query-time materializer that
+/// resolves invocant from the bag on every refs_to read would also
+/// work and avoids the cache-invalidation question.
+#[test]
+#[ignore = "cross-file invocant_class not refreshed by enrichment — see docs/prompt-cross-file-invocant-refresh.md"]
+fn references_cross_file_invocant_resolved_post_enrichment() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let producer_src = r#"
+package B;
+use Exporter 'import';
+our @EXPORT_OK = qw(make_b);
+
+sub new    { return bless {}, shift }
+sub make_b { return B->new }
+sub touch  { 1 }
+1;
+"#;
+    let consumer_src = r#"
+use B qw(make_b);
+my $b = make_b();
+$b->touch();
+1;
+"#;
+
+    let producer_path = PathBuf::from("/tmp/refs_xfile_b.pm");
+    let consumer_path = PathBuf::from("/tmp/refs_xfile_a.pm");
+
+    // Module index sees the producer so enrichment can resolve
+    // `make_b`'s return type via cross-file scan.
+    let idx = ModuleIndex::new_for_test();
+    let producer_fa = parse(producer_src);
+    idx.register_workspace_module(producer_path.clone(), Arc::new(producer_fa));
+
+    // Build the consumer and enrich it. Post-enrichment, the bag
+    // should know `$b: ClassName('B')` — verify that invariant first
+    // so the test fails for the right reason.
+    let mut consumer_fa = parse(consumer_src);
+    consumer_fa.enrich_imported_types_with_keys(Some(&idx));
+    let b_type = consumer_fa.inferred_type_via_bag(
+        "$b",
+        tree_sitter::Point { row: 4, column: 0 },
+    );
+    assert_eq!(
+        b_type.as_ref().and_then(|t| t.class_name()),
+        Some("B"),
+        "precondition: enrichment must type $$b as B; got {:?}",
+        b_type,
+    );
+
+    // Build a FileStore over both files. `refs_to` reads
+    // `invocant_class` directly off the consumer's MethodCall ref —
+    // that field was populated at consumer-build time when B's types
+    // weren't yet known.
+    let store = FileStore::new();
+    store.insert_workspace(producer_path, parse(producer_src));
+    store.insert_workspace(consumer_path.clone(), consumer_fa);
+
+    let target = TargetRef {
+        name: "touch".to_string(),
+        kind: TargetKind::Method { class: "B".to_string() },
+    };
+    let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
+    let consumer_hit = refs.iter().any(|r| {
+        matches!(&r.key, FileKey::Path(p) if p == &consumer_path)
+    });
+    assert!(
+        consumer_hit,
+        "refs_to(B::touch) missed consumer's $$b->touch() call site. \
+         invocant_class on the MethodCall ref is None because the \
+         consumer was built before B's return types were known, and \
+         enrichment does not refresh ref fields. hits: {:?}",
+        refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
+    );
+}

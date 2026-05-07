@@ -292,19 +292,6 @@ pub enum SymbolDetail {
         /// no core heuristic on the type name.
         #[serde(default)]
         opaque_return: bool,
-        /// Structural capture of the sub's implicit-last-statement
-        /// return when our in-file inference can't collapse it to a
-        /// concrete `InferredType`. Perl's last statement returns —
-        /// so `sub get { shift->_generate_route(GET => @_) }` has a
-        /// return equal to whatever `_generate_route` returns. We
-        /// can't compute that at walk time (cross-file return chains
-        /// aren't yet resolvable), but recording the method name lets
-        /// the consumer-side `find_method_return_type` chase it when
-        /// module_index IS available. Small, orthogonal to
-        /// `return_type` — populated only when `return_type` is None
-        /// after the walk.
-        #[serde(default)]
-        return_self_method: Option<String>,
     },
     Class {
         parent: Option<String>,
@@ -943,7 +930,6 @@ pub struct FileAnalysis {
     pub scopes: Vec<Scope>,
     pub symbols: Vec<Symbol>,
     pub refs: Vec<Ref>,
-    pub type_constraints: Vec<TypeConstraint>,
     pub fold_ranges: Vec<FoldRange>,
     pub imports: Vec<Import>,
     pub call_bindings: Vec<CallBinding>,
@@ -1000,21 +986,20 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub package_framework: HashMap<String, crate::witnesses::FrameworkFact>,
 
-    /// Part 7 — typed-evidence bag. Additive: `type_constraints`,
-    /// `call_bindings`, `method_call_bindings` all still flow the
-    /// existing paths. Witnesses are pushed by the builder in parallel
-    /// (where useful) and consumed by `FileAnalysis::inferred_type_via_bag`.
+    /// Part 7 — the witness bag. Canonical store for type facts:
+    /// every Variable type, Symbol/MethodOnClass return type, branch
+    /// arm Edge, hash-key observation. `inferred_type_via_bag` reads
+    /// here. The builder pushes directly via `push_type_constraint`
+    /// (Variable witnesses with TC shape) and per-attachment emit
+    /// helpers; cache blobs round-trip the bag in full.
     #[serde(default)]
     pub witnesses: crate::witnesses::WitnessBag,
 
-    // Baseline counts — set after build_indices(), used to truncate on re-enrichment.
-    #[serde(default)]
-    base_type_constraint_count: usize,
+    /// Witness-bag baseline — `enrich_imported_types_with_keys`
+    /// truncates back to this length before re-deriving so repeat
+    /// calls stay idempotent.
     #[serde(default)]
     base_symbol_count: usize,
-    /// Witness-bag baseline, parallel to the constraint baseline.
-    /// Enrichment truncates back to this length before re-deriving so
-    /// repeat calls stay idempotent.
     #[serde(default)]
     base_witness_count: usize,
 
@@ -1027,12 +1012,6 @@ pub struct FileAnalysis {
     symbols_by_scope: HashMap<ScopeId, Vec<SymbolId>>,
     #[serde(skip, default)]
     refs_by_name: HashMap<String, Vec<usize>>,
-    // NB: no parallel index for `type_constraints`. We used to maintain
-    // a `HashMap<String, Vec<usize>>` pointing into the Vec and it
-    // desynced on every truncate+rebuild (stale indices → panic on
-    // lookup). `inferred_type` scans the Vec directly instead —
-    // correctness over a speculative speedup on data that's in the
-    // hundreds at worst.
     /// Refs indexed by the SymbolId they resolve to (phase 5).
     /// Every query for "refs to symbol X" collapses to an O(1) lookup here.
     #[serde(skip, default)]
@@ -1045,7 +1024,6 @@ impl FileAnalysis {
         scopes: Vec<Scope>,
         symbols: Vec<Symbol>,
         refs: Vec<Ref>,
-        type_constraints: Vec<TypeConstraint>,
         fold_ranges: Vec<FoldRange>,
         imports: Vec<Import>,
         call_bindings: Vec<CallBinding>,
@@ -1063,7 +1041,6 @@ impl FileAnalysis {
             scopes,
             symbols,
             refs,
-            type_constraints,
             fold_ranges,
             imports,
             call_bindings,
@@ -1078,7 +1055,6 @@ impl FileAnalysis {
             type_provenance,
             witnesses: crate::witnesses::WitnessBag::new(),
             package_framework: HashMap::new(),
-            base_type_constraint_count: 0,
             base_symbol_count: 0,
             base_witness_count: 0,
             scope_starts: Vec::new(),
@@ -1088,92 +1064,17 @@ impl FileAnalysis {
             refs_by_target: HashMap::new(),
         };
         fa.build_indices();
-        // Seed the bag from type_constraints so direct constructions
-        // (tests, deserialised analyses without a bag, ad-hoc fa
-        // assembly) get a working witness pipeline. The builder path
-        // overwrites this with its own already-populated bag — so
-        // the seeding is redundant on that path, but it's the
-        // architectural invariant: every FileAnalysis ALWAYS has a
-        // bag in sync with `type_constraints` when it returns from a
-        // constructor.
-        fa.seed_bag_from_constraints();
-        // NB: the local `resolve_method_call_types(None)` post-pass and
-        // baseline-count seal moved out to `finalize_post_walk()` so
-        // they run AFTER `build()` injects the witness bag. Bag and
-        // type_constraints stay in sync because the post-pass goes
-        // through `push_type_constraint`.
+        // The builder path overwrites `witnesses` with its already-populated
+        // bag after construction. Hand-crafted FAs (tests) push witnesses
+        // directly via `fa.witnesses.push(...)` or `push_type_constraint`.
+        // `finalize_post_walk` runs on the builder path to seal baseline
+        // counts and resolve text-based MCB; tests skip it.
         fa
-    }
-
-    /// Mirror every existing `TypeConstraint` into the witness bag as
-    /// a `Variable` witness (with class-assertion / FirstParam
-    /// observations for class-identity types).
-    ///
-    /// Per-symbol return types are NOT seeded here — `Symbol.return_type`
-    /// was deleted in D1, and the bag carries those facts directly
-    /// (`Symbol(sym_id)` / `MethodOnClass{class, name}`) via the
-    /// builder's `write_back_sub_return_types` and round-trip through
-    /// the bincode blob. This method is the fa-construction-time
-    /// counterpart for code that builds a FileAnalysis without going
-    /// through `builder::build` — hand-crafted FAs in tests, ad-hoc
-    /// FA assembly. Called from `FileAnalysis::new` and
-    /// `after_deserialize` to keep the invariant: bag and
-    /// `type_constraints` are in sync after a constructor returns.
-    pub(crate) fn seed_bag_from_constraints(&mut self) {
-        use crate::witnesses::{
-            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
-        };
-        for tc in self.type_constraints.clone() {
-            self.witnesses.push(Witness {
-                attachment: WitnessAttachment::Variable {
-                    name: tc.variable.clone(),
-                    scope: tc.scope,
-                },
-                source: WitnessSource::Builder("type_constraint".into()),
-                payload: WitnessPayload::InferredType(tc.inferred_type.clone()),
-                span: Span { start: tc.constraint_span.start, end: tc.constraint_span.start },
-            });
-            match tc.inferred_type {
-                InferredType::ClassName(n) => {
-                    self.witnesses.push(Witness {
-                        attachment: WitnessAttachment::Variable {
-                            name: tc.variable,
-                            scope: tc.scope,
-                        },
-                        source: WitnessSource::Builder("type_constraint".into()),
-                        payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(n)),
-                        span: tc.constraint_span,
-                    });
-                }
-                InferredType::FirstParam { package } => {
-                    self.witnesses.push(Witness {
-                        attachment: WitnessAttachment::Variable {
-                            name: tc.variable,
-                            scope: tc.scope,
-                        },
-                        source: WitnessSource::Builder("type_constraint".into()),
-                        payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
-                            package,
-                        }),
-                        span: tc.constraint_span,
-                    });
-                }
-                _ => {}
-            }
-        }
-        // Sub/Method return-type seeding from `Symbol.return_type` is
-        // gone: the field was deleted in D1 of the bag-residual
-        // refactor. The bag is the single durable carrier of
-        // per-symbol return types post-build, and bincode-serialized
-        // FAs round-trip the bag directly. The cache version bump
-        // forces re-resolution for any blob produced before the
-        // field was removed.
     }
 
     /// Run the local-only method-call-binding resolution and seal
     /// baseline counts. Called by `builder::build` after the witness
-    /// bag has been moved in. Keeps the bag canonical: every new
-    /// `TypeConstraint` pushed here lands as a `Witness` too.
+    /// bag has been moved in.
     ///
     /// `Symbol(sym_id)` and `MethodOnClass{class, name}` return-type
     /// witnesses for every local Sub/Method are already in the bag —
@@ -1183,7 +1084,6 @@ impl FileAnalysis {
     /// mirror; they resolve lazily through `query_sub_return_type`.
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
-        self.base_type_constraint_count = self.type_constraints.len();
         self.base_symbol_count = self.symbols.len();
         self.base_witness_count = self.witnesses.len();
     }
@@ -1385,9 +1285,9 @@ impl FileAnalysis {
         None
     }
 
-    /// Raw `type_constraints` lookup — returns the latest in-scope
-    /// constraint for `var_name` before `point`, with no framework
-    /// rules, no branch fold, no narrowing.
+    /// Raw Variable+InferredType lookup — returns the latest in-scope
+    /// witness for `var_name` before `point`, with no framework rules,
+    /// no branch fold, no narrowing.
     ///
     /// **NOT the canonical type query.** Use `inferred_type_via_bag`
     /// for any consumer that wants the answer the rest of the LSP
@@ -1395,25 +1295,28 @@ impl FileAnalysis {
     ///
     /// 1. Internal "did we explicitly assign a type to this variable
     ///    yet?" checks (e.g. `resolve_method_call_types` early-out)
-    ///    that need the bare constraint state, not the bag's reduced
-    ///    answer (which can be non-`None` from rep observations alone).
-    /// 2. Tests that assert on raw constraint state.
+    ///    that need the bare seed state, not the bag's reduced answer
+    ///    (which can be non-`None` from rep observations alone).
+    /// 2. Tests that assert on raw seed state.
     ///
     /// If you find a third use case, prefer `inferred_type_via_bag`
     /// and only fall back here if you have a concrete reason that
     /// would survive a code review.
     pub fn inferred_type(&self, var_name: &str, point: Point) -> Option<&InferredType> {
-        let mut best: Option<&TypeConstraint> = None;
-        for tc in &self.type_constraints {
-            if tc.variable != var_name { continue; }
-            let scope = &self.scopes[tc.scope.0 as usize];
-            if !contains_point(&scope.span, point) { continue; }
-            if tc.constraint_span.start > point { continue; }
-            if best.is_none() || tc.constraint_span.start > best.unwrap().constraint_span.start {
-                best = Some(tc);
+        use crate::witnesses::{WitnessAttachment, WitnessPayload};
+        let mut best: Option<(&InferredType, Point)> = None;
+        for w in self.witnesses.all() {
+            let WitnessAttachment::Variable { name, scope } = &w.attachment else { continue };
+            if name != var_name { continue; }
+            let scope_obj = &self.scopes[scope.0 as usize];
+            if !contains_point(&scope_obj.span, point) { continue; }
+            if w.span.start > point { continue; }
+            let WitnessPayload::InferredType(t) = &w.payload else { continue };
+            if best.is_none() || w.span.start > best.unwrap().1 {
+                best = Some((t, w.span.start));
             }
         }
-        best.map(|tc| &tc.inferred_type)
+        best.map(|(t, _)| t)
     }
 
     /// Part 6/7 — query the witness bag via the reducer registry for
@@ -1422,11 +1325,11 @@ impl FileAnalysis {
     /// `InferredType` because the reducer may synthesize a value not
     /// stored anywhere.
     ///
-    /// Additive by design: every existing flow (`type_constraints`,
-    /// `call_bindings`, framework accessor synthesis, cross-file
-    /// enrichment) keeps writing its usual structures. Witnesses push
-    /// *additional* observations on top; if none are present the
-    /// result is identical to `inferred_type()`.
+    /// The bag is the canonical store: `push_type_constraint` (TC
+    /// shape), `call_bindings` propagation, framework accessor
+    /// synthesis, and cross-file enrichment all push witnesses here.
+    /// `inferred_type` reads the same Variable+InferredType slice
+    /// without applying reducer rules.
     pub fn inferred_type_via_bag(&self, var_name: &str, point: Point) -> Option<InferredType> {
         let scope = self.scope_at(point)?;
         crate::witnesses::query_variable_type(
@@ -1591,9 +1494,9 @@ impl FileAnalysis {
         module_index: Option<&ModuleIndex>,
     ) {
         // Truncate back to baseline so repeated enrichment doesn't
-        // accumulate duplicates. The bag is also truncated; enrichment
-        // pushes Variable witnesses via `push_type_constraint`.
-        self.type_constraints.truncate(self.base_type_constraint_count);
+        // accumulate duplicates. Enrichment pushes Variable witnesses
+        // via `push_type_constraint` and synthetic symbols + witnesses
+        // for imported-hash-key completion.
         self.symbols.truncate(self.base_symbol_count);
         self.witnesses.truncate(self.base_witness_count);
 
@@ -1818,28 +1721,20 @@ impl FileAnalysis {
         }
     }
 
-    /// Push a `TypeConstraint` and mirror it into the witness bag in
-    /// one step. The bag is the source of truth; every code path that
-    /// adds a constraint must call this so subsequent
-    /// `inferred_type` / `inferred_type_via_bag` queries see it. New
-    /// callers in the resolve / enrich path go through here. The walk
-    /// (Builder) seeds the bag in bulk via `populate_witness_bag` and
-    /// pushes call-binding constraints through its own helper —
-    /// equivalent semantics, different phase.
+    /// Push a `TypeConstraint` shape into the witness bag — a Variable
+    /// `InferredType` witness plus a class-assertion observation when
+    /// the type is a class identity. The bag is the single store; this
+    /// helper exists so callers can keep the legible "I'm seeding a
+    /// type constraint on $X" call shape rather than open-coding the
+    /// witness construction. Builder has a parallel helper that does
+    /// the same thing during the walk.
     pub(crate) fn push_type_constraint(&mut self, tc: TypeConstraint) {
         use crate::witnesses::{
             TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
         };
-        let var = tc.variable.clone();
-        let scope = tc.scope;
-        let span = tc.constraint_span;
-        let ty = tc.inferred_type.clone();
-        self.type_constraints.push(tc);
+        let TypeConstraint { variable, scope, constraint_span: span, inferred_type: ty } = tc;
         self.witnesses.push(Witness {
-            attachment: WitnessAttachment::Variable {
-                name: var.clone(),
-                scope,
-            },
+            attachment: WitnessAttachment::Variable { name: variable.clone(), scope },
             source: WitnessSource::Builder("type_constraint".into()),
             payload: WitnessPayload::InferredType(ty.clone()),
             span: Span { start: span.start, end: span.start },
@@ -1847,7 +1742,7 @@ impl FileAnalysis {
         match ty {
             InferredType::ClassName(n) => {
                 self.witnesses.push(Witness {
-                    attachment: WitnessAttachment::Variable { name: var, scope },
+                    attachment: WitnessAttachment::Variable { name: variable, scope },
                     source: WitnessSource::Builder("type_constraint".into()),
                     payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(n)),
                     span,
@@ -1855,7 +1750,7 @@ impl FileAnalysis {
             }
             InferredType::FirstParam { package } => {
                 self.witnesses.push(Witness {
-                    attachment: WitnessAttachment::Variable { name: var, scope },
+                    attachment: WitnessAttachment::Variable { name: variable, scope },
                     source: WitnessSource::Builder("type_constraint".into()),
                     payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
                         package,
@@ -3612,23 +3507,17 @@ impl FileAnalysis {
                 })
         } else {
             // Bareword invocant: ambiguous between class-name and
-            // zero-arg function call. If a local Sub/Method with this
-            // name has a ClassName return type, treat it as the call
-            // and use its return type — that's what Perl does at
-            // runtime when the name resolves as a sub. Falls back to
-            // class-name interpretation when no such sub exists.
-            // Mirrors the same rule in `receiver_type_for` and
-            // `resolve_invocant_class_tree` so every bareword-invocant
-            // path sees the same answer.
+            // zero-arg function call. If a sub by this name resolves
+            // (locally or via a cross-file import) to a ClassName
+            // return type when called with zero args, treat the
+            // bareword as the call and use that class. Mirrors the
+            // same rule in `receiver_type_for` and
+            // `resolve_invocant_class_tree`.
             let bare = invocant.rsplit("::").next().unwrap_or(invocant);
-            for sym in &self.symbols {
-                if sym.name != bare { continue; }
-                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                if let Some(InferredType::ClassName(c)) =
-                    self.symbol_return_type_via_bag(sym.id, None)
-                {
-                    return Some(c);
-                }
+            if let Some(InferredType::ClassName(c)) =
+                self.sub_return_type_at_arity(bare, Some(0))
+            {
+                return Some(c);
             }
             Some(invocant.to_string())
         }

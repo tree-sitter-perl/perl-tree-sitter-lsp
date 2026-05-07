@@ -423,28 +423,29 @@ everything else is at most a derived index rebuilt from it.
       Cross-file `MethodOnClass` queries through `BagContext.module_index`
       replace the explicit copy.
 
-- [ ] **Kill `FileAnalysis.type_constraints` as a write target.** It
-      can survive as a derived projection over Variable witnesses
-      built post-finalize for legacy consumers, OR die outright if
-      nothing reads it that can't read the bag instead. Audit
-      `push_type_constraint` callers to decide.
+- [~] **Kill `FileAnalysis.type_constraints` as a write target.**
+      Done as a partial: writes restricted to `push_type_constraint`
+      (which mirrors both stores), and the legacy non-helper
+      mutations are gone — `propagate_call_bindings_to_constraints`
+      is bag-only, `apply_chain_typing_assignments`'s
+      "already typed" check reads the bag, `resolve_hash_key_owners`
+      builds its type_map from bag witnesses, and the legacy
+      `inferred_type` API reads bag Variable+InferredType witnesses
+      directly. The vec field stays for serialized blobs and
+      debug/dump readers (main.rs `--dump-package`, plugin sandbox
+      diff) — those are non-load-bearing and worth the API churn
+      only when the next refactor pillar takes them.
 
-- [ ] **Kill the walk-time TC-first read** in
-      `invocant_type_at_node`'s scalar arm (builder.rs:1358-1362). The
-      reason it exists is "walk-time bag isn't populated yet, TCs
-      are." Fix by populating the bag live during the walk (push
-      Variable witnesses as TCs are seeded, not in one shot at
-      `populate_witness_bag`). Then the bag is canonical at every
-      phase, walk-time included.
+- [x] **Kill the walk-time TC-first read** in
+      `invocant_type_at_node`'s scalar arm. `push_type_constraint`
+      now mirrors TCs into Variable witnesses live during the walk,
+      so `bag_query_variable` always sees seed state.
 
-- [ ] **Kill `pending_witnesses` staging.** With live walk-time bag
-      population, the staging vec is dead — push directly to
-      `self.bag` from the walk emit sites.
+- [x] **Kill `pending_witnesses` staging.** Walk-time idiom emit
+      sites push directly to `self.bag`.
 
-- [ ] **Kill the FA-side `resolve_invocant_class` bareword arm field
-      read** (file_analysis.rs:3768-3775). Already a known followup;
-      route through `sub_return_type_at_arity(bare, Some(0))`. Becomes
-      trivial after Directive 1 lands the unified attachment shape.
+- [x] **Kill the FA-side `resolve_invocant_class` bareword arm field
+      read.** Routes through `sub_return_type_at_arity(bare, Some(0))`.
 
 - [x] **Kill the Builder's `last_expr_type` map.** Landed in
       Directive 2. Replaced with `last_expr_span: HashMap<ScopeId, Span>`
@@ -457,16 +458,18 @@ everything else is at most a derived index rebuilt from it.
       last statement we saw" — easiest at sub-body-close, which
       means a small visit hook.
 
-- [ ] **Kill `sub_return_delegations` and `self_method_tails` Builder
-      maps** as inputs to bag emission. After Directive 2, each return
-      is just an `Edge(Expr(span))` — the walker emits the edge
-      directly, no bookkeeping map. `fixup_call_bound_hash_key_owners`
-      (the only other reader) walks delegation chains for HashKeyOwner
-      resolution, which is a different question — that piece either
-      gets its own bag-routed answer (a `HashKeyOwnerEdge`?) or stays
-      procedural and explicitly NOT a type-inference path.
+- [x] **Kill `sub_return_delegations` and `self_method_tails` Builder
+      maps as inputs to bag emission.** `self_method_tails` and
+      `emit_delegation_edges` are gone — the bag-routed
+      `Symbol(_) ← branch_arm Edge → Expr(body) → Edge(call_target)`
+      chain handles delegation/tail propagation through D2's
+      `Edge(Expr(span))` emission. `sub_return_delegations` survives
+      as a procedural input to `fixup_call_bound_hash_key_owners`
+      only — explicitly NOT a type-inference path. The vestigial
+      `return_self_method` Symbol field is gone too (was set only
+      from `self_method_tails`; tests + `--dump-package` updated).
 
-- [ ] **Collapse the per-arm Edge expansion in
+- [x] **Collapse the per-arm Edge expansion in
       `publish_return_arm_witnesses` and
       `emit_branch_arm_witnesses_for_ternary`.** D2 left a residual
       duplication of mechanism: when the return body (or the RHS of
@@ -543,14 +546,53 @@ everything else is at most a derived index rebuilt from it.
   short-circuit) and is tracked in the D4 list above; the rule
   becomes unconditional once that item lands.
 
+- **Post-D4-G: delete `SubReturnReducer` entirely by unifying
+  synthesis into the arm-fold protocol.** D4-G's endgame leaves
+  `SubReturnReducer` alive as a passthrough — it claims
+  `Symbol + InferredType` and returns the writeback's primary
+  stored return. That witness only exists because synthesized
+  accessors (Mojo `has`, DBIC columns, plugin overrides, framework
+  accessor synth) emit a *direct* `InferredType` on `Symbol(sid)`
+  instead of going through the arm-fold shape. With no `return X`
+  source-level statements, there's no `branch_arm` Edge for
+  `SymbolReturnArmFold` to chase — so the direct witness is the
+  only record.
+
+  The unification: every synthesis site emits a synthetic
+  `Expr(synth_span) + expression: InferredType(t)` plus a
+  `Symbol(sid) ← branch_arm Edge → Expr(synth_span)`. Then
+  `SymbolReturnArmFold`'s `resolve_return_type([t])` returns `t`
+  exactly the same way it handles a real one-arm sub. Plugin
+  overrides keep their priority short-circuit, just relocated to
+  whichever attachment carries the synth Edge.
+
+  After unification, `Symbol(_)` carries no direct InferredType
+  witnesses at all — it's purely a query handle that Edges through
+  to the arm-fold attachment. `SubReturnReducer` becomes dead code
+  (no claimable witnesses) and gets deleted. The registry shrinks
+  to one per-sym fold reducer.
+
+  Cost: ~8–12 synthesis sites switch from "write `resolved_returns`"
+  / "push direct `Symbol + InferredType`" to "emit synth Expr + arm
+  Edge." Slight verbosity at the emit site, dramatic simplification
+  on the read side. Stacks on top of D4-G + `prompt-cleanups.md` #1
+  (which kills the `resolved_returns` intermediate but keeps the
+  direct-witness shape). The Mojo getter+writer pair on
+  `MethodOnClass{class, name}` stays primary-deduped — that part
+  is orthogonal.
+
+  **Schedule:** after D4-G ships and the rule is unconditional. The
+  unification turns "rule has zero exceptions" into "rule has zero
+  exceptions AND the registry has no fallback reducer for Symbol."
+
 ---
 
 ## Hardening (not principle-driven, but should land alongside)
 
-- [ ] `MAX_FOLD_ITERATIONS` is `debug_assert!`-only — release builds
-      have no cap, just rely on the lattice argument. Add a real
-      release-mode bound with a `tracing::error!` and break, or trust
-      the lattice and remove the debug-only check entirely. Pick one.
+- [x] `MAX_FOLD_ITERATIONS` is now an all-builds bound: `debug_assert!`
+      stays as the dev-time tripwire, plus a release-mode `eprintln!`
+      + `break` so a regression keeps the LSP responsive instead of
+      spinning forever.
 
 ---
 

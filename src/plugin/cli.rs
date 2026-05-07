@@ -271,19 +271,41 @@ fn diff_emissions(baseline: &FileAnalysis, with_plugin: &FileAnalysis, plugin_id
         }))
         .collect();
 
-    // type_constraints — diff by (var_name, type, span).
-    let baseline_tc: std::collections::HashSet<String> =
-        baseline.type_constraints.iter().map(tc_key).collect();
-    let type_constraints: Vec<Value> = with_plugin
-        .type_constraints
+    // type_constraints — diff Variable+InferredType witnesses by
+    // (var_name, type, scope, span). The bag is canonical;
+    // `push_type_constraint` mirrors every TC into a Variable witness,
+    // so plugin-emitted TCs land here regardless.
+    use crate::witnesses::{WitnessAttachment, WitnessPayload};
+    let var_type_key = |w: &crate::witnesses::Witness| -> Option<String> {
+        let WitnessAttachment::Variable { name, scope } = &w.attachment else { return None };
+        let WitnessPayload::InferredType(t) = &w.payload else { return None };
+        Some(format!(
+            "{}|{:?}|{}|{}:{}",
+            name, t, scope.0, w.span.start.row, w.span.start.column,
+        ))
+    };
+    let baseline_tc: std::collections::HashSet<String> = baseline
+        .witnesses
+        .all()
         .iter()
-        .filter(|tc| !baseline_tc.contains(&tc_key(tc)))
-        .map(|tc| json!({
-            "var": tc.variable,
-            "type": format!("{:?}", tc.inferred_type),
-            "scope": tc.scope.0,
-            "from_line": tc.constraint_span.start.row,
-        }))
+        .filter_map(var_type_key)
+        .collect();
+    let type_constraints: Vec<Value> = with_plugin
+        .witnesses
+        .all()
+        .iter()
+        .filter_map(|w| {
+            let key = var_type_key(w)?;
+            if baseline_tc.contains(&key) { return None; }
+            let WitnessAttachment::Variable { name, scope } = &w.attachment else { return None };
+            let WitnessPayload::InferredType(t) = &w.payload else { return None };
+            Some(json!({
+                "var": name,
+                "type": format!("{:?}", t),
+                "scope": scope.0,
+                "from_line": w.span.start.row,
+            }))
+        })
         .collect();
 
     json!({
@@ -386,14 +408,6 @@ fn import_key(i: &crate::file_analysis::Import) -> String {
     let mut items: Vec<&str> = i.imported_symbols.iter().map(|s| s.local_name.as_str()).collect();
     items.sort();
     format!("{}|{:?}", i.module_name, items)
-}
-
-fn tc_key(tc: &crate::file_analysis::TypeConstraint) -> String {
-    format!(
-        "{}|{:?}|{}|{}:{}",
-        tc.variable, tc.inferred_type, tc.scope.0,
-        tc.constraint_span.start.row, tc.constraint_span.start.column,
-    )
 }
 
 // ---- --plugin-check report ----
