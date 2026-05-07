@@ -1,8 +1,56 @@
 # Cross-file invocant_class refresh
 
-**Status:** known regression. Pinned by
-`references_cross_file_invocant_resolved_post_enrichment` in
-`resolve_tests.rs` (`#[ignore]` until this lands).
+**Status:** **LANDED in PR #34.** Implemented as **option 2** (drop
+the cached field), not option 3 (hybrid cache + bag fallback) which
+this spec originally recommended. Decisive factor against option 3:
+chain hops where the inner receiver's class is only known via
+cross-file enrichment (`$x->makeFoo()->ping()` — `makeFoo` returns
+a cross-file class) — option 3's bag fallback hits a string-based
+resolver that doesn't walk a chain at read time, so the chain hop
+keeps `invocant_class: None` and class-keyed ref filters silently
+miss it. Option 2's helper recurses on the inner receiver via
+`call_ref_by_start` and re-resolves fresh; cross-file enrichment
+composes through every chain hop without any read-time refresh
+logic. Pinned by `refs_to_cross_file_chain_hop_post_enrichment` and
+`find_highlights_cross_file_chain_hop_post_enrichment`.
+
+The single dispatcher is `FileAnalysis::method_call_invocant_class
+(ref, module_index)` — invocant shape (variable / chain receiver /
+function-call receiver / bareword / `__PACKAGE__` / `shift` /
+`$_[0]`) dispatches into bag queries; build-time chain typing
+publishes the witnesses the helper reads.
+`Builder.method_call_invocant: HashMap<usize, String>` survives as
+build-only worklist state (movement counter + post-walk arg-key
+emission gating) but is never copied into `FileAnalysis`.
+
+Bonus collapses landed in the same PR:
+  * 7-arg `resolve_method_invocant_public(invocant, span, scope,
+    point, tree, source, module_index)` → 2-arg `method_call_
+    invocant_class(ref, module_index)`.
+  * `_with_index` API duplicates removed; one signature with
+    `Option<&ModuleIndex>`.
+  * `module_index` threaded uniformly through the in-file readers
+    (`find_references` / `find_highlights` / `collect_refs_for_target`
+    / `rename_kind_at` / `rename_callable_in_scope` /
+    `rename_sub_in_package` / `rename_method_in_class`) — was
+    index-blind before.
+  * Perf bench gated on `--features perf_bench` (~11.5ms per
+    `refs_to` over 200 files × 50 calls; comfortably inside an LSP
+    interactive budget).
+  * 8 targeted tests pinning the `call_ref_by_start` tiebreak
+    invariants (smallest-span wins, equal-span first-write-wins,
+    only-call-kinds-indexed, `is_self` recursion guard) in
+    `src/call_ref_index_tests.rs`.
+
+Tests: 525 unit + 20 e2e green; the original red-pin
+`references_cross_file_invocant_resolved_post_enrichment` is
+un-ignored, plus `find_highlights_cross_file_invocant_resolved_post_enrichment`,
+`refs_to_cross_file_invocant_inherited_method` (multi-hop `use
+parent` chain), and the two chain-hop discriminators above.
+
+Original spec preserved below for context.
+
+---
 
 ## The bug
 
