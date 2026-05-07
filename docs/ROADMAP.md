@@ -25,7 +25,7 @@ Four docs, one engine:
 |---|---|---|
 | `prompt-type-inference-unification.md` | **HOW** — collapse walker + bag into one path | **Steps 1–4 landed (PR #27)** — historical |
 | `working-bag-residual.md` | **FINISH THE COLLAPSE** — four directives for "bag is the only truth" | **D1–D4 landed (PR #31).** D4-G follow-up open |
-| `prompt-forward-reference-resolution.md` | **REGRESSION** — walk-time sym lookups miss forward-defined callees | **Top of queue.** Red-pinned |
+| `prompt-forward-reference-resolution.md` | **REGRESSION** — walk-time sym lookups miss forward-defined callees | **LANDED** — post-walk resolver |
 | `prompt-cross-file-invocant-refresh.md` | **REGRESSION** — `invocant_class` cache stale after enrichment, cross-file refs under-match | **Top of queue.** Red-pinned |
 | `prompt-type-inference-residual.md` | **WHAT'S MISSING** — Parts 1–5 fact classes | each is a reducer+emitter pair |
 | `prompt-sequence-types.md` | **FIRST BIG CONSUMER** — sequence type lattice | 5 phases; ~half the spike's diff on a clean foundation |
@@ -40,7 +40,7 @@ staircase 1–4 (LANDED, PR #27) ─┐
                                  ├─▶ bag-residual D4 + follow-up (LANDED, PR #31 —
                                  │       FA.type_constraints gone, EXTRACT_VERSION 21)
                                  │       │
-                                 │       ├─▶ ★ forward-reference resolution (red-pinned)
+                                 │       ├─▶ forward-reference resolution (LANDED)
                                  │       ├─▶ ★ cross-file invocant refresh (red-pinned)
                                  │       │
                                  │       └─▶ sequence-types phases 1-3
@@ -52,8 +52,10 @@ staircase 1–4 (LANDED, PR #27) ─┐
 ```
 
 ★ = known regression with a pinned `#[ignore]` test that fails until
-fixed. Both block downstream type-intelligence quality but don't block
-sequence-types architecturally — sequence types can land in parallel.
+fixed. Forward-reference resolution landed; cross-file invocant
+refresh is the only ★ left. Both block downstream type-intelligence
+quality but don't block sequence-types architecturally — sequence
+types can land in parallel.
 
 - **Unification staircase** is done. PR #27 subsumed Steps 1–4: the walker only
   observes, edge-payload witnesses replace closure-driven chase, deferred-var /
@@ -131,17 +133,22 @@ sequence-types architecturally — sequence types can land in parallel.
    bumped 20 → 21), migrated `--dump-package vars_in_scope` and the
    plugin sandbox diff to bag reads, and pushed two known regressions
    into red-pinned tests rather than leaving them undocumented:
-   - **★ forward-reference resolution.** D4-E's bag-routed `Symbol ←
-     branch_arm Edge → Expr(body) → Edge(call_target)` chain assumes
-     `expr_payload` can resolve `call_target` at walk time, but
-     `function_call_expression`'s arm does walk-time
-     `self.symbols.iter().find(name)` — silently emits nothing for
-     forward-defined callees. Real-world hit: Carp's `longmess` →
-     `longmess_heavy`. Fix surface = a single post-walk
-     "compile-esque" pass that performs all definedness-dependent
-     lookups against the final symbol table; spec in
-     `docs/prompt-forward-reference-resolution.md`. Pinned by
-     `forward_reference_call_in_sub_return_resolves`.
+   - **forward-reference resolution.** **LANDED.** Walk queues every
+     name-driven `expr_payload` arm (`function_call_expression` /
+     `ambiguous_function_call_expression` / `bareword` /
+     `scoped_identifier`) whose symbol-table lookup came up empty as
+     `(name, expr_span)` in `Builder.unresolved_call_targets`. New
+     post-walk pass `resolve_forward_call_targets` runs between
+     `populate_witness_bag` and `fold_to_fixed_point` and pushes the
+     missing `Expr(span) → Edge(Symbol(sid))` witness for every entry
+     that resolves against the now-final symbol table. Same source
+     tag (`expression`) and span as the walk-time path so reducers
+     can't tell the two emission sites apart. Tests: 512 unit + 93
+     e2e green; coverage expanded beyond the Carp shape to ternary
+     arms, scoped-identifier calls, implicit returns, and
+     self-method tails (see `forward_reference_*` in
+     `builder_tests.rs`). Spec:
+     `docs/prompt-forward-reference-resolution.md`.
    - **★ cross-file `invocant_class` refresh.** `Ref::MethodCall.invocant_class`
      is set once at build time and never refreshed; when a consumer's
      invocant only becomes typeable post-enrichment (cross-file
@@ -151,11 +158,8 @@ sequence-types architecturally — sequence types can land in parallel.
      `docs/prompt-cross-file-invocant-refresh.md`. Pinned by
      `references_cross_file_invocant_resolved_post_enrichment`.
 
-   Both regressions are next on the queue before sequence-types
-   phases. They're independent of each other (different attachment
-   shapes, different fix surfaces) — order by which hurts user
-   workflows more. The forward-ref one is the higher-frequency hit
-   in real Perl code (Carp pattern is everywhere).
+   Forward-ref landed first (higher-frequency hit; Carp pattern is
+   everywhere). Cross-file invocant refresh remains queued.
 
 5. **Sequence-types phases 1-3** on the clean foundation. Can land in
    parallel with the regression fixes above; not architecturally

@@ -186,6 +186,7 @@ fn build_with_plugins_inner(
         plugin_namespaces: Vec::new(),
         type_provenance: std::collections::HashMap::new(),
         bag: crate::witnesses::WitnessBag::new(),
+        unresolved_call_targets: Vec::new(),
         package_framework: std::collections::HashMap::new(),
         scope_stack: Vec::new(),
         current_package: None,
@@ -259,6 +260,17 @@ fn build_with_plugins_inner(
     // (branch arms, arity gating) are already in `b.bag` — pushed
     // live during the walk.
     b.populate_witness_bag();
+
+    // Forward-reference resolution: walk-time `expr_payload` arms for
+    // `function_call_expression` / `bareword` / `scoped_identifier` did
+    // a `self.symbols.iter().find` against a partial symbol table.
+    // Forward-defined callees (Perl's `sub a { b() } sub b {…}` pattern,
+    // canonically Carp's `longmess` → `longmess_heavy`) silently
+    // produced no witness. The walk queued each missing lookup; resolve
+    // them now against the final symbol table and push the
+    // `Expr(span) → Edge(Symbol(sid))` witness the walk would have.
+    // See `docs/prompt-forward-reference-resolution.md`.
+    b.resolve_forward_call_targets();
 
     // Phase 6: worklist driver. Replaces the manually-ordered
     // `fold → chain → fold → chain` sequence with one fixed-point
@@ -909,6 +921,15 @@ struct Builder<'a> {
     /// push directly here. Moved into `FileAnalysis.witnesses` when
     /// the analysis is constructed — no second seeding pass.
     bag: crate::witnesses::WitnessBag,
+    /// Walk-time symbol-table lookups that came up empty for a name
+    /// resolvable to a local sub. Perl's name resolution for subs is
+    /// forward-tolerant (`sub a { b() } sub b {…}` is legal), but the
+    /// walk emits witnesses live, so a forward-defined callee silently
+    /// produces no witness in `expr_payload`'s call arms. Re-resolved
+    /// against the final symbol table by `resolve_forward_call_targets`
+    /// between `populate_witness_bag` and `fold_to_fixed_point`. See
+    /// `docs/prompt-forward-reference-resolution.md`.
+    unresolved_call_targets: Vec<UnresolvedCallTarget>,
     /// Per-package framework fact, computed from `framework_modes` once
     /// the walk finishes. Available before `resolve_return_types` so
     /// the bag-aware return-arm fold can ask the framework-aware
@@ -943,6 +964,18 @@ enum FrameworkMode {
     Moo,
     Moose,
     MojoBase,
+}
+
+/// Queued by `emit_expr_witness` whenever a name-driven call kind
+/// (`function_call_expression`, `bareword`, `scoped_identifier`) couldn't
+/// emit its `Edge(Symbol(_))` witness because the callee wasn't in the
+/// symbol table yet. Re-resolved post-walk against the final symbols.
+#[derive(Debug, Clone)]
+struct UnresolvedCallTarget {
+    /// Bare sub name (e.g. `longmess_heavy`, stripped of any `Pkg::` prefix).
+    name: String,
+    /// `Expr(span)` attachment that the missing witness should land on.
+    expr_span: Span,
 }
 
 impl<'a> Builder<'a> {
@@ -3608,6 +3641,62 @@ impl<'a> Builder<'a> {
                 source: WitnessSource::Builder("expression".into()),
                 payload,
                 span,
+            });
+        } else if let Some(name) = self.forward_call_name(node) {
+            // Sub call by bare name whose target wasn't in the symbol
+            // table yet — Perl resolves these at symbol-table time, not
+            // parse time, so the lookup is legitimately deferred. Queue
+            // for `resolve_forward_call_targets` to retry post-walk.
+            self.unresolved_call_targets.push(UnresolvedCallTarget {
+                name,
+                expr_span: span,
+            });
+        }
+    }
+
+    /// Return the bare-name of the sub the expression node *would* have
+    /// been resolved to, for the kinds whose `expr_payload` arm produces
+    /// `Edge(Symbol(sid))`. `None` for any other kind. Mirrors the
+    /// extraction logic in `expr_payload` exactly so a lookup that
+    /// failed there with `?` is rephrased as a queue entry here.
+    fn forward_call_name(&self, node: Node<'a>) -> Option<String> {
+        match node.kind() {
+            "function_call_expression" | "ambiguous_function_call_expression" => {
+                let func = node.child_by_field_name("function")?;
+                let name = func.utf8_text(self.source).ok()?;
+                Some(name.rsplit("::").next().unwrap_or(name).to_string())
+            }
+            "bareword" | "scoped_identifier" => {
+                let name = node.utf8_text(self.source).ok()?;
+                Some(name.rsplit("::").next().unwrap_or(name).to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Post-walk: re-resolve every queued `(name, expr_span)` pair
+    /// against the now-final symbol table and push the
+    /// `Expr(span) → Edge(Symbol(sid))` witness that
+    /// `emit_expr_witness` would have pushed live if the target had
+    /// existed. Same source tag (`expression`) and span as the
+    /// walk-time path so reducers can't tell the two emission sites
+    /// apart. Names that still don't resolve (cross-file imports
+    /// without a local sym, typos) are silently dropped — the bag is
+    /// monotone, no negative witnesses.
+    fn resolve_forward_call_targets(&mut self) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+        let queued = std::mem::take(&mut self.unresolved_call_targets);
+        for entry in queued {
+            let Some(sid) = self.symbols.iter().find(|s| {
+                s.name == entry.name && matches!(s.kind, SymKind::Sub | SymKind::Method)
+            }).map(|s| s.id) else {
+                continue;
+            };
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Expr(entry.expr_span),
+                source: WitnessSource::Builder("expression".into()),
+                payload: WitnessPayload::Edge(WitnessAttachment::Symbol(sid)),
+                span: entry.expr_span,
             });
         }
     }

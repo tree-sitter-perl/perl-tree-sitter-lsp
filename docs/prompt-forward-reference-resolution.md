@@ -1,8 +1,12 @@
 # Forward-reference resolution
 
-**Status:** known regression introduced by D4-E (commit 80b2b88). Pinned by
-`forward_reference_call_in_sub_return_resolves` in `builder_tests.rs`
-(`#[ignore]` until this lands).
+**Status:** **LANDED.** Pinned test
+`forward_reference_call_in_sub_return_resolves` (and four siblings —
+implicit return, ternary arms, scoped-identifier call, self-method
+tail) green in `builder_tests.rs`. Implemented as
+`Builder::resolve_forward_call_targets`, called between
+`populate_witness_bag` and `fold_to_fixed_point`. The remaining
+sections below are kept as historical context for the diagnosis.
 
 ## The bug
 
