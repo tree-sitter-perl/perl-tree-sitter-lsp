@@ -287,6 +287,53 @@ $schema->resultset('Schema::Result::Users')->search({ name => 'X' });
     );
 }
 
+/// (k) **Row-class method dispatch on `->find` result**.
+/// `$schema->resultset('Users')->find($id)->name` — cursor on
+/// `name` resolves to the row-class column accessor. The
+/// idiomatic DBIC pattern (`$row->{name}` works only via
+/// `DBIx::Class::ResultClass::HashRefInflator` which we don't
+/// support; method-call access via the synthesized accessor is
+/// the supported path).
+///
+/// Status: red-pin. Requires per-method return-type projection:
+///   * `->search` / `->search_rs` preserve `Parametric{B, [T]}`
+///   * `->find` / `->first` / `->single` / `->next` / `->create`
+///     project to `ClassName(T)` (return a single row, not a
+///     resultset)
+///
+/// Today the builder doesn't model either projection — `find`
+/// resolves to the cross-file `ResultSet::find` return type,
+/// which is unknown without a stub. Queued with the
+/// DBIC-as-plugin work; the per-method projection rules belong
+/// to the plugin's parametric-semantics declaration (see
+/// `docs/prompt-dbic-as-plugin.md` + `docs/prompt-parametric-semantics.md`).
+#[test]
+#[ignore = "per-method return-type projection (search→preserve, find→row) queued with DBIC plugin work"]
+fn method_dispatch_through_find_resolves_to_row_class() {
+    let src = format!(
+        "{}
+package main;
+my $schema;
+my $name = $schema->resultset('Schema::Result::Users')->find(1)->name;
+",
+        USERS_RESULT,
+    );
+    let (fa, tree) = parse_with_tree(&src);
+    // Cursor on `name` in `->name` (the trailing method call).
+    let pt = point_at(&src, "->name");
+    let pt = Point::new(pt.row, pt.column + 2);
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    assert_eq!(
+        def.map(|s| s.start.row),
+        Some(NAME_COL_DEF_ROW),
+        "$$row->name where $$row = $$rs->find(...) must dispatch \
+         against the row class. Requires `find` to project \
+         Parametric{{ResultSet, [Users]}} → ClassName(Users) at \
+         the return-type. got: {:?}",
+        def,
+    );
+}
+
 /// (j) **Custom ResultSet method discovery**. `$schema->resultset('Users')`
 /// should offer methods defined on the `*::ResultSet::Users`
 /// class (a custom resultset that inherits from

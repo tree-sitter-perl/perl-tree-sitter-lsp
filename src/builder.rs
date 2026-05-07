@@ -7501,7 +7501,12 @@ impl<'a> Builder<'a> {
                     'outer: while let Some(sid) = scope {
                         for (tc_scope, tc_type, tc_point) in constraints {
                             if *tc_scope == sid && *tc_point <= r.span.start {
-                                if let Some(cn) = tc_type.class_name() {
+                                // Hash-key owner: read
+                                // `hash_key_class()` so a Parametric
+                                // TC narrows to its row-class arg.
+                                // For non-Parametric this is the
+                                // dispatch class. CLAUDE.md #10.
+                                if let Some(cn) = tc_type.hash_key_class() {
                                     *owner = Some(HashKeyOwner::Class(cn.to_string()));
                                     break 'outer;
                                 }

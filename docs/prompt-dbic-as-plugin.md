@@ -87,6 +87,33 @@ DBIC conventions), iterates `module_index` for matching
 `<NS>::ResultSet::<arg>` packages, returns the resolved class or
 None.
 
+### Per-method return-type projection
+
+DBIC's `Parametric{ResultSet, [Row]}` doesn't preserve uniformly
+across method calls. The plugin needs to declare projection rules
+per method:
+
+| Method | Returns |
+| --- | --- |
+| `search` / `search_rs` | `Parametric{ResultSet, [Row]}` (preserve) |
+| `find` / `first` / `single` / `next` | `ClassName(Row)` (project to row) |
+| `create` / `find_or_new` / `update_or_create` | `ClassName(Row)` (project to row) |
+| `all` / `slice` | `ArrayRef<Row>` — Tier 3 nested-hashkey territory |
+| `count` / `exists` | `Numeric` |
+| `update` / `delete` (no args) | `Numeric` (DBIC returns rows-affected; `$count`) |
+
+The Phase 1 spec ("search/search_rs/find return same Parametric")
+was a simplification — only true for column-key arg resolution.
+For receiver-method dispatch on the result, `find`'s return is
+the row class. Without per-method projection, `$rs->find(1)->name`
+can't dispatch to the row's column accessor.
+
+This is exactly the kind of per-base behavior the
+parametric-semantics registry exists for. The plugin declares
+the projection table; the core's `find_method_return_type` (or
+the bag's MethodOnClass reducer) consults it before falling
+through to the generic ResultSet method lookup.
+
 ### Semantics
 
 The plugin registers per-flavor semantics for the Parametric values

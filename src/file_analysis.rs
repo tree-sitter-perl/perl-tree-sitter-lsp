@@ -2095,7 +2095,14 @@ impl FileAnalysis {
             }
         }
 
-        if let Some(cn) = ty.class_name() {
+        // Hash-key context: read `hash_key_class()` (= row-class
+        // for Parametric, dispatch class else) instead of bare
+        // `class_name()`. CLAUDE.md invariant #10 — never special-
+        // case for a particular shape; the type already carries
+        // the per-axis answer. For non-Parametric this is
+        // equivalent to `class_name()`; for Parametric it's the
+        // crucial narrowing to the type's row-class arg.
+        if let Some(cn) = ty.hash_key_class() {
             return Some(HashKeyOwner::Class(cn.to_string()));
         }
 
@@ -5387,9 +5394,13 @@ impl FileAnalysis {
             var_text
         };
 
-        // Try type inference → class owner (bag-routed).
+        // Try type inference → class owner (bag-routed). Hash-
+        // key context: read `hash_key_class()` so Parametric
+        // values narrow to their row-class arg (DBIC `$row->{name}`
+        // after `find` etc.). For non-Parametric this is
+        // equivalent to `class_name()`. CLAUDE.md invariant #10.
         if let Some(it) = self.inferred_type_via_bag(var_text, point) {
-            if let Some(cn) = it.class_name() {
+            if let Some(cn) = it.hash_key_class() {
                 return Some(HashKeyOwner::Class(cn.to_string()));
             }
         }
