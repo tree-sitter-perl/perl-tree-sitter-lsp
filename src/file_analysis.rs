@@ -499,108 +499,162 @@ pub enum InferredType {
     Numeric,
     /// Used in string context (`.`, `eq`, `=~`, etc.).
     String,
-    /// Parametric type — `Base<Arg₁, Arg₂, …>`. The motivating case is
-    /// DBIC `$schema->resultset('Foo')` typing as
-    /// `Parametric { base: "DBIx::Class::ResultSet", type_args:
-    /// [TypeArg::Class("Foo")] }`; the row-class arg threads through
-    /// `->search` / `->find` / `->search_rs` so hash-key completion
-    /// in `search({ KEY })` resolves against `Foo`'s columns.
+    /// Parametric type — a sealed enum where each variant carries
+    /// its own data shape (concrete flavors) or wraps an operand
+    /// for type-level projections. Per-axis methods on
+    /// `ParametricType` (`class_name`, `hash_key_class`,
+    /// `method_arg_owner`) carry per-flavor policy. **Match
+    /// invariant: never `_ => …`.** Compiler exhaustiveness is
+    /// the safety net for the future `Plugin` escape hatch
+    /// variant.
     ///
-    /// Type args are recursive (`TypeArg::Type(Box<InferredType>)`)
-    /// so shapes like `HashRef[ArrayRef[Str]]` (Type::Tiny / Moose
-    /// constraints) and the future `Promise<ResultSet<Users>>` /
-    /// `Mojo::Collection<X>` cases compose without a string-encoded
-    /// inner-type kludge. See `docs/adr/parametric-types.md` for the
-    /// design rationale.
-    ///
-    /// Method dispatch on a Parametric value uses `base` (so
-    /// `$rs->all` finds `DBIx::Class::ResultSet::all`, not anything
-    /// on the row class). Hash-key completion / parametric-aware
-    /// readers consult `type_args` for the narrowing dimension.
-    Parametric { base: String, type_args: Vec<TypeArg> },
+    /// Design history: Phase 1 of Part 5c shipped this as a flat
+    /// `{ base: String, type_args: Vec<TypeArg> }` shape with
+    /// dual-accessor helpers — that encoding's reflexive
+    /// complexity (per-method allowlist, `_open` emitter, accessor
+    /// pair) is gone now, lifted into per-flavor methods on
+    /// `ParametricType`. See `docs/prompt-parametric-redesign.md`.
+    Parametric(ParametricType),
 }
 
-/// One position in a `Parametric.type_args` list. `Class` is the
-/// flat happy path (DBIC's `ResultSet<Foo>`); `Type` boxes another
-/// `InferredType` so nested shapes (`HashRef<ArrayRef<Str>>`,
-/// `Promise<ResultSet<Users>>`, validator `ArrayRef[InstanceOf['T']]`)
-/// fit without a parallel string-encoded representation.
+/// Concrete parametric flavors + type-level operators. Each
+/// concrete flavor carries the data its semantics need; operators
+/// (`RowOf`) wrap a sub-`InferredType` and reduce via
+/// `ParametricProjectionReducer` in the witness bag.
+///
+/// **Match invariant: never `_ => …` arms.** Every consumer
+/// explicitly handles every variant. The compiler enforces this
+/// when the (deferred) `Plugin` escape hatch lands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TypeArg {
-    /// Plain class name — the DBIC happy path. Equivalent to
-    /// `Type(Box::new(InferredType::ClassName(...)))` but cheaper
-    /// (no Box, no recursion at the storage layer) and clearer at
-    /// match sites. Most consumers only need this case.
-    Class(String),
-    /// Boxed inner type — used when a type arg is itself parametric
-    /// or a non-class shape (HashRef, ArrayRef, …).
-    Type(Box<InferredType>),
+pub enum ParametricType {
+    /// DBIC `$schema->resultset('Foo')` shape. `base` is the
+    /// resolved resultset class (default
+    /// `DBIx::Class::ResultSet`, or a discovered custom resultset
+    /// class — see `goto_def_offers_custom_resultset_method` red-
+    /// pin). `row` is the row class (where `add_columns`
+    /// synthesizes its column accessors). Two distinct fields
+    /// because the value carries dual identity:
+    ///   - method dispatch goes through `base`
+    ///   - hash-key arg owner / direct hash-key access go through `row`
+    ///
+    /// Pinned by internal-shape tests so a refactor to a single-
+    /// class encoding silently breaks `RowOf` rather than
+    /// silently returning the wrong dimension.
+    ResultSet { base: String, row: String },
+
+    /// `RowOf<T>` — type-level projection. Reduces:
+    ///   - `RowOf<ResultSet { base, row }>` → `ClassName(row)`
+    ///   - everything else → `None` (the operand has no row
+    ///     dimension)
+    ///
+    /// Lazy: emitted as a witness, reduced by
+    /// `ParametricProjectionReducer` in the bag. Composes —
+    /// `RowOf<RowOf<X>>` evaluates by recursing into the operand.
+    /// Plugin port (queued) emits `RowOf(receiver_type)` for
+    /// methods like `find` / `first` / `single` / `next` /
+    /// `create` that project a ResultSet to its row.
+    RowOf(Box<InferredType>),
 }
 
-impl TypeArg {
-    /// If this arg is a class name (either `Class(_)` or a boxed
-    /// `Type(ClassName(_))` / `Type(FirstParam { .. })`), return
-    /// it. Lets readers that only need "the class for this arg"
-    /// — DBIC Phase 1 — write a one-line accessor regardless of
-    /// which constructor was used.
-    pub fn as_class(&self) -> Option<&str> {
+impl ParametricType {
+    /// Class to consult for method dispatch on this value.
+    /// `$rs->all` resolves against `class_name()`'s answer.
+    pub fn class_name(&self) -> Option<&str> {
         match self {
-            TypeArg::Class(c) => Some(c.as_str()),
-            TypeArg::Type(t) => t.class_name(),
+            ParametricType::ResultSet { base, .. } => Some(base.as_str()),
+            ParametricType::RowOf(inner) => {
+                // Evaluate: row-class of inner (if inner is
+                // ResultSet) is the dispatch class for the
+                // projected value.
+                match inner.as_ref() {
+                    InferredType::Parametric(ParametricType::ResultSet { row, .. }) => {
+                        Some(row.as_str())
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Class to consult for direct `recv->{key}` hash-key access
+    /// on this value. ResultSet returns `row` (the column-keyed
+    /// class — used today only by the cleanup-pass HashKeyAccess
+    /// owner-resolution paths; HRI shape isn't supported but the
+    /// field is the right one when it lands). Operators evaluate
+    /// recursively.
+    pub fn hash_key_class(&self) -> Option<&str> {
+        match self {
+            ParametricType::ResultSet { row, .. } => Some(row.as_str()),
+            ParametricType::RowOf(inner) => match inner.as_ref() {
+                InferredType::Parametric(p) => p.hash_key_class(),
+                _ => None,
+            },
+        }
+    }
+
+    /// Owner for hash-key args of `recv->method({KEY => ...})`.
+    /// `Some(owner)` means "this flavor claims this method's args
+    /// — emit the HashKeyAccess unconditionally with this owner;
+    /// the type IS the gate." `None` means "this flavor doesn't
+    /// claim, fall through to the strict-eq local-symbol path."
+    ///
+    /// ResultSet claims the row-keyed methods (search, search_rs,
+    /// find, find_or_new, find_or_create, update_or_create, create,
+    /// update, populate). Methods that take filters or no args
+    /// (count, exists, delete, all without args) return None.
+    pub fn method_arg_owner(&self, method: &str) -> Option<HashKeyOwner> {
+        match self {
+            ParametricType::ResultSet { row, .. } => match method {
+                "search" | "search_rs" | "find" | "find_or_new" | "find_or_create"
+                | "update_or_create" | "create" | "update" | "populate" | "new_result" => {
+                    Some(HashKeyOwner::Class(row.clone()))
+                }
+                _ => None,
+            },
+            ParametricType::RowOf(_) => None,
         }
     }
 }
 
 impl InferredType {
-    /// Extract the class name if this is an object type (ClassName,
-    /// FirstParam, or Parametric — the latter exposes its `base`,
-    /// since method dispatch on a Parametric value goes through the
-    /// base class). For the row-class / inner-type narrowing on a
-    /// Parametric, see `parametric_type_args`.
+    /// Extract the class name if this is an object type
+    /// (ClassName, FirstParam, or Parametric — the latter
+    /// delegates to the flavor's `class_name()`). For the row-
+    /// class / hash-key-arg dimension on a Parametric, see
+    /// `hash_key_class`.
     pub fn class_name(&self) -> Option<&str> {
         match self {
             InferredType::ClassName(name) => Some(name.as_str()),
             InferredType::FirstParam { package } => Some(package.as_str()),
-            InferredType::Parametric { base, .. } => Some(base.as_str()),
+            InferredType::Parametric(p) => p.class_name(),
             _ => None,
         }
     }
 
     /// True if this is any object-shaped variant (ClassName,
-    /// FirstParam, Parametric).
+    /// FirstParam, or a Parametric flavor that has a class_name).
     pub fn is_object(&self) -> bool {
         self.class_name().is_some()
     }
 
-    /// Type args of a `Parametric` — the row-class for DBIC
-    /// `ResultSet<Foo>`, the inner type for `HashRef<ArrayRef<Str>>`,
-    /// etc. `None` for non-parametric variants.
-    pub fn parametric_type_args(&self) -> Option<&[TypeArg]> {
+    /// Class to consult for direct `recv->{key}` hash-key access
+    /// on this value. For Parametric, delegates to the flavor; for
+    /// other variants, falls back to `class_name()` (constructor
+    /// keys etc. on `bless { } 'Foo'`-shaped values).
+    pub fn hash_key_class(&self) -> Option<&str> {
         match self {
-            InferredType::Parametric { type_args, .. } => Some(type_args.as_slice()),
-            _ => None,
+            InferredType::Parametric(p) => p.hash_key_class(),
+            _ => self.class_name(),
         }
     }
 
-    /// Class to consult when this type is the receiver of a method
-    /// call that takes a hash-key-shaped arg (`recv->m({KEY => …})`).
-    /// For most types this equals `class_name()` — the receiver's
-    /// own class owns its constructor / method hash keys. For
-    /// `Parametric` it's the first type arg's class: DBIC's
-    /// `Parametric{ResultSet, [Users]}` delegates hash-key args to
-    /// the row class, where `add_columns` synthesized the keys.
-    /// Same delegation generalizes to future parametrics over a
-    /// row-shape type (Mojo::Pg::Results, etc.).
-    ///
-    /// Method dispatch on the same value still uses `class_name()`
-    /// (= `base` for Parametric), so `$rs->search(...)` resolves
-    /// `search` against `DBIx::Class::ResultSet`, not the row class.
-    pub fn hash_key_class(&self) -> Option<&str> {
+    /// Direct accessor to the parametric flavor, when this type
+    /// is `Parametric(_)`. Lets consumers route to flavor-specific
+    /// methods (`method_arg_owner`, etc.) without re-matching.
+    pub fn as_parametric(&self) -> Option<&ParametricType> {
         match self {
-            InferredType::Parametric { type_args, .. } => {
-                type_args.first().and_then(|a| a.as_class())
-            }
-            _ => self.class_name(),
+            InferredType::Parametric(p) => Some(p),
+            _ => None,
         }
     }
 }
@@ -2756,32 +2810,43 @@ impl FileAnalysis {
 
                     // Check if cursor is on a named arg key in the
                     // call args, not on the method name itself.
-                    // Resolve to hash key def or :param field. The
-                    // lookup class for *hash keys* is the receiver
-                    // type's `hash_key_class()` — for plain
-                    // `ClassName` this equals the receiver's class
-                    // (constructor keys etc.); for `Parametric` it
-                    // narrows to the row class
-                    // (`Parametric{ResultSet, [Users]}` →
-                    // `Class("Users")`), where `add_columns`
-                    // HashKeyDefs live. Method dispatch keeps using
-                    // `class_name()`, so `$rs->search` still
+                    // Resolve to hash key def or :param field.
+                    //
+                    // The owner for hash-key args is per-flavor +
+                    // method-aware: ask the receiver's
+                    // ParametricType for `method_arg_owner(method)`
+                    // — `Some(owner)` means the flavor claims this
+                    // method's args (DBIC's ResultSet returns the
+                    // row class for search/find/create/etc.;
+                    // returns None for count/exists). When the
+                    // flavor doesn't claim, fall back to the
+                    // receiver's class (constructor keys etc. on
+                    // `bless { } 'Foo'`-shaped non-Parametric
+                    // values). Method dispatch on the same ref
+                    // still uses `class_name()`, so `$rs->search`
                     // resolves against the ResultSet base.
                     if let (Some(t), Some(s)) = (tree, source_bytes) {
                         if let Some(key_name) = self.call_arg_key_at(t, s, point) {
-                            let cn = self
+                            let owner = self
                                 .method_call_invocant_type(r, module_index)
-                                .and_then(|ty| ty.hash_key_class().map(str::to_string))
-                                .or_else(|| class_name.clone());
-                            if let Some(cn) = cn {
-                                let owner = HashKeyOwner::Class(cn.clone());
+                                .as_ref()
+                                .and_then(|ty| ty.as_parametric())
+                                .and_then(|p| p.method_arg_owner(&r.target_name))
+                                .or_else(|| {
+                                    class_name
+                                        .as_ref()
+                                        .map(|c| HashKeyOwner::Class(c.clone()))
+                                });
+                            if let Some(owner) = owner {
                                 for def in self.hash_key_defs_for_owner(&owner) {
                                     if def.name == key_name {
                                         return Some(def.selection_span);
                                     }
                                 }
-                                if let Some(span) = self.find_param_field(&cn, &key_name) {
-                                    return Some(span);
+                                if let HashKeyOwner::Class(cn) = &owner {
+                                    if let Some(span) = self.find_param_field(cn, &key_name) {
+                                        return Some(span);
+                                    }
                                 }
                             }
                         }
@@ -5758,11 +5823,14 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
         InferredType::Regexp => "Regexp".to_string(),
         InferredType::Numeric => "Numeric".to_string(),
         InferredType::String => "String".to_string(),
-        // Method dispatch on a Parametric uses its base, so the
-        // tag follows suit. Type-arg detail lives in the richer
-        // `format_inferred_type` rendering — sig-help's tag is
-        // the coarse-grained label.
-        InferredType::Parametric { base, .. } => format!("Object:{}", base),
+        // Method dispatch on a Parametric uses its `class_name()`
+        // (= the flavor's dispatch class), so the tag follows.
+        // Type-arg detail lives in the richer
+        // `format_inferred_type` rendering.
+        InferredType::Parametric(p) => match p.class_name() {
+            Some(c) => format!("Object:{}", c),
+            None => "Parametric".to_string(),
+        },
     }
 }
 
@@ -5802,20 +5870,17 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
         InferredType::Regexp => "Regexp".to_string(),
         InferredType::Numeric => "Numeric".to_string(),
         InferredType::String => "String".to_string(),
-        InferredType::Parametric { base, type_args } => {
-            if type_args.is_empty() {
-                base.clone()
-            } else {
-                let inner = type_args
-                    .iter()
-                    .map(|a| match a {
-                        TypeArg::Class(c) => c.clone(),
-                        TypeArg::Type(t) => format_inferred_type(t),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{}<{}>", base, inner)
-            }
+        InferredType::Parametric(p) => format_parametric_type(p),
+    }
+}
+
+fn format_parametric_type(p: &ParametricType) -> String {
+    match p {
+        ParametricType::ResultSet { base, row } => {
+            format!("{}<{}>", base, row)
+        }
+        ParametricType::RowOf(inner) => {
+            format!("RowOf<{}>", format_inferred_type(inner))
         }
     }
 }

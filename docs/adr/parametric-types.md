@@ -33,40 +33,53 @@ speculative one.
 
 ## Decision
 
-**Ship `InferredType::Parametric { base: String, type_args:
-Vec<TypeArg> }` with `TypeArg` recursive from day one.**
+**Ship `InferredType::Parametric(ParametricType)` where
+`ParametricType` is a sealed enum per flavor, each carrying its
+own data shape and per-axis policy methods.**
 
 ```rust
 pub enum InferredType {
     // ... existing variants ...
-    Parametric { base: String, type_args: Vec<TypeArg> },
+    Parametric(ParametricType),
 }
 
-pub enum TypeArg {
-    Class(String),                 // 95% case: ResultSet<Users>
-    Type(Box<InferredType>),       // recursive: HashRef<ArrayRef<Str>>
+pub enum ParametricType {
+    /// DBIC. Two distinct fields — dual identity is intrinsic.
+    ResultSet { base: String, row: String },
+
+    /// Type-level projection. `RowOf<ResultSet { row, .. }>`
+    /// reduces to `ClassName(row)`. Lazy — bag-side reducer.
+    RowOf(Box<InferredType>),
+
+    // Future: Wrapped { class, inner }, ListOf { class?, element },
+    // HashRef { key, value? }, Plugin escape hatch (deferred).
+    // See `docs/prompt-parametric-redesign.md`.
 }
 ```
 
-`Class(String)` is the flat-string variant for the DBIC happy path
-— no Box overhead, the most common case stays cheap. `Type(Box<…>)`
-is the recursive door, taken whenever a type arg is itself
-parametric or any non-class shape (HashRef, ArrayRef, …).
+Per-axis methods on `ParametricType` carry per-flavor policy:
+- `class_name()` — dispatch class. `ResultSet { base, .. }` returns
+  `&base`; `RowOf(inner)` evaluates the operator (returns the inner's
+  row if it's ResultSet, else None).
+- `hash_key_class()` — class to consult for direct `recv->{key}`
+  access. `ResultSet` returns `&row`.
+- `method_arg_owner(method)` — `Some(owner)` for hash-key args of
+  `recv->method({KEY})` claimed by this flavor; `None` to fall
+  through to the receiver-class strict-eq path. `ResultSet` claims
+  the row-keyed methods (search/find/create/update/...); returns
+  None for count/exists.
 
-Accessors:
-- `TypeArg::as_class() -> Option<&str>` for the 95% case.
-- `InferredType::class_name()` returns `Some(&base)` for Parametric
-  — method dispatch (`$rs->search`) resolves against the base.
-- `InferredType::hash_key_class()` returns
-  `type_args[0].as_class()` for Parametric, `class_name()` else —
-  hash-key arg lookup resolves against the row class.
-- `InferredType::parametric_type_args()` exposes the full slice for
-  consumers that need recursive walking (planned Tier 2/3
-  nested-hashkey work, future Promise reducer).
+The dual-class semantics (`$rs->search` dispatches against
+`class_name()` = base; `search({KEY})` looks up keys via
+`method_arg_owner` = row) live INSIDE the flavor's impl — not as
+consumer-side accessor accessors that special-case on data layout.
+**No method-name allowlist anywhere in consumers.** Per CLAUDE.md
+invariant #10.
 
-The two-accessor split (`class_name` vs `hash_key_class`) is the
-load-bearing piece — it carries the dual-class semantics generically
-so consumers don't special-case method targets.
+**No `_ => …` fall-through arms** on `ParametricType` matches.
+Compiler exhaustiveness is the safety net for the future `Plugin`
+escape hatch — when it lands, every consumer lights up
+mechanically.
 
 ## Why recursive from day one
 
@@ -117,38 +130,41 @@ updating — which is also the *benefit*: no silent fall-throughs.
 
 **Recursive serde of `Box<InferredType>` is fine.** bincode + zstd
 + JSON all handle it. The cache invalidates on `EXTRACT_VERSION`
-bump (22 → 23) so old blobs without the variant don't get
-deserialized.
+bumps (22 → 23 for the initial flat shape, 23 → 24 for the v2
+sealed-enum redesign before the branch merged) so old blobs
+without the variant don't get deserialized.
 
-**The `Class(String)` happy-path arm is a soft denormalization.**
-`Type(Box::new(InferredType::ClassName(c)))` is logically
-equivalent. Keeping `Class(c)` as a peer eliminates a Box on the
-common case (DBIC) and reads cleaner at match sites. `as_class()`
-papers over the difference for consumers.
+**Variant enum vs trait objects.** `Box<dyn Parametric>` (literal
+"abstract base class" in OO terms) doesn't roundtrip through
+serde without `typetag` or hand-rolled SerDe — both pain we don't
+want. The sealed enum gives the same expressivity (per-flavor
+dispatch via `match`), full serde derives, and exhaustiveness
+checking that catches missing-variant bugs at compile time.
 
-## Why two class-name accessors instead of one
+## Why two class-name accessors per flavor
 
-A `Parametric { base: ResultSet, type_args: [Users] }` value answers
-two morally different questions:
+A `Parametric(ResultSet { base, row })` value answers two morally
+different questions:
 
-1. **What class do this value's methods come from?** ResultSet
-   (`->search`, `->all`, `->count`).
-2. **What class do this value's hash-key args belong to?** Users
+1. **What class do this value's methods come from?** Base
+   (`$rs->search`, `$rs->all`, `$rs->count`).
+2. **What class do this value's hash-key args belong to?** Row
    (the row class with `add_columns`-synthesized columns).
 
 If we only exposed one accessor, consumers would route through it
 for both questions and get the wrong answer for one of them. The
 first design pass had a `hash_key_lookup_class` helper on
 `FileAnalysis` that hardcoded `target_name in {search, search_rs,
-find}` — a per-method allowlist. That smelled wrong: the rule
-isn't about which method is being called, it's about which dimension
-of the type the consumer is reading. Pushing the rule onto
-`InferredType` (each accessor returns its dimension) generalizes
-without method allowlists.
+find}` — a per-method allowlist. The v1 redesign made the rule
+type-level via a `hash_key_class()` accessor on `InferredType`
+that special-cased the Parametric variant. **The v2 redesign
+goes further**: each flavor's policy lives in its own impl
+(`ResultSet::class_name`, `ResultSet::method_arg_owner`, …); no
+data-layout-special-casing on `InferredType` accessors.
 
-When a future parametric type — `Promise<X>`, `Mojo::Collection<X>`
-— wants different class-narrowing semantics, it overrides
-`hash_key_class` (or whichever accessor) on its own terms. No
+When a future flavor — `Wrapped<X>`, `ListOf<X>`, `Plugin<id>` —
+wants different narrowing semantics, it implements its own
+`class_name` / `hash_key_class` / `method_arg_owner`. No
 consumer changes.
 
 ## Out of scope (queued)
@@ -161,8 +177,16 @@ consumer changes.
   (`#[ignore]`-tagged), tracked in
   `docs/prompt-type-inference-residual.md` Part 5c follow-up.
 - **Nested hash-key intelligence (Tiers 1–3).** The recursive
-  `TypeArg` is in place; emission + consumer narrowing is its own
-  workstream. Spec: `docs/prompt-nested-hashkey.md`.
+  shape via per-flavor `Box<InferredType>` fields is in place;
+  emission + consumer narrowing is its own workstream. Spec:
+  `docs/prompt-nested-hashkey.md`.
+- **Receiver-relative return types.** `return_type: ReturnExpr`
+  admitting `Receiver` placeholders + `UnionOnArgs` branches —
+  subsumes per-method projection (`find` declares
+  `RowOf(Receiver)` once on the symbol) AND arity dispatch
+  (Mojo `has` accessors as `{ args.is_empty() => T, _ =>
+  Self }`). Next architectural pillar after this redesign;
+  spec'd in `docs/prompt-parametric-redesign.md` Section 2.
 - **Promise<X> threading + async boundaries.** Own pillar — async
   semantics (boundary-rekks-globals, syntax warnings, await
   narrowing) are richer than just types.
@@ -173,25 +197,42 @@ consumer changes.
 
 ## Test discipline
 
-Tests in `src/parametric_resultset_tests.rs` assert against the
-public surface only — `find_definition`, `crate::resolve::refs_to`.
-None pattern-match on `InferredType::Parametric` or `TypeArg`
-internals. The encoding could change (e.g. `Vec<TypeArg>` →
-`Vec<NamedTypeArg>` with positional names) without rewriting any
-test. The one assertion that *would* depend on encoding —
-plugin-emitted Parametric witnesses — was deferred from the
-test-first commit until after the design settled.
+Tests in `src/parametric_resultset_tests.rs` are mostly
+encoding-agnostic — assert against the public surface
+(`find_definition`, `crate::resolve::refs_to`). They survived
+the v1 → v2 encoding change without modification.
+
+ONE test (`parametric_resultset_carries_base_and_row`)
+deliberately pins the internal shape:
+`Parametric(ResultSet { base, row })` at the resultset call's
+witness. This is the encoding-direction pin called for during
+review — without it, a refactor to a single-class encoding
+(`ResultSet(String)` for either dispatch class OR row class)
+would silently break `RowOf` at the projection site rather
+than tripping a test. External behavior tests can't catch this
+class of regression because they only see the projection's
+output.
+
+The pin pattern: behavior tests (the bulk) + one shape-pin per
+load-bearing variant. Behavior tests survive encoding changes;
+shape pins catch encoding regressions.
 
 ## Commit history
 
-This ADR was written alongside Phase 1's implementation:
-
-- TDD-first commit: 8 external-behavior pins for column lookup.
-- Implementation: `InferredType::Parametric` + `TypeArg`,
-  `extract_resultset_parametric` emitter, `hash_key_class()`
-  accessor, `emit_call_arg_key_accesses_open` for cross-file
-  Parametric receivers (skips the `has_hash_key_def` strict gate
-  the type itself replaces).
-- Pinned `goto_def_offers_custom_resultset_method` as the next
-  red-pin (custom resultset_class discovery — known gap, queued
-  follow-up).
+- v1 (commits c0f5c03 + c3f7863): TDD pins + `Parametric { base,
+  type_args: Vec<TypeArg> }` shape with `class_name()` /
+  `hash_key_class()` accessor pair on `InferredType`,
+  `emit_call_arg_key_accesses_open` sibling, search-family
+  allowlist in consumers. Captured the recursion + dual-class
+  insight but encoded it as flat-shape reflexes.
+- v2 (this commit): sealed-enum `ParametricType` redesign per
+  `docs/prompt-parametric-redesign.md`. Per-flavor methods,
+  `RowOf` operator, `method_arg_owner` driving emission gating,
+  no `_ => …` fall-throughs. Internal-shape pin added for
+  `ResultSet { base, row }`. EXTRACT_VERSION 23 → 24.
+- Red-pins queued: `goto_def_offers_custom_resultset_method`
+  (custom resultset_class discovery) and
+  `method_dispatch_through_find_resolves_to_row_class` (per-
+  method return-type projection — `find` → ClassName(row)) —
+  both queued with the DBIC-as-plugin port and ReturnExpr
+  pillar respectively.

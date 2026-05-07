@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tree_sitter::{Parser, Point, Tree};
 
+use crate::file_analysis::ParametricType;
 use crate::file_store::{FileKey, FileStore};
 use crate::module_index::ModuleIndex;
 use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
@@ -70,6 +71,58 @@ __PACKAGE__->add_columns(
 //   row 4: `    email => { ... }`
 const NAME_COL_DEF_ROW: usize = 3;
 const EMAIL_COL_DEF_ROW: usize = 4;
+
+/// **Internal-shape pin (encoding direction).** The
+/// `recv->resultset('Foo')` call's bag-resolved type is exactly
+/// `Parametric(ResultSet { base: "DBIx::Class::ResultSet",
+/// row: "Foo" })`. Pins:
+///   - `ResultSet` is the variant (not generic
+///     `Parametric { base, type_args }`).
+///   - `base` carries the resolved resultset class.
+///   - `row` carries the row class.
+///
+/// This pin is what makes `RowOf<ResultSet { row, .. }>` valid
+/// when it lands. A refactor that flips the encoding to a single-
+/// class shape (`ResultSet(String)` for either dispatch class OR
+/// row class) would silently break the projection — this test
+/// would catch it before any user-visible behavior shifts.
+///
+/// External-behavior tests (find_definition, refs_to) won't
+/// catch encoding regressions of this kind because they only
+/// see the projection's output, not the structure underneath.
+#[test]
+fn parametric_resultset_carries_base_and_row() {
+    let src = "
+package main;
+my $schema;
+$schema->resultset('Schema::Result::Users');
+";
+    let fa = parse(src);
+
+    // Find the resultset MethodCall ref.
+    let rs_idx = fa
+        .refs
+        .iter()
+        .position(|r| {
+            matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "resultset"
+        })
+        .expect("resultset MethodCall ref");
+
+    let ty = fa
+        .method_call_return_type_via_bag(rs_idx, None)
+        .expect("resultset's return type is bag-resolvable");
+
+    match ty {
+        InferredType::Parametric(ParametricType::ResultSet { base, row }) => {
+            assert_eq!(base, "DBIx::Class::ResultSet");
+            assert_eq!(row, "Schema::Result::Users");
+        }
+        other => panic!(
+            "expected `Parametric(ResultSet {{ base, row }})`; got {:?}",
+            other
+        ),
+    }
+}
 
 /// (a) **Happy path**. `$schema->resultset('Users')->search({ name => 'X' })`
 /// — cursor on `name` in the search args lands on the `name`

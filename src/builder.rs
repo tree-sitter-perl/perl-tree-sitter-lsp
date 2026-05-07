@@ -5656,10 +5656,10 @@ impl<'a> Builder<'a> {
         }
         let args = node.child_by_field_name("arguments")?;
         let row_class = self.first_string_literal_arg(args)?;
-        Some(InferredType::Parametric {
+        Some(InferredType::Parametric(crate::file_analysis::ParametricType::ResultSet {
             base: "DBIx::Class::ResultSet".to_string(),
-            type_args: vec![TypeArg::Class(row_class)],
-        })
+            row: row_class,
+        }))
     }
 
     /// First named child of a call-arg node that's a string literal,
@@ -6436,13 +6436,28 @@ impl<'a> Builder<'a> {
                     _ => continue,
                 })
                 .copied();
+            // Two paths for hash-key arg owner:
+            //
+            //  * **Parametric receiver claims the method.** Ask the
+            //    flavor: `p.method_arg_owner(method_name)`. `Some`
+            //    means "I claim this method's args; emit
+            //    unconditionally with this owner — the type is the
+            //    gate." Returns the row class (Class owner) for
+            //    DBIC's row-keyed methods (search, find, create,
+            //    update, ...) and None for count/exists. Cross-
+            //    file producer's HashKeyDef may not be visible at
+            //    consumer build; the type already pinned the class.
+            //  * **Non-Parametric / unclaimed.** Fall through to
+            //    `Sub { package: receiver, name: method }` strict-
+            //    eq path. Constructor keys (Mojo `has`) etc.
             let inv_ty = invocant_node.and_then(|n| self.invocant_type_at_node(n));
-            let (owner, parametric) = match inv_ty {
-                Some(ty) if matches!(ty, InferredType::Parametric { .. }) => {
-                    let Some(c) = ty.hash_key_class() else { continue };
-                    (HashKeyOwner::Class(c.to_string()), true)
-                }
-                _ => {
+            let claimed = inv_ty
+                .as_ref()
+                .and_then(|ty| ty.as_parametric())
+                .and_then(|p| p.method_arg_owner(&r.target_name));
+            let (owner, parametric) = match claimed {
+                Some(o) => (o, true),
+                None => {
                     let Some(cls) = self.method_call_invocant.get(&i) else { continue };
                     (
                         HashKeyOwner::Sub {
