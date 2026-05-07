@@ -2,7 +2,9 @@
 # Usage: ./scripts/qa/analyze-bench.sh BENCH_LOG
 # Summarizes a PERL_LSP_BENCH=1 stderr dump: top slow modules, latency
 # distribution, and parent-fallback duplicate re-parses.
-set -euo pipefail
+set -eu
+# No pipefail: `… | head -N` SIGPIPEs the upstream sort, which would
+# kill the whole script after the first section under pipefail.
 
 LOG="${1:?usage: analyze-bench.sh BENCH_LOG}"
 
