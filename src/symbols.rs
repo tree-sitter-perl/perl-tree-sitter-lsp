@@ -285,11 +285,9 @@ pub fn find_definition(
         }
 
         // Cross-file method goto-def: resolve inherited methods through module index
-        if let RefKind::MethodCall { ref invocant, ref invocant_span, .. } = r.kind {
+        if matches!(r.kind, RefKind::MethodCall { .. }) {
             use crate::file_analysis::MethodResolution;
-            let class_name = analysis.resolve_method_invocant_public(
-                invocant, invocant_span, r.scope, point, Some(tree), Some(source.as_bytes()), Some(module_index),
-            );
+            let class_name = analysis.method_call_invocant_class(r, Some(module_index));
             if let Some(ref cn) = class_name {
                 if let Some(MethodResolution::CrossFile { ref class }) = analysis.resolve_method_in_ancestors(cn, &r.target_name, Some(module_index)) {
                     if let Some(cached) = module_index.get_cached(class) {
@@ -315,8 +313,8 @@ pub fn find_definition(
     None
 }
 
-pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url, tree: &Tree, source: &str) -> Vec<Location> {
-    analysis.find_references(position_to_point(pos), Some(tree), Some(source.as_bytes()))
+pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url, tree: &Tree, source: &str, module_index: Option<&ModuleIndex>) -> Vec<Location> {
+    analysis.find_references(position_to_point(pos), Some(tree), Some(source.as_bytes()), module_index)
         .into_iter()
         .map(|span| Location {
             uri: uri.clone(),
@@ -887,9 +885,9 @@ pub fn hover_info(
     None
 }
 
-pub fn document_highlights(analysis: &FileAnalysis, pos: Position, tree: &tree_sitter::Tree, source: &str) -> Vec<DocumentHighlight> {
+pub fn document_highlights(analysis: &FileAnalysis, pos: Position, tree: &tree_sitter::Tree, source: &str, module_index: Option<&ModuleIndex>) -> Vec<DocumentHighlight> {
     use crate::file_analysis::AccessKind;
-    analysis.find_highlights(position_to_point(pos), Some(tree), Some(source.as_bytes()))
+    analysis.find_highlights(position_to_point(pos), Some(tree), Some(source.as_bytes()), module_index)
         .into_iter()
         .map(|(span, access)| DocumentHighlight {
             range: span_to_range(span),

@@ -1370,7 +1370,7 @@ fn test_find_references_variable() {
     let src = "my $x = 1;\nprint $x;\n$x = 2;";
     let fa = build_fa(src);
     // Cursor on the declaration of $x
-    let refs = fa.find_references(Point::new(0, 4), None, None);
+    let refs = fa.find_references(Point::new(0, 4), None, None, None);
     assert!(
         refs.len() >= 2,
         "should find at least declaration + usage, got {}",
@@ -1428,7 +1428,7 @@ fn test_find_references_sub() {
     let src = "sub greet { }\ngreet();\ngreet();";
     let fa = build_fa(src);
     // Cursor on the sub name
-    let refs = fa.find_references(Point::new(0, 5), None, None);
+    let refs = fa.find_references(Point::new(0, 5), None, None, None);
     assert!(
         refs.len() >= 2,
         "should find definition + calls, got {}",
@@ -1451,7 +1451,7 @@ get_foo()->bar();
     let tree = parse(src);
     let fa = build(&tree, src.as_bytes());
     // Cursor on bar definition (line 2, col 4)
-    let refs = fa.find_references(Point::new(2, 5), Some(&tree), Some(src.as_bytes()));
+    let refs = fa.find_references(Point::new(2, 5), Some(&tree), Some(src.as_bytes()), None);
     // Should find: $f->bar() + get_foo()->bar() (definition may or may not be included)
     let ref_lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
     assert!(
@@ -1517,7 +1517,7 @@ fn test_hash_key_def_in_return_gets_sub_owner() {
 
     // Verify go-to-references from the def finds the usage
     let host_def_point = host_defs[0].selection_span.start;
-    let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()));
+    let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()), None);
     // symbol_at returns include_decl=false, so only usages are returned
     assert!(
         refs.len() >= 1,
@@ -1527,7 +1527,7 @@ fn test_hash_key_def_in_return_gets_sub_owner() {
 
     // Verify go-to-references from the usage finds back to the def
     let host_ref_point = host_refs[0].span.start;
-    let refs_from_usage = fa.find_references(host_ref_point, Some(&tree), Some(src.as_bytes()));
+    let refs_from_usage = fa.find_references(host_ref_point, Some(&tree), Some(src.as_bytes()), None);
     // ref resolves to def → include_decl=true, so def + usage
     assert!(
         refs_from_usage.len() >= 2,
@@ -1577,7 +1577,7 @@ $calc->get_self->get_config->{host};
 
     // find_references from the def should find the chained usage via tree fallback
     let host_def_point = host_defs[0].selection_span.start;
-    let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()));
+    let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()), None);
     assert!(
         refs.len() >= 1,
         "should find chained usage via tree fallback, got {} refs",
@@ -1589,7 +1589,7 @@ $calc->get_self->get_config->{host};
 fn test_highlights_read_write() {
     let src = "my $x = 1;\nprint $x;\n$x = 2;";
     let fa = build_fa(src);
-    let highlights = fa.find_highlights(Point::new(0, 4), None, None);
+    let highlights = fa.find_highlights(Point::new(0, 4), None, None, None);
     assert!(!highlights.is_empty(), "should have highlights");
     // Check that we have both read and write accesses
     let has_write = highlights
@@ -1730,7 +1730,7 @@ sub test {
     // package=Foo catches the decl, the FunctionCall `emit()`,
     // AND the MethodCall `$self->emit()` — two shapes of the
     // same callable.
-    let edits = fa.rename_sub_in_package("emit", &Some("Foo".to_string()), "fire");
+    let edits = fa.rename_sub_in_package("emit", &Some("Foo".to_string()), "fire", None);
     assert!(
         edits.len() >= 3,
         "rename_sub_in_package should find def + function call + method call, got {} edits",
@@ -6298,7 +6298,7 @@ sub run {
     let col = src.lines().nth(row).unwrap().find("do_thing").unwrap();
     let point = tree_sitter::Point::new(row, col + 1);
 
-    let hits = fa.find_highlights(point, None, None);
+    let hits = fa.find_highlights(point, None, None, None);
     assert!(!hits.is_empty(), "should highlight at least one occurrence");
 
     for (span, _access) in &hits {
@@ -6539,7 +6539,8 @@ sub _generate_route {
         })
         .expect("MethodCall ref for `_generate_route`");
 
-    if let RefKind::MethodCall { invocant_class, .. } = &gr_ref.kind {
+    if matches!(gr_ref.kind, RefKind::MethodCall { .. }) {
+        let invocant_class = fa.method_call_invocant_class(gr_ref, None);
         assert_eq!(
             invocant_class.as_deref(),
             Some("Mojolicious::Routes::Route"),
@@ -6577,7 +6578,8 @@ sub inline {
         .find(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "inline")
         .expect("MethodCall ref for `inline`");
 
-    if let RefKind::MethodCall { invocant_class, .. } = &inline_ref.kind {
+    if matches!(inline_ref.kind, RefKind::MethodCall { .. }) {
+        let invocant_class = fa.method_call_invocant_class(inline_ref, None);
         assert_eq!(
             invocant_class.as_deref(),
             Some("Mojolicious::Routes::Route"),

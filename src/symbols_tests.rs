@@ -1579,8 +1579,9 @@ fn data_printer_use_line_options_completion() {
 /// (a) `$r` at line 71 resolves to a known class.
 /// (b) `->to` on line 71 is a MethodCall ref.
 /// (c) `->to`'s invocant resolves to a class via
-///     `resolve_method_invocant_public` (the path nvim hover/gd
-///     uses internally).
+///     `FileAnalysis::method_call_invocant_class` (the bag-routed
+///     resolver every reader — hover, gd, gr, rename — funnels
+///     through).
 ///
 /// Two possible failure modes the test distinguishes:
 ///   - `$r` is typed but `->to`'s invocant fails → crossfile
@@ -1713,21 +1714,9 @@ fn test_demo_file_chain_to_resolves_on_line_71() {
     // invocant is `$r`. Resolve it cross-file.
     let get_ref = analysis.ref_at(pt(get_col)).expect("ref at ->get");
     assert_eq!(get_ref.target_name, "get");
-    if let crate::file_analysis::RefKind::MethodCall {
-        invocant,
-        invocant_span,
-        ..
-    } = &get_ref.kind
-    {
-        let klass = analysis.resolve_method_invocant_public(
-            invocant,
-            invocant_span,
-            get_ref.scope,
-            pt(get_col),
-            Some(&tree),
-            Some(demo_source.as_bytes()),
-            Some(&idx),
-        );
+    if matches!(get_ref.kind, crate::file_analysis::RefKind::MethodCall { .. }) {
+        let _ = (&tree, demo_source.as_bytes(), &idx, get_col);
+        let klass = analysis.method_call_invocant_class(get_ref, Some(&idx));
         assert!(
             klass.is_some(),
             "`->get`'s invocant (= $r) should resolve to SOME class; got {:?}",
@@ -1755,21 +1744,9 @@ fn test_demo_file_chain_to_resolves_on_line_71() {
         ),
         "ref at ->to is a MethodCall"
     );
-    if let crate::file_analysis::RefKind::MethodCall {
-        invocant,
-        invocant_span,
-        ..
-    } = &to_ref.kind
-    {
-        let klass = analysis.resolve_method_invocant_public(
-            invocant,
-            invocant_span,
-            to_ref.scope,
-            pt(to_col),
-            Some(&tree),
-            Some(demo_source.as_bytes()),
-            Some(&idx),
-        );
+    if matches!(to_ref.kind, crate::file_analysis::RefKind::MethodCall { .. }) {
+        let _ = (&tree, demo_source.as_bytes(), &idx, to_col);
+        let klass = analysis.method_call_invocant_class(to_ref, Some(&idx));
         eprintln!(
             "DIAG: ->to invocant class (real Mojo): {:?} \
                  (None expected until deep chain through \
@@ -2089,21 +2066,8 @@ fn test_demo_chain_empirical_truth_table() {
 
     // --- Link 2: ->get's invocant class (= $r's class) ---
     let get_ref = analysis.ref_at(pt(get_col)).expect("ref at ->get");
-    let get_invocant_class = if let crate::file_analysis::RefKind::MethodCall {
-        invocant,
-        invocant_span,
-        ..
-    } = &get_ref.kind
-    {
-        analysis.resolve_method_invocant_public(
-            invocant,
-            invocant_span,
-            get_ref.scope,
-            pt(get_col),
-            Some(&tree),
-            Some(demo_source.as_bytes()),
-            Some(&idx),
-        )
+    let get_invocant_class = if matches!(get_ref.kind, crate::file_analysis::RefKind::MethodCall { .. }) {
+        analysis.method_call_invocant_class(get_ref, Some(&idx))
     } else {
         None
     };
@@ -2135,21 +2099,8 @@ fn test_demo_chain_empirical_truth_table() {
 
     // --- Link 4: ->to's invocant class (= ->get's return class) ---
     let to_ref = analysis.ref_at(pt(to_col)).expect("ref at ->to");
-    let to_invocant_class = if let crate::file_analysis::RefKind::MethodCall {
-        invocant,
-        invocant_span,
-        ..
-    } = &to_ref.kind
-    {
-        analysis.resolve_method_invocant_public(
-            invocant,
-            invocant_span,
-            to_ref.scope,
-            pt(to_col),
-            Some(&tree),
-            Some(demo_source.as_bytes()),
-            Some(&idx),
-        )
+    let to_invocant_class = if matches!(to_ref.kind, crate::file_analysis::RefKind::MethodCall { .. }) {
+        analysis.method_call_invocant_class(to_ref, Some(&idx))
     } else {
         None
     };

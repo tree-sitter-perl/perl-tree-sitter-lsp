@@ -606,7 +606,7 @@ fn test_phase5_find_references_on_hash_key_def_without_tree() {
     // *usages*, not the def itself. Previously this returned 0 without a
     // tree; phase 5 returns the access sites via refs_by_target.
     let point = def_host.selection_span.start;
-    let refs = fa.find_references(point, None, None);
+    let refs = fa.find_references(point, None, None, None);
     assert!(
         !refs.is_empty(),
         "expected at least one access for 'host' via refs_by_target (no tree), got empty",
@@ -866,7 +866,7 @@ $r->get('/x')->to('Y#z');
     // Querying the bag for the get-call's return should yield
     // MyApp::Route (since its return is `return $self`, which is
     // FirstParam → ClassName projection).
-    let t = fa.method_call_return_type_via_bag(get_ref_idx);
+    let t = fa.method_call_return_type_via_bag(get_ref_idx, None);
     assert!(
         matches!(t, Some(InferredType::ClassName(ref n)) if n == "MyApp::Route"),
         "->get's return type via bag should be ClassName(MyApp::Route), got {:?}",

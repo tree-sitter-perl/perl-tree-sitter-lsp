@@ -420,23 +420,29 @@ pub enum RefKind {
         #[serde(default)]
         resolved_package: Option<String>,
     },
+    /// Method call site `$obj->m(...)` / `Class->m(...)` /
+    /// `chain()->m(...)`. **Invocant class is NOT cached on the
+    /// variant** — it's resolved on demand via
+    /// `FileAnalysis::method_call_invocant_class(ref, module_index)`,
+    /// which dispatches by invocant shape (variable / chain receiver /
+    /// function-call receiver / bareword / `__PACKAGE__` / `shift` /
+    /// `$_[0]`) and queries the witness bag. This is intentional:
+    /// a cached field would silently miss invocants that get typed
+    /// only by post-build cross-file enrichment, and chain hops
+    /// can't be cached without invalidation. The bag-routed helper
+    /// composes through cross-file enrichment automatically.
+    ///
+    /// Build-time chain typing still runs in the builder — it
+    /// publishes Variable witnesses + chain-receiver `Expression`
+    /// edge witnesses; the helper reads those at query time.
     MethodCall {
         invocant: String,
-        /// Span of the invocant node (for complex expressions needing tree resolution).
+        /// Span of the invocant node. Used by
+        /// `method_call_invocant_class` to find an inner-receiver
+        /// ref via `call_ref_by_start` (chain dispatch).
         invocant_span: Option<Span>,
         /// Span of just the method name (for rename — r.span covers the whole expression).
         method_name_span: Span,
-        /// Resolved class of the invocant at build time, when derivable
-        /// from the tree. Populated for:
-        ///   - `$self`/`__PACKAGE__` → current package
-        ///   - bareword `Foo` → `Foo`
-        ///   - typed `$var` → constraint's ClassName
-        ///   - `Foo->new` chain invocant → `Foo` (via extract_constructor_class)
-        /// `None` means "couldn't pin a class at build time" — refs_to
-        /// treats that as no-match (safe default, avoids cross-linking
-        /// unrelated classes that share a method name).
-        #[serde(default)]
-        invocant_class: Option<String>,
     },
     PackageRef,
     HashKeyAccess {
@@ -1016,6 +1022,15 @@ pub struct FileAnalysis {
     /// Every query for "refs to symbol X" collapses to an O(1) lookup here.
     #[serde(skip, default)]
     refs_by_target: HashMap<SymbolId, Vec<usize>>,
+    /// Start-point → call-shaped ref index. Used by
+    /// `method_call_invocant_class` to chase a chain receiver:
+    /// `Foo->new->m`'s outer `->m` `invocant_span` starts at the
+    /// inner `Foo->new` call's start; `make_b()->touch()`'s outer
+    /// `invocant_span` starts at `make_b`'s start. Only MethodCall
+    /// and FunctionCall refs go in here — the receiver dispatch is
+    /// keyed on those two kinds.
+    #[serde(skip, default)]
+    call_ref_by_start: HashMap<Point, usize>,
 }
 
 impl FileAnalysis {
@@ -1062,6 +1077,7 @@ impl FileAnalysis {
             symbols_by_scope: HashMap::new(),
             refs_by_name: HashMap::new(),
             refs_by_target: HashMap::new(),
+            call_ref_by_start: HashMap::new(),
         };
         fa.build_indices();
         // The builder path overwrites `witnesses` with its already-populated
@@ -1099,6 +1115,7 @@ impl FileAnalysis {
         self.symbols_by_scope.clear();
         self.refs_by_name.clear();
         self.refs_by_target.clear();
+        self.call_ref_by_start.clear();
         self.build_indices();
     }
 
@@ -1188,6 +1205,12 @@ impl FileAnalysis {
         }
 
         // Refs by target name, and refs by resolved target SymbolId (phase 5).
+        // Same loop populates the start-point → call-ref-idx index
+        // used by `method_call_invocant_class` to chase chain
+        // receivers. Only MethodCall (whose span covers the whole
+        // call expression) and FunctionCall (whose span covers just
+        // the function-name node, but whose start point still
+        // matches the outer call's invocant_span.start) refs go in.
         for (i, r) in self.refs.iter().enumerate() {
             self.refs_by_name
                 .entry(r.target_name.clone())
@@ -1195,6 +1218,37 @@ impl FileAnalysis {
                 .push(i);
             if let Some(sym_id) = r.resolves_to {
                 self.refs_by_target.entry(sym_id).or_default().push(i);
+            }
+            if matches!(r.kind, RefKind::MethodCall { .. } | RefKind::FunctionCall { .. }) {
+                // First write wins. Method-call refs are visited
+                // outer-first by the walker (the outer call site is
+                // emitted before recursing into its receiver), so
+                // for a chain like `Foo->new->m` the outer `m` ref
+                // would land at start point of `Foo`. Insert with
+                // `or_insert(i)` and rely on the inner receiver
+                // being visited later — but for FunctionCall there
+                // is no outer clash because chains-of-function-calls
+                // don't have the same shape. To keep the inner
+                // receiver as the lookup target, prefer overwriting
+                // when the new ref has a *smaller* span (closer to
+                // the actual receiver).
+                let cur = self.call_ref_by_start.get(&r.span.start).copied();
+                let take = match cur {
+                    None => true,
+                    Some(prev) => {
+                        let prev_span = self.refs[prev].span;
+                        // Smaller span (closer to the receiver) wins.
+                        // Tie-breaker: prefer FunctionCall over MethodCall
+                        // when at the same start, since FunctionCall is
+                        // narrower (just the function-name span).
+                        let new_smaller = (r.span.end.row, r.span.end.column)
+                            < (prev_span.end.row, prev_span.end.column);
+                        new_smaller
+                    }
+                };
+                if take {
+                    self.call_ref_by_start.insert(r.span.start, i);
+                }
             }
         }
     }
@@ -1350,8 +1404,18 @@ impl FileAnalysis {
     ///
     /// This is the piece that makes `$r->get('/x')->to(...)` fold
     /// across chain hops without needing an intermediate variable.
+    /// Resolve the inferred return type of a method call by its
+    /// ref index. Reads `Expression(refidx)` witnesses seeded by
+    /// the builder; `module_index` lets cross-file MethodOnClass
+    /// edges (e.g. `$r->get(...)` where `get` lives in
+    /// `Mojolicious::Routes`) chase through the registry's
+    /// recursive walker.
     #[allow(dead_code)] // documented type-query entry point; CLAUDE.md
-    pub fn method_call_return_type_via_bag(&self, ref_idx: usize) -> Option<InferredType> {
+    pub fn method_call_return_type_via_bag(
+        &self,
+        ref_idx: usize,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<InferredType> {
         use crate::witnesses::{
             BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
             WitnessAttachment,
@@ -1362,7 +1426,7 @@ impl FileAnalysis {
         let ctx = BagContext {
             scopes: &self.scopes,
             package_framework: &self.package_framework,
-            module_index: None,
+            module_index,
             package_parents: &self.package_parents,
             };
         let q = ReducerQuery {
@@ -2592,16 +2656,8 @@ impl FileAnalysis {
                     // Nothing local; leave cross-file resolution to
                     // the LSP adapter (symbols::find_definition).
                 }
-                RefKind::MethodCall { ref invocant, ref invocant_span, ref invocant_class, .. } => {
-                    // Prefer the build-time `invocant_class` (pre-computed
-                    // by `resolve_invocant_class_tree`, handles chains
-                    // like `Foo->new->m`). Fall back to the runtime
-                    // resolver for refs where the builder couldn't pin
-                    // a class (rare — plugin-emitted refs from older
-                    // code paths, ERROR-recovered invocants).
-                    let class_name = invocant_class.clone().or_else(|| self.resolve_method_invocant(
-                        invocant, invocant_span, r.scope, point, tree, source_bytes, module_index,
-                    ));
+                RefKind::MethodCall { .. } => {
+                    let class_name = self.method_call_invocant_class(r, module_index);
 
                     // Check if cursor is on a named arg key in the call args,
                     // not on the method name itself. Resolve to hash key def or :param field.
@@ -2715,9 +2771,15 @@ impl FileAnalysis {
     }
 
     /// Find all references to the symbol at cursor.
-    pub fn find_references(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Vec<Span> {
-        if let Some((target_id, include_decl)) = self.resolve_target_at(point, tree, source_bytes, None) {
-            let mut results = self.collect_refs_for_target(target_id, include_decl, tree, source_bytes);
+    pub fn find_references(
+        &self,
+        point: Point,
+        tree: Option<&tree_sitter::Tree>,
+        source_bytes: Option<&[u8]>,
+        module_index: Option<&ModuleIndex>,
+    ) -> Vec<Span> {
+        if let Some((target_id, include_decl)) = self.resolve_target_at(point, tree, source_bytes, module_index) {
+            let mut results = self.collect_refs_for_target(target_id, include_decl, tree, source_bytes, module_index);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
             results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
             results.into_iter().map(|(span, _)| span).collect()
@@ -2727,9 +2789,15 @@ impl FileAnalysis {
     }
 
     /// Document highlights: like references but with read/write annotation.
-    pub fn find_highlights(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Vec<(Span, AccessKind)> {
-        if let Some((target_id, _)) = self.resolve_target_at(point, tree, source_bytes, None) {
-            let mut results = self.collect_refs_for_target(target_id, true, tree, source_bytes);
+    pub fn find_highlights(
+        &self,
+        point: Point,
+        tree: Option<&tree_sitter::Tree>,
+        source_bytes: Option<&[u8]>,
+        module_index: Option<&ModuleIndex>,
+    ) -> Vec<(Span, AccessKind)> {
+        if let Some((target_id, _)) = self.resolve_target_at(point, tree, source_bytes, module_index) {
+            let mut results = self.collect_refs_for_target(target_id, true, tree, source_bytes, module_index);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
             results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
             return results;
@@ -2743,16 +2811,21 @@ impl FileAnalysis {
         if let Some(r) = self.ref_at(point) {
             let mut results: Vec<(Span, AccessKind)> = Vec::new();
             match &r.kind {
-                RefKind::MethodCall { invocant_class: Some(cn), method_name_span, .. } => {
-                    let wanted_class = cn.clone();
+                RefKind::MethodCall { method_name_span, .. } => {
+                    // Single bag-routed invocant resolver — same call
+                    // for the cursor's ref and every candidate.
+                    let Some(wanted_class) = self.method_call_invocant_class(r, module_index) else {
+                        return Vec::new();
+                    };
                     results.push((*method_name_span, r.access));
                     for other in &self.refs {
                         if std::ptr::eq(other, r) { continue; }
                         if other.target_name != r.target_name { continue; }
-                        if let RefKind::MethodCall { invocant_class: Some(ocn), method_name_span: ms, .. } = &other.kind {
-                            if ocn == &wanted_class {
-                                results.push((*ms, other.access));
-                            }
+                        if !matches!(other.kind, RefKind::MethodCall { .. }) { continue; }
+                        let Some(ocn) = self.method_call_invocant_class(other, module_index) else { continue };
+                        if ocn != wanted_class { continue; }
+                        if let RefKind::MethodCall { method_name_span: ms, .. } = &other.kind {
+                            results.push((*ms, other.access));
                         }
                     }
                 }
@@ -2785,6 +2858,7 @@ impl FileAnalysis {
         include_decl: bool,
         tree: Option<&tree_sitter::Tree>,
         source_bytes: Option<&[u8]>,
+        module_index: Option<&ModuleIndex>,
     ) -> Vec<(Span, AccessKind)> {
         let sym = self.symbol(target_id);
         let mut results: Vec<(Span, AccessKind)> = Vec::new();
@@ -2820,7 +2894,7 @@ impl FileAnalysis {
                                 results.push((r.span, r.access));
                             }
                         }
-                        (RefKind::MethodCall { method_name_span, invocant_class, .. },
+                        (RefKind::MethodCall { method_name_span, .. },
                          SymKind::Sub | SymKind::Method) => {
                             // Same-class match only; unresolved or
                             // different-class invocants are excluded.
@@ -2828,8 +2902,8 @@ impl FileAnalysis {
                             // `$obj->foo(...)` expression so we use
                             // `method_name_span` to highlight just
                             // the identifier.
-                            match (invocant_class, &sym_package) {
-                                (Some(cn), Some(pkg)) if cn == pkg => {
+                            match (self.method_call_invocant_class(r, module_index), &sym_package) {
+                                (Some(cn), Some(pkg)) if cn == *pkg => {
                                     results.push((*method_name_span, r.access));
                                 }
                                 _ => {}
@@ -2872,7 +2946,7 @@ impl FileAnalysis {
     }
 
     /// Hover info: return display text for the symbol at cursor.
-    pub fn hover_info(&self, point: Point, source: &str, tree: Option<&tree_sitter::Tree>, module_index: Option<&ModuleIndex>) -> Option<String> {
+    pub fn hover_info(&self, point: Point, source: &str, _tree: Option<&tree_sitter::Tree>, module_index: Option<&ModuleIndex>) -> Option<String> {
         // Check refs first
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
@@ -2884,10 +2958,8 @@ impl FileAnalysis {
                             && contains_point(&mr.span, point)
                             && mr.target_name != r.target_name);
                     if let Some(mr) = method_hover {
-                        if let RefKind::MethodCall { ref invocant, ref invocant_span, ref invocant_class, .. } = mr.kind {
-                            let class_name = invocant_class.clone().or_else(|| self.resolve_method_invocant(
-                                invocant, invocant_span, mr.scope, point, tree, Some(source.as_bytes()), module_index,
-                            ));
+                        if matches!(mr.kind, RefKind::MethodCall { .. }) {
+                            let class_name = self.method_call_invocant_class(mr, module_index);
                             if let Some(ref cn) = class_name {
                                 match self.resolve_method_in_ancestors(cn, &mr.target_name, module_index) {
                                     Some(MethodResolution::Local { sym_id, class: ref defining_class, .. }) => {
@@ -2991,13 +3063,8 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::MethodCall { ref invocant, ref invocant_span, ref invocant_class, .. } => {
-                    // Prefer the build-time `invocant_class` field
-                    // (handles chains); fall back to the runtime
-                    // tree-based resolver.
-                    let class_name = invocant_class.clone().or_else(|| self.resolve_method_invocant(
-                        invocant, invocant_span, r.scope, point, tree, Some(source.as_bytes()), module_index,
-                    ));
+                RefKind::MethodCall { .. } => {
+                    let class_name = self.method_call_invocant_class(r, module_index);
                     if let Some(ref cn) = class_name {
                         match self.resolve_method_in_ancestors(cn, &r.target_name, module_index) {
                             Some(MethodResolution::Local { sym_id, class: ref defining_class, .. }) => {
@@ -3100,7 +3167,7 @@ impl FileAnalysis {
 
     /// Rename: return all spans + new text for renaming the symbol at cursor.
     pub fn rename_at(&self, point: Point, new_name: &str, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Option<Vec<(Span, String)>> {
-        let refs = self.find_references(point, tree, source_bytes);
+        let refs = self.find_references(point, tree, source_bytes, None);
         if refs.is_empty() {
             return None;
         }
@@ -3141,7 +3208,7 @@ impl FileAnalysis {
     /// falls through to symbol-at resolution; if that also has no
     /// class context (orphan Sub), returns `None` — the cursor isn't
     /// on something we can safely rename.
-    pub fn rename_kind_at(&self, point: Point) -> Option<RenameKind> {
+    pub fn rename_kind_at(&self, point: Point, module_index: Option<&ModuleIndex>) -> Option<RenameKind> {
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => return Some(RenameKind::Variable),
@@ -3151,15 +3218,8 @@ impl FileAnalysis {
                         package: resolved_package.clone(),
                     });
                 }
-                RefKind::MethodCall { invocant, invocant_span, invocant_class, .. } => {
-                    // Prefer build-time class (chain-resolved);
-                    // fall back to text-based resolution.
-                    let class = invocant_class.clone()
-                        .or_else(|| {
-                            let resolve_point = invocant_span.map(|s| s.start).unwrap_or(point);
-                            self.invocant_text_to_class(Some(invocant), resolve_point)
-                        });
-                    if let Some(class) = class {
+                RefKind::MethodCall { .. } => {
+                    if let Some(class) = self.method_call_invocant_class(r, module_index) {
                         return Some(RenameKind::Method {
                             name: r.target_name.clone(),
                             class,
@@ -3230,6 +3290,7 @@ impl FileAnalysis {
         old_name: &str,
         scope: &Option<String>,
         new_name: &str,
+        module_index: Option<&ModuleIndex>,
     ) -> Vec<(Span, String)> {
         let mut edits = Vec::new();
         for sym in &self.symbols {
@@ -3246,11 +3307,13 @@ impl FileAnalysis {
                         edits.push((r.span, new_name.to_string()));
                     }
                 }
-                RefKind::MethodCall { invocant_class, method_name_span, .. } => {
+                RefKind::MethodCall { method_name_span, .. } => {
                     // MethodCall refs target a class — `None` scope
                     // doesn't reach methods.
-                    if let (Some(cls), Some(wanted)) = (invocant_class, scope.as_ref()) {
-                        if cls == wanted {
+                    if let (Some(cls), Some(wanted)) =
+                        (self.method_call_invocant_class(r, module_index), scope.as_ref())
+                    {
+                        if &cls == wanted {
                             edits.push((*method_name_span, new_name.to_string()));
                         }
                     }
@@ -3265,8 +3328,14 @@ impl FileAnalysis {
     /// Function rename path. Delegates to the unified
     /// `rename_callable_in_scope`; the distinction between "function"
     /// and "method" in Perl is just call shape, not identity.
-    pub fn rename_sub_in_package(&self, old_name: &str, package: &Option<String>, new_name: &str) -> Vec<(Span, String)> {
-        self.rename_callable_in_scope(old_name, package, new_name)
+    pub fn rename_sub_in_package(
+        &self,
+        old_name: &str,
+        package: &Option<String>,
+        new_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Vec<(Span, String)> {
+        self.rename_callable_in_scope(old_name, package, new_name, module_index)
     }
 
     /// Class-scoped method rename — public-API name used by the
@@ -3274,8 +3343,14 @@ impl FileAnalysis {
     /// `rename_sub_in_package(old, &Some(class), new)`: function and
     /// method calls into the same package are two shapes of the same
     /// callable.
-    pub fn rename_method_in_class(&self, old_name: &str, class: &str, new_name: &str) -> Vec<(Span, String)> {
-        self.rename_callable_in_scope(old_name, &Some(class.to_string()), new_name)
+    pub fn rename_method_in_class(
+        &self,
+        old_name: &str,
+        class: &str,
+        new_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Vec<(Span, String)> {
+        self.rename_callable_in_scope(old_name, &Some(class.to_string()), new_name, module_index)
     }
 
     /// Find all occurrences of a package name (def + refs + use statements) for cross-file rename.
@@ -3319,10 +3394,8 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::MethodCall { ref invocant, ref invocant_span, ref invocant_class, .. } => {
-                    let class_name = invocant_class.clone().or_else(|| self.resolve_method_invocant(
-                        invocant, invocant_span, r.scope, point, tree, source_bytes, module_index,
-                    ));
+                RefKind::MethodCall { .. } => {
+                    let class_name = self.method_call_invocant_class(r, module_index);
                     // Try inheritance-aware resolution first
                     if let Some(ref cn) = class_name {
                         match self.resolve_method_in_ancestors(cn, &r.target_name, module_index) {
@@ -3419,46 +3492,178 @@ impl FileAnalysis {
         None
     }
 
-    /// Resolve a method call's invocant to a class name (public API for cross-file goto-def).
-    pub fn resolve_method_invocant_public(
+    /// Resolve a `MethodCall` ref's invocant class via the witness
+    /// bag — **the** invocant resolver. No tree, no text fallback,
+    /// no per-reader parallel paths. Every reader (refs_to,
+    /// find_highlights, collect_refs_for_target, rename_callable_in_scope,
+    /// hover, find-def, rename_kind_at, resolve_target_at, the
+    /// completion path) routes through here.
+    ///
+    /// Dispatch by invocant shape:
+    ///   * `$var` / `@var` / `%var` → `inferred_type_via_bag` (so
+    ///     cross-file enrichment's variable types compose
+    ///     automatically — the bug that prompted this rewrite).
+    ///   * `$self` (untyped) → enclosing class fallback.
+    ///   * `__PACKAGE__` → enclosing class.
+    ///   * Chain or function-call receiver (invocant_span points at
+    ///     another ref) → that ref's bag answer
+    ///     (`method_call_return_type_via_bag` for MethodCall;
+    ///     `sub_return_type_at_arity` for FunctionCall). Receiver
+    ///     ref is found via `ref_idx_by_exact_span` (O(1)).
+    ///   * Bareword → `Foo` if a zero-arg sub by that name returns
+    ///     ClassName, else the bareword itself.
+    ///
+    /// Build-time chain typing still runs in the builder — its
+    /// product lands in the bag (Variable witnesses, `Expression`
+    /// edge witnesses on chain receivers). This helper just queries
+    /// the bag, never re-derives.
+    ///
+    /// `module_index` lets chain receivers whose return type lives
+    /// in another package resolve (e.g. `$r->get('/x')->to(...)`
+    /// where `Routes::get` returns `Routes::Route`). Pass `None`
+    /// only when no index is available (CLI debug, isolated tests);
+    /// every LSP-facing reader has one.
+    pub fn method_call_invocant_class(
         &self,
-        invocant: &str,
-        invocant_span: &Option<Span>,
-        scope: ScopeId,
-        point: Point,
-        tree: Option<&tree_sitter::Tree>,
-        source_bytes: Option<&[u8]>,
+        r: &Ref,
         module_index: Option<&ModuleIndex>,
     ) -> Option<String> {
-        self.resolve_method_invocant(invocant, invocant_span, scope, point, tree, source_bytes, module_index)
-    }
+        let RefKind::MethodCall { invocant, invocant_span, .. } = &r.kind else {
+            return None;
+        };
+        if invocant.is_empty() {
+            return None;
+        }
+        let point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
 
-    /// Resolve a method call's invocant to a class name, using tree-based resolution
-    /// for complex expressions when available.
-    fn resolve_method_invocant(
-        &self,
-        invocant: &str,
-        invocant_span: &Option<Span>,
-        scope: ScopeId,
-        point: Point,
-        tree: Option<&tree_sitter::Tree>,
-        source_bytes: Option<&[u8]>,
-        module_index: Option<&ModuleIndex>,
-    ) -> Option<String> {
-        // Try tree-based resolution for complex invocants, fall through on failure
-        if let (Some(span), Some(tree), Some(src)) = (invocant_span, tree, source_bytes) {
-            if let Some(node) = tree.root_node()
-                .descendant_for_point_range(span.start, span.end)
-            {
-                if let Some(ty) = self.resolve_expression_type(node, src, module_index) {
-                    if let Some(cn) = ty.class_name() {
-                        return Some(cn.to_string());
+        // Pseudo-invocants for "$self at the method's first arg":
+        // `shift` (no args; `sub m { my $self = shift; ... }`),
+        // `$_[0]` / `@_[0]` (positional). Tree-aware build-time
+        // resolver treats these as enclosing-class identity. The
+        // bag has no Variable witness for them — they aren't real
+        // variables — so we resolve here directly.
+        if invocant == "shift" || invocant == "$_[0]" || invocant == "@_[0]" {
+            return self.enclosing_class_for_scope(r.scope);
+        }
+
+        // `__PACKAGE__` is rewritten to the enclosing package at
+        // walk time, but synthesized refs may still carry it raw.
+        if invocant == "__PACKAGE__" {
+            return self.enclosing_class_for_scope(r.scope);
+        }
+
+        // Chain / function-call receiver — checked BEFORE the
+        // simple-variable path because complex invocants like
+        // `$r->get('/x')` lead with `$` but aren't a variable
+        // lookup; they're a sub-expression whose type lives in
+        // another ref's bag answer. Index `call_ref_by_start`
+        // returns the *innermost* call-shaped ref starting at
+        // `invocant_span.start` (smallest-span tie-break in
+        // `build_indices`); we additionally require that ref's
+        // span be contained in `invocant_span` so we don't loop
+        // back on the outer ref itself for `Foo->m` where there's
+        // no real inner receiver.
+        if let Some(span) = invocant_span {
+            if let Some(&recv_idx) = self.call_ref_by_start.get(&span.start) {
+                let recv_span = self.refs[recv_idx].span;
+                let contained = recv_span.start == span.start
+                    && (recv_span.end.row, recv_span.end.column)
+                        <= (span.end.row, span.end.column);
+                // Guard against the lookup returning the outer ref
+                // itself (no genuine inner receiver). Compare by
+                // pointer to handle the equal-span case.
+                let is_self = std::ptr::eq(&self.refs[recv_idx], r);
+                if contained && !is_self {
+                    match &self.refs[recv_idx].kind {
+                    RefKind::MethodCall { .. } => {
+                        // Recursive: resolve the receiver's own
+                        // invocant class fresh (so cross-file
+                        // enrichment-typed variables compose
+                        // through chain hops without depending on
+                        // a build-time-published Expression edge),
+                        // then chase MethodOnClass{class, method}
+                        // through `find_method_return_type` — the
+                        // single class-keyed entry point that walks
+                        // ancestors + cross-file bridges via the
+                        // registry's `query_rec`.
+                        let recv = &self.refs[recv_idx];
+                        if let Some(recv_class) =
+                            self.method_call_invocant_class(recv, module_index)
+                        {
+                            if recv.target_name == "new" {
+                                return Some(recv_class);
+                            }
+                            if let Some(t) = self.find_method_return_type(
+                                &recv_class,
+                                &recv.target_name,
+                                module_index,
+                                None,
+                            ) {
+                                if let Some(cn) = t.class_name() {
+                                    return Some(cn.to_string());
+                                }
+                            }
+                        }
+                        return None;
+                    }
+                    RefKind::FunctionCall { .. } => {
+                        let recv = &self.refs[recv_idx];
+                        if let Some(InferredType::ClassName(c)) =
+                            self.sub_return_type_at_arity(&recv.target_name, Some(0))
+                        {
+                            return Some(c);
+                        }
+                        return None;
+                    }
+                    _ => {}
                     }
                 }
             }
         }
-        // Fall back to string-based resolution
-        self.resolve_invocant_class(invocant, scope, point)
+
+        // Variable invocant — bag query handles every typed shape
+        // (TC, FrameworkAware, BranchArm, ArityReturn, cross-file
+        // Variable witnesses pushed by enrichment).
+        let first = invocant.as_bytes()[0];
+        if first == b'$' || first == b'@' || first == b'%' {
+            if let Some(t) = self.inferred_type_via_bag(invocant, point) {
+                if let Some(cn) = t.class_name() {
+                    return Some(cn.to_string());
+                }
+            }
+            // `$self` enclosing-class fallback. Other untyped
+            // variable invocants stay None — better than poisoning
+            // them with the surrounding package and pretending
+            // method calls land on it.
+            if invocant == "$self" {
+                return self.enclosing_class_for_scope(r.scope);
+            }
+            return None;
+        }
+
+        // Bareword invocant. Could be a zero-arg sub returning
+        // ClassName (`app->routes` where `app` is plugin-emitted) —
+        // promote that case. Otherwise the bareword *is* the class
+        // name (`Foo->method`).
+        let bare = invocant.rsplit("::").next().unwrap_or(invocant);
+        if let Some(InferredType::ClassName(c)) = self.sub_return_type_at_arity(bare, Some(0)) {
+            return Some(c);
+        }
+        Some(invocant.to_string())
+    }
+
+    /// Walk the scope chain to find the enclosing class or package.
+    fn enclosing_class_for_scope(&self, scope: ScopeId) -> Option<String> {
+        for sid in self.scope_chain(scope).iter() {
+            let s = self.scope(*sid);
+            if let ScopeKind::Class { ref name } = s.kind {
+                return Some(name.clone());
+            }
+            if let Some(ref pkg) = s.package {
+                return Some(pkg.clone());
+            }
+        }
+        None
     }
 
     /// Test-only wrapper over the private `resolve_invocant_class`.
@@ -3472,7 +3677,11 @@ impl FileAnalysis {
         self.resolve_invocant_class(invocant, scope, point)
     }
 
-    /// Resolve an invocant string to a class name.
+    /// Resolve an invocant string to a class name. Internal helper
+    /// used by string-based completion / hover-context paths that
+    /// don't have a `Ref` in hand. The ref-aware
+    /// `method_call_invocant_class` is preferred everywhere a
+    /// `&Ref` is available.
     fn resolve_invocant_class(&self, invocant: &str, scope: ScopeId, point: Point) -> Option<String> {
         if invocant.starts_with('$') || invocant.starts_with('@') || invocant.starts_with('%') {
             // Variable invocant → infer type via the witness bag so
@@ -5407,3 +5616,7 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
 #[cfg(test)]
 #[path = "file_analysis_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "call_ref_index_tests.rs"]
+mod call_ref_index_tests;

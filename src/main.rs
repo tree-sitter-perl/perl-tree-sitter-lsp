@@ -528,7 +528,7 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
         .unwrap_or_else(|_| std::path::PathBuf::from(file));
 
     // Local refs
-    let local_refs = analysis.find_references(point, Some(&tree), Some(source.as_bytes()));
+    let local_refs = analysis.find_references(point, Some(&tree), Some(source.as_bytes()), None);
     for span in &local_refs {
         results.push(serde_json::json!({
             "file": file_path.display().to_string(),
@@ -554,8 +554,8 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
             let scope_from_ref = match &r.kind {
                 file_analysis::RefKind::FunctionCall { resolved_package } =>
                     Some(("sub", resolved_package.clone())),
-                file_analysis::RefKind::MethodCall { invocant_class, .. } =>
-                    invocant_class.as_ref().map(|c| ("method", Some(c.clone()))),
+                file_analysis::RefKind::MethodCall { .. } =>
+                    analysis.method_call_invocant_class(r, None).map(|c| ("method", Some(c))),
                 _ => None,
             };
             let scope_from_sym = analysis.symbol_at(point).and_then(|s| match s.kind {
@@ -572,9 +572,9 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
                 } else {
                     match &scope {
                         Some(("sub", package)) =>
-                            entry.value().rename_sub_in_package(target, package, target),
+                            entry.value().rename_sub_in_package(target, package, target, None),
                         Some(("method", Some(class))) =>
-                            entry.value().rename_method_in_class(target, class, target),
+                            entry.value().rename_method_in_class(target, class, target, None),
                         // Unresolvable method scope — skip rather than
                         // cross-link. Matches refs_to / rename semantics.
                         _ => Vec::new(),
@@ -611,7 +611,7 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
     }
     let analysis_ref = ws.get_workspace(&file_path).unwrap();
 
-    let rename_kind = match analysis_ref.rename_kind_at(point) {
+    let rename_kind = match analysis_ref.rename_kind_at(point, None) {
         Some(k) => k,
         None => {
             eprintln!("Nothing renameable at {}:{}", line_str, col_str);
@@ -641,9 +641,9 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
             for entry in ws.workspace_raw().iter() {
                 let edits = match &rename_kind {
                     file_analysis::RenameKind::Function { name, package } =>
-                        entry.value().rename_sub_in_package(name, package, new_name),
+                        entry.value().rename_sub_in_package(name, package, new_name, None),
                     file_analysis::RenameKind::Method { name, class } =>
-                        entry.value().rename_method_in_class(name, class, new_name),
+                        entry.value().rename_method_in_class(name, class, new_name, None),
                     _ => unreachable!(),
                 };
                 if !edits.is_empty() {

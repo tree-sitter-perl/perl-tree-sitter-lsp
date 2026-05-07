@@ -195,6 +195,7 @@ fn build_with_plugins_inner(
         package_ranges: Vec::new(),
         open_statement_package: None,
         plugins,
+        method_call_invocant: std::collections::HashMap::new(),
     };
 
     // Create file-level scope and walk
@@ -964,6 +965,20 @@ struct Builder<'a> {
     /// Framework plugin registry. Shared Arc so multiple builders in one
     /// process avoid re-compiling the same Rhai scripts.
     plugins: Arc<PluginRegistry>,
+
+    /// Build-time chain-typing cache for MethodCall ref invocants.
+    /// Keyed by `refs[idx]`. Walk-time fills it for syntactic cases
+    /// (constructor pattern `Foo->new`, `__PACKAGE__->m`); PostFold's
+    /// `apply_chain_typing_invocants` fills it for variable invocants
+    /// whose TC has crystallized. Build-time consumers
+    /// (`emit_method_call_arg_keys`, `emit_method_call_return_edges`,
+    /// fixed-point movement counter) read it.
+    ///
+    /// **Build-only.** Never copied into `FileAnalysis`. The reader-
+    /// side counterpart is `FileAnalysis::method_call_invocant_class`,
+    /// which queries the bag at read time and so picks up cross-file
+    /// enrichment automatically.
+    method_call_invocant: std::collections::HashMap<usize, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1744,12 +1759,12 @@ impl<'a> Builder<'a> {
                 } else {
                     Some(invocant.clone())
                 };
+                let ref_idx = self.refs.len();
                 self.refs.push(Ref {
                     kind: RefKind::MethodCall {
                         invocant,
                         invocant_span,
                         method_name_span: span,
-                        invocant_class,
                     },
                     span,
                     scope: self.current_scope(),
@@ -1757,6 +1772,9 @@ impl<'a> Builder<'a> {
                     access: AccessKind::Read,
                     resolves_to: None,
                 });
+                if let Some(c) = invocant_class {
+                    self.method_call_invocant.insert(ref_idx, c);
+                }
             }
             plugin::EmitAction::DispatchCall { name, dispatcher, owner, span, var_text } => {
                 // Same pattern as HashKeyAccess: record the owner so
@@ -4950,31 +4968,37 @@ impl<'a> Builder<'a> {
             if name.starts_with('$') {
                 if let Some(resolved) = self.resolve_constant_strings(name, 0) {
                     for rname in resolved {
+                        let idx = self.refs.len();
                         self.add_ref(
                             RefKind::MethodCall {
                                 invocant: invocant.clone().unwrap_or_default(),
                                 invocant_span,
                                 method_name_span,
-                                invocant_class: invocant_class.clone(),
                             },
                             node_to_span(node),
                             rname,
                             AccessKind::Read,
                         );
+                        if let Some(c) = invocant_class.clone() {
+                            self.method_call_invocant.insert(idx, c);
+                        }
                     }
                 }
             } else {
+                let idx = self.refs.len();
                 self.add_ref(
                     RefKind::MethodCall {
                         invocant: invocant.clone().unwrap_or_default(),
                         invocant_span,
                         method_name_span,
-                        invocant_class: invocant_class.clone(),
                     },
                     node_to_span(node),
                     name.clone(),
                     AccessKind::Read,
                 );
+                if let Some(c) = invocant_class.clone() {
+                    self.method_call_invocant.insert(idx, c);
+                }
             }
         }
 
@@ -6074,18 +6098,14 @@ impl<'a> Builder<'a> {
             .map(|s| (s.id, self.resolved_returns.get(&s.id).cloned()))
             .collect();
         answers.sort_by_key(|(id, _)| id.0);
-        // Count refs with filled `invocant_class` so progressive
-        // chain-typing inside the loop registers as movement —
-        // without this, an iteration that only newly fills
-        // `invocant_class` (driving the next iteration's
+        // Count entries in the build-time invocant cache so
+        // progressive chain-typing inside the loop registers as
+        // movement — without this, an iteration that only newly
+        // fills the invocant cache (driving the next iteration's
         // `emit_method_call_return_edges` to publish a new edge)
         // would produce the same answers/bag snapshot and the loop
         // would terminate prematurely.
-        let invocant_filled = self
-            .refs
-            .iter()
-            .filter(|r| matches!(&r.kind, RefKind::MethodCall { invocant_class: Some(_), .. }))
-            .count();
+        let invocant_filled = self.method_call_invocant.len();
         (answers, self.bag.len(), invocant_filled)
     }
 
@@ -6204,12 +6224,11 @@ impl<'a> Builder<'a> {
         let mut pending: Vec<(usize, Node<'a>)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
             if let RefKind::MethodCall {
-                invocant_class,
                 invocant_span: Some(sp),
                 ..
             } = &r.kind
             {
-                if invocant_class.is_some() {
+                if self.method_call_invocant.contains_key(&i) {
                     continue;
                 }
                 if let Some(n) = idx.invocant_nodes.get(&(sp.start, sp.end)).copied() {
@@ -6219,9 +6238,7 @@ impl<'a> Builder<'a> {
         }
         for (i, node) in pending {
             if let Some(class) = self.resolve_invocant_class_tree(node) {
-                if let RefKind::MethodCall { invocant_class, .. } = &mut self.refs[i].kind {
-                    *invocant_class = Some(class);
-                }
+                self.method_call_invocant.insert(i, class);
             }
         }
     }
@@ -6242,8 +6259,11 @@ impl<'a> Builder<'a> {
     fn emit_method_call_arg_keys(&mut self, idx: &ChainTypingIndex<'a>) {
         // Snapshot first so we can `&mut self` the emit loop below.
         let mut pending: Vec<(HashKeyOwner, Node<'a>)> = Vec::new();
-        for r in &self.refs {
-            let RefKind::MethodCall { invocant_class: Some(cls), .. } = &r.kind else {
+        for (i, r) in self.refs.iter().enumerate() {
+            if !matches!(r.kind, RefKind::MethodCall { .. }) {
+                continue;
+            }
+            let Some(cls) = self.method_call_invocant.get(&i) else {
                 continue;
             };
             let Some(args) = idx
@@ -6301,7 +6321,10 @@ impl<'a> Builder<'a> {
 
         let mut edges: Vec<Witness> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
-            let RefKind::MethodCall { invocant_class: Some(class), .. } = &r.kind else {
+            if !matches!(r.kind, RefKind::MethodCall { .. }) {
+                continue;
+            }
+            let Some(class) = self.method_call_invocant.get(&i) else {
                 continue;
             };
             edges.push(Witness {

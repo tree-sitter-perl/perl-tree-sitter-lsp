@@ -110,7 +110,7 @@ pub fn refs_to(
             if let Ok(p) = url.to_file_path() {
                 covered_paths.insert(p);
             }
-            collect_from_analysis(&FileKey::Url(url), &doc.analysis, target, &mut out);
+            collect_from_analysis(&FileKey::Url(url), &doc.analysis, target, module_index, &mut out);
         });
     } else {
         // Even if open isn't in the mask, track the paths so a WORKSPACE walk
@@ -128,7 +128,7 @@ pub fn refs_to(
             if covered_paths.contains(entry.key()) {
                 continue;
             }
-            collect_from_analysis(&FileKey::Path(entry.key().clone()), entry.value(), target, &mut out);
+            collect_from_analysis(&FileKey::Path(entry.key().clone()), entry.value(), target, module_index, &mut out);
         }
     }
 
@@ -137,7 +137,7 @@ pub fn refs_to(
         if let Some(idx) = module_index {
             idx.for_each_cached(|_module_name, cached| {
                 let key = FileKey::Path(cached.path.clone());
-                collect_from_analysis(&key, &cached.analysis, target, &mut out);
+                collect_from_analysis(&key, &cached.analysis, target, module_index, &mut out);
             });
         }
     }
@@ -170,6 +170,7 @@ fn collect_from_analysis(
     key: &FileKey,
     analysis: &FileAnalysis,
     target: &TargetRef,
+    module_index: Option<&ModuleIndex>,
     out: &mut Vec<RefLocation>,
 ) {
     use crate::file_analysis::{HashKeyOwner, SymbolDetail};
@@ -246,16 +247,21 @@ fn collect_from_analysis(
                 resolved_package == scope
             }
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
-             RefKind::MethodCall { invocant_class, .. }) => {
+             RefKind::MethodCall { .. }) => {
                 // Method-shaped call: match only when the ref's
-                // invocant resolved to the target scope. No text
-                // fallback — unresolved invocants are excluded rather
-                // than cross-linked. (Build-time
-                // `resolve_invocant_class_tree` handles chains.)
+                // invocant resolves to the target scope. The bag is
+                // the single resolver — `method_call_invocant_class`
+                // dispatches by invocant shape (variable / chain /
+                // bareword / `__PACKAGE__`) and queries the bag.
+                // Cross-file enrichment composes naturally because
+                // it pushes Variable witnesses the bag query reads.
+                // Class still has to be `Some` to match — package-
+                // less subs and genuinely unpinnable invocants stay
+                // out, no cross-linking.
                 let scope = callable_scope_for_refs.as_ref().unwrap();
-                match (invocant_class, scope) {
-                    (Some(cn), Some(pkg)) => cn == pkg,
-                    _ => false, // package-less sub or unpinned method
+                match (analysis.method_call_invocant_class(r, module_index), scope) {
+                    (Some(cn), Some(pkg)) => &cn == pkg,
+                    _ => false,
                 }
             }
             (TargetKind::Package, RefKind::PackageRef) => true,

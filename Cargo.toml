@@ -13,6 +13,16 @@ categories = ["development-tools", "text-editors"]
 name = "perl-lsp"
 path = "src/main.rs"
 
+[features]
+default = []
+# Compile the workspace-scale `refs_to` perf bench
+# (`bench_refs_to_invocant_resolution`). Off by default so the
+# regular `cargo test` doesn't carry a long-running synthetic
+# workload — and so we never ship `#[ignore]`d tests as
+# perpetual yellow output. Run with:
+#   cargo test --release --features perf_bench bench_refs_to
+perf_bench = []
+
 [dependencies]
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }

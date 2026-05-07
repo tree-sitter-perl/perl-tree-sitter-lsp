@@ -378,7 +378,7 @@ impl LanguageServer for Backend {
         use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
 
         let point = symbols::position_to_point(pos);
-        let target = match doc.analysis.rename_kind_at(point) {
+        let target = match doc.analysis.rename_kind_at(point, Some(&self.module_index)) {
             Some(RenameKind::Function { name, package }) => TargetRef {
                 name,
                 kind: TargetKind::Sub { package },
@@ -448,7 +448,7 @@ impl LanguageServer for Backend {
                         // Fall back to single-file (e.g. keys owned by a lexical
                         // variable — scope-local by definition).
                         let refs = symbols::find_references(
-                            &doc.analysis, pos, uri, &doc.tree, &doc.text,
+                            &doc.analysis, pos, uri, &doc.tree, &doc.text, Some(&self.module_index),
                         );
                         return Ok(if refs.is_empty() { None } else { Some(refs) });
                     }
@@ -457,7 +457,7 @@ impl LanguageServer for Backend {
             Some(RenameKind::Variable) | None => {
                 // Variables are lexical — single-file only.
                 let refs = symbols::find_references(
-                    &doc.analysis, pos, uri, &doc.tree, &doc.text,
+                    &doc.analysis, pos, uri, &doc.tree, &doc.text, Some(&self.module_index),
                 );
                 return Ok(if refs.is_empty() { None } else { Some(refs) });
             }
@@ -512,7 +512,7 @@ impl LanguageServer for Backend {
         };
 
         let point = symbols::position_to_point(pos);
-        let rename_kind = doc.analysis.rename_kind_at(point);
+        let rename_kind = doc.analysis.rename_kind_at(point, Some(&self.module_index));
 
         match rename_kind {
             Some(crate::file_analysis::RenameKind::Variable) => {
@@ -536,26 +536,32 @@ impl LanguageServer for Backend {
                 let (name, rename_fn): (String, Box<dyn Fn(&FileAnalysis, &str, &str) -> Vec<(crate::file_analysis::Span, String)>>) = match rename_kind.as_ref().unwrap() {
                     crate::file_analysis::RenameKind::Function { name, package } => {
                         let p = package.clone();
-                        (name.clone(), Box::new(move |fa, old, new| fa.rename_sub_in_package(old, &p, new)))
+                        let mi = Arc::clone(&self.module_index);
+                        (name.clone(), Box::new(move |fa, old, new| {
+                            fa.rename_sub_in_package(old, &p, new, Some(&mi))
+                        }))
                     }
                     crate::file_analysis::RenameKind::Method { name, class } => {
                         // Walk MyWorker → ... → BaseWorker (the actual
                         // defining class). Each link is needed: the
-                        // call-site invocant_class on `$worker->process`
-                        // is "MyWorker" (the static type), while the
-                        // `sub process` definition lives in BaseWorker.
+                        // call-site invocant class on `$worker->process`
+                        // (resolved via the bag-routed
+                        // `method_call_invocant_class`) is "MyWorker"
+                        // (the static type), while the `sub process`
+                        // definition lives in BaseWorker.
                         // `rename_method_in_class` matches strict
-                        // `invocant_class == scope`, so without the
-                        // chain we'd pick up only one of the two ends.
+                        // class == scope, so without the chain we'd
+                        // pick up only one of the two ends.
                         let chain = doc.analysis.method_rename_chain(
                             class,
                             name,
                             Some(&self.module_index),
                         );
+                        let mi = Arc::clone(&self.module_index);
                         (name.clone(), Box::new(move |fa, old, new| {
                             let mut all = Vec::new();
                             for c in &chain {
-                                all.extend(fa.rename_method_in_class(old, c, new));
+                                all.extend(fa.rename_method_in_class(old, c, new, Some(&mi)));
                             }
                             all
                         }))
@@ -688,7 +694,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let highlights = symbols::document_highlights(&doc.analysis, pos, &doc.tree, &doc.text);
+        let highlights = symbols::document_highlights(&doc.analysis, pos, &doc.tree, &doc.text, Some(&self.module_index));
         if highlights.is_empty() {
             Ok(None)
         } else {
@@ -994,7 +1000,7 @@ impl LanguageServer for Backend {
         };
 
         let point = symbols::position_to_point(pos);
-        let refs = doc.analysis.find_references(point, None, None);
+        let refs = doc.analysis.find_references(point, None, None, Some(&self.module_index));
         if refs.len() < 2 {
             return Ok(None);
         }
