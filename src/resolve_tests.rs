@@ -355,19 +355,19 @@ Bler->new->hi;
 }
 
 /// ALL FOUR LSP paths (hover, gd, gr, rename) must class-scope
-/// for two packages sharing a method name. Five different resolvers
-/// exist in the codebase:
+/// for two packages sharing a method name. Single resolver post
+/// option-2 — `FileAnalysis::method_call_invocant_class(ref, idx)`
+/// — but the four user-visible surfaces still each need their own
+/// integration coverage:
 ///
-///   1. `Builder::resolve_invocant_class_tree` — populates
-///      `RefKind::MethodCall.invocant_class` at build time.
-///   2. `FileAnalysis::resolve_method_invocant` — tree-based,
-///      used by `find_definition` and `hover_info`.
-///   3. `FileAnalysis::resolve_invocant_class` — text fallback
-///      used by resolve_method_invocant.
-///   4. `FileAnalysis::invocant_text_to_class` — used by
-///      `rename_kind_at` and `refs_to` fallback.
-///   5. `FileAnalysis::rename_method_in_class` — my new one;
-///      filters rename edits by class.
+///   1. find_definition (gd) — bag-routed via the helper, then
+///      walks ancestors for cross-class fallback.
+///   2. hover_info (K) — same helper; walks ancestors for the
+///      "*from BaseClass*" provenance.
+///   3. find_references / refs_to (gr) — iterates every MethodCall
+///      ref and filters by helper-resolved invocant class.
+///   4. rename_method_in_class — class-scopes edits to MethodCall
+///      refs whose helper answer matches.
 ///
 /// Classic copy-paste risk. This test drives all four LSP-visible
 /// surfaces with a single Foo/Bar fixture and proves every path

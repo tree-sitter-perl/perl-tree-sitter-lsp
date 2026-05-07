@@ -420,9 +420,26 @@ pub enum RefKind {
         #[serde(default)]
         resolved_package: Option<String>,
     },
+    /// Method call site `$obj->m(...)` / `Class->m(...)` /
+    /// `chain()->m(...)`. **Invocant class is NOT cached on the
+    /// variant** — it's resolved on demand via
+    /// `FileAnalysis::method_call_invocant_class(ref, module_index)`,
+    /// which dispatches by invocant shape (variable / chain receiver /
+    /// function-call receiver / bareword / `__PACKAGE__` / `shift` /
+    /// `$_[0]`) and queries the witness bag. This is intentional:
+    /// a cached field would silently miss invocants that get typed
+    /// only by post-build cross-file enrichment, and chain hops
+    /// can't be cached without invalidation. The bag-routed helper
+    /// composes through cross-file enrichment automatically.
+    ///
+    /// Build-time chain typing still runs in the builder — it
+    /// publishes Variable witnesses + chain-receiver `Expression`
+    /// edge witnesses; the helper reads those at query time.
     MethodCall {
         invocant: String,
-        /// Span of the invocant node (for complex expressions needing tree resolution).
+        /// Span of the invocant node. Used by
+        /// `method_call_invocant_class` to find an inner-receiver
+        /// ref via `call_ref_by_start` (chain dispatch).
         invocant_span: Option<Span>,
         /// Span of just the method name (for rename — r.span covers the whole expression).
         method_name_span: Span,
@@ -5599,3 +5616,7 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
 #[cfg(test)]
 #[path = "file_analysis_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "call_ref_index_tests.rs"]
+mod call_ref_index_tests;

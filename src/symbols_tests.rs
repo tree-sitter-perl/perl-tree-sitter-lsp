@@ -1579,8 +1579,9 @@ fn data_printer_use_line_options_completion() {
 /// (a) `$r` at line 71 resolves to a known class.
 /// (b) `->to` on line 71 is a MethodCall ref.
 /// (c) `->to`'s invocant resolves to a class via
-///     `resolve_method_invocant_public` (the path nvim hover/gd
-///     uses internally).
+///     `FileAnalysis::method_call_invocant_class` (the bag-routed
+///     resolver every reader — hover, gd, gr, rename — funnels
+///     through).
 ///
 /// Two possible failure modes the test distinguishes:
 ///   - `$r` is typed but `->to`'s invocant fails → crossfile
