@@ -183,6 +183,105 @@ strictly grows when work happens. The convergence rule is unchanged.
 
 ---
 
+## 6. Unify name resolution via a name-keyed witness attachment
+
+**Where:** `src/builder.rs` — `expr_payload`'s
+`function_call_expression` / `ambiguous_function_call_expression` /
+`bareword` / `scoped_identifier` arm,
+`Builder::find_callee_symbol`, `Builder::forward_callee_name`,
+`Builder::resolve_forward_call_targets`, and the
+`unresolved_call_targets: Vec<UnresolvedCallTarget>` field on
+`Builder`. Witness attachment enum in `src/witnesses.rs`.
+
+**Why:** the forward-reference fix (PR landed alongside this entry,
+see `prompt-forward-reference-resolution.md`) is a two-phase
+recovery: walk-time `find_callee_symbol` for the fast path, plus a
+queue + post-walk retry for misses. The structure works but
+*duplicates the lookup rule* (`s.kind ∈ {Sub, Method}` and
+`s.name == bare`) across two sites. If the rule ever has to grow —
+package-aware lookup, plugin-synthesized callees, private/anonymous
+exclusions — both sites have to change in lockstep, and the
+`find_callee_symbol` helper hides but doesn't eliminate the
+duplication (the retry path still has to know *when* to call it).
+
+The principled shape is to push the lookup off the walk entirely:
+emit a name-keyed witness at walk time (no symbol-table consult), and
+let a single post-walk reducer or pass resolve all such witnesses
+against the final symbol table.
+
+**How to apply:** add a `WitnessAttachment::CalleeByName { name:
+String }` variant (or a `WitnessPayload::CalleeByName` payload —
+attachment-vs-payload depends on whether other reducers want to
+chase into "the sub named X" abstractly, or only at the Expr-arm
+level). `expr_payload`'s call arm becomes:
+
+```rust
+"function_call_expression"
+| "ambiguous_function_call_expression"
+| "bareword"
+| "scoped_identifier" => Some(WitnessPayload::Edge(
+    WitnessAttachment::CalleeByName {
+        name: self.forward_callee_name(node)?,
+    },
+)),
+```
+
+A single post-walk pass (`resolve_callee_by_name_witnesses`, replacing
+`resolve_forward_call_targets`) walks the bag for
+`Edge(CalleeByName{..})` payloads and rewrites each to
+`Edge(Symbol(sid))` once `find_callee_symbol` resolves — or drops
+the rewrite if it doesn't (still monotone; consumers see no Edge,
+which is the same as today's "name didn't resolve" semantics).
+
+After this lands, `unresolved_call_targets`, `forward_callee_name`'s
+.to_string() owned-name return, and the post-walk recovery queue all
+collapse — the attachment IS the queue. `find_callee_symbol` survives
+as the single lookup helper, called only from the resolver pass.
+
+**Watch out for:**
+
+1. **Bag generation.** Pushing a name-keyed attachment that gets
+   *rewritten* in place is a bag mutation, which violates monotonicity.
+   Two viable shapes: (a) the resolver pass pushes a *new*
+   `Edge(Symbol(sid))` witness alongside the original (the
+   `CalleeByName` one becomes a non-resolving dead end the registry
+   ignores once a `Symbol`-keyed sibling exists) — strictly monotone,
+   matches today's pattern; or (b) the registry resolves
+   `CalleeByName` lazily at query time via a reducer that does the
+   lookup itself. (b) is simpler in code but pushes I/O-shaped work
+   into the query path, which the rest of the registry takes pains to
+   avoid. (a) is the right shape for this repo.
+
+2. **Cross-file imports.** Today, `find_callee_symbol` returns `None`
+   for cross-file imports (the local symbol table doesn't carry
+   imported subs as own-Symbol entries). The `CalleeByName` resolver
+   should preserve that — the chain-receiver path through enrichment
+   covers cross-file return types via `MethodOnClass` / `NamedSub`
+   reducers, not via the `Expr(span)` Edge. Verify by removing the
+   recovery queue and confirming the cross-file enrichment tests
+   (`test_cross_file_*` in `builder_tests.rs`) still pass.
+
+3. **Span equality of synthetic witnesses.** The current path uses the
+   call's `expr_span` for both the Expr attachment and the Witness
+   span; the rewrite must keep that exact span so
+   `FrameworkAwareTypeFold`'s point-contains filter behaves
+   identically. Hand-test against `forward_reference_in_ternary_arms_resolves`
+   (the trickiest of the four sibling tests — recursion into ternary arms
+   means the same span is referenced from multiple Edge witnesses).
+
+4. **Cache version.** Adding a `WitnessAttachment` variant changes the
+   bincode shape. Bump `EXTRACT_VERSION` in `module_cache.rs` so
+   stale cache blobs are re-resolved.
+
+**Shipping check:** the four `forward_reference_*` sibling tests in
+`builder_tests.rs` should pass byte-for-byte (same return types) before
+and after this refactor — that's the regression bar. The diff should
+be net-negative LOC: the `unresolved_call_targets` field, the
+`UnresolvedCallTarget` struct, and the pre-walk-vs-post-walk split in
+`emit_expr_witness` all collapse.
+
+---
+
 ## Notes on what's NOT in this list
 
 - **Two D1 bullets that didn't land as written** (inheritance via

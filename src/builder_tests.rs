@@ -8647,21 +8647,14 @@ my $m = MooApp->new('a', 1, 'b', 2);
     );
 }
 
-/// Red-pin: known regression introduced by D4-E (commit 80b2b88).
-/// `longmess` calls `longmess_heavy` which is defined later in the
-/// source. Both arms of the if/else return that call, so the chain
-/// should fold to String. It currently folds to None because
-/// `expr_payload`'s `function_call_expression` arm does a walk-time
-/// `self.symbols.iter().find(name)` that misses forward references —
-/// the post-walk `emit_delegation_edges` pass that used to cover this
-/// case in D3 was removed without an equivalent.
-///
-/// Spec: docs/prompt-forward-reference-resolution.md.
-/// Reverse the order of the two subs in the source and the test
-/// passes. When the spec lands, drop `#[ignore]` and add coverage for
-/// method calls + scoped-identifier calls.
+/// Carp's canonical shape: `longmess` (caller) is defined before
+/// `longmess_heavy` (callee). Both arms of the if/else return the
+/// forward-defined call, so the per-sub fold should agree on `String`
+/// — but only if the walk-time symbol-table miss for `longmess_heavy`
+/// is recovered post-walk. `resolve_forward_call_targets` is what
+/// makes this work; without it the bag has no `Expr(call_span)`
+/// witness at all and `longmess` returns `None`.
 #[test]
-#[ignore = "forward-reference regression — see docs/prompt-forward-reference-resolution.md"]
 fn forward_reference_call_in_sub_return_resolves() {
     let src = r#"
 package main;
@@ -8686,5 +8679,102 @@ sub longmess_heavy { return "ouch"; }
          got {:?}. Walk-order regression: longmess_heavy is \
          defined after longmess.",
         rt,
+    );
+}
+
+/// Single-arm forward call: implicit `return forward()` should fold
+/// to whatever `forward()` returns. No branch arms — exercises the
+/// `Symbol ← branch_arm Edge → Expr(body) → Edge(Symbol(callee))`
+/// chain at minimum width.
+#[test]
+fn forward_reference_implicit_return_resolves() {
+    let src = r#"
+package main;
+
+sub caller_sub { forward_sub() }
+
+sub forward_sub { return "ok"; }
+"#;
+    let fa = build_fa(src);
+    assert_eq!(
+        fa.sub_return_type_at_arity("caller_sub", None),
+        Some(InferredType::String),
+    );
+}
+
+/// Forward reference inside a ternary return. Each arm calls a
+/// different forward-defined sub; both must resolve so the ternary's
+/// `BranchArmFold` agrees on `String`. Mixes the forward-ref fix with
+/// the existing ternary path (`emit_expr_witness` recursion + arm
+/// witnesses on the ternary span).
+#[test]
+fn forward_reference_in_ternary_arms_resolves() {
+    let src = r#"
+package main;
+
+sub dispatch {
+    return $_[0] ? handle_a() : handle_b();
+}
+
+sub handle_a { return "a"; }
+sub handle_b { return "b"; }
+"#;
+    let fa = build_fa(src);
+    assert_eq!(
+        fa.sub_return_type_at_arity("dispatch", None),
+        Some(InferredType::String),
+    );
+}
+
+/// Scoped-identifier call: `Pkg::name()` form. `expr_payload`'s
+/// `bareword`/`scoped_identifier` arm does the same walk-time lookup
+/// as `function_call_expression`; the queue + post-walk resolve must
+/// cover it too.
+#[test]
+fn forward_reference_scoped_identifier_call_resolves() {
+    let src = r#"
+package main;
+
+sub bridge { return Helper::canon(); }
+
+package Helper;
+
+sub canon { return "yes"; }
+"#;
+    let fa = build_fa(src);
+    assert_eq!(
+        fa.sub_return_type_at_arity("bridge", None),
+        Some(InferredType::String),
+    );
+}
+
+/// Self-method tail with a forward-defined target. `$self->later()`
+/// where `later` is declared after the caller. The MethodOnClass
+/// chase needs the callee's `Symbol(sid)` writeback, which only fires
+/// once the callee's own `Expr(body)` is populated — exercising the
+/// forward-ref fix on the inner sub's body, not the call site itself.
+#[test]
+fn forward_reference_self_method_call_resolves() {
+    let src = r#"
+package Box;
+
+sub new { my $class = shift; return bless {}, $class; }
+
+sub head {
+    my ($self) = @_;
+    return $self->tail();
+}
+
+sub tail {
+    my ($self) = @_;
+    return helper();
+}
+
+sub helper { return "fin"; }
+"#;
+    let fa = build_fa(src);
+    assert_eq!(
+        fa.sub_return_type_at_arity("tail", None),
+        Some(InferredType::String),
     );
 }

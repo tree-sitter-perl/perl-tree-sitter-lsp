@@ -1,8 +1,21 @@
 # Forward-reference resolution
 
-**Status:** known regression introduced by D4-E (commit 80b2b88). Pinned by
-`forward_reference_call_in_sub_return_resolves` in `builder_tests.rs`
-(`#[ignore]` until this lands).
+**Status:** **LANDED.** Pinned test
+`forward_reference_call_in_sub_return_resolves` (and four siblings —
+implicit return, ternary arms, scoped-identifier call, self-method
+tail) green in `builder_tests.rs`. Implemented as
+`Builder::resolve_forward_call_targets`, called between
+`populate_witness_bag` and `fold_to_fixed_point`. The remaining
+sections below are kept as historical context for the diagnosis.
+
+**Follow-up filed:** the landed shape is a two-phase recovery
+(walk-time `find_callee_symbol` + post-walk retry queue) which still
+duplicates the "is this a callee symbol?" rule across two sites. The
+deeper unification — pushing the lookup off the walk entirely via a
+`WitnessAttachment::CalleeByName` and a single post-walk resolver —
+is filed as `prompt-cleanups.md` **§6**. Independent, self-contained,
+and the regression bar is "the four `forward_reference_*` sibling
+tests pass byte-for-byte." Pick it up when convenient.
 
 ## The bug
 
