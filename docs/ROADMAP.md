@@ -26,7 +26,7 @@ Four docs, one engine:
 | `prompt-type-inference-unification.md` | **HOW** — collapse walker + bag into one path | **Steps 1–4 landed (PR #27)** — historical |
 | `working-bag-residual.md` | **FINISH THE COLLAPSE** — four directives for "bag is the only truth" | **D1–D4 landed (PR #31).** D4-G follow-up open |
 | `prompt-forward-reference-resolution.md` | **REGRESSION** — walk-time sym lookups miss forward-defined callees | **LANDED** — post-walk resolver |
-| `prompt-cross-file-invocant-refresh.md` | **REGRESSION** — `invocant_class` cache stale after enrichment, cross-file refs under-match | **Top of queue.** Red-pinned |
+| `prompt-cross-file-invocant-refresh.md` | **REGRESSION** — `invocant_class` cache stale after enrichment, cross-file refs under-match | **LANDED** — reader-side bag fallback |
 | `prompt-type-inference-residual.md` | **WHAT'S MISSING** — Parts 1–5 fact classes | each is a reducer+emitter pair |
 | `prompt-sequence-types.md` | **FIRST BIG CONSUMER** — sequence type lattice | 5 phases; ~half the spike's diff on a clean foundation |
 
@@ -41,7 +41,7 @@ staircase 1–4 (LANDED, PR #27) ─┐
                                  │       FA.type_constraints gone, EXTRACT_VERSION 21)
                                  │       │
                                  │       ├─▶ forward-reference resolution (LANDED)
-                                 │       ├─▶ ★ cross-file invocant refresh (red-pinned)
+                                 │       ├─▶ cross-file invocant refresh (LANDED)
                                  │       │
                                  │       └─▶ sequence-types phases 1-3
                                  │
@@ -52,10 +52,9 @@ staircase 1–4 (LANDED, PR #27) ─┐
 ```
 
 ★ = known regression with a pinned `#[ignore]` test that fails until
-fixed. Forward-reference resolution landed; cross-file invocant
-refresh is the only ★ left. Both block downstream type-intelligence
-quality but don't block sequence-types architecturally — sequence
-types can land in parallel.
+fixed. Both ★ regressions have now landed (forward-reference
+resolution and cross-file invocant refresh); sequence types and the
+residual Parts are next, with no red-pins blocking.
 
 - **Unification staircase** is done. PR #27 subsumed Steps 1–4: the walker only
   observes, edge-payload witnesses replace closure-driven chase, deferred-var /
@@ -149,17 +148,25 @@ types can land in parallel.
      self-method tails (see `forward_reference_*` in
      `builder_tests.rs`). Spec:
      `docs/prompt-forward-reference-resolution.md`.
-   - **★ cross-file `invocant_class` refresh.** `Ref::MethodCall.invocant_class`
-     is set once at build time and never refreshed; when a consumer's
-     invocant only becomes typeable post-enrichment (cross-file
-     return type), `refs_to`'s `cn == pkg` filter excludes it. Fix
-     surface (recommended): hybrid cache + bag fallback — readers
-     consult the bag when `invocant_class` is `None`; spec in
-     `docs/prompt-cross-file-invocant-refresh.md`. Pinned by
-     `references_cross_file_invocant_resolved_post_enrichment`.
+   - **cross-file `invocant_class` refresh.** **LANDED.** Hybrid
+     reader-side fix: build-time cache stays canonical, readers that
+     filter MethodCall refs by class (`refs_to`,
+     `collect_refs_for_target`, `find_highlights` cross-file
+     fallback, `rename_callable_in_scope`) route through new
+     `FileAnalysis::invocant_class_of_method_call` which falls back
+     to a bag query when the cached field is `None`. Hover /
+     find-def / rename_kind_at already self-healed via the
+     tree-aware `resolve_method_invocant`; this is the no-tree
+     equivalent for bulk ref scans. Tests: 515 unit + 20 e2e green;
+     `references_cross_file_invocant_resolved_post_enrichment`
+     un-ignored, plus
+     `find_highlights_cross_file_invocant_resolved_post_enrichment`
+     and `refs_to_cross_file_invocant_inherited_method` covering the
+     highlights path and a multi-hop `use parent` chain.
 
    Forward-ref landed first (higher-frequency hit; Carp pattern is
-   everywhere). Cross-file invocant refresh remains queued.
+   everywhere). Cross-file invocant refresh has now landed too — no
+   red-pinned regressions outstanding.
 
 5. **Sequence-types phases 1-3** on the clean foundation. Can land in
    parallel with the regression fixes above; not architecturally
@@ -218,15 +225,13 @@ already exists; just the eager-target invariant is missing.
 
 ### Why this matters
 
-The bag-residual directives are done — the bag is canonical. The two
-red-pinned regressions are the immediate priority because they're the
-only places where "more type intelligence" *doesn't* automatically
-flow through to user-visible features. Both are bag-canonical
-violations of different flavors: forward-ref is *emit-side* (witness
-never gets pushed for forward-defined callees), invocant-refresh is
-*cache-side* (witness exists, the cached projection on refs is stale).
-Fixing them keeps the audited claim — "all type intelligence routes
-through the bag" — actually true at every phase.
+The bag-residual directives are done — the bag is canonical. Both
+red-pinned regressions have landed: forward-ref was *emit-side* (the
+witness never got pushed for forward-defined callees, fixed by the
+post-walk resolver), invocant-refresh was *cache-side* (the witness
+existed but the cached projection on refs was stale, fixed by reader-
+side bag fallback). The audited claim — "all type intelligence routes
+through the bag" — now holds at every phase.
 
 Graph rework is what unblocks Phase 6 (Openness diagnostic), multi-app
 Mojo support, and the eventual `Symbol.home_scope` move (was: phase

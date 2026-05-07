@@ -1,8 +1,23 @@
 # Cross-file invocant_class refresh
 
-**Status:** known regression. Pinned by
-`references_cross_file_invocant_resolved_post_enrichment` in
-`resolve_tests.rs` (`#[ignore]` until this lands).
+**Status:** **LANDED.** Reader-side bag fallback per option 3 below.
+Build-time `invocant_class` stays as a fast-path cache; readers that
+filter MethodCall refs by class (`resolve::refs_to`,
+`FileAnalysis::collect_refs_for_target`, `find_highlights` cross-file
+fallback, `rename_callable_in_scope`) route through
+`FileAnalysis::invocant_class_of_method_call`, which queries the bag
+when the cached field is `None`. Hover / find-def / rename_kind_at
+already self-healed via the tree-aware `resolve_method_invocant`;
+the new method is the no-tree equivalent for bulk ref scans. Tests:
+515 unit + 20 e2e green; the red-pin
+`references_cross_file_invocant_resolved_post_enrichment` is
+un-ignored, with
+`find_highlights_cross_file_invocant_resolved_post_enrichment` and
+`refs_to_cross_file_invocant_inherited_method` added for the
+highlights path and a multi-hop `use parent` chain. Original spec
+preserved below for context.
+
+---
 
 ## The bug
 

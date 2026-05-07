@@ -246,16 +246,20 @@ fn collect_from_analysis(
                 resolved_package == scope
             }
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
-             RefKind::MethodCall { invocant_class, .. }) => {
+             RefKind::MethodCall { .. }) => {
                 // Method-shaped call: match only when the ref's
-                // invocant resolved to the target scope. No text
-                // fallback — unresolved invocants are excluded rather
-                // than cross-linked. (Build-time
-                // `resolve_invocant_class_tree` handles chains.)
+                // invocant resolves to the target scope. The
+                // build-time `invocant_class` cache is preferred;
+                // when it's `None` we fall back to a bag query
+                // (`invocant_class_of_method_call`) so cross-file
+                // call sites typed only by enrichment don't get
+                // silently excluded. Class still has to be `Some` to
+                // match — package-less subs and genuinely unpinnable
+                // invocants stay out, no cross-linking.
                 let scope = callable_scope_for_refs.as_ref().unwrap();
-                match (invocant_class, scope) {
-                    (Some(cn), Some(pkg)) => cn == pkg,
-                    _ => false, // package-less sub or unpinned method
+                match (analysis.invocant_class_of_method_call(r), scope) {
+                    (Some(cn), Some(pkg)) => &cn == pkg,
+                    _ => false,
                 }
             }
             (TargetKind::Package, RefKind::PackageRef) => true,

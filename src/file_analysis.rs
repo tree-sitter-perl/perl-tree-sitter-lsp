@@ -2743,16 +2743,22 @@ impl FileAnalysis {
         if let Some(r) = self.ref_at(point) {
             let mut results: Vec<(Span, AccessKind)> = Vec::new();
             match &r.kind {
-                RefKind::MethodCall { invocant_class: Some(cn), method_name_span, .. } => {
-                    let wanted_class = cn.clone();
+                RefKind::MethodCall { method_name_span, .. } => {
+                    // Build-time cache preferred; bag fallback so a
+                    // cross-file invocant typed only by enrichment
+                    // still resolves into a same-class highlight set.
+                    let Some(wanted_class) = self.invocant_class_of_method_call(r) else {
+                        return Vec::new();
+                    };
                     results.push((*method_name_span, r.access));
                     for other in &self.refs {
                         if std::ptr::eq(other, r) { continue; }
                         if other.target_name != r.target_name { continue; }
-                        if let RefKind::MethodCall { invocant_class: Some(ocn), method_name_span: ms, .. } = &other.kind {
-                            if ocn == &wanted_class {
-                                results.push((*ms, other.access));
-                            }
+                        if !matches!(other.kind, RefKind::MethodCall { .. }) { continue; }
+                        let Some(ocn) = self.invocant_class_of_method_call(other) else { continue };
+                        if ocn != wanted_class { continue; }
+                        if let RefKind::MethodCall { method_name_span: ms, .. } = &other.kind {
+                            results.push((*ms, other.access));
                         }
                     }
                 }
@@ -2820,15 +2826,18 @@ impl FileAnalysis {
                                 results.push((r.span, r.access));
                             }
                         }
-                        (RefKind::MethodCall { method_name_span, invocant_class, .. },
+                        (RefKind::MethodCall { method_name_span, .. },
                          SymKind::Sub | SymKind::Method) => {
                             // Same-class match only; unresolved or
                             // different-class invocants are excluded.
                             // Method-call ref.span covers the whole
                             // `$obj->foo(...)` expression so we use
                             // `method_name_span` to highlight just
-                            // the identifier.
-                            match (invocant_class, &sym_package) {
+                            // the identifier. Bag fallback so
+                            // cross-file invocants typed only post-
+                            // enrichment still match.
+                            let resolved = self.invocant_class_of_method_call(r);
+                            match (&resolved, &sym_package) {
                                 (Some(cn), Some(pkg)) if cn == pkg => {
                                     results.push((*method_name_span, r.access));
                                 }
@@ -3246,11 +3255,16 @@ impl FileAnalysis {
                         edits.push((r.span, new_name.to_string()));
                     }
                 }
-                RefKind::MethodCall { invocant_class, method_name_span, .. } => {
+                RefKind::MethodCall { method_name_span, .. } => {
                     // MethodCall refs target a class — `None` scope
-                    // doesn't reach methods.
-                    if let (Some(cls), Some(wanted)) = (invocant_class, scope.as_ref()) {
-                        if cls == wanted {
+                    // doesn't reach methods. Bag fallback so a
+                    // call site typed only by cross-file enrichment
+                    // gets renamed in lockstep with the locally-typed
+                    // ones.
+                    if let (Some(cls), Some(wanted)) =
+                        (self.invocant_class_of_method_call(r), scope.as_ref())
+                    {
+                        if &cls == wanted {
                             edits.push((*method_name_span, new_name.to_string()));
                         }
                     }
@@ -3470,6 +3484,28 @@ impl FileAnalysis {
         point: Point,
     ) -> Option<String> {
         self.resolve_invocant_class(invocant, scope, point)
+    }
+
+    /// Resolve a `MethodCall` ref's invocant class, preferring the
+    /// build-time cached field and falling back to a bag query when
+    /// it's `None`. Readers that filter refs by class (refs_to,
+    /// collect_refs_for_target, find_highlights cross-file fallback,
+    /// rename_callable_in_scope) route through this so they see
+    /// post-enrichment-fresh types — `invocant_class` is set once at
+    /// build time, but cross-file enrichment can later type the
+    /// invocant via the bag without refilling the field. Hover /
+    /// find-def / rename_kind_at already self-heal via the
+    /// tree-aware `resolve_method_invocant`; this is the no-tree
+    /// equivalent for bulk ref scans.
+    pub fn invocant_class_of_method_call(&self, r: &Ref) -> Option<String> {
+        let RefKind::MethodCall { invocant, invocant_span, invocant_class, .. } = &r.kind else {
+            return None;
+        };
+        if let Some(cn) = invocant_class.clone() {
+            return Some(cn);
+        }
+        let point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
+        self.resolve_invocant_class(invocant, r.scope, point)
     }
 
     /// Resolve an invocant string to a class name.

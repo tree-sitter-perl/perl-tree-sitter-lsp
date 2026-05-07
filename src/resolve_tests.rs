@@ -1144,7 +1144,6 @@ fn test_refs_to_role_mask_excludes_workspace() {
 /// resolves invocant from the bag on every refs_to read would also
 /// work and avoids the cache-invalidation question.
 #[test]
-#[ignore = "cross-file invocant_class not refreshed by enrichment — see docs/prompt-cross-file-invocant-refresh.md"]
 fn references_cross_file_invocant_resolved_post_enrichment() {
     use crate::module_index::ModuleIndex;
     use std::sync::Arc;
@@ -1213,6 +1212,147 @@ $b->touch();
          invocant_class on the MethodCall ref is None because the \
          consumer was built before B's return types were known, and \
          enrichment does not refresh ref fields. hits: {:?}",
+        refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
+    );
+}
+
+/// Companion: `find_highlights`'s cross-file fallback path
+/// (`file_analysis.rs:2746-2757`) must agree with the bag-routed
+/// invocant_class. Cursor sits on the cross-file `$b->touch()` call;
+/// the file also has a *second* call site `$b->touch()` whose ref
+/// has the same None invocant_class. Both should highlight together
+/// once enrichment has typed `$b: B`.
+#[test]
+fn find_highlights_cross_file_invocant_resolved_post_enrichment() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let producer_src = r#"
+package B;
+use Exporter 'import';
+our @EXPORT_OK = qw(make_b);
+
+sub new    { return bless {}, shift }
+sub make_b { return B->new }
+sub touch  { 1 }
+1;
+"#;
+    let consumer_src = r#"
+use B qw(make_b);
+my $b = make_b();
+$b->touch();
+$b->touch();
+1;
+"#;
+
+    let producer_path = PathBuf::from("/tmp/highlights_xfile_b.pm");
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(producer_path, Arc::new(parse(producer_src)));
+
+    let mut consumer_fa = parse(consumer_src);
+    consumer_fa.enrich_imported_types_with_keys(Some(&idx));
+
+    // Cursor on the first $b->touch() — column 4 lands on `t` of touch.
+    let highlights = consumer_fa.find_highlights(
+        tree_sitter::Point { row: 3, column: 4 },
+        None,
+        None,
+    );
+
+    // Two call sites in the file, both should be highlighted together
+    // since they share the same (cross-file) invocant_class.
+    assert_eq!(
+        highlights.len(),
+        2,
+        "find_highlights should match both $$b->touch() sites once \
+         enrichment has typed $$b: B. got {:?}",
+        highlights,
+    );
+}
+
+/// Multi-hop: producer's exported sub returns a class that inherits
+/// from another. The consumer's `$x->ancestor_method()` call site
+/// resolves to the parent class only after enrichment + ancestor
+/// walk. Confirms the bag fallback composes with cross-file
+/// inheritance resolution rather than each layer needing its own
+/// re-entry point.
+#[test]
+fn refs_to_cross_file_invocant_inherited_method() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let parent_src = r#"
+package P;
+sub new { return bless {}, shift }
+sub ping { "pong" }
+1;
+"#;
+    let child_src = r#"
+package C;
+use parent 'P';
+use Exporter 'import';
+our @EXPORT_OK = qw(make_c);
+sub make_c { return C->new }
+1;
+"#;
+    let consumer_src = r#"
+use C qw(make_c);
+my $x = make_c();
+$x->ping();
+1;
+"#;
+
+    let parent_path = PathBuf::from("/tmp/multihop_p.pm");
+    let child_path = PathBuf::from("/tmp/multihop_c.pm");
+    let consumer_path = PathBuf::from("/tmp/multihop_consumer.pm");
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(parent_path.clone(), Arc::new(parse(parent_src)));
+    idx.register_workspace_module(child_path.clone(), Arc::new(parse(child_src)));
+
+    let mut consumer_fa = parse(consumer_src);
+    consumer_fa.enrich_imported_types_with_keys(Some(&idx));
+
+    // Sanity: enrichment typed $x as C.
+    let x_type = consumer_fa.inferred_type_via_bag(
+        "$x",
+        tree_sitter::Point { row: 4, column: 0 },
+    );
+    assert_eq!(
+        x_type.as_ref().and_then(|t| t.class_name()),
+        Some("C"),
+        "precondition: enrichment must type $$x as C; got {:?}",
+        x_type,
+    );
+
+    let store = FileStore::new();
+    store.insert_workspace(parent_path, parse(parent_src));
+    store.insert_workspace(child_path, parse(child_src));
+    store.insert_workspace(consumer_path.clone(), consumer_fa);
+
+    // Target the parent's `ping` — refs_to uses class-keyed Method
+    // matching, so `$x->ping()` (whose nearest invocant_class is C)
+    // doesn't directly equal P. The current `refs_to` filter is a
+    // strict scope == invocant_class compare; it does NOT walk
+    // ancestors. Targeting `C::ping` (the inherited shape) is what
+    // matches today, and that's the relevant case for the
+    // invocant-refresh fix: even though `ping` isn't defined on C,
+    // a caller that wants "every call to a method on C named ping"
+    // must include the cross-file site.
+    let refs = refs_to(
+        &store,
+        Some(&idx),
+        &TargetRef {
+            name: "ping".to_string(),
+            kind: TargetKind::Method { class: "C".to_string() },
+        },
+        RoleMask::WORKSPACE,
+    );
+    assert!(
+        refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &consumer_path)),
+        "refs_to(C::ping) missed consumer's $$x->ping() call site \
+         (multi-hop: $$x typed as C only post-enrichment). hits: {:?}",
         refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
     );
 }
