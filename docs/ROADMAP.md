@@ -29,7 +29,8 @@ Four docs, one engine:
 | `prompt-cross-file-invocant-refresh.md` | **REGRESSION** — `invocant_class` cache stale after enrichment, cross-file refs under-match | **LANDED (PR #34)** — bag-only resolver |
 | `prompt-type-inference-residual.md` | **WHAT'S MISSING** — Parts 1–5 fact classes | each is a reducer+emitter pair |
 | `prompt-nested-hashkey.md` | **FOLLOW-UP TO 5C** — hash-key intelligence on Parametric values + structural hashes + array-element narrowing | three tiers (~30 / ~150 / ~50 LOC) |
-| `prompt-parametric-semantics.md` | **PER-FLAVOR PARAMETRIC SEMANTICS** — pluggable `hash_key_class` / `element_type` / `dispatch_class` per parametric base; required for non-DBIC parametrics (Promise, Mojo::Collection, GraphQL) | open discussion; queued before DBIC plugin port |
+| `prompt-parametric-redesign.md` | **WORKING DOC** — Phase 1 sealed-enum redesign + receiver-relative return types (subsumes arity dispatch + per-method projection in one mechanism) | actively being implemented |
+| `prompt-parametric-semantics.md` | **(superseded)** original pluggable-semantics-registry proposal | retained for context; `prompt-parametric-redesign.md` carries the chosen design |
 | `prompt-type-system-encoding.md` | **TYPE-SAFE AXIS DISPATCH** — make wrong-axis class-name reads unrepresentable; covers the dual-class problem + the two-bag-attachments seam | discussion; partially deferred to graph-walking |
 | `prompt-type-is-the-gate.md` | **GENERALIZE STRICT-EQ GATES** — `type_says()` answers replace local-symbol-table presence checks; cross-file completeness story | defer until 2nd site arrives |
 | `prompt-dbic-as-plugin.md` | **MOVE DBIC OUT OF CORE** — port `visit_dbic_*` family + Parametric emission + custom resultset_class discovery to a plugin | queued behind parametric-semantics + type-system-encoding |
