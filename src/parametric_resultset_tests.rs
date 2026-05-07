@@ -12,7 +12,7 @@
 use super::*;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tree_sitter::{Parser, Point};
+use tree_sitter::{Parser, Point, Tree};
 
 use crate::file_store::{FileKey, FileStore};
 use crate::module_index::ModuleIndex;
@@ -25,6 +25,20 @@ fn parse(source: &str) -> FileAnalysis {
         .unwrap();
     let tree = parser.parse(source, None).unwrap();
     crate::builder::build(&tree, source.as_bytes())
+}
+
+/// Parse + build, returning both the FA and the tree. The
+/// hash-key-arg consumer in `find_definition` needs the tree to
+/// know cursor-on-key vs cursor-on-method, so most tests here
+/// thread it through.
+fn parse_with_tree(source: &str) -> (FileAnalysis, Tree) {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let fa = crate::builder::build(&tree, source.as_bytes());
+    (fa, tree)
 }
 
 /// Locate `needle` in `source` and return a Point at the FIRST
@@ -70,11 +84,11 @@ $schema->resultset('Schema::Result::Users')->search({{ name => 'X' }});
 ",
         USERS_RESULT,
     );
-    let fa = parse(&src);
+    let (fa, tree) = parse_with_tree(&src);
     // Cursor on `name` in the search-arg hash. Pin column-def row
     // by name (hardcoded line numbers rot when fixtures shift).
     let pt = point_at(&src, "name => 'X'");
-    let def = fa.find_definition(pt, None, None, None);
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(NAME_COL_DEF_ROW),
@@ -97,9 +111,9 @@ $rs->search({{ email => 'x@y' }});
 ",
         USERS_RESULT,
     );
-    let fa = parse(&src);
+    let (fa, tree) = parse_with_tree(&src);
     let pt = point_at(&src, "email => 'x@y'");
-    let def = fa.find_definition(pt, None, None, None);
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(EMAIL_COL_DEF_ROW),
@@ -122,9 +136,9 @@ $schema->resultset('Schema::Result::Users')->search({{ name => 'A' }})->search({
 ",
         USERS_RESULT,
     );
-    let fa = parse(&src);
+    let (fa, tree) = parse_with_tree(&src);
     let pt = point_at(&src, "email => 'B'");
-    let def = fa.find_definition(pt, None, None, None);
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(EMAIL_COL_DEF_ROW),
@@ -146,9 +160,9 @@ $schema->resultset('Schema::Result::Users')->find({{ name => 'X' }});
 ",
         USERS_RESULT,
     );
-    let fa = parse(&src);
+    let (fa, tree) = parse_with_tree(&src);
     let pt = point_at(&src, "name => 'X'");
-    let def = fa.find_definition(pt, None, None, None);
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(NAME_COL_DEF_ROW),
@@ -176,9 +190,9 @@ $schema->resultset('Schema::Result::Users')->all();
 ",
         USERS_RESULT,
     );
-    let fa = parse(&src);
+    let (fa, tree) = parse_with_tree(&src);
     let pt = point_at(&src, "all()");
-    let def = fa.find_definition(pt, None, None, None);
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
     // Either None (no DBIx::Class::ResultSet stub in fixture) or a
     // span pointing into a ResultSet class — but NEVER a span on
     // the Users row-class file. The negative pin is "doesn't
@@ -207,9 +221,9 @@ $schema->resultset('Schema::Result::Users')->search({{ definitely_not_a_column =
 ",
         USERS_RESULT,
     );
-    let fa = parse(&src);
+    let (fa, tree) = parse_with_tree(&src);
     let pt = point_at(&src, "definitely_not_a_column");
-    let def = fa.find_definition(pt, None, None, None);
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
     assert!(
         def.is_none(),
         "unknown column must not resolve to anything; got: {:?}",
@@ -273,6 +287,54 @@ $schema->resultset('Schema::Result::Users')->search({ name => 'X' });
     );
 }
 
+/// (j) **Custom ResultSet method discovery**. `$schema->resultset('Users')`
+/// should offer methods defined on the `*::ResultSet::Users`
+/// class (a custom resultset that inherits from
+/// `DBIx::Class::ResultSet` and adds project-specific helpers like
+/// `admins`, `recently_active`, etc.). Today the Parametric base
+/// is hard-coded to `DBIx::Class::ResultSet`, so custom methods
+/// don't resolve — pinned as a sanity test the user will
+/// definitely notice when it changes. Expected to FAIL until
+/// resultset_class discovery lands (a follow-up phase). Documented
+/// so the gap is visible in the test list, not invisible in the
+/// roadmap.
+#[test]
+#[ignore = "custom resultset_class discovery — follow-up phase, see prompt-type-inference-residual.md Part 5c"]
+fn goto_def_offers_custom_resultset_method() {
+    let src = r#"
+package Schema::Result::Users;
+use base 'DBIx::Class::Core';
+__PACKAGE__->add_columns(
+    name  => { data_type => 'varchar' },
+);
+
+package Schema::ResultSet::Users;
+use base 'DBIx::Class::ResultSet';
+sub admins { my $self = shift; $self->search({ is_admin => 1 }) }
+
+package main;
+my $schema;
+$schema->resultset('Schema::Result::Users')->admins;
+"#;
+    let (fa, tree) = parse_with_tree(src);
+    let pt = point_at(src, "->admins");
+    // Cursor lands on `-` before `admins`; bump past `->` to `a`.
+    let pt = Point::new(pt.row, pt.column + 2);
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    // The admins sub is in package Schema::ResultSet::Users,
+    // declared on a single line. Goto-def should land on its
+    // declaration row (the 8th line of the fixture, 0-indexed
+    // accounting for the leading newline).
+    assert!(
+        def.is_some(),
+        "$$schema->resultset('Users')->admins must resolve to the \
+         custom resultset_class's `admins` method. got: {:?}. \
+         Requires discovering `*::ResultSet::Users` as the \
+         Parametric base instead of hard-coding `DBIx::Class::ResultSet`.",
+        def,
+    );
+}
+
 /// (i) **Negative — wrong method name**. Only `resultset` (and
 /// search-family follow-ups) carry the parametric type. A
 /// same-shape method with a different name (`->frobnicate('Users')`)
@@ -289,9 +351,9 @@ $schema->frobnicate('Schema::Result::Users')->search({{ name => 'X' }});
 ",
         USERS_RESULT,
     );
-    let fa = parse(&src);
+    let (fa, tree) = parse_with_tree(&src);
     let pt = point_at(&src, "name => 'X'");
-    let def = fa.find_definition(pt, None, None, None);
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
     // `frobnicate` is not `resultset` — no parametric witness
     // emitted. The chain hop's invocant is therefore unknown,
     // hash-key resolution has no class to look up, def returns

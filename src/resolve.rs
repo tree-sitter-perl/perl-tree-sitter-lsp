@@ -274,7 +274,16 @@ fn collect_from_analysis(
                     if op == package && on == name
             ),
             (TargetKind::HashKeyOfClass(wanted), RefKind::HashKeyAccess { owner, .. }) => {
-                matches!(owner, Some(HashKeyOwner::Class(n)) if n == wanted)
+                // `Class(wanted)` is the canonical shape for "this
+                // class's keys"; a `Sub { package: wanted, .. }`-
+                // owned access (constructor / search-arg /
+                // accessor) is *also* a hash-key access against
+                // `wanted`. Use `found_by` to admit both — same
+                // rule the in-file `hash_key_defs_for_owner`
+                // dispatcher uses, so cross-file `refs_to` and
+                // local find_definition agree on the set.
+                let target_owner = HashKeyOwner::Class(wanted.clone());
+                matches!(owner, Some(o) if o.found_by(&target_owner))
             }
             (TargetKind::Handler { owner, name: hname },
              RefKind::DispatchCall { owner: ref_owner, .. }) => {

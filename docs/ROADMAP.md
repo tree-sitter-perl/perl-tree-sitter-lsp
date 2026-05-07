@@ -28,6 +28,7 @@ Four docs, one engine:
 | `prompt-forward-reference-resolution.md` | **REGRESSION** — walk-time sym lookups miss forward-defined callees | **LANDED** — post-walk resolver |
 | `prompt-cross-file-invocant-refresh.md` | **REGRESSION** — `invocant_class` cache stale after enrichment, cross-file refs under-match | **LANDED (PR #34)** — bag-only resolver |
 | `prompt-type-inference-residual.md` | **WHAT'S MISSING** — Parts 1–5 fact classes | each is a reducer+emitter pair |
+| `prompt-nested-hashkey.md` | **FOLLOW-UP TO 5C** — hash-key intelligence on Parametric values + structural hashes + array-element narrowing | three tiers (~30 / ~150 / ~50 LOC) |
 | `prompt-sequence-types.md` | **FIRST BIG CONSUMER** — sequence type lattice | 5 phases; ~half the spike's diff on a clean foundation |
 
 ### Dependency map
@@ -82,6 +83,13 @@ regression backlog gating them.
   functional operators, value-indexed returns / sum types / parametric types)
   remain independent reducer+emitter pairs. Order by value; pick what hurts
   most when missing.
+- **Nested hash-key intelligence** (`docs/prompt-nested-hashkey.md`) is the
+  natural follow-up to Part 5c — the recursive `TypeArg` shape from 5c is
+  already wired; this is purely emission + consumer narrowing. Three tiers:
+  (1) hash-key access on a Parametric value (`$row->{name}` after `find`),
+  ~30 LOC, may bundle into the 5c PR; (2) structurally-typed hash literals
+  + chain narrowing (`$config->{db}->{host}`), ~150 LOC, own PR; (3)
+  array-element narrowing for `$obj->{users}->[0]->{name}`, ~50 LOC on top.
 
 ### Recommended sequencing
 
