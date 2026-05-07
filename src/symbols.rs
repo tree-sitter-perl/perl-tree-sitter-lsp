@@ -285,11 +285,9 @@ pub fn find_definition(
         }
 
         // Cross-file method goto-def: resolve inherited methods through module index
-        if let RefKind::MethodCall { ref invocant, ref invocant_span, .. } = r.kind {
+        if matches!(r.kind, RefKind::MethodCall { .. }) {
             use crate::file_analysis::MethodResolution;
-            let class_name = analysis.resolve_method_invocant_public(
-                invocant, invocant_span, r.scope, point, Some(tree), Some(source.as_bytes()), Some(module_index),
-            );
+            let class_name = analysis.method_call_invocant_class_with_index(r, Some(module_index));
             if let Some(ref cn) = class_name {
                 if let Some(MethodResolution::CrossFile { ref class }) = analysis.resolve_method_in_ancestors(cn, &r.target_name, Some(module_index)) {
                     if let Some(cached) = module_index.get_cached(class) {

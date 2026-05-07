@@ -541,12 +541,14 @@ impl LanguageServer for Backend {
                     crate::file_analysis::RenameKind::Method { name, class } => {
                         // Walk MyWorker → ... → BaseWorker (the actual
                         // defining class). Each link is needed: the
-                        // call-site invocant_class on `$worker->process`
-                        // is "MyWorker" (the static type), while the
-                        // `sub process` definition lives in BaseWorker.
+                        // call-site invocant class on `$worker->process`
+                        // (resolved via the bag-routed
+                        // `method_call_invocant_class`) is "MyWorker"
+                        // (the static type), while the `sub process`
+                        // definition lives in BaseWorker.
                         // `rename_method_in_class` matches strict
-                        // `invocant_class == scope`, so without the
-                        // chain we'd pick up only one of the two ends.
+                        // class == scope, so without the chain we'd
+                        // pick up only one of the two ends.
                         let chain = doc.analysis.method_rename_chain(
                             class,
                             name,

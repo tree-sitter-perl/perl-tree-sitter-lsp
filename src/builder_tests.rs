@@ -6539,7 +6539,8 @@ sub _generate_route {
         })
         .expect("MethodCall ref for `_generate_route`");
 
-    if let RefKind::MethodCall { invocant_class, .. } = &gr_ref.kind {
+    if matches!(gr_ref.kind, RefKind::MethodCall { .. }) {
+        let invocant_class = fa.method_call_invocant_class(gr_ref);
         assert_eq!(
             invocant_class.as_deref(),
             Some("Mojolicious::Routes::Route"),
@@ -6577,7 +6578,8 @@ sub inline {
         .find(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "inline")
         .expect("MethodCall ref for `inline`");
 
-    if let RefKind::MethodCall { invocant_class, .. } = &inline_ref.kind {
+    if matches!(inline_ref.kind, RefKind::MethodCall { .. }) {
+        let invocant_class = fa.method_call_invocant_class(inline_ref);
         assert_eq!(
             invocant_class.as_deref(),
             Some("Mojolicious::Routes::Route"),

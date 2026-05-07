@@ -554,8 +554,8 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
             let scope_from_ref = match &r.kind {
                 file_analysis::RefKind::FunctionCall { resolved_package } =>
                     Some(("sub", resolved_package.clone())),
-                file_analysis::RefKind::MethodCall { invocant_class, .. } =>
-                    invocant_class.as_ref().map(|c| ("method", Some(c.clone()))),
+                file_analysis::RefKind::MethodCall { .. } =>
+                    analysis.method_call_invocant_class(r).map(|c| ("method", Some(c))),
                 _ => None,
             };
             let scope_from_sym = analysis.symbol_at(point).and_then(|s| match s.kind {

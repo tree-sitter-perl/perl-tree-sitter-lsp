@@ -1144,7 +1144,6 @@ fn test_refs_to_role_mask_excludes_workspace() {
 /// resolves invocant from the bag on every refs_to read would also
 /// work and avoids the cache-invalidation question.
 #[test]
-#[ignore = "cross-file invocant_class not refreshed by enrichment — see docs/prompt-cross-file-invocant-refresh.md"]
 fn references_cross_file_invocant_resolved_post_enrichment() {
     use crate::module_index::ModuleIndex;
     use std::sync::Arc;
@@ -1214,5 +1213,374 @@ $b->touch();
          consumer was built before B's return types were known, and \
          enrichment does not refresh ref fields. hits: {:?}",
         refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
+    );
+}
+
+/// Companion: `find_highlights`'s cross-file fallback path
+/// must match both `$b->touch()` sites once enrichment has typed
+/// `$b: B`. Cursor on the first call; the second has the same None
+/// build-time-resolved invocant_class — both should highlight.
+#[test]
+fn find_highlights_cross_file_invocant_resolved_post_enrichment() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let producer_src = r#"
+package B;
+use Exporter 'import';
+our @EXPORT_OK = qw(make_b);
+
+sub new    { return bless {}, shift }
+sub make_b { return B->new }
+sub touch  { 1 }
+1;
+"#;
+    let consumer_src = r#"
+use B qw(make_b);
+my $b = make_b();
+$b->touch();
+$b->touch();
+1;
+"#;
+
+    let producer_path = PathBuf::from("/tmp/highlights_xfile_b.pm");
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(producer_path, Arc::new(parse(producer_src)));
+
+    let mut consumer_fa = parse(consumer_src);
+    consumer_fa.enrich_imported_types_with_keys(Some(&idx));
+
+    // Cursor on the first $b->touch() — column 4 lands on `t` of touch.
+    let highlights = consumer_fa.find_highlights(
+        tree_sitter::Point { row: 3, column: 4 },
+        None,
+        None,
+    );
+
+    assert_eq!(
+        highlights.len(),
+        2,
+        "find_highlights should match both $$b->touch() sites once \
+         enrichment has typed $$b: B. got {:?}",
+        highlights,
+    );
+}
+
+/// Multi-hop: producer's exported sub returns a class that inherits
+/// from another. The consumer's `$x->ancestor_method()` call site
+/// resolves to the parent class only after enrichment + ancestor
+/// walk. Confirms the bag-only path composes with cross-file
+/// inheritance resolution.
+#[test]
+fn refs_to_cross_file_invocant_inherited_method() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let parent_src = r#"
+package P;
+sub new { return bless {}, shift }
+sub ping { "pong" }
+1;
+"#;
+    let child_src = r#"
+package C;
+use parent 'P';
+use Exporter 'import';
+our @EXPORT_OK = qw(make_c);
+sub make_c { return C->new }
+1;
+"#;
+    let consumer_src = r#"
+use C qw(make_c);
+my $x = make_c();
+$x->ping();
+1;
+"#;
+
+    let parent_path = PathBuf::from("/tmp/multihop_p.pm");
+    let child_path = PathBuf::from("/tmp/multihop_c.pm");
+    let consumer_path = PathBuf::from("/tmp/multihop_consumer.pm");
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(parent_path.clone(), Arc::new(parse(parent_src)));
+    idx.register_workspace_module(child_path.clone(), Arc::new(parse(child_src)));
+
+    let mut consumer_fa = parse(consumer_src);
+    consumer_fa.enrich_imported_types_with_keys(Some(&idx));
+
+    // Sanity: enrichment typed $x as C.
+    let x_type = consumer_fa.inferred_type_via_bag(
+        "$x",
+        tree_sitter::Point { row: 4, column: 0 },
+    );
+    assert_eq!(
+        x_type.as_ref().and_then(|t| t.class_name()),
+        Some("C"),
+        "precondition: enrichment must type $$x as C; got {:?}",
+        x_type,
+    );
+
+    let store = FileStore::new();
+    store.insert_workspace(parent_path, parse(parent_src));
+    store.insert_workspace(child_path, parse(child_src));
+    store.insert_workspace(consumer_path.clone(), consumer_fa);
+
+    // Target the parent's `ping` — refs_to uses class-keyed Method
+    // matching, so `$x->ping()` (whose nearest invocant class is C)
+    // doesn't directly equal P. Targeting `C::ping` (the inherited
+    // shape) is what matches today.
+    let refs = refs_to(
+        &store,
+        Some(&idx),
+        &TargetRef {
+            name: "ping".to_string(),
+            kind: TargetKind::Method { class: "C".to_string() },
+        },
+        RoleMask::WORKSPACE,
+    );
+    assert!(
+        refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &consumer_path)),
+        "refs_to(C::ping) missed consumer's $$x->ping() call site \
+         (multi-hop: $$x typed as C only post-enrichment). hits: {:?}",
+        refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
+    );
+}
+
+/// Perf bench (gated `#[ignore]`). Generates a synthetic
+/// workspace with N files × M method-call sites and measures
+/// `refs_to` wall time. Useful when changing the invocant
+/// resolver — gut-check the cost. Run with
+///   `cargo test --release -- --nocapture --ignored \
+///    bench_refs_to_invocant_resolution`
+#[test]
+#[ignore]
+fn bench_refs_to_invocant_resolution() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    const N_FILES: usize = 200;
+    const M_CALLS: usize = 50;
+    const R_REPS: usize = 50;
+
+    // Producer: defines `B::touch` plus a constructor.
+    let producer_src = r#"
+package B;
+use Exporter 'import';
+our @EXPORT_OK = qw(make_b);
+
+sub new    { return bless {}, shift }
+sub make_b { return B->new }
+sub touch  { 1 }
+1;
+"#;
+
+    let store = FileStore::new();
+    let idx = ModuleIndex::new_for_test();
+    let producer_path = PathBuf::from("/tmp/bench_b.pm");
+    idx.register_workspace_module(producer_path.clone(), Arc::new(parse(producer_src)));
+    store.insert_workspace(producer_path, parse(producer_src));
+
+    // N consumer files, each with M method-call sites that mix:
+    //  - $b->touch() (var invocant, cross-file enrichment)
+    //  - B->touch() (bareword invocant)
+    //  - $self->touch() (enclosing-class invocant)
+    //  - $b->touch()->touch() (chain invocant)
+    //  - make_b()->touch() (function-call invocant)
+    for f in 0..N_FILES {
+        let mut src = String::from(
+            "package Consumer;\nuse B qw(make_b);\nsub run {\n  my $self = shift;\n  my $b = make_b();\n",
+        );
+        for c in 0..M_CALLS {
+            match c % 5 {
+                0 => src.push_str("  $b->touch();\n"),
+                1 => src.push_str("  B->touch();\n"),
+                2 => src.push_str("  $self->touch();\n"),
+                3 => src.push_str("  $b->touch()->touch();\n"),
+                _ => src.push_str("  make_b()->touch();\n"),
+            }
+        }
+        src.push_str("}\n1;\n");
+        let path = PathBuf::from(format!("/tmp/bench_consumer_{}.pm", f));
+        let mut fa = parse(&src);
+        fa.enrich_imported_types_with_keys(Some(&idx));
+        store.insert_workspace(path, fa);
+    }
+
+    let target = TargetRef {
+        name: "touch".to_string(),
+        kind: TargetKind::Method { class: "B".to_string() },
+    };
+
+    // Warm-up — JIT'd registry caches, lazy index allocs.
+    let _ = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
+
+    let t0 = Instant::now();
+    let mut total_hits: usize = 0;
+    for _ in 0..R_REPS {
+        let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
+        total_hits += refs.len();
+    }
+    let elapsed = t0.elapsed();
+    let per_call = elapsed / (R_REPS as u32);
+    eprintln!(
+        "BENCH refs_to: {} files × {} calls × {} reps = {} hits in {:?} ({:?}/call avg)",
+        N_FILES, M_CALLS, R_REPS, total_hits, elapsed, per_call,
+    );
+}
+
+/// Discriminator: a chain hop where the inner receiver's class is
+/// only known via cross-file enrichment. Hybrid branch (cache + bag
+/// fallback inside `invocant_class_of_method_call`) handles VARIABLE
+/// invocants whose type comes from enrichment, but does NOT handle
+/// CHAIN invocants (`$x->makeFoo()->ping()`) when the inner
+/// `$x->makeFoo()` ref's invocant_class cache stayed None at build
+/// time — the hybrid's bag fallback hits `resolve_invocant_class`
+/// which doesn't know how to walk a chain at read time. Option 2's
+/// helper recurses on the inner receiver via `call_ref_by_start`,
+/// re-resolving fresh, so cross-file enrichment composes through
+/// every chain hop.
+///
+/// Expected:
+///   * Option 2 branch: passes (refs_to finds the consumer's chain hop).
+///   * Hybrid branch: fails (chain hop's class stays unknown).
+#[test]
+fn refs_to_cross_file_chain_hop_post_enrichment() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    // Producer P — defines a class returning itself (so makeFoo's return is P).
+    let producer_src = r#"
+package P;
+use Exporter 'import';
+our @EXPORT_OK = qw(makeP);
+
+sub new     { return bless {}, shift }
+sub makeP   { return P->new }
+sub makeFoo { return P->new }
+sub ping    { 1 }
+1;
+"#;
+    // Consumer A — uses P, builds a chain whose inner receiver
+    // ($x) is typed only by cross-file enrichment.
+    let consumer_src = r#"
+use P qw(makeP);
+my $x = makeP();
+$x->makeFoo()->ping();
+1;
+"#;
+
+    let producer_path = PathBuf::from("/tmp/chain_xfile_p.pm");
+    let consumer_path = PathBuf::from("/tmp/chain_xfile_consumer.pm");
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(producer_path.clone(), Arc::new(parse(producer_src)));
+
+    let mut consumer_fa = parse(consumer_src);
+    consumer_fa.enrich_imported_types_with_keys(Some(&idx));
+
+    // Sanity: $x types as P via enrichment.
+    let x_type = consumer_fa.inferred_type_via_bag(
+        "$x",
+        tree_sitter::Point { row: 4, column: 0 },
+    );
+    assert_eq!(
+        x_type.as_ref().and_then(|t| t.class_name()),
+        Some("P"),
+        "precondition: enrichment must type $$x as P; got {:?}",
+        x_type,
+    );
+
+    let store = FileStore::new();
+    store.insert_workspace(producer_path, parse(producer_src));
+    store.insert_workspace(consumer_path.clone(), consumer_fa);
+
+    // refs_to(P::ping) — the consumer's `->ping()` is reachable
+    // only by typing `$x->makeFoo()` (the chain hop's invocant)
+    // through the cross-file P::makeFoo return type. Only works
+    // if the helper resolves the chain hop fresh against the bag.
+    let refs = refs_to(
+        &store,
+        Some(&idx),
+        &TargetRef {
+            name: "ping".to_string(),
+            kind: TargetKind::Method { class: "P".to_string() },
+        },
+        RoleMask::WORKSPACE,
+    );
+    assert!(
+        refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &consumer_path)),
+        "refs_to(P::ping) missed the chain hop $$x->makeFoo()->ping(). \
+         The inner $$x->makeFoo() invocant ($$x) was typed only by \
+         cross-file enrichment; chain typing must compose through the \
+         bag at read time. hits: {:?}",
+        refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
+    );
+}
+
+/// **Red-pin** — `find_highlights` doesn't thread `module_index`
+/// down to `method_call_invocant_class`, so a chain hop whose
+/// receiver class is only known via cross-file `MethodOnClass`
+/// resolution (`$x->makeFoo()->ping()` — `makeFoo` returns a
+/// cross-file class) silently fails to highlight.
+///
+/// The threaded reader is `crate::resolve::refs_to`; it works
+/// (`refs_to_cross_file_chain_hop_post_enrichment` covers it).
+/// The same scenario via the in-file `find_highlights` path
+/// (used by `textDocument/documentHighlight`) currently doesn't.
+///
+/// Un-ignore when polish lands `module_index` through
+/// `find_highlights` / `collect_refs_for_target` /
+/// `find_references` / `rename_kind_at` / `rename_callable_in_scope`.
+#[test]
+#[ignore = "find_highlights doesn't thread module_index — polish commit un-ignores"]
+fn find_highlights_cross_file_chain_hop_post_enrichment() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let producer_src = r#"
+package P;
+use Exporter 'import';
+our @EXPORT_OK = qw(makeP);
+
+sub new     { return bless {}, shift }
+sub makeP   { return P->new }
+sub makeFoo { return P->new }
+sub ping    { 1 }
+1;
+"#;
+    let consumer_src = r#"
+use P qw(makeP);
+my $x = makeP();
+$x->makeFoo()->ping();
+$x->makeFoo()->ping();
+1;
+"#;
+
+    let producer_path = PathBuf::from("/tmp/highlights_chain_p.pm");
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(producer_path, Arc::new(parse(producer_src)));
+
+    let mut consumer_fa = parse(consumer_src);
+    consumer_fa.enrich_imported_types_with_keys(Some(&idx));
+
+    // Cursor on the first `->ping()` — column 18 lands on `p` of ping.
+    let highlights = consumer_fa.find_highlights(
+        tree_sitter::Point { row: 3, column: 18 },
+        None,
+        None,
+    );
+
+    // Both call sites of `->ping()` share the same chain receiver
+    // shape; they must highlight together once chain typing
+    // composes through the bag at read time.
+    assert_eq!(
+        highlights.len(),
+        2,
+        "find_highlights should match both $$x->makeFoo()->ping() sites \
+         once chain typing through cross-file enrichment is threaded \
+         via module_index. got {:?}",
+        highlights,
     );
 }
