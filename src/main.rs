@@ -838,14 +838,16 @@ fn cli_dump_package(root: &str, package_name: &str) {
             .map(|s| s.id);
         let mut vars_in_scope: Vec<serde_json::Value> = Vec::new();
         if let Some(sid) = sub_scope_id {
-            for tc in &analysis.type_constraints {
-                if tc.scope == sid {
-                    vars_in_scope.push(serde_json::json!({
-                        "var": tc.variable,
-                        "type": file_analysis::format_inferred_type(&tc.inferred_type),
-                        "line": tc.constraint_span.start.row,
-                    }));
-                }
+            use crate::witnesses::{WitnessAttachment, WitnessPayload};
+            for w in analysis.witnesses.all() {
+                let WitnessAttachment::Variable { name, scope } = &w.attachment else { continue };
+                if *scope != sid { continue; }
+                let WitnessPayload::InferredType(t) = &w.payload else { continue };
+                vars_in_scope.push(serde_json::json!({
+                    "var": name,
+                    "type": file_analysis::format_inferred_type(t),
+                    "line": w.span.start.row,
+                }));
             }
         }
 

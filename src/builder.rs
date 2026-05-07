@@ -139,9 +139,8 @@ pub fn build_with_plugins(
 ///
 /// Since Phase 6, the fold is fully idempotent: the resulting
 /// `FileAnalysis` is byte-identical to a plain `build_with_plugins(...)`
-/// call — same `Symbol.return_type`, same `type_provenance`, same
-/// `sub_return_type_at_arity` answers, AND same witness counts and
-/// `type_constraints` shape. The two re-emittable passes inside
+/// call — same `type_provenance`, same `sub_return_type_at_arity`
+/// answers, same witness counts. The two re-emittable passes inside
 /// `resolve_return_types` (arity-return emission, call-binding
 /// propagator) clear their prior outputs before re-emitting, so each
 /// fact lands in the bag exactly once regardless of iteration count.
@@ -167,7 +166,6 @@ fn build_with_plugins_inner(
         scopes: Vec::new(),
         symbols: Vec::new(),
         refs: Vec::new(),
-        type_constraints: Vec::new(),
         deferred_var_types: Vec::new(),
         fold_ranges: Vec::new(),
         imports: Vec::new(),
@@ -267,9 +265,9 @@ fn build_with_plugins_inner(
     // loop over chain typing + reducer dispatch. Each iteration runs
     // `ChainPassMode::PreFold` (assignment + return-arm refresh)
     // followed by `resolve_return_types`; the loop exits when the
-    // snapshot of Sub/Method return types and `type_constraints`
-    // length stops moving. Invocant-class refresh runs once after
-    // the lattice settles.
+    // snapshot of Sub/Method return types and bag length stops
+    // moving. Invocant-class refresh runs once after the lattice
+    // settles.
     //
     // The two re-emittable passes inside `resolve_return_types`
     // (arity-return witnesses, call-binding propagator) became
@@ -317,7 +315,6 @@ fn build_with_plugins_inner(
         b.scopes,
         b.symbols,
         b.refs,
-        b.type_constraints,
         b.fold_ranges,
         b.imports,
         b.call_bindings,
@@ -344,24 +341,20 @@ fn build_with_plugins_inner(
 }
 
 impl<'a> Builder<'a> {
-    /// Push a `TypeConstraint` and mirror it into the witness bag in
-    /// one step. Mirrors `FileAnalysis::push_type_constraint`'s
-    /// invariant: bag-and-TC stay in sync. Every code path that adds a
-    /// constraint during the walk or worklist must call this so
-    /// `bag_query_variable` sees the seeded type immediately —
-    /// post-walk queries (`invocant_type_at_node`'s scalar arm, chain
-    /// typing) read the bag, not the TC vec.
+    /// Push a `TypeConstraint` shape into the witness bag — Variable
+    /// `InferredType` + class-assertion / FirstParam observation when
+    /// the type is a class identity. Walk-time and worklist callers go
+    /// through here so `bag_query_variable` sees seeded types
+    /// immediately. Mirrors `FileAnalysis::push_type_constraint`'s
+    /// shape (the FA helper handles enrichment-time pushes after the
+    /// builder's bag has been moved into the FA).
     pub(crate) fn push_type_constraint(&mut self, tc: TypeConstraint) {
         use crate::witnesses::{
             TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
         };
-        let var = tc.variable.clone();
-        let scope = tc.scope;
-        let span = tc.constraint_span;
-        let ty = tc.inferred_type.clone();
-        self.type_constraints.push(tc);
+        let TypeConstraint { variable, scope, constraint_span: span, inferred_type: ty } = tc;
         self.bag.push(Witness {
-            attachment: WitnessAttachment::Variable { name: var.clone(), scope },
+            attachment: WitnessAttachment::Variable { name: variable.clone(), scope },
             source: WitnessSource::Builder("type_constraint".into()),
             payload: WitnessPayload::InferredType(ty.clone()),
             span: Span { start: span.start, end: span.start },
@@ -369,7 +362,7 @@ impl<'a> Builder<'a> {
         match ty {
             InferredType::ClassName(n) => {
                 self.bag.push(Witness {
-                    attachment: WitnessAttachment::Variable { name: var, scope },
+                    attachment: WitnessAttachment::Variable { name: variable, scope },
                     source: WitnessSource::Builder("type_constraint".into()),
                     payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(n)),
                     span,
@@ -377,7 +370,7 @@ impl<'a> Builder<'a> {
             }
             InferredType::FirstParam { package } => {
                 self.bag.push(Witness {
-                    attachment: WitnessAttachment::Variable { name: var, scope },
+                    attachment: WitnessAttachment::Variable { name: variable, scope },
                     source: WitnessSource::Builder("type_constraint".into()),
                     payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
                         package,
@@ -841,7 +834,6 @@ struct Builder<'a> {
     scopes: Vec<Scope>,
     symbols: Vec<Symbol>,
     refs: Vec<Ref>,
-    type_constraints: Vec<TypeConstraint>,
     /// Plugin-emitted `VarType` constraints, resolved to scopes only
     /// after the whole CST has been walked (plugin dispatch runs
     /// before we recurse into call args, so at emit-time the target
@@ -1243,10 +1235,11 @@ impl<'a> Builder<'a> {
     /// Best-effort receiver-type resolution for a method call. Handles:
     ///   * `$self` / `__PACKAGE__`        → current package
     ///   * bare `Pkg::Name`               → literal class
-    ///   * `$var` with a prior `my $var = Pkg->new` → looked up in
-    ///     `type_constraints` (reverse scan; latest wins). This lets the
-    ///     mojo-events plugin resolve `$obj->emit(...)` in a consumer file
-    ///     to the producer's class, enabling cross-file def/ref pairing.
+    ///   * `$var` with a prior `my $var = Pkg->new` → looked up via
+    ///     the bag's Variable witnesses (latest wins). This lets the
+    ///     mojo-events plugin resolve `$obj->emit(...)` in a consumer
+    ///     file to the producer's class, enabling cross-file def/ref
+    ///     pairing.
     /// Resolve a bare `foo()` call to the package whose `sub foo` it
     /// refers to. Order mirrors Perl's name-lookup rule:
     ///
@@ -5912,17 +5905,17 @@ impl<'a> Builder<'a> {
     /// `ChainPassMode::PreFold` (assignment typing + return-arm refresh)
     /// followed by `resolve_return_types` (the reducer-dispatch driver
     /// from Phase 4); when the snapshot of Sub/Method return types and
-    /// the `type_constraints` length stops moving, the lattice has
-    /// settled and the loop exits.
+    /// the bag length stops moving, the lattice has settled and the
+    /// loop exits.
     ///
     /// The two re-emittable passes inside `resolve_return_types`
     /// (arity-return witnesses, call-binding propagator) are
     /// **clear-and-emit**: they drop their prior outputs at the start
     /// of every call so the bag stays canonical regardless of how many
-    /// iterations the loop runs. Chain typing's TC-existence check
-    /// keeps it idempotent on the same span. The result: each fact
-    /// lands in the bag exactly once at the end of the loop, no matter
-    /// how deep the chain is.
+    /// iterations the loop runs. Chain typing's bag-existence check
+    /// keeps it idempotent on the same assignment span. The result:
+    /// each fact lands in the bag exactly once at the end of the loop,
+    /// no matter how deep the chain is.
     ///
     /// `MAX_FOLD_ITERATIONS` is the all-builds safety net: the lattice
     /// argument (witnesses are monotonically appended; reduced answers
@@ -5967,16 +5960,16 @@ impl<'a> Builder<'a> {
     }
 
     /// Snapshot of the answers the worklist driver tracks for fixed
-    /// point detection: every Sub/Method's return type + the
-    /// `type_constraints` length. Two consecutive iterations producing
-    /// the same snapshot means no fold pass changed any sub's answer
-    /// AND chain typing pushed no new TCs — the lattice has settled.
+    /// point detection: every Sub/Method's return type + the bag
+    /// length. Two consecutive iterations producing the same snapshot
+    /// means no fold pass changed any sub's answer AND chain typing
+    /// pushed no new witnesses — the lattice has settled.
     ///
-    /// Excludes bag length on purpose: the re-emittable passes inside
-    /// `resolve_return_types` (arity, call-binding) are now
-    /// clear-and-emit, so their bag contribution is stable across
-    /// iterations. The only monotonic-grower is chain typing's TCs,
-    /// which the `type_constraints.len()` term captures.
+    /// `bag.len()` captures chain typing's monotonic grow. The
+    /// re-emittable passes inside `resolve_return_types` (arity,
+    /// call-binding) are clear-and-emit, so their bag contribution is
+    /// stable across iterations and a flat total bag length means no
+    /// new chain-assignment pushes either.
     fn fold_state_snapshot(&self) -> (Vec<(SymbolId, Option<InferredType>)>, usize, usize) {
         let mut answers: Vec<(SymbolId, Option<InferredType>)> = self
             .symbols
@@ -5990,35 +5983,34 @@ impl<'a> Builder<'a> {
         // without this, an iteration that only newly fills
         // `invocant_class` (driving the next iteration's
         // `emit_method_call_return_edges` to publish a new edge)
-        // would produce the same answers/TCs snapshot and the loop
+        // would produce the same answers/bag snapshot and the loop
         // would terminate prematurely.
         let invocant_filled = self
             .refs
             .iter()
             .filter(|r| matches!(&r.kind, RefKind::MethodCall { invocant_class: Some(_), .. }))
             .count();
-        (answers, self.type_constraints.len(), invocant_filled)
+        (answers, self.bag.len(), invocant_filled)
     }
 
     /// Symbolically execute the rhs of every `my $X = <expr>` and
-    /// push the resulting class type into the bag (and
-    /// `type_constraints`). ONE recursive typer
+    /// push the resulting class type into the bag. ONE recursive typer
     /// (`resolve_invocant_class_tree`) handles every expression shape
     /// it knows — scalar lookup, method-call chain, bareword, shift
     /// idiom, function call. No "is it a chain" branch. Whatever the
     /// rhs is, the typer descends.
     ///
-    /// Idempotent: skips an assignment if a TC for `$X` already
-    /// exists at the assignment's start point. Walk-time inference
-    /// covers literals/constructors via the existing path; this pass
-    /// fills in anything that was unresolvable at walk time
+    /// Idempotent: skips an assignment if a Variable witness for `$X`
+    /// already exists at the assignment's start point. Walk-time
+    /// inference covers literals/constructors via the existing path;
+    /// this pass fills in anything that was unresolvable at walk time
     /// (specifically chains whose links' return types only became
     /// known after the first `resolve_return_types`).
     ///
     /// Provenance: each pushed witness carries
-    /// `WitnessSource::Builder("chain_assignment")` so a future debug
-    /// dump can answer "why does $X have this type?" without
-    /// re-running the typer.
+    /// `WitnessSource::Builder("type_constraint")` (via
+    /// `push_type_constraint`) so a future debug dump can answer "why
+    /// does $X have this type?" without re-running the typer.
     ///
     /// Reads from the shared `ChainTypingIndex.assignment_nodes` (built
     /// by `build_chain_typing_index`); does not walk the tree itself.
@@ -6049,9 +6041,7 @@ impl<'a> Builder<'a> {
             let Some(var) = self.get_var_text_from_lhs(left) else { continue };
             let span = node_to_span(node);
             // Idempotency: skip if a Variable witness for this var was
-            // already pushed at the assignment's start point. The bag
-            // is canonical; `type_constraints` is a finalize-time
-            // projection so it can't be the read source mid-build.
+            // already pushed at the assignment's start point.
             let already_typed = self.bag.all().iter().any(|w| {
                 matches!(&w.attachment, crate::witnesses::WitnessAttachment::Variable { name, .. } if name == &var)
                     && matches!(w.payload, crate::witnesses::WitnessPayload::InferredType(_))
@@ -6888,10 +6878,8 @@ impl<'a> Builder<'a> {
     ) {
         use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
 
-        // Bag-only: clear-and-emit on tag `call_binding`. The
-        // `type_constraints` vec is a finalize-time projection (see
-        // `finalize_post_walk`), so intra-build mutations don't need
-        // to mirror.
+        // Clear-and-emit on tag `call_binding` so the witnesses stay
+        // canonical across worklist iterations.
         self.bag.remove_by_source_tag("call_binding");
         for binding in &self.call_bindings {
             let rt = return_types

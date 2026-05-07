@@ -5246,16 +5246,14 @@ my $x = app;
 
     // `$x = app` — $x should pick up the return type of the plugin's
     // `app` Sub (ClassName("Mojolicious")).
-    let tc = fa
-        .type_constraints
-        .iter()
-        .find(|tc| tc.variable == "$x")
-        .expect("$x must carry a type constraint sourced from `app`'s return type");
+    let ty = fa
+        .inferred_type("$x", tree_sitter::Point::new(4, 0))
+        .expect("$x must carry a type sourced from `app`'s return type");
     assert!(
-        matches!(&tc.inferred_type, InferredType::ClassName(c) if c == "Mojolicious"),
+        matches!(ty, InferredType::ClassName(c) if c == "Mojolicious"),
         "`$$x = app` must type as Mojolicious — bareword `app` resolves to the \
              plugin's typed Sub. got: {:?}",
-        tc.inferred_type,
+        ty,
     );
 }
 
@@ -6013,18 +6011,15 @@ $minion->add_task(send_email => sub {
 "#;
     let fa = build_fa(src);
 
-    // `$job` should have a type constraint inside the callback.
-    let tc = fa
-        .type_constraints
-        .iter()
-        .find(|t| {
-            t.variable == "$job"
-                && matches!(&t.inferred_type, InferredType::ClassName(c) if c == "Minion::Job")
-        })
-        .expect("$job must be typed Minion::Job inside add_task callback");
+    // `$job` should be typed Minion::Job inside the callback —
+    // plugin-declared ClassName, not builder's FirstParam.
+    let ty = fa
+        .inferred_type("$job", tree_sitter::Point::new(8, 0))
+        .expect("$job must carry a type inside add_task callback");
     assert!(
-        !matches!(tc.inferred_type, InferredType::FirstParam { .. }),
-        "type should be plugin-declared ClassName, not builder's FirstParam"
+        matches!(ty, InferredType::ClassName(c) if c == "Minion::Job"),
+        "type should be plugin-declared ClassName(Minion::Job), got {:?}",
+        ty,
     );
 }
 

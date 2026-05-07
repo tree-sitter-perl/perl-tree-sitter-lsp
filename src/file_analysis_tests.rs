@@ -2,8 +2,10 @@ use super::*;
 use tree_sitter::Point;
 
 /// Helper: build a minimal FileAnalysis with a single file scope and given type constraints.
+/// Constraints are pushed via `push_type_constraint` so the witness bag carries them —
+/// the bag is the sole store post-D4-followup.
 fn fa_with_constraints(constraints: Vec<TypeConstraint>) -> FileAnalysis {
-    FileAnalysis::new(
+    let mut fa = FileAnalysis::new(
         vec![Scope {
             id: ScopeId(0),
             parent: None,
@@ -16,7 +18,6 @@ fn fa_with_constraints(constraints: Vec<TypeConstraint>) -> FileAnalysis {
         }],
         vec![],
         vec![],
-        constraints,
         vec![],
         vec![],
         vec![],
@@ -29,7 +30,11 @@ fn fa_with_constraints(constraints: Vec<TypeConstraint>) -> FileAnalysis {
         HashMap::new(),
         HashMap::new(),
         vec![],
-    )
+    );
+    for tc in constraints {
+        fa.push_type_constraint(tc);
+    }
+    fa
 }
 
 fn constraint(var: &str, row: usize, inferred_type: InferredType) -> TypeConstraint {
@@ -158,7 +163,6 @@ fn test_resolve_sub_return_type() {
             namespace: Namespace::Language,
             outline_label: None,
         }],
-        vec![],
         vec![],
         vec![],
         vec![],

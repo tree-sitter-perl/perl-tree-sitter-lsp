@@ -278,25 +278,18 @@ fn post_walk_fold_is_observably_idempotent() {
         );
     }
 
-    // Phase 6 strengthening: bag size and `type_constraints` length
-    // must be byte-identical across single-fold and double-fold runs.
-    // The worklist driver's clear-and-emit invariant (each iteration
-    // truncates its own prior outputs before re-emitting) is what
-    // makes this hold; the pre-Phase-6 pipeline duplicated arity +
-    // call-binding witnesses on every extra fold pass, which is why
-    // this assertion didn't exist before.
+    // Phase 6 strengthening: bag size must be byte-identical across
+    // single-fold and double-fold runs. The worklist driver's
+    // clear-and-emit invariant (each iteration truncates its own prior
+    // outputs before re-emitting) is what makes this hold; the
+    // pre-Phase-6 pipeline duplicated arity + call-binding witnesses
+    // on every extra fold pass, which is why this assertion didn't
+    // exist before.
     assert_eq!(
         fa_once.witnesses.len(),
         fa_twice.witnesses.len(),
         "extra fold pass must not change witness count — \
          Phase 6's clear-and-emit invariant has regressed"
-    );
-    assert_eq!(
-        fa_once.type_constraints.len(),
-        fa_twice.type_constraints.len(),
-        "extra fold pass must not change type_constraints length — \
-         the call-binding propagator's clear-and-emit invariant has \
-         regressed"
     );
 }
 
