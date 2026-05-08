@@ -499,21 +499,202 @@ pub enum InferredType {
     Numeric,
     /// Used in string context (`.`, `eq`, `=~`, etc.).
     String,
+    /// Parametric type — a sealed enum where each variant carries
+    /// its own data shape (concrete flavors) or wraps an operand
+    /// for type-level projections. Per-axis methods on
+    /// `ParametricType` (`class_name`, `hash_key_class`,
+    /// `method_arg_owner`) carry per-flavor policy. **Match
+    /// invariant: never `_ => …`.** Compiler exhaustiveness is
+    /// the safety net for the future `Plugin` escape hatch
+    /// variant.
+    ///
+    /// Design history: Phase 1 of Part 5c shipped this as a flat
+    /// `{ base: String, type_args: Vec<TypeArg> }` shape with
+    /// dual-accessor helpers; the per-method allowlist and the
+    /// data-layout-special-cased accessors are gone, lifted into
+    /// per-flavor methods on `ParametricType`. The emitter still
+    /// gates per-shape — `Strict` (constructor keys), `Open`
+    /// (Parametric receiver claims the method), `Deferred`
+    /// (chain receiver, type unresolvable until enrichment) — but
+    /// the three flavors share one `emit_call_arg_key_accesses`
+    /// body via a `Gate` discriminator. See
+    /// `docs/adr/parametric-types.md`.
+    Parametric(ParametricType),
+}
+
+/// Concrete parametric flavors + type-level operators. Each
+/// concrete flavor carries the data its semantics need; operators
+/// (`RowOf`) wrap a sub-`InferredType` and reduce via
+/// `ParametricProjectionReducer` in the witness bag.
+///
+/// **Match invariant: never `_ => …` arms.** Every consumer
+/// explicitly handles every variant. The compiler enforces this
+/// when the (deferred) `Plugin` escape hatch lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParametricType {
+    /// DBIC `$schema->resultset('Foo')` shape. `base` is the
+    /// resolved resultset class (default
+    /// `DBIx::Class::ResultSet`, or a discovered custom resultset
+    /// class — see `goto_def_offers_custom_resultset_method` red-
+    /// pin). `row` is the row class (where `add_columns`
+    /// synthesizes its column accessors). Two distinct fields
+    /// because the value carries dual identity:
+    ///   - method dispatch goes through `base`
+    ///   - hash-key arg owner / direct hash-key access go through `row`
+    ///
+    /// Pinned by internal-shape tests so a refactor to a single-
+    /// class encoding silently breaks `RowOf` rather than
+    /// silently returning the wrong dimension.
+    ResultSet { base: String, row: String },
+
+    /// `RowOf<T>` — type-level projection. Reduces:
+    ///   - `RowOf<ResultSet { base, row }>` → `ClassName(row)`
+    ///   - everything else → `None` (the operand has no row
+    ///     dimension)
+    ///
+    /// Lazy: emitted as a witness, reduced by
+    /// `ParametricProjectionReducer` in the bag. Composes —
+    /// `RowOf<RowOf<X>>` evaluates by recursing into the operand.
+    /// Plugin port (queued) emits `RowOf(receiver_type)` for
+    /// methods like `find` / `first` / `single` / `next` /
+    /// `create` that project a ResultSet to its row.
+    RowOf(Box<InferredType>),
+}
+
+impl ParametricType {
+    /// Class to consult for method dispatch on this value.
+    /// `$rs->all` resolves against `class_name()`'s answer.
+    pub fn class_name(&self) -> Option<&str> {
+        match self {
+            ParametricType::ResultSet { base, .. } => Some(base.as_str()),
+            ParametricType::RowOf(inner) => {
+                // Evaluate: row-class of inner (if inner is
+                // ResultSet) is the dispatch class for the
+                // projected value.
+                match inner.as_ref() {
+                    InferredType::Parametric(ParametricType::ResultSet { row, .. }) => {
+                        Some(row.as_str())
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Class to consult for direct `recv->{key}` hash-key access
+    /// on this value. ResultSet returns `row` (the column-keyed
+    /// class — used today only by the cleanup-pass HashKeyAccess
+    /// owner-resolution paths; HRI shape isn't supported but the
+    /// field is the right one when it lands). Operators evaluate
+    /// recursively.
+    pub fn hash_key_class(&self) -> Option<&str> {
+        match self {
+            ParametricType::ResultSet { row, .. } => Some(row.as_str()),
+            ParametricType::RowOf(inner) => match inner.as_ref() {
+                InferredType::Parametric(p) => p.hash_key_class(),
+                _ => None,
+            },
+        }
+    }
+
+    /// Owner for hash-key args of `recv->method({KEY => ...})`.
+    /// `Some(owner)` means "this flavor claims this method's args
+    /// — emit the HashKeyAccess unconditionally with this owner;
+    /// the type IS the gate." `None` means "this flavor doesn't
+    /// claim, fall through to the strict-eq local-symbol path."
+    ///
+    /// ResultSet claims the row-keyed methods (search, search_rs,
+    /// find, find_or_new, find_or_create, update_or_create, create,
+    /// update, populate). Methods that take filters or no args
+    /// (count, exists, delete, all without args) return None.
+    pub fn method_arg_owner(&self, method: &str) -> Option<HashKeyOwner> {
+        match self {
+            ParametricType::ResultSet { row, .. } => match method {
+                "search" | "search_rs" | "find" | "find_or_new" | "find_or_create"
+                | "update_or_create" | "create" | "update" | "populate" | "new_result" => {
+                    Some(HashKeyOwner::Class(row.clone()))
+                }
+                _ => None,
+            },
+            ParametricType::RowOf(_) => None,
+        }
+    }
+
+    /// Return-type projection for `recv->method(...)`. `Some(p)`
+    /// means the call site emits a witness of `Parametric(p)` —
+    /// the flavor declares that this method projects through
+    /// some operator. `None` means default (fall through to
+    /// standard `MethodOnClass` resolution).
+    ///
+    /// ResultSet projects through `RowOf<self>` for methods that
+    /// return a single row (find / first / single / next /
+    /// create / find_or_new / find_or_create / update_or_create
+    /// / new_result). search / search_rs preserve the Parametric
+    /// (no projection — they return the same ResultSet shape);
+    /// the absence of an entry here means "preserve via the
+    /// standard return-type resolution."  count / exists return
+    /// Numeric and aren't represented as projections — they fall
+    /// through to whatever cross-file lookup of the method's
+    /// return type yields.
+    ///
+    /// Per CLAUDE.md #10: each flavor's projections live in its
+    /// own match arm. New flavors add their own; consumers
+    /// dispatch generically.
+    pub fn return_projection(&self, method: &str) -> Option<ParametricType> {
+        match self {
+            ParametricType::ResultSet { .. } => match method {
+                "find" | "first" | "single" | "next" | "create"
+                | "find_or_new" | "find_or_create" | "update_or_create"
+                | "new_result" => Some(ParametricType::RowOf(Box::new(
+                    InferredType::Parametric(self.clone()),
+                ))),
+                _ => None,
+            },
+            ParametricType::RowOf(_) => None,
+        }
+    }
 }
 
 impl InferredType {
-    /// Extract the class name if this is an object type (ClassName or FirstParam).
+    /// Extract the class name if this is an object type
+    /// (ClassName, FirstParam, or Parametric — the latter
+    /// delegates to the flavor's `class_name()`). For the row-
+    /// class / hash-key-arg dimension on a Parametric, see
+    /// `hash_key_class`.
     pub fn class_name(&self) -> Option<&str> {
         match self {
             InferredType::ClassName(name) => Some(name.as_str()),
             InferredType::FirstParam { package } => Some(package.as_str()),
+            InferredType::Parametric(p) => p.class_name(),
             _ => None,
         }
     }
 
-    /// True if this is any Object variant (ClassName or FirstParam).
+    /// True if this is any object-shaped variant (ClassName,
+    /// FirstParam, or a Parametric flavor that has a class_name).
     pub fn is_object(&self) -> bool {
         self.class_name().is_some()
+    }
+
+    /// Class to consult for direct `recv->{key}` hash-key access
+    /// on this value. For Parametric, delegates to the flavor; for
+    /// other variants, falls back to `class_name()` (constructor
+    /// keys etc. on `bless { } 'Foo'`-shaped values).
+    pub fn hash_key_class(&self) -> Option<&str> {
+        match self {
+            InferredType::Parametric(p) => p.hash_key_class(),
+            _ => self.class_name(),
+        }
+    }
+
+    /// Direct accessor to the parametric flavor, when this type
+    /// is `Parametric(_)`. Lets consumers route to flavor-specific
+    /// methods (`method_arg_owner`, etc.) without re-matching.
+    pub fn as_parametric(&self) -> Option<&ParametricType> {
+        match self {
+            InferredType::Parametric(p) => Some(p),
+            _ => None,
+        }
     }
 }
 
@@ -1100,8 +1281,68 @@ impl FileAnalysis {
     /// mirror; they resolve lazily through `query_sub_return_type`.
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
+        // Fill HashKeyAccess owners that are resolvable in-file
+        // via the chain-recursion dispatcher
+        // (`method_call_invocant_type`'s `call_ref_by_start`
+        // walk). Cross-file gaps stay None until
+        // `enrich_imported_types_with_keys` re-runs the same
+        // routine with `module_index`.
+        self.fix_chain_receiver_hash_key_owners(None);
         self.base_symbol_count = self.symbols.len();
         self.base_witness_count = self.witnesses.len();
+    }
+
+    /// Set the `owner` on `HashKeyAccess { owner: None, .. }` refs
+    /// whose enclosing `MethodCall`'s receiver types as a
+    /// `Parametric` flavor that claims this method's args (DBIC's
+    /// `search`/`find`/`update`/...). Build emits these refs
+    /// eagerly with `owner: None` for chain receivers it can't
+    /// resolve at walk time; this routine fills them once the
+    /// receiver's type is resolvable.
+    ///
+    /// `module_index = None` resolves only in-file chains. The
+    /// same routine runs from enrichment with `module_index =
+    /// Some(_)` to fill cross-file gaps. Idempotent — only None-
+    /// owner refs are touched, so a second run leaves them alone.
+    fn fix_chain_receiver_hash_key_owners(&mut self, module_index: Option<&ModuleIndex>) {
+        let mut owner_fixes: Vec<(usize, HashKeyOwner)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            if !matches!(r.kind, RefKind::HashKeyAccess { owner: None, .. }) {
+                continue;
+            }
+            // Find the enclosing MethodCall ref by span
+            // containment — smallest-span containing MethodCall
+            // wins (innermost call's args).
+            let mut enclosing: Option<&Ref> = None;
+            let mut enclosing_area: u64 = u64::MAX;
+            for other in &self.refs {
+                if !matches!(other.kind, RefKind::MethodCall { .. }) {
+                    continue;
+                }
+                if !contains_point(&other.span, r.span.start) {
+                    continue;
+                }
+                let area = (other.span.end.row.saturating_sub(other.span.start.row)) as u64
+                    * 10_000
+                    + other.span.end.column as u64;
+                if area < enclosing_area {
+                    enclosing = Some(other);
+                    enclosing_area = area;
+                }
+            }
+            let Some(call) = enclosing else { continue };
+            let Some(ty) = self.method_call_invocant_type(call, module_index) else {
+                continue;
+            };
+            let Some(p) = ty.as_parametric() else { continue };
+            let Some(o) = p.method_arg_owner(&call.target_name) else { continue };
+            owner_fixes.push((i, o));
+        }
+        for (i, o) in owner_fixes {
+            if let RefKind::HashKeyAccess { ref mut owner, .. } = self.refs[i].kind {
+                *owner = Some(o);
+            }
+        }
     }
 
 
@@ -1691,6 +1932,15 @@ impl FileAnalysis {
             }
         }
 
+        // Deferred HashKeyAccess owner fix for chain-receiver
+        // method calls — see `fix_chain_receiver_hash_key_owners`.
+        // Enrichment runs it with module_index so cross-file
+        // receiver types resolve; the same routine runs from
+        // `finalize_post_walk` with module_index=None for the
+        // in-file-resolvable case (chain recursion via
+        // `call_ref_by_start` doesn't need module_index).
+        self.fix_chain_receiver_hash_key_owners(module_index);
+
         // Cross-file inheritance edges. Local writeback emits
         // `MethodOnClass(child, m) → Edge(MethodOnClass(parent, m))`
         // for every method `m` declared on a *local* parent. When
@@ -2007,7 +2257,14 @@ impl FileAnalysis {
             }
         }
 
-        if let Some(cn) = ty.class_name() {
+        // Hash-key context: read `hash_key_class()` (= row-class
+        // for Parametric, dispatch class else) instead of bare
+        // `class_name()`. CLAUDE.md invariant #10 — never special-
+        // case for a particular shape; the type already carries
+        // the per-axis answer. For non-Parametric this is
+        // equivalent to `class_name()`; for Parametric it's the
+        // crucial narrowing to the type's row-class arg.
+        if let Some(cn) = ty.hash_key_class() {
             return Some(HashKeyOwner::Class(cn.to_string()));
         }
 
@@ -2659,20 +2916,46 @@ impl FileAnalysis {
                 RefKind::MethodCall { .. } => {
                     let class_name = self.method_call_invocant_class(r, module_index);
 
-                    // Check if cursor is on a named arg key in the call args,
-                    // not on the method name itself. Resolve to hash key def or :param field.
-                    if let (Some(t), Some(s), Some(ref cn)) = (tree, source_bytes, &class_name) {
+                    // Check if cursor is on a named arg key in the
+                    // call args, not on the method name itself.
+                    // Resolve to hash key def or :param field.
+                    //
+                    // The owner for hash-key args is per-flavor +
+                    // method-aware: ask the receiver's
+                    // ParametricType for `method_arg_owner(method)`
+                    // — `Some(owner)` means the flavor claims this
+                    // method's args (DBIC's ResultSet returns the
+                    // row class for search/find/create/etc.;
+                    // returns None for count/exists). When the
+                    // flavor doesn't claim, fall back to the
+                    // receiver's class (constructor keys etc. on
+                    // `bless { } 'Foo'`-shaped non-Parametric
+                    // values). Method dispatch on the same ref
+                    // still uses `class_name()`, so `$rs->search`
+                    // resolves against the ResultSet base.
+                    if let (Some(t), Some(s)) = (tree, source_bytes) {
                         if let Some(key_name) = self.call_arg_key_at(t, s, point) {
-                            // Try hash key defs (bless hash)
-                            let owner = HashKeyOwner::Class(cn.to_string());
-                            for def in self.hash_key_defs_for_owner(&owner) {
-                                if def.name == key_name {
-                                    return Some(def.selection_span);
+                            let owner = self
+                                .method_call_invocant_type(r, module_index)
+                                .as_ref()
+                                .and_then(|ty| ty.as_parametric())
+                                .and_then(|p| p.method_arg_owner(&r.target_name))
+                                .or_else(|| {
+                                    class_name
+                                        .as_ref()
+                                        .map(|c| HashKeyOwner::Class(c.clone()))
+                                });
+                            if let Some(owner) = owner {
+                                for def in self.hash_key_defs_for_owner(&owner) {
+                                    if def.name == key_name {
+                                        return Some(def.selection_span);
+                                    }
                                 }
-                            }
-                            // Try :param fields (Perl 5.38+ classes)
-                            if let Some(span) = self.find_param_field(cn, &key_name) {
-                                return Some(span);
+                                if let HashKeyOwner::Class(cn) = &owner {
+                                    if let Some(span) = self.find_param_field(cn, &key_name) {
+                                        return Some(span);
+                                    }
+                                }
                             }
                         }
                     }
@@ -3650,6 +3933,79 @@ impl FileAnalysis {
             return Some(c);
         }
         Some(invocant.to_string())
+    }
+
+    /// Full `InferredType` of a `MethodCall` ref's invocant — same
+    /// dispatch shape as `method_call_invocant_class` but returning
+    /// the type, not just the class name. Lets readers that care
+    /// about Parametric narrowing (hash-key lookup for DBIC search-
+    /// family methods, etc.) inspect `parametric_type_args` without
+    /// re-resolving the invocant from scratch.
+    pub fn method_call_invocant_type(
+        &self,
+        r: &Ref,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<InferredType> {
+        let RefKind::MethodCall { invocant, invocant_span, .. } = &r.kind else {
+            return None;
+        };
+        if invocant.is_empty() {
+            return None;
+        }
+        let point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
+
+        // Pseudo-invocants (`shift`, `$_[0]`, `__PACKAGE__`) → enclosing class.
+        if invocant == "shift" || invocant == "$_[0]" || invocant == "@_[0]" || invocant == "__PACKAGE__" {
+            return self.enclosing_class_for_scope(r.scope).map(InferredType::ClassName);
+        }
+
+        // Chain / function-call receiver — same indexing path
+        // `method_call_invocant_class` uses, but we surface the
+        // full type instead of unwrapping to class_name.
+        if let Some(span) = invocant_span {
+            if let Some(&recv_idx) = self.call_ref_by_start.get(&span.start) {
+                let recv_span = self.refs[recv_idx].span;
+                let contained = recv_span.start == span.start
+                    && (recv_span.end.row, recv_span.end.column)
+                        <= (span.end.row, span.end.column);
+                let is_self = std::ptr::eq(&self.refs[recv_idx], r);
+                if contained && !is_self {
+                    match &self.refs[recv_idx].kind {
+                        RefKind::MethodCall { .. } => {
+                            return self.method_call_return_type_via_bag(recv_idx, module_index);
+                        }
+                        RefKind::FunctionCall { .. } => {
+                            return self.sub_return_type_at_arity(
+                                &self.refs[recv_idx].target_name,
+                                Some(0),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Variable invocant.
+        let first = invocant.as_bytes()[0];
+        if first == b'$' || first == b'@' || first == b'%' {
+            if let Some(t) = self.inferred_type_via_bag(invocant, point) {
+                return Some(t);
+            }
+            if invocant == "$self" {
+                return self.enclosing_class_for_scope(r.scope).map(InferredType::ClassName);
+            }
+            return None;
+        }
+
+        // Bareword: the bareword *is* the class (or a zero-arg
+        // ClassName-returning sub — same rule as
+        // `method_call_invocant_class`'s bareword branch).
+        let bare = invocant.rsplit("::").next().unwrap_or(invocant);
+        if let Some(InferredType::ClassName(c)) = self.sub_return_type_at_arity(bare, Some(0)) {
+            return Some(InferredType::ClassName(c));
+        }
+        Some(InferredType::ClassName(invocant.clone()))
     }
 
     /// Walk the scope chain to find the enclosing class or package.
@@ -5211,9 +5567,13 @@ impl FileAnalysis {
             var_text
         };
 
-        // Try type inference → class owner (bag-routed).
+        // Try type inference → class owner (bag-routed). Hash-
+        // key context: read `hash_key_class()` so Parametric
+        // values narrow to their row-class arg (DBIC `$row->{name}`
+        // after `find` etc.). For non-Parametric this is
+        // equivalent to `class_name()`. CLAUDE.md invariant #10.
         if let Some(it) = self.inferred_type_via_bag(var_text, point) {
-            if let Some(cn) = it.class_name() {
+            if let Some(cn) = it.hash_key_class() {
                 return Some(HashKeyOwner::Class(cn.to_string()));
             }
         }
@@ -5571,6 +5931,14 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
         InferredType::Regexp => "Regexp".to_string(),
         InferredType::Numeric => "Numeric".to_string(),
         InferredType::String => "String".to_string(),
+        // Method dispatch on a Parametric uses its `class_name()`
+        // (= the flavor's dispatch class), so the tag follows.
+        // Type-arg detail lives in the richer
+        // `format_inferred_type` rendering.
+        InferredType::Parametric(p) => match p.class_name() {
+            Some(c) => format!("Object:{}", c),
+            None => "Parametric".to_string(),
+        },
     }
 }
 
@@ -5610,6 +5978,18 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
         InferredType::Regexp => "Regexp".to_string(),
         InferredType::Numeric => "Numeric".to_string(),
         InferredType::String => "String".to_string(),
+        InferredType::Parametric(p) => format_parametric_type(p),
+    }
+}
+
+fn format_parametric_type(p: &ParametricType) -> String {
+    match p {
+        ParametricType::ResultSet { base, row } => {
+            format!("{}<{}>", base, row)
+        }
+        ParametricType::RowOf(inner) => {
+            format!("RowOf<{}>", format_inferred_type(inner))
+        }
     }
 }
 
@@ -5620,3 +6000,7 @@ mod tests;
 #[cfg(test)]
 #[path = "call_ref_index_tests.rs"]
 mod call_ref_index_tests;
+
+#[cfg(test)]
+#[path = "parametric_resultset_tests.rs"]
+mod parametric_resultset_tests;

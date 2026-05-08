@@ -92,6 +92,14 @@ fn on_method_call(ctx) {
 
     if segments.len() == 1 {
         // Simple helper: ONE Method on the canonical entry class.
+        // `return_via_edge` lifts the helper's return type from
+        // the callback body's last expression at query time. The
+        // body hasn't been walked when this hook fires, but
+        // `Expr(span)` carries the type by the time consumers
+        // query — the bag's edge-chase resolver follows the back-
+        // pointer. Lets `$c->name->method` chain on a helper that
+        // returns a Parametric ResultSet (DBIC), a Promise, etc.,
+        // without the plugin inspecting the body at parse time.
         out += #{
             Method: #{
                 name: name,
@@ -100,6 +108,7 @@ fn on_method_call(ctx) {
                 params: params,
                 is_method: true,
                 return_type: (),
+                return_via_edge: args[1].sub_body_last_expr_span,
                 doc: (),
                 on_class: "Mojolicious::Controller",
                 display: "Helper",

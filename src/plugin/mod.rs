@@ -52,6 +52,21 @@ pub struct ArgInfo {
     /// HashKeyDef so signature help can surface it at call sites.
     #[serde(default)]
     pub sub_params: Vec<EmittedParam>,
+    /// For anonymous-sub args, the span of the body's last expression
+    /// (the one that determines the sub's return value when called).
+    /// Lets plugins emit `Symbol(method_id) → Edge(Expr(span))` so
+    /// the synthesized callable's return type follows the body's
+    /// last-expression type — resolved at query time, after the
+    /// body has been walked. The natural shape for
+    /// `$app->helper(name => sub { ... })`-style synthesis where
+    /// the plugin doesn't statically know what the body returns
+    /// (it could be a Parametric resultset, a class instance, an
+    /// arbitrary value).
+    ///
+    /// `None` for non-sub args, sub args without a recognizable
+    /// last expression, or empty bodies.
+    #[serde(default)]
+    pub sub_body_last_expr_span: Option<Span>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +195,22 @@ pub enum EmitAction {
         /// ("helper") and appends the non-invocant params.
         #[serde(default)]
         outline_label: Option<String>,
+        /// Lazy return type via `Edge` to an `Expr(span)` attachment
+        /// — the synthesized Method's return type IS that expression's
+        /// type, resolved at query time after the source has fully
+        /// walked. Lets plugins like `mojo-helpers` lift the return
+        /// type from a `sub { ... }` callback's body without
+        /// inspecting the body at plugin-call time (when the body
+        /// hasn't been walked yet). Set to `args[N].sub_body_last_expr_span`
+        /// for the relevant callback arg.
+        ///
+        /// Mutually exclusive with `return_type` in spirit — if both
+        /// are set, `return_type` wins (the plugin overrode
+        /// explicitly). Builder pushes a `Symbol(sid) → Edge(Expr(span))`
+        /// witness; the bag's edge-chase resolver follows it at
+        /// query time.
+        #[serde(default)]
+        return_via_edge: Option<Span>,
     },
     /// Synthesize a `HashKeyDef` for a constructor/stash/etc. key.
     HashKeyDef {
@@ -853,6 +884,7 @@ mod tests {
             hide_in_outline: false,
             opaque_return: false,
             outline_label: None,
+            return_via_edge: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         assert!(json.contains("\"Method\""));

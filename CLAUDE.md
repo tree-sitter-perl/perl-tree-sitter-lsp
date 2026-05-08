@@ -44,6 +44,16 @@ See `docs/ROADMAP.md` for the forward design corpus entry point. `docs/adr/file-
 
 9. **Provenance: derived refs trace to source** for rename/cross-ref. Constant folding (`my $m = 'process'; $self->$m()`), `has` declarations (accessor + constructor key + internal hash key), import lists, return hash keys → caller derefs (`HashKeyOwner::Sub`), package→file path, inherited overrides.
 
+10. **Never special-case for a particular shape — you are always wrong.** Any code that branches on "is this method named `search`", "does this base equal `DBIx::Class::ResultSet`", "did this come from a plugin vs the real walker", or "is this return-type a String" is encoding a partial enumeration of shapes that match a behavior. The list is always incomplete — tomorrow's case that should match silently doesn't; tomorrow's case that shouldn't match silently does. **Fix:** encode the "wants behavior X" property on the *type / value / witness* itself, so consumers ask the value the question and the value answers. The consumer never sees the shape.
+
+   Recurring forms of this antipattern:
+   - **Method-name allowlists** in consumers (`if target_name in {search, find}`). Push the rule onto the *type*: `InferredType::hash_key_class()` for the parametric-arg case. See `docs/adr/parametric-types.md`.
+   - **Lossy-string returns** (`Option<String>` for a class name when the source had `Option<InferredType>`). The string is a consumer-side projection, not a return-type contract. Helpers that resolve "what type does this expression produce" return `Option<InferredType>`. Class-name accessors (`class_name()`, `dispatch_class()`, etc.) are caller-side methods on the rich type. Cleanup pass landed; back-compat thin wrappers remain (`method_call_invocant_class`, `resolve_invocant_class_tree`, `invocant_text_to_class`) — they each call the typed sibling and project at the consumer.
+   - **Real vs synthetic branches** in worker code (`if synthetic { skip step }`). Synthetic paths run the same body, factored to a function. Termination concerns go on the dispatcher (seen-sets, depth caps) — not on the worker.
+   - **Per-base / per-name lookup tables in core** for behavior plugins should own. The plugin trait carries the rule; core dispatches generically.
+
+   The discipline is hard because the special case is always the smallest diff right now. Reaching up to the general path is the larger commit. Do the larger commit anyway — the special case never stays cheap, and provenance / observability / future flavors of the same rule all rot when they're not paying it forward.
+
 ### File map
 
 - `main.rs` — entry, CLI modes (`--rename`, `--workspace-symbol`, `--dump-package`, `--version`). `cli_full_startup(root)` = "act like LSP just started".

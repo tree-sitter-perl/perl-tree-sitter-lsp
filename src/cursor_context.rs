@@ -951,6 +951,7 @@ pub fn build_plugin_query_context(
                 content_span: None,
                 inferred_type: Some(InferredType::String),
                 sub_params: Vec::new(),
+                sub_body_last_expr_span: None,
             }],
             None => Vec::new(),
         };

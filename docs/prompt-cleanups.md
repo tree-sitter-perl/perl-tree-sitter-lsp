@@ -193,8 +193,7 @@ strictly grows when work happens. The convergence rule is unchanged.
 `unresolved_call_targets: Vec<UnresolvedCallTarget>` field on
 `Builder`. Witness attachment enum in `src/witnesses.rs`.
 
-**Why:** the forward-reference fix (PR landed alongside this entry,
-see `prompt-forward-reference-resolution.md`) is a two-phase
+**Why:** the forward-reference fix (PR #32) is a two-phase
 recovery: walk-time `find_callee_symbol` for the fast path, plus a
 queue + post-walk retry for misses. The structure works but
 *duplicates the lookup rule* (`s.kind ∈ {Sub, Method}` and
