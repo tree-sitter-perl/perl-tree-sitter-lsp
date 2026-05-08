@@ -71,10 +71,14 @@ fn test_resolve_arrayref_type() {
 
 #[test]
 fn test_resolve_coderef_type() {
-    let fa = fa_with_constraints(vec![constraint("$cref", 0, InferredType::CodeRef)]);
+    let fa = fa_with_constraints(vec![constraint(
+        "$cref",
+        0,
+        InferredType::CodeRef { return_edge: None },
+    )]);
     assert_eq!(
         fa.inferred_type_via_bag("$cref", Point::new(1, 0)),
-        Some(InferredType::CodeRef)
+        Some(InferredType::CodeRef { return_edge: None })
     );
 }
 
@@ -246,8 +250,8 @@ fn test_resolve_return_type_object_does_not_subsume_arrayref() {
 #[test]
 fn test_resolve_return_type_single() {
     assert_eq!(
-        resolve_return_type(&[InferredType::CodeRef]),
-        Some(InferredType::CodeRef),
+        resolve_return_type(&[InferredType::CodeRef { return_edge: None }]),
+        Some(InferredType::CodeRef { return_edge: None }),
     );
 }
 
@@ -266,7 +270,7 @@ fn test_class_name_helper() {
     );
     assert_eq!(InferredType::HashRef.class_name(), None);
     assert_eq!(InferredType::ArrayRef.class_name(), None);
-    assert_eq!(InferredType::CodeRef.class_name(), None);
+    assert_eq!(InferredType::CodeRef { return_edge: None }.class_name(), None);
     assert_eq!(InferredType::Regexp.class_name(), None);
     assert_eq!(InferredType::Numeric.class_name(), None);
     assert_eq!(InferredType::String.class_name(), None);

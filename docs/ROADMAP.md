@@ -76,6 +76,18 @@ invocant refresh) and the commit history.
   dispatch, truthiness, `wantarray`). Do **not** ship more arity-shaped
   facts that need their own reducer in the meantime — fold them into
   `ReturnExpr` instead.
+- **`return_via_edge` chases lack provenance.** Helper Methods that
+  resolve their return type by chasing a `CodeRef.return_edge` (anon-
+  literal `Expr(span)` or `\&foo` `MethodOnClass{...}`) record no
+  `TypeProvenance` for the chase — `--dump-package` shows the resolved
+  type but not "via Edge → MethodOnClass{Producer, build_rs} → reducer
+  fold". Not a regression (the older span-based path was the same), but
+  weaker than `MethodOnClassReducer`'s existing provenance story for
+  method dispatch. Fix: stamp `TypeProvenance::Delegation { kind:
+  "callable_return_edge", via: <attachment-tag> }` when the chain
+  typer's `coderef_call_expression` arm fires, and mirror it onto the
+  synthesized Method's symbol when `EmitAction::Method.return_via_edge`
+  resolves.
 
 ---
 

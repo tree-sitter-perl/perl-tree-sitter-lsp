@@ -491,8 +491,30 @@ pub enum InferredType {
     HashRef,
     /// `$x = []` or `$x = [ ... ]` — unblessed array reference.
     ArrayRef,
-    /// `$x = sub { ... }` — code reference.
-    CodeRef,
+    /// `$x = sub { ... }` — code reference. `return_edge` is a
+    /// witness-bag attachment whose type IS the callable's return
+    /// when invoked. Two shapes populate it:
+    ///
+    ///   - Anonymous-sub literals (`sub { ... }`) →
+    ///     `Expr(body_last_expr_span)`. The bag walks that span's
+    ///     own witnesses at query time, after the body is built.
+    ///   - Named-sub references (`\&foo`, `\&Foo::bar`) →
+    ///     `MethodOnClass { class, name }`. Same attachment the
+    ///     bag's existing edge-chase uses for method dispatch —
+    ///     resolves in-file via the named-sub's Symbol witnesses
+    ///     AND cross-file via `module_index` (the bag transparently
+    ///     recurses into the cached module's bag).
+    ///
+    /// Survives variable rebinding because chain typing propagates
+    /// the whole `InferredType` through `my $sub = ...` via the
+    /// bag's TC machinery — so `helper(name => sub {...})` and
+    /// `my $cb = \&foo; helper(name => $cb)` both reach the same
+    /// attachment-driven resolution.
+    ///
+    /// `None` for opaque sources (params typed `CodeRef`, deref-
+    /// shape narrowing, `Rep::Code` observations) where no body or
+    /// named target is reachable from the syntax alone.
+    CodeRef { return_edge: Option<crate::witnesses::WitnessAttachment> },
     /// `$x = qr/.../` — compiled regular expression.
     Regexp,
     /// Used in numeric context (`+`, `-`, `==`, etc.).
@@ -694,6 +716,61 @@ impl InferredType {
         match self {
             InferredType::Parametric(p) => Some(p),
             _ => None,
+        }
+    }
+
+    /// Witness-bag attachment whose type IS this callable's return
+    /// when invoked. `Expr(span)` for anon-sub literals (resolves
+    /// at query time via the body's last-expression witnesses);
+    /// `MethodOnClass{class, name}` for named-sub references
+    /// (`\&foo`, `\&Foo::bar` — resolves via the bag's existing
+    /// MRO + cross-file machinery, same shape used by method
+    /// dispatch). Returns `None` for opaque coderef sources.
+    ///
+    /// Survives variable rebinding: chain typing propagates the
+    /// `InferredType` through `my $cb = ...` via the bag's TC
+    /// machinery, so consumers see the same attachment whether
+    /// the callable arrives as a literal or a rebound scalar.
+    pub fn callable_return_edge(&self) -> Option<&crate::witnesses::WitnessAttachment> {
+        match self {
+            InferredType::CodeRef { return_edge } => return_edge.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// True when `self` is at least as informative as `narrowing`
+    /// — adding the narrowing's TC would not refine `self` further.
+    /// "Informativeness" is defined per-variant: same discriminant
+    /// AND, where the variant carries refinable payload, `self`'s
+    /// payload is at least as specific as `narrowing`'s.
+    ///
+    /// Used by `infer_deref_type` to suppress the
+    /// `$cb->()`-shaped narrowing TC when the operand was already
+    /// typed with a richer attachment (e.g. an anon-sub literal's
+    /// `CodeRef { return_edge: Some(_) }` should NOT be clobbered
+    /// by the deref's `CodeRef { return_edge: None }` under
+    /// latest-wins reduction).
+    ///
+    /// Conservative: returns false on different discriminants
+    /// (let the reducer-stack decide the conflict). Variants
+    /// without refinable payload (HashRef/ArrayRef/Regexp/Numeric/
+    /// String) subsume themselves trivially.
+    pub fn subsumes_narrowing(&self, narrowing: &InferredType) -> bool {
+        match (self, narrowing) {
+            // Refinable-payload variants — `self` subsumes only
+            // if its payload is at least as specific.
+            (
+                InferredType::CodeRef { return_edge: have },
+                InferredType::CodeRef { return_edge: want },
+            ) => want.is_none() || have.is_some(),
+            (InferredType::ClassName(a), InferredType::ClassName(b)) => a == b,
+            (InferredType::FirstParam { package: a }, InferredType::FirstParam { package: b }) => {
+                a == b
+            }
+            (InferredType::Parametric(a), InferredType::Parametric(b)) => a == b,
+            // Unit-shape variants subsume themselves; mismatched
+            // discriminants don't subsume.
+            (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
         }
     }
 }
@@ -5927,7 +6004,7 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
         InferredType::FirstParam { package } => format!("Object:{}", package),
         InferredType::HashRef => "HashRef".to_string(),
         InferredType::ArrayRef => "ArrayRef".to_string(),
-        InferredType::CodeRef => "CodeRef".to_string(),
+        InferredType::CodeRef { .. } => "CodeRef".to_string(),
         InferredType::Regexp => "Regexp".to_string(),
         InferredType::Numeric => "Numeric".to_string(),
         InferredType::String => "String".to_string(),
@@ -5974,7 +6051,7 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
         InferredType::FirstParam { package } => package.clone(),
         InferredType::HashRef => "HashRef".to_string(),
         InferredType::ArrayRef => "ArrayRef".to_string(),
-        InferredType::CodeRef => "CodeRef".to_string(),
+        InferredType::CodeRef { .. } => "CodeRef".to_string(),
         InferredType::Regexp => "Regexp".to_string(),
         InferredType::Numeric => "Numeric".to_string(),
         InferredType::String => "String".to_string(),

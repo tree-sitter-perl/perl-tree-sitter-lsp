@@ -588,6 +588,58 @@ sub action {
     assert_eq!(def.unwrap().start.row, 4);
 }
 
+/// **Composition: rebound coderef in helper arg slot.** Same end
+/// result as `…composes_in_file` but the callback is bound to a
+/// scalar first (`my $body = sub { … }; $app->helper(name =>
+/// $body)`). Forces the chain typer + bag's `CodeRef.return_edge`
+/// to carry through the rebinding — `infer_expression_type` only
+/// fires for literal-in-arg-slot, so the rebind path comes from
+/// `invocant_type_at_node` resolving `$body` to the bag-typed
+/// CodeRef. If `callable_return_edge` is reachable through both
+/// shapes, the helper's synthesized return Edges into the body
+/// the same way and the `name`-key resolution composes.
+#[test]
+fn mojo_helper_returning_resultset_via_rebound_coderef_composes() {
+    let src = "
+package Schema::Result::Sner;
+use base 'DBIx::Class::Core';
+__PACKAGE__->add_columns(
+    name => { data_type => 'varchar' },
+);
+
+package MyApp;
+use Mojo::Base 'Mojolicious';
+my $schema;
+my $app;
+my $body = sub {
+    my $sner = 'Schema::Result::Sner';
+    return $schema->resultset($sner);
+};
+$app->helper(sner_r => $body);
+
+package MyApp::Controller::X;
+use Mojo::Base 'Mojolicious::Controller';
+sub action {
+    my $c = shift;
+    $c->sner_r->search({ name => 'foo' });
+}
+1;
+";
+    let (fa, tree) = parse_with_tree(src);
+    let pt = point_at(src, "name => 'foo'");
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    assert!(
+        def.is_some(),
+        "rebound-coderef helper must compose the same as a literal \
+         in-arg-slot helper: `my $$body = sub {{...}}; \
+         $$app->helper(name => $$body)` should let \
+         `$$c->sner_r->search({{ name }})` resolve to Sner's column. \
+         got: {:?}",
+        def,
+    );
+    assert_eq!(def.unwrap().start.row, 4);
+}
+
 /// **Composition: same as the in-file test, split across two
 /// files.** Producer declares `Schema::Result::Sner` + the
 /// `MyApp` helper; consumer is a Mojolicious::Controller subclass
@@ -648,6 +700,77 @@ sub action {
         "Mojo helper returning Parametric ResultSet must compose \
          cross-file via the namespace bridge + edge-back-pointer + \
          enrichment. hits: {:?}",
+        refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
+    );
+}
+
+/// **Composition: cross-file `\&Foo::bar` reference as helper
+/// callback.** The helper plugin synthesizes a Method whose return
+/// edges to `MethodOnClass{class: "Producer", name: "build_rs"}`.
+/// The bag's existing edge-chase resolves it through `module_index`
+/// — no consumer-side branching on whether the named sub lives
+/// in this file or another. If column-key resolution still works,
+/// the whole `\&foo`-as-callable + cross-file return-type chase
+/// composes end-to-end.
+#[test]
+fn mojo_helper_with_named_sub_reference_composes_cross_file() {
+    let producer_src = "
+package Schema::Result::Sner;
+use base 'DBIx::Class::Core';
+__PACKAGE__->add_columns(
+    name => { data_type => 'varchar' },
+);
+
+package Producer;
+my $schema;
+sub build_rs {
+    my $sner = 'Schema::Result::Sner';
+    return $schema->resultset($sner);
+}
+
+package MyApp;
+use Mojo::Base 'Mojolicious';
+my $app;
+$app->helper(sner_r => \\&Producer::build_rs);
+1;
+";
+    let consumer_src = "
+package MyApp::Controller::X;
+use Mojo::Base 'Mojolicious::Controller';
+sub action {
+    my $c = shift;
+    $c->sner_r->search({ name => 'foo' });
+}
+1;
+";
+    let producer_path = PathBuf::from("/tmp/named_ref_producer.pm");
+    let consumer_path = PathBuf::from("/tmp/named_ref_consumer.pm");
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(producer_path.clone(), Arc::new(parse(producer_src)));
+
+    let mut consumer_fa = parse(consumer_src);
+    consumer_fa.enrich_imported_types_with_keys(Some(&idx));
+
+    let store = FileStore::new();
+    store.insert_workspace(producer_path.clone(), parse(producer_src));
+    store.insert_workspace(consumer_path.clone(), consumer_fa);
+
+    let target = TargetRef {
+        name: "name".to_string(),
+        kind: TargetKind::HashKeyOfClass("Schema::Result::Sner".to_string()),
+    };
+    let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
+    let consumer_hit = refs
+        .iter()
+        .any(|r| matches!(&r.key, FileKey::Path(p) if p == &consumer_path));
+    assert!(
+        consumer_hit,
+        "Mojo helper with `\\&Foo::bar` named-sub reference must compose \
+         cross-file: the helper's return edge points at \
+         MethodOnClass{{class: Producer, name: build_rs}}, the bag \
+         chases that through module_index to find the row class, and \
+         column-key resolution finds the call site. hits: {:?}",
         refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
     );
 }

@@ -1309,14 +1309,36 @@ impl<'a> Builder<'a> {
             _ => None,
         };
         let inferred_type = self.infer_expression_type(arg);
-        let (sub_params, sub_body_last_expr_span) =
-            if arg.kind() == "anonymous_subroutine_expression" {
-                let params = self.extract_anonymous_sub_params(arg);
-                let last = self.anonymous_sub_body_last_expr_span(arg);
-                (params, last)
-            } else {
-                (Vec::new(), None)
-            };
+        let sub_params = if arg.kind() == "anonymous_subroutine_expression" {
+            self.extract_anonymous_sub_params(arg)
+        } else {
+            Vec::new()
+        };
+        // `callable_return_edge` flows from whichever
+        // `InferredType::CodeRef { return_edge }` is reachable for
+        // this arg. Three reachability paths covered uniformly:
+        //
+        //   helper(name => sub { … })             (anon literal)
+        //   my $sub = sub { … }; helper(_, $sub)   (rebound anon)
+        //   helper(name => \&Foo::bar)             (named ref)
+        //
+        // The literal path goes through `infer_expression_type`'s
+        // syntax-closed arms (anon-sub + refgen); the rebind path
+        // goes through `invocant_type_at_node`'s `scalar` arm,
+        // which `bag_query_variable`-resolves the variable's TC.
+        // Either yields the right `CodeRef` shape; the projection
+        // extracts the attachment whatever its target shape
+        // (`Expr(span)` for anon, `MethodOnClass{...}` for refgen).
+        let callable_return_edge = inferred_type
+            .as_ref()
+            .and_then(InferredType::callable_return_edge)
+            .cloned()
+            .or_else(|| {
+                self.invocant_type_at_node(arg)
+                    .as_ref()
+                    .and_then(InferredType::callable_return_edge)
+                    .cloned()
+            });
         plugin::ArgInfo {
             text,
             string_value,
@@ -1324,7 +1346,7 @@ impl<'a> Builder<'a> {
             content_span,
             inferred_type,
             sub_params,
-            sub_body_last_expr_span,
+            callable_return_edge,
         }
     }
 
@@ -1356,6 +1378,49 @@ impl<'a> Builder<'a> {
             }
         }
         Some(node_to_span(node))
+    }
+
+    /// Single derivation site for a CodeRef-shaped value's
+    /// `return_edge`, given the source node. Both `expr_payload`
+    /// (bag-witness emission, walk-time) and
+    /// `infer_expression_type` (closed-syntax InferredType for
+    /// chain typing's RHS) call this — keeping them in sync by
+    /// construction.
+    ///
+    /// Two recognized shapes:
+    ///   - `anonymous_subroutine_expression` →
+    ///     `Expr(body_last_expr_span)`. Bag walks the body's
+    ///     last-expression witnesses at query time.
+    ///   - `refgen_expression` (`\&foo`, `\&Foo::bar`,
+    ///     `\&$const_folded`) → `MethodOnClass { class, name }`.
+    ///     Bag's MRO + `module_index` machinery resolves it,
+    ///     including cross-file. Bare names default `class` to
+    ///     the current package; qualified names split at the
+    ///     last `::`. `\&$var` with a non-const-foldable name
+    ///     returns `None`.
+    ///
+    /// Other node kinds return `None` (caller decides whether to
+    /// wrap the result in `CodeRef { return_edge: None }` for
+    /// opaque-coderef sources or fall through entirely).
+    fn coderef_return_edge_for(
+        &self,
+        node: Node<'a>,
+    ) -> Option<crate::witnesses::WitnessAttachment> {
+        match node.kind() {
+            "anonymous_subroutine_expression" => self
+                .anonymous_sub_body_last_expr_span(node)
+                .map(crate::witnesses::WitnessAttachment::Expr),
+            "refgen_expression" => {
+                let names = self.extract_names_from_refgen(node);
+                let raw = names.into_iter().next()?;
+                let (class, name) = match raw.rsplit_once("::") {
+                    Some((c, n)) => (c.to_string(), n.to_string()),
+                    None => (self.current_package.clone()?, raw),
+                };
+                Some(crate::witnesses::WitnessAttachment::MethodOnClass { class, name })
+            }
+            _ => None,
+        }
     }
 
     /// Extract params from an anonymous sub. Delegates to the builder's
@@ -1463,6 +1528,22 @@ impl<'a> Builder<'a> {
                 // getter's String depending on declaration order.
                 let arity = self.extract_call_args(node).len() as u32;
                 self.bag_query_expression(crate::witnesses::RefIdx(idx as u32), Some(arity))
+            }
+            "coderef_call_expression" => {
+                // `$cb->()` — value-type IS whatever the operand's
+                // `CodeRef.return_edge` resolves to. Resolve the
+                // operand recursively (via this same dispatch),
+                // pull its callable return target, and chase it
+                // through the bag. No witness emission, no
+                // post-walk pass — chain typing re-asks every fold
+                // iteration, so monotone refinement of the operand
+                // type lifts $r's type on the next pass for free.
+                let operand = node.named_child(0)?;
+                let target = self
+                    .invocant_type_at_node(operand)?
+                    .callable_return_edge()?
+                    .clone();
+                self.bag_query_attachment(&target)
             }
             "scalar" => {
                 let text = node.utf8_text(self.source).ok()?;
@@ -1793,25 +1874,26 @@ impl<'a> Builder<'a> {
                             span,
                         });
                     }
-                } else if let Some(target_span) = return_via_edge {
-                    // Lazy return type: emit `Symbol(sid) → Edge(
-                    // Expr(target_span))`. The writeback
-                    // (`write_back_sub_return_types`) iterates
-                    // symbols and projects whatever payload sits
-                    // on each `Symbol(sid)` to `MethodOnClass{class,
-                    // name}` for class-scoped methods, so this
-                    // single Symbol-attached emission reaches both
-                    // attachments. The bag's edge-chase resolver
-                    // follows the edge at query time — by then,
-                    // the sub body has been walked and
-                    // `Expr(target_span)` carries its type.
+                } else if let Some(target) = return_via_edge {
+                    // Lazy return type: emit `Symbol(sid) →
+                    // Edge(target)`. `target` is whichever
+                    // attachment the source callable carries
+                    // (`Expr(span)` for anon-sub bodies, or
+                    // `MethodOnClass{class, name}` for `\&foo` /
+                    // `\&Foo::bar` references — the bag's existing
+                    // edge-chase covers both, including the
+                    // cross-file `module_index` recursion for
+                    // MethodOnClass). Writeback projects this
+                    // single Symbol-attached emission to
+                    // `MethodOnClass{class, name}` for class-
+                    // scoped methods at the post-walk pass.
                     use crate::witnesses::{
                         Witness, WitnessAttachment, WitnessPayload, WitnessSource,
                     };
                     self.bag.push(Witness {
                         attachment: WitnessAttachment::Symbol(sid),
                         source: WitnessSource::Plugin(plugin_id),
-                        payload: WitnessPayload::Edge(WitnessAttachment::Expr(target_span)),
+                        payload: WitnessPayload::Edge(target),
                         span,
                     });
                 }
@@ -2084,7 +2166,18 @@ impl<'a> Builder<'a> {
                 self.visit_children(node);
             }
             "coderef_call_expression" => {
-                self.infer_deref_type(node, InferredType::CodeRef);
+                // Walk-time: just narrow the operand to CodeRef.
+                // The callable-return propagation onto this call's
+                // value-type happens at *query* time — `invocant_
+                // type_at_node`'s `coderef_call_expression` arm
+                // chases the operand's `CodeRef.return_edge`
+                // through the bag every time it's asked. Chain
+                // typing already re-asks on each worklist
+                // iteration, so monotone refinement of the
+                // operand's TC lifts the call's type for free as
+                // the lattice settles. No witness emission here;
+                // no post-walk pass.
+                self.infer_deref_type(node, InferredType::CodeRef { return_edge: None });
                 self.visit_children(node);
             }
             "array_deref_expression" => {
@@ -3687,8 +3780,9 @@ impl<'a> Builder<'a> {
                 Some(WitnessPayload::InferredType(InferredType::ArrayRef))
             }
             "quoted_regexp" => Some(WitnessPayload::InferredType(InferredType::Regexp)),
-            "anonymous_subroutine_expression" => {
-                Some(WitnessPayload::InferredType(InferredType::CodeRef))
+            "anonymous_subroutine_expression" | "refgen_expression" => {
+                let return_edge = self.coderef_return_edge_for(node);
+                Some(WitnessPayload::InferredType(InferredType::CodeRef { return_edge }))
             }
             "binary_expression"
             | "equality_expression"
@@ -3926,7 +4020,9 @@ impl<'a> Builder<'a> {
     /// type is determined by the syntax alone:
     ///
     /// - Literals (`"foo"`, `42`, `{}`, `[]`, `qr//`).
-    /// - Anonymous subs → `CodeRef`.
+    /// - Anonymous subs → `CodeRef { return_edge: Expr(body_last) }`.
+    /// - `\&foo` / `\&Foo::bar` →
+    ///   `CodeRef { return_edge: MethodOnClass{class, name} }`.
     /// - Constructor pattern `Bareword->new` → `ClassName`.
     ///
     /// Variables, function calls, name-driven method calls — all
@@ -3939,7 +4035,11 @@ impl<'a> Builder<'a> {
             "anonymous_hash_expression" => Some(InferredType::HashRef),
             "anonymous_array_expression" => Some(InferredType::ArrayRef),
             "quoted_regexp" => Some(InferredType::Regexp),
-            "anonymous_subroutine_expression" => Some(InferredType::CodeRef),
+            "anonymous_subroutine_expression" | "refgen_expression" => {
+                Some(InferredType::CodeRef {
+                    return_edge: self.coderef_return_edge_for(node),
+                })
+            }
             "method_call_expression" => {
                 self.extract_constructor_class(node).map(InferredType::ClassName)
             }
@@ -4001,9 +4101,25 @@ impl<'a> Builder<'a> {
     }
 
     /// Infer a type on the first named child (the operand) of a dereference expression.
-    fn infer_deref_type(&mut self, node: Node<'a>, inferred_type: InferredType) {
+    fn infer_deref_type(&mut self, node: Node<'a>, narrowing: InferredType) {
         if let Some(operand) = node.named_child(0) {
-            self.push_var_type_constraint(operand, node, inferred_type);
+            // The narrowing is observational — `$cb->()` says
+            // "$cb is a coderef", `${$x}` says "$x is a hashref",
+            // etc. — and doesn't reveal payload (no body span
+            // from the deref site). If the operand is ALREADY
+            // typed with a witness at least as informative as
+            // this narrowing, the TC would only ever clobber
+            // richer payload under latest-wins reduction (the
+            // motivating regression: a `my $cb = sub { ... }`
+            // literal's `CodeRef { return_edge: Some(_) }` losing
+            // its edge to the subsequent `$cb->()`'s
+            // `CodeRef { return_edge: None }`). Skip in that case.
+            if let Some(existing) = self.invocant_type_at_node(operand) {
+                if existing.subsumes_narrowing(&narrowing) {
+                    return;
+                }
+            }
+            self.push_var_type_constraint(operand, node, narrowing);
         }
     }
 
@@ -4166,7 +4282,7 @@ impl<'a> Builder<'a> {
             "function" => {
                 if let Ok(text) = outer.utf8_text(self.source) {
                     if text.starts_with("&{") {
-                        return Some((InferredType::CodeRef, outer));
+                        return Some((InferredType::CodeRef { return_edge: None }, outer));
                     }
                 }
                 None
@@ -4997,7 +5113,7 @@ impl<'a> Builder<'a> {
             "Bool" => Some(InferredType::Numeric),
             "HashRef" => Some(InferredType::HashRef),
             "ArrayRef" => Some(InferredType::ArrayRef),
-            "CodeRef" => Some(InferredType::CodeRef),
+            "CodeRef" => Some(InferredType::CodeRef { return_edge: None }),
             "RegexpRef" => Some(InferredType::Regexp),
             _ => {
                 // InstanceOf['Foo::Bar'] (Moo style) — the isa value is
@@ -6837,20 +6953,31 @@ impl<'a> Builder<'a> {
     /// so Edge chases through `Variable{...}` use scope-chain +
     /// framework-aware semantics.
     fn bag_query_expr_span(&self, span: Span) -> Option<InferredType> {
+        self.bag_query_attachment(&crate::witnesses::WitnessAttachment::Expr(span))
+    }
+
+    /// Generic registry query against any attachment shape.
+    /// `bag_query_expr_span` is a thin wrapper for the common
+    /// `Expr(span)` case; the coderef-call arm of
+    /// `invocant_type_at_node` uses this to chase a CodeRef's
+    /// `return_edge` (which can be `Expr(body_last)` for anon
+    /// literals or `MethodOnClass{class, name}` for `\&foo`).
+    fn bag_query_attachment(
+        &self,
+        att: &crate::witnesses::WitnessAttachment,
+    ) -> Option<InferredType> {
         use crate::witnesses::{
             BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
-            WitnessAttachment,
         };
-        let att = WitnessAttachment::Expr(span);
         let reg = ReducerRegistry::with_defaults();
         let ctx = BagContext {
             scopes: &self.scopes,
             package_framework: &self.package_framework,
             module_index: None,
             package_parents: &self.package_parents,
-            };
+        };
         let q = ReducerQuery {
-            attachment: &att,
+            attachment: att,
             point: None,
             framework: FrameworkFact::Plain,
             arity_hint: None,

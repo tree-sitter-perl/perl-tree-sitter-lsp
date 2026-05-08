@@ -100,6 +100,10 @@ fn on_method_call(ctx) {
         // pointer. Lets `$c->name->method` chain on a helper that
         // returns a Parametric ResultSet (DBIC), a Promise, etc.,
         // without the plugin inspecting the body at parse time.
+        // `callable_return_edge` is bag-aware — it carries the
+        // body span whether the callback is a literal in the arg
+        // slot (`helper(name => sub { ... })`) or a rebound
+        // scalar (`my $sub = sub { ... }; helper(name => $sub)`).
         out += #{
             Method: #{
                 name: name,
@@ -108,7 +112,7 @@ fn on_method_call(ctx) {
                 params: params,
                 is_method: true,
                 return_type: (),
-                return_via_edge: args[1].sub_body_last_expr_span,
+                return_via_edge: args[1].callable_return_edge,
                 doc: (),
                 on_class: "Mojolicious::Controller",
                 display: "Helper",
