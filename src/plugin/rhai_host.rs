@@ -63,7 +63,9 @@ pub fn make_engine() -> Engine {
     engine.register_fn("type_numeric", || to_dynamic(InferredType::Numeric).unwrap());
     engine.register_fn("type_hashref", || to_dynamic(InferredType::HashRef).unwrap());
     engine.register_fn("type_arrayref", || to_dynamic(InferredType::ArrayRef).unwrap());
-    engine.register_fn("type_coderef", || to_dynamic(InferredType::CodeRef).unwrap());
+    engine.register_fn("type_coderef", || {
+        to_dynamic(InferredType::CodeRef { return_edge: None }).unwrap()
+    });
     engine.register_fn("type_regexp", || to_dynamic(InferredType::Regexp).unwrap());
     engine.register_fn("type_class", |class: String| {
         to_dynamic(InferredType::ClassName(class)).unwrap_or(Dynamic::UNIT)
@@ -581,14 +583,14 @@ mod tests {
                     string_value: Some("connect".into()),
                     span: evt_span,
                     content_span: None,
-                    inferred_type: Some(InferredType::String), sub_params: vec![], sub_body_last_expr_span: None,
+                    inferred_type: Some(InferredType::String), sub_params: vec![], callable_return_edge: None,
                 },
                 ArgInfo {
                     text: "sub { ... }".into(),
                     string_value: None,
                     span: cb_span,
                     content_span: None,
-                    inferred_type: Some(InferredType::CodeRef), sub_params: vec![], sub_body_last_expr_span: None,
+                    inferred_type: Some(InferredType::CodeRef { return_edge: None }), sub_params: vec![], callable_return_edge: None,
                 },
             ],
             call_span: sp(3, 4, 3, 45),
@@ -648,14 +650,14 @@ mod tests {
                     string_value: None,
                     span: sp(0, 0, 0, 5),
                     content_span: None,
-                    inferred_type: None, sub_params: vec![], sub_body_last_expr_span: None,
+                    inferred_type: None, sub_params: vec![], callable_return_edge: None,
                 },
                 ArgInfo {
                     text: "sub {}".into(),
                     string_value: None,
                     span: sp(0, 6, 0, 12),
                     content_span: None,
-                    inferred_type: Some(InferredType::CodeRef), sub_params: vec![], sub_body_last_expr_span: None,
+                    inferred_type: Some(InferredType::CodeRef { return_edge: None }), sub_params: vec![], callable_return_edge: None,
                 },
             ],
             call_span: sp(0, 0, 0, 15),

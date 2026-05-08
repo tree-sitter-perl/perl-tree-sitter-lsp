@@ -704,7 +704,15 @@ fn test_extract_arrayref_literal() {
 fn test_extract_coderef_literal() {
     let fa = build_fa("my $cref = sub { 42 };");
     let ty = fa.inferred_type_via_bag("$cref", Point::new(0, 22));
-    assert_eq!(ty, Some(InferredType::CodeRef), "anonymous sub");
+    // Sub-literal CodeRef carries `return_edge: Some(_)` — the
+    // body's last-expression span. Survives the `my $cref = ...`
+    // binding so downstream callable-shape consumers can edge-chase
+    // into the body's type. Opaque coderef tests below use `None`.
+    assert!(
+        matches!(ty, Some(InferredType::CodeRef { return_edge: Some(_) })),
+        "anonymous sub: got {:?}",
+        ty
+    );
 }
 
 #[test]
@@ -753,7 +761,9 @@ fn test_arrow_array_deref_infers_arrayref() {
 fn test_arrow_code_deref_infers_coderef() {
     let fa = build_fa("my $x;\n$x->(1, 2);");
     let ty = fa.inferred_type_via_bag("$x", Point::new(1, 10));
-    assert_eq!(ty, Some(InferredType::CodeRef));
+    // Deref-context inference: `$x->(...)` says `$x` is a coderef
+    // but reveals nothing about its body (the binding is opaque).
+    assert_eq!(ty, Some(InferredType::CodeRef { return_edge: None }));
 }
 
 #[test]
@@ -882,7 +892,7 @@ fn test_block_hash_deref_infers_hashref() {
 fn test_block_code_deref_infers_coderef() {
     let fa = build_fa("my $z;\n&{$z}();\nmy $w;");
     let ty = fa.inferred_type_via_bag("$z", Point::new(2, 0));
-    assert_eq!(ty, Some(InferredType::CodeRef));
+    assert_eq!(ty, Some(InferredType::CodeRef { return_edge: None }));
 }
 
 #[test]
@@ -981,9 +991,13 @@ fn test_return_type_arrayref() {
 #[test]
 fn test_return_type_coderef() {
     let fa = build_fa("sub get_handler {\n    return sub { 1 };\n}");
-    assert_eq!(
-        fa.sub_return_type_at_arity("get_handler", None),
-        Some(InferredType::CodeRef)
+    let ty = fa.sub_return_type_at_arity("get_handler", None);
+    // `return sub { 1 }` is a sub-literal — the returned CodeRef
+    // carries `return_edge` to the body's last expression.
+    assert!(
+        matches!(ty, Some(InferredType::CodeRef { return_edge: Some(_) })),
+        "got {:?}",
+        ty
     );
 }
 

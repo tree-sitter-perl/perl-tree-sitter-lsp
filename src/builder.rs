@@ -1309,14 +1309,32 @@ impl<'a> Builder<'a> {
             _ => None,
         };
         let inferred_type = self.infer_expression_type(arg);
-        let (sub_params, sub_body_last_expr_span) =
-            if arg.kind() == "anonymous_subroutine_expression" {
-                let params = self.extract_anonymous_sub_params(arg);
-                let last = self.anonymous_sub_body_last_expr_span(arg);
-                (params, last)
-            } else {
-                (Vec::new(), None)
-            };
+        let sub_params = if arg.kind() == "anonymous_subroutine_expression" {
+            self.extract_anonymous_sub_params(arg)
+        } else {
+            Vec::new()
+        };
+        // `callable_return_edge` flows from whichever
+        // `InferredType::CodeRef { return_edge }` is reachable for
+        // this arg. Two reachability paths covered uniformly:
+        //
+        //   helper(name => sub { … })          (literal in arg slot)
+        //   my $sub = sub { … }; helper(name => $sub)   (rebound)
+        //
+        // The literal path goes through `infer_expression_type`'s
+        // syntax-closed `anonymous_subroutine_expression` arm; the
+        // rebind path goes through `invocant_type_at_node`'s
+        // `scalar` arm, which `bag_query_variable`-resolves the
+        // variable's TC. Either yields the right `CodeRef` shape;
+        // the projection extracts `return_edge`.
+        let callable_return_edge = inferred_type
+            .as_ref()
+            .and_then(InferredType::callable_return_edge)
+            .or_else(|| {
+                self.invocant_type_at_node(arg)
+                    .as_ref()
+                    .and_then(InferredType::callable_return_edge)
+            });
         plugin::ArgInfo {
             text,
             string_value,
@@ -1324,7 +1342,7 @@ impl<'a> Builder<'a> {
             content_span,
             inferred_type,
             sub_params,
-            sub_body_last_expr_span,
+            callable_return_edge,
         }
     }
 
@@ -2084,7 +2102,7 @@ impl<'a> Builder<'a> {
                 self.visit_children(node);
             }
             "coderef_call_expression" => {
-                self.infer_deref_type(node, InferredType::CodeRef);
+                self.infer_deref_type(node, InferredType::CodeRef { return_edge: None });
                 self.visit_children(node);
             }
             "array_deref_expression" => {
@@ -3688,7 +3706,8 @@ impl<'a> Builder<'a> {
             }
             "quoted_regexp" => Some(WitnessPayload::InferredType(InferredType::Regexp)),
             "anonymous_subroutine_expression" => {
-                Some(WitnessPayload::InferredType(InferredType::CodeRef))
+                let return_edge = self.anonymous_sub_body_last_expr_span(node);
+                Some(WitnessPayload::InferredType(InferredType::CodeRef { return_edge }))
             }
             "binary_expression"
             | "equality_expression"
@@ -3939,7 +3958,9 @@ impl<'a> Builder<'a> {
             "anonymous_hash_expression" => Some(InferredType::HashRef),
             "anonymous_array_expression" => Some(InferredType::ArrayRef),
             "quoted_regexp" => Some(InferredType::Regexp),
-            "anonymous_subroutine_expression" => Some(InferredType::CodeRef),
+            "anonymous_subroutine_expression" => Some(InferredType::CodeRef {
+                return_edge: self.anonymous_sub_body_last_expr_span(node),
+            }),
             "method_call_expression" => {
                 self.extract_constructor_class(node).map(InferredType::ClassName)
             }
@@ -4166,7 +4187,7 @@ impl<'a> Builder<'a> {
             "function" => {
                 if let Ok(text) = outer.utf8_text(self.source) {
                     if text.starts_with("&{") {
-                        return Some((InferredType::CodeRef, outer));
+                        return Some((InferredType::CodeRef { return_edge: None }, outer));
                     }
                 }
                 None
@@ -4997,7 +5018,7 @@ impl<'a> Builder<'a> {
             "Bool" => Some(InferredType::Numeric),
             "HashRef" => Some(InferredType::HashRef),
             "ArrayRef" => Some(InferredType::ArrayRef),
-            "CodeRef" => Some(InferredType::CodeRef),
+            "CodeRef" => Some(InferredType::CodeRef { return_edge: None }),
             "RegexpRef" => Some(InferredType::Regexp),
             _ => {
                 // InstanceOf['Foo::Bar'] (Moo style) — the isa value is

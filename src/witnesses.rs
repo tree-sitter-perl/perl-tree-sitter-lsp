@@ -570,7 +570,7 @@ impl WitnessReducer for FrameworkAwareTypeFold {
             return ReducedValue::Type(match r {
                 Rep::Hash => InferredType::HashRef,
                 Rep::Array => InferredType::ArrayRef,
-                Rep::Code => InferredType::CodeRef,
+                Rep::Code => InferredType::CodeRef { return_edge: None },
                 Rep::Scalar => InferredType::String,
             });
         }

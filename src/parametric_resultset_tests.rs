@@ -588,6 +588,58 @@ sub action {
     assert_eq!(def.unwrap().start.row, 4);
 }
 
+/// **Composition: rebound coderef in helper arg slot.** Same end
+/// result as `…composes_in_file` but the callback is bound to a
+/// scalar first (`my $body = sub { … }; $app->helper(name =>
+/// $body)`). Forces the chain typer + bag's `CodeRef.return_edge`
+/// to carry through the rebinding — `infer_expression_type` only
+/// fires for literal-in-arg-slot, so the rebind path comes from
+/// `invocant_type_at_node` resolving `$body` to the bag-typed
+/// CodeRef. If `callable_return_edge` is reachable through both
+/// shapes, the helper's synthesized return Edges into the body
+/// the same way and the `name`-key resolution composes.
+#[test]
+fn mojo_helper_returning_resultset_via_rebound_coderef_composes() {
+    let src = "
+package Schema::Result::Sner;
+use base 'DBIx::Class::Core';
+__PACKAGE__->add_columns(
+    name => { data_type => 'varchar' },
+);
+
+package MyApp;
+use Mojo::Base 'Mojolicious';
+my $schema;
+my $app;
+my $body = sub {
+    my $sner = 'Schema::Result::Sner';
+    return $schema->resultset($sner);
+};
+$app->helper(sner_r => $body);
+
+package MyApp::Controller::X;
+use Mojo::Base 'Mojolicious::Controller';
+sub action {
+    my $c = shift;
+    $c->sner_r->search({ name => 'foo' });
+}
+1;
+";
+    let (fa, tree) = parse_with_tree(src);
+    let pt = point_at(src, "name => 'foo'");
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    assert!(
+        def.is_some(),
+        "rebound-coderef helper must compose the same as a literal \
+         in-arg-slot helper: `my $$body = sub {{...}}; \
+         $$app->helper(name => $$body)` should let \
+         `$$c->sner_r->search({{ name }})` resolve to Sner's column. \
+         got: {:?}",
+        def,
+    );
+    assert_eq!(def.unwrap().start.row, 4);
+}
+
 /// **Composition: same as the in-file test, split across two
 /// files.** Producer declares `Schema::Result::Sner` + the
 /// `MyApp` helper; consumer is a Mojolicious::Controller subclass

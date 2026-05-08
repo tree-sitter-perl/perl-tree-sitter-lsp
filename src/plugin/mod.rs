@@ -52,21 +52,29 @@ pub struct ArgInfo {
     /// HashKeyDef so signature help can surface it at call sites.
     #[serde(default)]
     pub sub_params: Vec<EmittedParam>,
-    /// For anonymous-sub args, the span of the body's last expression
-    /// (the one that determines the sub's return value when called).
-    /// Lets plugins emit `Symbol(method_id) → Edge(Expr(span))` so
-    /// the synthesized callable's return type follows the body's
-    /// last-expression type — resolved at query time, after the
-    /// body has been walked. The natural shape for
-    /// `$app->helper(name => sub { ... })`-style synthesis where
-    /// the plugin doesn't statically know what the body returns
-    /// (it could be a Parametric resultset, a class instance, an
-    /// arbitrary value).
+    /// Span of the body's last expression for any arg whose type
+    /// resolves to `InferredType::CodeRef { return_edge: Some(_) }`.
+    /// Plugins emit `Symbol(method_id) → Edge(Expr(span))` against
+    /// it so the synthesized callable's return type follows the
+    /// body's last-expression type at query time.
     ///
-    /// `None` for non-sub args, sub args without a recognizable
-    /// last expression, or empty bodies.
+    /// Bag-aware. Two shapes resolve uniformly:
+    ///
+    /// ```perl
+    /// $app->helper(name => sub { ... });           # literal
+    /// my $sub = sub { ... };
+    /// $app->helper(name => $sub);                  # rebound
+    /// ```
+    ///
+    /// In both cases the `CodeRef`'s `return_edge` carries the
+    /// body span — populated at the literal site, propagated
+    /// through `my $sub = ...` by the bag's TC machinery, and
+    /// projected onto this field by the host. `None` for opaque
+    /// coderefs (function refs, params typed `CodeRef`, deref
+    /// shapes like `&{...}`, empty bodies) where the body span
+    /// genuinely isn't reachable.
     #[serde(default)]
-    pub sub_body_last_expr_span: Option<Span>,
+    pub callable_return_edge: Option<Span>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,8 +209,12 @@ pub enum EmitAction {
         /// walked. Lets plugins like `mojo-helpers` lift the return
         /// type from a `sub { ... }` callback's body without
         /// inspecting the body at plugin-call time (when the body
-        /// hasn't been walked yet). Set to `args[N].sub_body_last_expr_span`
-        /// for the relevant callback arg.
+        /// hasn't been walked yet). Set to `args[N].callable_return_edge`
+        /// for the relevant callback arg — works whether the arg is
+        /// a sub-literal (`helper(name => sub { ... })`) or a
+        /// rebound coderef (`my $sub = sub { ... }; helper(name =>
+        /// $sub)`). The host populates `callable_return_edge` from
+        /// the arg's bag-resolved `CodeRef` shape.
         ///
         /// Mutually exclusive with `return_type` in spirit — if both
         /// are set, `return_type` wins (the plugin overrode

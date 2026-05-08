@@ -491,8 +491,16 @@ pub enum InferredType {
     HashRef,
     /// `$x = []` or `$x = [ ... ]` — unblessed array reference.
     ArrayRef,
-    /// `$x = sub { ... }` — code reference.
-    CodeRef,
+    /// `$x = sub { ... }` — code reference. `return_edge` carries
+    /// the span of the body's last expression for sub-literal
+    /// origins, so calling it through a rebound scalar (`my $sub =
+    /// sub {...}; $app->helper(thing => $sub)`) propagates the
+    /// callable's return type the same way a literal-in-arg-slot
+    /// does. `None` for opaque coderefs (function references,
+    /// `\&foo`, params typed `CodeRef`, etc.) where we don't have
+    /// a body span to point at — the bag's edge-chase resolver
+    /// just returns nothing for those, same as before.
+    CodeRef { return_edge: Option<Span> },
     /// `$x = qr/.../` — compiled regular expression.
     Regexp,
     /// Used in numeric context (`+`, `-`, `==`, etc.).
@@ -693,6 +701,21 @@ impl InferredType {
     pub fn as_parametric(&self) -> Option<&ParametricType> {
         match self {
             InferredType::Parametric(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Span of the body's last expression for sub-literal-origin
+    /// `CodeRef` values. Survives variable rebinding because it's
+    /// carried on the `InferredType` itself: `my $sub = sub { ... }`
+    /// propagates the same `CodeRef { return_edge: Some(span) }`
+    /// through chain typing, so a downstream callable-shape consumer
+    /// (Mojo helper plugin, signature-help return formatter, etc.)
+    /// can `Edge(Expr(span))` into the body's last expression and
+    /// pick up its type at query time.
+    pub fn callable_return_edge(&self) -> Option<Span> {
+        match self {
+            InferredType::CodeRef { return_edge } => *return_edge,
             _ => None,
         }
     }
@@ -5927,7 +5950,7 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
         InferredType::FirstParam { package } => format!("Object:{}", package),
         InferredType::HashRef => "HashRef".to_string(),
         InferredType::ArrayRef => "ArrayRef".to_string(),
-        InferredType::CodeRef => "CodeRef".to_string(),
+        InferredType::CodeRef { .. } => "CodeRef".to_string(),
         InferredType::Regexp => "Regexp".to_string(),
         InferredType::Numeric => "Numeric".to_string(),
         InferredType::String => "String".to_string(),
@@ -5974,7 +5997,7 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
         InferredType::FirstParam { package } => package.clone(),
         InferredType::HashRef => "HashRef".to_string(),
         InferredType::ArrayRef => "ArrayRef".to_string(),
-        InferredType::CodeRef => "CodeRef".to_string(),
+        InferredType::CodeRef { .. } => "CodeRef".to_string(),
         InferredType::Regexp => "Regexp".to_string(),
         InferredType::Numeric => "Numeric".to_string(),
         InferredType::String => "String".to_string(),

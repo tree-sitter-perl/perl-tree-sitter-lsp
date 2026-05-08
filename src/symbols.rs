@@ -795,7 +795,7 @@ fn ref_type_snippet_completions(ty: &InferredType) -> Vec<CompletionItem> {
             sort_text: Some("000".to_string()),
             ..Default::default()
         }],
-        InferredType::CodeRef => vec![CompletionItem {
+        InferredType::CodeRef { .. } => vec![CompletionItem {
             label: "(args)".to_string(),
             kind: Some(CompletionItemKind::SNIPPET),
             detail: Some("code dereference".to_string()),
