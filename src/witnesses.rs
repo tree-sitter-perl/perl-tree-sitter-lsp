@@ -188,10 +188,14 @@ pub enum ReturnExpr {
     /// `method_arg_owner`) handle the value-side projection
     /// downstream.
     Operator(ParametricOp),
-    /// Union over arg-shape — subsumes `FluentArityDispatch`'s
-    /// `ArityReturn` observations. Each branch is `(guard, expr)`;
-    /// the first guard matching `q.arity_hint` wins. Order matters
-    /// — narrow guards (`Empty`, `Exact`) before broad ones (`Any`).
+    /// Union over arg-shape. Each branch is `(guard, expr)`; for a
+    /// concrete `arity_hint` the first matching guard wins. For a
+    /// hint-less introspection query (no specific call site) the
+    /// `Any` branch is preferred, falling back to `Empty` so a Mojo
+    /// `has`-style getter+writer pair surfaces its primary
+    /// (`Empty`) arm. Branch order matters when the hint is
+    /// concrete — narrow guards (`Empty`, `Exact`, `AtLeast`)
+    /// before `Any`.
     UnionOnArgs { branches: Vec<(ArgGuard, ReturnExpr)> },
 }
 
@@ -224,6 +228,18 @@ pub enum ArgGuard {
 }
 
 impl ArgGuard {
+    /// Match against the call's arity hint. Strict semantics: a
+    /// guard fires only when the hint *positively matches* it. The
+    /// `Any` branch is the only catch-all, so a `None` hint never
+    /// silently fires `Empty` / `Exact` / `AtLeast` arms.
+    ///
+    /// `None` callers are introspection queries that don't pin a
+    /// call-site arity. Sym-introspection entry points
+    /// (`symbol_return_type_via_bag`) compensate by defaulting the
+    /// hint from the sym's own `params` count — a writer sym
+    /// (params=1) gets `arity_hint = Some(1)` and matches its
+    /// `AtLeast(1)` arm; a getter sym (params=0) gets
+    /// `arity_hint = Some(0)` and matches `Empty`.
     pub fn matches(self, arity_hint: Option<u32>) -> bool {
         match (self, arity_hint) {
             (ArgGuard::Empty, Some(0)) => true,
@@ -262,10 +278,6 @@ pub enum TypeObservation {
     RegexpUse,
     /// `bless [], $c` pins the representation axis to Array.
     BlessTarget(Rep),
-    /// A single arity-dispatch fact: for arity `arg_count`, the sub
-    /// returns `return_type`. `None` for `arg_count` means the
-    /// fall-through / default branch. Attached to a `Symbol(sub_id)`.
-    ArityReturn { arg_count: Option<u32>, return_type: InferredType },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -621,9 +633,6 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                     TypeObservation::NumericUse => num = true,
                     TypeObservation::StringUse => str_ = true,
                     TypeObservation::RegexpUse => re = true,
-                    TypeObservation::ArityReturn { .. } => {
-                        // Arity dispatch is a separate reducer.
-                    }
                 },
                 _ => {}
             }
@@ -812,14 +821,6 @@ impl WitnessReducer for SymbolReturnArmFold {
     }
 }
 
-// FluentArityDispatch retired — the symbol-declarative
-// `WitnessPayload::ReturnExpr(UnionOnArgs)` shape (claimed by
-// `ReturnExprReducer`) carries the same per-arity facts. The
-// `TypeObservation::ArityReturn` variant is no longer pushed
-// anywhere in the bag (build-time arity classification still uses
-// `ArityBranch` as a walk-time intermediate before being projected
-// into UnionOnArgs branches).
-
 // Sub-return delegation chains (`return other()`,
 // `shift->method(...)`) are represented as `Edge(Symbol(...))` /
 // `Edge(MethodOnClass{...})` payloads. Registry materialization
@@ -897,66 +898,27 @@ impl WitnessReducer for SubReturnReducer {
     }
 
     fn claims(&self, w: &Witness) -> bool {
-        // Excludes `branch_arm`-source witnesses — those are
-        // `SymbolReturnArmFold`'s, and its agreement / disagreement
-        // result must propagate (single-arm ambiguity or disagreeing
-        // arms yield None on purpose; this reducer mustn't paper
-        // over that with a latest-wins pick on the same materialized
-        // arm types). Without the filter, materialize's synthetic
-        // `Symbol(_) + InferredType` witnesses (one per arm, with
-        // `branch_arm` source preserved) would all be claimed here
-        // too, and the disagreement signal disappears.
+        // `Symbol(_) + InferredType` only, latest-wins, excluding
+        // `branch_arm`-source witnesses — those are
+        // `SymbolReturnArmFold`'s and the agreement / disagreement
+        // signal must propagate (single-arm ambiguity or
+        // disagreeing arms yield None on purpose; this reducer must
+        // not paper over that with a latest-wins pick on
+        // materialized arm types).
         //
-        // Claims `ArityReturn` observations as a *witness* of arity
-        // dispatch (so `reduce` can detect "this Symbol participates
-        // in arity dispatch" without bag access) — payload is
-        // ignored at reduce time, the existence of any such witness
-        // is the gate.
-        if !matches!(w.attachment, WitnessAttachment::Symbol(_)) {
-            return false;
-        }
-        let payload_ok = match &w.payload {
-            WitnessPayload::InferredType(_) => true,
-            WitnessPayload::Observation(TypeObservation::ArityReturn { .. }) => true,
-            _ => false,
-        };
-        if !payload_ok {
-            return false;
-        }
-        !matches!(&w.source, WitnessSource::Builder(s) if s == "branch_arm")
+        // Symbols that participate in arity dispatch publish
+        // `WitnessPayload::ReturnExpr(UnionOnArgs)` — claimed by
+        // `ReturnExprReducer` (registered earlier), which runs the
+        // arity-arm match before this reducer ever sees the
+        // attachment. With ReturnExpr in place there's no need to
+        // gate this reducer on arity-hint presence; the unions
+        // either match or fall through cleanly.
+        matches!(w.attachment, WitnessAttachment::Symbol(_))
+            && matches!(w.payload, WitnessPayload::InferredType(_))
+            && !matches!(&w.source, WitnessSource::Builder(s) if s == "branch_arm")
     }
 
-    fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
-        // Two-axis decision:
-        //
-        // 1. If `arity_hint` is set AND this Symbol participates in
-        //    arity dispatch (any `ArityReturn` observation in the
-        //    claimed witness set), `FluentArityDispatch` already had
-        //    its chance to match an arm and didn't — falling through
-        //    to a plain stored-return read on the wrong sym would
-        //    silently wrong-answer Mojo::Base writer-vs-getter
-        //    (`level(1)` on the getter sym would surface String
-        //    instead of routing to the writer's `MethodOnClass{...}`
-        //    arm). Return None so the caller routes through
-        //    `MethodOnClass{class, name}` for cross-symbol dispatch.
-        //
-        // 2. If no `ArityReturn` observations exist on this Symbol
-        //    (anon subs without arity arms, plain named subs called
-        //    via coderef), the arity_hint is just call-site context
-        //    that no arm consumes — surface the stored InferredType
-        //    answer. This restores `my $cb = sub { [1,2] };
-        //    $cb->()` typing through the chain typer's coderef arm,
-        //    which threads `arity_hint = call_args.len()` for
-        //    uniformity with method-shaped chases.
-        let has_arity_obs = ws.iter().any(|w| {
-            matches!(
-                &w.payload,
-                WitnessPayload::Observation(TypeObservation::ArityReturn { .. })
-            )
-        });
-        if q.arity_hint.is_some() && has_arity_obs {
-            return ReducedValue::None;
-        }
+    fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
         for w in ws.iter().rev() {
             if let WitnessPayload::InferredType(t) = &w.payload {
                 return ReducedValue::Type(t.clone());
@@ -973,10 +935,12 @@ impl WitnessReducer for SubReturnReducer {
 // Pushed by `write_back_sub_return_types` for the primary symbol of
 // each `(class, method)` pair: that's the "default" return type when
 // the caller doesn't constrain by arity.
-// `FluentArityDispatch` runs first and handles per-arity dispatch
-// from `ArityReturn` observations; this reducer only fires when no
-// arity-specific fact answers (no arity hint, or no observation
-// matches the hint) — and produces the primary's stored return.
+//
+// `ReturnExprReducer` runs first and handles arity-aware /
+// receiver-relative dispatch when a `WitnessPayload::ReturnExpr`
+// witness exists on the same attachment. This reducer only fires
+// when no symbol-declarative ReturnExpr answers — and produces the
+// primary's stored return.
 //
 // Latest-wins: the worklist clears `method_on_class` source witnesses
 // each iteration and re-pushes from current state. The last witness
@@ -1011,7 +975,8 @@ impl WitnessReducer for MethodOnClassReducer {
 // in the bag, it short-circuits the symbol-return fold — overrides
 // dominate inference. Registered first in `with_defaults()` so its
 // short-circuit runs before any inferred fold (BranchArmFold,
-// FluentArityDispatch) gets a chance to claim Symbol attachments.
+// ReturnExprReducer, SubReturnReducer) gets a chance to claim
+// Symbol attachments.
 //
 // Why a separate reducer rather than a branch in
 // FrameworkAwareTypeFold: keeping the priority short-circuit a
@@ -1067,9 +1032,8 @@ impl WitnessReducer for PluginOverrideReducer {
 // placeholders, dispatches `UnionOnArgs` branches against
 // `q.arity_hint`, and evaluates `Operator(RowOf(_))` by recursing
 // into the sub-expression and re-wrapping into `ParametricType`.
-// Registered before `FluentArityDispatch`, `MethodOnClassReducer`,
-// and `SubReturnReducer` so symbol-declarative answers dominate
-// per-arity observations and primary-sym writeback.
+// Registered before `MethodOnClassReducer` and `SubReturnReducer`
+// so symbol-declarative answers dominate primary-sym writeback.
 //
 // **No side-effects, no special-cases.** Per CLAUDE.md #10, the
 // reducer doesn't peek at method names, classes, or attachment
@@ -1151,8 +1115,31 @@ fn eval_return_expr(re: &ReturnExpr, q: &ReducerQuery) -> Option<InferredType> {
             }
         },
         ReturnExpr::UnionOnArgs { branches } => {
+            // First-match wins when the hint is concrete.
+            if q.arity_hint.is_some() {
+                for (guard, sub) in branches {
+                    if guard.matches(q.arity_hint) {
+                        return eval_return_expr(sub, q);
+                    }
+                }
+                return None;
+            }
+            // Hint-less query (sym introspection / class-keyed
+            // lookup with no specific call site): prefer the Any
+            // arm — it's the union's catch-all, semantically
+            // closest to "default branch." If no Any arm exists,
+            // fall back to the Empty arm (the typical "primary"
+            // for Mojo `has` getter+writer pairs and DBIC
+            // accessors). This keeps the per-call-site dispatch
+            // strict (no Empty matching None directly) while still
+            // answering legitimate introspection queries.
             for (guard, sub) in branches {
-                if guard.matches(q.arity_hint) {
+                if matches!(guard, ArgGuard::Any) {
+                    return eval_return_expr(sub, q);
+                }
+            }
+            for (guard, sub) in branches {
+                if matches!(guard, ArgGuard::Empty) {
                     return eval_return_expr(sub, q);
                 }
             }
@@ -1264,18 +1251,12 @@ impl ReducerRegistry {
         r.register(Box::new(SymbolReturnArmFold));
         r.register(Box::new(BranchArmFold));
         r.register(Box::new(FrameworkAwareTypeFold));
-        // FluentArityDispatch retired — arity dispatch lives on
-        // `WitnessPayload::ReturnExpr(UnionOnArgs)` now, claimed by
-        // `ReturnExprReducer` (registered second). The `ArityReturn`
-        // observation variant is unused at the reducer level but
-        // kept as a walk-time intermediate value (`ReturnInfo.
-        // arity_branch`) until phase 5 cleanup retires it too.
         r.register(Box::new(ExprReturn));
-        // MethodOnClass primary-fallback runs after the arity-aware
-        // dispatch (FluentArityDispatch claims MethodOnClass +
-        // ArityReturn) so per-arity facts win when the caller has an
-        // arity hint that matches; only when nothing more precise
-        // answers does the primary's plain `InferredType` surface.
+        // MethodOnClass primary-fallback runs after the
+        // symbol-declarative `ReturnExprReducer` so per-arity
+        // declarations win when one matches; only when no
+        // ReturnExpr answers does the primary's plain
+        // `InferredType` surface.
         r.register(Box::new(MethodOnClassReducer));
         // Last — fallback for "this Symbol's stored return type"
         // queries that none of the more-precise reducers claimed.
@@ -1682,8 +1663,9 @@ pub fn query_sub_return_type(
     context: Option<&BagContext>,
 ) -> Option<InferredType> {
     let reg = ReducerRegistry::with_defaults();
-    // Local-symbol bag query first — picks up arity-discriminated
-    // dispatch via FluentArityDispatch on the matching sym.
+    // Local-symbol bag query first — `ReturnExprReducer` picks up
+    // any arity-discriminated `UnionOnArgs` declaration on the
+    // matching sym.
     let local_sym = symbols.iter().find(|s| {
         s.name == sub_name
             && matches!(

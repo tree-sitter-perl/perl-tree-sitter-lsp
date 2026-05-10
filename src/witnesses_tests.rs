@@ -578,8 +578,8 @@ fn arity_zero_returns_string_default_returns_self() {
         ReducedValue::Type(receiver.clone())
     );
 
-    // Arity unknown — Any matches first (ArgGuard::Any matches any
-    // hint including None), so the answer is Receiver.
+    // Arity unknown — Empty doesn't match None (strict Some(0)
+    // only), Any does. Returns Receiver substitution.
     let qn = ReducerQuery {
         attachment: &att,
         point: None,
@@ -823,7 +823,8 @@ fn return_expr_union_on_args_dispatches_by_arity() {
     assert_eq!(
         reg.query(&bag, &q_no_hint),
         ReducedValue::Type(InferredType::ClassName("Foo".into())),
-        "no hint matches Any (the catch-all)"
+        "no hint falls through Empty (strict Some(0) only) and \
+         hits Any => Receiver — the catch-all"
     );
 }
 

@@ -642,39 +642,6 @@ impl ParametricType {
         }
     }
 
-    /// Return-type projection for `recv->method(...)`. `Some(p)`
-    /// means the call site emits a witness of `Parametric(p)` —
-    /// the flavor declares that this method projects through
-    /// some operator. `None` means default (fall through to
-    /// standard `MethodOnClass` resolution).
-    ///
-    /// ResultSet projects through `RowOf<self>` for methods that
-    /// return a single row (find / first / single / next /
-    /// create / find_or_new / find_or_create / update_or_create
-    /// / new_result). search / search_rs preserve the Parametric
-    /// (no projection — they return the same ResultSet shape);
-    /// the absence of an entry here means "preserve via the
-    /// standard return-type resolution."  count / exists return
-    /// Numeric and aren't represented as projections — they fall
-    /// through to whatever cross-file lookup of the method's
-    /// return type yields.
-    ///
-    /// Per CLAUDE.md #10: each flavor's projections live in its
-    /// own match arm. New flavors add their own; consumers
-    /// dispatch generically.
-    pub fn return_projection(&self, method: &str) -> Option<ParametricType> {
-        match self {
-            ParametricType::ResultSet { .. } => match method {
-                "find" | "first" | "single" | "next" | "create"
-                | "find_or_new" | "find_or_create" | "update_or_create"
-                | "new_result" => Some(ParametricType::RowOf(Box::new(
-                    InferredType::Parametric(self.clone()),
-                ))),
-                _ => None,
-            },
-            ParametricType::RowOf(_) => None,
-        }
-    }
 
     /// Symbol-declarative projection table — list of `(method_name,
     /// ReturnExpr)` pairs the flavor publishes on
@@ -2436,12 +2403,38 @@ impl FileAnalysis {
             module_index: None,
             package_parents: &self.package_parents,
             };
+        // Default the arity hint from the sym's own param count
+        // when the caller didn't supply one. Symbol introspection
+        // is naturally "what does THIS sym return," and the sym's
+        // params count IS its native arity — Mojo writer (params=1)
+        // answers its `(AtLeast(1), Receiver)` arm, getter (params=0)
+        // answers its `(Empty, Concrete(_))` arm. Without this, a
+        // writer's per-Symbol UnionOnArgs would be unmatched at a
+        // None hint (AtLeast(1) doesn't match None) and the query
+        // would silently return None.
+        //
+        // Default receiver = `ClassName(class)` so the writer's
+        // `Receiver` placeholder evaluates to the natural fluent
+        // answer at sym-introspection time.
+        let resolved_arity = arg_count.map(|n| n as u32).or_else(|| {
+            self.symbols
+                .get(sym_id.0 as usize)
+                .and_then(|s| match &s.detail {
+                    SymbolDetail::Sub { params, .. } => Some(params.len() as u32),
+                    _ => None,
+                })
+        });
+        let receiver = self
+            .symbols
+            .get(sym_id.0 as usize)
+            .and_then(|s| s.package.clone())
+            .map(InferredType::ClassName);
         let q = ReducerQuery {
             attachment: &att,
             point: None,
             framework: FrameworkFact::Plain,
-            arity_hint: arg_count.map(|n| n as u32),
-            receiver: None,
+            arity_hint: resolved_arity,
+            receiver,
             context: Some(&ctx),
         };
         match reg.query(&self.witnesses, &q) {
@@ -2457,9 +2450,8 @@ impl FileAnalysis {
     /// `package_parents` (carried in `BagContext`); cross-file
     /// classes resolve via `module_index`. No procedural ancestor
     /// walk; no procedural overload picking — the registry's
-    /// `FluentArityDispatch` reducer claims `MethodOnClass +
-    /// ArityReturn` and the structural-walk code in `query_rec`
-    /// handles MRO.
+    /// `ReturnExprReducer` claims `MethodOnClass + ReturnExpr` and
+    /// the structural-walk code in `query_rec` handles MRO.
     pub(crate) fn find_method_return_type(
         &self,
         class_name: &str,
@@ -4032,7 +4024,7 @@ impl FileAnalysis {
         }
 
         // Variable invocant — bag query handles every typed shape
-        // (TC, FrameworkAware, BranchArm, ArityReturn, cross-file
+        // (TC, FrameworkAware, BranchArm, ReturnExpr, cross-file
         // Variable witnesses pushed by enrichment).
         let first = invocant.as_bytes()[0];
         if first == b'$' || first == b'@' || first == b'%' {
