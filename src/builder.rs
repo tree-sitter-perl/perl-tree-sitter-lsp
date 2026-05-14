@@ -722,7 +722,7 @@ fn raw_mid_op(node: tree_sitter::Node, source: &[u8]) -> String {
 /// which sub the return belongs to, where it is, the arity bucket it
 /// gates on (for `emit_arity_return_witnesses`), and the body span
 /// (the `Expr(span)` key both `emit_arity_return_witnesses` and
-/// `fold_per_sub_return_arms` query inline via `bag_query_expr_span`).
+/// `seed_return_types_from_bag` query inline via `bag_query_expr_span`).
 struct ReturnInfo {
     /// The scope (Sub/Method) this return belongs to.
     scope: ScopeId,
@@ -885,7 +885,7 @@ struct Builder<'a> {
     return_infos: Vec<ReturnInfo>,
     /// For each Sub/Method scope, the body span of the last
     /// top-level expression statement. Used as the implicit-return
-    /// query key — `fold_per_sub_return_arms` reads `Expr(span)` via
+    /// query key — `seed_return_types_from_bag` reads `Expr(span)` via
     /// `bag_query_expr_span` for scopes without an explicit `return`.
     /// Replaces the old `last_expr_type: HashMap<ScopeId,
     /// Option<InferredType>>` dual-store: types now ride the bag,
@@ -2721,7 +2721,7 @@ impl<'a> Builder<'a> {
     /// arg literal). Ensures a Symbol of kind `Sub` exists with the
     /// conventional name `(anon)` so the per-scope arity / return
     /// machinery (`emit_arity_return_witnesses`,
-    /// `fold_per_sub_return_arms`, plugin-priority writeback) finds
+    /// `seed_return_types_from_bag`, plugin-priority writeback) finds
     /// the sub uniformly with named subs — no special-case for "this
     /// is an anonymous body." The Symbol's `span` matches the scope's
     /// span exactly so `find_sub_symbol_for_scope` resolves by
@@ -7257,8 +7257,7 @@ impl<'a> Builder<'a> {
     fn resolve_return_types(&mut self) {
         self.emit_arity_return_witnesses();
         self.emit_method_call_return_edges();
-        let (mut return_types, mut return_provenance) = self.fold_per_sub_return_arms();
-        self.seed_plugin_overrides_into_return_types(&mut return_types, &mut return_provenance);
+        let (return_types, return_provenance) = self.seed_return_types_from_bag();
         self.write_back_sub_return_types(&return_provenance);
         self.propagate_call_bindings_to_constraints(&return_types);
         self.fixup_call_bound_hash_key_owners(&return_types);
@@ -7314,7 +7313,7 @@ impl<'a> Builder<'a> {
 
     /// Single-attachment registry query for `Expr(span)`. Used by
     /// `emit_arity_return_witnesses` (per-RI) and the implicit-last-
-    /// expression fallback in `fold_per_sub_return_arms`. Threads the
+    /// expression fallback in `seed_return_types_from_bag`. Threads the
     /// file's scope topology + per-package framework as a `BagContext`
     /// so Edge chases through `Variable{...}` use scope-chain +
     /// framework-aware semantics.
@@ -7537,7 +7536,7 @@ impl<'a> Builder<'a> {
             // Pass 2: Default arm(s). Fold to a single Any branch
             // — multiple Default arms with disagreeing types lose
             // their disagreement signal here; the per-arm fold
-            // runs separately (`fold_per_sub_return_arms`) and is
+            // runs separately (`seed_return_types_from_bag`) and is
             // what surfaces ambiguity in the writeback.
             let mut default_t: Option<InferredType> = None;
             for (branch, body_span) in arms {
@@ -7585,14 +7584,27 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Step 3: fold each Sub/Method scope's return arms into a single
-    /// type via `resolve_return_type` (1+ arms agree → `Some(t)`,
-    /// disagreement → `None`). Falls back to `last_expr_span`'s
-    /// Expr(span) query for subs without explicit `return`s — Perl's
-    /// last statement is the implicit return. Provenance is recorded
-    /// as `ReducerFold { reducer: "return_arms" }` so `--dump-package`
-    /// can answer "why does this return X?".
-    fn fold_per_sub_return_arms(
+    /// The seed pass. For every Sub/Method scope, query
+    /// `Symbol(sub_id)` through the registry; the answering reducer's
+    /// priority order (Plugin first, then ReturnExpr / MethodOnClass /
+    /// SymbolReturnArm / SubReturn) gives the correct precedence for
+    /// free. Falls back to `last_expr_span`'s `Expr(span)` query for
+    /// subs without explicit `return`s — Perl's last statement is the
+    /// implicit return.
+    ///
+    /// Provenance: records `ReducerFold { reducer: "return_arms" }`
+    /// unless `self.type_provenance` already carries a stronger entry
+    /// (`PluginOverride`, `Delegation`) — those are written upstream
+    /// (`apply_type_overrides`, synthesis sites) and must survive the
+    /// seed pass, otherwise `--dump-package` would lose the
+    /// "why did this come from a plugin?" story.
+    ///
+    /// Replaces the prior split (`fold_per_sub_return_arms` for
+    /// reducer-fold answers, `seed_plugin_overrides_into_return_types`
+    /// for plugin priority): the registry's reducer order is
+    /// authoritative, so the second pass was structurally duplicating
+    /// what `PluginOverrideReducer` already does on the first.
+    fn seed_return_types_from_bag(
         &mut self,
     ) -> (
         std::collections::HashMap<String, InferredType>,
@@ -7699,74 +7711,31 @@ impl<'a> Builder<'a> {
         for (sid, sub_name, rt, evidence) in updates {
             self.resolved_returns.insert(sid, rt.clone());
             return_types.insert(sub_name.clone(), rt);
-            return_provenance.insert(
-                sub_name,
-                crate::file_analysis::TypeProvenance::ReducerFold {
-                    reducer: "return_arms".into(),
-                    evidence,
-                },
+            // Don't overwrite a stronger upstream provenance —
+            // `PluginOverride` (from `apply_type_overrides`) and
+            // `Delegation` (from synthesis sites) record *why* a
+            // type came in by a path the reducer fold doesn't see.
+            // The bag's answer is the same value, but the
+            // provenance story would lose its source if we
+            // clobbered it with `ReducerFold { return_arms }`.
+            let preserve = matches!(
+                self.type_provenance.get(&sid),
+                Some(
+                    crate::file_analysis::TypeProvenance::PluginOverride { .. }
+                    | crate::file_analysis::TypeProvenance::Delegation { .. }
+                )
             );
+            if !preserve {
+                return_provenance.insert(
+                    sub_name,
+                    crate::file_analysis::TypeProvenance::ReducerFold {
+                        reducer: "return_arms".into(),
+                        evidence,
+                    },
+                );
+            }
         }
         (return_types, return_provenance)
-    }
-
-    /// Step 4: seed Plugin overrides into `return_types` before
-    /// delegation / self_method_tail propagation. Routes through
-    /// `PluginOverrideReducer`'s own `claims` + `reduce` so the
-    /// predicate stays in lock-step with the registry — if the reducer
-    /// gains a tie-breaker or attachment-shape filter, the seed pass
-    /// inherits it for free instead of silently disagreeing.
-    fn seed_plugin_overrides_into_return_types(
-        &mut self,
-        return_types: &mut std::collections::HashMap<String, InferredType>,
-        return_provenance: &mut std::collections::HashMap<
-            String,
-            crate::file_analysis::TypeProvenance,
-        >,
-    ) {
-        use crate::witnesses::{
-            FrameworkFact, PluginOverrideReducer, ReducedValue, ReducerQuery, Witness,
-            WitnessAttachment, WitnessReducer,
-        };
-
-        let plugin_reducer = PluginOverrideReducer;
-        // Two-step: collect (sym_id, name, rt) without holding a
-        // borrow on self.symbols, then write to resolved_returns
-        // and return_types in a separate pass. Same pattern as
-        // `fold_per_sub_return_arms` to avoid the &self / &mut self
-        // borrow conflict.
-        let mut overrides: Vec<(SymbolId, String, InferredType)> = Vec::new();
-        for sym in &self.symbols {
-            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                continue;
-            }
-            let att = WitnessAttachment::Symbol(sym.id);
-            let claimed: Vec<&Witness> = self
-                .bag
-                .for_attachment(&att)
-                .into_iter()
-                .filter(|w| plugin_reducer.claims(w))
-                .collect();
-            if claimed.is_empty() {
-                continue;
-            }
-            let q = ReducerQuery {
-                attachment: &att,
-                point: None,
-                framework: FrameworkFact::Plain,
-                arity_hint: None,
-                receiver: None,
-                context: None,
-            };
-            if let ReducedValue::Type(t) = plugin_reducer.reduce(&claimed, &q) {
-                overrides.push((sym.id, sym.name.clone(), t));
-            }
-        }
-        for (sid, name, t) in overrides {
-            self.resolved_returns.insert(sid, t.clone());
-            return_types.insert(name.clone(), t);
-            return_provenance.remove(&name);
-        }
     }
 
     /// Step 7: writeback. Iterate `resolved_returns` and publish each
@@ -7792,12 +7761,11 @@ impl<'a> Builder<'a> {
     /// local mirror needed.
     ///
     /// `return_self_method` is set for subs whose return couldn't
-    /// be collapsed in-file. Plugin overrides flow through
-    /// `return_types` via the bag-priority seeding step, with
-    /// `return_provenance` cleared so we don't clobber the existing
-    /// `PluginOverride` entry written by `apply_type_overrides`. No
-    /// special-case skip needed — overrides win because they're
-    /// higher-priority bag witnesses.
+    /// be collapsed in-file. Plugin overrides surface through the
+    /// seed pass's registry query (PluginOverrideReducer is first);
+    /// `seed_return_types_from_bag` preserves the existing
+    /// `PluginOverride` entry in `self.type_provenance` so the
+    /// plugin source story survives `--dump-package`.
     ///
     /// Idempotent across re-runs: `bag.remove_by_source_tag("local_return")`
     /// (and `"plugin_bridge"` / `"inheritance"`) at the start of every
@@ -7818,23 +7786,16 @@ impl<'a> Builder<'a> {
         self.bag.remove_by_source_tag("plugin_bridge");
         self.bag.remove_by_source_tag("inheritance");
 
-        // First pass: update `resolved_returns` from worklist's
-        // per-name folds and (when no fold answer exists) `return_self_method`
-        // from the in-flight self-method-tail bookkeeping. The map is
-        // the post-field source of truth for "what does this sym
-        // return?" — walk-time synthesis seeds it directly,
-        // worklist-resolved folds update it here.
         // `resolved_returns` is the post-D1 source of truth for
         // per-sym return types. Walk-time synthesis writes to it
-        // directly (`record_framework_accessor_witness`,
-        // plugin emit handlers). Worklist's
-        // `fold_per_sub_return_arms` and
-        // `seed_plugin_overrides_into_return_types` write per-sym
-        // here too — the legacy `return_types: HashMap<String, _>`
-        // is kept around only for downstream consumers that look up
-        // by name (call-binding propagation, hash-key fixup) and is
-        // intentionally last-write-wins on name collisions; the bag
-        // path keys by `sym_id` and stays correct.
+        // directly (`record_framework_accessor_witness`, plugin emit
+        // handlers); the worklist's `seed_return_types_from_bag`
+        // refreshes it from the registry on every iteration. The
+        // legacy `return_types: HashMap<String, _>` survives only
+        // for downstream consumers that look up by name (call-binding
+        // propagation, hash-key fixup) and is intentionally
+        // last-write-wins on name collisions — the bag path keys by
+        // `sym_id` and stays correct.
         for sym in &self.symbols {
             if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                 continue;
