@@ -1303,7 +1303,7 @@ impl<'a> Builder<'a> {
     /// arg is an anonymous sub, also extracts its param list so plugins
     /// registering handlers (`->on('ready', sub ($s, $m) {})`) can preserve
     /// the handler signature for later sig-help lookup.
-    fn arg_info_for(&self, arg: Node<'a>) -> plugin::ArgInfo {
+    fn arg_info_for(&mut self, arg: Node<'a>) -> plugin::ArgInfo {
         let text = arg.utf8_text(self.source).unwrap_or("").to_string();
         let mut content_span: Option<Span> = None;
         let string_value = match arg.kind() {
@@ -1335,7 +1335,8 @@ impl<'a> Builder<'a> {
             }
             _ => None,
         };
-        let inferred_type = self.infer_expression_type(arg);
+        self.emit_expr_witness(arg);
+        let inferred_type = self.bag_query_expr_span(node_to_span(arg));
         let sub_params = if arg.kind() == "anonymous_subroutine_expression" {
             self.extract_anonymous_sub_params(arg)
         } else {
@@ -1349,13 +1350,13 @@ impl<'a> Builder<'a> {
         //   my $sub = sub { … }; helper(_, $sub)   (rebound anon)
         //   helper(name => \&Foo::bar)             (named ref)
         //
-        // The literal path goes through `infer_expression_type`'s
-        // syntax-closed arms (anon-sub + refgen); the rebind path
-        // goes through `invocant_type_at_node`'s `scalar` arm,
-        // which `bag_query_variable`-resolves the variable's TC.
-        // Either yields the right `CodeRef` shape; the projection
-        // extracts the attachment whatever its target shape
-        // (`Expr(span)` for anon, `MethodOnClass{...}` for refgen).
+        // The literal paths (anon-sub + refgen) flow through
+        // `emit_expr_witness`'s closed-syntax arms in `expr_payload`;
+        // the rebind path goes through `invocant_type_at_node`'s
+        // `scalar` arm, which `bag_query_variable`-resolves the
+        // variable's TC. Either yields the right `CodeRef` shape;
+        // the projection extracts the attachment whatever its target
+        // shape (`Expr(span)` for anon, `MethodOnClass{...}` for refgen).
         let callable_return_edge = inferred_type
             .as_ref()
             .and_then(InferredType::callable_return_edge)
@@ -1408,11 +1409,10 @@ impl<'a> Builder<'a> {
     }
 
     /// Single derivation site for a CodeRef-shaped value's
-    /// `return_edge`, given the source node. Both `expr_payload`
-    /// (bag-witness emission, walk-time) and
-    /// `infer_expression_type` (closed-syntax InferredType for
-    /// chain typing's RHS) call this — keeping them in sync by
-    /// construction.
+    /// `return_edge`, given the source node. Used by `expr_payload`
+    /// when emitting the bag witness for `anonymous_subroutine_expression`
+    /// / `refgen_expression` — the bag is canonical and there's no
+    /// second consumer that bypasses it.
     ///
     /// Two recognized shapes:
     ///   - `anonymous_subroutine_expression` → `Symbol(sub_id)`,
@@ -1804,7 +1804,7 @@ impl<'a> Builder<'a> {
     /// Build the read-only snapshot plugins see, minus the call-shape bits
     /// that only method-call vs function-call callers know.
     fn base_call_context(
-        &self,
+        &mut self,
         args_raw: Vec<Node<'a>>,
         call_span: Span,
         selection_span: Span,
@@ -3792,9 +3792,15 @@ impl<'a> Builder<'a> {
                 // attachment without a per-shape dispatch in the
                 // chase site.
                 self.visit_node(right);
-                // Try constructor class first, then literal types, then expression type
-                let inferred = self.infer_expression_type(right)
-                    .or_else(|| self.infer_expression_result_type(right));
+                // Push the RHS's Expr(span) witness so the bag is
+                // canonical for this expression, then query for the
+                // resolved type. `emit_expr_witness` covers every
+                // shape via `expr_payload` — literals, anon-subs,
+                // constructor patterns, binary ops, scalars, calls,
+                // ternaries; Edge payloads resolve through the
+                // registry's materialization.
+                self.emit_expr_witness(right);
+                let inferred = self.bag_query_expr_span(node_to_span(right));
                 if let Some(it) = inferred {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
                         self.push_type_constraint(TypeConstraint {
@@ -3804,8 +3810,17 @@ impl<'a> Builder<'a> {
                             inferred_type: it,
                         });
                     }
-                } else if let Some(func_name) = self.extract_call_name(right) {
-                    // RHS is a function call — record binding for return-type post-pass
+                }
+                // Always record call/method-call bindings (independent
+                // of whether the bag resolved a type) — they're the
+                // source-sub linkage that hash-key ownership fixup
+                // walks. Pre-Step-4, the bag's call resolution wasn't
+                // available at walk time so `inferred` was None for
+                // function calls and the binding fell out of the
+                // `else if` branch; with the implicit-return edge
+                // routing through SymbolReturnArm chains, the type
+                // surfaces but the binding still has to fire.
+                if let Some(func_name) = self.extract_call_name(right) {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
                         self.call_bindings.push(CallBinding {
                             variable: vt,
@@ -4225,43 +4240,17 @@ impl<'a> Builder<'a> {
         });
     }
 
-    /// Closed-under-syntax type observation for an expression node.
-    /// The walker observes; it does not chase names. Only kinds whose
-    /// type is determined by the syntax alone:
-    ///
-    /// - Literals (`"foo"`, `42`, `{}`, `[]`, `qr//`).
-    /// - Anonymous subs → `CodeRef { return_edge: Expr(body_last) }`.
-    /// - `\&foo` / `\&Foo::bar` →
-    ///   `CodeRef { return_edge: MethodOnClass{class, name} }`.
-    /// - Constructor pattern `Bareword->new` → `ClassName`.
-    ///
-    /// Variables, function calls, name-driven method calls — all
-    /// excluded. They go through `expr_payload` as `Edge` payloads
-    /// pointing at attachments the bag knows.
-    fn infer_expression_type(&self, node: Node<'a>) -> Option<InferredType> {
-        match node.kind() {
-            "string_literal" | "interpolated_string_literal" => Some(InferredType::String),
-            "number" => Some(InferredType::Numeric),
-            "anonymous_hash_expression" => Some(InferredType::HashRef),
-            "anonymous_array_expression" => Some(InferredType::ArrayRef),
-            "quoted_regexp" => Some(InferredType::Regexp),
-            "anonymous_subroutine_expression" | "refgen_expression" => {
-                Some(InferredType::CodeRef {
-                    return_edge: self.coderef_return_edge_for(node),
-                })
-            }
-            "method_call_expression" => {
-                self.extract_constructor_class(node).map(InferredType::ClassName)
-            }
-            _ => None,
-        }
-    }
 
     /// What does this anonymous-sub return, by inspecting the body's
-    /// last expression? Closed under syntax — recurses through
-    /// `infer_expression_type` only, no name lookup. Used by Mojo
-    /// `has 'x' => sub { [] }` to type the getter's return.
-    fn infer_anonymous_sub_return_type(&self, node: Node<'a>) -> Option<InferredType> {
+    /// last expression? Emits the body's last-expression witness
+    /// onto the bag, then queries the resolved type at that
+    /// attachment. Used by Mojo `has 'x' => sub { [] }` to type the
+    /// getter's return. Recursion handles `sub { sub { [] } }`:
+    /// the outer's `bag_query` yields `CodeRef { return_edge }`,
+    /// but the caller wants the inner sub's *return*, so we recurse
+    /// into the nested anon-sub's body if the bag's CodeRef shape
+    /// doesn't unwrap on its own.
+    fn infer_anonymous_sub_return_type(&mut self, node: Node<'a>) -> Option<InferredType> {
         if node.kind() != "anonymous_subroutine_expression" {
             return None;
         }
@@ -4271,7 +4260,8 @@ impl<'a> Builder<'a> {
             "expression_statement" | "return_expression" => last_stmt.named_child(0)?,
             _ => last_stmt,
         };
-        self.infer_expression_type(expr)
+        self.emit_expr_witness(expr);
+        self.bag_query_expr_span(node_to_span(expr))
             .or_else(|| self.infer_anonymous_sub_return_type(expr))
     }
 
@@ -5199,13 +5189,16 @@ impl<'a> Builder<'a> {
             }
             FrameworkMode::MojoBase => {
                 // Infer getter return type from default value if present
-                let getter_type = mojo_default_node.and_then(|n| {
+                let getter_type = if let Some(n) = mojo_default_node {
                     if n.kind() == "anonymous_subroutine_expression" {
                         self.infer_anonymous_sub_return_type(n)
                     } else {
-                        self.infer_expression_type(n)
+                        self.emit_expr_witness(n);
+                        self.bag_query_expr_span(node_to_span(n))
                     }
-                });
+                } else {
+                    None
+                };
                 let fluent_type = self
                     .current_package
                     .as_ref()
