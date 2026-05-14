@@ -1,0 +1,59 @@
+#!/usr/bin/env perl
+use v5.42;
+use utf8;
+use warnings;
+use experimental 'signatures';
+
+use Getopt::Long qw(GetOptions);
+use FindBin ();
+use lib "$FindBin::RealBin/../lib";
+
+use App::PerlLSP::PluginGen::ImportBase ();
+
+sub usage ($exit = 1) {
+    print STDERR <<~'USAGE';
+        usage: perl-lsp-gen-importbase <Kit::Class> [options]
+
+        Generate a .rhai plugin from an Import::Base subclass.
+
+        Options:
+          --lib <path>       Prepend <path> to @INC. Repeatable.
+          --out <file>       Write to <file>. Defaults to stdout.
+          --alias <class>    Extra module name that should trigger the plugin
+                             (e.g. the install-wide shim `Co::Base` that
+                             forwards to `Co::Base::Local`). Repeatable.
+          --plugin-id <id>   Override the default `<kit>-generated` plugin id.
+          --help             Show this message.
+        USAGE
+    exit $exit;
+}
+
+my (@libs, @aliases, $out, $plugin_id, $help);
+GetOptions(
+    'lib=s'       => \@libs,
+    'alias=s'     => \@aliases,
+    'out=s'       => \$out,
+    'plugin-id=s' => \$plugin_id,
+    'help|h'      => \$help,
+) or usage();
+usage(0) if $help;
+
+my $kit = shift @ARGV or usage();
+@ARGV and die "unexpected extra arguments: @ARGV\n";
+
+my $rhai = App::PerlLSP::PluginGen::ImportBase::generate_plugin(
+    $kit,
+    lib_paths => \@libs,
+    aliases   => \@aliases,
+    ( defined $plugin_id ? ( plugin_id => $plugin_id ) : () ),
+);
+
+if (defined $out) {
+    open my $fh, '>:encoding(UTF-8)', $out or die "open $out: $!";
+    print $fh $rhai;
+    close $fh or die "close $out: $!";
+    say STDERR "wrote $out";
+} else {
+    binmode STDOUT, ':encoding(UTF-8)';
+    print $rhai;
+}
