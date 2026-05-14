@@ -4149,12 +4149,14 @@ impl<'a> Builder<'a> {
     /// - `Expr(body_span)` is populated by `emit_expr_witness` —
     ///   directly with the body's payload for non-ternary, or
     ///   recursively with per-arm `branch_arm` Edges for ternary.
-    /// - `Symbol(sub_id)` gets a single `branch_arm`-source
-    ///   `Edge(Expr(body_span))` witness. The registry's edge chase +
-    ///   per-attachment reducer (BranchArmFold for ternary `Expr`,
-    ///   straight payload otherwise) folds the body. No ternary
-    ///   special-case here — `emit_expr_witness` owns it on the `Expr`
-    ///   side.
+    /// - `SymbolReturnArm(sub_id)` gets one `Edge(Expr(body_span))`
+    ///   witness per arm. `SymbolReturnArmFold` claims this
+    ///   attachment and folds arms via `resolve_return_type`
+    ///   (agreement / disagreement / single-arm).
+    /// - `Symbol(sub_id)` gets one `Edge(SymbolReturnArm(sub_id))`
+    ///   chain witness so consumers querying the symbol's return
+    ///   walk through to the arm-fold. Pushed per arm — duplicates
+    ///   are idempotent (same target, same materialized result).
     fn publish_return_arm_witnesses(&mut self, return_node: Node<'a>, scope: ScopeId) {
         use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
         let body = match return_node.named_child(0) {
@@ -4168,9 +4170,15 @@ impl<'a> Builder<'a> {
         let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) else { return };
 
         self.bag.push(Witness {
-            attachment: WitnessAttachment::Symbol(sym_id),
-            source: WitnessSource::Builder("branch_arm".into()),
+            attachment: WitnessAttachment::SymbolReturnArm(sym_id),
+            source: WitnessSource::Builder("return_arm".into()),
             payload: WitnessPayload::Edge(WitnessAttachment::Expr(body_span)),
+            span: body_span,
+        });
+        self.bag.push(Witness {
+            attachment: WitnessAttachment::Symbol(sym_id),
+            source: WitnessSource::Builder("return_arm_chain".into()),
+            payload: WitnessPayload::Edge(WitnessAttachment::SymbolReturnArm(sym_id)),
             span: body_span,
         });
     }
@@ -7637,13 +7645,13 @@ impl<'a> Builder<'a> {
 
             // Two sources, in priority order:
             //   1. Bag query on `Symbol(sub_id)` — covers explicit
-            //      `return EXPR` arms (each emits one `branch_arm`
-            //      Edge to `Expr(body_span)` on Symbol) and ternary
-            //      returns (each arm emits its own Edge). Both
-            //      `SymbolReturnArmFold` (1+ arms via
-            //      `resolve_return_type`) and `BranchArmFold` (≥2
-            //      arms agree) can answer here; the registered order
-            //      gives the Symbol-fold first refusal.
+            //      `return EXPR` arms via the `Edge(SymbolReturnArm(_))`
+            //      chain `publish_return_arm_witnesses` emits. The
+            //      registry materializes the chain into the
+            //      arm-fold's answer (`SymbolReturnArmFold` claiming
+            //      `SymbolReturnArm(_)`); ternary arms inside a
+            //      return body fold one level deeper via
+            //      `BranchArmFold` on the body's `Expr(_)`.
             //   2. `Expr(last_expr_span)` for subs without explicit
             //      returns — Perl's implicit-last-statement return.
             let bag_answer = sub_sym_id.and_then(|id| {

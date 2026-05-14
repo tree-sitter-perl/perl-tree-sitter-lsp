@@ -46,9 +46,10 @@ What it *doesn't* support yet:
   not "publish a Parametric InferredType on this call's
   Expression(refidx)."
 - Per-flavor parametric semantics (`hash_key_class`, dispatch class
-  override, etc.) — see `prompt-return-type-expressions.md`. Without
-  pluggable semantics, a DBIC plugin can emit Parametric but the
-  core's hardcoded `hash_key_class()` behavior owns the read side.
+  override, etc.) — see `adr/return-expr.md` for the receiver-
+  relative machinery the plugin would feed into. Without pluggable
+  semantics, a DBIC plugin can emit Parametric but the core's
+  hardcoded `hash_key_class()` behavior owns the read side.
 
 ## What the plugin would own
 
@@ -117,9 +118,8 @@ through to the generic ResultSet method lookup.
 ### Semantics
 
 The plugin registers per-flavor semantics for the Parametric values
-it emits. Once `prompt-return-type-expressions.md` lands the
-`ReturnExpr` machinery,
-DBIC's plugin contributes:
+it emits. With the `ReturnExpr` machinery landed
+(`adr/return-expr.md`), DBIC's plugin contributes:
 
 ```rhai
 fn parametric_semantics() {
@@ -160,8 +160,8 @@ Plugin infrastructure additions:
   Parametric witness on a call's Expression(refidx). Maybe 30 LOC
   in the plugin EmitAction enum + builder dispatch.
 - Plugin-side parametric semantics registry — see
-  `prompt-return-type-expressions.md`. ~50 LOC depending on which
-  option lands.
+  `adr/return-expr.md` for the receiver-relative shape the
+  registry plugs into. ~50 LOC depending on which option lands.
 - Cross-file row-class enrichment hook — bigger; ~100 LOC of
   enrichment-pass extension. Could be cheaper if it piggybacks on
   the existing imports loop with a "Parametric type_args" map.
@@ -216,12 +216,12 @@ test migration. Multi-PR workstream. Worth doing in this order:
 ## Sequencing
 
 DBIC-as-plugin is queued behind:
-- `prompt-return-type-expressions.md` (machinery needed for plugin to
-  contribute semantics)
-- `prompt-type-system-encoding.md` (axis traits clarify what the
-  plugin's semantics return)
+- `adr/return-expr.md` — landed; the receiver-relative machinery is
+  the contract the plugin's semantics return.
+- `prompt-type-system-encoding.md` — discussion; axis traits clarify
+  what the plugin's semantics return.
 
-Both are discussion docs. Either land first, the other follows.
+The remaining gate is type-system-encoding.
 Then DBIC plugin infra → DBIC plugin port → cleanup of in-builder
 DBIC code.
 

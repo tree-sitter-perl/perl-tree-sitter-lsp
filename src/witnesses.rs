@@ -81,6 +81,15 @@ pub enum WitnessAttachment {
     /// recurses into the cached module's bag for `class` — same shape,
     /// different bag.
     MethodOnClass { class: String, name: String },
+    /// Per-arm return collector for a sub. Each `return EXPR` arm
+    /// pushes one `Edge(Expr(body_span))` witness here; the parent
+    /// `Symbol(sub_id)` carries a single `Edge(SymbolReturnArm(_))`
+    /// chain so consumers querying the symbol still see arm-fold
+    /// answers via standard edge materialization. Distinct from
+    /// `Symbol(_)` so `SymbolReturnArmFold` claims by attachment
+    /// shape, not by source-tag exclusion — `SubReturnReducer` and
+    /// `SymbolReturnArmFold` no longer share an attachment family.
+    SymbolReturnArm(SymbolId),
 }
 
 /// Index into `FileAnalysis::refs`.
@@ -162,11 +171,10 @@ pub enum WitnessPayload {
 /// Receiver-relative / arity-relative return-type expression. Lives
 /// on `WitnessPayload::ReturnExpr` and is evaluated by
 /// `ReturnExprReducer` against the query's `receiver` and
-/// `arity_hint`. See `docs/prompt-return-type-expressions.md` for the
-/// design corpus and `docs/adr/parametric-types.md` for the
-/// load-bearing decisions about *why* it's a sealed enum (same shape
-/// rules as `InferredType` + `ParametricType`: every consumer
-/// dispatches via match, no `_ => …` fall-throughs).
+/// `arity_hint`. See `docs/adr/return-expr.md` for the load-bearing
+/// decisions and `docs/adr/parametric-types.md` for the rationale
+/// behind the sealed-enum shape (every consumer dispatches via
+/// match, no `_ => …` fall-throughs).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReturnExpr {
     /// Concrete type — equivalent to today's plain `InferredType`
@@ -782,16 +790,18 @@ impl WitnessReducer for BranchArmFold {
 
 // ---- Symbol-attached return-arm fold ----
 //
-// Claims `Symbol(sub_id)` attachments carrying `branch_arm`-source
-// `InferredType` payloads (Edges materialized into types). Each
-// witness is one return arm — a `return EXPR` body, an explicit
-// if/else arm pushed onto Symbol, or an implicit-last-expression
-// edge. `resolve_return_type` agrees them: 1 arm → that type,
-// agreeing arms → that type, disagreeing → None (with HashRef
-// subsumed by Object). Replaces the per-RI `returns_by_scope` Vec
-// fold the builder used to do by hand. Registered before BranchArmFold
-// so the Symbol case is handled here even though both reducers
-// claim source `branch_arm`.
+// Claims `SymbolReturnArm(sub_id)` attachments carrying `InferredType`
+// payloads (Edges materialized into types). Each witness is one
+// return arm — a `return EXPR` body, an explicit if/else arm,
+// or an implicit-last-expression edge. `resolve_return_type` agrees
+// them: 1 arm → that type, agreeing arms → that type, disagreeing →
+// None (with HashRef subsumed by Object). Replaces the per-RI
+// `returns_by_scope` Vec fold the builder used to do by hand.
+//
+// Symbol(sub_id) carries one `Edge(SymbolReturnArm(sub_id))` chain
+// witness pushed per arm, so consumers querying the symbol's return
+// still see arm-fold answers through standard edge materialization.
+// Claim by attachment shape — no source-tag filter needed.
 
 pub struct SymbolReturnArmFold;
 
@@ -801,8 +811,7 @@ impl WitnessReducer for SymbolReturnArmFold {
     }
 
     fn claims(&self, w: &Witness) -> bool {
-        matches!(w.attachment, WitnessAttachment::Symbol(_))
-            && matches!(&w.source, WitnessSource::Builder(s) if s == "branch_arm")
+        matches!(w.attachment, WitnessAttachment::SymbolReturnArm(_))
             && matches!(w.payload, WitnessPayload::InferredType(_))
     }
 
@@ -887,8 +896,16 @@ impl WitnessReducer for ExprReturn {
 // Latest wins so a later writeback re-publish (the worklist clears
 // `local_return` on every iteration and re-pushes from
 // `resolved_returns`) dominates an older value. Registered AFTER
-// every more-precise reducer (Plugin override, branch-arm fold,
-// arity dispatch) so those still get to claim first.
+// every more-precise reducer (Plugin override, ReturnExpr arity
+// dispatch) so those still get to claim first.
+//
+// Per-arm return witnesses live on `SymbolReturnArm(sub_id)` and are
+// claimed by `SymbolReturnArmFold`; `Symbol(sub_id)` carries an
+// `Edge(SymbolReturnArm(_))` chain that materializes the arm-fold's
+// agreed answer (or None on disagreement) as a synthetic
+// `InferredType` witness here. Latest-wins resolves the writeback-
+// vs-arm-chain race: writeback runs in step 6 of the build pipeline,
+// after the walk-time arm pushes, so it dominates when present.
 
 pub struct SubReturnReducer;
 
@@ -898,24 +915,15 @@ impl WitnessReducer for SubReturnReducer {
     }
 
     fn claims(&self, w: &Witness) -> bool {
-        // `Symbol(_) + InferredType` only, latest-wins, excluding
-        // `branch_arm`-source witnesses — those are
-        // `SymbolReturnArmFold`'s and the agreement / disagreement
-        // signal must propagate (single-arm ambiguity or
-        // disagreeing arms yield None on purpose; this reducer must
-        // not paper over that with a latest-wins pick on
-        // materialized arm types).
-        //
-        // Symbols that participate in arity dispatch publish
-        // `WitnessPayload::ReturnExpr(UnionOnArgs)` — claimed by
-        // `ReturnExprReducer` (registered earlier), which runs the
-        // arity-arm match before this reducer ever sees the
-        // attachment. With ReturnExpr in place there's no need to
-        // gate this reducer on arity-hint presence; the unions
-        // either match or fall through cleanly.
+        // `Symbol(_) + InferredType`, latest-wins. No source-tag
+        // filter — every claim discriminator lives on the attachment
+        // shape now. Per-arm answers route through
+        // `SymbolReturnArm(_)` (claimed by `SymbolReturnArmFold`);
+        // arity-dispatched answers route through
+        // `WitnessPayload::ReturnExpr` (claimed by `ReturnExprReducer`,
+        // registered earlier).
         matches!(w.attachment, WitnessAttachment::Symbol(_))
             && matches!(w.payload, WitnessPayload::InferredType(_))
-            && !matches!(&w.source, WitnessSource::Builder(s) if s == "branch_arm")
     }
 
     fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
@@ -1241,13 +1249,11 @@ impl ReducerRegistry {
         // priority compare; PluginOverrideReducer above still
         // short-circuits Symbol+InferredType plugin payloads.
         r.register(Box::new(ReturnExprReducer));
-        // SymbolReturnArmFold runs before BranchArmFold because both
-        // claim `branch_arm`-source InferredType witnesses; the
-        // Symbol-attached case allows single-arm answers (a sub with
-        // one `return X`) which BranchArmFold rejects. Keeping them
-        // distinct (rather than making BranchArmFold attachment-aware)
-        // makes the source-tag / attachment-shape rule clear: each
-        // reducer claims its own (attachment, source) pair.
+        // SymbolReturnArmFold claims `SymbolReturnArm(_)` — a
+        // dedicated attachment shape distinct from BranchArmFold's
+        // `Variable{..}` / `Expr(_)` ternary scope. Single-arm
+        // answers (a sub with one `return X`) need to surface here,
+        // where BranchArmFold's ≥2-arm rule would reject them.
         r.register(Box::new(SymbolReturnArmFold));
         r.register(Box::new(BranchArmFold));
         r.register(Box::new(FrameworkAwareTypeFold));

@@ -3279,12 +3279,13 @@ has 'name';
 /// `$ua->ca($f)->cert(...)` chain lost its receiver type at the second
 /// hop.
 ///
-/// Fix: framework synthesis publishes per-arity `ArityReturn`
-/// observations on both `Symbol(sym_id)` (per-symbol introspection)
-/// and `MethodOnClass{class, name}` (cross-symbol arity dispatch
-/// scoped to the declaring class), and `FluentArityDispatch` claims
-/// either attachment so the right arm wins regardless of which
-/// sister sym `find()` returned.
+/// Fix: framework synthesis publishes `ReturnExpr::UnionOnArgs`
+/// arms on `Symbol(sym_id)` (per-symbol arity arm) and a multi-arm
+/// `UnionOnArgs` on `MethodOnClass{class, name}` (cross-symbol arity
+/// dispatch scoped to the declaring class). `ReturnExprReducer`
+/// dispatches `q.arity_hint` against the union's `ArgGuard` branches
+/// regardless of which sister sym `find()` returned. See
+/// `docs/adr/return-expr.md`.
 #[test]
 fn test_mojo_base_writer_returns_invocant_via_bag() {
     use crate::file_analysis::TypeProvenance;

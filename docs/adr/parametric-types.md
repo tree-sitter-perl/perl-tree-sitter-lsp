@@ -37,7 +37,6 @@ pub enum ParametricType {
     // Future: Wrapped { class, inner } for Promise/Future/Lazy,
     // ListOf { class?, element } for Mojo::Collection/ArrayRef,
     // HashRef { key, value? }, Plugin { id, args } escape hatch.
-    // See docs/prompt-return-type-expressions.md.
 }
 ```
 
@@ -169,41 +168,19 @@ Bumping is free; old blobs re-resolve lazily.
 ## Where this is going
 
 The receiver-relative return-type pillar landed alongside this
-work. `WitnessPayload::ReturnExpr(_)` carries `Concrete(t)`,
-`Receiver`, `Operator(RowOf(_))`, and `UnionOnArgs { branches }`
+work — `docs/adr/return-expr.md` carries the load-bearing
+decisions. The summary: `WitnessPayload::ReturnExpr(_)` admits
+`Concrete(t)` / `Receiver` / `Operator(RowOf(_))` / `UnionOnArgs`
 shapes; `ReturnExprReducer` substitutes `q.receiver` for
 `Receiver` placeholders and dispatches `UnionOnArgs` against
-`q.arity_hint`. Concrete migrations:
-
-- DBIC's `find` / `single` / `next` / `create` / `find_or_*` /
-  `update_or_create` / `new_result` declare
-  `Operator(RowOf(Receiver))` once on
-  `MethodOnClass{base, method}` per `extract_resultset_parametric`
-  hit (`builder::emit_parametric_return_expr_decls`). The chain
-  typer's coderef-call / dynamic-method arms thread the call's
-  invocant as `q.receiver`, so `\&MyRS::find; $cb->($rs, ...)` and
-  `$rs->find(...)` resolve through one substitution.
-- Mojo `has` synth declares
-  `UnionOnArgs { (Empty, Concrete(default_type)?), (AtLeast(1),
-  Receiver) }` on `MethodOnClass{class, name}`; `query_sub_return_
-  type` / `find_method_return_type` default `q.receiver` to
-  `ClassName(class)` when no specific invocant is supplied, so
-  fluent writer chains keep typing without call-site context.
-- In-body arity-discriminated subs (`return X unless @_; return
-  Y;`) emit a single `UnionOnArgs` per arity-discriminated scope
-  on `Symbol(sub_id)` and `MethodOnClass{class, name}`.
-  `FluentArityDispatch` (the legacy `ArityReturn`-observation
-  reducer) is retired; observation pushes from
-  `record_framework_accessor_witness` survive only as the punt
-  signal in `SubReturnReducer` (so getter+writer pairs route
-  through `MethodOnClass` for cross-symbol arity dispatch).
+`q.arity_hint`. DBIC `find` / `single` / etc. declare
+`Operator(RowOf(Receiver))` on `MethodOnClass{base, method}`,
+collapsing the per-call-site projection emitter; Mojo `has`
+declares `UnionOnArgs` on `MethodOnClass{class, name}`, retiring
+`FluentArityDispatch` and `TypeObservation::ArityReturn`.
 
 The deferred `Plugin` escape hatch and nested-hash-key tiers
 queue behind this — the ROADMAP carries their order.
-
-`docs/prompt-return-type-expressions.md` is the original design
-corpus and stays as-is for context; the load-bearing decisions
-are now in this ADR.
 
 ## Test discipline
 

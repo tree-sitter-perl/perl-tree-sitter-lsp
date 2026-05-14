@@ -23,14 +23,15 @@ backburner: ship when types + architecture are in a healthy place.
 |---|---|---|
 | `prompt-type-inference-residual.md` | **WHAT'S MISSING** — Parts 1–5 fact classes | each is a reducer+emitter pair |
 | `prompt-nested-hashkey.md` | hash-key intelligence on Parametric values + structural hashes + array-element narrowing | Tier 1 partially landed; Tiers 2/3 queued |
-| `prompt-return-type-expressions.md` | **NEXT PILLAR** — receiver-relative return types subsume per-method projection + arity dispatch | queued; ~200–300 LOC |
 | `prompt-type-system-encoding.md` | **TYPE-SAFE AXIS DISPATCH** — make wrong-axis class-name reads unrepresentable | discussion; partially deferred to graph-walking |
 | `prompt-type-is-the-gate.md` | **GENERALIZE STRICT-EQ GATES** — `type_says()` answers replace local-symbol-table presence checks | two instances landed (Part 5c); general refactor open |
-| `prompt-dbic-as-plugin.md` | **MOVE DBIC OUT OF CORE** — port `visit_dbic_*` family + Parametric emission to a plugin | queued behind ReturnExpr + type-system-encoding |
+| `prompt-dbic-as-plugin.md` | **MOVE DBIC OUT OF CORE** — port `visit_dbic_*` family + Parametric emission to a plugin | ReturnExpr gate cleared; still behind type-system-encoding |
 | `prompt-sequence-types.md` | sequence type lattice | 5 phases on the clean foundation |
 
 Landed work has its durable record in `docs/adr/` (`parametric-types.md`
 for the Part 5c flavor enum + cross-file deferred owner fix;
+`return-expr.md` for receiver-relative return types subsuming
+per-method projection + arity dispatch;
 `plugin-system.md` for the `return_via_edge` lazy-return mechanism;
 `file-store-and-resolve.md` for forward-reference resolution + cross-file
 invocant refresh) and the commit history.
@@ -43,13 +44,6 @@ invocant refresh) and the commit history.
 - **Residual Parts 1-5** — invocant mutations, hash-key unions, method
   loops, functional operators, value-indexed returns. Independent
   reducer+emitter pairs. Order by value.
-- **Receiver-relative return types** — the next architectural pillar.
-  `return_type: ReturnExpr` admitting `Receiver` placeholders +
-  `UnionOnArgs` branches. Subsumes per-method projection (DBIC `find`
-  declares `RowOf(Receiver)` once on the symbol) AND arity dispatch
-  (Mojo `has` accessors as `{ args.is_empty() => T, _ => Self }`).
-  Retires the `FluentArityDispatch` family. Queued before the
-  DBIC-plugin port.
 - **Type-system encoding for axis dispatch** — defer until the full axis
   set is known (Element, Wrapped, Effect on top of Dispatch + HashKey).
 - **Type-is-the-gate** — defer the general refactor until a second
@@ -70,12 +64,11 @@ invocant refresh) and the commit history.
   do full-bag scans. Cheap to fix with a `HashSet<(name, scope, point)>`
   if profiling ever flags them. See `docs/d4-review-followups.md` items
   2, 3.
-- Arity is bolted on (own `ReducerQuery` field, own observation variant,
-  own reducer, own `ArityBranch` enum). Generalizing to a `Vec<Guard>`
-  shape is premature until a second guard kind appears (type-of-arg
-  dispatch, truthiness, `wantarray`). Do **not** ship more arity-shaped
-  facts that need their own reducer in the meantime — fold them into
-  `ReturnExpr` instead.
+- Arg-shape dispatch is unified under `ReturnExpr::UnionOnArgs` /
+  `ArgGuard` (see `docs/adr/return-expr.md`). New guard kinds
+  (type-of-arg, truthiness, `wantarray`) become new `ArgGuard`
+  variants — no new reducers. Do **not** ship more guard-shaped facts
+  that need their own reducer; fold them into `ArgGuard`.
 - **`return_via_edge` chases lack provenance.** Helper Methods that
   resolve their return type by chasing a `CodeRef.return_edge` (anon-
   literal `Expr(span)` or `\&foo` `MethodOnClass{...}`) record no
