@@ -422,6 +422,45 @@ pub enum EmitAction {
         at: Span,
         inferred_type: InferredType,
     },
+
+    /// Inject a `use` statement as if it appeared in source at `span`.
+    /// Equivalent in every respect to the user having written
+    /// `use <module> <args>` at that point — same plugin dispatch,
+    /// same framework detection, same Import/Module symbol emission,
+    /// same `package_uses` / `package_parents` / `framework_imports`
+    /// writes.
+    ///
+    /// Powers "style kits" (`Import::Base` subclasses, `ToolKit`,
+    /// company-wide `use Co::Base -Class` shims) — a single user-facing
+    /// `use` line collapses a dozen real `use`s, and the LSP needs to
+    /// see those reals to make `has`, `with`, `extends`, etc. work.
+    /// Kit plugins react to the user's outer use via `on_use`, then
+    /// emit one `SyntheticUse` per inner real-use the kit performs.
+    ///
+    /// Re-entry is the point: the synthetic re-dispatches every
+    /// applicable `on_use` hook, including the emitting plugin's own.
+    /// `Builder.use_dedup` breaks cycles by `(package, module, args)`.
+    ///
+    /// All four fields mirror what `visit_use` extracts from a real
+    /// CST node, so the synthetic path is call-compatible with the
+    /// real path's worker — no `synthetic: bool` flag inside the
+    /// builder.
+    SyntheticUse {
+        module: String,
+        /// Raw arg tokens, exactly as `extract_mojo_base_args` would
+        /// produce from a real CST. Includes barewords like `-Class`
+        /// and quoted parents like `'Mojolicious::Plugin'`.
+        #[serde(default)]
+        args: Vec<String>,
+        /// qw-style imports (the named-symbol list a real
+        /// `extract_use_import_list` would yield).
+        #[serde(default)]
+        imports: Vec<String>,
+        /// Span the synthetic use is "attributed to" — typically the
+        /// emitting plugin's `ctx.span` (the original real `use` that
+        /// triggered the kit expansion).
+        span: Span,
+    },
 }
 
 // ---- Plugin trait ----

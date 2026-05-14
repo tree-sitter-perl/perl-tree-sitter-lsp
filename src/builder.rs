@@ -197,6 +197,7 @@ fn build_with_plugins_inner(
         pod_texts: Vec::new(),
         package_parents: std::collections::HashMap::new(),
         package_uses: std::collections::HashMap::new(),
+        use_dedup: std::collections::HashSet::new(),
         sub_return_delegations: std::collections::HashMap::new(),
         resolved_returns: std::collections::HashMap::new(),
         framework_modes: std::collections::HashMap::new(),
@@ -903,6 +904,14 @@ struct Builder<'a> {
     /// Modules the current package has `use`d, in source order. Used by
     /// `PluginRegistry::applicable` for `Trigger::UsesModule` matching.
     package_uses: std::collections::HashMap<String, Vec<String>>,
+    /// `(current_package, module, raw_args)` tuples already processed by
+    /// `process_use` in this build. Both real `use` statements (from
+    /// `visit_use`) and plugin-emitted `SyntheticUse` actions go through
+    /// the same gate, so a second `use Moo` — real or synthetic — is a
+    /// no-op. Cleared between files (lives on Builder, not FileAnalysis).
+    /// Also breaks cycles when a kit plugin's SyntheticUse re-triggers
+    /// the same kit plugin's `on_use`.
+    use_dedup: std::collections::HashSet<(Option<String>, String, Vec<String>)>,
     /// sub_name → delegated sub name, for bodies that are `return other()` or
     /// a bare trailing call. Used to propagate hash-key ownership through
     /// intermediate subs so `sub chain { return get_config() }` doesn't
@@ -2142,6 +2151,20 @@ impl<'a> Builder<'a> {
                     inferred_type,
                 });
             }
+            plugin::EmitAction::SyntheticUse { module, args, imports, span } => {
+                // Route through the same worker `visit_use` uses. Plugin
+                // dispatch re-fires inside; `use_dedup` breaks cycles.
+                // `node: None` skips source-positioned ref emission
+                // (parent PackageRefs, qw-import FunctionCalls) — there's
+                // no source span to attach those to. The Module symbol,
+                // framework mode flip, package_uses, package_parents, the
+                // `Import` entry, and the recursive `on_use` dispatch all
+                // run identically to a literal `use`. `plugin_id` is
+                // unused — the synthetic use isn't tagged with a plugin
+                // namespace; anything emitted DOWNSTREAM of it (the
+                // re-entered `on_use` hooks) gets its own emitter's id.
+                self.process_use(module, args, imports, span, span, None);
+            }
             plugin::EmitAction::PluginNamespace {
                 id,
                 kind,
@@ -3222,77 +3245,108 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_use(&mut self, node: Node<'a>) {
-        if let Some(module_node) = node.child_by_field_name("module") {
-            if let Ok(module_name) = module_node.utf8_text(self.source) {
-                self.add_symbol(
-                    module_name.to_string(),
-                    SymKind::Module,
-                    node_to_span(node),
-                    node_to_span(module_node),
-                    SymbolDetail::None,
-                );
+        // Thin shim: pull the value triple off the CST node and hand it
+        // to the value-taking worker. `process_use` runs the actual
+        // framework-detection, package_uses tracking, import emission,
+        // and plugin dispatch — shared with `EmitAction::SyntheticUse`
+        // so kit plugins (`use Co::Base -Class` → SyntheticUse "Moo")
+        // hit the exact same code path the user's literal `use Moo`
+        // would.
+        let Some(module_node) = node.child_by_field_name("module") else { return };
+        let Ok(module_name) = module_node.utf8_text(self.source) else { return };
+        let raw_args = self.extract_mojo_base_args(node);
+        let (imports, _qw_close) = self.extract_use_import_list(node);
+        self.process_use(
+            module_name.to_string(),
+            raw_args,
+            imports,
+            node_to_span(node),
+            node_to_span(module_node),
+            Some(node),
+        );
+        // Don't recurse — use statements don't contain interesting sub-nodes
+    }
 
-                // Track uses per-package so `Trigger::UsesModule` matches.
-                // Populated before any plugin-dispatch site reads it.
-                if let Some(pkg) = self.current_package.as_ref().cloned() {
-                    self.package_uses
-                        .entry(pkg)
-                        .or_default()
-                        .push(module_name.to_string());
-                }
+    /// Value-taking core of `use` handling. Shared by real source uses
+    /// (`visit_use`) and plugin-emitted `EmitAction::SyntheticUse`. Both
+    /// callers route through here so framework mode, package_uses,
+    /// Import / Module symbol emission, and the on_use plugin re-dispatch
+    /// happen identically — there is no `synthetic: bool` branch inside.
+    ///
+    /// `node` is `Some` when the call originated from a real CST node and
+    /// `None` for synthetic. The only thing it gates is source-positioned
+    /// ref emission (parent `PackageRef`s, qw-import `FunctionCall`s,
+    /// `use constant` accumulation, the qw-close-paren completion anchor)
+    /// — there's no source span to attach those to when the use was
+    /// synthesized, so they're skipped. Everything else (the Module
+    /// symbol, package_uses, framework_modes, package_parents, the
+    /// `Import` entry, plugin dispatch) runs uniformly.
+    ///
+    /// Dedup gate: `(current_package, module, raw_args)` is the work
+    /// identity. A second real `use Moo;` after a synthetic one — or
+    /// vice versa, or two real ones, or a SyntheticUse cycle (kit
+    /// plugin reacting to its own emission) — short-circuits here.
+    fn process_use(
+        &mut self,
+        module_name: String,
+        raw_args: Vec<String>,
+        imports: Vec<String>,
+        span: Span,
+        module_name_span: Span,
+        node: Option<Node<'a>>,
+    ) {
+        let key = (self.current_package.clone(), module_name.clone(), raw_args.clone());
+        if !self.use_dedup.insert(key) { return; }
 
-                // Detect framework mode from use statements
-                if let Some(pkg) = self.current_package.as_ref().cloned() {
-                    match module_name {
-                        "Moo" | "Moo::Role" => {
-                            self.framework_modes.insert(pkg, FrameworkMode::Moo);
-                            for kw in &["has", "with", "extends", "around", "before", "after"] {
-                                self.framework_imports.insert(kw.to_string());
-                            }
-                        }
-                        "Moose" | "Moose::Role" => {
-                            self.framework_modes.insert(pkg, FrameworkMode::Moose);
-                            for kw in &["has", "with", "extends", "around", "before", "after",
-                                        "override", "super", "inner", "augment", "confess", "blessed"] {
-                                self.framework_imports.insert(kw.to_string());
-                            }
-                        }
-                        "Mojo::Base" => {
-                            // Check args: -strict means no accessors, -base or 'Parent' means MojoBase mode
-                            // Collect all args including barewords (which extract_use_import_list skips)
-                            let all_args = self.extract_mojo_base_args(node);
-                            let is_strict = all_args.iter().any(|a| a == "-strict");
-                            if !is_strict {
-                                self.framework_modes.insert(pkg.clone(), FrameworkMode::MojoBase);
-                                self.framework_imports.insert("has".to_string());
-                                // 'Parent' arg (not starting with -) is an inheritance declaration
-                                let parents: Vec<String> = all_args.into_iter()
-                                    .filter(|s| !s.starts_with('-'))
-                                    .collect();
-                                if !parents.is_empty() {
-                                    let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
-                                    self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
-                                    self.package_parents
-                                        .entry(pkg)
-                                        .or_default()
-                                        .extend(parents);
-                                }
-                            }
-                        }
-                        _ => {}
+        self.add_symbol(
+            module_name.clone(),
+            SymKind::Module,
+            span,
+            module_name_span,
+            SymbolDetail::None,
+        );
+
+        // Track uses per-package so `Trigger::UsesModule` matches.
+        // Populated before any plugin-dispatch site reads it.
+        if let Some(pkg) = self.current_package.as_ref().cloned() {
+            self.package_uses
+                .entry(pkg)
+                .or_default()
+                .push(module_name.clone());
+        }
+
+        // Detect framework mode from use statements
+        if let Some(pkg) = self.current_package.as_ref().cloned() {
+            match module_name.as_str() {
+                "Moo" | "Moo::Role" => {
+                    self.framework_modes.insert(pkg, FrameworkMode::Moo);
+                    for kw in &["has", "with", "extends", "around", "before", "after"] {
+                        self.framework_imports.insert(kw.to_string());
                     }
                 }
-
-                // Extract parent classes from `use parent` / `use base`
-                if module_name == "parent" || module_name == "base" {
-                    if let Some(pkg) = self.current_package.clone() {
-                        let (parents, _) = self.extract_use_import_list(node);
-                        let parents: Vec<String> = parents.into_iter()
-                            .filter(|s| !s.starts_with('-')) // skip -norequire etc.
+                "Moose" | "Moose::Role" => {
+                    self.framework_modes.insert(pkg, FrameworkMode::Moose);
+                    for kw in &["has", "with", "extends", "around", "before", "after",
+                                "override", "super", "inner", "augment", "confess", "blessed"] {
+                        self.framework_imports.insert(kw.to_string());
+                    }
+                }
+                "Mojo::Base" => {
+                    // Check args: -strict means no accessors, -base or 'Parent' means MojoBase mode
+                    let is_strict = raw_args.iter().any(|a| a == "-strict");
+                    if !is_strict {
+                        self.framework_modes.insert(pkg.clone(), FrameworkMode::MojoBase);
+                        self.framework_imports.insert("has".to_string());
+                        // 'Parent' arg (not starting with -) is an inheritance declaration
+                        let parents: Vec<String> = raw_args.iter()
+                            .filter(|s| !s.starts_with('-'))
+                            .cloned()
                             .collect();
                         if !parents.is_empty() {
-                            let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
-                            self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
+                            if let Some(node) = node {
+                                let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
+                                self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
+                            }
                             self.package_parents
                                 .entry(pkg)
                                 .or_default()
@@ -3300,60 +3354,86 @@ impl<'a> Builder<'a> {
                         }
                     }
                 }
+                _ => {}
+            }
+        }
 
-                // Accumulate constant values: use constant NAME => 'val' / qw(a b)
-                if module_name == "constant" {
-                    self.accumulate_use_constant(node);
-                }
-
-                // Extract imported symbols from qw(...) or list
-                let (raw_names, qw_close_paren) = self.extract_use_import_list(node);
-                // Emit FunctionCall refs for imported symbol names (for goto-def on import args).
-                // These refs pin to the module being imported from — the
-                // qw list IS the authoritative source.
-                if module_name != "parent" && module_name != "base" {
-                    if !raw_names.is_empty() {
-                        let sym_set: std::collections::HashSet<&str> = raw_names.iter().map(|s| s.as_str()).collect();
-                        let kind = RefKind::FunctionCall {
-                            resolved_package: Some(module_name.to_string()),
-                        };
-                        self.emit_refs_for_strings(node, &sym_set, kind);
-                    }
-                }
-                // Tree-sitter parses `qw(a b)` as same-name imports — no
-                // syntactic support for `use Foo ( a => { -as => 'b' } )`
-                // yet, so this loop is pure `ImportedSymbol::same`. Plugin
-                // emissions (below) can produce renaming imports.
-                let imported_symbols: Vec<ImportedSymbol> = raw_names
-                    .iter()
-                    .map(|n| ImportedSymbol::same(n.clone()))
+        // Extract parent classes from `use parent` / `use base`
+        if module_name == "parent" || module_name == "base" {
+            if let Some(pkg) = self.current_package.clone() {
+                let parents: Vec<String> = imports.iter()
+                    .filter(|s| !s.starts_with('-')) // skip -norequire etc.
+                    .cloned()
                     .collect();
-                self.imports.push(Import {
-                    module_name: module_name.to_string(),
-                    imported_symbols,
-                    span: node_to_span(node),
-                    qw_close_paren,
-                });
-
-                // Plugin dispatch for use-statements. Mojolicious::Lite
-                // autoimports a verb set (`get`, `post`, `helper`, ...)
-                // — the plugin emits `Import` actions pointing at the
-                // real source module so hover/gd/sig-help flow through
-                // the existing imported-function resolution path.
-                if !self.plugins.is_empty() {
-                    let raw_args = self.extract_mojo_base_args(node);
-                    let ctx = plugin::UseContext {
-                        module_name: module_name.to_string(),
-                        imports: raw_names,
-                        raw_args,
-                        current_package: self.current_package.clone(),
-                        span: node_to_span(node),
-                    };
-                    self.dispatch_use_plugins(ctx);
+                if !parents.is_empty() {
+                    if let Some(node) = node {
+                        let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
+                        self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
+                    }
+                    self.package_parents
+                        .entry(pkg)
+                        .or_default()
+                        .extend(parents);
                 }
             }
         }
-        // Don't recurse — use statements don't contain interesting sub-nodes
+
+        // Accumulate constant values: use constant NAME => 'val' / qw(a b)
+        if module_name == "constant" {
+            if let Some(node) = node {
+                self.accumulate_use_constant(node);
+            }
+        }
+
+        let qw_close_paren = node.and_then(|n| self.find_qw_close_position(n));
+
+        // Emit FunctionCall refs for imported symbol names (for goto-def on import args).
+        // These refs pin to the module being imported from — the qw list
+        // IS the authoritative source. Synthetic uses skip this — there's
+        // no source span for the imported names to live on.
+        if module_name != "parent" && module_name != "base" {
+            if !imports.is_empty() {
+                if let Some(node) = node {
+                    let sym_set: std::collections::HashSet<&str> = imports.iter().map(|s| s.as_str()).collect();
+                    let kind = RefKind::FunctionCall {
+                        resolved_package: Some(module_name.clone()),
+                    };
+                    self.emit_refs_for_strings(node, &sym_set, kind);
+                }
+            }
+        }
+        // Tree-sitter parses `qw(a b)` as same-name imports — no
+        // syntactic support for `use Foo ( a => { -as => 'b' } )`
+        // yet, so this loop is pure `ImportedSymbol::same`. Plugin
+        // emissions (below) can produce renaming imports.
+        let imported_symbols: Vec<ImportedSymbol> = imports
+            .iter()
+            .map(|n| ImportedSymbol::same(n.clone()))
+            .collect();
+        self.imports.push(Import {
+            module_name: module_name.clone(),
+            imported_symbols,
+            span,
+            qw_close_paren,
+        });
+
+        // Plugin dispatch for use-statements. Mojolicious::Lite
+        // autoimports a verb set (`get`, `post`, `helper`, ...) —
+        // the plugin emits `Import` actions pointing at the real
+        // source module so hover/gd/sig-help flow through the
+        // existing imported-function resolution path. Re-entered
+        // (without distinction) when a plugin emits SyntheticUse;
+        // `use_dedup` breaks any cycle.
+        if !self.plugins.is_empty() {
+            let ctx = plugin::UseContext {
+                module_name,
+                imports,
+                raw_args,
+                current_package: self.current_package.clone(),
+                span,
+            };
+            self.dispatch_use_plugins(ctx);
+        }
     }
 
     /// Check if we're at package scope (file scope or class block, not inside a sub).
