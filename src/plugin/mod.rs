@@ -439,12 +439,35 @@ pub enum EmitAction {
     ///
     /// Re-entry is the point: the synthetic re-dispatches every
     /// applicable `on_use` hook, including the emitting plugin's own.
-    /// `Builder.use_dedup` breaks cycles by `(package, module, args)`.
+    /// `Builder.use_dedup` breaks cycles by
+    /// `(package, module, args, imports)`.
     ///
     /// All four fields mirror what `visit_use` extracts from a real
     /// CST node, so the synthetic path is call-compatible with the
     /// real path's worker — no `synthetic: bool` flag inside the
     /// builder.
+    ///
+    /// **Provenance.** The synthesized Module symbol carries the
+    /// emitting plugin's `Namespace::Framework { id }` tag (vs. real
+    /// `use` lines, whose Module symbol stays on `Namespace::Language`).
+    /// `--dump-package` / outline / completion filters use the
+    /// namespace channel to surface "this came from plugin X" for
+    /// every other plugin-emitted symbol; SyntheticUse joins the same
+    /// channel. Anything downstream of the synthetic (re-entered
+    /// `on_use` hooks, has-synthesizers, etc.) gets its OWN emitter's
+    /// id through the regular `apply_emit_action` path — so a
+    /// `co-base → Moo → has` chain ends up with the Module tagged
+    /// `co-base` and each synthesized accessor tagged `moo`.
+    ///
+    /// **Known limitation: `use constant`.** `accumulate_use_constant`
+    /// reads the value side of the fat-comma pair from the CST. A
+    /// synthetic `SyntheticUse { module: "constant", ... }` has no
+    /// source to scan, so `constant_strings` does NOT get populated —
+    /// the rest of the use-handling (Module symbol, package_uses,
+    /// Import entry, plugin re-dispatch) still runs. Kit plugins
+    /// that need to inject constants should request a dedicated
+    /// `EmitAction::ConstantString { name, values }` (not yet
+    /// available — add when a real plugin needs it).
     SyntheticUse {
         module: String,
         /// Raw arg tokens, exactly as `extract_mojo_base_args` would

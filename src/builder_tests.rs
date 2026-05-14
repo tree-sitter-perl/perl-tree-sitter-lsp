@@ -8826,6 +8826,7 @@ sub helper { return "fin"; }
 // literal build.
 mod synthetic_use {
     use super::*;
+    use crate::file_analysis::Namespace;
     use crate::plugin::{
         CompletionQueryContext, EmitAction, FrameworkPlugin, PluginCompletionAnswer,
         PluginRegistry, PluginSigHelpAnswer, SigHelpQueryContext, Trigger, UseContext,
@@ -8940,6 +8941,29 @@ has 'name' => (is => 'ro');
              SyntheticUse \"Moo\" as under literal `use Moo`",
         );
         assert_eq!(kit_methods.len(), 1, "ro getter is exactly one Method");
+
+        // Provenance: the synthesized `Moo` Module symbol in the kit
+        // build carries the emitting plugin's namespace tag; the
+        // literal build's `Moo` Module is plain `Language`. This is
+        // the one observable axis where the two builds are SUPPOSED
+        // to differ — it's what lets `--dump-package` / outline /
+        // completion filters surface "this came from co-base-test".
+        let kit_moo = kit.symbols.iter()
+            .find(|s| s.kind == SymKind::Module && s.name == "Moo")
+            .expect("kit build must have a Module symbol for synthesized `use Moo`");
+        assert_eq!(
+            kit_moo.namespace,
+            Namespace::framework("co-base-test"),
+            "synthesized Module must carry the emitting plugin's namespace tag"
+        );
+        let lit_moo = lit.symbols.iter()
+            .find(|s| s.kind == SymKind::Module && s.name == "Moo")
+            .expect("literal build must have a Module symbol for `use Moo`");
+        assert_eq!(
+            lit_moo.namespace,
+            Namespace::Language,
+            "literal-source Module must stay on Namespace::Language (no plugin tag)"
+        );
     }
 
     /// `use_dedup` short-circuits cycles. The stub plugin reacts to
@@ -8984,5 +9008,91 @@ has 'name' => (is => 'ro');
             .filter(|s| s.kind == SymKind::Module && s.name == "Co::Base")
             .count();
         assert_eq!(module_syms, 1, "self-cycle must emit one Module symbol");
+
+        // Belt-and-suspenders for the gate. The dedup short-circuits at
+        // the top of `process_use`, so every downstream effect is bounded
+        // by construction — but pinning each axis catches a future
+        // regression where the gate gets moved or `process_use` gets
+        // split. If any of these grow without the others, something's
+        // half-processing the cycle.
+        let co_base_uses = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Module && s.name == "Co::Base")
+            .count();
+        assert_eq!(
+            co_base_uses, 1,
+            "package_uses-equivalent (Module symbol count) should match Import count"
+        );
+        // `framework_imports` for `use Co::Base` (not a built-in framework
+        // module): the bundled plugins shouldn't touch it. Cycle should
+        // leave this empty whether it loops once or a thousand times.
+        assert!(
+            fa.framework_imports.is_empty()
+                || fa.framework_imports.iter().all(|s| !s.starts_with("co_base_")),
+            "cycle on a non-framework module should not leak Co::Base-tagged keywords \
+             into framework_imports; got {:?}",
+            fa.framework_imports,
+        );
+    }
+
+    /// `imports` MUST be part of the dedup key. Real `use Foo qw(a)` and
+    /// `use Foo qw(b)` discriminate via `extract_mojo_base_args`'s
+    /// fallback to `extract_use_import_list` (the fallback fires when
+    /// no barewords / literals are present, putting qw imports in
+    /// `raw_args`). Synthetic emissions carry `args` and `imports` as
+    /// separate fields, so the equivalent two SyntheticUses with
+    /// different `imports` and empty `args` must NOT collide on the
+    /// dedup key. Pre-fix, both keyed on `(pkg, "Foo", [])` and the
+    /// second silently dropped.
+    #[test]
+    fn synthetic_use_distinct_imports_both_emit() {
+        struct ImportPlugin;
+        impl FrameworkPlugin for ImportPlugin {
+            fn id(&self) -> &str { "imports-test" }
+            fn triggers(&self) -> &[Trigger] {
+                static T: [Trigger; 1] = [Trigger::Always];
+                &T
+            }
+            fn on_use(&self, ctx: &UseContext) -> Vec<EmitAction> {
+                if ctx.module_name != "Trigger::Kit" { return Vec::new(); }
+                vec![
+                    EmitAction::SyntheticUse {
+                        module: "Foo".into(),
+                        args: vec![],
+                        imports: vec!["a".into()],
+                        span: ctx.span,
+                    },
+                    EmitAction::SyntheticUse {
+                        module: "Foo".into(),
+                        args: vec![],
+                        imports: vec!["b".into()],
+                        span: ctx.span,
+                    },
+                ]
+            }
+            fn on_signature_help(&self, _: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> { None }
+            fn on_completion(&self, _: &CompletionQueryContext) -> Option<PluginCompletionAnswer> { None }
+        }
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(ImportPlugin));
+        let fa = build_with("package Foo; use Trigger::Kit;\n", Arc::new(reg));
+
+        let foo_imports: Vec<&crate::file_analysis::Import> = fa.imports.iter()
+            .filter(|i| i.module_name == "Foo")
+            .collect();
+        assert_eq!(
+            foo_imports.len(), 2,
+            "two SyntheticUse \"Foo\" with distinct imports must both produce \
+             Import entries — dedup must NOT collide on the args-only key. \
+             Got imports: {:?}",
+            foo_imports.iter().map(|i| &i.imported_symbols).collect::<Vec<_>>(),
+        );
+
+        // Each Import entry must carry its own qw-style import name.
+        // Order-independent: we check the union covers both.
+        let all_names: std::collections::HashSet<&str> = foo_imports.iter()
+            .flat_map(|i| i.imported_symbols.iter().map(|s| s.local_name.as_str()))
+            .collect();
+        assert!(all_names.contains("a"), "missing import name 'a': {:?}", all_names);
+        assert!(all_names.contains("b"), "missing import name 'b': {:?}", all_names);
     }
 }

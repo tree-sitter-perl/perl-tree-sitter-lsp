@@ -904,14 +904,21 @@ struct Builder<'a> {
     /// Modules the current package has `use`d, in source order. Used by
     /// `PluginRegistry::applicable` for `Trigger::UsesModule` matching.
     package_uses: std::collections::HashMap<String, Vec<String>>,
-    /// `(current_package, module, raw_args)` tuples already processed by
-    /// `process_use` in this build. Both real `use` statements (from
-    /// `visit_use`) and plugin-emitted `SyntheticUse` actions go through
-    /// the same gate, so a second `use Moo` — real or synthetic — is a
-    /// no-op. Cleared between files (lives on Builder, not FileAnalysis).
-    /// Also breaks cycles when a kit plugin's SyntheticUse re-triggers
-    /// the same kit plugin's `on_use`.
-    use_dedup: std::collections::HashSet<(Option<String>, String, Vec<String>)>,
+    /// `(current_package, module, raw_args, imports)` tuples already
+    /// processed by `process_use` in this build. Both real `use`
+    /// statements (from `visit_use`) and plugin-emitted `SyntheticUse`
+    /// actions go through the same gate, so a second `use Moo` — real
+    /// or synthetic — is a no-op. Cleared between files (lives on
+    /// Builder, not FileAnalysis). Also breaks cycles when a kit
+    /// plugin's SyntheticUse re-triggers the same kit plugin's `on_use`.
+    ///
+    /// `imports` lives in the key because the synthetic shape carries
+    /// `args` and `imports` as separate fields, and real `use Foo qw(a)`
+    /// vs `use Foo qw(b)` is two distinct pieces of work. Without
+    /// `imports` here, `SyntheticUse { args: [], imports: ["a"] }` and
+    /// `SyntheticUse { args: [], imports: ["b"] }` would collide on the
+    /// args-only key and silently drop the second emission.
+    use_dedup: std::collections::HashSet<(Option<String>, String, Vec<String>, Vec<String>)>,
     /// sub_name → delegated sub name, for bodies that are `return other()` or
     /// a bare trailing call. Used to propagate hash-key ownership through
     /// intermediate subs so `sub chain { return get_config() }` doesn't
@@ -2159,11 +2166,16 @@ impl<'a> Builder<'a> {
                 // no source span to attach those to. The Module symbol,
                 // framework mode flip, package_uses, package_parents, the
                 // `Import` entry, and the recursive `on_use` dispatch all
-                // run identically to a literal `use`. `plugin_id` is
-                // unused — the synthetic use isn't tagged with a plugin
-                // namespace; anything emitted DOWNSTREAM of it (the
-                // re-entered `on_use` hooks) gets its own emitter's id.
-                self.process_use(module, args, imports, span, span, None);
+                // run identically to a literal `use`. `plugin_id` rides
+                // through as `synthesized_by` so the Module symbol carries
+                // the emitting plugin's `Namespace::Framework { id }` tag
+                // — `--dump-package` / outline filters can distinguish
+                // synthesized Module symbols from user-written ones.
+                // Anything DOWNSTREAM of the synthetic (re-entered
+                // `on_use` hooks, has-synthesizers, etc.) gets its own
+                // emitter's id through the regular `apply_emit_action`
+                // path; the namespace chain works out naturally.
+                self.process_use(module, args, imports, span, span, None, Some(plugin_id));
             }
             plugin::EmitAction::PluginNamespace {
                 id,
@@ -3263,6 +3275,7 @@ impl<'a> Builder<'a> {
             node_to_span(node),
             node_to_span(module_node),
             Some(node),
+            None, // real source — default `Namespace::Language` on the Module
         );
         // Don't recurse — use statements don't contain interesting sub-nodes
     }
@@ -3282,10 +3295,25 @@ impl<'a> Builder<'a> {
     /// symbol, package_uses, framework_modes, package_parents, the
     /// `Import` entry, plugin dispatch) runs uniformly.
     ///
-    /// Dedup gate: `(current_package, module, raw_args)` is the work
-    /// identity. A second real `use Moo;` after a synthetic one — or
-    /// vice versa, or two real ones, or a SyntheticUse cycle (kit
-    /// plugin reacting to its own emission) — short-circuits here.
+    /// `synthesized_by` is `Some(plugin_id)` for synthetic uses — the
+    /// emitting plugin's id rides through to the Module symbol's
+    /// `Namespace::Framework { id }` tag, so `--dump-package` / outline
+    /// / completion filters can distinguish "this `use Moo` came from
+    /// the user's source" from "this `use Moo` came from the
+    /// `co-base` kit plugin reacting to `use Co::Base -Class`". `None`
+    /// leaves the Module on the default `Namespace::Language`, matching
+    /// every literal `use` line's symbol tagging.
+    ///
+    /// When a kit chains (`co-base` plugin emits `SyntheticUse "Moo"`,
+    /// then the bundled `moo` plugin reacts to it via on_use), the
+    /// Module symbol carries the OUTER emitter's id (`co-base`). The
+    /// inner emissions get their own emitter's namespace through the
+    /// regular `apply_emit_action` path.
+    ///
+    /// Dedup gate: `(current_package, module, raw_args, imports)` is
+    /// the work identity. A second real `use Moo;` after a synthetic
+    /// one — or vice versa, or two real ones, or a SyntheticUse cycle
+    /// (kit plugin reacting to its own emission) — short-circuits here.
     fn process_use(
         &mut self,
         module_name: String,
@@ -3294,16 +3322,31 @@ impl<'a> Builder<'a> {
         span: Span,
         module_name_span: Span,
         node: Option<Node<'a>>,
+        synthesized_by: Option<String>,
     ) {
-        let key = (self.current_package.clone(), module_name.clone(), raw_args.clone());
+        let key = (
+            self.current_package.clone(),
+            module_name.clone(),
+            raw_args.clone(),
+            imports.clone(),
+        );
         if !self.use_dedup.insert(key) { return; }
 
-        self.add_symbol(
+        // Module symbol gets the synthesizing plugin's namespace tag
+        // when this is a SyntheticUse — that's the channel `--dump-package`
+        // / outline / completion already use to surface "this came from
+        // plugin X". For literal source `use`, default `Namespace::Language`.
+        let module_ns = match &synthesized_by {
+            Some(id) => Namespace::framework(id.clone()),
+            None => Namespace::Language,
+        };
+        self.add_symbol_ns(
             module_name.clone(),
             SymKind::Module,
             span,
             module_name_span,
             SymbolDetail::None,
+            module_ns,
         );
 
         // Track uses per-package so `Trigger::UsesModule` matches.
@@ -3378,7 +3421,16 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Accumulate constant values: use constant NAME => 'val' / qw(a b)
+        // Accumulate constant values: use constant NAME => 'val' / qw(a b).
+        // Gated on `Some(node)`: the accumulator scans the CST for the
+        // value side of the fat-comma pair, so a synthetic
+        // `SyntheticUse "constant"` can't populate `constant_strings`
+        // (there's no source to scan). This is the one observable
+        // axis where synthetic doesn't match a literal — kit plugins
+        // that need to inject constants should request a dedicated
+        // `EmitAction::ConstantString { name, values }` rather than
+        // routing it through SyntheticUse. See `EmitAction::SyntheticUse`
+        // doc for the limitation context.
         if module_name == "constant" {
             if let Some(node) = node {
                 self.accumulate_use_constant(node);
