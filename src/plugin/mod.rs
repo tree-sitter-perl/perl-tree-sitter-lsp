@@ -422,6 +422,68 @@ pub enum EmitAction {
         at: Span,
         inferred_type: InferredType,
     },
+
+    /// Inject a `use` statement as if it appeared in source at `span`.
+    /// Equivalent in every respect to the user having written
+    /// `use <module> <args>` at that point — same plugin dispatch,
+    /// same framework detection, same Import/Module symbol emission,
+    /// same `package_uses` / `package_parents` / `framework_imports`
+    /// writes.
+    ///
+    /// Powers "style kits" (`Import::Base` subclasses, `ToolKit`,
+    /// company-wide `use Co::Base -Class` shims) — a single user-facing
+    /// `use` line collapses a dozen real `use`s, and the LSP needs to
+    /// see those reals to make `has`, `with`, `extends`, etc. work.
+    /// Kit plugins react to the user's outer use via `on_use`, then
+    /// emit one `SyntheticUse` per inner real-use the kit performs.
+    ///
+    /// Re-entry is the point: the synthetic re-dispatches every
+    /// applicable `on_use` hook, including the emitting plugin's own.
+    /// `Builder.use_dedup` breaks cycles by
+    /// `(package, module, args, imports)`.
+    ///
+    /// All four fields mirror what `visit_use` extracts from a real
+    /// CST node, so the synthetic path is call-compatible with the
+    /// real path's worker — no `synthetic: bool` flag inside the
+    /// builder.
+    ///
+    /// **Provenance.** The synthesized Module symbol carries the
+    /// emitting plugin's `Namespace::Framework { id }` tag (vs. real
+    /// `use` lines, whose Module symbol stays on `Namespace::Language`).
+    /// `--dump-package` / outline / completion filters use the
+    /// namespace channel to surface "this came from plugin X" for
+    /// every other plugin-emitted symbol; SyntheticUse joins the same
+    /// channel. Anything downstream of the synthetic (re-entered
+    /// `on_use` hooks, has-synthesizers, etc.) gets its OWN emitter's
+    /// id through the regular `apply_emit_action` path — so a
+    /// `co-base → Moo → has` chain ends up with the Module tagged
+    /// `co-base` and each synthesized accessor tagged `moo`.
+    ///
+    /// **Known limitation: `use constant`.** `accumulate_use_constant`
+    /// reads the value side of the fat-comma pair from the CST. A
+    /// synthetic `SyntheticUse { module: "constant", ... }` has no
+    /// source to scan, so `constant_strings` does NOT get populated —
+    /// the rest of the use-handling (Module symbol, package_uses,
+    /// Import entry, plugin re-dispatch) still runs. Kit plugins
+    /// that need to inject constants should request a dedicated
+    /// `EmitAction::ConstantString { name, values }` (not yet
+    /// available — add when a real plugin needs it).
+    SyntheticUse {
+        module: String,
+        /// Raw arg tokens, exactly as `extract_mojo_base_args` would
+        /// produce from a real CST. Includes barewords like `-Class`
+        /// and quoted parents like `'Mojolicious::Plugin'`.
+        #[serde(default)]
+        args: Vec<String>,
+        /// qw-style imports (the named-symbol list a real
+        /// `extract_use_import_list` would yield).
+        #[serde(default)]
+        imports: Vec<String>,
+        /// Span the synthetic use is "attributed to" — typically the
+        /// emitting plugin's `ctx.span` (the original real `use` that
+        /// triggered the kit expansion).
+        span: Span,
+    },
 }
 
 // ---- Plugin trait ----

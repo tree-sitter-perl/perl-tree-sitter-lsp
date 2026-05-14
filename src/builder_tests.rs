@@ -8813,3 +8813,286 @@ sub helper { return "fin"; }
         Some(InferredType::String),
     );
 }
+
+// ---- SyntheticUse — plugin-emitted `use` statements ------------------------
+//
+// `EmitAction::SyntheticUse` lets a plugin react to a kit module's outer
+// use (e.g. `use Co::Base -Class`) by injecting the inner `use`s that the
+// kit performs at runtime (`Moo`, `parent`, etc.). The point is that the
+// downstream effect — framework detection, has-synthesis, parent
+// inheritance, plugin re-dispatch — is identical to what the user would
+// have gotten by writing those `use` lines literally. The test below
+// drives the kit path through a stub plugin and compares against a
+// literal build.
+mod synthetic_use {
+    use super::*;
+    use crate::file_analysis::Namespace;
+    use crate::plugin::{
+        CompletionQueryContext, EmitAction, FrameworkPlugin, PluginCompletionAnswer,
+        PluginRegistry, PluginSigHelpAnswer, SigHelpQueryContext, Trigger, UseContext,
+    };
+    use std::sync::Arc;
+
+    /// Catches `use Co::Base -Class` and emits a synthetic `use Moo`.
+    /// One trigger (`Always`), one hook (`on_use`), zero overrides.
+    /// Stripped to the minimum that exercises the path.
+    struct CoBasePlugin;
+
+    impl FrameworkPlugin for CoBasePlugin {
+        fn id(&self) -> &str { "co-base-test" }
+        fn triggers(&self) -> &[Trigger] {
+            // `on_use` bypasses the trigger filter (every plugin sees
+            // every use), so the trigger list here is incidental. Kept
+            // non-empty to mirror real plugins.
+            static T: [Trigger; 1] = [Trigger::Always];
+            &T
+        }
+        fn on_use(&self, ctx: &UseContext) -> Vec<EmitAction> {
+            if ctx.module_name != "Co::Base" { return Vec::new(); }
+            let is_class = ctx.raw_args.iter().any(|a| a == "-Class");
+            if !is_class { return Vec::new(); }
+            vec![EmitAction::SyntheticUse {
+                module: "Moo".into(),
+                args: vec![],
+                imports: vec![],
+                span: ctx.span,
+            }]
+        }
+        fn on_signature_help(&self, _: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> { None }
+        fn on_completion(&self, _: &CompletionQueryContext) -> Option<PluginCompletionAnswer> { None }
+    }
+
+    fn registry_with_co_base() -> Arc<PluginRegistry> {
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(CoBasePlugin));
+        Arc::new(reg)
+    }
+
+    fn build_with(source: &str, plugins: Arc<PluginRegistry>) -> FileAnalysis {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        super::super::build_with_plugins(&tree, source.as_bytes(), plugins)
+    }
+
+    /// `use Co::Base -Class` (via the stub kit plugin) produces the same
+    /// observable downstream state as a literal `use Moo`:
+    ///
+    ///   * `package_framework` carries `Moo` for the package.
+    ///   * `framework_imports` covers Moo's keyword set.
+    ///   * `has 'name'` synthesizes the accessor Method.
+    ///
+    /// Anything that depends on those — has-synthesis, accessor symbols,
+    /// inheritance via `with`/`extends`, the constructor key, downstream
+    /// plugin chains — comes along for free because it reads the same
+    /// state. We pin only the load-bearing axes; broader Moo behavior
+    /// has its own dedicated tests.
+    #[test]
+    fn synthetic_use_moo_matches_literal_use_moo() {
+        let kit_src = r#"
+package Foo;
+use Co::Base -Class;
+has 'name' => (is => 'ro');
+"#;
+        let lit_src = r#"
+package Foo;
+use Moo;
+has 'name' => (is => 'ro');
+"#;
+        let kit = build_with(kit_src, registry_with_co_base());
+        let lit = build_with(lit_src, registry_with_co_base());
+
+        // Both should record Moo as the active framework for Foo.
+        assert_eq!(
+            kit.package_framework.get("Foo"),
+            lit.package_framework.get("Foo"),
+            "kit (`use Co::Base -Class`) and literal (`use Moo`) must agree on package_framework"
+        );
+        assert!(
+            kit.package_framework.contains_key("Foo"),
+            "Foo's framework should be set by SyntheticUse \"Moo\"; package_framework={:?}",
+            kit.package_framework,
+        );
+
+        // Both should have Moo's keyword set in framework_imports.
+        for kw in &["has", "with", "extends", "around", "before", "after"] {
+            assert!(
+                kit.framework_imports.contains(*kw),
+                "SyntheticUse \"Moo\" must populate framework_imports[{kw}]; got {:?}",
+                kit.framework_imports,
+            );
+        }
+
+        // The `has 'name'` accessor synthesis depends on framework_modes
+        // being set at the time `visit_has_call` fires. With SyntheticUse,
+        // the kit's `use Co::Base -Class` precedes `has`, so the plugin
+        // re-dispatch flips the mode before the has-call is walked.
+        let kit_methods: Vec<&str> = kit.symbols.iter()
+            .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+            .map(|s| s.name.as_str())
+            .collect();
+        let lit_methods: Vec<&str> = lit.symbols.iter()
+            .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            kit_methods, lit_methods,
+            "`has 'name'` should synthesize the same accessor Methods under \
+             SyntheticUse \"Moo\" as under literal `use Moo`",
+        );
+        assert_eq!(kit_methods.len(), 1, "ro getter is exactly one Method");
+
+        // Provenance: the synthesized `Moo` Module symbol in the kit
+        // build carries the emitting plugin's namespace tag; the
+        // literal build's `Moo` Module is plain `Language`. This is
+        // the one observable axis where the two builds are SUPPOSED
+        // to differ — it's what lets `--dump-package` / outline /
+        // completion filters surface "this came from co-base-test".
+        let kit_moo = kit.symbols.iter()
+            .find(|s| s.kind == SymKind::Module && s.name == "Moo")
+            .expect("kit build must have a Module symbol for synthesized `use Moo`");
+        assert_eq!(
+            kit_moo.namespace,
+            Namespace::framework("co-base-test"),
+            "synthesized Module must carry the emitting plugin's namespace tag"
+        );
+        let lit_moo = lit.symbols.iter()
+            .find(|s| s.kind == SymKind::Module && s.name == "Moo")
+            .expect("literal build must have a Module symbol for `use Moo`");
+        assert_eq!(
+            lit_moo.namespace,
+            Namespace::Language,
+            "literal-source Module must stay on Namespace::Language (no plugin tag)"
+        );
+    }
+
+    /// `use_dedup` short-circuits cycles. The stub plugin reacts to
+    /// `use Co::Base` by emitting `SyntheticUse "Co::Base"` — if the
+    /// gate didn't catch it, the on_use re-dispatch would loop and
+    /// produce many duplicate Module symbols / Import entries.
+    /// With dedup, the second emission is a no-op.
+    #[test]
+    fn synthetic_use_self_cycle_is_bounded() {
+        struct LoopPlugin;
+        impl FrameworkPlugin for LoopPlugin {
+            fn id(&self) -> &str { "loop-test" }
+            fn triggers(&self) -> &[Trigger] {
+                static T: [Trigger; 1] = [Trigger::Always];
+                &T
+            }
+            fn on_use(&self, ctx: &UseContext) -> Vec<EmitAction> {
+                if ctx.module_name != "Co::Base" { return Vec::new(); }
+                vec![EmitAction::SyntheticUse {
+                    module: "Co::Base".into(),
+                    args: vec![],
+                    imports: vec![],
+                    span: ctx.span,
+                }]
+            }
+            fn on_signature_help(&self, _: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> { None }
+            fn on_completion(&self, _: &CompletionQueryContext) -> Option<PluginCompletionAnswer> { None }
+        }
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(LoopPlugin));
+        let fa = build_with("package Foo; use Co::Base;\n", Arc::new(reg));
+
+        let co_base_imports = fa.imports.iter()
+            .filter(|i| i.module_name == "Co::Base")
+            .count();
+        assert_eq!(
+            co_base_imports, 1,
+            "self-cycle must collapse to one Import entry; use_dedup gate kicked in"
+        );
+
+        let module_syms = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Module && s.name == "Co::Base")
+            .count();
+        assert_eq!(module_syms, 1, "self-cycle must emit one Module symbol");
+
+        // Belt-and-suspenders for the gate. The dedup short-circuits at
+        // the top of `process_use`, so every downstream effect is bounded
+        // by construction — but pinning each axis catches a future
+        // regression where the gate gets moved or `process_use` gets
+        // split. If any of these grow without the others, something's
+        // half-processing the cycle.
+        let co_base_uses = fa.symbols.iter()
+            .filter(|s| s.kind == SymKind::Module && s.name == "Co::Base")
+            .count();
+        assert_eq!(
+            co_base_uses, 1,
+            "package_uses-equivalent (Module symbol count) should match Import count"
+        );
+        // `framework_imports` for `use Co::Base` (not a built-in framework
+        // module): the bundled plugins shouldn't touch it. Cycle should
+        // leave this empty whether it loops once or a thousand times.
+        assert!(
+            fa.framework_imports.is_empty()
+                || fa.framework_imports.iter().all(|s| !s.starts_with("co_base_")),
+            "cycle on a non-framework module should not leak Co::Base-tagged keywords \
+             into framework_imports; got {:?}",
+            fa.framework_imports,
+        );
+    }
+
+    /// `imports` MUST be part of the dedup key. Real `use Foo qw(a)` and
+    /// `use Foo qw(b)` discriminate via `extract_mojo_base_args`'s
+    /// fallback to `extract_use_import_list` (the fallback fires when
+    /// no barewords / literals are present, putting qw imports in
+    /// `raw_args`). Synthetic emissions carry `args` and `imports` as
+    /// separate fields, so the equivalent two SyntheticUses with
+    /// different `imports` and empty `args` must NOT collide on the
+    /// dedup key. Pre-fix, both keyed on `(pkg, "Foo", [])` and the
+    /// second silently dropped.
+    #[test]
+    fn synthetic_use_distinct_imports_both_emit() {
+        struct ImportPlugin;
+        impl FrameworkPlugin for ImportPlugin {
+            fn id(&self) -> &str { "imports-test" }
+            fn triggers(&self) -> &[Trigger] {
+                static T: [Trigger; 1] = [Trigger::Always];
+                &T
+            }
+            fn on_use(&self, ctx: &UseContext) -> Vec<EmitAction> {
+                if ctx.module_name != "Trigger::Kit" { return Vec::new(); }
+                vec![
+                    EmitAction::SyntheticUse {
+                        module: "Foo".into(),
+                        args: vec![],
+                        imports: vec!["a".into()],
+                        span: ctx.span,
+                    },
+                    EmitAction::SyntheticUse {
+                        module: "Foo".into(),
+                        args: vec![],
+                        imports: vec!["b".into()],
+                        span: ctx.span,
+                    },
+                ]
+            }
+            fn on_signature_help(&self, _: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> { None }
+            fn on_completion(&self, _: &CompletionQueryContext) -> Option<PluginCompletionAnswer> { None }
+        }
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(ImportPlugin));
+        let fa = build_with("package Foo; use Trigger::Kit;\n", Arc::new(reg));
+
+        let foo_imports: Vec<&crate::file_analysis::Import> = fa.imports.iter()
+            .filter(|i| i.module_name == "Foo")
+            .collect();
+        assert_eq!(
+            foo_imports.len(), 2,
+            "two SyntheticUse \"Foo\" with distinct imports must both produce \
+             Import entries — dedup must NOT collide on the args-only key. \
+             Got imports: {:?}",
+            foo_imports.iter().map(|i| &i.imported_symbols).collect::<Vec<_>>(),
+        );
+
+        // Each Import entry must carry its own qw-style import name.
+        // Order-independent: we check the union covers both.
+        let all_names: std::collections::HashSet<&str> = foo_imports.iter()
+            .flat_map(|i| i.imported_symbols.iter().map(|s| s.local_name.as_str()))
+            .collect();
+        assert!(all_names.contains("a"), "missing import name 'a': {:?}", all_names);
+        assert!(all_names.contains("b"), "missing import name 'b': {:?}", all_names);
+    }
+}
