@@ -80,6 +80,16 @@ resolution + cross-file invocant refresh) and the commit history.
   (type-of-arg, truthiness, `wantarray`) become new `ArgGuard`
   variants — no new reducers. Do **not** ship more guard-shaped facts
   that need their own reducer; fold them into `ArgGuard`.
+- **DBIC parametric column-key completion at `->search({ | })`.**
+  Goto-def from a typed key in `$rs->search({ name => 'X' })` lands
+  on the `add_columns` def (proves the parametric chain resolves),
+  but completion at an *empty* `->search({ | })` returns no items.
+  The `find_call_context` path routes empty-hash-arg key completion
+  through `complete_keyval_args`, which has no parametric-ResultSet
+  branch — it should ask the call's typed receiver
+  (`Parametric(ResultSet { row })`) for its column-key set and emit
+  those alongside any built-in `keyval_args`. Pin already lives in
+  `test_e2e_dbic_parametric.lua`'s header comment.
 - **Cursor-context qualified-path detection should lean on the parser.**
   `extract_package_from_prefix` in `cursor_context.rs` walks the source
   text backward to recover the `Foo::Bar` chunk preceding the cursor's
