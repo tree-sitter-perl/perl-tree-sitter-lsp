@@ -244,6 +244,11 @@ pub struct ModuleIndex {
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
     stale_modules: Arc<DashMap<String, ()>>,
+    /// Perl builtins hover docs, name → rendered markdown. Hydrated
+    /// from SQLite by the resolver thread at startup (parsed from
+    /// `perlfunc.pod` on first cold-cache miss). Empty until the
+    /// resolver has run its warmup path.
+    builtins: Arc<DashMap<String, String>>,
     /// Known module names from @INC scan. Name → path. No exports until resolved.
     available_modules: Arc<DashMap<String, std::path::PathBuf>>,
     queue: Arc<ResolveQueue>,
@@ -259,6 +264,7 @@ impl ModuleIndex {
         let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
+        let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let queue = Arc::new(ResolveQueue {
             priority: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
@@ -281,6 +287,7 @@ impl ModuleIndex {
             Arc::clone(&reverse_index),
             Arc::clone(&stale_modules),
             Arc::clone(&available_modules),
+            Arc::clone(&builtins),
             Arc::clone(&queue),
             Arc::clone(&resolved),
             Arc::clone(&workspace_root),
@@ -293,11 +300,19 @@ impl ModuleIndex {
             reverse_index,            bridges_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
+            builtins,
             queue,
             resolved,
             workspace_root,
             refresh_diagnostics: refresh,
         }
+    }
+
+    /// Hover markdown for a Perl builtin (e.g. `push`, `scalar`).
+    /// Returns `None` for unknown names or before the resolver has
+    /// hydrated the index from SQLite.
+    pub fn builtin_doc(&self, name: &str) -> Option<String> {
+        self.builtins.get(name).map(|e| e.clone())
     }
 
     /// Notify the resolver thread of the workspace root (from LSP initialize).
@@ -450,6 +465,7 @@ impl ModuleIndex {
             reverse_index: Arc::new(DashMap::new()),            bridges_index: Arc::new(DashMap::new()),
             stale_modules: Arc::new(DashMap::new()),
             available_modules: Arc::new(DashMap::new()),
+            builtins: Arc::new(DashMap::new()),
             queue: Arc::new(ResolveQueue {
                 priority: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
@@ -475,6 +491,7 @@ impl ModuleIndex {
         let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
+        let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let queue = Arc::new(ResolveQueue {
             priority: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
@@ -504,11 +521,20 @@ impl ModuleIndex {
             reverse_index,            bridges_index: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
+            builtins,
             queue,
             resolved,
             workspace_root,
             refresh_diagnostics: Arc::new(|| {}),
         }
+    }
+
+    /// Test-only: seed the builtins map directly (bypasses SQLite +
+    /// the resolver thread). Used by hover tests so they don't have
+    /// to spin up the perlfunc.pod parse pipeline.
+    #[cfg(test)]
+    pub fn seed_builtin_for_test(&self, name: &str, doc: &str) {
+        self.builtins.insert(name.to_string(), doc.to_string());
     }
 
     /// Direct access to the raw cache DashMap (for CLI warm_cache integration).

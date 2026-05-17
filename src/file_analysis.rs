@@ -4813,19 +4813,21 @@ impl FileAnalysis {
                     let children = body_scope
                         .map(|s| self.outline_children_of(s))
                         .unwrap_or_default();
-                    // Name format: "<word> identifier (params)".
-                    // The `<…>` wrapper is the visual distinguisher —
-                    // clients that render only `name` (nvim's builtin
-                    // document_symbol handler) get a kind cue that
-                    // survives the LSP-kind collapse (Helper → FUNCTION
-                    // erases "helper"). Plugins override via `display`;
-                    // native subs/methods use the bare "sub"/"method"
-                    // words. Params included for all — hand-written
-                    // subs want signatures in the outline as much as
-                    // framework-synthesized ones do.
+                    // LSP `DocumentSymbol.name` should be the bare
+                    // identifier; `kind` (Function/Method) is what
+                    // tells the client to render the right icon.
+                    //
+                    // Plugin-tagged subs are the exception: when a
+                    // plugin overrides the display word (helper,
+                    // action, route, task, event …), SymbolKind has
+                    // no enum value that conveys it, so we keep the
+                    // `<word>` prefix in `name` for those — it's the
+                    // only surviving kind cue once SymbolKind collapses
+                    // Helper/Action/Route → FUNCTION. Native subs and
+                    // methods get the spec-compliant bare name and
+                    // route their kind word through `detail`.
                     let disp = sub_display_override(&sym.detail);
                     let default_word = if matches!(sym.kind, SymKind::Method) { "method" } else { "sub" };
-                    let word = disp.and_then(|d| d.outline_word()).unwrap_or(default_word);
                     let identifier = sym.outline_label.clone().unwrap_or_else(|| sym.name.clone());
                     let params_suffix = match &sym.detail {
                         SymbolDetail::Sub { params, .. } => {
@@ -4838,8 +4840,16 @@ impl FileAnalysis {
                         }
                         _ => String::new(),
                     };
-                    let label = format!("<{}> {}{}", word, identifier, params_suffix);
-                    let outline_detail = disp.and_then(|d| d.outline_word()).map(|s| s.to_string());
+                    let (label, outline_detail) = match disp.and_then(|d| d.outline_word()) {
+                        Some(plugin_word) => (
+                            format!("<{}> {}{}", plugin_word, identifier, params_suffix),
+                            Some(plugin_word.to_string()),
+                        ),
+                        None => (
+                            identifier,
+                            Some(format!("{}{}", default_word, params_suffix)),
+                        ),
+                    };
                     (label, outline_detail, children)
                 }
                 SymKind::Class => {

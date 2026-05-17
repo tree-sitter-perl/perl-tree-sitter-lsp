@@ -322,6 +322,227 @@ fn test_unimported_completion_skips_imported_modules() {
     assert!(edits[0].new_text.contains("use Scalar::Util qw(blessed)"));
 }
 
+/// Regression: typing `Package::` should NOT trigger the global
+/// workspace-symbol firehose. Mirrors the EM gold corpus fixture
+/// `completion_package_colon` (the pre-fix flood was 263 items); the
+/// fix narrows to the package's own subs.
+///
+/// Multi-segment package name (`Math::Util`) on purpose — earlier
+/// drafts narrowed only single-segment names, so this case is the
+/// load-bearing assertion. Fixture also threads a `use constant` +
+/// const-folded call site so the case is realistic Perl and the
+/// constant doesn't get mistaken for a package qualifier.
+#[test]
+fn test_qualified_path_completion_narrows_to_package() {
+    let source = "\
+package Math::Util;
+use constant PI => 3.14159;
+sub square    { my ($n) = @_; $n * $n }
+sub cube      { my ($n) = @_; $n * $n * $n }
+sub circle_area {
+    my ($r) = @_;
+    return PI * $r * $r;           # const-folded arg flows through
+}
+package main;
+use constant TAU => Math::Util::PI() * 2;
+my $sq   = Math::Util::s
+";
+    let analysis = parse_analysis(source);
+    let module_index = ModuleIndex::new_for_test();
+    module_index.set_workspace_root(None);
+    // Seed an unrelated cross-file module so the workspace flood
+    // would include it if the firehose were still firing.
+    module_index.insert_cache(
+        "Scalar::Util",
+        Some(fake_cached(
+            "/usr/lib/perl5/Scalar/Util.pm",
+            &[],
+            &["blessed", "reftype"],
+        )),
+    );
+
+    let tree = crate::document::Document::new(source.to_string())
+        .unwrap()
+        .tree;
+    // Cursor at end of `Math::Util::s` on line 10 (0-indexed).
+    // Line: `my $sq   = Math::Util::s` — cursor sits past the `s`.
+    let line_text = source.lines().nth(10).unwrap();
+    let cursor_col = line_text.len() as u32;
+    let items = completion_items(
+        &analysis,
+        &tree,
+        source,
+        Position { line: 10, character: cursor_col },
+        &module_index,
+        None,
+    );
+
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"square"),
+        "completion after `Math::Util::` should include `square`, got {:?}",
+        labels,
+    );
+    assert!(
+        labels.contains(&"cube"),
+        "completion after `Math::Util::` should include `cube`, got {:?}",
+        labels,
+    );
+    assert!(
+        labels.contains(&"circle_area"),
+        "completion after `Math::Util::` should include `circle_area` \
+         (the const-folded sub), got {:?}",
+        labels,
+    );
+    assert!(
+        !labels.contains(&"blessed"),
+        "completion after `Math::Util::` must NOT flood unrelated workspace \
+         symbols (`blessed` is from Scalar::Util), got {:?}",
+        labels,
+    );
+    // Tight bound — the 263-item flood is the bug we're regressing.
+    // Allow some headroom for inherited / framework-synthesized
+    // members but flag anything that grows past ~10× the package
+    // size as a regression of the narrowing.
+    assert!(
+        items.len() <= 20,
+        "completion after `Math::Util::` should narrow tightly to the package; \
+         got {} items: {:?}",
+        items.len(),
+        labels,
+    );
+}
+
+/// Sibling case: the *package name itself* arrives via const-fold.
+/// `my $pkg = 'Math::Util';` should let `$pkg->squ<cursor>` narrow
+/// to `Math::Util`'s methods — but reaching that end-state needs the
+/// witness bag to upgrade `$pkg` from `String` to `ClassName` when
+/// it's used as a method invocant. That's a separate inference gap
+/// (the QualifiedPath narrowing this PR ships handles the literal
+/// `Foo::Bar::sub` syntactic form only). Marking ignored so the gap
+/// is tracked rather than absorbed into this PR.
+#[test]
+#[ignore = "needs ClassName-from-string-invocant inference; tracked separately"]
+fn test_const_folded_package_resolves_for_method_completion() {
+    let source = "\
+package Math::Util;
+sub square    { my ($n) = @_; $n * $n }
+sub cube      { my ($n) = @_; $n * $n * $n }
+package main;
+my $pkg = 'Math::Util';
+$pkg->squ
+";
+    let analysis = parse_analysis(source);
+    let module_index = ModuleIndex::new_for_test();
+    module_index.set_workspace_root(None);
+
+    let tree = crate::document::Document::new(source.to_string())
+        .unwrap()
+        .tree;
+    // Cursor sits past the `q` in `$pkg->squ`.
+    let line_text = source.lines().nth(5).unwrap();
+    let cursor_col = line_text.len() as u32;
+    let items = completion_items(
+        &analysis,
+        &tree,
+        source,
+        Position { line: 5, character: cursor_col },
+        &module_index,
+        None,
+    );
+
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"square"),
+        "method completion on const-folded `$pkg` (= 'Math::Util') \
+         should offer `square`, got {:?}",
+        labels,
+    );
+    assert!(
+        labels.contains(&"cube"),
+        "method completion on const-folded `$pkg` (= 'Math::Util') \
+         should offer `cube`, got {:?}",
+        labels,
+    );
+}
+
+/// Native subs emit `DocumentSymbol.name` as the bare identifier —
+/// the LSP `kind` enum carries the Function/Method distinction.
+/// Pre-fix we stuffed `<sub> ` into the name, which collided with
+/// the EM gold corpus' protocol-correct assertions.
+#[test]
+fn test_document_symbol_name_is_bare_identifier() {
+    let source = "\
+package Demo::Symbols;
+sub alpha { return 1 }
+sub beta  { my ($x) = @_; $x * 2 }
+1;
+";
+    let analysis = parse_analysis(source);
+    let names: Vec<String> = analysis
+        .document_symbols()
+        .iter()
+        .flat_map(|sym| {
+            let mut acc = vec![sym.name.clone()];
+            for c in &sym.children {
+                acc.push(c.name.clone());
+            }
+            acc
+        })
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "alpha"),
+        "expected bare 'alpha' in document symbols, got {:?}",
+        names,
+    );
+    assert!(
+        names.iter().any(|n| n == "beta"),
+        "expected bare 'beta' in document symbols, got {:?}",
+        names,
+    );
+    for n in &names {
+        assert!(
+            !n.starts_with("<sub>") && !n.starts_with("<method>"),
+            "DocumentSymbol.name should not carry `<sub>`/`<method>` prefix (got {:?})",
+            n,
+        );
+    }
+}
+
+/// Hover on a Perl builtin returns the seeded perlfunc.pod entry.
+/// The full POD parse pipeline is exercised separately in the
+/// builtins_pod unit tests; here we just confirm the wiring from
+/// hover_info → module_index.builtin_doc fires for builtin names.
+#[test]
+fn test_hover_on_builtin_uses_module_index() {
+    let source = "push @items, 4;\n";
+    let analysis = parse_analysis(source);
+    let module_index = ModuleIndex::new_for_test();
+    module_index.set_workspace_root(None);
+    module_index.seed_builtin_for_test(
+        "push",
+        "```perl\npush ARRAY,LIST\n```\n\nAppends LIST to ARRAY.",
+    );
+
+    let tree = crate::document::Document::new(source.to_string())
+        .unwrap()
+        .tree;
+    let hover = hover_info(
+        &analysis,
+        source,
+        Position { line: 0, character: 0 },
+        &module_index,
+        &tree,
+    )
+    .expect("expected hover on `push`");
+    let text = match hover.contents {
+        HoverContents::Markup(m) => m.value,
+        _ => panic!("expected markdown hover"),
+    };
+    assert!(text.contains("push ARRAY,LIST"), "hover body missing: {text}");
+    assert!(text.contains("Appends LIST"), "hover body missing: {text}");
+}
+
 #[test]
 fn test_code_action_multiple_exporters_not_preferred() {
     let source = "use strict;\nfirst();\n";

@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PERL5LIB="${PERL5LIB:-$PWD/test_files/lib}"
 
-suites=(test_e2e.lua test_e2e_types.lua test_e2e_cross_file.lua test_e2e_inheritance.lua test_e2e_frameworks.lua)
+suites=(test_e2e.lua test_e2e_types.lua test_e2e_cross_file.lua test_e2e_inheritance.lua test_e2e_frameworks.lua test_e2e_array_hop.lua)
 
 total_passed=0
 total_failed=0

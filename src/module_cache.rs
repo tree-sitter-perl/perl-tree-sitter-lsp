@@ -100,6 +100,10 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             source           TEXT NOT NULL DEFAULT 'import',
             analysis         BLOB,
             extract_version  INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS builtins (
+            name TEXT PRIMARY KEY,
+            doc  TEXT NOT NULL
         );",
     )?;
 
@@ -175,6 +179,64 @@ pub fn validate_inc_paths(conn: &Connection, inc_paths: &[PathBuf]) -> rusqlite:
         )?;
     }
     Ok(())
+}
+
+/// Hydrate the in-memory `builtins` mirror from SQLite, parsing
+/// `perlfunc.pod` and writing rows on first use (or when the perl
+/// version tag changes since the last run). Returns the populated
+/// map. Keyed in `meta` under `builtins_perl_version`: mismatch wipes
+/// the table and re-parses, same pattern as `validate_inc_paths` /
+/// `validate_plugin_fingerprint`.
+pub fn hydrate_builtins(conn: &Connection) -> rusqlite::Result<DashMap<String, String>> {
+    let map: DashMap<String, String> = DashMap::new();
+
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'builtins_perl_version'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let parsed = crate::builtins_pod::parse_perlfunc();
+
+    let need_parse = match (&stored, &parsed) {
+        (Some(s), Some(p)) => *s != p.perl_version,
+        (None, Some(_)) => true,
+        _ => false, // no parse + no cache rows we trust → leave map empty
+    };
+
+    if need_parse {
+        if let Some(p) = parsed.as_ref() {
+            conn.execute("DELETE FROM builtins", [])?;
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare("INSERT INTO builtins (name, doc) VALUES (?1, ?2)")?;
+                for (name, doc) in &p.entries {
+                    stmt.execute(params![name, doc])?;
+                }
+            }
+            tx.commit()?;
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('builtins_perl_version', ?1)",
+                params![p.perl_version],
+            )?;
+            log::info!("Indexed {} Perl builtins from {}", p.entries.len(), p.perl_version);
+        }
+    }
+
+    // Read whatever's in the table now (either freshly written, or
+    // the same rows from a prior run) into the in-memory mirror.
+    let mut stmt = conn.prepare("SELECT name, doc FROM builtins")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for r in rows {
+        if let Ok((name, doc)) = r {
+            map.insert(name, doc);
+        }
+    }
+    Ok(map)
 }
 
 /// Drop the module cache when the plugin set has changed since the last

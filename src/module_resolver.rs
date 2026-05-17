@@ -30,6 +30,7 @@ pub fn spawn_resolver(
     reverse_index: Arc<DashMap<String, Vec<String>>>,
     stale_modules: Arc<DashMap<String, ()>>,
     available_modules: Arc<DashMap<String, PathBuf>>,
+    builtins: Arc<DashMap<String, String>>,
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
@@ -65,6 +66,17 @@ pub fn spawn_resolver(
                     conn,
                     &crate::plugin::rhai_host::plugin_fingerprint(),
                 );
+                // Hydrate Perl builtin hover docs (cached in SQLite,
+                // re-parsed from perlfunc.pod only when the perl
+                // version tag changes).
+                match module_cache::hydrate_builtins(conn) {
+                    Ok(map) => {
+                        for entry in map.iter() {
+                            builtins.insert(entry.key().clone(), entry.value().clone());
+                        }
+                    }
+                    Err(e) => log::warn!("Builtins hydrate failed: {}", e),
+                }
                 let (n, stale_names) = module_cache::warm_cache(conn, &cache);
                 log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
                 // Queue stale modules for priority re-resolution.

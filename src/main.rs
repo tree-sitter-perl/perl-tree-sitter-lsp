@@ -1,5 +1,6 @@
 mod backend;
 mod builder;
+mod builtins_pod;
 mod cpanfile;
 mod cursor_context;
 mod document;

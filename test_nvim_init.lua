@@ -8,8 +8,11 @@ vim.opt.updatetime = 300
 vim.opt.completeopt = { "menuone", "noselect", "popup" }
 vim.opt.pumheight = 15
 
--- Path to the built binary
-local lsp_bin = vim.fn.fnamemodify("target/release/perl-lsp", ":p")
+-- Path to the built binary. Override with PERL_LSP_BIN to point at a
+-- different server (e.g. EffortlessMetrics `perllsp`) for comparison runs.
+local lsp_bin = vim.env.PERL_LSP_BIN
+  and vim.fn.fnamemodify(vim.env.PERL_LSP_BIN, ":p")
+  or vim.fn.fnamemodify("target/release/perl-lsp", ":p")
 
 -- Debug mode: set PERL_LSP_DEBUG=1 env var before launching nvim to enable.
 --   PERL_LSP_DEBUG=1 nvim --clean -u test_nvim_init.lua test_files/sample.pl
