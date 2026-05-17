@@ -413,6 +413,92 @@ my $sq   = Math::Util::s
     );
 }
 
+/// `Foo::<cursor>` should also offer the *sub-packages* nested
+/// underneath, not just the methods on `Foo` itself. Typing `Mojo::`
+/// expects to see `Util`, `Base`, `IOLoop` etc. alongside any methods
+/// `Mojo` directly carries. Covers two sources of sub-packages —
+/// in-file `package Foo::Bar` declarations AND cross-file modules
+/// known to the resolver index — since either can be the right
+/// answer in a real project.
+#[test]
+fn test_qualified_path_completion_offers_sub_packages() {
+    let source = "\
+package Math::Util;
+sub square { my ($n) = @_; $n * $n }
+package Math::Helpers;     # in-file sub-package, no module index entry
+sub clamp { my ($x, $lo, $hi) = @_; $x }
+package main;
+my $x = Math::
+";
+    let analysis = parse_analysis(source);
+    let module_index = ModuleIndex::new_for_test();
+    module_index.set_workspace_root(None);
+    // Cross-file sub-package: known via the workspace index, mirrors
+    // the real "every package in its own .pm" project layout.
+    module_index.insert_cache(
+        "Math::Stats",
+        Some(fake_cached("/usr/lib/perl5/Math/Stats.pm", &[], &["mean", "stddev"])),
+    );
+    // Unrelated module — must not bleed into Math:: results.
+    module_index.insert_cache(
+        "Scalar::Util",
+        Some(fake_cached(
+            "/usr/lib/perl5/Scalar/Util.pm",
+            &[],
+            &["blessed", "reftype"],
+        )),
+    );
+
+    let tree = crate::document::Document::new(source.to_string())
+        .unwrap()
+        .tree;
+    // Cursor at end of `Math::` on the last source line.
+    let last_line_idx = source.lines().count() as u32 - 1;
+    let line_text = source.lines().last().unwrap();
+    let items = completion_items(
+        &analysis,
+        &tree,
+        source,
+        Position { line: last_line_idx, character: line_text.len() as u32 },
+        &module_index,
+        None,
+    );
+
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"Util"),
+        "`Math::` should offer in-file sub-package `Util`, got {:?}",
+        labels,
+    );
+    assert!(
+        labels.contains(&"Helpers"),
+        "`Math::` should offer in-file sub-package `Helpers`, got {:?}",
+        labels,
+    );
+    assert!(
+        labels.contains(&"Stats"),
+        "`Math::` should offer cross-file sub-package `Stats`, got {:?}",
+        labels,
+    );
+    assert!(
+        !labels.contains(&"Scalar::Util") && !labels.contains(&"blessed"),
+        "`Math::` must NOT bleed unrelated workspace symbols, got {:?}",
+        labels,
+    );
+    // Sub-packages carry SymbolKind::MODULE, subs carry FUNCTION —
+    // sanity-check the kind so clients pick the right icon.
+    for item in &items {
+        if matches!(item.label.as_str(), "Util" | "Helpers" | "Stats") {
+            assert_eq!(
+                item.kind,
+                Some(tower_lsp::lsp_types::CompletionItemKind::MODULE),
+                "sub-package `{}` should be SymbolKind::MODULE",
+                item.label,
+            );
+        }
+    }
+}
+
 /// Sibling case: the *package name itself* arrives via const-fold.
 /// `my $pkg = 'Math::Util';` should let `$pkg->squ<cursor>` narrow
 /// to `Math::Util`'s methods — but reaching that end-state needs the

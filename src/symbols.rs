@@ -792,34 +792,71 @@ fn complete_import_list(module_name: &str, module_index: &ModuleIndex) -> Vec<Co
 }
 
 /// Completion items for `Package::<cursor>` — subs declared in that
-/// package, in both the current file's analysis and the cross-file
-/// module index. Inherited subs are included via the existing
-/// class-completion path so `Child::` shows ancestor methods too.
+/// package (cross-file + local + inherited) PLUS sub-packages nested
+/// underneath. Typing `Mojo::` shows both the methods on Mojo itself
+/// and the available namespaces (`Util`, `Base`, `IOLoop`, …) so the
+/// user can drill in without leaving completion. Subs sort first
+/// (priority 010), sub-packages second (020).
 fn qualified_path_completions(
     analysis: &FileAnalysis,
     module_index: &ModuleIndex,
     package: &str,
 ) -> Vec<CompletionItem> {
-    let candidates = analysis.complete_methods_for_class(package, Some(module_index));
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    candidates
-        .into_iter()
-        .filter_map(|c| {
-            if !seen.insert(c.label.clone()) {
-                return None;
-            }
-            // Insert the bare sub name — the typed `Package::` prefix
-            // is already at the cursor and stays put.
-            Some(CompletionItem {
-                label: c.label.clone(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail: c.detail.clone().or_else(|| Some(format!("from {}", package))),
-                sort_text: Some(format!("010{}", c.label)),
-                insert_text: Some(c.label),
-                ..Default::default()
-            })
-        })
-        .collect()
+    let mut items: Vec<CompletionItem> = Vec::new();
+
+    // Subs declared in this package (cross-file + local + inherited).
+    // Insert the bare name — the typed `Package::` prefix stays put.
+    for c in analysis.complete_methods_for_class(package, Some(module_index)) {
+        if !seen.insert(c.label.clone()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: c.label.clone(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: c.detail.clone().or_else(|| Some(format!("from {}", package))),
+            sort_text: Some(format!("010{}", c.label)),
+            insert_text: Some(c.label),
+            ..Default::default()
+        });
+    }
+
+    // Sub-packages — both cross-file modules whose name starts with
+    // `Package::` AND in-file `package Package::Other` declarations.
+    // Label is the suffix (what follows the typed prefix), so the
+    // client's `Package::<typed>` filter matches naturally.
+    let prefix = format!("{}::", package);
+    let mut subpaths: Vec<(String, &'static str)> = Vec::new();
+    for (name, is_resolved) in module_index.complete_module_names(&prefix) {
+        let hint = if is_resolved { "indexed" } else { "available" };
+        subpaths.push((name, hint));
+    }
+    for sym in &analysis.symbols {
+        if !matches!(sym.kind, FaSymKind::Package | FaSymKind::Class) {
+            continue;
+        }
+        if sym.name.starts_with(&prefix) && sym.name != package {
+            subpaths.push((sym.name.clone(), "in-file"));
+        }
+    }
+    for (name, hint) in subpaths {
+        let suffix = match name.strip_prefix(&prefix) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        if !seen.insert(suffix.clone()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: suffix.clone(),
+            kind: Some(CompletionItemKind::MODULE),
+            detail: Some(hint.to_string()),
+            sort_text: Some(format!("020{}", suffix)),
+            insert_text: Some(suffix),
+            ..Default::default()
+        });
+    }
+    items
 }
 
 /// Returns snippet completions for ref-type dereference after `->`.
