@@ -31,9 +31,8 @@ pub fn default_plugin_registry() -> Arc<PluginRegistry> {
     }).clone()
 }
 
-/// Single CST walk that powers the post-walk `ChainTypingReducer`
-/// (Phase 5 of the type-inference worklist refactor). Replaces three
-/// independent tree walks at the old steps 7/8/10:
+/// Single CST walk that powers the post-walk `ChainTypingReducer`.
+/// Indexes the node sets the reducer needs:
 ///
 /// - `assignment_nodes` — every `assignment_expression`, used to type
 ///   `my $X = <rhs>` (and bare `$X = …`) via `resolve_invocant_class_tree`.
@@ -158,7 +157,7 @@ pub fn build_with_plugins(
 /// Test-only entry: build the file, then re-run the worklist fold
 /// driver (`fold_to_fixed_point`) one extra time before finalizing.
 ///
-/// Since Phase 6, the fold is fully idempotent: the resulting
+/// The fold is fully idempotent: the resulting
 /// `FileAnalysis` is byte-identical to a plain `build_with_plugins(...)`
 /// call — same `type_provenance`, same `sub_return_type_at_arity`
 /// answers, same witness counts. The two re-emittable passes inside
@@ -304,9 +303,9 @@ fn build_with_plugins_inner(
     // See `docs/prompt-forward-reference-resolution.md`.
     b.resolve_forward_expr_witnesses();
 
-    // Phase 6: worklist driver. Replaces the manually-ordered
-    // `fold → chain → fold → chain` sequence with one fixed-point
-    // loop over chain typing + reducer dispatch. Each iteration runs
+    // Worklist driver: one fixed-point loop over chain typing +
+    // reducer dispatch (rather than a manually-ordered
+    // `fold → chain → fold → chain` sequence). Each iteration runs
     // `ChainPassMode::PreFold` (assignment + return-arm refresh)
     // followed by `resolve_return_types`; the loop exits when the
     // snapshot of Sub/Method return types and bag length stops
@@ -945,18 +944,15 @@ struct Builder<'a> {
     /// `(scope, arr_name, contribution_spans)` triples — re-emitted
     /// each iteration as `Variable{arr_name, scope} +
     /// InferredType(Sequence(...))` with the latest known per-arg
-    /// types. Clear-and-emit on `source_tag = "array_push"`. Spike
-    /// scope: tuple shape only; cross-scope and conditional
-    /// branches not yet handled.
+    /// types. Clear-and-emit on `source_tag = "array_push"`. Tuple
+    /// shape only; cross-scope and conditional branches not handled.
     pending_array_pushes: Vec<(ScopeId, String, Vec<Span>)>,
     /// For each Sub/Method scope, the body span of the last
     /// top-level expression statement. Used as the implicit-return
     /// query key — `seed_return_types_from_bag` reads `Expr(span)` via
     /// `bag_query_expr_span` for scopes without an explicit `return`.
-    /// Replaces the old `last_expr_type: HashMap<ScopeId,
-    /// Option<InferredType>>` dual-store: types now ride the bag,
-    /// this map only carries the structural pointer to the source
-    /// span.
+    /// Types ride the bag; this map only carries the structural
+    /// pointer to the source span.
     last_expr_span: std::collections::HashMap<ScopeId, Span>,
     /// Assignments where RHS is a function call — resolved in return-type post-pass.
     call_bindings: Vec<CallBinding>,
@@ -7097,28 +7093,21 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Phase 5 of the worklist refactor: the three post-walk CST walks
-    /// (assignment typing, return-arm refresh, invocant-class refresh)
-    /// collapse into one **ChainTypingReducer**. A single CST walk
-    /// builds a `ChainTypingIndex` (assignment, return-expression, and
-    /// invocant nodes by span); the reducer drains the index in two
-    /// modes — `PreFold` between the two `resolve_return_types` calls
-    /// (assignments + return arms feed fold-2), `PostFold` after the
-    /// second fold (invocants are query-time outputs and need every
-    /// sub return type resolved).
+    /// The post-walk **ChainTypingReducer**: one CST walk builds a
+    /// `ChainTypingIndex` (assignment, return-expression, and invocant
+    /// nodes by span); this drains it in two modes — `PreFold`
+    /// (assignments + return arms feed the next `resolve_return_types`)
+    /// and `PostFold` (invocants are query-time outputs, so they need
+    /// every sub return type resolved first). The worklist driver
+    /// (`fold_to_fixed_point`) calls `PreFold` each iteration and
+    /// `PostFold` once after the lattice settles. Assignment + invocant
+    /// typing run through `resolve_invocant_class_tree`; return arms
+    /// feed the fold via `return_infos`.
     ///
-    /// The recursive typer (`resolve_invocant_class_tree` for
-    /// assignments + invocants, `infer_return_value_type` for return
-    /// arms) is unchanged — only the scheduling collapses. Step 6's
-    /// first invocation feeds chain types via the same path; step 9
-    /// (still the second hardcoded fold call) re-runs and picks up any
-    /// chain types that needed the first fold to land. Phase 6 will
-    /// replace the explicit pre/post split with a worklist driver.
-    ///
-    /// Idempotent across both calls — assignments skip if a TC already
+    /// Idempotent across calls — assignments skip if a TC already
     /// exists, return arms only upgrade `None → Some`, invocants skip
     /// if `invocant_class` is already pinned. Running the reducer twice
-    /// in `PostFold` mode would type strictly the same set as one call.
+    /// in `PostFold` mode types strictly the same set as one call.
     fn run_chain_typing_reducer(
         &mut self,
         idx: &ChainTypingIndex<'a>,
@@ -7144,13 +7133,12 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Phase 6: replace the manually-ordered `fold → chain → fold`
-    /// sequence with a fixed-point loop. Each iteration runs
-    /// `ChainPassMode::PreFold` (assignment typing + return-arm refresh)
-    /// followed by `resolve_return_types` (the reducer-dispatch driver
-    /// from Phase 4); when the snapshot of Sub/Method return types and
-    /// the bag length stops moving, the lattice has settled and the
-    /// loop exits.
+    /// Fixed-point loop driving chain typing + reducer dispatch. Each
+    /// iteration runs `ChainPassMode::PreFold` (assignment typing +
+    /// return-arm refresh) followed by `resolve_return_types` (the
+    /// reducer-dispatch driver); when the snapshot of Sub/Method return
+    /// types and the bag length stops moving, the lattice has settled
+    /// and the loop exits.
     ///
     /// The two re-emittable passes inside `resolve_return_types`
     /// (arity-return witnesses, call-binding propagator) are
@@ -7499,10 +7487,10 @@ impl<'a> Builder<'a> {
     }
 
 
-    /// Phase 4 of the worklist refactor: this is the tiny driver. Each
-    /// step is a named helper below. The call-binding propagator and
-    /// hash-key-owner fixup are post-fold sync passes — they're
-    /// conceptually "not reducers" (per the spec) and stay procedural,
+    /// The tiny reducer-dispatch driver. Each step is a named helper
+    /// below. The call-binding propagator and hash-key-owner fixup are
+    /// post-fold sync passes — conceptually "not reducers" and stay
+    /// procedural,
     /// but factored out as named methods. The reducer registry
     /// (`PluginOverrideReducer`, `ReturnExprReducer`,
     /// `MethodOnClassReducer`, `SubReturnReducer`) lives in
@@ -8166,9 +8154,9 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Step 8: `CallBindingPropagator` (per Phase 4 spec — not a
-    /// witness reducer, just the bag-and-TC sync pass that runs after
-    /// the fold). For each `my $cfg = get_config()` binding recorded
+    /// `CallBindingPropagator` — not a witness reducer, just the
+    /// bag-and-TC sync pass that runs after the fold. For each
+    /// `my $cfg = get_config()` binding recorded
     /// during the walk, push BOTH the legacy `TypeConstraint` and the
     /// corresponding `Variable` witness so any later bag query about
     /// `$cfg` sees the call-resolved type without a separate sync pass.
