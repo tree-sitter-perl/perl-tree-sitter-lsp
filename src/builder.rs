@@ -1012,9 +1012,8 @@ struct Builder<'a> {
     /// push directly here. Moved into `FileAnalysis.witnesses` when
     /// the analysis is constructed — no second seeding pass.
     bag: crate::witnesses::WitnessBag,
-    /// Walk-time symbol-table lookups that came up empty for a name
-    /// Nodes that `emit_expr_witness` couldn't resolve at walk
-    /// time. Two common shapes:
+    /// Nodes that `emit_expr_witness` couldn't resolve at walk time.
+    /// Two common shapes:
     ///   * **Forward-defined sub call** — `sub a { b() } sub b {…}`
     ///     is legal Perl, but the walk emits witnesses live and the
     ///     callee isn't in the symbol table yet when `b()` is
@@ -1528,14 +1527,6 @@ impl<'a> Builder<'a> {
             .collect()
     }
 
-    /// Best-effort receiver-type resolution for a method call. Handles:
-    ///   * `$self` / `__PACKAGE__`        → current package
-    ///   * bare `Pkg::Name`               → literal class
-    ///   * `$var` with a prior `my $var = Pkg->new` → looked up via
-    ///     the bag's Variable witnesses (latest wins). This lets the
-    ///     mojo-events plugin resolve `$obj->emit(...)` in a consumer
-    ///     file to the producer's class, enabling cross-file def/ref
-    ///     pairing.
     /// Resolve a bare `foo()` call to the package whose `sub foo` it
     /// refers to. Order mirrors Perl's name-lookup rule:
     ///
