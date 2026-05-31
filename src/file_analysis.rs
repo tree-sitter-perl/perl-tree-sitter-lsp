@@ -2410,15 +2410,13 @@ impl FileAnalysis {
             module_index: None,
             package_parents: &self.package_parents,
             };
-        // Default the arity hint from the sym's own param count
-        // when the caller didn't supply one. Symbol introspection
-        // is naturally "what does THIS sym return," and the sym's
-        // params count IS its native arity — Mojo writer (params=1)
-        // answers its `(AtLeast(1), Receiver)` arm, getter (params=0)
-        // answers its `(Empty, Concrete(_))` arm. Without this, a
-        // writer's per-Symbol UnionOnArgs would be unmatched at a
-        // None hint (AtLeast(1) doesn't match None) and the query
-        // would silently return None.
+        // Default the arity hint from the sym's own param count when
+        // the caller didn't supply one — the sym's params count IS its
+        // native arity. Mojo writer (params=1) answers its
+        // `(AtLeast(1), Receiver)` arm, getter (params=0) its
+        // `(Empty, Concrete(_))` arm. Without this a writer's
+        // UnionOnArgs would be unmatched at a None hint (AtLeast(1)
+        // doesn't match None) and the query would silently return None.
         //
         // Default receiver = `ClassName(class)` so the writer's
         // `Receiver` placeholder evaluates to the natural fluent
@@ -2556,20 +2554,16 @@ impl FileAnalysis {
             class_name.to_string()
         };
         if let Some(ref rt) = self.find_method_return_type(class_name, method_name, module_index, None) {
-            // `opaque_return` lets the declaring plugin say "this
-            // whole chain link is internal plumbing — don't render
-            // the class name OR the return type". The chain still
-            // resolves (find_method_return_type returned the proxy),
-            // but the user doesn't see the proxy-class path at every
-            // completion detail line. Plugin-declared; the core
-            // never inspects names.
+            // `opaque_return` lets the declaring plugin say "this chain
+            // link is internal plumbing — don't render the class name OR
+            // the return type". The chain still resolves; the user just
+            // doesn't see the proxy-class path at every completion detail.
             //
-            // Check both the completion context class AND the
-            // defining class (when the method is inherited from a
-            // parent): the plugin declares opacity on the symbol
-            // where the method LIVES, which is the defining class
-            // during a cross-class walk (e.g. Users inheriting the
-            // helper from Mojolicious::Controller).
+            // Check both the context class AND the defining class: the
+            // plugin declares opacity on the symbol where the method
+            // LIVES, which is the defining class during a cross-class
+            // walk (e.g. Users inheriting the helper from
+            // Mojolicious::Controller).
             let opaque = self.method_opaque_return_cross_file(class_name, method_name, module_index)
                 || defining_class.is_some_and(|dc| {
                     self.method_opaque_return_cross_file(dc, method_name, module_index)
@@ -3042,23 +3036,18 @@ impl FileAnalysis {
                 RefKind::MethodCall { .. } => {
                     let class_name = self.method_call_invocant_class(r, module_index);
 
-                    // Check if cursor is on a named arg key in the
-                    // call args, not on the method name itself.
-                    // Resolve to hash key def or :param field.
+                    // Cursor on a named arg key (not the method name):
+                    // resolve to its hash-key def or :param field.
                     //
-                    // The owner for hash-key args is per-flavor +
-                    // method-aware: ask the receiver's
-                    // ParametricType for `method_arg_owner(method)`
-                    // — `Some(owner)` means the flavor claims this
-                    // method's args (DBIC's ResultSet returns the
-                    // row class for search/find/create/etc.;
-                    // returns None for count/exists). When the
-                    // flavor doesn't claim, fall back to the
-                    // receiver's class (constructor keys etc. on
-                    // `bless { } 'Foo'`-shaped non-Parametric
-                    // values). Method dispatch on the same ref
-                    // still uses `class_name()`, so `$rs->search`
-                    // resolves against the ResultSet base.
+                    // The hash-key-arg owner is per-flavor + method-aware:
+                    // `ParametricType::method_arg_owner(method)` —
+                    // `Some(owner)` means the flavor claims these args
+                    // (DBIC ResultSet → row class for search/find/create;
+                    // None for count/exists). When unclaimed, fall back to
+                    // the receiver's class (constructor keys on
+                    // `bless {} 'Foo'`). Method dispatch still uses
+                    // `class_name()`, so `$rs->search` resolves against the
+                    // ResultSet base.
                     if let (Some(t), Some(s)) = (tree, source_bytes) {
                         if let Some(key_name) = self.call_arg_key_at(t, s, point) {
                             let owner = self
@@ -3681,8 +3670,6 @@ impl FileAnalysis {
         None
     }
 
-    /// Find all occurrences of a sub name (def + ALL call refs) for cross-file rename.
-    /// Searches both FunctionCall and MethodCall refs because Perl subs can be called either way.
     /// Scope-aware rename for a sub/method: matches decls + both
     /// call shapes that resolve to this (scope, name) pair.
     ///
@@ -3906,36 +3893,29 @@ impl FileAnalysis {
     }
 
     /// Resolve a `MethodCall` ref's invocant class via the witness
-    /// bag — **the** invocant resolver. No tree, no text fallback,
-    /// no per-reader parallel paths. Every reader (refs_to,
-    /// find_highlights, collect_refs_for_target, rename_callable_in_scope,
-    /// hover, find-def, rename_kind_at, resolve_target_at, the
-    /// completion path) routes through here.
+    /// bag — **the** invocant resolver. No tree, no text fallback, no
+    /// per-reader parallel paths: every reader routes through here.
     ///
     /// Dispatch by invocant shape:
     ///   * `$var` / `@var` / `%var` → `inferred_type_via_bag` (so
-    ///     cross-file enrichment's variable types compose
-    ///     automatically — the bug that prompted this rewrite).
+    ///     cross-file enrichment's variable types compose automatically).
     ///   * `$self` (untyped) → enclosing class fallback.
     ///   * `__PACKAGE__` → enclosing class.
     ///   * Chain or function-call receiver (invocant_span points at
     ///     another ref) → that ref's bag answer
     ///     (`method_call_return_type_via_bag` for MethodCall;
-    ///     `sub_return_type_at_arity` for FunctionCall). Receiver
-    ///     ref is found via the `call_ref_by_start` index (O(1)).
+    ///     `sub_return_type_at_arity` for FunctionCall). Receiver ref
+    ///     found via the `call_ref_by_start` index (O(1)).
     ///   * Bareword → `Foo` if a zero-arg sub by that name returns
     ///     ClassName, else the bareword itself.
     ///
-    /// Build-time chain typing still runs in the builder — its
-    /// product lands in the bag (Variable witnesses, `Expression`
-    /// edge witnesses on chain receivers). This helper just queries
-    /// the bag, never re-derives.
+    /// Query-only: build-time chain typing already landed its product
+    /// in the bag (Variable witnesses, `Expression` edge witnesses on
+    /// chain receivers); this never re-derives.
     ///
-    /// `module_index` lets chain receivers whose return type lives
-    /// in another package resolve (e.g. `$r->get('/x')->to(...)`
-    /// where `Routes::get` returns `Routes::Route`). Pass `None`
-    /// only when no index is available (CLI debug, isolated tests);
-    /// every LSP-facing reader has one.
+    /// `module_index` lets chain receivers whose return type lives in
+    /// another package resolve (e.g. `$r->get('/x')->to(...)`). Pass
+    /// `None` only for CLI debug / isolated tests.
     pub fn method_call_invocant_class(
         &self,
         r: &Ref,
