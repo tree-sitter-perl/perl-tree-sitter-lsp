@@ -4232,35 +4232,43 @@ impl<'a> Builder<'a> {
     /// Emit the `Expr(span)` witnesses for `node` and (recursively)
     /// its sub-arms. For a non-ternary node: one witness on
     /// `Expr(span)` with the node's `expr_payload` (literal type, or
-    /// Edge to Variable/Symbol/Expression). For a ternary: two
-    /// `branch_arm`-source `Edge(Expr(arm_span))` witnesses on
-    /// `Expr(span)`, plus a recursive call per arm so each arm's own
-    /// `Expr(span)` is populated. Idempotent on span — multiple
-    /// callers (return arm + chain typing + RHS-of-assignment) firing
-    /// against the same node produce duplicate witnesses but don't
-    /// change query answers, since the latest-wins reducers fold
-    /// them all the same way.
+    /// Edge to Variable/Symbol/Expression). For a ternary: one
+    /// `Edge(Expr(arm_span))` per arm on `BranchArm(span)`, a single
+    /// `Edge(BranchArm(span))` on `Expr(span)` (so the expression
+    /// resolves to `BranchArmFold`'s agreed answer), plus a recursive
+    /// call per arm so each arm's own `Expr(span)` is populated.
+    /// Idempotent on span — multiple callers (return arm + chain typing
+    /// + RHS-of-assignment) firing against the same node produce
+    /// duplicate witnesses but don't change query answers, since the
+    /// latest-wins reducers fold them all the same way.
     fn emit_expr_witness(&mut self, node: Node<'a>) {
         use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
         let span = node_to_span(node);
         if node.kind() == "conditional_expression" {
+            let arm_att = WitnessAttachment::BranchArm(span);
             let arms = [
                 node.child_by_field_name("consequent"),
                 node.child_by_field_name("alternative"),
             ];
             for arm in arms.into_iter().flatten() {
                 // Make sure the arm's own Expr(span) carries its
-                // payload — consumers Edge into it from
-                // Variable($n)/Symbol(sid) for the `my $n = $c ? A : B`
-                // and ternary-return paths.
+                // payload, then collect it on the BranchArm attachment.
                 self.emit_expr_witness(arm);
                 self.bag.push(Witness {
-                    attachment: WitnessAttachment::Expr(span),
+                    attachment: arm_att.clone(),
                     source: WitnessSource::Builder("branch_arm".into()),
                     payload: WitnessPayload::Edge(WitnessAttachment::Expr(node_to_span(arm))),
                     span: node_to_span(arm),
                 });
             }
+            // The ternary's value IS the agreed arm type: point its
+            // Expr(span) at the BranchArm fold.
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Expr(span),
+                source: WitnessSource::Builder("branch_arm".into()),
+                payload: WitnessPayload::Edge(arm_att),
+                span,
+            });
             return;
         }
         if let Some(payload) = self.expr_payload(node) {

@@ -394,12 +394,10 @@ fn narrowed_span_wins_over_outer_witness_at_inside_point() {
 // type before BranchArmFold sees it. These tests pin the agreement
 // rule on direct types.
 
-fn wbranch(name: &str, scope: u32, t: InferredType) -> Witness {
+// A ternary arm: one type witness on the ternary's `BranchArm(span)`.
+fn wbranch(t: InferredType) -> Witness {
     Witness {
-        attachment: WitnessAttachment::Variable {
-            name: name.to_string(),
-            scope: ScopeId(scope),
-        },
+        attachment: WitnessAttachment::BranchArm(span(0, 0, 0, 0)),
         source: WitnessSource::Builder("branch_arm".into()),
         payload: WitnessPayload::InferredType(t),
         span: span(0, 0, 0, 0),
@@ -409,13 +407,10 @@ fn wbranch(name: &str, scope: u32, t: InferredType) -> Witness {
 #[test]
 fn branch_arms_agree_folds_to_that_type() {
     let mut bag = WitnessBag::new();
-    bag.push(wbranch("$x", 0, InferredType::Numeric));
-    bag.push(wbranch("$x", 0, InferredType::Numeric));
+    bag.push(wbranch(InferredType::Numeric));
+    bag.push(wbranch(InferredType::Numeric));
     let reg = ReducerRegistry::with_defaults();
-    let att = WitnessAttachment::Variable {
-        name: "$x".into(),
-        scope: ScopeId(0),
-    };
+    let att = WitnessAttachment::BranchArm(span(0, 0, 0, 0));
     let q = ReducerQuery {
         attachment: &att,
         point: None,
@@ -431,13 +426,10 @@ fn branch_arms_agree_folds_to_that_type() {
 #[test]
 fn branch_arms_disagree_folds_to_none() {
     let mut bag = WitnessBag::new();
-    bag.push(wbranch("$x", 0, InferredType::Numeric));
-    bag.push(wbranch("$x", 0, InferredType::String));
+    bag.push(wbranch(InferredType::Numeric));
+    bag.push(wbranch(InferredType::String));
     let reg = ReducerRegistry::with_defaults();
-    let att = WitnessAttachment::Variable {
-        name: "$x".into(),
-        scope: ScopeId(0),
-    };
+    let att = WitnessAttachment::BranchArm(span(0, 0, 0, 0));
     let q = ReducerQuery {
         attachment: &att,
         point: None,
@@ -475,10 +467,7 @@ fn branch_arm_edge_resolves_through_variable() {
         span: span(0, 0, 0, 0),
     });
     bag.push(Witness {
-        attachment: WitnessAttachment::Variable {
-            name: "$x".into(),
-            scope: ScopeId(0),
-        },
+        attachment: WitnessAttachment::BranchArm(span(0, 0, 0, 0)),
         source: WitnessSource::Builder("branch_arm".into()),
         payload: WitnessPayload::Edge(WitnessAttachment::Variable {
             name: "$a".into(),
@@ -487,10 +476,7 @@ fn branch_arm_edge_resolves_through_variable() {
         span: span(0, 0, 0, 0),
     });
     bag.push(Witness {
-        attachment: WitnessAttachment::Variable {
-            name: "$x".into(),
-            scope: ScopeId(0),
-        },
+        attachment: WitnessAttachment::BranchArm(span(0, 0, 0, 0)),
         source: WitnessSource::Builder("branch_arm".into()),
         payload: WitnessPayload::Edge(WitnessAttachment::Variable {
             name: "$b".into(),
@@ -499,10 +485,7 @@ fn branch_arm_edge_resolves_through_variable() {
         span: span(0, 0, 0, 0),
     });
     let reg = ReducerRegistry::with_defaults();
-    let att = WitnessAttachment::Variable {
-        name: "$x".into(),
-        scope: ScopeId(0),
-    };
+    let att = WitnessAttachment::BranchArm(span(0, 0, 0, 0));
     let q = ReducerQuery {
         attachment: &att,
         point: None,

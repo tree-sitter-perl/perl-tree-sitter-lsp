@@ -75,6 +75,16 @@ pub enum WitnessAttachment {
     /// Distinct from `Symbol(_)` so `SymbolReturnArmFold` claims by
     /// attachment shape, not source-tag exclusion.
     SymbolReturnArm(SymbolId),
+    /// Per-arm collector for a ternary `$c ? A : B`, keyed by the
+    /// conditional expression's span. Each arm pushes one
+    /// `Edge(Expr(arm_span))` here; the ternary's own `Expr(span)`
+    /// carries a single `Edge(BranchArm(span))` so consumers querying
+    /// the expression materialize the agreed arm type. Distinct shape
+    /// (like `SymbolReturnArm`) so `BranchArmFold` claims by attachment,
+    /// which is why `ExprReturn` / `FrameworkAwareTypeFold` no longer
+    /// have to exclude branch-arm witnesses from the shared `Expr` /
+    /// `Variable` attachments.
+    BranchArm(Span),
 }
 
 /// Index into `FileAnalysis::refs`.
@@ -489,17 +499,13 @@ impl WitnessReducer for FrameworkAwareTypeFold {
     }
 
     fn claims(&self, w: &Witness) -> bool {
-        // Excludes `branch_arm`-source witnesses — `BranchArmFold`
-        // (registered earlier) owns those so its agreement/disagreement
-        // rule applies; otherwise this fold's latest-wins would silently
-        // pick one of two disagreeing arms.
         matches!(
             w.attachment,
             WitnessAttachment::Variable { .. } | WitnessAttachment::Expression(_)
         ) && matches!(
             w.payload,
             WitnessPayload::InferredType(_) | WitnessPayload::Observation(_)
-        ) && !matches!(&w.source, WitnessSource::Builder(s) if s == "branch_arm")
+        )
     }
 
     fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
@@ -659,15 +665,15 @@ fn merge_rep(existing: Option<Rep>, new: Rep) -> Option<Rep> {
     }
 }
 
-// ---- Branch-arm fold reducer (ternary RHS + Expr-attached arms) ----
+// ---- Branch-arm fold reducer (ternary `$c ? A : B`) ----
 
-/// Branch-arm reduction for `Variable` and `Expr` attachments —
-/// `my $x = $c ? A : B` and the per-arm Expr witnesses a ternary carries.
+/// Folds a ternary's per-arm types on the `BranchArm(span)` attachment.
 /// Agreement across ≥2 arms → that type; a single arm → None (ternaries
 /// always carry both arms syntactically, so one witness means inference
-/// for the other arm failed). Symbol-attached return arms go through
-/// `SymbolReturnArmFold` instead — single-return subs DO carry their
-/// answer via one witness, so the ≥2 rule is wrong there.
+/// for the other arm failed). Claims by attachment shape — the ternary's
+/// `Expr(span)` carries one `Edge(BranchArm(span))` so a query on the
+/// expression materializes this fold's answer. Symbol-attached return
+/// arms go through `SymbolReturnArmFold` instead (1+ arms rule).
 pub struct BranchArmFold;
 
 impl WitnessReducer for BranchArmFold {
@@ -676,13 +682,7 @@ impl WitnessReducer for BranchArmFold {
     }
 
     fn claims(&self, w: &Witness) -> bool {
-        // Source-tag + attachment claim. Symbol attachments are owned by
-        // `SymbolReturnArmFold` (1+ arms rule), so restrict to
-        // Variable/Expr here.
-        matches!(
-            w.attachment,
-            WitnessAttachment::Variable { .. } | WitnessAttachment::Expr(_)
-        ) && matches!(&w.source, WitnessSource::Builder(s) if s == "branch_arm")
+        matches!(w.attachment, WitnessAttachment::BranchArm(_))
             && matches!(w.payload, WitnessPayload::InferredType(_))
     }
 
@@ -768,10 +768,6 @@ impl WitnessReducer for ExprReturn {
     fn claims(&self, w: &Witness) -> bool {
         matches!(w.attachment, WitnessAttachment::Expr(_))
             && matches!(w.payload, WitnessPayload::InferredType(_))
-            // BranchArmFold (registered earlier) owns `branch_arm`-source
-            // Expr witnesses; this covers the plain "this expr has a type"
-            // case.
-            && !matches!(&w.source, WitnessSource::Builder(s) if s == "branch_arm")
     }
 
     fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
@@ -1074,9 +1070,9 @@ impl ReducerRegistry {
         // shape; single-arm answers surface here, where BranchArmFold's
         // ≥2-arm rule would reject them.
         r.register(Box::new(SymbolReturnArmFold));
-        // BranchArmFold before FrameworkAwareTypeFold so the agreement/
-        // disagreement rule for branch_arm witnesses applies before the
-        // multi-axis fold's latest-wins could pick one disagreeing arm.
+        // BranchArmFold claims the dedicated `BranchArm(_)` shape, so its
+        // order relative to the Variable/Expr folds below is no longer
+        // load-bearing — they no longer overlap.
         r.register(Box::new(BranchArmFold));
         r.register(Box::new(FrameworkAwareTypeFold));
         r.register(Box::new(ExprReturn));
