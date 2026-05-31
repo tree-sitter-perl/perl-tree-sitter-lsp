@@ -57,15 +57,21 @@ read-only). References uses `VISIBLE` (yes, search deps too). Diagnostics
 use `VISIBLE`. Forgetting a tier is now visible at the type level — you
 have to write the mask down.
 
-### Single `resolve_symbol` + `refs_to`
+### Single `refs_to` (and a planned `resolve_symbol`)
 
 `src/resolve.rs` is the only place tier-walking lives. LSP handlers do not
-iterate `FileStore` directly. Adding a new query = picking a mask and
-calling `resolve_symbol` / `refs_to`.
+iterate `FileStore` directly. Adding a new cross-file query = picking a
+mask and calling `refs_to`.
 
 The walk: start at the `from` namespace, DFS through `package_parents`
 (soon: `namespace_parents`), filter file entries by mask. `refs_to` reads
 each file's `refs_by_target` for O(1) per-file lookup.
+
+The inverse direction — `resolve_symbol` (cursor → target) — is **not yet
+landed** (deferred to phase 5, below). Handlers still identify the target
+via `FileAnalysis::rename_kind_at` + an inline `RenameKind → TargetRef` map
+(duplicated across `backend.rs` references/rename and `main.rs`), then call
+`refs_to`. Unifying that into `resolve_symbol` is mostly de-duplication.
 
 ### Lazy enrichment, idempotent
 
