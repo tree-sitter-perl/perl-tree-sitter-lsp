@@ -41,7 +41,7 @@ pub(crate) mod point_opt_serde {
     }
 }
 
-// ---- Shared types (formerly in analysis.rs) ----
+// ---- Shared types ----
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Span {
@@ -1239,13 +1239,13 @@ pub struct FileAnalysis {
     /// (a Mojolicious app, a Minion instance, an event-emitter subclass,
     /// …). Declares bridges into Perl-space and owns a set of entities.
     /// Lookups union these with native Perl resolution — see
-    /// `ModuleIndex::namespaces_bridged_to` for the cross-file primitive.
+    /// `ModuleIndex::for_each_entity_bridged_to` for the cross-file primitive.
     #[serde(default)]
     pub plugin_namespaces: Vec<PluginNamespace>,
 
     /// Per-symbol provenance for return types. Populated for plugin
-    /// `overrides()` and (with this spike) for reducer-driven folds
-    /// over the witness bag. Missing entry == `TypeProvenance::Inferred`.
+    /// `overrides()` and for reducer-driven folds over the witness bag.
+    /// Missing entry == `TypeProvenance::Inferred`.
     /// Read-only debugging aid: features like hover/completion don't
     /// branch on it; it exists so `--dump-package` and a future
     /// inspector can answer "why does the LSP think this returns X?"
@@ -1253,14 +1253,13 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub type_provenance: HashMap<SymbolId, TypeProvenance>,
 
-    /// Detected framework mode per package (for Part 6's resolver).
+    /// Detected framework mode per package (for the type resolver).
     /// Populated by the builder when `use Moo` / `use Mojo::Base` /
-    /// `use Moose` etc. is observed. Additive: the existing framework
-    /// accessor synthesis keeps running the same code paths.
+    /// `use Moose` etc. is observed.
     #[serde(default)]
     pub package_framework: HashMap<String, crate::witnesses::FrameworkFact>,
 
-    /// Part 7 — the witness bag. Canonical store for type facts:
+    /// The witness bag. Canonical store for type facts:
     /// every Variable type, Symbol/MethodOnClass return type, branch
     /// arm Edge, hash-key observation. `inferred_type_via_bag` reads
     /// here. The builder pushes directly via `push_type_constraint`
@@ -1470,8 +1469,8 @@ impl FileAnalysis {
                 .push(sym.id);
         }
 
-        // Phase 5: link HashKeyAccess refs to their HashKeyDef symbols whenever
-        // the owner is already resolved (the builder's pre-pass handled type
+        // Link HashKeyAccess refs to their HashKeyDef symbols whenever the
+        // owner is already resolved (the builder's pre-pass handled type
         // constraints + variable identity + call-binding fixups). With this
         // link, `refs_to_symbol(def_id)` returns all accesses in O(1), which
         // is what references, rename, and highlights consume.
@@ -1532,7 +1531,7 @@ impl FileAnalysis {
             self.refs[idx].resolves_to = Some(sid);
         }
 
-        // Refs by target name, and refs by resolved target SymbolId (phase 5).
+        // Refs by target name, and refs by resolved target SymbolId.
         // Same loop populates the start-point → call-ref-idx index
         // used by `method_call_invocant_class` to chase chain
         // receivers. Only MethodCall (whose span covers the whole
@@ -1548,18 +1547,15 @@ impl FileAnalysis {
                 self.refs_by_target.entry(sym_id).or_default().push(i);
             }
             if matches!(r.kind, RefKind::MethodCall { .. } | RefKind::FunctionCall { .. }) {
-                // First write wins. Method-call refs are visited
-                // outer-first by the walker (the outer call site is
-                // emitted before recursing into its receiver), so
-                // for a chain like `Foo->new->m` the outer `m` ref
-                // would land at start point of `Foo`. Insert with
-                // `or_insert(i)` and rely on the inner receiver
-                // being visited later — but for FunctionCall there
-                // is no outer clash because chains-of-function-calls
-                // don't have the same shape. To keep the inner
-                // receiver as the lookup target, prefer overwriting
-                // when the new ref has a *smaller* span (closer to
-                // the actual receiver).
+                // Smaller span (closer to the actual receiver) wins;
+                // a tie keeps the earlier insertion. Method-call refs
+                // are visited outer-first, so for a chain like
+                // `Foo->new->m` the outer `m` and inner `Foo->new`
+                // share a start point — keeping the smaller-span ref
+                // points the index at the inner receiver. FunctionCall
+                // refs (just the function-name span) are naturally
+                // narrower than the enclosing MethodCall, so they win
+                // the same way.
                 let cur = self.call_ref_by_start.get(&r.span.start).copied();
                 let take = match cur {
                     None => true,
@@ -1701,11 +1697,10 @@ impl FileAnalysis {
         best.map(|(t, _)| t)
     }
 
-    /// Part 6/7 — query the witness bag via the reducer registry for
-    /// a variable at a point, falling back to the legacy
-    /// `inferred_type()` when the bag has nothing. Returns owned
-    /// `InferredType` because the reducer may synthesize a value not
-    /// stored anywhere.
+    /// Query the witness bag via the reducer registry for a variable at
+    /// a point, falling back to the legacy `inferred_type()` when the bag
+    /// has nothing. Returns owned `InferredType` because the reducer may
+    /// synthesize a value not stored anywhere.
     ///
     /// The bag is the canonical store: `push_type_constraint` (TC
     /// shape), `call_bindings` propagation, framework accessor
@@ -1774,10 +1769,10 @@ impl FileAnalysis {
         }
     }
 
-    /// Part 6b — resolve a sub's return type at a call site given
-    /// the caller's arg count. Queries the arity-dispatch reducer; if
-    /// no arity fact exists, falls back to the declared /
-    /// inferred-from-returns `sub_return_type`.
+    /// Resolve a sub's return type at a call site given the caller's arg
+    /// count. Queries the arity-dispatch reducer; if no arity fact
+    /// exists, falls back to `sub_return_type` (declared /
+    /// inferred-from-returns).
     ///
     /// `arity` is the number of *additional* args passed after the
     /// invocant on methods (or simply the arg count for plain subs).
@@ -1802,8 +1797,8 @@ impl FileAnalysis {
         )
     }
 
-    /// Part 1 — list hash keys that have been written to on instances
-    /// of `class`. Powers dynamic-key completion: `$self->{` completes
+    /// List hash keys that have been written to on instances of `class`.
+    /// Powers dynamic-key completion: `$self->{` completes
     /// with both `has`-declared keys and keys observed as write
     /// targets across the class's methods.
     #[allow(dead_code)] // documented type-query entry point; CLAUDE.md
@@ -3282,7 +3277,7 @@ impl FileAnalysis {
             results.push((sym.selection_span, AccessKind::Declaration));
         }
 
-        // Phase 5: O(1) lookup for every ref resolved to this symbol.
+        // O(1) lookup for every ref resolved to this symbol.
         // This covers variables, HashKeyAccess refs whose owner was resolved at
         // build time, and any future kinds that set resolves_to.
         for &idx in self.refs_to_symbol(target_id) {
@@ -4730,8 +4725,7 @@ impl FileAnalysis {
         // `package X;`, `my`/`our` decls, `use` imports, …) attach
         // to the file scope directly. Statement-form `package X;`
         // is package context, not a lexical boundary, so it doesn't
-        // create an intermediate scope. The bucket-merge + post-sort
-        // shim that used to live here is gone — children come out in
+        // create an intermediate scope. Children come out in
         // declaration order from the symbols vector.
         //
         // Plugin namespaces are NOT surfaced. They exist for
