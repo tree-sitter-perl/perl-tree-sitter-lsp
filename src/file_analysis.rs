@@ -563,22 +563,14 @@ pub enum ParametricType {
     ///   - method dispatch goes through `base`
     ///   - hash-key arg owner / direct hash-key access go through `row`
     ///
-    /// Pinned by internal-shape tests so a refactor to a single-
-    /// class encoding silently breaks `RowOf` rather than
-    /// silently returning the wrong dimension.
-    ResultSet { base: String, row: String },
-
-    /// `RowOf<T>` — type-level projection. Reduces:
-    ///   - `RowOf<ResultSet { base, row }>` → `ClassName(row)`
-    ///   - everything else → `None` (the operand has no row dimension)
+    /// Pinned by internal-shape tests so a refactor to a single-class
+    /// encoding can't silently merge the two dimensions.
     ///
-    /// Projected by the value-side accessors (`class_name` /
-    /// `hash_key_class`) and, in symbol-declarative form, by
-    /// `ReturnExprReducer`'s `Operator(RowOf)` arm. Composes —
-    /// `RowOf<RowOf<X>>` recurses into the operand. The row-projecting
-    /// methods (`find` / `first` / `single` / …) are declared in
-    /// `ParametricType::return_method_declarations`.
-    RowOf(Box<InferredType>),
+    /// The row-of projection (`find`/`first`/… → the row class) lives on
+    /// the deferred side as `ReturnExpr::Operator(RowOf)`, which
+    /// `eval_return_expr` projects eagerly to `ClassName(row)` — there is
+    /// no value-side `RowOf` variant.
+    ResultSet { base: String, row: String },
 }
 
 impl ParametricType {
@@ -587,17 +579,6 @@ impl ParametricType {
     pub fn class_name(&self) -> Option<&str> {
         match self {
             ParametricType::ResultSet { base, .. } => Some(base.as_str()),
-            ParametricType::RowOf(inner) => {
-                // Evaluate: row-class of inner (if inner is
-                // ResultSet) is the dispatch class for the
-                // projected value.
-                match inner.as_ref() {
-                    InferredType::Parametric(ParametricType::ResultSet { row, .. }) => {
-                        Some(row.as_str())
-                    }
-                    _ => None,
-                }
-            }
         }
     }
 
@@ -605,15 +586,10 @@ impl ParametricType {
     /// on this value. ResultSet returns `row` (the column-keyed
     /// class — used today only by the cleanup-pass HashKeyAccess
     /// owner-resolution paths; HRI shape isn't supported but the
-    /// field is the right one when it lands). Operators evaluate
-    /// recursively.
+    /// field is the right one when it lands).
     pub fn hash_key_class(&self) -> Option<&str> {
         match self {
             ParametricType::ResultSet { row, .. } => Some(row.as_str()),
-            ParametricType::RowOf(inner) => match inner.as_ref() {
-                InferredType::Parametric(p) => p.hash_key_class(),
-                _ => None,
-            },
         }
     }
 
@@ -636,7 +612,6 @@ impl ParametricType {
                 }
                 _ => None,
             },
-            ParametricType::RowOf(_) => None,
         }
     }
 
@@ -675,7 +650,6 @@ impl ParametricType {
                     .map(|m| (*m, row_of_receiver.clone()))
                     .collect()
             }
-            ParametricType::RowOf(_) => Vec::new(),
         }
     }
 }
@@ -6154,9 +6128,6 @@ fn format_parametric_type(p: &ParametricType) -> String {
     match p {
         ParametricType::ResultSet { base, row } => {
             format!("{}<{}>", base, row)
-        }
-        ParametricType::RowOf(inner) => {
-            format!("RowOf<{}>", format_inferred_type(inner))
         }
     }
 }

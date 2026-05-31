@@ -157,32 +157,22 @@ $row->{name};
 ";
     let fa = parse(src);
 
-    // $row's TC carries the unevaluated `Parametric(RowOf(ResultSet))`
-    // — the value-side projection. Consumers (`class_name()`,
-    // `hash_key_class()`) evaluate it on demand. Pin the structural
-    // shape so a regression to a flat / unrelated encoding trips
-    // here before any user-visible feature breaks.
+    // `find`'s `RowOf(Receiver)` over the ResultSet receiver projects
+    // eagerly to the row class, so $row is typed `ClassName(row)`. Pin it
+    // so a regression to a flat / unrelated encoding trips here before
+    // any user-visible feature breaks.
     let pt_row = point_at(src, "$row->{name}");
     let ty = fa.inferred_type_via_bag("$row", pt_row);
-    let parametric = match ty {
-        Some(InferredType::Parametric(p)) => p,
-        other => panic!(
-            "coderef call of `find` with a Parametric receiver must produce \
-             a Parametric (RowOf<ResultSet>); got {:?}",
-            other
-        ),
-    };
     assert_eq!(
-        parametric.class_name(),
+        ty.as_ref().and_then(|t| t.class_name()),
         Some("Schema::Result::Users"),
-        "RowOf<ResultSet>'s class_name() evaluates to the row class for \
-         downstream method dispatch + hash-key access"
+        "coderef call of `find` with a Parametric receiver projects to the \
+         row class for downstream method dispatch"
     );
     assert_eq!(
-        parametric.hash_key_class(),
+        ty.as_ref().and_then(|t| t.hash_key_class()),
         Some("Schema::Result::Users"),
-        "RowOf<ResultSet>'s hash_key_class() evaluates to the row class \
-         (delegates to inner ResultSet's hash_key_class)"
+        "...and the same row class for hash-key access"
     );
 }
 

@@ -858,12 +858,11 @@ fn return_expr_operator_rowof_wraps_receiver() {
         context: None,
     };
     let result = reg.query(&bag, &q);
-    let ReducedValue::Type(InferredType::Parametric(ParametricType::RowOf(inner))) = result else {
-        panic!("expected Parametric(RowOf(_)); got {:?}", result);
+    let ReducedValue::Type(InferredType::ClassName(class)) = result else {
+        panic!("expected ClassName(row); got {:?}", result);
     };
-    assert_eq!(*inner, receiver, "RowOf must wrap the substituted receiver");
-    // Downstream consumption: the value-side accessor evaluates RowOf
-    // to the row class.
-    let parametric = ParametricType::RowOf(inner);
-    assert_eq!(parametric.class_name(), Some("Schema::Result::Users"));
+    assert_eq!(
+        class, "Schema::Result::Users",
+        "RowOf(Receiver) over a ResultSet projects eagerly to the row class"
+    );
 }

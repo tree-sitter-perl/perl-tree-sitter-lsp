@@ -179,15 +179,16 @@ pub enum ReturnExpr {
     UnionOnArgs { branches: Vec<(ArgGuard, ReturnExpr)> },
 }
 
-/// Operators with `ReturnExpr`-valued sub-positions. Mirrors
-/// `ParametricType`'s operator flavors; concrete flavors (`ResultSet`)
-/// live in `ReturnExpr::Concrete(Parametric(...))` because they carry
-/// data, not sub-expressions. No `_ => …` fall-throughs.
+/// Type-level operators with `ReturnExpr`-valued sub-positions —
+/// projections that can't resolve until the receiver is substituted, so
+/// they live on the deferred (`ReturnExpr`) side, not on the concrete
+/// `InferredType`/`ParametricType` value side. No `_ => …` fall-throughs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ParametricOp {
-    /// `RowOf<T>` — projects a `ResultSet { base, row }` to
-    /// `ClassName(row)`. Evaluates by wrapping the substituted type in
-    /// `ParametricType::RowOf` so the value-side accessors resolve it.
+    /// `RowOf<T>` — projects a `ResultSet { base, row }` to its row class.
+    /// `eval_return_expr` evaluates the sub-expression and projects
+    /// eagerly: `ResultSet { row, .. }` → `ClassName(row)`, anything else
+    /// → `None`.
     RowOf(Box<ReturnExpr>),
 }
 
@@ -961,13 +962,17 @@ fn eval_return_expr(re: &ReturnExpr, q: &ReducerQuery) -> Option<InferredType> {
         ReturnExpr::Receiver => q.receiver.clone(),
         ReturnExpr::Operator(op) => match op {
             ParametricOp::RowOf(inner) => {
-                let inner_t = eval_return_expr(inner, q)?;
-                // Wrap into the value-side `RowOf` so the existing
-                // `ParametricType` accessors handle consumption uniformly
-                // (`RowOf(ResultSet{row,..})` → `Some(row)`, else `None`).
-                Some(InferredType::Parametric(ParametricType::RowOf(Box::new(
-                    inner_t,
-                ))))
+                // Project eagerly: `RowOf` only has meaning over a
+                // `ResultSet` (→ its row class). Any other operand has no
+                // row dimension, so → `None`. A projected row is a plain
+                // class with no further row dimension, so nested
+                // `RowOf<RowOf<…>>` correctly bottoms out at `None`.
+                match eval_return_expr(inner, q)? {
+                    InferredType::Parametric(ParametricType::ResultSet { row, .. }) => {
+                        Some(InferredType::ClassName(row))
+                    }
+                    _ => None,
+                }
             }
         },
         ReturnExpr::UnionOnArgs { branches } => {

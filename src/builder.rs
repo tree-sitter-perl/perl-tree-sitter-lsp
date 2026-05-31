@@ -6473,7 +6473,6 @@ impl<'a> Builder<'a> {
         let Some(p) = ty.as_parametric() else { return };
         let base_class = match p {
             crate::file_analysis::ParametricType::ResultSet { base, .. } => base.clone(),
-            crate::file_analysis::ParametricType::RowOf(_) => return,
         };
         let zero = Span {
             start: Point { row: 0, column: 0 },
