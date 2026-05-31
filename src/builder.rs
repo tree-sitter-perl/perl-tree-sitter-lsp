@@ -472,7 +472,7 @@ impl<'a> Builder<'a> {
             });
         }
 
-        // Part 1 — invocant mutations on hash keys.
+        // Invocant mutations on hash keys.
         let mut mutations: Vec<(HashKeyOwner, String, Span)> = Vec::new();
         for r in &self.refs {
             if let (RefKind::HashKeyAccess { owner, var_text }, AccessKind::Write) =
@@ -570,7 +570,7 @@ enum ArityBranch {
 /// look at the connector keyword (`if` vs `unless`) to decide. If
 /// it's a bare expression_statement, this is a default branch.
 ///
-/// Known idioms (spike shortlist):
+/// Known idioms:
 ///   - `return X unless @_;`       → Zero
 ///   - `return X;`                  → Default
 ///
@@ -2059,7 +2059,7 @@ impl<'a> Builder<'a> {
                 self.add_symbol_ns(name, SymKind::HashKeyDef, span, selection_span, detail, ns);
             }
             plugin::EmitAction::HashKeyAccess { name, owner, var_text, span, access } => {
-                // `owner: Some(owner)` so the phase-5 linkage pass (which looks
+                // `owner: Some(owner)` so the linkage pass (which looks
                 // for HashKeyAccess → HashKeyDef by name+owner) pairs these
                 // refs to both in-file and cross-file defs automatically.
                 self.refs.push(Ref {
@@ -2141,9 +2141,8 @@ impl<'a> Builder<'a> {
             }
             plugin::EmitAction::Symbol { name, kind, span, selection_span, detail, return_type } => {
                 // The per-symbol return type rides at the action
-                // level (not on `SymbolDetail`) since D1 of the
-                // bag-residual refactor. The Symbol(sid) push is the
-                // canonical record — chain typing's bag-routed
+                // level, not on `SymbolDetail`. The Symbol(sid) push
+                // is the canonical record — chain typing's bag-routed
                 // queries see plugin-synthesized callables uniformly
                 // with locals + imports. Writeback iterates symbols
                 // and pushes `MethodOnClass{class, name} → Edge(Symbol(sid))`
@@ -4788,8 +4787,8 @@ impl<'a> Builder<'a> {
         // each X / Y through `emit_expr_witness + bag_query_expr_span`,
         // look up the running Sequence for `@arr` in scope, append.
         // Latest-wins Variable witness keeps the running answer
-        // queryable at any later point. Spike scope: tuple shape
-        // only — no Homogeneous / Cycle classification yet.
+        // queryable at any later point. Tuple shape only — no
+        // homogeneous/heterogeneous classification yet.
         self.emit_array_push_contribution(arr_name, &children[1..]);
 
         let is_export = arr_name.ends_with("@EXPORT") && !arr_name.ends_with("@EXPORT_OK");
@@ -6168,7 +6167,7 @@ impl<'a> Builder<'a> {
         // Distinguish read vs write by asking determine_access on the
         // element node itself — `$self->{k} = ...` has this element as
         // the LHS of an assignment, so the grandparent check returns
-        // Write. Needed for Part 1 (invocant mutations).
+        // Write. Needed for invocant mutations.
         let element_access = self.determine_access(node);
 
         // Record the key access
@@ -6530,7 +6529,7 @@ impl<'a> Builder<'a> {
         let folded = self.resolve_constant_strings(var_text, 0)?;
         // Single-value fold only — multi-value (loop variable that
         // takes several strings) doesn't have a single row class to
-        // emit. Future Part 5 sum-types work could lift this.
+        // emit. Future sum-types work could lift this.
         if folded.len() == 1 {
             folded.into_iter().next()
         } else {

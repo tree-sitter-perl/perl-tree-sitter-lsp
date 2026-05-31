@@ -392,7 +392,7 @@ impl LanguageServer for Backend {
                 kind: TargetKind::Package,
             },
             Some(RenameKind::HashKey(name)) => {
-                // Phase 5: if the cursor is on a HashKeyDef or a HashKeyAccess
+                // If the cursor is on a HashKeyDef or a HashKeyAccess
                 // whose owner was resolved at build time, do a cross-file walk
                 // keyed on (key name, owner). If we can't determine the owner,
                 // fall back to single-file.

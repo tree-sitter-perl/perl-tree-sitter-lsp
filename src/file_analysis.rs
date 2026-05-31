@@ -2153,7 +2153,7 @@ impl FileAnalysis {
     }
 
     /// Rebuild indices affected by enrichment (type constraints + symbols +
-    /// the phase-5 refs_by_target + HashKeyAccess linkage).
+    /// refs_by_target + HashKeyAccess linkage).
     ///
     /// Enrichment injects synthetic HashKeyDef symbols for imported subs and
     /// clears `resolves_to` on HashKeyAccess refs that now have a matching
@@ -2175,7 +2175,7 @@ impl FileAnalysis {
         }
 
         // Re-link HashKeyAccess refs to (possibly newly-injected) HashKeyDef
-        // symbols, mirroring build_indices's phase-5 logic.
+        // symbols, mirroring build_indices's logic.
         let hashkey_defs: HashMap<(String, HashKeyOwner), SymbolId> = self.symbols.iter()
             .filter_map(|sym| {
                 if let SymbolDetail::HashKeyDef { owner, .. } = &sym.detail {
