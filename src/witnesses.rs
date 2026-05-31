@@ -142,11 +142,20 @@ pub enum WitnessPayload {
     Custom { family: String, json: String },
 }
 
-/// Receiver-relative / arity-relative return-type expression. Evaluated
-/// by `ReturnExprReducer` against the query's `receiver` and
-/// `arity_hint`. See `docs/adr/return-expr.md` and
-/// `docs/adr/parametric-types.md` for the sealed-enum rationale (every
-/// consumer dispatches via match, no `_ => …` fall-throughs).
+/// A sub's return type as a **deferred computation**, not a value:
+/// conceptually `(receiver, arity) -> InferredType`. `ReturnExprReducer`
+/// evaluates it against the query's `q.receiver` / `q.arity_hint`.
+///
+/// This is deliberately distinct from `InferredType` and must NOT be
+/// merged into it: `Receiver` is a free variable and `UnionOnArgs` is an
+/// arity-indexed dispatch table — neither is a concrete type. Folding
+/// these into `InferredType` would force every type *consumer* to handle
+/// "what if this is still an unsubstituted hole / a dispatch table?".
+/// Keeping the schema (`ReturnExpr`) separate from the value
+/// (`InferredType`) confines that concern to `eval_return_expr`.
+///
+/// See `docs/adr/return-expr.md` and `docs/adr/parametric-types.md` for
+/// the sealed-enum rationale (every consumer matches, no `_ => …`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReturnExpr {
     /// Concrete type — equivalent to a plain `InferredType` payload on a
