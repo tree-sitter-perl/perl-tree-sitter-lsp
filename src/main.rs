@@ -168,15 +168,6 @@ fn parse_point(line_str: &str, col_str: &str) -> tree_sitter::Point {
     tree_sitter::Point::new(line, col)
 }
 
-fn index_workspace(root: &str) -> file_store::FileStore {
-    use std::path::{Path, PathBuf};
-    let root_path = Path::new(root).canonicalize().unwrap_or_else(|_| PathBuf::from(root));
-    let store = file_store::FileStore::new();
-    let count = module_resolver::index_workspace(&root_path, &store);
-    eprintln!("Indexed {} files", count);
-    store
-}
-
 /// Canonicalize `root` and produce the matching `file://...` URI.
 /// Returns both because callers usually want the path (for `@INC`
 /// project-lib discovery, file walking) AND the URI (the cache hash
@@ -202,14 +193,14 @@ fn canonical_root_and_uri(root: &str) -> (std::path::PathBuf, String) {
 fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleIndex) {
     let (root_path, root_uri) = canonical_root_and_uri(root);
     // Pin repo-local `.perl-lsp/` plugin discovery to the same root the
-    // cache keys on, before `index_workspace` triggers the first build().
+    // cache keys on, before the first build() (workspace indexing) fires.
     plugin::rhai_host::set_workspace_root(Some(&root_uri));
 
     // Register workspace files INTO the module index (not just a FileStore)
     // so their plugin bridges + package names participate in cross-file
     // lookups — the whole point of "act like the server just started".
-    // Using the bridge-less `index_workspace` here is what forced callers
-    // to hand-roll their own `index_workspace_with_index`, and they drifted.
+    // Indexing without the index (bridge-less) is what forced callers to
+    // hand-roll their own `index_workspace_with_index`, and they drifted.
     let module_index = module_index::ModuleIndex::new_for_cli();
     let ws = file_store::FileStore::new();
     let indexed = module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index));
@@ -629,7 +620,9 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
 
     let file_path = Path::new(file).canonicalize().unwrap_or_else(|_| PathBuf::from(file));
     let point = parse_point(line_str, col_str);
-    let ws = index_workspace(root);
+    // Full startup so the workspace files this renames across are built with
+    // the same plugins (loaded from `root`'s `.perl-lsp/`, not cwd).
+    let (ws, _idx) = cli_full_startup(root);
 
     // Ensure target file is in the workspace index
     if ws.get_workspace(&file_path).is_none() {
@@ -961,7 +954,9 @@ fn cli_dump_package(root: &str, package_name: &str) {
 
 /// --workspace-symbol <root> <query> — Search symbols
 fn cli_workspace_symbol(root: &str, query: &str) {
-    let ws = index_workspace(root);
+    // Full startup so workspace symbols reflect plugin-synthesized entities
+    // (helpers, routes, accessors), built with `root`'s plugins not cwd's.
+    let (ws, _idx) = cli_full_startup(root);
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
 

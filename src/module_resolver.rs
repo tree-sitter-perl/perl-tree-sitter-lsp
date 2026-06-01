@@ -612,16 +612,6 @@ pub fn add_project_lib_paths(inc_paths: &mut Vec<PathBuf>, workspace_root: &std:
 }
 
 
-/// Index all Perl files in a workspace directory using Rayon for parallelism.
-/// Populates the workspace role of the shared `FileStore`. Returns the number
-/// of successfully indexed files.
-pub fn index_workspace(
-    root: &std::path::Path,
-    files: &crate::file_store::FileStore,
-) -> usize {
-    index_workspace_with_index(root, files, None)
-}
-
 /// Variant that also registers each indexed file in the given
 /// `ModuleIndex` under its primary package name. Used so workspace
 /// modules participate in cross-file lookups (method resolution,
