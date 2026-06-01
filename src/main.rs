@@ -560,6 +560,40 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
     let file_path = std::path::Path::new(file).canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(file));
 
+    // Handler refs (Minion tasks, Mojo events, …) fan out by (name, owner)
+    // through `refs_to` — the same path the LSP `references` handler uses.
+    // The hand-rolled sub/method/package walk below can't express the
+    // Handler target, so route it here before falling through.
+    if let Some(file_analysis::RenameKind::Handler { owner, name }) =
+        analysis.rename_kind_at(point, Some(&idx))
+    {
+        // Make the target file the freshest VISIBLE copy so its own refs
+        // join the cross-file set (workspace indexing may hold a staler one).
+        ws.insert_workspace(file_path.clone(), analysis);
+        let target = resolve::TargetRef {
+            name: name.clone(),
+            kind: resolve::TargetKind::Handler { owner, name },
+        };
+        let hits = resolve::refs_to(&ws, Some(&idx), &target, resolve::RoleMask::VISIBLE);
+        for loc in hits {
+            let path = match &loc.key {
+                file_store::FileKey::Path(p) => p.display().to_string(),
+                file_store::FileKey::Url(u) => u
+                    .to_file_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| u.to_string()),
+            };
+            results.push(serde_json::json!({
+                "file": path,
+                "line": loc.span.start.row,
+                "col": loc.span.start.column,
+            }));
+        }
+        println!("{}", serde_json::to_string_pretty(&results).unwrap());
+        eprintln!("{} references", results.len());
+        return;
+    }
+
     // Local refs
     let local_refs = analysis.find_references(point, Some(&tree), Some(source.as_bytes()), None);
     for span in &local_refs {

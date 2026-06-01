@@ -1579,3 +1579,60 @@ $x->makeFoo()->ping();
         highlights,
     );
 }
+
+/// Minion task references fan out cross-file. `$minion->add_task('T' => sub)`
+/// stamps a `Handler` owned by `Class("Minion")`; every dispatch site
+/// (`enqueue`, and crm's tenant sugar) emits a `DispatchCall` ref carrying
+/// the same `(name, owner)`. Pairing is owner+name only — the dispatcher
+/// verb never enters the match — so `refs_to(TargetKind::Handler)` collects
+/// the registration AND every caller across files. This is the resolve-side
+/// contract the LSP `references` handler and the `--references` CLI both lean
+/// on for "go to references on a minion task".
+#[test]
+fn refs_to_handler_fans_out_across_files() {
+    let store = FileStore::new();
+    let path_reg = PathBuf::from("/tmp/resolve_minion_reg.pm");
+    let path_call = PathBuf::from("/tmp/resolve_minion_call.pm");
+
+    // Registry file: add_task stamps the Handler (owner Class("Minion")).
+    let fa_reg = parse(
+        "package App::Tasks;\nuse Minion;\n\
+sub setup ($minion) {\n  $minion->add_task('send_email' => sub ($job, $to) { 1 });\n}\n1;\n",
+    );
+    store.insert_workspace(path_reg.clone(), fa_reg);
+
+    // Caller file: plain enqueue dispatch site → DispatchCall ref.
+    let fa_call = parse(
+        "package App::Caller;\nuse Minion;\n\
+sub fire ($minion) {\n  $minion->enqueue('send_email' => ['a@b']);\n}\n1;\n",
+    );
+    store.insert_workspace(path_call.clone(), fa_call);
+
+    let results = refs_to(
+        &store,
+        None,
+        &TargetRef {
+            name: "send_email".to_string(),
+            kind: TargetKind::Handler {
+                owner: crate::file_analysis::HandlerOwner::Class("Minion".to_string()),
+                name: "send_email".to_string(),
+            },
+        },
+        RoleMask::EDITABLE,
+    );
+
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(&r.key, FileKey::Path(p) if p == &path_reg)),
+        "expected the add_task registration in the registry file, got {:?}",
+        results,
+    );
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(&r.key, FileKey::Path(p) if p == &path_call)),
+        "expected the cross-file enqueue caller, got {:?}",
+        results,
+    );
+}
