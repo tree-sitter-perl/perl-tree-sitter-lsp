@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-use v5.42;
+use v5.36;
 use utf8;
 use warnings;
 use open ':std', ':encoding(UTF-8)';
@@ -50,11 +50,21 @@ like $rhai,
     qr|// TODO: unimport warnings \[experimental::for_list\] \(via import_into\)|,
     '`>-` prefix → unimport TODO (via import_into)';
 
-# --- Coderef → TODO with file:line -----------------------------------
+# --- Coderef probing -------------------------------------------------
+# The @IMPORT_MODULES coderef returns `'Carp::Clan' => ["^Mojo"]`;
+# probing runs it and turns the return value into a SyntheticUse.
 
 like $rhai,
-    qr|// TODO: coderef at .+/My/TestKit\.pm:\d+|,
-    'coderef in @IMPORT_MODULES → TODO with file:line';
+    qr/"module": "Carp::Clan", "args": \[\], "imports": \[\]/,
+    'coderef return value → bare `use` SyntheticUse (runtime args dropped)';
+
+# The -Controller bundle coderef calls
+# `$args->{package}->can('extends')->('Mojolicious::Controller')`;
+# the probe records it and emits a PackageParent on the consumer.
+
+like $rhai,
+    qr/"PackageParent": \#\{ "package": ctx\.current_package, "parent": "Mojolicious::Controller" \}/,
+    'coderef `extends` side effect → PackageParent (probe recorded the call)';
 
 # --- Bundle dispatch -------------------------------------------------
 

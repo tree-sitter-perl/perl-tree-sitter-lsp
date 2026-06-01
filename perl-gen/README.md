@@ -55,26 +55,37 @@ minimal Import::Base subclass covering every sigil + a coderef.
 | `<MOD => [args]`                | Same shape, emitted **first** within its bundle (base-class ordering) |
 | `-MOD => [args]`                | `// TODO: unimport ...` (no SyntheticUnuse primitive yet)             |
 | `>-MOD => [args]`               | Same TODO                                                             |
-| coderef                         | `// TODO: coderef at <file>:<line>` — user hand-authors               |
+| coderef (returns `MOD => [...]`)| `SyntheticUse { module: MOD }` (bare `use` — runtime args dropped)    |
+| coderef (`extends`/`with`/`parent`/`base`) | `PackageParent { parent }` per arg                        |
+| coderef (`load_components('A')`)| `PackageParent { parent: "DBIx::Class::A" }` (`+A` → bare `A`)        |
+| coderef (dies / unknown verb)   | `// TODO` with the source line and reason                            |
 
-The generator `require`s the kit (so `our`-vars populate) but
-**never invokes its `import` method** — no side effects, no probe
-package, no `Import::Into` monkey-patching. Coderef bodies don't
-execute. Multi-arg expressions like `map "-$_", qw/.../` evaluate
-at module-compile time (inside the literal array initializer) and
-survive into the generator as plain string lists.
+The generator `require`s the kit so its `our`-vars populate, then
+**runs each coderef once against a recording probe** standing in for
+the consumer package (`$args->{package}`). The coderef's return value
+becomes `SyntheticUse`; its `extends`/`with`/`parent`/`base`/
+`load_components` calls become `PackageParent`. It still **never invokes
+the kit's own `import` method** — only the individual coderefs run.
+
+> ⚠️ **Coderef probing is best-effort.** The probe executes each coderef
+> exactly once with a stand-in package and no bundle args, so any branch
+> on `$args->{package}`, the requested bundle, or other inputs is invisible.
+> Every probed coderef emits a `// best-effort:` banner anchored to its
+> kit source line — verify those and hand-author the cases the probe
+> couldn't reach.
+
+Multi-arg expressions like `map "-$_", qw/.../` evaluate at
+module-compile time (inside the literal array initializer) and survive
+into the generator as plain string lists.
 
 ## What it doesn't handle
 
 - **Import::Into kits** (hand-rolled `sub import { Pkg->import::into(...) }`).
-  Imperative bodies have no data tables to read; needs a runtime
-  recorder. Deferred.
-- **Coderef interpretation** — the LSP's `PackageParent` action can
-  represent `extends('X')` / `with('X')` / `load_components('A', 'B')`
-  side effects, but recognizing those idioms from inside a coderef
-  needs either `B::Deparse` pattern-matching or a probe-package
-  interception layer. Deferred. For now the TODO points at the kit
-  source line so a human can hand-author the equivalent.
+  Imperative bodies have no `@IMPORT_MODULES`/`%IMPORT_BUNDLES` tables to
+  read, so there's nothing for the generator to walk — hand-author these
+  (see the `Clove::Common` plugin for a worked example).
+- **Conditional coderefs** — see the best-effort warning above; a single
+  probe run can't see branches it didn't take.
 - **Unimport** — `no MOD args` has no SyntheticUse counterpart. Add a
   `SyntheticUnuse` EmitAction in the LSP if these turn out to matter.
 - **`--check` mode** — CI gate for "committed .rhai differs from a

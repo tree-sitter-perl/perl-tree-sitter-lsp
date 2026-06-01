@@ -6,16 +6,30 @@ package App::PerlLSP::PluginGen::ImportBase;
 # bundle flag.
 #
 # We `require` the kit (which populates `our`-vars at module compile
-# time) but never invoke its `import` method — coderef bodies and
-# bundle dispatch never run at generator time, so no probe package or
-# `Import::Into` monkey-patching is needed.
+# time) but never invoke its `import` method, so the bundle-dispatch
+# machinery never runs at generator time.
 #
-# Coderef entries can't be statically decoded; the generator emits a
-# `// TODO` comment with the kit-file location and skips them.
-# Unimport entries (`-MOD` / `>-MOD`) get a TODO too — no
-# `SyntheticUnuse` primitive exists yet on the LSP side.
+# Coderef entries CAN'T be read statically, so we run each one against
+# a recording probe (`Probe` below) standing in for `$args->{package}`.
+# Two things fall out: the coderef's RETURN value (Import::Base-style
+# `MOD => [args]` pairs → `SyntheticUse`) and its SIDE EFFECTS — the
+# `extends` / `with` / `parent` / `base` / `load_components` calls real
+# kits make on the consumer package → `PackageParent`. This is the only
+# way to see what e.g. a `-Controller` bundle's coderef sets up
+# (`extends 'Mojolicious::Controller'`). A coderef that dies under the
+# probe falls back to the old `// TODO` comment with the error.
+#
+# This is BEST-EFFORT, not a faithful translation: the probe runs each
+# coderef exactly once, with a stand-in package and no bundle args, so a
+# coderef that branches on `$args->{package}`, the requested bundle, or
+# any other input only reveals the path it happened to take. Every
+# probed coderef emits a `// best-effort:` banner anchored to its source
+# line so the author can verify and fill the cases the probe missed.
+#
+# Unimport entries (`-MOD` / `>-MOD`) get a TODO — no `SyntheticUnuse`
+# primitive exists yet on the LSP side.
 
-use v5.42;
+use v5.36;
 use utf8;
 use warnings;
 use experimental 'signatures';
@@ -48,9 +62,9 @@ sub generate_plugin ($kit_class, %opts) {
 
     my ($modules_ref, $bundles_ref) = _read_tables($kit_class);
 
-    my @base_entries = _walk_entries($modules_ref);
+    my @base_entries = _walk_entries($modules_ref, $bundles_ref);
     my %bundle_entries =
-        map { $_ => [ _walk_entries($bundles_ref->{$_}) ] }
+        map { $_ => [ _walk_entries($bundles_ref->{$_}, $bundles_ref) ] }
         keys %$bundles_ref;
 
     return _render_rhai(
@@ -74,16 +88,19 @@ sub _read_tables ($kit_class) {
 # --- Walking + sigil classification --------------------------------
 
 # Yield a normalized record per logical entry:
-#   { kind => 'synthetic_use', module, args, imports, priority }
-#   { kind => 'todo_unimport', module, args, via }
-#   { kind => 'todo_coderef',  file, line }
-#   { kind => 'todo_unknown',  raw }
+#   { kind => 'synthetic_use',  module, args, imports, priority }
+#   { kind => 'package_parent', parent }
+#   { kind => 'todo_unimport',  module, args, via }
+#   { kind => 'todo_coderef',   file, line, error }
+#   { kind => 'todo_probe_call',verb, args }
+#   { kind => 'todo_unknown',   raw }
 #
 # Import::Base stores entries in two shapes:
 #   1. `MOD => [args]`  — pair: string key, arrayref value.
 #   2. `MOD`            — bare scalar with no following arrayref.
-# Coderefs appear as standalone scalars (no following arrayref).
-sub _walk_entries ($list) {
+# Coderefs appear as standalone scalars (no following arrayref) and
+# are run against a probe; see `_probe_coderef`.
+sub _walk_entries ( $list, $bundles_ref = {} ) {
     return () unless ref $list eq 'ARRAY';
     my @out;
     my $i = 0;
@@ -91,12 +108,7 @@ sub _walk_entries ($list) {
         my $entry = $list->[$i];
 
         if ( ref $entry eq 'CODE' ) {
-            my ( $file, $line ) = _coderef_loc($entry);
-            push @out, {
-                kind => 'todo_coderef',
-                file => $file // '?',
-                line => $line // 0,
-            };
+            push @out, _probe_coderef( $entry, $bundles_ref );
             $i++;
             next;
         }
@@ -167,6 +179,81 @@ sub _coderef_loc ($cv) {
     return ( $file, $line );
 }
 
+# Run one coderef entry against a recording probe and turn what it does
+# into records. The probe stands in for `$args->{package}` (the
+# consumer package) — kit coderefs both RETURN module entries and CALL
+# inheritance verbs on it. We pass the real `$bundles_ref` as the first
+# arg since that's Import::Base's calling convention; coderefs that
+# ignore it (the common case) don't care.
+sub _probe_coderef ( $cv, $bundles_ref ) {
+    my ( $file, $line ) = _coderef_loc($cv);
+    my $probe = App::PerlLSP::PluginGen::Probe->new('__PERL_LSP_CONSUMER__');
+
+    my @ret = eval { $cv->( $bundles_ref, { package => $probe } ) };
+    if ( my $err = $@ ) {
+        $err =~ s/\s+\z//;
+        return {
+            kind  => 'todo_coderef',
+            file  => $file // '?',
+            line  => $line // 0,
+            error => "$err",
+        };
+    }
+
+    my @records;
+    # Side effects: inheritance verbs the coderef called on the package.
+    push @records, _verb_to_records(@$_) for @{ $probe->calls };
+
+    # Return value: Import::Base-style module entries (no priority — a
+    # coderef can't carry a `<`/`>` sigil, so they sort as `normal`).
+    my @returned = _walk_entries( [@ret], $bundles_ref );
+    # A coderef computes its args at runtime — often config rather than a
+    # static import list (Carp::Clan's clan regex, which here even embeds
+    # the probe's stringified sentinel). Reduce each to a bare `use MOD`:
+    # the module's default exports resolve normally and we don't fabricate
+    # an import list we can't actually know.
+    @{$_}{qw(args imports)} = ( [], [] )
+        for grep { $_->{kind} eq 'synthetic_use' } @returned;
+    push @records, @returned;
+
+    # The probe ran the coderef exactly ONCE, with a stand-in package and
+    # no bundle args. A coderef that branches on `$args->{package}`, the
+    # requested bundle, or any other input only reveals the path it took
+    # here — this is best-effort, not a faithful translation. Make that
+    # explicit in the output, anchored to the source so the author can
+    # verify and hand-author the cases the probe couldn't see.
+    unshift @records, {
+        kind    => 'probe_note',
+        file    => $file // '?',
+        line    => $line // 0,
+        emitted => scalar(@records),
+    };
+    return @records;
+}
+
+# Map a probed method call to records. The handful of verbs that real
+# kits use to wire inheritance (`extends`/`with` from Mojo/Moo, bare
+# `parent`/`base`, DBIC's `load_components`) become `package_parent`.
+# Anything else is surfaced as a TODO so the author can decide.
+sub _verb_to_records ( $verb, @args ) {
+    state $PARENT_VERB = { map { $_ => 1 } qw(extends with parent base) };
+
+    if ( $verb eq 'load_components' ) {
+        return map { { kind => 'package_parent', parent => _dbic_component_class($_) } } @args;
+    }
+    if ( $PARENT_VERB->{$verb} ) {
+        return map { { kind => 'package_parent', parent => "$_" } } @args;
+    }
+    return { kind => 'todo_probe_call', verb => $verb, args => [ map "$_", @args ] };
+}
+
+# DBIC `load_components('Foo')` loads `DBIx::Class::Foo`; a leading `+`
+# means "already fully qualified, don't prepend".
+sub _dbic_component_class ($comp) {
+    return $1 if $comp =~ /\A\+(.+)\z/;
+    return "DBIx::Class::$comp";
+}
+
 # --- Rendering -----------------------------------------------------
 
 sub _kit_to_plugin_id ($kit_class) {
@@ -208,8 +295,26 @@ sub _render_entry ( $entry, $indent ) {
         # on the LSP side accepts quoted keys transparently.
         return qq(${indent}out += #{ "SyntheticUse": #{ "module": $mod, "args": $args, "imports": $imps, "span": ctx.span }};);
     }
+    if ( $kind eq 'probe_note' ) {
+        my $loc = "$entry->{file}:$entry->{line}";
+        return $entry->{emitted}
+            ? qq(${indent}// best-effort: coderef at $loc was probed by running it ONCE (stand-in package, no bundle args). Conditional branches on the consumer/bundle are NOT captured — verify against source.)
+            : qq(${indent}// note: coderef at $loc probed clean (no emissions). If it branches on its inputs, hand-author the cases the probe couldn't reach.);
+    }
+    if ( $kind eq 'package_parent' ) {
+        my $parent = _rhai_quote( $entry->{parent} );
+        # `current_package` is `Option<String>` on the Rust side; it
+        # serializes to `()` when the `use` is outside any package. Guard
+        # so we never emit a PackageParent with a unit `package`.
+        return qq(${indent}if ctx.current_package != () { out += #{ "PackageParent": #{ "package": ctx.current_package, "parent": $parent }}; });
+    }
     if ( $kind eq 'todo_coderef' ) {
-        return qq(${indent}// TODO: coderef at $entry->{file}:$entry->{line} — hand-author equivalent SyntheticUse / PackageParent emissions.);
+        my $why = $entry->{error} ? " (probe died: $entry->{error})" : '';
+        return qq(${indent}// TODO: coderef at $entry->{file}:$entry->{line}$why — hand-author equivalent SyntheticUse / PackageParent emissions.);
+    }
+    if ( $kind eq 'todo_probe_call' ) {
+        my $args = join ', ', @{ $entry->{args} };
+        return qq(${indent}// TODO: probed kit call $entry->{verb}($args) — no PackageParent/SyntheticUse mapping for this verb.);
     }
     if ( $kind eq 'todo_unimport' ) {
         my $args = join( ' ', @{ $entry->{args} } );
@@ -281,6 +386,37 @@ sub _render_rhai (%args) {
     push @lines, "";
 
     return join "\n", @lines;
+}
+
+# --- Coderef probe -------------------------------------------------
+#
+# Stands in for `$args->{package}` while a kit coderef runs. Kits use it
+# two ways: as a STRING (`"^$args->{package}"` in a Carp::Clan regex)
+# and as an INVOCANT (`$args->{package}->extends(...)`,
+# `->can('with')->(...)`, `->load_components(...)`). Overloaded
+# stringification covers the first; `can` + `AUTOLOAD` record the
+# second. Every recorded call is `[verb, @args]`, read back via `calls`.
+package App::PerlLSP::PluginGen::Probe {
+    use v5.36;
+    use overload '""' => sub { $_[0]{name} }, fallback => 1;
+
+    sub new ( $class, $name ) { bless { name => $name, calls => [] }, $class }
+
+    sub calls ($self) { $self->{calls} }
+
+    # `$pkg->can('extends')->(@args)` is the indirect idiom; hand back a
+    # recorder closure so the eventual call lands in the same log.
+    sub can ( $self, $method ) {
+        return sub { push $self->{calls}->@*, [ $method, @_ ]; return; };
+    }
+
+    our $AUTOLOAD;
+    sub AUTOLOAD ( $self, @args ) {
+        my $verb = $AUTOLOAD =~ s/.*:://r;
+        return if $verb eq 'DESTROY';
+        push $self->{calls}->@*, [ $verb, @args ];
+        return;
+    }
 }
 
 1;
