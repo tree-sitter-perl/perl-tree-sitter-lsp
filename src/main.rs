@@ -492,6 +492,13 @@ fn cli_type_at(file: &str, line_str: &str, col_str: &str) {
 
 /// --definition <root> <file> <line> <col> — Cross-file goto-def
 fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
+    // Pin repo-local `.perl-lsp/` discovery to `root` BEFORE the first
+    // build (`parse_file`), so kit plugins load regardless of cwd. Without
+    // this the CLI falls back to cwd and cross-file resolution silently
+    // loses any bridge a repo-local plugin would have synthesized.
+    let (_root_path, root_uri) = canonical_root_and_uri(root);
+    plugin::rhai_host::set_workspace_root(Some(&root_uri));
+
     let (source, tree, analysis) = parse_file(file);
     let point = parse_point(line_str, col_str);
 
@@ -541,6 +548,11 @@ fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
 
 /// --references <root> <file> <line> <col> — Cross-file find-refs
 fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
+    // Pin repo-local `.perl-lsp/` discovery to `root` before the first
+    // build, so kit plugins load regardless of cwd (see `cli_definition`).
+    let (_root_path, root_uri) = canonical_root_and_uri(root);
+    plugin::rhai_host::set_workspace_root(Some(&root_uri));
+
     let (source, tree, analysis) = parse_file(file);
     let point = parse_point(line_str, col_str);
 
