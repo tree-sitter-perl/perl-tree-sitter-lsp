@@ -205,9 +205,15 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     // cache keys on, before `index_workspace` triggers the first build().
     plugin::rhai_host::set_workspace_root(Some(&root_uri));
 
-    let ws = index_workspace(root);
-
+    // Register workspace files INTO the module index (not just a FileStore)
+    // so their plugin bridges + package names participate in cross-file
+    // lookups — the whole point of "act like the server just started".
+    // Using the bridge-less `index_workspace` here is what forced callers
+    // to hand-roll their own `index_workspace_with_index`, and they drifted.
     let module_index = module_index::ModuleIndex::new_for_cli();
+    let ws = file_store::FileStore::new();
+    let indexed = module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index));
+    eprintln!("Indexed {} files", indexed);
 
     let mut inc_paths = module_resolver::discover_inc_paths();
     module_resolver::add_project_lib_paths(&mut inc_paths, &root_path);
@@ -492,25 +498,15 @@ fn cli_type_at(file: &str, line_str: &str, col_str: &str) {
 
 /// --definition <root> <file> <line> <col> — Cross-file goto-def
 fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
-    // Pin repo-local `.perl-lsp/` discovery to `root` BEFORE the first
-    // build (`parse_file`), so kit plugins load regardless of cwd. Without
-    // this the CLI falls back to cwd and cross-file resolution silently
-    // loses any bridge a repo-local plugin would have synthesized.
-    let (_root_path, root_uri) = canonical_root_and_uri(root);
-    plugin::rhai_host::set_workspace_root(Some(&root_uri));
-
-    let (source, tree, analysis) = parse_file(file);
+    // One setup path: `cli_full_startup` pins the plugin root, indexes the
+    // workspace (with bridges) into the module index, warms the cache, and
+    // resolves @INC deps — exactly what the server does on startup.
+    let (_ws, idx) = cli_full_startup(root);
+    let (source, tree, mut analysis) = parse_file(file);
+    // Enrich the queried file against the index, mirroring the server's
+    // open-file path (cross-file imported types + hash keys).
+    analysis.enrich_imported_types_with_keys(Some(&idx));
     let point = parse_point(line_str, col_str);
-
-    // Build a real ModuleIndex and register workspace modules the same
-    // way the backend does, so CLI gd goes through the production
-    // cross-file resolution path (Handler/MethodCallRef/DispatchCall/
-    // inheritance walk via class_content_index) instead of the CLI's
-    // old ad-hoc workspace scan. Keeps nvim and CLI results in sync.
-    let idx = module_index::ModuleIndex::new_for_cli();
-    let files = file_store::FileStore::new();
-    let root_path = std::path::PathBuf::from(root);
-    module_resolver::index_workspace_with_index(&root_path, &files, Some(&idx));
 
     let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
     let uri = tower_lsp::lsp_types::Url::from_file_path(&abs)
@@ -541,19 +537,18 @@ fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
         }
     }
 
-    let _ = files; // suppress unused-variable warnings
     eprintln!("No definition found at {}:{}", line_str, col_str);
     std::process::exit(1);
 }
 
 /// --references <root> <file> <line> <col> — Cross-file find-refs
 fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
-    // Pin repo-local `.perl-lsp/` discovery to `root` before the first
-    // build, so kit plugins load regardless of cwd (see `cli_definition`).
-    let (_root_path, root_uri) = canonical_root_and_uri(root);
-    plugin::rhai_host::set_workspace_root(Some(&root_uri));
-
-    let (source, tree, analysis) = parse_file(file);
+    // One setup path (see `cli_definition`): plugin root + workspace index
+    // (with bridges) + cache + @INC, so the workspace files this scans are
+    // built with the same plugins the target is.
+    let (ws, idx) = cli_full_startup(root);
+    let (source, tree, mut analysis) = parse_file(file);
+    analysis.enrich_imported_types_with_keys(Some(&idx));
     let point = parse_point(line_str, col_str);
 
     let mut results = Vec::new();
@@ -580,7 +575,6 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
         )).unwrap_or(false);
 
         if is_sub || matches!(r.kind, file_analysis::RefKind::PackageRef) {
-            let ws = index_workspace(root);
             // Derive the scope (package for Sub, class for Method) so
             // cross-file walks don't union unrelated packages that
             // share a symbol name.
