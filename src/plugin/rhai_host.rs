@@ -489,6 +489,7 @@ const BUNDLED: &[(&str, &str)] = &[
     ("data-printer", include_str!("../../frameworks/data-printer.rhai")),
     ("dbic-resultddl", include_str!("../../frameworks/dbic-resultddl.rhai")),
     ("type-tiny", include_str!("../../frameworks/type-tiny.rhai")),
+    ("dancer", include_str!("../../frameworks/dancer.rhai")),
 ];
 
 pub fn load_bundled(engine: Arc<Engine>) -> Vec<Box<dyn FrameworkPlugin>> {
@@ -774,6 +775,7 @@ mod tests {
             ("data-printer", include_str!("../../frameworks/data-printer.rhai")),
             ("dbic-resultddl", include_str!("../../frameworks/dbic-resultddl.rhai")),
             ("type-tiny", include_str!("../../frameworks/type-tiny.rhai")),
+            ("dancer", include_str!("../../frameworks/dancer.rhai")),
         ] {
             RhaiPlugin::from_source(src, engine.clone())
                 .unwrap_or_else(|e| panic!("{}.rhai failed to compile: {e}", id));

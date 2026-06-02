@@ -8723,6 +8723,176 @@ fn plugin_data_printer_skips_unrelated_use_statements() {
     );
 }
 
+// ---- Dancer2 plugin tests ----
+
+/// `use Dancer2` autoimports ~90 DSL keywords — unresolved-function
+/// diagnostics must skip all of them. The plugin stashes a
+/// `FrameworkImport` per keyword into `framework_imports`.
+#[test]
+fn plugin_dancer2_autoimports_dsl_keywords() {
+    let src = r#"
+package main;
+use Dancer2;
+
+get '/users' => sub { return template 'users' };
+post '/login' => sub { my $u = param('user'); session user => $u; };
+"#;
+    let fa = build_fa(src);
+    for kw in &[
+        // Route verbs
+        "get", "post", "put", "del", "patch", "any", "options",
+        // Route organisation
+        "prefix",
+        // Lifecycle hooks
+        "hook",
+        // Request / response
+        "request", "response", "param", "params",
+        "body_parameters", "query_parameters", "route_parameters",
+        // Headers / status
+        "header", "headers", "content_type", "status",
+        // Response control
+        "redirect", "forward", "pass", "halt",
+        // Rendering
+        "template", "send_file", "send_as",
+        // Config
+        "config", "set", "setting",
+        // Session / cookie
+        "session", "cookie", "cookies",
+        // Serialisers
+        "to_json", "from_json", "to_yaml", "from_yaml",
+        // Misc
+        "var", "vars", "uri_for", "splat", "captures", "upload",
+        "push_response_header",
+        // App / DSL
+        "app", "dancer_app", "dsl", "engine",
+        // Async
+        "delayed", "flush",
+        // Logging
+        "debug", "info", "warning", "error",
+        // Boolean constants
+        "true", "false",
+        // Lifecycle
+        "dance", "to_app", "start",
+    ] {
+        assert!(
+            fa.framework_imports.contains(*kw),
+            "`{}` must be autoimported by `use Dancer2`; framework_imports={:?}",
+            kw,
+            fa.framework_imports,
+        );
+    }
+}
+
+/// `use Dancer2` synthesizes typed Sub symbols for high-value DSL
+/// functions so chained calls (`request->path`, `app->config`)
+/// resolve against the correct class.
+#[test]
+fn plugin_dancer2_typed_stubs_have_return_types() {
+    use crate::file_analysis::InferredType;
+
+    let src = r#"
+package main;
+use Dancer2;
+"#;
+    let fa = build_fa(src);
+
+    // `request` must resolve to Dancer2::Core::Request.
+    let request_sym = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "request" && matches!(s.kind, crate::file_analysis::SymKind::Sub));
+    assert!(
+        request_sym.is_some(),
+        "dancer plugin must synthesize a `request` Sub symbol"
+    );
+    let rt = fa.sub_return_type_at_arity("request", None);
+    assert_eq!(
+        rt,
+        Some(InferredType::ClassName("Dancer2::Core::Request".into())),
+        "`request` must return Dancer2::Core::Request; got {:?}",
+        rt
+    );
+
+    // `app` must resolve to Dancer2::Core::App.
+    let rt = fa.sub_return_type_at_arity("app", None);
+    assert_eq!(
+        rt,
+        Some(InferredType::ClassName("Dancer2::Core::App".into())),
+        "`app` must return Dancer2::Core::App; got {:?}",
+        rt
+    );
+
+    // `session` must resolve to Dancer2::Core::Session.
+    let rt = fa.sub_return_type_at_arity("session", None);
+    assert_eq!(
+        rt,
+        Some(InferredType::ClassName("Dancer2::Core::Session".into())),
+        "`session` must return Dancer2::Core::Session; got {:?}",
+        rt
+    );
+
+    // `config` returns a HashRef.
+    let rt = fa.sub_return_type_at_arity("config", None);
+    assert_eq!(
+        rt,
+        Some(InferredType::HashRef),
+        "`config` must return HashRef; got {:?}",
+        rt
+    );
+}
+
+/// `use Dancer2::Plugin` also gets the full DSL — plugins
+/// re-export via import and expect every DSL word to be in scope.
+#[test]
+fn plugin_dancer2_plugin_also_autoimports() {
+    let src = r#"
+package MyApp::Plugin::Foo;
+use Dancer2::Plugin;
+
+register my_keyword => sub { my $dsl = shift; $dsl->param('x') };
+"#;
+    let fa = build_fa(src);
+    for kw in &["get", "post", "param", "request", "session", "config", "debug"] {
+        assert!(
+            fa.framework_imports.contains(*kw),
+            "`{}` must be autoimported by `use Dancer2::Plugin`; got {:?}",
+            kw,
+            fa.framework_imports,
+        );
+    }
+}
+
+/// Unrelated `use` statements must NOT inject Dancer2 keywords.
+/// Guards against the trigger firing too broadly.
+#[test]
+fn plugin_dancer2_skips_unrelated_use() {
+    let src = r#"
+package main;
+use Mojolicious::Lite;
+"#;
+    let fa = build_fa(src);
+    // `param` is a Dancer2 keyword — it should NOT appear in
+    // framework_imports just because of Mojolicious::Lite.
+    // (Mojolicious::Lite does not expose `param` as a standalone function.)
+    // We verify via the synthesized Sub symbol: the dancer plugin
+    // should not have emitted one.
+    let dancer_stubs = fa
+        .symbols
+        .iter()
+        .filter(|s| {
+            s.name == "dancer_app"
+                && matches!(
+                    &s.namespace,
+                    crate::file_analysis::Namespace::Framework { id } if id == "dancer"
+                )
+        })
+        .count();
+    assert_eq!(
+        dancer_stubs, 0,
+        "dancer plugin must not emit stubs for `use Mojolicious::Lite`"
+    );
+}
+
 // ---- Red-pin: regressions caught against the rhai-plugins branch ----
 
 /// `my` is lexical and crosses statement-form `package X;`
