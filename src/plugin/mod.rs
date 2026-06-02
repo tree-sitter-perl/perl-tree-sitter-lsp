@@ -96,7 +96,7 @@ pub struct CallContext {
     /// receiver's `InferredType::BrandedRoute` brand by the builder so
     /// a partial `->to('#action')` plugin can recover the inherited
     /// controller without inspecting the enum's serde shape. Empty for
-    /// non-route receivers. See `docs/prompt-route-default-inheritance.md`.
+    /// non-route receivers. See `docs/adr/route-branding.md`.
     #[serde(default)]
     pub receiver_route_defaults: Vec<(String, String)>,
     pub args: Vec<ArgInfo>,
@@ -586,7 +586,8 @@ pub struct ConstraintParam {
 /// is the `Mojolicious` app. The builder applies this at the sub-declaration
 /// walk (the one place that sees a sub's params, rule #1), pushing a Variable
 /// type constraint for the param — the same mechanism `detect_first_param_type`
-/// uses for `$self`. See `docs/prompt-param-typing.md`. (Callback-arg param
+/// uses for `$self`. See `docs/adr/plugin-system.md` (`param_types()`).
+/// (Callback-arg param
 /// typing — `$job` in a Minion task — stays in the per-plugin `VarType` emit;
 /// this manifest is the *declaration*-site selector that has no hook.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -649,7 +650,7 @@ pub trait FrameworkPlugin: Send + Sync {
 
     /// Receiver classes that compose the fictional app surface
     /// (`file_analysis::APP_SURFACE_CLASS`) — the "open consumption" axis
-    /// of the helper/plugin model (see `docs/prompt-app-entity.md`). Each
+    /// of the helper/plugin model (see `docs/adr/plugin-system.md`). Each
     /// listed class gains the surface as a synthetic ancestor in the MRO
     /// walk, so entities a plugin bridges to the surface resolve from
     /// every consumer (`$app->h`, `$c->h`, app subclasses) through the

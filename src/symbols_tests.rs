@@ -2936,7 +2936,7 @@ sub action ($c) {\n\
 
 /// Spike: Mojo partial route targets inherit the controller down the
 /// route-builder chain via a value brand (`InferredType::BrandedRoute`).
-/// See `docs/prompt-route-default-inheritance.md` (option C, collapsed:
+/// See `docs/adr/route-branding.md` (option C, collapsed:
 /// resolved defaults ride the type, no separate brand-id/side-table).
 ///
 /// The brand carries the inherited `->to('ctrl#')` controller and rides

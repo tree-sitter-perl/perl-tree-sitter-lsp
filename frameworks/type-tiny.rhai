@@ -31,7 +31,7 @@ fn type_constraint_inner(name, params) {
         // constrained value (when present) is whatever T constrains to. The
         // single param is a nested constructor the core typed
         // `TypeConstraintOf(T)`; pass through to T's inner. (Optionalness
-        // itself isn't modeled — see docs/prompt-optional-types.md.)
+        // itself isn't modeled — see docs/adr/type-constraints.md.)
         return constrained_inner(params[0].ty);
     }
     // InstanceOf['Foo'] / ConsumerOf['Role'] — first string param is the class.

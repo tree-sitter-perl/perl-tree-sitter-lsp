@@ -37,8 +37,16 @@ source of types, edges chase, materialized projections are bugs;
 cross-file deferred owner fix; `return-expr.md` for receiver-
 relative return types subsuming per-method projection + arity
 dispatch; `plugin-system.md` for the `return_via_edge` lazy-return
-mechanism; `file-store-and-resolve.md` for forward-reference
+mechanism + the declarative-manifest family (`overrides` / `dispatch_verbs`
+/ `type_constraint_names` / `param_types` / `app_surface_consumers`) +
+`SyntheticUse`; `type-constraints.md` for `TypeConstraintOf` + `Maybe`
+erasure; `route-branding.md` for partial-route default inheritance via
+`BrandedRoute`; `file-store-and-resolve.md` for forward-reference
 resolution + cross-file invocant refresh) and the commit history.
+
+Genuinely-unsolved problems (the hard boundaries the forward designs run
+into — untyped param/hash-element boundaries, qualified-name suppression,
+runtime export generators) live in `docs/open-problems.md`.
 
 ### Notes on the queued work
 
@@ -169,7 +177,6 @@ Wired today; smarter is downstream of the engine work above.
 | `prompt-mojo-todo.md` | Stash keys, hook completion, route naming + url_for, plugin chain transitive helpers, config completion |
 | `prompt-cli-tools.md` | Diagnostic framework (PL001–PL010, `.perl-lsp.json`, suppression directives, SARIF), `--migrate`, remaining analysis subcommands |
 | `prompt-ref-provenance.md` | Constant-fold `folded_from`, framework-attribute unified rename, package→file rename, inheritance override scoping |
-| `prompt-synthetic-use.md` | `EmitAction::SyntheticUse` so plugins can mirror real `use` lines — unblocks trivial style-kit support (`Import::Base` / `ToolKit` shims) |
 | `prompt-wasm-web-extension.md` | Cargo workspace split + browser extension; orthogonal to everything else |
 
 These are ship-when-ready, not blocked. Several are worth slotting between
@@ -198,6 +205,8 @@ type-inference phases when an engine refactor needs cooling time.
    plugin mechanics, type-inference query path. Source of truth.
 2. `docs/adr/*.md` — load-bearing decisions for landed work (pod rendering,
    plugin system, error recovery, file store + resolve, parametric types,
+   return-expr, sequence types, type constraints, route branding,
    bag-canonical typing).
 3. This roadmap — what's queued, what blocks what.
-4. The relevant `prompt-*.md` for the workstream you're picking up.
+4. `docs/open-problems.md` — the hard boundaries deferred deliberately.
+5. The relevant `prompt-*.md` for the workstream you're picking up.

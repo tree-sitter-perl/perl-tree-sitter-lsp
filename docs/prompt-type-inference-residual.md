@@ -6,9 +6,9 @@
 > the live shape. This doc is the still-pending fact classes. Each lands
 > as a **new reducer + emitter pair** without expanding `InferredType`.
 >
-> Cross-refs: `prompt-type-inference-unification.md` (the staircase to
-> collapse walk-time + bag-time into one path); `prompt-sequence-types.md`
-> (positional containers, lands after the unification's Step 3).
+> Cross-refs: `adr/bag-canonical.md` (the bag is the only source of types —
+> the foundation each fact class below builds on); `prompt-sequence-types.md`
+> (positional containers).
 
 ## Part 1 — Invocant mutations
 
@@ -156,33 +156,20 @@ InferredType(narrowed), span: if_body_span }`. The bag-fold prefers the
 narrowest-span witness containing the query point. No new
 `narrowing_scope` field — the span IS the narrowing.
 
-## Part 5c — Parametric types (DBIC, indexed string collections)
+## Part 5c — Parametric types (DBIC, indexed string collections) — LANDED
 
-```perl
-my $rs = $schema->resultset('Users');     # ResultSet<Users>
-$rs->search({ KEY => ... });              # KEY narrowed to Users columns
-```
+`$schema->resultset('Users')` types as `Parametric(ResultSet{base, row})`;
+search-family methods thread it; hash-key args route to the row class.
+The sealed-flavor data model + per-axis policy is in
+`docs/adr/parametric-types.md`; the receiver-relative return projection
+(`find` → row class) in `docs/adr/return-expr.md`.
 
-**Forward work:**
-
-```rust
-InferredType::Parametric { base: String, type_arg: String }
-```
-
-Emission rules:
-
-- `$schema->resultset('Users')` (literal first arg) → `Parametric {
-  base: "ResultSet", type_arg: canonicalized_class }`.
-- `->search(...)` / `->search_rs(...)` / `->find(...)` return the same
-  Parametric — the parameter threads through.
-
-Consumer: `cursor_context.rs` recognizes hash-key position inside a
-search-family call on a `Parametric { base: "ResultSet", type_arg }`
-receiver, looks up `HashKeyDef`s + synthesized column accessors in
-`Package(type_arg)`. Diagnostic for unknown columns.
-
-Relationship prefetch (`->search({...}, { join => 'posts' })`) extends
-the valid key set with `posts.col` from the joined Result class. Phase 2.
+**Residual:** relationship prefetch (`->search({...}, { join => 'posts' })`)
+extending the valid key set with `posts.col` from the joined Result class.
+And empty-hash-arg key *completion* at `->search({ | })` — goto-def from a
+typed key already resolves, but `complete_keyval_args` has no
+parametric-ResultSet branch; it should ask the typed receiver for its
+column-key set. Pinned in `ROADMAP.md`.
 
 ## Part 7 — Plugin-registered reducers from Rhai
 

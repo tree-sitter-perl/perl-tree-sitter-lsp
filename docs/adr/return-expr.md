@@ -192,26 +192,16 @@ through the full registry. If profiling ever flags the guard,
 pruning the discriminant down to "any non-None vs None" would
 shrink the key without losing correctness.
 
-**One residual source-tag filter.** `SubReturnReducer` still
-excludes `branch_arm`-source witnesses on `Symbol(_)` — the
-per-arm fold needs to claim them and `SubReturnReducer` must
-not paper over `None` from disagreeing arms. Tracked in
-`working-bag-residual.md` D4-G; resolution requires moving per-
-arm branch witnesses off `Symbol(_)` to a dedicated attachment.
-Independent of `ReturnExpr`'s correctness — the rule "claim by
-attachment shape, not source tag" has one documented exception
-until D4-G lands.
+**Cycle-guard cost** (above) is the standing trade-off. Per-arm
+return witnesses live on their own `SymbolReturnArm(sid)`
+attachment, so `SubReturnReducer` claims plain `Symbol(_) +
+InferredType` by attachment shape with no source-tag filter — the
+"claim by attachment shape, not source tag" rule holds with no
+exception.
 
-**`Builder.resolved_returns` map survives.** Cleanup #1 in
-`prompt-cleanups.md` deletes it; this ADR's work narrowed but
-didn't kill it. `record_framework_accessor_witness` no longer
-seeds it (the per-Symbol UnionOnArgs is canonical), but
-writeback still iterates the map. Switching writeback to bag-
-direct emission is the cleanup, not new design.
-
-**Cache invalidation.** `EXTRACT_VERSION` 26 → 27 for the
-payload variant, then 27 → 28 for the `TypeObservation` shape
-change once `ArityReturn` was deleted. Bumping is free.
+**Cache invalidation.** `EXTRACT_VERSION` bumps on every payload /
+observation shape change. Bumping is free; old blobs re-resolve
+lazily.
 
 ## Where this is going
 

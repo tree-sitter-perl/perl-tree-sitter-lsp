@@ -33,7 +33,7 @@ fn triggers() {
 }
 
 // The receiver classes that compose the app surface — the "open
-// consumption" axis (docs/prompt-app-entity.md). Helpers bridge to the
+// consumption" axis (docs/adr/plugin-system.md). Helpers bridge to the
 // single app-surface class; core gives each of these classes the
 // surface as a synthetic ancestor, so `$app->h` AND `$c->h` resolve
 // through the existing ancestor + bridge walk. App subclasses inherit
@@ -93,7 +93,7 @@ fn on_method_call(ctx) {
     // same Method surfaces from a `Mojolicious` query too.
 
     // App namespace — one per current_package. Bridges to the single
-    // fictional "app surface" class (docs/prompt-app-entity.md). The
+    // fictional "app surface" class (docs/adr/plugin-system.md). The
     // consumer classes (declared by `app_surface_consumers()` below, and
     // any app subclass) inherit the surface as a synthetic parent in
     // core, so the existing ancestor walk + bridge resolution finds the

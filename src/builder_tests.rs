@@ -4628,7 +4628,7 @@ $app->helper(current_user => sub {
     }
 
     // The PluginNamespace owns the bridge visibility: a SINGLE bridge
-    // to the fictional app surface (docs/prompt-app-entity.md). The
+    // to the fictional app surface (docs/adr/plugin-system.md). The
     // consumer classes reach it via the synthetic-parent edge in core,
     // not via a per-helper bridge list.
     let ns = fa
@@ -5711,7 +5711,7 @@ app->helper(greet => sub {
     assert!(matches!(&greet.namespace, Namespace::Framework { id } if id == "mojo-helpers"));
 }
 
-/// Synthetic-ancestor app surface (docs/prompt-app-entity.md): a helper
+/// Synthetic-ancestor app surface (docs/adr/plugin-system.md): a helper
 /// that returns a concrete class resolves its RETURN type identically
 /// from the app, the controller, AND a user-written app subclass —
 /// proving the single bridge target + synthetic-parent edge composes with
@@ -5744,7 +5744,7 @@ $app->helper(model => sub { my ($c) = @_; return MyApp::Model->new; });
     }
 }
 
-/// App surface (docs/prompt-app-entity.md): `$app->minion->enqueue`
+/// App surface (docs/adr/plugin-system.md): `$app->minion->enqueue`
 /// resolves once `$app` is typed. The `minion` helper (return type a
 /// Minion subclass) is reached from the locally-typed `$app` via the app
 /// surface; enrichment then resolves the `->enqueue` receiver and promotes
@@ -7758,7 +7758,7 @@ $minion->enqueue(task_x => ['a'], { priority => 10,  });
 }
 
 /// mojo-helpers emits a PluginNamespace for the app, bridging to the
-/// single fictional app surface (docs/prompt-app-entity.md). Each
+/// single fictional app surface (docs/adr/plugin-system.md). Each
 /// registered helper's name is an entity. The consumer classes reach
 /// the surface via the synthetic-parent edge in core. Multi-app
 /// workspaces get one namespace per app.

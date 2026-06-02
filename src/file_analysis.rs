@@ -547,7 +547,7 @@ pub enum InferredType {
     /// gives its accessor the *constrained* (inner) type via
     /// `constrained_inner()`. A plugin's `type_constraint_inner` fold
     /// produces the inner; the core wraps it. See
-    /// `docs/prompt-type-constraint-types.md`. Kept at the END for
+    /// `docs/adr/type-constraints.md`. Kept at the END for
     /// bincode variant-index stability (bump `EXTRACT_VERSION`).
     TypeConstraintOf(Box<InferredType>),
     /// A Mojolicious route-builder value carrying the **accumulated
@@ -556,7 +556,7 @@ pub enum InferredType {
     /// (`Mojolicious::Routes::Route`); `controller` / `stash` are the
     /// inherited `->to(...)` defaults a partial `->to('#action')`
     /// reads. This is the "brand on the value" from
-    /// `docs/prompt-route-default-inheritance.md` (option C, collapsed):
+    /// `docs/adr/route-branding.md` (option C, collapsed):
     /// the defaults ride the type through assignment / chaining /
     /// nesting via the witness bag for free, so there is no separate
     /// brand-id + side-table to keep cache-stable — the resolved
@@ -1052,7 +1052,8 @@ pub enum Bridge {
 /// Mojolicious app / controller / command classes (the manifest-declared
 /// consumer set, see `FrameworkPlugin::app_surface_consumers`) all
 /// inherit, so a single bridge target reaches every receiver that can see
-/// helpers (docs/prompt-app-entity.md). Helpers bridge to THIS one class;
+/// helpers (see `FrameworkPlugin::app_surface_consumers`, `docs/adr/plugin-system.md`).
+/// Helpers bridge to THIS one class;
 /// the consumer classes get it as a synthetic parent injected in the MRO
 /// walk (`parents_of`). The existing ancestor walk + bridge resolution
 /// then finds helpers with no per-receiver bridge list. Not a real Perl

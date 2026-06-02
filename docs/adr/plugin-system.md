@@ -102,19 +102,30 @@ Members today:
   isa path projects the inner onto the accessor. Arity lives in the fold, not
   the core, so a constructor can take 0/1/N params. (`frameworks/type-tiny.rhai`:
   `InstanceOf`/`ConsumerOf`.)
-- **`param_types()` → `[ParamType]`** — type a sub's parameter by selector (a
-  callback arg, or a method in a role-doer). Applied at the sub-declaration
-  walk. (`docs/prompt-param-typing.md`.)
+- **`param_types()` → `[ParamType]`** — type a sub's parameter by selector. The
+  callback-arg case (`$job` in a Minion task, `$c` in a helper) and the
+  role-contract case (`$app` in `sub run_upgrade ($self, $app)` for a doer of
+  `Clove::Upgrade::OneTime`) are the same statement — *parameter N of a sub has
+  type T, determined by the sub's context* — differing only in the selector that
+  identifies the sub. A manifest (not an `on_sub` hook) because a plugin can't
+  walk nodes (rule #1) and the selector is pure data; the core does the single
+  sub-declaration observation and applies every plugin's rules at the
+  declaration walk.
 - **`app_surface_consumers()` → `[String]`** — the receiver classes that compose
-  the fictional app surface (`file_analysis::APP_SURFACE_CLASS`). The "open
-  consumption" axis of the helper/plugin model: each listed class gains the
-  surface as a synthetic ancestor in the MRO walk (`file_analysis::parents_of`,
-  the single edge-injection seam shared by every parent-enumeration site), so
-  entities a plugin bridges to the surface resolve from every consumer
-  (`$app->h`, `$c->h`, app subclasses) through the existing ancestor + bridge
-  resolution — one bridge target, the consumer set declared once. The builder
-  bakes the union onto `FileAnalysis.app_surface_consumers`.
-  (`frameworks/mojo-helpers.rhai`; `docs/prompt-app-entity.md`.)
+  the fictional app surface (`file_analysis::APP_SURFACE_CLASS`). Mojo helpers
+  conceptually belong to the *app*, reachable from a set of receivers
+  (`$app->h`, any `$c->h`, app subclasses, `$cmd->app->h`, `$job->app->h`) with
+  **no single real class** that is an ancestor of all of them — and they arrive
+  from many plugins *after* any class is "defined". So the home must be an open
+  namespace, not a closed class, and open on **both** axes: open contribution
+  (N plugins each bridge helpers to the surface; `bridges_index` unions them) and
+  open consumption (N receivers see the surface, declared once and extensible).
+  The encoding decouples the two: each listed class gains the surface as a
+  synthetic ancestor in the MRO walk (`file_analysis::parents_of`, the single
+  edge-injection seam shared by every parent-enumeration site), so adding a
+  consumer is one synthetic-parent edge and adding a helper is one bridge to the
+  surface. The builder bakes the union onto `FileAnalysis.app_surface_consumers`.
+  (`frameworks/mojo-helpers.rhai`.)
 
 The recurring rule: **a manifest entry is the plugin naming a property; the core
 asks the value the question** (rule #10). Adding a member is a trait method

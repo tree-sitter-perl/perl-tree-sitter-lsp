@@ -383,7 +383,7 @@ fn build_with_plugins_inner(
     // controller from a parent `->to('ctrl#')` via the route value's
     // brand, which only settles after the fold. Re-dispatch the route
     // plugins now that the brand is resolved. See
-    // `docs/prompt-route-default-inheritance.md`.
+    // `docs/adr/route-branding.md`.
     b.emit_partial_route_targets(&chain_idx);
 
     // Test-only: re-run the worklist fold one more time to pin
@@ -1754,7 +1754,7 @@ impl<'a> Builder<'a> {
                 // the inherited controller. The brand IS the type, so
                 // it rides assignment / chaining / nesting through the
                 // bag for free — see
-                // `docs/prompt-route-default-inheritance.md` (option C).
+                // `docs/adr/route-branding.md`.
                 if Self::is_route_type(call_ty.as_ref()) {
                     return Some(self.brand_route_call(node, invocant_ty.as_ref(), call_ty));
                 }
@@ -7935,7 +7935,7 @@ impl<'a> Builder<'a> {
     /// re-run is purely additive for the partials it newly resolves.
     ///
     /// This is the consumer side of the brand-on-the-value design
-    /// (`docs/prompt-route-default-inheritance.md`, option C). The
+    /// (`docs/adr/route-branding.md`). The
     /// brand itself is produced in `invocant_type_at_node`'s route
     /// arm; this pass turns a resolved brand into the cross-file
     /// MethodCallRef a partial target needs.
