@@ -10372,6 +10372,44 @@ mod param_types_manifest {
         );
     }
 
+    /// The Phase-2 cross-file case: a controller in file A `extends` a base in
+    /// file B which `isa Catalyst::Controller`. The controller's ancestry to
+    /// the wildcard rule's `in_role` is established only CROSS-FILE, so the old
+    /// build-time local-only `transitive_parents` gate dropped it. The gated TC
+    /// resolves at query time with the module index in hand → `$c` types.
+    #[test]
+    fn catalyst_wildcard_c_typed_through_cross_file_base() {
+        use crate::module_index::ModuleIndex;
+        use std::path::PathBuf;
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+        // `MyApp::ControllerBase` isa Catalyst::Controller, cross-file. The
+        // controller below `extends` it — its ancestry to the role is two hops,
+        // through a class in another file the builder never sees.
+        idx.insert_cache(
+            "MyApp::ControllerBase",
+            Some(fake_cached_for_class(
+                "MyApp::ControllerBase",
+                &PathBuf::from("/fake/MyApp/ControllerBase.pm"),
+                &[],
+                &["Catalyst::Controller"],
+            )),
+        );
+        let src = "package MyApp::Controller::Deep;\nuse parent 'MyApp::ControllerBase';\nsub show :Local {\n    my ($self, $c) = @_;\n    my $req = $c;\n}\n1;\n";
+        // Build as the workspace indexer does (no enrichment); the gated TC
+        // rides the FA and resolves cross-file at query time.
+        let fa = build_with_catalyst(src);
+        let ty = fa
+            .inferred_type_via_bag_ctx("$c", Point::new(4, 14), Some(&idx))
+            .expect("$c should type via the cross-file Catalyst::Controller ancestry");
+        assert!(
+            matches!(&ty, InferredType::ClassName(c) if c == "Catalyst"),
+            "wildcard param_types must type $c when Catalyst::Controller is a \
+             cross-file ancestor, got {:?}",
+            ty,
+        );
+    }
+
     #[test]
     fn catalyst_wildcard_not_applied_outside_controller() {
         // A package without the Catalyst::Controller ancestor must not get $c typed.

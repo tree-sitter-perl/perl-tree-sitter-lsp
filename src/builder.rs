@@ -236,6 +236,7 @@ fn build_with_plugins_inner(
         param_type_manifest: std::collections::HashMap::new(),
         param_type_wildcards: Vec::new(),
         provisional_dispatches: Vec::new(),
+        gated_param_types: Vec::new(),
         method_call_invocant: std::collections::HashMap::new(),
         method_call_arity: std::collections::HashMap::new(),
         parametric_emitted_refs: std::collections::HashSet::new(),
@@ -442,6 +443,7 @@ fn build_with_plugins_inner(
     fa.witnesses = bag;
     fa.witnesses.rebuild_index();
     fa.provisional_dispatches = std::mem::take(&mut b.provisional_dispatches);
+    fa.gated_param_types = std::mem::take(&mut b.gated_param_types);
     // Finalize: run the legacy text-based MCB resolver as a fallback.
     // For every assignment the unified typer (run before
     // `resolve_return_types` above) couldn't handle, MCB fills in.
@@ -1149,6 +1151,10 @@ struct Builder<'a> {
     /// enrichment once the receiver's cross-file class is known. See
     /// `file_analysis::ProvisionalDispatch`.
     provisional_dispatches: Vec<crate::file_analysis::ProvisionalDispatch>,
+    /// `param_types()` role-contract TCs, emitted ungated at the sub walk and
+    /// gated on the enclosing package's `isa in_role` (checked cross-file at
+    /// query time). See `FileAnalysis::gated_param_types`.
+    gated_param_types: Vec<crate::file_analysis::ReceiverGated<crate::file_analysis::TypeConstraint>>,
 
     /// Build-time chain-typing cache for MethodCall ref invocants.
     /// Keyed by `refs[idx]`. Walk-time fills it for syntactic cases
@@ -3496,66 +3502,63 @@ impl<'a> Builder<'a> {
         // Legacy params: they'll be picked up as normal variable_declaration nodes
     }
 
-    /// Apply plugin `param_types()` rules to a sub declaration: if a rule's
-    /// `method` matches (or is `None` = any method) and the enclosing package
-    /// does/inherits the rule's `in_role`, push a typed TC for the named param.
-    /// Called inside the sub scope (like `detect_first_param_type`). The role
-    /// check uses parents recorded so far (`with` typically precedes the method);
-    /// a role declared *after* the method in the file wouldn't be seen here.
+    /// Apply plugin `param_types()` rules to a sub declaration: for every rule
+    /// whose `method` matches (or is `None` = any method) and whose named param
+    /// is present, emit a `ReceiverGated` typed TC gated on the enclosing
+    /// package's `isa` the rule's `in_role`. The gate is NOT checked here — the
+    /// builder is index-free (rule #1), so a class whose `in_role` ancestor is
+    /// reachable only cross-file can't be confirmed at parse time. Resolution
+    /// is deferred to query time (`FileAnalysis::gated_param_type_for`), where
+    /// the module index walks the ancestry cross-file. Called inside the sub
+    /// scope (like `detect_first_param_type`).
     fn apply_param_type_manifest(&mut self, method: &str, params: &[ParamInfo], node: Node<'a>) {
-        // No rules → skip the ancestry DFS + alloc every sub declaration would
-        // otherwise pay for nothing.
+        // No rules → skip the alloc every sub declaration would otherwise pay.
         if self.param_type_manifest.is_empty() && self.param_type_wildcards.is_empty() {
             return;
         }
-        let Some(pkg) = self.current_package.clone() else { return };
-        // Resolved ancestry of the enclosing package (roles via `with`,
-        // parents via extends/isa/use parent), plus the package itself.
-        let ancestry = self.transitive_parents(&pkg);
-
-        // Collect (param-index, class) pairs before mutating self — can't hold
-        // the manifest borrow while calling push_type_constraint.
-        let mut to_type: Vec<(String, String)> = Vec::new();
+        // Collect (variable, gate-class, type-class) before mutating self —
+        // can't hold the manifest borrow while pushing into `gated_param_types`.
+        let mut to_gate: Vec<(String, String, String)> = Vec::new();
 
         // Named rules: only those keyed to exactly this method name.
         if let Some(rules) = self.param_type_manifest.get(method) {
-            Self::collect_param_type_matches(rules, &pkg, &ancestry, params, &mut to_type);
+            Self::collect_param_type_matches(rules, params, &mut to_gate);
         }
 
         // Wildcard rules: method is None — apply to every sub in the class.
         let wildcards = std::mem::take(&mut self.param_type_wildcards);
-        Self::collect_param_type_matches(&wildcards, &pkg, &ancestry, params, &mut to_type);
+        Self::collect_param_type_matches(&wildcards, params, &mut to_gate);
         self.param_type_wildcards = wildcards;
 
         let scope = self.current_scope();
         let span = node_to_span(node);
-        for (variable, class) in to_type {
-            self.push_type_constraint(TypeConstraint {
-                variable,
-                scope,
-                constraint_span: span,
-                inferred_type: InferredType::ClassName(class),
-            });
+        for (variable, in_role, class) in to_gate {
+            self.gated_param_types.push(crate::file_analysis::ReceiverGated::new(
+                in_role,
+                TypeConstraint {
+                    variable,
+                    scope,
+                    constraint_span: span,
+                    inferred_type: InferredType::ClassName(class),
+                },
+            ));
         }
     }
 
-    /// Inner fold for `apply_param_type_manifest`: given a slice of rules and
-    /// the current package's ancestry, push matching (variable_name, class)
-    /// pairs into `out`. Pure — no self borrow, so it can be called while
-    /// `param_type_wildcards` is temporarily moved out.
+    /// Inner fold for `apply_param_type_manifest`: collect matching
+    /// (variable_name, in_role, type_class) triples into `out`. Pure — no self
+    /// borrow, so it can be called while `param_type_wildcards` is temporarily
+    /// moved out. The `in_role` gate rides each triple; ancestry is checked at
+    /// query time, not here.
     fn collect_param_type_matches(
         rules: &[plugin::ParamType],
-        pkg: &str,
-        ancestry: &[String],
         params: &[ParamInfo],
-        out: &mut Vec<(String, String)>,
+        out: &mut Vec<(String, String, String)>,
     ) {
         for r in rules {
-            let in_scope = pkg == r.in_role || ancestry.iter().any(|a| a == &r.in_role);
-            if !in_scope { continue; }
             if let Some(p) = params.get(r.param) {
                 if p.name.starts_with('$') {
-                    out.push((p.name.clone(), r.type_class.clone()));
+                    out.push((p.name.clone(), r.in_role.clone(), r.type_class.clone()));
                 }
             }
         }

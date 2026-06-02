@@ -113,3 +113,29 @@ depends on them yet:
 
 These are recorded so the next refactor in the area picks them up; none
 justifies a standalone PR.
+
+## Cross-file `ClassIsa`-trigger emissions (Phase 2 residual)
+
+`param_types` `in_role` is now cross-file via `ReceiverGated<TypeConstraint>`
+resolved at query time (`FileAnalysis::gated_param_type_for`), landed in the
+receiver-gated Phase 2. The sibling gap — a plugin whose `applicable` is
+`ClassIsa(P)` firing its emit hooks through a CROSS-FILE parent chain — stays
+open (`probe_class_isa_trigger_through_cross_file_parent`, `#[ignore]`).
+
+Why it didn't fold onto the same seam in Phase 2: `param_types` produces a
+TYPED CONSTRAINT on a variable — a value read through exactly one query seam
+(`inferred_type_via_bag_ctx`), so gating that one read covers every consumer.
+`ClassIsa` triggers instead fire EMIT HOOKS (`on_method_call` /
+`on_function_call` / `on_use`) that SYNTHESIZE SYMBOLS (e.g. a mojo-events
+`Handler` symbol for `$self->on('ready', ...)`). Those synthesized symbols
+feed completion, goto-def, references, hover — there is no single query seam
+to gate; the symbols must materialize into `fa.symbols` to be reachable, and
+materialization happens at parse time inside the index-free builder.
+
+The contained move would be: record the would-be emissions as
+`ReceiverGated<PendingEmission>` (gate = the trigger class), then materialize
+the symbols at enrichment (open docs) / a query-time symbol overlay (non-open),
+resolving each gate cross-file. That is a real overlay-symbols mechanism —
+every symbol-table consumer must consult it — and is the natural companion to
+the planned graph-walking pillar (`docs/prompt-graph-walking.md`), not a
+contained follow-up. Deferred there.

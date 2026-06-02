@@ -100,14 +100,26 @@ The receiver-isa rule is one instance of a broader shape: *a plugin
 emission applies only when an ancestry/role/surface predicate holds, and
 that predicate is cross-file*. The same `ReceiverGated` producer mints
 the other deferred emission-conditionals (see
-`docs/prompt-enrichment-inheritance-residual.md`):
+`docs/prompt-enrichment-inheritance-residual.md`).
+
+**`param_types` `in_role` — LANDED.** A plugin `param_types()` rule types a
+named param when the enclosing package `isa` the rule's `in_role` class. The
+builder now emits one `ReceiverGated<TypeConstraint>` per matching sub
+(`gate = in_role`), UNGATED — no local-ancestry precondition, preserving the
+index-free contract. `FileAnalysis::gated_param_type_for` resolves it at
+query time via `resolve_for(enclosing_package, …)`, so a controller whose
+`Catalyst::Controller` ancestor is reachable only through a cross-file base
+types its `$c`. The gated TC is a *value read through one query seam*
+(`inferred_type_via_bag_ctx`), which is what makes the single-seam gate
+sufficient.
+
+Still deferred:
 
 - `ClassIsa` triggers (mojo-events `$self->on('ready')` through a
-  cross-file parent chain),
-- `param_types` `in_role` through a cross-file ancestor,
-- the app-surface consumer set.
-
-Each becomes a gated producer resolved at query time, so the index-free-
-builder contract holds and the predicate is checked once, where the
-module index exists. The type enforces the filter; the consumer never sees
-the shape.
+  cross-file parent chain). Unlike `param_types`, these fire EMIT HOOKS
+  that synthesize symbols feeding every symbol-table consumer — there's no
+  single query seam to gate. Needs an overlay-symbols mechanism; see
+  `docs/open-problems.md` and the graph-walking pillar.
+- the app-surface consumer set (already isa-shaped via `parents_of` +
+  `app_surface_consumers`; folding it onto `resolve_for` is a small
+  consolidation, not a correctness gap).

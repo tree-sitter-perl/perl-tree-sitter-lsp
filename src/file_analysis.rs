@@ -1600,6 +1600,19 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
 
+    /// Plugin `param_types()` role-contract TCs, each gated on the enclosing
+    /// package's `isa` the rule's `in_role` class. The builder emits one per
+    /// matching sub declaration UNCONDITIONALLY (no local-ancestry
+    /// precondition — it's index-free per rule #1), so a controller whose
+    /// `in_role` ancestor is reachable only CROSS-FILE still carries the
+    /// candidate. The gate (`isa in_role`) is checked at QUERY time in
+    /// `inferred_type_via_bag_ctx`, where the module index resolves the
+    /// enclosing package's ancestry cross-file. The `ReceiverGated` wrapper
+    /// keeps the typed TC unreadable without that check (rule #10). See
+    /// `docs/adr/receiver-gated-dispatch.md` (Phase 2).
+    #[serde(default)]
+    pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
+
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
@@ -1666,6 +1679,7 @@ impl FileAnalysis {
             base_witness_count: 0,
             base_ref_count: 0,
             provisional_dispatches: Vec::new(),
+            gated_param_types: Vec::new(),
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -2052,7 +2066,7 @@ impl FileAnalysis {
         module_index: Option<&ModuleIndex>,
     ) -> Option<InferredType> {
         let scope = self.scope_at(point)?;
-        crate::witnesses::query_variable_type(
+        if let Some(t) = crate::witnesses::query_variable_type(
             &self.witnesses,
             &self.scopes,
             &self.package_framework,
@@ -2062,7 +2076,44 @@ impl FileAnalysis {
             var_name,
             scope,
             point,
-        )
+        ) {
+            return Some(t);
+        }
+        // Role-contract param types are gated on the enclosing package's
+        // cross-file ancestry, so they resolve here (index in hand), not in
+        // the bag the index-free builder seeded.
+        self.gated_param_type_for(var_name, scope, point, module_index)
+    }
+
+    /// Resolve a `param_types()` role-contract TC for `var` at `point`: find a
+    /// gated TC whose scope is on the chain and whose variable matches, then
+    /// read its inner type ONLY if the enclosing package `isa` the rule's
+    /// gate (`in_role`), resolved cross-file via `resolve_for`. The gate makes
+    /// a controller whose `Catalyst::Controller` ancestry is established
+    /// through a cross-file base type its `$c` — the build-time local-only
+    /// ancestry check this replaces would have dropped it.
+    fn gated_param_type_for(
+        &self,
+        var: &str,
+        scope: ScopeId,
+        point: Point,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<InferredType> {
+        if self.gated_param_types.is_empty() {
+            return None;
+        }
+        let chain = self.scope_chain(scope);
+        let pkg = self.package_at(point);
+        for gated in &self.gated_param_types {
+            if let GateResult::Applies(tc) =
+                gated.resolve_for(pkg, &self.package_parents, module_index)
+            {
+                if tc.variable == var && chain.contains(&tc.scope) {
+                    return Some(tc.inferred_type.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Resolve the inferred return type of a method call by its ref index
