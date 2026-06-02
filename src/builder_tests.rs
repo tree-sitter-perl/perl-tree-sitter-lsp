@@ -9609,3 +9609,41 @@ fn instanceof_accessor_chains_into_method_call() {
         "->greet on an InstanceOf['Other'] accessor must resolve against Other; got: {hover}",
     );
 }
+
+/// Option B resolves a receiver whose type comes from a Mojo HELPER, not a
+/// plain method. `$c->minion` (a helper bridged to Mojolicious::Controller,
+/// returning a Minion subclass) → `$c->minion->enqueue('T')` must synthesize
+/// the dispatch. This is the gap that left `$app->minion`/`$c->minion`
+/// chains dark: option-B's enrichment receiver-resolution now threads the
+/// index (variable arm) and chases the helper bridge the way hover does.
+#[test]
+fn provisional_dispatch_resolves_helper_returned_receiver() {
+    use std::path::PathBuf;
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    idx.register_workspace_module(
+        PathBuf::from("/tmp/b_hr_minion.pm"),
+        std::sync::Arc::new(build_fa("package Acme::Minion;\nuse Mojo::Base 'Minion';\n1;\n")),
+    );
+    idx.register_workspace_module(
+        PathBuf::from("/tmp/b_hr_plugin.pm"),
+        std::sync::Arc::new(build_fa(
+            "package Acme::Plugin;\nuse Mojo::Base 'Mojolicious::Plugin';\nsub register ($self, $app, $conf) {\n  my $m = Acme::Minion->new;\n  $app->helper(minion => sub {$m});\n  $app->minion->add_task('Task.go' => sub ($job) { 1 });\n}\n1;\n",
+        )),
+    );
+
+    let mut fa = build_fa(
+        "package Acme::Ctrl;\nuse Mojo::Base 'Mojolicious::Controller';\nsub act ($c) {\n  $c->minion->enqueue('Task.go');\n}\n1;\n",
+    );
+    fa.enrich_imported_types_with_keys(Some(&idx));
+
+    let dc = fa.refs.iter().find(|r| {
+        matches!(&r.kind, RefKind::DispatchCall { dispatcher, owner: Some(HandlerOwner::Class(c)) }
+            if dispatcher == "enqueue" && c == "Minion")
+            && r.target_name == "Task.go"
+    });
+    assert!(
+        dc.is_some(),
+        "enrichment must resolve the helper-returned receiver $c->minion (Acme::Minion \
+         isa Minion) and synthesize the DispatchCall for the chained enqueue",
+    );
+}

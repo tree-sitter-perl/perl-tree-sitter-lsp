@@ -3340,6 +3340,13 @@ impl FileAnalysis {
                             }
                         }
                     }
+                    // No LOCAL Handler — the registration is cross-file.
+                    // Return None (terminal) so the LSP adapter's cross-file
+                    // DispatchCall resolver runs. Falling through to the
+                    // `symbol_at` fallback below would wrongly grab whatever
+                    // symbol overlaps the call-arg string (e.g. a synthesized
+                    // hash-key def at the same span).
+                    return None;
                 }
                 RefKind::DispatchCall { owner: None, .. } => {}
             }
@@ -4251,10 +4258,15 @@ impl FileAnalysis {
 
         // Variable invocant — bag query handles every typed shape
         // (TC, FrameworkAware, BranchArm, ReturnExpr, cross-file
-        // Variable witnesses pushed by enrichment).
+        // Variable witnesses pushed by enrichment). Thread the
+        // `module_index` so a variable whose type flows from a
+        // cross-file source — `my $m = $c->helper` where the helper
+        // (and its return) live in another file — resolves here the
+        // same way hover does. Dropping it was the gap that left
+        // option-B dispatch dark on helper-returned receivers.
         let first = invocant.as_bytes()[0];
         if first == b'$' || first == b'@' || first == b'%' {
-            if let Some(t) = self.inferred_type_via_bag(invocant, point) {
+            if let Some(t) = self.inferred_type_via_bag_ctx(invocant, point, module_index) {
                 if let Some(cn) = t.class_name() {
                     return Some(cn.to_string());
                 }
