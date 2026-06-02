@@ -106,3 +106,32 @@ shows up.
 - Naming + namespace `kind`: `app` surface vs reusing the existing
   `Bridge::Class` machinery with a fictional class name. Prefer whatever keeps
   `for_each_entity_bridged_to` unchanged.
+
+## Landed
+
+The synthetic-ancestor encoding (above) shipped:
+
+- **One bridge target.** `mojo-helpers.rhai` bridges every helper to a single
+  fictional class `file_analysis::APP_SURFACE_CLASS`
+  (`Mojolicious::_AppSurface`) — never a real package, no parents, inert in the
+  walk beyond contributing its bridge. The per-helper 2-class bridge list is
+  gone.
+- **Open consumer set via a manifest.** `FrameworkPlugin::app_surface_consumers()`
+  (default empty; registry union; Rhai array-of-strings reader — same
+  declarative family as `overrides()` / `dispatch_verbs()` / `param_types()`)
+  declares the receiver classes. `mojo-helpers` declares
+  `[Mojolicious::Controller, Mojolicious]`. The Mojo names live in the plugin,
+  not in core (no `APP_SURFACE_CONSUMERS` const). The builder bakes the union
+  onto `FileAnalysis.app_surface_consumers` so query-time walks read it without
+  re-touching the registry; it rides the cache blob (`#[serde(default)]`).
+- **Single edge-injection seam.** `file_analysis::parents_of(class,
+  package_parents, module_index, consumers)` is the ONE place the synthetic
+  `APP_SURFACE_CLASS` parent is appended. All three parent-enumeration sites —
+  `for_each_ancestor_class`, `collect_ancestor_methods`, and the `MethodOnClass`
+  inheritance walk in `witnesses.rs` — route through it, so MRO rules and the
+  edge can't drift. `BagContext` carries `app_surface_consumers` so the
+  bag-side walk has the same set.
+
+The open questions resolved as expected: the fictional parent is inert (no
+parents, bounded by the existing seen-set + depth cap), and the surface stays
+helper-scoped. The multi-app caveat is unchanged (one global surface).

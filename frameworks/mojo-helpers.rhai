@@ -32,6 +32,17 @@ fn triggers() {
     ]
 }
 
+// The receiver classes that compose the app surface — the "open
+// consumption" axis (docs/prompt-app-entity.md). Helpers bridge to the
+// single app-surface class; core gives each of these classes the
+// surface as a synthetic ancestor, so `$app->h` AND `$c->h` resolve
+// through the existing ancestor + bridge walk. App subclasses inherit
+// the surface for free through the normal MRO. Add a consumer here, not
+// in each helper's bridge list.
+fn app_surface_consumers() {
+    ["Mojolicious::Controller", "Mojolicious"]
+}
+
 // Helpers live on multiple classes in Mojolicious: the application
 // instance (`$app`) AND every controller (`$c`). Users call them on
 // both — `$app->current_user` from a hook, `$c->current_user` from an
@@ -81,18 +92,21 @@ fn on_method_call(ctx) {
     // for_each_entity_bridged_to matches via bridge union, so the
     // same Method surfaces from a `Mojolicious` query too.
 
-    // App namespace — one per current_package. Find-or-create on the
-    // core side. Bridges to both Controller (so `$c->helper` works) and
-    // Mojolicious (so `$app->helper` works). Entity names accumulate
-    // as we register more helpers on the same app.
+    // App namespace — one per current_package. Bridges to the single
+    // fictional "app surface" class (docs/prompt-app-entity.md). The
+    // consumer classes (declared by `app_surface_consumers()` below, and
+    // any app subclass) inherit the surface as a synthetic parent in
+    // core, so the existing ancestor walk + bridge resolution finds the
+    // helper from `$app->h` AND `$c->h` — one bridge target, open
+    // consumer set. Entity names accumulate per app namespace.
     let app_ns_id = if ctx.current_package == () {
         "mojo-app:main"
     } else {
         "mojo-app:" + ctx.current_package
     };
+    let app_surface = "Mojolicious::_AppSurface";
     let app_bridges = [
-        #{ Class: "Mojolicious::Controller" },
-        #{ Class: "Mojolicious" },
+        #{ Class: app_surface },
     ];
 
     if segments.len() == 1 {
@@ -119,14 +133,14 @@ fn on_method_call(ctx) {
                 return_type: (),
                 return_via_edge: args[1].callable_return_edge,
                 doc: (),
-                on_class: "Mojolicious::Controller",
+                on_class: app_surface,
                 display: "Helper",
                 hide_in_outline: false,
             }
         };
-        // Register the helper into the app namespace. Bridges to both
-        // Controller and Mojolicious; the single Method's package is
-        // Controller, and the bridge-union lookup finds it from both.
+        // Register the helper into the app namespace, bridged to the app
+        // surface. The Method's home package is the surface; consumer
+        // classes reach it via the synthetic-parent edge in core.
         out += #{
             PluginNamespace: #{
                 id: app_ns_id,
@@ -144,7 +158,7 @@ fn on_method_call(ctx) {
         out += #{
             MethodCallRef: #{
                 method_name: name,
-                invocant: "Mojolicious::Controller",
+                invocant: app_surface,
                 span: name_span,
                 invocant_span: (),
             }
@@ -158,8 +172,8 @@ fn on_method_call(ctx) {
     // deterministic per prefix and two helpers sharing a prefix
     // (`users.create`, `users.delete`) collapse onto the same proxy.
     //
-    // First segment: ONE Method owned by Controller. The namespace's
-    // bridge-union surfaces it from a Mojolicious query too.
+    // First segment: ONE Method owned by the app surface (the chain
+    // root, reached from `$c`/`$app` via the synthetic-parent edge).
     //
     // `hide_in_outline: true` on non-leaf segments — they're chain
     // plumbing, not registrations the user wrote. Two helpers
@@ -182,7 +196,7 @@ fn on_method_call(ctx) {
             is_method: true,
             return_type: #{ ClassName: first_proxy },
             doc: (),
-            on_class: "Mojolicious::Controller",
+            on_class: app_surface,
             display: "Helper",
             hide_in_outline: true,
             opaque_return: true,
@@ -235,11 +249,11 @@ fn on_method_call(ctx) {
     // Register the chain across TWO kinds of namespaces so bridge
     // visibility stays isolated per proxy level:
     //
-    //   1. App namespace (bridges: Controller, Mojolicious) — owns
-    //      ONLY the first segment (the entry point from `$c`/`$app`).
-    //      Query Controller/Mojolicious → gets top-level helpers +
-    //      chain roots, but NOT proxy-only entities (no create/delete
-    //      leaking into `$c->` completion).
+    //   1. App namespace (bridges: the app surface) — owns ONLY the
+    //      first segment (the entry point from `$c`/`$app`, reached via
+    //      the synthetic-parent edge). Query a consumer class → gets
+    //      top-level helpers + chain roots, but NOT proxy-only entities
+    //      (no create/delete leaking into `$c->` completion).
     //   2. One namespace per proxy level (bridges: just that proxy
     //      class) — owns the entities that live ON that proxy.
     //      Query _Helper::users → gets exactly {create, delete, admin}.

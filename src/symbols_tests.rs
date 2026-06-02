@@ -2586,13 +2586,13 @@ $r->get('/users')->
 /// Pin: a Mojo helper registered in one file (`$app->helper(widget => ...)`)
 /// must be reachable by goto-definition from `$c->widget` in ANOTHER file.
 ///
-/// The provider's `mojo-helpers` synthesis bridges `widget` to
-/// `Mojolicious::Controller`; the consumer's `$c` is a controller subclass.
-/// `resolve_method_in_ancestors` already finds the bridged symbol, but if its
-/// `CrossFile` result only carries the class name, the goto-def consumer
-/// re-looks-up the method in `Mojolicious::Controller`'s OWN module (where it
-/// doesn't exist) and the jump is lost. Same-file works; this is the cross-file
-/// hole that had no coverage.
+/// The provider's `mojo-helpers` synthesis bridges `widget` to the app
+/// surface; the consumer's `$c` is a controller subclass that reaches the
+/// surface via the synthetic-parent edge. `resolve_method_in_ancestors`
+/// already finds the bridged symbol, but if its `CrossFile` result only
+/// carries the class name, the goto-def consumer re-looks-up the method in
+/// the bridged class's OWN module (where it doesn't exist) and the jump is
+/// lost. Same-file works; this is the cross-file hole that had no coverage.
 #[test]
 fn cross_file_plugin_helper_goto_def_resolves() {
     let provider_src = "package My::Plugin;\n\
@@ -2603,14 +2603,14 @@ sub register ($self, $app, $conf) {\n\
 1;\n";
     let provider = parse_analysis(provider_src);
     // Sanity: the provider really did synthesize a `widget` Method bridged to
-    // Mojolicious::Controller (otherwise the test would pass vacuously once the
-    // bug is "fixed" by an unrelated path).
+    // the app surface (otherwise the test would pass vacuously once the bug is
+    // "fixed" by an unrelated path).
     assert!(
         provider.plugin_namespaces.iter().any(|ns| ns
             .bridges
             .iter()
-            .any(|b| matches!(b, crate::file_analysis::Bridge::Class(c) if c == "Mojolicious::Controller"))),
-        "provider must bridge a namespace to Mojolicious::Controller",
+            .any(|b| matches!(b, crate::file_analysis::Bridge::Class(c) if c == crate::file_analysis::APP_SURFACE_CLASS))),
+        "provider must bridge a namespace to the app surface",
     );
 
     let idx = crate::module_index::ModuleIndex::new_for_test();
@@ -2695,9 +2695,12 @@ sub action ($c) {\n\
         .hover_info(point, consumer_src, Some(&idx))
         .expect("cross-file hover should resolve the bridged helper");
     assert!(hover.contains("widget"), "hover should mention the helper, got: {hover}");
+    // The helper now lives on the fictional app surface; the controller
+    // subclass reaches it through the synthetic-parent edge. Hover shows
+    // where the symbol is bridged from.
     assert!(
-        hover.contains("Mojolicious::Controller"),
-        "hover should show the bridging class, got: {hover}",
+        hover.contains(crate::file_analysis::APP_SURFACE_CLASS),
+        "hover should show the app surface as the bridging class, got: {hover}",
     );
 }
 

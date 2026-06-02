@@ -4602,8 +4602,8 @@ $app->helper(current_user => sub {
     let helper = helpers[0];
     assert_eq!(
         helper.package.as_deref(),
-        Some("Mojolicious::Controller"),
-        "canonical home is Mojolicious::Controller"
+        Some(crate::file_analysis::APP_SURFACE_CLASS),
+        "canonical home is the fictional app surface"
     );
 
     if let SymbolDetail::Sub {
@@ -4627,8 +4627,10 @@ $app->helper(current_user => sub {
         panic!("helper detail should be Sub");
     }
 
-    // The PluginNamespace owns the bridge visibility: its Class
-    // bridges cover both entry classes.
+    // The PluginNamespace owns the bridge visibility: a SINGLE bridge
+    // to the fictional app surface (docs/prompt-app-entity.md). The
+    // consumer classes reach it via the synthetic-parent edge in core,
+    // not via a per-helper bridge list.
     let ns = fa
         .plugin_namespaces
         .iter()
@@ -4639,14 +4641,29 @@ $app->helper(current_user => sub {
         .iter()
         .map(|Bridge::Class(c)| c.as_str())
         .collect();
-    assert!(
-        bridge_classes.contains("Mojolicious::Controller"),
-        "namespace bridges Controller"
+    assert_eq!(
+        bridge_classes,
+        std::iter::once(crate::file_analysis::APP_SURFACE_CLASS).collect(),
+        "namespace bridges ONLY the app surface — open consumer set lives in core"
     );
-    assert!(
-        bridge_classes.contains("Mojolicious"),
-        "namespace bridges Mojolicious (the app class)"
-    );
+
+    // The synthetic-ancestor edge: the helper resolves from BOTH the
+    // app class and the controller class through the SAME ancestor walk,
+    // even though neither is the helper's home package.
+    for consumer in ["Mojolicious", "Mojolicious::Controller"] {
+        let res = fa.resolve_method_in_ancestors(consumer, "current_user", None);
+        match res {
+            Some(crate::file_analysis::MethodResolution::Local { sym_id, .. }) => {
+                assert_eq!(
+                    sym_id, helper.id,
+                    "{consumer}->current_user must resolve to the helper via the app surface"
+                );
+            }
+            other => panic!(
+                "{consumer}->current_user should resolve to the helper Local; got {other:?}"
+            ),
+        }
+    }
 }
 
 /// Dotted helpers chain into namespace methods: `users.create` means
@@ -4667,7 +4684,8 @@ $app->helper('thing.there' => sub { my ($c, $arg_b) = @_; });
 "#;
     let fa = build_fa(src);
 
-    // Exactly one `thing` method on Mojolicious::Controller,
+    // Exactly one `thing` method on the app surface (the chain root's
+    // home; consumer classes reach it via the synthetic-parent edge),
     // despite two dotted helpers sharing that prefix.
     let thing_syms: Vec<&Symbol> = fa
         .symbols
@@ -4675,7 +4693,7 @@ $app->helper('thing.there' => sub { my ($c, $arg_b) = @_; });
         .filter(|s| {
             s.name == "thing"
                 && s.kind == SymKind::Method
-                && s.package.as_deref() == Some("Mojolicious::Controller")
+                && s.package.as_deref() == Some(crate::file_analysis::APP_SURFACE_CLASS)
         })
         .collect();
     assert_eq!(
@@ -4742,9 +4760,9 @@ $app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
         .find(|s| {
             s.name == "admin"
                 && s.kind == SymKind::Method
-                && s.package.as_deref() == Some("Mojolicious::Controller")
+                && s.package.as_deref() == Some(crate::file_analysis::APP_SURFACE_CLASS)
         })
-        .expect("admin on Controller");
+        .expect("admin on app surface (chain root)");
     let users = fa
         .symbols
         .iter()
@@ -5638,34 +5656,34 @@ use parent 'Mojolicious::Controller';
     let idx = ModuleIndex::new_for_test();
     idx.register_workspace_module(std::path::PathBuf::from("/tmp/MyApp.pm"), lite_fa.clone());
 
-    // bridges_index knows MyApp.pm declares a namespace bridged to
-    // Mojolicious::Controller (mojo-helpers' app namespace).
-    let mods = idx.modules_bridging_to("Mojolicious::Controller");
+    // bridges_index knows MyApp.pm declares a namespace bridged to the
+    // app surface (mojo-helpers' app namespace).
+    let mods = idx.modules_bridging_to(crate::file_analysis::APP_SURFACE_CLASS);
     assert!(
         mods.iter().any(|m| m == "MyApp"),
-        "MyApp module should be listed as bridged to \
-             Mojolicious::Controller; got: {:?}",
+        "MyApp module should be listed as bridged to the app surface; got: {:?}",
         mods
     );
 
     // Completion on MyApp::Controller::Home inheriting from
-    // Mojolicious::Controller should walk up and find `greet`.
+    // Mojolicious::Controller should walk up to the controller, cross
+    // the synthetic-parent edge to the app surface, and find `greet`.
     let candidates = ctrl_fa.complete_methods_for_class("MyApp::Controller::Home", Some(&idx));
     let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"greet"),
-        "helper `greet` emitted on Mojolicious::Controller in \
-             MyApp.pm should complete on subclasses; got: {:?}",
+        "helper `greet` on the app surface in MyApp.pm should complete on \
+             controller subclasses via the synthetic-parent edge; got: {:?}",
         labels
     );
 }
 
 /// mojo-helpers cross-file: when a Lite script registers a helper
-/// `greet`, the resulting Method symbol's `package` is
-/// `Mojolicious::Controller`. Any consumer file — controller
-/// subclass or otherwise — finds it via the standard workspace
-/// walk + inheritance chain without a single mojo-helpers-aware
-/// line in the consumer-side code path.
+/// `greet`, the resulting Method symbol's `package` is the fictional
+/// app surface. Any consumer file — controller subclass, the app, or
+/// otherwise — finds it via the standard workspace walk + the
+/// synthetic-parent edge, without a single mojo-helpers-aware line in
+/// the consumer-side code path.
 #[test]
 fn plugin_mojo_helpers_land_on_controller_package() {
     let src = r#"
@@ -5686,11 +5704,89 @@ app->helper(greet => sub {
         .expect("helper must emit a Method named greet");
     assert_eq!(
         greet.package.as_deref(),
-        Some("Mojolicious::Controller"),
-        "helper Method must be packaged on the shared controller base; \
-             that's what lets every subclass pick it up via inheritance walk"
+        Some(crate::file_analysis::APP_SURFACE_CLASS),
+        "helper Method is packaged on the app surface; the synthetic-parent \
+             edge lets every consumer class pick it up via the inheritance walk"
     );
     assert!(matches!(&greet.namespace, Namespace::Framework { id } if id == "mojo-helpers"));
+}
+
+/// Synthetic-ancestor app surface (docs/prompt-app-entity.md): a helper
+/// that returns a concrete class resolves its RETURN type identically
+/// from the app, the controller, AND a user-written app subclass —
+/// proving the single bridge target + synthetic-parent edge composes with
+/// the MethodOnClass type-resolution walk and that subclasses inherit the
+/// surface for free.
+#[test]
+fn plugin_mojo_helpers_return_type_via_app_surface() {
+    let src = r#"
+package MyApp;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(model => sub { my ($c) = @_; return MyApp::Model->new; });
+"#;
+    // Declare a user app subclass in the SAME file so its
+    // `package_parents` edge (MyApp::Web -> Mojolicious) is present;
+    // it must inherit the surface for free.
+    let src = format!("{src}\npackage MyApp::Web;\nuse parent 'Mojolicious';\n1;\n");
+    let fa = build_fa(&src);
+
+    // The helper resolves its return type from the app class, the
+    // controller class, AND the user app subclass.
+    for class in ["Mojolicious", "Mojolicious::Controller", "MyApp::Web"] {
+        let rt = fa.find_method_return_type(class, "model", None, None);
+        assert_eq!(
+            rt,
+            Some(crate::file_analysis::InferredType::ClassName("MyApp::Model".into())),
+            "`{class}->model` must return MyApp::Model via the app surface; got {rt:?}",
+        );
+    }
+}
+
+/// App surface (docs/prompt-app-entity.md): `$app->minion->enqueue`
+/// resolves once `$app` is typed. The `minion` helper (return type a
+/// Minion subclass) is reached from the locally-typed `$app` via the app
+/// surface; enrichment then resolves the `->enqueue` receiver and promotes
+/// the dispatch. Proves the surface composes with dispatch-verb promotion.
+#[test]
+fn plugin_app_surface_minion_enqueue_resolves_when_app_typed() {
+    use crate::file_analysis::HandlerOwner;
+    use std::path::PathBuf;
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    idx.register_workspace_module(
+        PathBuf::from("/tmp/as_acme_minion.pm"),
+        std::sync::Arc::new(build_fa("package Acme::Minion;\nuse Mojo::Base 'Minion';\n1;\n")),
+    );
+
+    // `$app` is locally typed (Mojolicious->new); the `minion` helper
+    // returns an Acme::Minion. `$app->minion` reaches the helper via the
+    // synthetic app-surface edge, so its return type is Acme::Minion.
+    let mut fa = build_fa(
+        "package MyApp;\nuse Mojolicious::Lite;\n\
+         my $app = Mojolicious->new;\n\
+         $app->helper(minion => sub { my ($c) = @_; return Acme::Minion->new; });\n\
+         $app->minion->enqueue('send_email' => ['alice']);\n1;\n",
+    );
+
+    let mref = fa.refs.iter().find(|r| {
+        matches!(&r.kind, RefKind::MethodCall { .. }) && r.target_name == "minion"
+    });
+    assert!(mref.is_some(), "an `$app->minion` MethodCall ref must exist");
+
+    fa.enrich_imported_types_with_keys(Some(&idx));
+
+    let dc = fa.refs.iter().find(|r| {
+        matches!(&r.kind, RefKind::DispatchCall { dispatcher, owner: Some(HandlerOwner::Class(c)) }
+            if dispatcher == "enqueue" && c == "Minion")
+            && r.target_name == "send_email"
+    });
+    assert!(
+        dc.is_some(),
+        "`$app->minion->enqueue` must promote to a Minion DispatchCall — \
+         the `minion` helper resolves from the typed $app via the app surface, \
+         and its Acme::Minion return type drives dispatch promotion",
+    );
 }
 
 /// Helpers complete on both `$c` (Controller) and `$app` (the
@@ -6424,13 +6520,14 @@ sub session { my ($self, $key) = @_; }
         ctrl_fa,
     );
 
-    // The workspace knows the Lite file declares a namespace
-    // bridged to Mojolicious::Controller (the mojo-helpers app
-    // namespace emits `Bridge::Class("Mojolicious::Controller")`).
-    let mods = idx.modules_bridging_to("Mojolicious::Controller");
+    // The workspace knows the Lite file declares a namespace bridged
+    // to the app surface (the mojo-helpers app namespace emits
+    // `Bridge::Class(APP_SURFACE_CLASS)`). The controller reaches it
+    // through the synthetic-parent edge in the ancestor walk.
+    let mods = idx.modules_bridging_to(crate::file_analysis::APP_SURFACE_CLASS);
     assert!(
         mods.iter().any(|m| m == "MyApp"),
-        "workspace index must list MyApp.pm bridged to Controller; got: {:?}",
+        "workspace index must list MyApp.pm bridged to the app surface; got: {:?}",
         mods
     );
 
@@ -7660,11 +7757,11 @@ $minion->enqueue(task_x => ['a'], { priority => 10,  });
     );
 }
 
-/// mojo-helpers emits a PluginNamespace for the app, bridging to
-/// `Mojolicious::Controller` and `Mojolicious`. Each registered
-/// helper's name is an entity; the two fan-out Method symbols
-/// (one per entry class) both land in the namespace via name
-/// resolution. Multi-app workspaces get one namespace per app.
+/// mojo-helpers emits a PluginNamespace for the app, bridging to the
+/// single fictional app surface (docs/prompt-app-entity.md). Each
+/// registered helper's name is an entity. The consumer classes reach
+/// the surface via the synthetic-parent edge in core. Multi-app
+/// workspaces get one namespace per app.
 #[test]
 fn mojo_helpers_emits_app_plugin_namespace() {
     use crate::file_analysis::Bridge;
@@ -7676,20 +7773,19 @@ $app->helper('users.create' => sub { my ($c) = @_; });
 "#;
     let fa = build_fa(src);
 
-    // Identify by semantic shape (kind + bridges), not by plugin
-    // id — the contract is "there's an 'app' namespace bridging to
-    // both Controller and Mojolicious", not "a plugin literally
-    // called mojo-helpers emits it".
+    // Identify by semantic shape (kind + bridge to the app surface),
+    // not by plugin id — the contract is "there's an 'app' namespace
+    // bridging to the app surface", not "a plugin literally called
+    // mojo-helpers emits it".
     let ns = fa
         .plugin_namespaces
         .iter()
         .find(|n| {
             n.kind == "app"
                 && n.bridges
-                    .contains(&Bridge::Class("Mojolicious::Controller".into()))
-                && n.bridges.contains(&Bridge::Class("Mojolicious".into()))
+                    .contains(&Bridge::Class(crate::file_analysis::APP_SURFACE_CLASS.into()))
         })
-        .expect("an `app` namespace must bridge both Controller and Mojolicious");
+        .expect("an `app` namespace must bridge the app surface");
 
     // Entities cover both registered helpers, through the
     // name-keyed resolution that expands fan-out Methods.

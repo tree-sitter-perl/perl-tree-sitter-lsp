@@ -993,6 +993,50 @@ pub enum Bridge {
     Class(String),
 }
 
+/// Fictional "app surface" class — the synthetic ancestor that the
+/// Mojolicious app / controller / command classes (the manifest-declared
+/// consumer set, see `FrameworkPlugin::app_surface_consumers`) all
+/// inherit, so a single bridge target reaches every receiver that can see
+/// helpers (docs/prompt-app-entity.md). Helpers bridge to THIS one class;
+/// the consumer classes get it as a synthetic parent injected in the MRO
+/// walk (`parents_of`). The existing ancestor walk + bridge resolution
+/// then finds helpers with no per-receiver bridge list. Not a real Perl
+/// package — never resolves to a file, has no parents, so it's inert in
+/// the walk beyond contributing its bridge.
+pub const APP_SURFACE_CLASS: &str = "Mojolicious::_AppSurface";
+
+/// Inject the synthetic app-surface ancestor (`APP_SURFACE_CLASS`) when
+/// `class` is one of the declared `consumers`. The ONE place the
+/// synthetic-parent edge is added — every parent-enumeration site
+/// (`for_each_ancestor_class`, `collect_ancestor_methods`, and the
+/// `MethodOnClass` inheritance walk in `witnesses.rs`) routes through
+/// here so they can't drift. Real ancestors come first; the surface is
+/// appended last so same-name overrides on a real parent win. The
+/// surface has no parents of its own, so the walk's seen-set + depth cap
+/// bound it like any edge.
+pub fn parents_of(
+    class: &str,
+    package_parents: &HashMap<String, Vec<String>>,
+    module_index: Option<&ModuleIndex>,
+    consumers: &[String],
+) -> Vec<String> {
+    let mut parents: Vec<String> = package_parents.get(class).cloned().unwrap_or_default();
+    if let Some(idx) = module_index {
+        for p in idx.parents_cached(class) {
+            if !parents.contains(&p) {
+                parents.push(p);
+            }
+        }
+    }
+    if class != APP_SURFACE_CLASS
+        && consumers.iter().any(|c| c == class)
+        && !parents.iter().any(|p| p == APP_SURFACE_CLASS)
+    {
+        parents.push(APP_SURFACE_CLASS.to_string());
+    }
+    parents
+}
+
 // ---- Hash key owner (for scope graph) ----
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1247,6 +1291,15 @@ pub struct FileAnalysis {
     /// Populated by the builder from use parent/base, @ISA, and class :isa.
     pub package_parents: HashMap<String, Vec<String>>,
 
+    /// Manifest-declared app-surface consumer classes
+    /// (`FrameworkPlugin::app_surface_consumers`), baked from the plugin
+    /// registry at build so the query-time ancestor walk can inject the
+    /// synthetic `APP_SURFACE_CLASS` parent (`parents_of`) without
+    /// re-reading the registry. `#[serde(default)]` so older cache blobs
+    /// deserialize as empty.
+    #[serde(default)]
+    pub app_surface_consumers: Vec<String>,
+
     /// Modules `use`-d inside each package in this file. Parallel to
     /// `package_parents`: keyed by the enclosing package name, values are
     /// module names. Powers trigger-matching for plugin query hooks
@@ -1370,6 +1423,7 @@ impl FileAnalysis {
             method_call_bindings,
             package_ranges,
             package_parents,
+            app_surface_consumers: Vec::new(),
             package_uses,
             framework_imports,
             export,
@@ -1773,6 +1827,7 @@ impl FileAnalysis {
             &self.scopes,
             &self.package_framework,
             &self.package_parents,
+            &self.app_surface_consumers,
             module_index,
             var_name,
             scope,
@@ -1806,6 +1861,7 @@ impl FileAnalysis {
             package_framework: &self.package_framework,
             module_index,
             package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
             };
         let q = ReducerQuery {
             attachment: &att,
@@ -1852,6 +1908,7 @@ impl FileAnalysis {
             package_framework: &self.package_framework,
             module_index,
             package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
         };
         let q = ReducerQuery {
             attachment: &att,
@@ -1941,6 +1998,7 @@ impl FileAnalysis {
             package_framework: &self.package_framework,
             module_index: None,
             package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
             };
         crate::witnesses::query_sub_return_type(
             &self.witnesses,
@@ -2707,6 +2765,7 @@ impl FileAnalysis {
             package_framework: &self.package_framework,
             module_index,
             package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
             };
         // Default the arity hint from the sym's own param count when
         // the caller didn't supply one — the sym's params count IS its
@@ -2780,6 +2839,7 @@ impl FileAnalysis {
             package_framework: &self.package_framework,
             module_index,
             package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
         };
         // Default receiver = `ClassName(class_name)` so that
         // `ReturnExpr::Receiver` evaluates correctly for class-keyed
@@ -3018,16 +3078,9 @@ impl FileAnalysis {
             }
         }
 
-        // Walk local parents
-        if let Some(parents) = self.package_parents.get(class_name) {
-            for parent in parents {
-                self.collect_ancestor_methods(
-                    original_class, parent, module_index, candidates, seen_names, depth + 1,
-                );
-            }
-        }
-
-        // Walk cross-file parents
+        // Cross-file entity + own-class method collection. Parent
+        // recursion (local ∪ cross-file ∪ synthetic app-surface edge)
+        // is the single `parents_of` walk at the end of the fn.
         if let Some(idx) = module_index {
             // Two sources of candidates:
             //   (1) Plugin entities reached through bridges (helpers,
@@ -3095,16 +3148,20 @@ impl FileAnalysis {
                 }
             }
 
-            // Cross-file parents
-            let cross_parents = idx.parents_cached(class_name);
-            for parent in &cross_parents {
-                // Don't re-collect if it's a local package (already handled above)
-                if !self.package_parents.contains_key(parent.as_str()) {
-                    self.collect_ancestor_methods(
-                        original_class, parent, module_index, candidates, seen_names, depth + 1,
-                    );
-                }
-            }
+        }
+
+        // Walk parents: local ∪ cross-file ∪ synthetic app-surface edge,
+        // unioned + deduped by `parents_of` (the single edge-injection
+        // site). Name dedup across the recursion is the `seen_names` set.
+        for parent in parents_of(
+            class_name,
+            &self.package_parents,
+            module_index,
+            &self.app_surface_consumers,
+        ) {
+            self.collect_ancestor_methods(
+                original_class, &parent, module_index, candidates, seen_names, depth + 1,
+            );
         }
     }
 
@@ -4562,17 +4619,12 @@ impl FileAnalysis {
             if let std::ops::ControlFlow::Break(()) = visit(&cur) {
                 return;
             }
-            let mut parents: Vec<String> = Vec::new();
-            if let Some(ps) = self.package_parents.get(&cur) {
-                parents.extend(ps.iter().cloned());
-            }
-            if let Some(idx) = module_index {
-                for p in idx.parents_cached(&cur) {
-                    if !parents.contains(&p) {
-                        parents.push(p);
-                    }
-                }
-            }
+            let parents = parents_of(
+                &cur,
+                &self.package_parents,
+                module_index,
+                &self.app_surface_consumers,
+            );
             for p in parents.into_iter().rev() {
                 stack.push(p);
             }

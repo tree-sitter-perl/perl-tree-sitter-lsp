@@ -226,6 +226,7 @@ fn build_with_plugins_inner(
         plugins,
         dispatch_manifest: std::collections::HashMap::new(),
         type_constraint_names: std::collections::HashSet::new(),
+        app_surface_consumers: Vec::new(),
         param_type_manifest: std::collections::HashMap::new(),
         provisional_dispatches: Vec::new(),
         method_call_invocant: std::collections::HashMap::new(),
@@ -240,6 +241,11 @@ fn build_with_plugins_inner(
     b.type_constraint_names = b
         .plugins
         .type_constraint_names()
+        .map(|s| s.to_string())
+        .collect();
+    b.app_surface_consumers = b
+        .plugins
+        .app_surface_consumers()
         .map(|s| s.to_string())
         .collect();
     for pt in b.plugins.param_types() {
@@ -409,6 +415,7 @@ fn build_with_plugins_inner(
         b.package_ranges,
     );
     fa.package_framework = package_framework;
+    fa.app_surface_consumers = b.app_surface_consumers.clone();
     fa.witnesses = bag;
     fa.witnesses.rebuild_index();
     fa.provisional_dispatches = std::mem::take(&mut b.provisional_dispatches);
@@ -1103,6 +1110,11 @@ struct Builder<'a> {
     /// (`InstanceOf`, …), flattened once. A call to one of these is typed as
     /// `TypeConstraintOf` via the plugin's fold rather than its callee return.
     type_constraint_names: std::collections::HashSet<String>,
+    /// Plugin `app_surface_consumers()` manifest union, flattened once.
+    /// Threaded into `BagContext` so the build-time `MethodOnClass`
+    /// inheritance walk injects the synthetic app-surface parent the same
+    /// way the query-time walks do (`file_analysis::parents_of`).
+    app_surface_consumers: Vec<String>,
     /// Plugin `param_types()` manifest, grouped by method name. At a matching
     /// sub declaration in a role-doer, the named param gets a typed TC.
     param_type_manifest: std::collections::HashMap<String, Vec<plugin::ParamType>>,
@@ -7882,6 +7894,7 @@ impl<'a> Builder<'a> {
             package_framework: &self.package_framework,
             module_index: None,
             package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
         };
         let q = ReducerQuery {
             attachment: att,
@@ -7912,6 +7925,7 @@ impl<'a> Builder<'a> {
             &self.scopes,
             &self.package_framework,
             &self.package_parents,
+            &self.app_surface_consumers,
             None, // build time: no module index (single-file)
             name,
             scope,
@@ -7936,6 +7950,7 @@ impl<'a> Builder<'a> {
             package_framework: &self.package_framework,
             module_index: None,
             package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
             };
         crate::witnesses::query_sub_return_type(
             &self.bag,
@@ -7975,6 +7990,7 @@ impl<'a> Builder<'a> {
             package_framework: &self.package_framework,
             module_index: None,
             package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
             };
         let q = ReducerQuery {
             attachment: &att,
@@ -8155,6 +8171,7 @@ impl<'a> Builder<'a> {
             package_framework: &self.package_framework,
             module_index: None,
             package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
         };
 
         let mut updates: Vec<(SymbolId, String, InferredType)> = Vec::new();

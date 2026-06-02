@@ -460,6 +460,11 @@ pub struct BagContext<'a> {
     pub package_framework: &'a HashMap<String, FrameworkFact>,
     pub module_index: Option<&'a crate::module_index::ModuleIndex>,
     pub package_parents: &'a HashMap<String, Vec<String>>,
+    /// Manifest-declared app-surface consumer classes — threaded so the
+    /// `MethodOnClass` inheritance walk injects the synthetic surface
+    /// parent via `parents_of`, matching the FA-side ancestor walks.
+    /// Empty for in-file callers that don't carry consumer state.
+    pub app_surface_consumers: &'a [String],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1210,6 +1215,7 @@ impl ReducerRegistry {
                                 package_framework: &cached.analysis.package_framework,
                                 module_index: Some(idx),
                                 package_parents: &cached.analysis.package_parents,
+                                app_surface_consumers: &cached.analysis.app_surface_consumers,
                             };
                             let sub_q = ReducerQuery {
                                 attachment: q.attachment,
@@ -1230,16 +1236,16 @@ impl ReducerRegistry {
                         }
                     }
                 }
-                // (2) Inheritance walk via package_parents.
-                let mut parents: Vec<String> =
-                    ctx.package_parents.get(class).cloned().unwrap_or_default();
-                if let Some(idx) = ctx.module_index {
-                    for p in idx.parents_cached(class) {
-                        if !parents.contains(&p) {
-                            parents.push(p);
-                        }
-                    }
-                }
+                // (2) Inheritance walk via package_parents (local ∪
+                // cross-file ∪ synthetic app-surface edge — `parents_of`
+                // is the single edge-injection site shared with the
+                // FA-side ancestor walks).
+                let parents = crate::file_analysis::parents_of(
+                    class,
+                    ctx.package_parents,
+                    ctx.module_index,
+                    ctx.app_surface_consumers,
+                );
                 for p in parents {
                     let parent_att = WitnessAttachment::MethodOnClass {
                         class: p,
@@ -1330,6 +1336,7 @@ impl ReducerRegistry {
                                 ctx.scopes,
                                 ctx.package_framework,
                                 ctx.package_parents,
+                                ctx.app_surface_consumers,
                                 ctx.module_index,
                                 name,
                                 *scope,
@@ -1402,6 +1409,7 @@ impl ReducerRegistry {
         scopes: &[Scope],
         package_framework: &HashMap<String, FrameworkFact>,
         package_parents: &HashMap<String, Vec<String>>,
+        app_surface_consumers: &[String],
         module_index: Option<&crate::module_index::ModuleIndex>,
         var: &str,
         scope: ScopeId,
@@ -1428,6 +1436,7 @@ impl ReducerRegistry {
             package_framework,
             module_index,
             package_parents,
+            app_surface_consumers,
         };
         for sid in chain {
             let att = WitnessAttachment::Variable {
@@ -1556,6 +1565,7 @@ pub fn query_sub_return_type(
                     package_framework: &cached.analysis.package_framework,
                     module_index: Some(idx),
                     package_parents: &cached.analysis.package_parents,
+                    app_surface_consumers: &cached.analysis.app_surface_consumers,
                 };
                 let att = WitnessAttachment::Symbol(sym.id);
                 let q = ReducerQuery {
@@ -1588,6 +1598,7 @@ pub fn query_variable_type(
     scopes: &[Scope],
     package_framework: &HashMap<String, FrameworkFact>,
     package_parents: &HashMap<String, Vec<String>>,
+    app_surface_consumers: &[String],
     module_index: Option<&crate::module_index::ModuleIndex>,
     var: &str,
     scope: ScopeId,
@@ -1600,6 +1611,7 @@ pub fn query_variable_type(
         scopes,
         package_framework,
         package_parents,
+        app_surface_consumers,
         module_index,
         var,
         scope,

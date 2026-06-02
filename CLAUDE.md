@@ -187,6 +187,7 @@ The fold driver in step 6 is the only place type inference iterates. Adding a ne
 
 - `package_parents: HashMap<String, Vec<String>>` — unified from `use parent`, `use base`, `@ISA`, `class :isa`, `class :does`, `with` (Moo/Moose), `__PACKAGE__->load_components` (DBIC).
 - `resolve_method_in_ancestors()` — DFS parent walk (Perl's default MRO), depth limit 20. `MethodResolution::Local { class, sym_id }` vs `CrossFile { class }`.
+- `parents_of(class, package_parents, module_index, consumers)` is the **single** parent-enumeration seam: local ∪ cross-file ∪ the synthetic `APP_SURFACE_CLASS` edge for manifest-declared `app_surface_consumers` (the Mojo helper/plugin "app surface", `docs/prompt-app-entity.md`). `for_each_ancestor_class`, `collect_ancestor_methods`, and the `MethodOnClass` walk in `witnesses.rs` all route through it so the edge is injected once. The consumer set rides `FileAnalysis.app_surface_consumers` (baked from the plugin manifest) and `BagContext`.
 - `complete_methods_for_class` walks ancestors, dedups by name (child shadows parent).
 - Frameworks (`FrameworkMode::{Moo, Moose, MojoBase}`) detected per-package from `use`. `has 'name' => (...)` synthesizes Method symbol + HashKeyDefs (constructor key + internal hash key). `isa` constraints map to `InferredType` (`Str`/`Int`/`HashRef`/`InstanceOf['X']`/...). Mojo::Base accessors get fluent `ClassName(current_package)` return.
 - DBIC: `__PACKAGE__->add_columns` / `has_many` / `belongs_to` / `has_one` / `might_have` synthesize accessors with typed returns.

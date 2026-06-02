@@ -638,6 +638,18 @@ pub trait FrameworkPlugin: Send + Sync {
         &[]
     }
 
+    /// Receiver classes that compose the fictional app surface
+    /// (`file_analysis::APP_SURFACE_CLASS`) — the "open consumption" axis
+    /// of the helper/plugin model (see `docs/prompt-app-entity.md`). Each
+    /// listed class gains the surface as a synthetic ancestor in the MRO
+    /// walk, so entities a plugin bridges to the surface resolve from
+    /// every consumer (`$app->h`, `$c->h`, app subclasses) through the
+    /// existing ancestor + bridge resolution — one bridge target, an open
+    /// consumer set declared once. Default empty.
+    fn app_surface_consumers(&self) -> &[String] {
+        &[]
+    }
+
     /// Fold a constraint constructor's extracted params into the
     /// *constrained inner* type (the type a satisfying value has). The
     /// builder wraps the result in `TypeConstraintOf`. Return `None` to
@@ -928,6 +940,16 @@ impl PluginRegistry {
         self.plugins
             .iter()
             .flat_map(|p| p.type_constraint_names().iter().map(|s| s.as_str()))
+    }
+
+    /// Union of app-surface consumer classes across the registry — the
+    /// declared receiver set that composes the app surface (one place,
+    /// open). The builder bakes this onto `FileAnalysis` so the
+    /// query-time ancestor walk can inject the synthetic-parent edge.
+    pub fn app_surface_consumers<'a>(&'a self) -> impl Iterator<Item = &'a str> + 'a {
+        self.plugins
+            .iter()
+            .flat_map(|p| p.app_surface_consumers().iter().map(|s| s.as_str()))
     }
 
     /// Fold a constraint constructor → its inner type, asking the plugin(s)

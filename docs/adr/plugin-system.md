@@ -102,13 +102,24 @@ Members today:
   isa path projects the inner onto the accessor. Arity lives in the fold, not
   the core, so a constructor can take 0/1/N params. (`frameworks/type-tiny.rhai`:
   `InstanceOf`/`ConsumerOf`.)
+- **`param_types()` → `[ParamType]`** — type a sub's parameter by selector (a
+  callback arg, or a method in a role-doer). Applied at the sub-declaration
+  walk. (`docs/prompt-param-typing.md`.)
+- **`app_surface_consumers()` → `[String]`** — the receiver classes that compose
+  the fictional app surface (`file_analysis::APP_SURFACE_CLASS`). The "open
+  consumption" axis of the helper/plugin model: each listed class gains the
+  surface as a synthetic ancestor in the MRO walk (`file_analysis::parents_of`,
+  the single edge-injection seam shared by every parent-enumeration site), so
+  entities a plugin bridges to the surface resolve from every consumer
+  (`$app->h`, `$c->h`, app subclasses) through the existing ancestor + bridge
+  resolution — one bridge target, the consumer set declared once. The builder
+  bakes the union onto `FileAnalysis.app_surface_consumers`.
+  (`frameworks/mojo-helpers.rhai`; `docs/prompt-app-entity.md`.)
 
 The recurring rule: **a manifest entry is the plugin naming a property; the core
 asks the value the question** (rule #10). Adding a member is a trait method
 defaulting to empty + a registry union + a Rhai reader (mirror `overrides`),
-plus the one core application site. A forthcoming `param_types()` (type a sub's
-parameter by selector — a callback arg, or a method in a role-doer) is designed
-in `docs/prompt-param-typing.md`.
+plus the one core application site.
 
 ### Lazy return types via `Edge`
 

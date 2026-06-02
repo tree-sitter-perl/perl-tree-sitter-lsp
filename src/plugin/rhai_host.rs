@@ -122,6 +122,7 @@ pub struct RhaiPlugin {
     dispatch_verbs: Vec<DispatchVerb>,
     param_types: Vec<ParamType>,
     type_constraint_names: Vec<String>,
+    app_surface_consumers: Vec<String>,
     engine: Arc<Engine>,
     ast: Arc<AST>,
     has_on_function_call: bool,
@@ -246,6 +247,27 @@ impl RhaiPlugin {
             }
         }
 
+        // `app_surface_consumers()` — the declared receiver set for the
+        // app surface; same optional, fail-safe array-of-strings shape.
+        let mut app_surface_consumers: Vec<String> = Vec::new();
+        if signatures.iter().any(|n| n == "app_surface_consumers") {
+            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "app_surface_consumers", ()) {
+                Ok(arr) => {
+                    for d in arr {
+                        match from_dynamic::<String>(&d) {
+                            Ok(s) => app_surface_consumers.push(s),
+                            Err(e) => log::error!(
+                                "plugin `{}` app_surface_consumers() bad entry: {}",
+                                id,
+                                e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => log::error!("plugin `{}` app_surface_consumers() failed: {}", id, e),
+            }
+        }
+
         Ok(Self {
             has_on_function_call: signatures.iter().any(|n| n == "on_function_call"),
             has_type_constraint_inner: signatures.iter().any(|n| n == "type_constraint_inner"),
@@ -259,6 +281,7 @@ impl RhaiPlugin {
             dispatch_verbs,
             param_types,
             type_constraint_names,
+            app_surface_consumers,
             engine,
             ast: Arc::new(ast),
         })
@@ -343,6 +366,10 @@ impl FrameworkPlugin for RhaiPlugin {
 
     fn type_constraint_names(&self) -> &[String] {
         &self.type_constraint_names
+    }
+
+    fn app_surface_consumers(&self) -> &[String] {
+        &self.app_surface_consumers
     }
 
     fn type_constraint_inner(
