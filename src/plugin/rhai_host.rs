@@ -489,6 +489,7 @@ const BUNDLED: &[(&str, &str)] = &[
     ("data-printer", include_str!("../../frameworks/data-printer.rhai")),
     ("dbic-resultddl", include_str!("../../frameworks/dbic-resultddl.rhai")),
     ("type-tiny", include_str!("../../frameworks/type-tiny.rhai")),
+    ("moo", include_str!("../../frameworks/moo.rhai")),
 ];
 
 pub fn load_bundled(engine: Arc<Engine>) -> Vec<Box<dyn FrameworkPlugin>> {
@@ -700,6 +701,7 @@ mod tests {
             current_package: Some("Demo::App".into()),
             current_package_parents: vec![],
             current_package_uses: vec!["Demo".into()],
+            has_options: None,
         };
 
         let emissions = plugin.on_function_call(&ctx);
@@ -774,6 +776,7 @@ mod tests {
             ("data-printer", include_str!("../../frameworks/data-printer.rhai")),
             ("dbic-resultddl", include_str!("../../frameworks/dbic-resultddl.rhai")),
             ("type-tiny", include_str!("../../frameworks/type-tiny.rhai")),
+            ("moo", include_str!("../../frameworks/moo.rhai")),
         ] {
             RhaiPlugin::from_source(src, engine.clone())
                 .unwrap_or_else(|e| panic!("{}.rhai failed to compile: {e}", id));
@@ -821,6 +824,7 @@ mod tests {
             current_package: Some("My::Emitter".into()),
             current_package_parents: vec!["Mojo::EventEmitter".into()],
             current_package_uses: vec![],
+            has_options: None,
         };
 
         let emissions = plugin.on_method_call(&ctx);
@@ -886,6 +890,7 @@ mod tests {
                 current_package: Some("My::Schema::Result::Thing".into()),
                 current_package_parents: vec![],
                 current_package_uses: vec!["DBIx::Class::ResultDDL".into()],
+                has_options: None,
             };
 
             let emissions = plugin.on_function_call(&ctx);
@@ -927,6 +932,7 @@ mod tests {
             current_package: Some("My::Schema::Result::Thing".into()),
             current_package_parents: vec![],
             current_package_uses: vec!["DBIx::Class::ResultDDL".into()],
+            has_options: None,
         };
 
         // Dynamic column name (`col $field => ...`) — nothing to synthesize.
@@ -977,6 +983,7 @@ mod tests {
             current_package: Some("Foo".into()),
             current_package_parents: vec!["Mojo::EventEmitter".into()],
             current_package_uses: vec![],
+            has_options: None,
         };
 
         let emissions = plugin.on_method_call(&ctx);
@@ -1062,6 +1069,7 @@ mod tests {
             current_package: None,
             current_package_parents: vec![],
             current_package_uses: vec![],
+            has_options: None,
         };
         assert!(plugin.on_function_call(&ctx).is_empty());
     }
