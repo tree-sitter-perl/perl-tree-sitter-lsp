@@ -3072,3 +3072,124 @@ sub startup {
     assert_eq!(loc.range.start.line, list_line,
         "goto-def on '#list' lands on `sub list` in the alerts controller");
 }
+
+// ---- Types::Standard / Types::Common import-scoped vocabulary ----
+
+/// `use Types::Standard qw/Str Int/; Str();` — Str is explicitly imported, so
+/// calling it as a function (with parens, producing a FunctionCall ref) must not
+/// raise an unresolved-function diagnostic. The plugin's on_use hook provides the
+/// import-scoped vocabulary; the builder's process_use already creates an Import
+/// entry for the qw-list, but this also exercises the plugin path.
+#[test]
+fn types_standard_explicit_import_suppresses_diagnostic() {
+    let source = "use Types::Standard qw/Str Int/;\nStr();\nInt();\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index);
+    let names: Vec<&str> = diags.iter()
+        .filter_map(|d| {
+            if matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-function") {
+                Some(d.message.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        names.is_empty(),
+        "Str()/Int() explicitly imported from Types::Standard must not produce unresolved-function; got: {:?}",
+        names,
+    );
+}
+
+/// `-all` import flag: the plugin expands to the full vocabulary, so any type
+/// constant used as a function call is known even when the module isn't in the
+/// module_index. Without the plugin's on_use hook, `-all` would appear literally
+/// in imported_symbols and InstanceOf wouldn't match, producing a spurious diagnostic.
+#[test]
+fn types_standard_all_flag_suppresses_diagnostic() {
+    let source = "use Types::Standard '-all';\nInstanceOf(['Foo']);\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index);
+    let unresolved: Vec<&str> = diags.iter()
+        .filter_map(|d| {
+            if matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-function") {
+                Some(d.message.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "InstanceOf() with '-all' must not produce unresolved-function; got: {:?}",
+        unresolved,
+    );
+}
+
+/// Types::Common::String and Types::Common::Numeric vocabularies are similarly
+/// suppressed when explicitly imported.
+#[test]
+fn types_common_string_numeric_explicit_import_suppresses_diagnostic() {
+    let source = concat!(
+        "use Types::Common::String qw/NonEmptyStr/;\n",
+        "use Types::Common::Numeric qw/PositiveInt/;\n",
+        "NonEmptyStr();\nPositiveInt();\n",
+    );
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index);
+    let unresolved: Vec<&str> = diags.iter()
+        .filter_map(|d| {
+            if matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-function") {
+                Some(d.message.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "Types::Common String/Numeric names must not produce unresolved-function; got: {:?}",
+        unresolved,
+    );
+}
+
+/// Regression: the existing InstanceOf['Foo'] constraint typing must still work
+/// after adding the on_use hook. The import suppression is additive; it must not
+/// disturb the type_constraint_names / type_constraint_inner machinery.
+#[test]
+fn types_standard_instanceof_constraint_typing_still_works() {
+    use crate::file_analysis::InferredType;
+    let source = concat!(
+        "package T;\nuse Moo;\n",
+        "use Types::Standard qw/Str Int InstanceOf/;\n",
+        "has x => (is => 'ro', isa => InstanceOf['Foo']);\n",
+        "my $t = Str;\n1;\n",
+    );
+    let analysis = parse_analysis(source);
+    // Accessor `x` must return Foo (constraint-projection)
+    assert_eq!(
+        analysis.sub_return_type_at_arity("x", Some(0)),
+        Some(InferredType::ClassName("Foo".to_string())),
+        "InstanceOf['Foo'] isa must give the accessor a Foo return type",
+    );
+    // No unresolved-function diagnostics for Str, Int, InstanceOf
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index);
+    let unresolved: Vec<&str> = diags.iter()
+        .filter_map(|d| {
+            if matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-function") {
+                Some(d.message.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "No unresolved-function expected for Types::Standard imports; got: {:?}",
+        unresolved,
+    );
+}
