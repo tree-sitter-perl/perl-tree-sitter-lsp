@@ -378,7 +378,7 @@ impl LanguageServer for Backend {
         // target is inherently local (variables), fall back to single-file
         // references — no cross-file walk to do.
         use crate::file_analysis::RenameKind;
-        use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
+        use crate::resolve::{refs_to, TargetKind, TargetRef};
 
         let point = symbols::position_to_point(pos);
         let target = match doc.analysis.rename_kind_at(point, Some(&self.module_index)) {
@@ -420,30 +420,32 @@ impl LanguageServer for Backend {
                 match owner {
                     Some(HashKeyOwner::Sub { package, name: sub_name }) => {
                         drop(doc);
-                        let results = crate::resolve::refs_to(
-                            &self.files,
-                            Some(&self.module_index),
-                            &crate::resolve::TargetRef {
-                                name,
-                                kind: crate::resolve::TargetKind::HashKeyOfSub {
-                                    package,
-                                    name: sub_name,
-                                },
+                        let t = crate::resolve::TargetRef {
+                            name,
+                            kind: crate::resolve::TargetKind::HashKeyOfSub {
+                                package,
+                                name: sub_name,
                             },
-                            crate::resolve::RoleMask::VISIBLE,
+                        };
+                        let mask = crate::resolve::references_mask_for(
+                            &self.files, Some(&self.module_index), &t,
+                        );
+                        let results = crate::resolve::refs_to(
+                            &self.files, Some(&self.module_index), &t, mask,
                         );
                         return Ok(refs_to_locations(results));
                     }
                     Some(HashKeyOwner::Class(class_name)) => {
                         drop(doc);
+                        let t = crate::resolve::TargetRef {
+                            name,
+                            kind: crate::resolve::TargetKind::HashKeyOfClass(class_name),
+                        };
+                        let mask = crate::resolve::references_mask_for(
+                            &self.files, Some(&self.module_index), &t,
+                        );
                         let results = crate::resolve::refs_to(
-                            &self.files,
-                            Some(&self.module_index),
-                            &crate::resolve::TargetRef {
-                                name,
-                                kind: crate::resolve::TargetKind::HashKeyOfClass(class_name),
-                            },
-                            crate::resolve::RoleMask::VISIBLE,
+                            &self.files, Some(&self.module_index), &t, mask,
                         );
                         return Ok(refs_to_locations(results));
                     }
@@ -470,14 +472,16 @@ impl LanguageServer for Backend {
             },
         };
 
-        // Cross-file walk: workspace + open + deps.
+        // Cross-file walk. Scope to editable space when the target is a
+        // project symbol so "find references" never scans CPAN; widen to
+        // VISIBLE only for dependency-defined targets. See `references_mask_for`.
         drop(doc); // release the DashMap read lock before the resolve walk
-        let results = refs_to(
+        let mask = crate::resolve::references_mask_for(
             &self.files,
             Some(&self.module_index),
             &target,
-            RoleMask::VISIBLE,
         );
+        let results = refs_to(&self.files, Some(&self.module_index), &target, mask);
         Ok(refs_to_locations(results))
     }
 

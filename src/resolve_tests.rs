@@ -1636,3 +1636,145 @@ sub fire ($minion) {\n  $minion->enqueue('send_email' => ['a@b']);\n}\n1;\n",
         results,
     );
 }
+
+/// Cross-file plain-sub references: an exported sub defined in one
+/// workspace file, imported and called from two others, plus an
+/// unrelated same-named sub in a *different* package that must NOT
+/// be collected. Mirrors the crm `info_to_task` case (def in
+/// TaskInfo, callers in TaskProxy + tests). The def-site query is the
+/// one the hand-rolled CLI walk used to miss — here exercised through
+/// `refs_to`, the single path both backend and CLI now share.
+#[test]
+fn references_cross_file_sub_fans_out_and_stays_package_scoped() {
+    let store = FileStore::new();
+    let def = PathBuf::from("/tmp/xsub_def.pm");
+    let caller1 = PathBuf::from("/tmp/xsub_c1.pm");
+    let caller2 = PathBuf::from("/tmp/xsub_c2.pm");
+    let decoy = PathBuf::from("/tmp/xsub_decoy.pm");
+
+    store.insert_workspace(
+        def.clone(),
+        parse("package TaskInfo;\nuse Exporter 'import';\nour @EXPORT_OK = qw/info_to_task/;\nsub info_to_task { 1 }\n1;\n"),
+    );
+    store.insert_workspace(
+        caller1.clone(),
+        parse("package TaskProxy;\nuse TaskInfo qw/info_to_task/;\nsub run { info_to_task(); }\n1;\n"),
+    );
+    store.insert_workspace(
+        caller2.clone(),
+        parse("use TaskInfo qw/info_to_task/;\ninfo_to_task();\n1;\n"),
+    );
+    // Decoy: a *different* package with a same-named sub, never imported.
+    store.insert_workspace(
+        decoy.clone(),
+        parse("package Other;\nsub info_to_task { 99 }\nsub use_it { info_to_task(); }\n1;\n"),
+    );
+
+    let target = TargetRef {
+        name: "info_to_task".to_string(),
+        kind: TargetKind::Sub { package: Some("TaskInfo".to_string()) },
+    };
+    let refs = refs_to(&store, None, &target, RoleMask::EDITABLE);
+    let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
+
+    assert!(hit(&def), "missed TaskInfo def. hits: {:?}", refs);
+    assert!(hit(&caller1), "missed TaskProxy caller. hits: {:?}", refs);
+    assert!(hit(&caller2), "missed top-level caller. hits: {:?}", refs);
+    assert!(
+        !hit(&decoy),
+        "cross-linked Other::info_to_task (unrelated package). hits: {:?}",
+        refs,
+    );
+}
+
+/// Cross-file method references via inheritance: a method defined on
+/// a parent/role, called on a child instance (`$child->m()`) in
+/// another file, must surface when the *parent* class is the target.
+/// This is the crm role case (`Clove::Role::REST::success` called as
+/// `$c->success` in every controller that `with`s the role) and the
+/// `todays_rate`/`add_data` shape generally. The matcher uses
+/// `method_rename_chain`, so the parent is on the invocant's
+/// resolution chain; an unrelated class sharing the method name is
+/// not, and stays out.
+#[test]
+fn references_cross_file_method_matches_inheriting_invocant() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    // Role/parent defines `success`; child consumes it via `use parent`.
+    let role_src = "package Role::REST;\nsub success { 1 }\n1;\n";
+    let child_src = "package Ctrl;\nuse parent 'Role::REST';\nsub find ($c) { $c->success(); }\n1;\n";
+    // Decoy: an unrelated class with its own `success`, called on its
+    // own instance — must NOT be attributed to Role::REST.
+    let decoy_src = "package Loner;\nsub new { bless {}, shift }\nsub success { 0 }\nsub go { my $x = Loner->new; $x->success(); }\n1;\n";
+
+    let role_path = PathBuf::from("/tmp/inh_role.pm");
+    let child_path = PathBuf::from("/tmp/inh_child.pm");
+    let decoy_path = PathBuf::from("/tmp/inh_decoy.pm");
+
+    // Module index carries parents so the child's cross-file ancestor
+    // walk reaches Role::REST.
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(role_path.clone(), Arc::new(parse(role_src)));
+    idx.register_workspace_module(child_path.clone(), Arc::new(parse(child_src)));
+
+    let store = FileStore::new();
+    store.insert_workspace(role_path.clone(), parse(role_src));
+    store.insert_workspace(child_path.clone(), parse(child_src));
+    store.insert_workspace(decoy_path.clone(), parse(decoy_src));
+
+    let target = TargetRef {
+        name: "success".to_string(),
+        kind: TargetKind::Method { class: "Role::REST".to_string() },
+    };
+    let refs = refs_to(&store, Some(&idx), &target, RoleMask::EDITABLE);
+    let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
+
+    assert!(hit(&role_path), "missed Role::REST::success decl. hits: {:?}", refs);
+    assert!(
+        hit(&child_path),
+        "missed $c->success() in child controller (inherited from Role::REST). hits: {:?}",
+        refs,
+    );
+    assert!(
+        !hit(&decoy_path),
+        "cross-linked Loner::success (unrelated class, own method). hits: {:?}",
+        refs,
+    );
+}
+
+/// `references_mask_for`: a target declared in editable space (open or
+/// workspace) scopes to EDITABLE so "find references" never scans
+/// @INC; a target with no editable declaration widens to VISIBLE.
+#[test]
+fn references_mask_scopes_to_editable_for_project_symbols() {
+    let store = FileStore::new();
+    let def = PathBuf::from("/tmp/mask_def.pm");
+    store.insert_workspace(
+        def.clone(),
+        parse("package Proj;\nsub thing { 1 }\n1;\n"),
+    );
+
+    // Declared in the workspace → editable, no dep scan.
+    let in_ws = TargetRef {
+        name: "thing".to_string(),
+        kind: TargetKind::Sub { package: Some("Proj".to_string()) },
+    };
+    assert_eq!(
+        references_mask_for(&store, None, &in_ws).bits(),
+        RoleMask::EDITABLE.bits(),
+        "project-declared sub should scope to EDITABLE",
+    );
+
+    // No editable declaration anywhere → widen to VISIBLE so refs into
+    // a dependency-defined symbol still surface.
+    let dep_only = TargetRef {
+        name: "nowhere".to_string(),
+        kind: TargetKind::Sub { package: Some("CPAN::Thing".to_string()) },
+    };
+    assert_eq!(
+        references_mask_for(&store, None, &dep_only).bits(),
+        RoleMask::VISIBLE.bits(),
+        "symbol with no editable decl should widen to VISIBLE",
+    );
+}

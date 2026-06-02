@@ -552,111 +552,79 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
     // (with bridges) + cache + @INC, so the workspace files this scans are
     // built with the same plugins the target is.
     let (ws, idx) = cli_full_startup(root);
-    let (source, tree, mut analysis) = parse_file(file);
+    let (_source, _tree, mut analysis) = parse_file(file);
     analysis.enrich_imported_types_with_keys(Some(&idx));
     let point = parse_point(line_str, col_str);
 
-    let mut results = Vec::new();
     let file_path = std::path::Path::new(file).canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(file));
 
-    // Handler refs (Minion tasks, Mojo events, …) fan out by (name, owner)
-    // through `refs_to` — the same path the LSP `references` handler uses.
-    // The hand-rolled sub/method/package walk below can't express the
-    // Handler target, so route it here before falling through.
-    if let Some(file_analysis::RenameKind::Handler { owner, name }) =
-        analysis.rename_kind_at(point, Some(&idx))
-    {
-        // Make the target file the freshest VISIBLE copy so its own refs
-        // join the cross-file set (workspace indexing may hold a staler one).
-        ws.insert_workspace(file_path.clone(), analysis);
-        let target = resolve::TargetRef {
+    // Single resolution path: identify the cursor's target via the
+    // rename-kind machinery (covers decl sites that have no `Ref`),
+    // then fan out through `refs_to` exactly like the LSP `references`
+    // handler. The previous hand-rolled sub/method walk missed decl
+    // sites entirely and resolved cross-file invocants with `None`
+    // module index, so chained `Class->new->method` callers fell out.
+    let target = match analysis.rename_kind_at(point, Some(&idx)) {
+        Some(file_analysis::RenameKind::Function { name, package }) => resolve::TargetRef {
+            name,
+            kind: resolve::TargetKind::Sub { package },
+        },
+        Some(file_analysis::RenameKind::Method { name, class }) => resolve::TargetRef {
+            name,
+            kind: resolve::TargetKind::Method { class },
+        },
+        Some(file_analysis::RenameKind::Package(name)) => resolve::TargetRef {
+            name,
+            kind: resolve::TargetKind::Package,
+        },
+        Some(file_analysis::RenameKind::Handler { owner, name }) => resolve::TargetRef {
             name: name.clone(),
             kind: resolve::TargetKind::Handler { owner, name },
-        };
-        let hits = resolve::refs_to(&ws, Some(&idx), &target, resolve::RoleMask::VISIBLE);
-        for loc in hits {
-            let path = match &loc.key {
-                file_store::FileKey::Path(p) => p.display().to_string(),
-                file_store::FileKey::Url(u) => u
-                    .to_file_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| u.to_string()),
-            };
-            results.push(serde_json::json!({
-                "file": path,
-                "line": loc.span.start.row,
-                "col": loc.span.start.column,
-            }));
+        },
+        // HashKey / Variable / None aren't cross-file callable targets
+        // here; emit just the local refs (variables are lexical anyway).
+        _ => {
+            let mut results = Vec::new();
+            let local = analysis.find_references(point, None, None, Some(&idx));
+            for span in &local {
+                results.push(serde_json::json!({
+                    "file": file_path.display().to_string(),
+                    "line": span.start.row,
+                    "col": span.start.column,
+                }));
+            }
+            println!("{}", serde_json::to_string_pretty(&results).unwrap());
+            eprintln!("{} references", results.len());
+            return;
         }
-        println!("{}", serde_json::to_string_pretty(&results).unwrap());
-        eprintln!("{} references", results.len());
-        return;
-    }
+    };
 
-    // Local refs
-    let local_refs = analysis.find_references(point, Some(&tree), Some(source.as_bytes()), None);
-    for span in &local_refs {
+    // Make the target file the freshest workspace copy so its own
+    // (enriched) refs join the cross-file set — the background index may
+    // hold a staler, un-enriched build.
+    ws.insert_workspace(file_path.clone(), analysis);
+
+    // Editable-scoped for project symbols (no CPAN scan), VISIBLE only
+    // for dependency-defined targets — same policy as the LSP handler.
+    let mask = resolve::references_mask_for(&ws, Some(&idx), &target);
+    let hits = resolve::refs_to(&ws, Some(&idx), &target, mask);
+
+    let mut results = Vec::new();
+    for loc in hits {
+        let path = match &loc.key {
+            file_store::FileKey::Path(p) => p.display().to_string(),
+            file_store::FileKey::Url(u) => u
+                .to_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| u.to_string()),
+        };
         results.push(serde_json::json!({
-            "file": file_path.display().to_string(),
-            "line": span.start.row,
-            "col": span.start.column,
+            "file": path,
+            "line": loc.span.start.row,
+            "col": loc.span.start.column,
         }));
     }
-
-    // Cross-file refs (for functions/methods/packages)
-    if let Some(r) = analysis.ref_at(point) {
-        let target = &r.target_name;
-        let is_sub = matches!(r.kind,
-            file_analysis::RefKind::FunctionCall { .. } | file_analysis::RefKind::MethodCall { .. }
-        ) || analysis.symbol_at(point).map(|s| matches!(s.kind,
-            file_analysis::SymKind::Sub | file_analysis::SymKind::Method
-        )).unwrap_or(false);
-
-        if is_sub || matches!(r.kind, file_analysis::RefKind::PackageRef) {
-            // Derive the scope (package for Sub, class for Method) so
-            // cross-file walks don't union unrelated packages that
-            // share a symbol name.
-            let scope_from_ref = match &r.kind {
-                file_analysis::RefKind::FunctionCall { resolved_package } =>
-                    Some(("sub", resolved_package.clone())),
-                file_analysis::RefKind::MethodCall { .. } =>
-                    analysis.method_call_invocant_class(r, None).map(|c| ("method", Some(c))),
-                _ => None,
-            };
-            let scope_from_sym = analysis.symbol_at(point).and_then(|s| match s.kind {
-                file_analysis::SymKind::Sub => Some(("sub", s.package.clone())),
-                file_analysis::SymKind::Method => Some(("method", s.package.clone())),
-                _ => None,
-            });
-            let scope = scope_from_ref.or(scope_from_sym);
-
-            for entry in ws.workspace_raw().iter() {
-                if *entry.key() == file_path { continue; }
-                let edits = if matches!(r.kind, file_analysis::RefKind::PackageRef) {
-                    entry.value().rename_package(target, target)
-                } else {
-                    match &scope {
-                        Some(("sub", package)) =>
-                            entry.value().rename_sub_in_package(target, package, target, None),
-                        Some(("method", Some(class))) =>
-                            entry.value().rename_method_in_class(target, class, target, None),
-                        // Unresolvable method scope — skip rather than
-                        // cross-link. Matches refs_to / rename semantics.
-                        _ => Vec::new(),
-                    }
-                };
-                for (span, _) in edits {
-                    results.push(serde_json::json!({
-                        "file": entry.key().display().to_string(),
-                        "line": span.start.row,
-                        "col": span.start.column,
-                    }));
-                }
-            }
-        }
-    }
-
     println!("{}", serde_json::to_string_pretty(&results).unwrap());
     eprintln!("{} references", results.len());
 }
