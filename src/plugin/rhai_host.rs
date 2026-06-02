@@ -72,6 +72,20 @@ pub fn make_engine() -> Engine {
         to_dynamic(InferredType::ClassName(class)).unwrap_or(Dynamic::UNIT)
     });
 
+    // Project a constraint type to what it constrains — the rhai mirror of
+    // `InferredType::constrained_inner`. A nested constructor param
+    // (`Maybe[InstanceOf['Foo']]`) arrives as a `ConstraintParam.ty` typed
+    // `TypeConstraintOf(inner)`; a passthrough fold (`Maybe[T]` → T's inner)
+    // asks the value for its inner without destructuring the serde shape.
+    // Unit for a non-constraint `ty` (or `()`), so the fold declines cleanly.
+    engine.register_fn("constrained_inner", |ty: Dynamic| -> Dynamic {
+        let Ok(t) = from_dynamic::<InferredType>(&ty) else { return Dynamic::UNIT; };
+        match t.constrained_inner() {
+            Some(inner) => to_dynamic(inner.clone()).unwrap_or(Dynamic::UNIT),
+            None => Dynamic::UNIT,
+        }
+    });
+
     // Mark a param-list's first element as the implicit invocant.
     // Framework callbacks typically receive the receiver as their
     // first positional (`$c` for Mojolicious helpers, `$self_in`

@@ -3,11 +3,18 @@
 > **CORE LANDED** (`InferredType::TypeConstraintOf`, the `has` projection, the
 > `type_constraint_names()`/`type_constraint_inner()` plugin surface,
 > `frameworks/type-tiny.rhai` for `InstanceOf`/`ConsumerOf`). The manifest
-> family is summarized in `docs/adr/plugin-system.md`. **Residual / deferred**
-> (still forward work): method dispatch on a constraint value → `Type::Tiny`;
-> richer/nested vocabulary (`ArrayRef[InstanceOf[X]]`, `Maybe`, `Enum`, `Dict`);
-> moving constraint-name registration from the global gate to the import seam
-> (so it's package-scoped — `Clove::Types` re-exporting Types::Standard).
+> family is summarized in `docs/adr/plugin-system.md`. **Nested vocabulary
+> landed for `Maybe[T]`**: `ConstraintParam.ty` is now filled for nested
+> constructor params (core types the inner call through the bag, recursively),
+> and `type-tiny.rhai` declares `Maybe` as a passthrough fold. `Maybe[...]` is
+> *erased* to its inner for resolution (no first-class optional type) — see
+> `docs/prompt-optional-types.md` for why and what a first-class `Maybe` would
+> buy. **Residual / deferred** (still forward work): method dispatch on a
+> constraint value → `Type::Tiny`; remaining richer vocabulary
+> (`ArrayRef[InstanceOf[X]]`, `Enum`, `Dict` — the `ty`-filling plumbing now
+> exists, each is a fold entry); moving constraint-name registration from the
+> global gate to the import seam (so it's package-scoped — `Clove::Types`
+> re-exporting Types::Standard).
 
 > A Moo/Moose attribute declared `has x => (isa => InstanceOf['Foo'])` should
 > give its accessor a return type of `Foo`, so `$self->x->method` types. Today

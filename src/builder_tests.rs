@@ -9602,6 +9602,22 @@ fn moo_instanceof_isa_types_both_getter_and_writer() {
     assert_eq!(fa.sub_return_type_at_arity("thing", Some(1)), want, "rw writer");
 }
 
+/// `Maybe[InstanceOf['Foo']]` — the nested constructor is itself a constraint
+/// value. The core types the inner call (`TypeConstraintOf(ClassName(Foo))`)
+/// into the param's `ty`; the `Maybe` passthrough fold projects its inner, so
+/// the accessor returns `Foo` (optionalness unmodeled — unwrap for resolution).
+#[test]
+fn moo_maybe_instanceof_isa_unwraps_to_inner_class() {
+    let fa = build_fa(
+        "package T;\nuse Moo;\nuse Types::Standard qw/Maybe InstanceOf/;\nhas thing => (is=>'ro', isa=>Maybe[InstanceOf['My::Thing']]);\n1;\n",
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("thing", Some(0)),
+        Some(InferredType::ClassName("My::Thing".to_string())),
+        "Maybe[InstanceOf['My::Thing']] must unwrap to a My::Thing accessor return",
+    );
+}
+
 /// `ConsumerOf['Role']` shares the ClassParam shape (you can call the role's
 /// methods on the value) — declared by the same plugin manifest entry.
 #[test]

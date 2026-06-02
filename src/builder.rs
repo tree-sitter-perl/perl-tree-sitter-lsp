@@ -4349,7 +4349,11 @@ impl<'a> Builder<'a> {
                 let name = node.utf8_text(self.source).ok()?;
                 Some(WitnessPayload::Edge(WitnessAttachment::Variable {
                     name: name.to_string(),
-                    scope: self.current_scope(),
+                    // `expr_payload` re-runs post-walk (forward-ref recovery,
+                    // nested-constraint param typing) when the live scope stack
+                    // is gone; recover the scope from the node's position.
+                    scope: self.scope_stack.last().copied()
+                        .unwrap_or_else(|| self.scope_at_point(node.start_position())),
                 }))
             }
 
@@ -5845,42 +5849,56 @@ impl<'a> Builder<'a> {
     }
 
     /// Walk a constraint constructor's args (`InstanceOf['Foo']`,
-    /// `Enum['a','b']`) into a flat param list for the plugin fold. The
-    /// arg is the parameterizing arrayref `['Foo', ...]`; we flatten its
-    /// elements. String elements fill `string` (class names, enum values);
-    /// nested type params (`Int`, `InstanceOf[...]`) leave the `ty` slot
-    /// for a later pass (nesting is deferred). Rule #1: only the builder
-    /// walks these nodes — the plugin gets the structured params.
-    fn extract_constraint_params(&self, call_node: Node<'a>) -> Vec<plugin::ConstraintParam> {
+    /// `Enum['a','b']`, `Maybe[InstanceOf['Foo']]`) into a flat param list
+    /// for the plugin fold. The arg is the parameterizing arrayref
+    /// `['Foo', ...]`; we flatten its elements via `constraint_param_for`
+    /// (string → `string`, nested constructor → `ty`). Rule #1: only the
+    /// builder walks these nodes — the plugin gets the structured params.
+    fn extract_constraint_params(&mut self, call_node: Node<'a>) -> Vec<plugin::ConstraintParam> {
         let mut params = Vec::new();
         let Some(args) = call_node.child_by_field_name("arguments") else {
             return params;
         };
-        // The `[...]` arrayref holds the type params; flatten one level
-        // (the `anonymous_array_expression` arm below). A non-arrayref form
-        // (`InstanceOf('Foo')`) is scanned directly by the same loop.
+        // The `arguments` field is the `[...]` arrayref itself (`Name[p, ...]`),
+        // or a paren list for the `Name(p, ...)` form. Each named child is one
+        // param — a string literal, or a nested constructor (`Maybe[InstanceOf
+        // ['Foo']]`). A nested arrayref (`Tuple[[...]]`) flattens one level.
         for i in 0..args.named_child_count() {
             let Some(child) = args.named_child(i) else { continue };
             match child.kind() {
-                "string_literal" | "interpolated_string_literal" => {
-                    if let Some(s) = self.extract_string_content(child) {
-                        params.push(plugin::ConstraintParam { string: Some(s), ty: None });
-                    }
-                }
                 "anonymous_array_expression" | "array_ref_expression" => {
                     for j in 0..child.named_child_count() {
-                        let Some(el) = child.named_child(j) else { continue };
-                        if matches!(el.kind(), "string_literal" | "interpolated_string_literal") {
-                            if let Some(s) = self.extract_string_content(el) {
-                                params.push(plugin::ConstraintParam { string: Some(s), ty: None });
-                            }
+                        if let Some(el) = child.named_child(j) {
+                            params.push(self.constraint_param_for(el));
                         }
                     }
                 }
-                _ => {}
+                _ => params.push(self.constraint_param_for(child)),
             }
         }
         params
+    }
+
+    /// One arrayref element of a constraint constructor → a `ConstraintParam`.
+    /// A string-literal param fills `string` (class names, enum values); a
+    /// nested constructor (`Maybe[InstanceOf['Foo']]`, `ArrayRef[Int]`) is a
+    /// *value* in its own right, so we type its expression through the bag —
+    /// the same `expr_payload` path the outer call walks, hence any nesting
+    /// depth resolves — and fill `ty` with the resulting `TypeConstraintOf`.
+    /// The plugin's fold then projects (a `Maybe` passthrough asks the param's
+    /// `ty` for its `constrained_inner`). rule #1: the builder walks the node.
+    fn constraint_param_for(&mut self, el: Node<'a>) -> plugin::ConstraintParam {
+        if matches!(el.kind(), "string_literal" | "interpolated_string_literal") {
+            return plugin::ConstraintParam {
+                string: self.extract_string_content(el),
+                ty: None,
+            };
+        }
+        self.emit_expr_witness(el);
+        plugin::ConstraintParam {
+            string: None,
+            ty: self.bag_query_expr_span(node_to_span(el)),
+        }
     }
 
     /// The value NODE for fat-comma `key` in a `( k => v, ... )` list,
