@@ -10360,3 +10360,98 @@ sub hiss { "ssss" }
         other => panic!("expected ClassName/FirstParam, got {:?}", other),
     }
 }
+
+// ---- Runtime exporter modeling ----
+//
+// Static analysis can't run import(); we model the declarative setup
+// shapes so exported names land in `export_ok` (same plumbing as
+// `@EXPORT_OK`), which then drives goto-def / refs / diagnostics.
+
+#[test]
+fn sub_exporter_use_setup_records_exports() {
+    let fa = build_fa(
+        "package My::Exporter;\n\
+         use Sub::Exporter -setup => { exports => [qw/alpha beta/] };\n\
+         sub alpha { 1 }\n\
+         sub beta { 2 }\n\
+         1;\n",
+    );
+    assert!(fa.export_ok.contains(&"alpha".to_string()),
+        "export_ok should contain alpha; got {:?}", fa.export_ok);
+    assert!(fa.export_ok.contains(&"beta".to_string()),
+        "export_ok should contain beta; got {:?}", fa.export_ok);
+}
+
+#[test]
+fn sub_exporter_setup_exporter_call_records_exports() {
+    let fa = build_fa(
+        "package My::Exporter;\n\
+         use Sub::Exporter ();\n\
+         Sub::Exporter::setup_exporter({ exports => [qw/gamma/] });\n\
+         sub gamma { 3 }\n\
+         1;\n",
+    );
+    assert!(fa.export_ok.contains(&"gamma".to_string()),
+        "export_ok should contain gamma; got {:?}", fa.export_ok);
+}
+
+#[test]
+fn sub_exporter_generator_hashref_records_keys() {
+    // Generators: best-effort — the hashref keys are the exported names.
+    let fa = build_fa(
+        "package My::Exporter;\n\
+         use Sub::Exporter -setup => { exports => { delta => \\&_gen_delta } };\n\
+         sub _gen_delta { sub { 4 } }\n\
+         1;\n",
+    );
+    assert!(fa.export_ok.contains(&"delta".to_string()),
+        "export_ok should contain generator name delta; got {:?}", fa.export_ok);
+}
+
+#[test]
+fn moose_exporter_setup_import_methods_records_exports() {
+    let fa = build_fa(
+        "package My::Sugar;\n\
+         use Moose::Exporter;\n\
+         Moose::Exporter->setup_import_methods(\n\
+             with_meta => ['has_table'],\n\
+             as_is     => [qw/col belongs_to/],\n\
+         );\n\
+         sub has_table { }\n\
+         sub col { }\n\
+         sub belongs_to { }\n\
+         1;\n",
+    );
+    for name in ["has_table", "col", "belongs_to"] {
+        assert!(fa.export_ok.contains(&name.to_string()),
+            "export_ok should contain {}; got {:?}", name, fa.export_ok);
+    }
+}
+
+#[test]
+fn type_library_add_type_records_named_export() {
+    let fa = build_fa(
+        "package My::Types;\n\
+         use Type::Library -base;\n\
+         __PACKAGE__->add_type({ name => 'PositiveInt' });\n\
+         __PACKAGE__->add_type({ name => 'Email' });\n\
+         1;\n",
+    );
+    assert!(fa.export_ok.contains(&"PositiveInt".to_string()),
+        "export_ok should contain PositiveInt; got {:?}", fa.export_ok);
+    assert!(fa.export_ok.contains(&"Email".to_string()),
+        "export_ok should contain Email; got {:?}", fa.export_ok);
+}
+
+#[test]
+fn non_exporter_setup_does_not_pollute_exports() {
+    // A plain method call named neither setup verb leaves exports empty.
+    let fa = build_fa(
+        "package My::Thing;\n\
+         My::Thing->configure({ name => 'nope', exports => [qw/leak/] });\n\
+         1;\n",
+    );
+    assert!(!fa.export_ok.contains(&"leak".to_string()),
+        "unrelated method call must not record exports; got {:?}", fa.export_ok);
+    assert!(!fa.export_ok.contains(&"nope".to_string()));
+}

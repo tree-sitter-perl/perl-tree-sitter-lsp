@@ -149,3 +149,32 @@ sub make_obj {
     );
     assert_eq!(idx.get_return_type_cached("nonexistent"), None);
 }
+
+#[test]
+fn runtime_exporter_names_resolve_as_exporters() {
+    // A package whose exports come from a runtime exporter setup
+    // (Sub::Exporter / Moose::Exporter / Type::Library) must be found
+    // by `find_exporters` so consumer goto-def / diagnostics resolve.
+    let idx = ModuleIndex::new_for_test();
+
+    let sub_exp = "package Sugar::Sub;\n\
+        use Sub::Exporter -setup => { exports => [qw/sweeten/] };\n\
+        sub sweeten { }\n1;";
+    idx.insert_cache("Sugar::Sub", Some(parse_source_to_cached(sub_exp, "Sugar::Sub")));
+
+    let moose_exp = "package Sugar::Moose;\n\
+        use Moose::Exporter;\n\
+        Moose::Exporter->setup_import_methods(as_is => [qw/has_column/]);\n\
+        sub has_column { }\n1;";
+    idx.insert_cache("Sugar::Moose", Some(parse_source_to_cached(moose_exp, "Sugar::Moose")));
+
+    let type_lib = "package My::Types;\n\
+        use Type::Library -base;\n\
+        __PACKAGE__->add_type({ name => 'PositiveInt' });\n\
+        sub PositiveInt { }\n1;";
+    idx.insert_cache("My::Types", Some(parse_source_to_cached(type_lib, "My::Types")));
+
+    assert_eq!(idx.find_exporters("sweeten"), vec!["Sugar::Sub"]);
+    assert_eq!(idx.find_exporters("has_column"), vec!["Sugar::Moose"]);
+    assert_eq!(idx.find_exporters("PositiveInt"), vec!["My::Types"]);
+}

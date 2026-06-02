@@ -3707,6 +3707,11 @@ impl<'a> Builder<'a> {
             Some(node),
             None, // real source — default `Namespace::Language` on the Module
         );
+        // `use Sub::Exporter -setup => { exports => [...] }` declares this
+        // package's exports inline — model them so consumers' imports resolve.
+        if module_name == "Sub::Exporter" {
+            self.detect_sub_exporter_use(node);
+        }
         // Don't recurse — use statements don't contain interesting sub-nodes
     }
 
@@ -5205,6 +5210,18 @@ impl<'a> Builder<'a> {
                     }
                 }
 
+                // Runtime-exporter setup in function-call form:
+                // `Sub::Exporter::setup_exporter({ exports => [...] })`.
+                // Match on the unqualified tail so the package prefix
+                // (which the caller may have aliased) isn't load-bearing.
+                if let Some(tail) = name.rsplit("::").next() {
+                    if tail == "setup_exporter" {
+                        if let Some(args) = node.child_by_field_name("arguments") {
+                            self.detect_exporter_setup_call(tail, args);
+                        }
+                    }
+                }
+
                 // Framework plugin dispatch for function calls. Mirrors
                 // the method-call path so plugins (e.g. Mojolicious::Lite
                 // routes: `get '/path' => sub {}`) get the same
@@ -6263,6 +6280,173 @@ impl<'a> Builder<'a> {
     }
 
 
+    // ---- Runtime exporter modeling ----
+    //
+    // Static analysis can't run an exporter's import(), so we model the
+    // declarative *setup* shapes: the names a package registers as exports
+    // map to same-named subs defined in the package. We feed the discovered
+    // names into `export_ok` — the existing `@EXPORT_OK` plumbing then drives
+    // goto-def (`resolve_imported_function` → same-named sub), cross-file
+    // `refs_to` (the consumer's `use X 'name'` FunctionCall ref pins to X;
+    // the def is a `Sub { package: X }` symbol), and diagnostic suppression
+    // (`find_exporters`). Generators (`exports => { a => \&gen }`) are
+    // best-effort: the name resolves to a same-named sub if one exists,
+    // otherwise goto-def stops at the `use` line. Conditional/dynamic
+    // exports built at runtime are unmodeled.
+
+    /// Add `names` to `export_ok` (the package's exported vocabulary),
+    /// deduped against what's already there. The defining sub is the
+    /// same-named symbol — no separate provenance is recorded, matching
+    /// how `@EXPORT_OK` names already trace to their subs via the resolver.
+    fn record_runtime_exports(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            if name.is_empty() { continue; }
+            if !self.export_ok.contains(&name) && !self.export.contains(&name) {
+                self.export_ok.push(name);
+            }
+        }
+    }
+
+    /// Find the value node following a fat-comma `key` in a list-like
+    /// container (`list_expression`, the body of an `anonymous_hash_expression`,
+    /// or a `use` statement's arg list). Keys may be barewords,
+    /// autoquoted barewords (`-setup`), or strings.
+    fn value_node_after_key(&self, container: Node<'a>, key: &str) -> Option<Node<'a>> {
+        // Descend into an anonymous hash's inner list so callers can pass
+        // either the `{ ... }` node or the bare list.
+        let list = if container.kind() == "anonymous_hash_expression" {
+            (0..container.named_child_count())
+                .filter_map(|i| container.named_child(i))
+                .find(|c| c.kind() == "list_expression")
+                .unwrap_or(container)
+        } else {
+            container
+        };
+        let count = list.child_count();
+        let mut i = 0;
+        while i < count {
+            let Some(k_node) = list.child(i) else { i += 1; continue; };
+            if !k_node.is_named() { i += 1; continue; }
+            let k_text = match k_node.kind() {
+                "bareword" | "autoquoted_bareword" => k_node.utf8_text(self.source).ok().map(|s| s.to_string()),
+                "string_literal" | "interpolated_string_literal" => self.extract_string_content(k_node),
+                _ => None,
+            };
+            i += 1;
+            if k_text.as_deref() != Some(key) { continue; }
+            // Skip the fat comma / commas, return the next named node.
+            while i < count {
+                match list.child(i) {
+                    Some(c) if c.is_named() => return Some(c),
+                    _ => i += 1,
+                }
+            }
+        }
+        None
+    }
+
+    /// `use Sub::Exporter -setup => { exports => [...] }` — pull the
+    /// `exports` arrayref names. Also accepts a bare `exports => [...]`
+    /// at the top of the use args (the common minimal form).
+    fn detect_sub_exporter_use(&mut self, use_node: Node<'a>) {
+        // The args live in the use statement's list_expression child.
+        let args = (0..use_node.named_child_count())
+            .filter_map(|i| use_node.named_child(i))
+            .find(|c| c.kind() == "list_expression");
+        let Some(args) = args else { return; };
+        let setup = self.value_node_after_key(args, "-setup");
+        // `-setup => { exports => [...] }` or top-level `exports => [...]`.
+        let exports_owner = setup.unwrap_or(args);
+        if let Some(list) = self.value_node_after_key(exports_owner, "exports") {
+            let names = self.exported_names_from_list(list);
+            self.record_runtime_exports(names);
+        }
+    }
+
+    /// Extract exported names from a Sub::Exporter `exports` value, which is
+    /// either an arrayref of names (`[qw/a b/]`) or a hashref of
+    /// name→generator pairs (`{ a => \&gen }` — best-effort: the keys are
+    /// the exported names). `extract_string_names` already collects qw /
+    /// string / bareword leaves recursively; for the hashref-of-generators
+    /// shape we additionally take the fat-comma keys.
+    fn exported_names_from_list(&self, list: Node<'a>) -> Vec<String> {
+        let mut names = self.extract_string_names(list);
+        // Generator hashref: `{ name => \&gen }`. The values are coderefs,
+        // not strings, so `extract_string_names` won't have grabbed the
+        // names — they're the keys.
+        let inner = if list.kind() == "anonymous_hash_expression" {
+            (0..list.named_child_count())
+                .filter_map(|i| list.named_child(i))
+                .find(|c| c.kind() == "list_expression")
+        } else { None };
+        if let Some(inner) = inner {
+            let count = inner.child_count();
+            let mut i = 0;
+            let mut expect_key = true;
+            while i < count {
+                if let Some(c) = inner.child(i) {
+                    if c.kind() == "=>" { expect_key = false; i += 1; continue; }
+                    if c.kind() == "," { expect_key = true; i += 1; continue; }
+                    if c.is_named() && expect_key {
+                        if let Some(k) = match c.kind() {
+                            "bareword" | "autoquoted_bareword" => c.utf8_text(self.source).ok().map(|s| s.to_string()),
+                            "string_literal" | "interpolated_string_literal" => self.extract_string_content(c),
+                            _ => None,
+                        } {
+                            names.push(k);
+                        }
+                        expect_key = false;
+                    } else if c.is_named() {
+                        expect_key = false;
+                    }
+                }
+                i += 1;
+            }
+        }
+        names
+    }
+
+    /// `Moose::Exporter->setup_import_methods(with_meta => [...], as_is => [...])`
+    /// or `Sub::Exporter::setup_exporter({ exports => [...] })`. `args` is the
+    /// call's argument node. Pull names from the export-bearing keys.
+    fn detect_exporter_setup_call(&mut self, callee: &str, args: Node<'a>) {
+        match callee {
+            "setup_import_methods" => {
+                // Moose::Exporter: with_meta + as_is are exported names.
+                // `also` re-exports another package's exports — unmodeled
+                // (we'd need to resolve that package's vocabulary).
+                let mut names = Vec::new();
+                for key in ["with_meta", "as_is"] {
+                    if let Some(list) = self.value_node_after_key(args, key) {
+                        names.extend(self.extract_string_names(list));
+                    }
+                }
+                self.record_runtime_exports(names);
+            }
+            "setup_exporter" => {
+                // Sub::Exporter::setup_exporter({ exports => [...] }).
+                if let Some(list) = self.value_node_after_key(args, "exports") {
+                    let names = self.exported_names_from_list(list);
+                    self.record_runtime_exports(names);
+                }
+            }
+            "add_type" => {
+                // Type::Library / Exporter::Tiny: __PACKAGE__->add_type({ name => 'X' })
+                // registers `X` as an exported constant sub. Bare-name form
+                // `add_type(Foo => ...)` / `add_type('Foo')` also seen.
+                if let Some(name_node) = self.value_node_after_key(args, "name") {
+                    self.record_runtime_exports(self.extract_string_names(name_node));
+                } else if let Some(first) = args.named_child(0) {
+                    // `add_type Foo, ...` — first positional is the name.
+                    if matches!(first.kind(), "string_literal" | "interpolated_string_literal" | "bareword" | "autoquoted_bareword") {
+                        self.record_runtime_exports(self.extract_string_names(first));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Map a Moo/Moose `isa` type constraint string to an InferredType.
     fn map_isa_to_type(&self, isa: &str, mode: FrameworkMode) -> Option<InferredType> {
         match isa {
@@ -6436,6 +6620,17 @@ impl<'a> Builder<'a> {
                 );
                 if let Some(c) = invocant_class.clone() {
                     self.method_call_invocant.insert(idx, c);
+                }
+
+                // Runtime-exporter setup in method-call form:
+                // `Moose::Exporter->setup_import_methods(...)`,
+                // `__PACKAGE__->add_type({ name => 'X' })`. Match on the
+                // method name only — the invocant package isn't load-bearing
+                // (Type::Library subclasses inherit `add_type`).
+                if matches!(name.as_str(), "setup_import_methods" | "add_type") {
+                    if let Some(args) = node.child_by_field_name("arguments") {
+                        self.detect_exporter_setup_call(name, args);
+                    }
                 }
 
                 // Part 5c — `recv->resultset('Foo')` is closed

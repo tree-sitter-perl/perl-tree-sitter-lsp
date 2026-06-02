@@ -1637,6 +1637,55 @@ sub fire ($minion) {\n  $minion->enqueue('send_email' => ['a@b']);\n}\n1;\n",
     );
 }
 
+/// A package that declares its exports via a runtime exporter setup
+/// (Sub::Exporter) must let cross-file `refs_to` fan the defining sub
+/// out to a consumer's `use X qw/name/` import and call site — the
+/// same as a `@EXPORT_OK` sub. Models the export so the import resolves.
+#[test]
+fn refs_to_fans_runtime_exported_sub_to_consumer() {
+    let store = FileStore::new();
+    let path_def = PathBuf::from("/tmp/runtime_export_def.pm");
+    let path_use = PathBuf::from("/tmp/runtime_export_use.pm");
+
+    // Exporting package: names come from Sub::Exporter, not @EXPORT_OK.
+    let fa_def = parse(
+        "package Sugar::Sub;\n\
+         use Sub::Exporter -setup => { exports => [qw/sweeten/] };\n\
+         sub sweeten { 42 }\n1;\n",
+    );
+    store.insert_workspace(path_def.clone(), fa_def);
+
+    // Consumer imports and calls it.
+    let fa_use = parse(
+        "package Consumer;\n\
+         use Sugar::Sub qw/sweeten/;\n\
+         sub run { sweeten(); }\n1;\n",
+    );
+    store.insert_workspace(path_use.clone(), fa_use);
+
+    let results = refs_to(
+        &store,
+        None,
+        &TargetRef {
+            name: "sweeten".to_string(),
+            kind: TargetKind::Sub { package: Some("Sugar::Sub".to_string()) },
+        },
+        RoleMask::EDITABLE,
+    );
+
+    assert!(
+        results.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &path_def)
+            && r.access == AccessKind::Declaration),
+        "expected declaration of sweeten in the exporting package; got {:?}",
+        results,
+    );
+    assert!(
+        results.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &path_use)),
+        "expected the consumer's import/call of sweeten to fan out; got {:?}",
+        results,
+    );
+}
+
 /// Cross-file plain-sub references: an exported sub defined in one
 /// workspace file, imported and called from two others, plus an
 /// unrelated same-named sub in a *different* package that must NOT
