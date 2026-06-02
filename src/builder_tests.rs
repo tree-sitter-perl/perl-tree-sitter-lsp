@@ -9483,3 +9483,129 @@ fn moo_isa_via_constraint_variable_projects_inner() {
         "isa => $constraint_var must project the constrained inner onto the accessor",
     );
 }
+
+// ---- isa coverage: the TypeConstraintOf path + the string/bareword split ----
+
+/// String/bareword isa (the Moose idiom + builtins) stays on the meaning-map,
+/// untouched by the constraint path. Regression guard that adding the node
+/// path didn't break the common forms.
+#[test]
+fn moo_string_isa_forms_still_resolve() {
+    let fa = build_fa(
+        "package T;\nuse Moo;\nhas s => (is=>'ro', isa=>'Str');\nhas i => (is=>'ro', isa=>'Int');\nhas h => (is=>'ro', isa=>'HashRef');\n1;\n",
+    );
+    assert_eq!(fa.sub_return_type_at_arity("s", Some(0)), Some(InferredType::String));
+    assert_eq!(fa.sub_return_type_at_arity("i", Some(0)), Some(InferredType::Numeric));
+    assert_eq!(fa.sub_return_type_at_arity("h", Some(0)), Some(InferredType::HashRef));
+}
+
+/// `is => 'rw'` synthesizes a writer too; both getter (arity 0) and writer
+/// (arity ≥1) return the constrained inner class.
+#[test]
+fn moo_instanceof_isa_types_both_getter_and_writer() {
+    let fa = build_fa(
+        "package T;\nuse Moo;\nuse Types::Standard qw/InstanceOf/;\nhas thing => (is=>'rw', isa=>InstanceOf['My::Thing']);\n1;\n",
+    );
+    let want = Some(InferredType::ClassName("My::Thing".to_string()));
+    assert_eq!(fa.sub_return_type_at_arity("thing", Some(0)), want.clone(), "getter");
+    assert_eq!(fa.sub_return_type_at_arity("thing", Some(1)), want, "rw writer");
+}
+
+/// `ConsumerOf['Role']` shares the ClassParam shape (you can call the role's
+/// methods on the value) — declared by the same plugin manifest entry.
+#[test]
+fn moo_consumerof_isa_types_accessor() {
+    let fa = build_fa(
+        "package T;\nuse Moo;\nuse Types::Standard qw/ConsumerOf/;\nhas r => (is=>'ro', isa=>ConsumerOf['My::Role']);\n1;\n",
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("r", Some(0)),
+        Some(InferredType::ClassName("My::Role".to_string())),
+    );
+}
+
+/// crm writes `InstanceOf ['Class']` (space before the bracket). Both spacings
+/// parse as the same call node, so both must type.
+#[test]
+fn moo_instanceof_isa_handles_space_before_bracket() {
+    let fa = build_fa(
+        "package T;\nuse Moo;\nuse Types::Standard qw/InstanceOf/;\nhas thing => (is=>'ro', isa=>InstanceOf ['My::Thing']);\n1;\n",
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("thing", Some(0)),
+        Some(InferredType::ClassName("My::Thing".to_string())),
+    );
+}
+
+/// Moose mode, not just Moo — same constraint vocabulary.
+#[test]
+fn moose_instanceof_isa_types_accessor() {
+    let fa = build_fa(
+        "package T;\nuse Moose;\nuse Types::Standard qw/InstanceOf/;\nhas thing => (is=>'ro', isa=>InstanceOf['My::Thing']);\n1;\n",
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("thing", Some(0)),
+        Some(InferredType::ClassName("My::Thing".to_string())),
+    );
+}
+
+/// NEGATIVE: a coderef isa (`isa => sub {...}`) isn't a constraint — the
+/// accessor must stay untyped, never falsely a class. Guards the projection
+/// from over-firing on non-constraint complex RHS.
+#[test]
+fn moo_coderef_isa_leaves_accessor_untyped() {
+    let fa = build_fa(
+        "package T;\nuse Moo;\nhas thing => (is=>'ro', isa=>sub { die unless ref $_[0] });\n1;\n",
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("thing", Some(0)),
+        None,
+        "a coderef constraint has no class denotation",
+    );
+}
+
+/// NEGATIVE: an undeclared constructor (`SomeType['X']`, not in any plugin's
+/// type_constraint_names) falls through cleanly — no TypeConstraintOf, no
+/// crash, accessor untyped.
+#[test]
+fn moo_unknown_constructor_isa_falls_through() {
+    let fa = build_fa(
+        "package T;\nuse Moo;\nhas thing => (is=>'ro', isa=>SomeUnknownType['X']);\n1;\n",
+    );
+    assert_eq!(fa.sub_return_type_at_arity("thing", Some(0)), None);
+}
+
+/// The chain payoff: an `InstanceOf` accessor's class flows into a downstream
+/// method call. `$self->other->greet` must resolve `->greet` against `Other`
+/// — this is the `$self->_minion->enqueue` shape that the crm fix turns on.
+#[test]
+fn instanceof_accessor_chains_into_method_call() {
+    let src = "package Other;\nuse Moo;\nsub greet ($self) { return 'hi'; }\n\npackage T;\nuse Moo;\nuse Types::Standard qw/InstanceOf/;\nhas other => (is=>'ro', isa=>InstanceOf['Other']);\nsub use_it ($self) { return $self->other->greet; }\n1;\n";
+    let tree = parse(src);
+    let fa = build(&tree, src.as_bytes());
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+
+    // Find the `greet` method-call node in `$self->other->greet`.
+    fn find_call<'a>(n: tree_sitter::Node<'a>, src: &[u8], m: &str) -> Option<tree_sitter::Node<'a>> {
+        if n.kind() == "method_call_expression" {
+            if let Some(mn) = n.child_by_field_name("method") {
+                if mn.utf8_text(src).ok() == Some(m) { return Some(n); }
+            }
+        }
+        for i in 0..n.named_child_count() {
+            if let Some(c) = n.named_child(i) {
+                if let Some(f) = find_call(c, src, m) { return Some(f); }
+            }
+        }
+        None
+    }
+    let call = find_call(tree.root_node(), src.as_bytes(), "greet").expect("has $self->other->greet");
+    let method_node = call.child_by_field_name("method").unwrap();
+    let hover = fa
+        .hover_info(method_node.start_position(), src, Some(&tree), Some(&idx))
+        .expect("hover on ->greet resolves");
+    assert!(
+        hover.contains("Other"),
+        "->greet on an InstanceOf['Other'] accessor must resolve against Other; got: {hover}",
+    );
+}
