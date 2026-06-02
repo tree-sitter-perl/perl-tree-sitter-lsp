@@ -2155,6 +2155,7 @@ impl<'a> Builder<'a> {
             current_package: self.current_package.clone(),
             current_package_parents: parents,
             current_package_uses: uses,
+            has_options: None,
         }
     }
 
@@ -5318,6 +5319,17 @@ impl<'a> Builder<'a> {
                     );
                     ctx.call_kind = plugin::CallKind::Function;
                     ctx.function_name = Some(name.to_string());
+                    // The accessor-option vocabulary (predicate/clearer/writer/
+                    // reader/builder/handles) lives in the moo plugin. Core does
+                    // the node walk (rule #1) and hands over the decision-ready
+                    // option shape; the plugin maps keywords to method names.
+                    if name == "has" {
+                        if let Some(mode) = self.current_package.as_ref()
+                            .and_then(|pkg| self.framework_modes.get(pkg).copied())
+                        {
+                            ctx.has_options = self.extract_has_options(node, mode);
+                        }
+                    }
                     self.dispatch_function_call_plugins(ctx);
                 }
             }
@@ -6338,6 +6350,276 @@ impl<'a> Builder<'a> {
                     },
                 );
             }
+        }
+    }
+
+    /// Walk a `has` call's CST into the decision-ready `HasOptions` the moo
+    /// plugin reads. The split is deliberate: core owns the node walk
+    /// (rule #1) and value *classification* (shorthand `=> 1` vs explicit
+    /// string vs `handles` delegation pairs); the plugin owns the accessor
+    /// *vocabulary* (which keyword → which method-name pattern). Only the
+    /// non-default options live here — the default accessor / isa /
+    /// constructor-key synthesis stays native in `visit_has_call`. New Moo
+    /// behavior wants the plugin; this seam is where structured option data
+    /// crosses over.
+    fn extract_has_options(&mut self, node: Node<'a>, mode: FrameworkMode) -> Option<plugin::HasOptions> {
+        // Mojo::Base has no accessor-option vocabulary — its `has` is just
+        // getter/setter + default value, all native.
+        if mode == FrameworkMode::MojoBase {
+            return None;
+        }
+        let args = node.child_by_field_name("arguments")?;
+        let args_children: Vec<Node> = if matches!(args.kind(), "list_expression" | "parenthesized_expression") {
+            (0..args.child_count()).filter_map(|i| args.child(i)).collect()
+        } else {
+            vec![args]
+        };
+
+        let mut attr_names: Vec<(String, Span)> = Vec::new();
+        let mut isa_value: Option<String> = None;
+        let mut isa_value_node: Option<Node<'a>> = None;
+        let mut option_nodes: Vec<(String, Node<'a>)> = Vec::new();
+
+        let mut found_first = false;
+        for child in &args_children {
+            if !child.is_named() { continue; }
+            if !found_first {
+                found_first = true;
+                match child.kind() {
+                    "string_literal" | "interpolated_string_literal" => {
+                        if let Some(text) = self.extract_string_content(*child) {
+                            if !text.starts_with('+') {
+                                attr_names.push((text, self.string_content_span(*child)));
+                            }
+                        }
+                    }
+                    "bareword" | "autoquoted_bareword" => {
+                        if let Ok(text) = child.utf8_text(self.source) {
+                            attr_names.push((text.to_string(), node_to_span(*child)));
+                        }
+                    }
+                    "array_ref_expression" | "anonymous_array_expression" => {
+                        self.extract_array_attr_names(*child, &mut attr_names);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if matches!(child.kind(), "list_expression" | "parenthesized_expression") {
+                self.collect_has_option_value_nodes(
+                    *child, &mut isa_value, &mut isa_value_node, &mut option_nodes,
+                );
+            }
+        }
+
+        if attr_names.is_empty() { return None; }
+
+        let isa_type = isa_value
+            .as_deref()
+            .and_then(|isa| self.map_isa_to_type(isa, mode))
+            .or_else(|| {
+                let n = isa_value_node?;
+                self.emit_expr_witness(n);
+                self.bag_query_expr_span(node_to_span(n))?.constrained_inner().cloned()
+            });
+
+        let mut options: Vec<plugin::HasOption> = Vec::new();
+        for (keyword, val_node) in option_nodes {
+            let opt = match keyword.as_str() {
+                "predicate" | "clearer" | "writer" | "reader" | "builder" => {
+                    if self.node_is_numeric_one(val_node) {
+                        plugin::HasOption {
+                            keyword,
+                            shorthand: true,
+                            explicit_name: None,
+                            handles: Vec::new(),
+                        }
+                    } else if let Some(s) = self.extract_node_string(val_node) {
+                        plugin::HasOption {
+                            keyword,
+                            shorthand: false,
+                            explicit_name: Some(s),
+                            handles: Vec::new(),
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                "handles" => {
+                    let pairs = self.extract_handles_delegation(val_node);
+                    if pairs.is_empty() { continue; }
+                    plugin::HasOption {
+                        keyword,
+                        shorthand: false,
+                        explicit_name: None,
+                        handles: pairs,
+                    }
+                }
+                _ => continue,
+            };
+            options.push(opt);
+        }
+
+        if options.is_empty() { return None; }
+        Some(plugin::HasOptions { attr_names, isa_type, options })
+    }
+
+    /// Walk a `has` options fat-comma list, capturing the `isa` value (its
+    /// string and node) and the value node for each accessor-option keyword.
+    /// Keeps the raw nodes so the classifier can tell the shorthand `1` from
+    /// an explicit `'name'` and parse `handles` hashref/arrayref structurally.
+    fn collect_has_option_value_nodes(
+        &self,
+        opts_node: Node<'a>,
+        isa_value: &mut Option<String>,
+        isa_value_node: &mut Option<Node<'a>>,
+        option_nodes: &mut Vec<(String, Node<'a>)>,
+    ) {
+        let count = opts_node.child_count();
+        let mut i = 0;
+        while i < count {
+            let key_node = match opts_node.child(i) {
+                Some(c) if c.is_named() => c,
+                _ => { i += 1; continue; }
+            };
+            let key = match key_node.kind() {
+                "bareword" | "autoquoted_bareword" => key_node.utf8_text(self.source).ok().map(|s| s.to_string()),
+                "string_literal" | "interpolated_string_literal" => self.extract_string_content(key_node),
+                _ => { i += 1; continue; }
+            };
+            let key = match key { Some(k) => k, None => { i += 1; continue; } };
+
+            // Step past the key, then the `=>` and any unnamed tokens.
+            i += 1;
+            while i < count {
+                match opts_node.child(i) {
+                    Some(c) if c.kind() == "=>" => { i += 1; break; }
+                    Some(c) if !c.is_named() => { i += 1; }
+                    _ => break,
+                }
+            }
+            let val_node = loop {
+                if i >= count { break None; }
+                match opts_node.child(i) {
+                    Some(c) if c.is_named() => break Some(c),
+                    Some(_) => { i += 1; }
+                    None => break None,
+                }
+            };
+            let val_node = match val_node { Some(v) => v, None => continue };
+
+            match key.as_str() {
+                "isa" => {
+                    if isa_value.is_none() {
+                        *isa_value = self.extract_node_string(val_node);
+                    }
+                    if isa_value_node.is_none() {
+                        *isa_value_node = Some(val_node);
+                    }
+                }
+                "predicate" | "clearer" | "writer" | "reader" | "builder" | "handles" => {
+                    option_nodes.push((key, val_node));
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    /// `true` when the node is the integer literal `1` (the `=> 1` shorthand).
+    fn node_is_numeric_one(&self, node: Node<'_>) -> bool {
+        node.kind() == "number" && matches!(node.utf8_text(self.source), Ok("1"))
+    }
+
+    /// Extract a string from a bareword or string-literal node.
+    fn extract_node_string(&self, node: Node<'_>) -> Option<String> {
+        match node.kind() {
+            "bareword" | "autoquoted_bareword" => node.utf8_text(self.source).ok().map(|s| s.to_string()),
+            "string_literal" | "interpolated_string_literal" => self.extract_string_content(node),
+            _ => None,
+        }
+    }
+
+    /// Parse a `handles` value into `(local, remote)` delegation pairs.
+    /// Hashref `{ local => 'remote' }` maps local→remote; arrayref / qw list
+    /// uses the same name for both. tree-sitter-perl nests fat-comma pairs
+    /// right-associatively inside a `list_expression`, so the hashref form
+    /// flattens the token stream and re-pairs.
+    fn extract_handles_delegation(&self, node: Node<'_>) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        match node.kind() {
+            "anonymous_hash_expression" => {
+                let mut tokens: Vec<String> = Vec::new();
+                self.collect_hash_tokens(node, &mut tokens);
+                let mut i = 0;
+                while i + 1 < tokens.len() {
+                    pairs.push((tokens[i].clone(), tokens[i + 1].clone()));
+                    i += 2;
+                }
+            }
+            "array_ref_expression" | "anonymous_array_expression" => {
+                for (name, _span) in self.extract_string_list(node) {
+                    pairs.push((name.clone(), name));
+                }
+            }
+            "quoted_word_list" => {
+                let mut names = Vec::new();
+                self.extract_qw_word_spans(node, &mut names);
+                for (name, _span) in names {
+                    pairs.push((name.clone(), name));
+                }
+            }
+            _ => {}
+        }
+        pairs
+    }
+
+    /// Flatten a fat-comma hash node into alternating key/value strings,
+    /// recursing into tree-sitter-perl's right-associative nested
+    /// `list_expression` wrappers.
+    fn collect_hash_tokens(&self, node: Node<'_>, out: &mut Vec<String>) {
+        match node.kind() {
+            "anonymous_hash_expression" => {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        if matches!(child.kind(), "list_expression" | "parenthesized_expression") {
+                            self.collect_hash_tokens(child, out);
+                            return;
+                        }
+                    }
+                }
+                self.collect_hash_tokens_flat(node, out);
+            }
+            "list_expression" | "parenthesized_expression" => {
+                self.collect_hash_tokens_flat(node, out);
+            }
+            _ => {
+                if let Some(s) = self.extract_node_string(node) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+
+    fn collect_hash_tokens_flat(&self, node: Node<'_>, out: &mut Vec<String>) {
+        let count = node.child_count();
+        let mut i = 0;
+        while i < count {
+            if let Some(child) = node.child(i) {
+                match child.kind() {
+                    "=>" | "," => {}
+                    "list_expression" | "parenthesized_expression" => {
+                        self.collect_hash_tokens_flat(child, out);
+                    }
+                    _ if child.is_named() => {
+                        if let Some(s) = self.extract_node_string(child) {
+                            out.push(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
         }
     }
 

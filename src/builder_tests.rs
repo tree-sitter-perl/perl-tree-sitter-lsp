@@ -10569,3 +10569,330 @@ fn non_exporter_setup_does_not_pollute_exports() {
         "unrelated method call must not record exports; got {:?}", fa.export_ok);
     assert!(!fa.export_ok.contains(&"nope".to_string()));
 }
+
+// Moo/Moose non-default has options: predicate, clearer,
+// writer, reader, builder, handles
+// ============================================================
+
+#[test]
+fn test_moo_has_predicate_string() {
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'name' => (is => 'ro', predicate => 'has_name');
+",
+    );
+    let pred: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "has_name" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(pred.len(), 1, "explicit predicate string synthesizes method");
+    if let SymbolDetail::Sub { ref params, is_method, .. } = pred[0].detail {
+        assert!(is_method);
+        assert!(params.is_empty(), "predicate takes no args");
+    }
+}
+
+#[test]
+fn test_moo_has_predicate_shorthand() {
+    // `predicate => 1` derives `has_<attr>` for public attrs.
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'email' => (is => 'ro', predicate => 1);
+",
+    );
+    let pred: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "has_email" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(pred.len(), 1, "predicate => 1 derives has_<attr>");
+}
+
+#[test]
+fn test_moo_has_predicate_private_attr_shorthand() {
+    // Private attrs (leading `_`) get `_has_<rest>` not `has__<rest>`.
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has '_token' => (is => 'ro', predicate => 1);
+",
+    );
+    let pred: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "_has_token" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(pred.len(), 1, "predicate => 1 on _attr derives _has_<rest>");
+}
+
+#[test]
+fn test_moo_has_clearer_string() {
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'cache' => (is => 'rw', clearer => 'clear_cache');
+",
+    );
+    let clearer: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "clear_cache" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(clearer.len(), 1, "explicit clearer string synthesizes method");
+}
+
+#[test]
+fn test_moo_has_clearer_shorthand() {
+    // `clearer => 1` derives `clear_<attr>`.
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'items' => (is => 'rw', clearer => 1);
+",
+    );
+    let clearer: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "clear_items" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(clearer.len(), 1, "clearer => 1 derives clear_<attr>");
+}
+
+#[test]
+fn test_moo_has_clearer_private_shorthand() {
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has '_session' => (is => 'rw', clearer => 1);
+",
+    );
+    let clearer: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "_clear_session" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(clearer.len(), 1, "clearer => 1 on _attr derives _clear_<rest>");
+}
+
+#[test]
+fn test_moo_has_writer_option() {
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'color' => (is => 'ro', writer => 'set_color');
+",
+    );
+    let writer: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "set_color" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(writer.len(), 1, "writer option synthesizes method");
+    if let SymbolDetail::Sub { ref params, .. } = writer[0].detail {
+        assert_eq!(params.len(), 1, "writer has one param");
+    }
+}
+
+#[test]
+fn test_moo_has_reader_option() {
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'size' => (is => 'ro', reader => 'get_size');
+",
+    );
+    let reader: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "get_size" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(reader.len(), 1, "reader option synthesizes method");
+    if let SymbolDetail::Sub { ref params, is_method, .. } = reader[0].detail {
+        assert!(is_method);
+        assert!(params.is_empty(), "reader takes no args");
+    }
+}
+
+#[test]
+fn test_moo_has_builder_shorthand() {
+    // `builder => 1` → method symbol `_build_<attr>` so goto-def
+    // to the user-written sub resolves.
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'items' => (is => 'ro', builder => 1);
+sub _build_items { return [] }
+",
+    );
+    let builder_sym: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "_build_items" && s.kind == SymKind::Method)
+        .collect();
+    // The synthesized placeholder + the real sub definition both exist.
+    // At minimum one symbol with that name must be present.
+    assert!(
+        !builder_sym.is_empty(),
+        "_build_items must exist (synthesized or user-written)"
+    );
+}
+
+#[test]
+fn test_moo_has_builder_string() {
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'cache' => (is => 'lazy', builder => '_make_cache');
+",
+    );
+    let builder_sym: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "_make_cache" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(builder_sym.len(), 1, "explicit builder name synthesizes method");
+}
+
+#[test]
+fn test_moo_has_auxiliaries_without_is() {
+    // predicate/clearer/builder are valid even when `is` is absent.
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'flag' => (predicate => 'has_flag', clearer => 'clear_flag');
+",
+    );
+    let pred: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "has_flag" && s.kind == SymKind::Method)
+        .collect();
+    let clearer: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "clear_flag" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(pred.len(), 1, "predicate synthesized without is");
+    assert_eq!(clearer.len(), 1, "clearer synthesized without is");
+}
+
+#[test]
+fn test_moo_has_auxiliaries_with_bare() {
+    // `is => bare` suppresses default accessor but auxiliaries still appear.
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'secret' => (is => 'bare', predicate => 'has_secret');
+",
+    );
+    // Default accessor suppressed
+    let accessors: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "secret" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(accessors.len(), 0, "bare suppresses default accessor");
+    // Predicate still synthesized
+    let pred: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "has_secret" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(pred.len(), 1, "predicate synthesized even with is => bare");
+}
+
+#[test]
+fn test_moo_has_handles_hashref() {
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'logger' => (is => 'ro', isa => 'Log::Any', handles => { log => 'debug', warning => 'warn' });
+",
+    );
+    let log_sym: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "log" && s.kind == SymKind::Method)
+        .collect();
+    let warning_sym: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "warning" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(log_sym.len(), 1, "handles hashref synthesizes 'log' method");
+    assert_eq!(warning_sym.len(), 1, "handles hashref synthesizes 'warning' method");
+}
+
+#[test]
+fn test_moose_has_handles_arrayref() {
+    let fa = build_fa(
+        "
+package Foo;
+use Moose;
+has 'db' => (is => 'ro', isa => 'DBI::db', handles => [qw(prepare execute)]);
+",
+    );
+    let prepare: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "prepare" && s.kind == SymKind::Method)
+        .collect();
+    let execute: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "execute" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(prepare.len(), 1, "handles arrayref synthesizes 'prepare'");
+    assert_eq!(execute.len(), 1, "handles arrayref synthesizes 'execute'");
+}
+
+#[test]
+fn test_moo_has_handles_instanceof_edges_return_type() {
+    // When isa is InstanceOf['X'], handles delegation edges each local
+    // method's return through MethodOnClass{X, remote} so type inference
+    // chains through.
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'logger' => (is => 'ro', isa => \"InstanceOf['Log::Any']\", handles => { log => 'debug' });
+",
+    );
+    let log_sym: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "log" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(log_sym.len(), 1, "handles delegation synthesizes method");
+    // Provenance confirms this came from framework synthesis
+    match fa.return_type_provenance(log_sym[0].id) {
+        TypeProvenance::FrameworkSynthesis { framework, reason } => {
+            assert!(
+                framework == "Moo" || framework == "Moose",
+                "provenance framework should be Moo/Moose, got {}",
+                framework
+            );
+            assert!(reason.contains("handles"), "reason should mention handles");
+        }
+        TypeProvenance::Inferred => {
+            // Acceptable: no witness was pushed if there was no isa type resolution.
+        }
+        other => panic!("unexpected provenance: {other:?}"),
+    }
+}

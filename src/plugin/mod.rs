@@ -105,6 +105,54 @@ pub struct CallContext {
     pub current_package: Option<String>,
     pub current_package_parents: Vec<String>,
     pub current_package_uses: Vec<String>,
+    /// Structurally-extracted Moo/Moose `has` options, present ONLY on the
+    /// `has` function call. The builder walks the option nodes (rule #1) and
+    /// hands the plugin the decision-ready shape — attribute name(s), the
+    /// resolved `isa` type, and each accessor option keyword with its value
+    /// already classified (shorthand `=> 1` vs explicit name vs `handles`
+    /// delegation pairs). The plugin owns the *vocabulary*: which keyword
+    /// synthesizes which method-name pattern and return behavior. See
+    /// `frameworks/moo.rhai`. `None` for every other call.
+    #[serde(default)]
+    pub has_options: Option<HasOptions>,
+}
+
+/// Decision-ready snapshot of a Moo/Moose `has` declaration's accessor
+/// options. The builder fills it from the CST; the plugin reads it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HasOptions {
+    /// `(attribute_name, name_token_span)` — one per attr (`has [qw/a b/]`
+    /// declares several). The span is the synthesized method's
+    /// selection_span so goto-def lands on the `has` line.
+    pub attr_names: Vec<(String, Span)>,
+    /// The attribute's resolved `isa` type, if any. When this is a
+    /// `ClassName`, a `handles` delegation can edge the delegated method's
+    /// return to the remote method on that class.
+    #[serde(default)]
+    pub isa_type: Option<InferredType>,
+    pub options: Vec<HasOption>,
+}
+
+/// One Moo/Moose `has` accessor option (`predicate`, `clearer`, `writer`,
+/// `reader`, `builder`, `handles`). The builder classifies the value
+/// shape; the plugin maps the keyword to a method-name pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HasOption {
+    /// `"predicate"`, `"clearer"`, `"writer"`, `"reader"`, `"builder"`,
+    /// `"handles"`.
+    pub keyword: String,
+    /// The value was `=> 1` — the plugin derives the method name from the
+    /// attribute (`has_<attr>`, `clear_<attr>`, `_build_<attr>`, …).
+    #[serde(default)]
+    pub shorthand: bool,
+    /// The value was an explicit string — use it verbatim as the method name.
+    #[serde(default)]
+    pub explicit_name: Option<String>,
+    /// For `handles => {local => remote}` / `[qw/m.../]`: the
+    /// `(local_name, remote_name)` delegation pairs (local == remote for
+    /// the arrayref form). Empty for the non-`handles` keywords.
+    #[serde(default)]
+    pub handles: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
