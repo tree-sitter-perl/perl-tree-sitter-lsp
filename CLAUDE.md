@@ -68,7 +68,7 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 
 ### File map
 
-- `main.rs` — entry, CLI modes (`--rename`, `--workspace-symbol`, `--dump-package`, `--version`). `cli_full_startup(root)` = "act like LSP just started".
+- `main.rs` — entry, CLI modes (`--rename`, `--workspace-symbol`, `--dump-package`, `--parse`, `--version`). `cli_full_startup(root)` = "act like LSP just started". `perl-lsp --parse <file|-->` prints the tree-sitter parse tree (`--` reads stdin) — use it to check node kinds/fields instead of guessing.
 - `backend.rs` — `LanguageServer` impl, request routing.
 - `document.rs` — open-file `Document` (tree + text + analysis + stable_outline).
 - `file_store.rs` — unified store for open + workspace FileAnalyses, role-tagged, dedup'd by path.
@@ -172,6 +172,8 @@ The fold driver in step 6 is the only place type inference iterates. Adding a ne
 - **`vars_in_scope`** — every TC scoped to the sub's body. Surfaces chain assignment results: `$route` typed as `Mojolicious::Routes::Route` → chain typer worked. Combine with provenance on each method in the chain to find which hop broke.
 
 ## tree-sitter-perl gotchas
+
+Inspect any snippet's CST with `perl-lsp --parse <file>` (or `echo '...' | perl-lsp --parse --`) rather than guessing node kinds/fields.
 
 - `subroutine_declaration_statement` / `method_declaration_statement` — fields: `name`, `body`, `lexical`.
 - `variable_declaration` — `variable` (single) or `variables` (paren list).
