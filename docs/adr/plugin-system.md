@@ -73,6 +73,43 @@ Application semantics:
   `--dump-package`. The free-form `reason` is how a future reader answers
   "why does the LSP think `_route` returns X?" without re-running the build.
 
+### Declarative manifests (the `overrides()` family)
+
+`overrides()` is the first of a family of **static, trigger-independent
+manifests** a plugin declares once (read at load, no per-call cost) and the
+*core* applies. They share a shape: the plugin owns the *vocabulary* (which
+names/verbs/types mean what); the core owns the *mechanism* (it walks the CST —
+rule #1 — and applies the rule). Use a manifest, not an imperative hook, when
+the rule is pure data and a plugin couldn't do the work anyway (it can't walk
+nodes). The registry unions each manifest across all plugins.
+
+Members today:
+
+- **`overrides()` → `[TypeOverride]`** — priority return-type assertions (above).
+- **`dispatch_verbs()` → `[DispatchVerb]`** — "method `verb` on a receiver that
+  `isa target_class` dispatches a named handler into `owner_class`'s registry"
+  (`enqueue`→Minion tasks). The builder records a `ProvisionalDispatch` per
+  matching call; **enrichment** (which has the module index) promotes the ones
+  whose receiver `isa` the target — resolved by *receiver type*, cross-file, not
+  by the file's `use`s. That's why a `Minion` subclass (`Clove::Minion`) or a
+  helper-returned receiver (`$c->minion->enqueue`) lights up where a file-level
+  trigger never would. See `file_analysis.rs::promote_provisional_dispatches`.
+- **`type_constraint_names()` / `type_constraint_inner(name, params)`** — the
+  Type::Tiny `isa` vocabulary. Names gate which call expressions are constraint
+  constructors; the core extracts each constructor's params (rule #1) into a
+  `[ConstraintParam]` and the plugin *folds* them into the constrained inner
+  type. The core wraps the result as `TypeConstraintOf(inner)` and the `has`
+  isa path projects the inner onto the accessor. Arity lives in the fold, not
+  the core, so a constructor can take 0/1/N params. (`frameworks/type-tiny.rhai`:
+  `InstanceOf`/`ConsumerOf`.)
+
+The recurring rule: **a manifest entry is the plugin naming a property; the core
+asks the value the question** (rule #10). Adding a member is a trait method
+defaulting to empty + a registry union + a Rhai reader (mirror `overrides`),
+plus the one core application site. A forthcoming `param_types()` (type a sub's
+parameter by selector — a callback arg, or a method in a role-doer) is designed
+in `docs/prompt-param-typing.md`.
+
 ### Lazy return types via `Edge`
 
 Plugins synthesize callables (`mojo-helpers` for `$app->helper(name => sub

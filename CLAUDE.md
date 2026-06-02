@@ -150,7 +150,7 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 8. `FileAnalysis::new(...)` — construct FA, build indices, `resolve_method_call_types(None)` as text-based MCB fallback.
 9. `fa.finalize_post_walk()` — seal `base_*_count` for idempotent re-enrichment.
 
-`Builder::resolve_invocant_class_tree` is the **single** symbolic-execution function (chain typing, return-arm refresh, invocant filling). Adding a second is wrong; add cases. `FileAnalysis::resolve_expression_type` is the FA-side mirror at query time (cursor context, hover, completion) — keep them in sync.
+`Builder::resolve_invocant_class_tree` is the **single** build-time symbolic-execution function (chain typing, return-arm refresh, invocant filling); `invocant_type_at_node` is its node-kind dispatcher. Adding a second is wrong; add cases. Query-time expression typing is **tree-free**: `FileAnalysis::expr_type_at_span(span, module_index)` is the one entry — it reads the `Expr(span)` witnesses the builder records per invocant (`emit_invocant_expr_witnesses` PostFold pass) plus exact-span call-ref returns, materializing edges through the registry. `method_call_invocant_class(r, module_index)` resolves an invocant via it (no tree). `resolve_expression_type(node, …)` is now a thin `node → span → expr_type_at_span` adapter, degrading to a node-kind walk only for raw-cursor/incomplete-ERROR completion. There is no second structure-discovery walker to "keep in sync."
 
 ### Worklist invariants
 

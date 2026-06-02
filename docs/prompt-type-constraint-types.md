@@ -1,5 +1,14 @@
 # Type::Tiny constraints as a first-class type (`isa => InstanceOf['Foo']`)
 
+> **CORE LANDED** (`InferredType::TypeConstraintOf`, the `has` projection, the
+> `type_constraint_names()`/`type_constraint_inner()` plugin surface,
+> `frameworks/type-tiny.rhai` for `InstanceOf`/`ConsumerOf`). The manifest
+> family is summarized in `docs/adr/plugin-system.md`. **Residual / deferred**
+> (still forward work): method dispatch on a constraint value → `Type::Tiny`;
+> richer/nested vocabulary (`ArrayRef[InstanceOf[X]]`, `Maybe`, `Enum`, `Dict`);
+> moving constraint-name registration from the global gate to the import seam
+> (so it's package-scoped — `Clove::Types` re-exporting Types::Standard).
+
 > A Moo/Moose attribute declared `has x => (isa => InstanceOf['Foo'])` should
 > give its accessor a return type of `Foo`, so `$self->x->method` types. Today
 > it returns `None` — the parametric Type::Tiny constraint never resolves.
