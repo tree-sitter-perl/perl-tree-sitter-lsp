@@ -59,6 +59,57 @@ and unwraps. The split is only in *who types the RHS*:
 
 Both land as `TypeConstraintOf(inner)`, so downstream is uniform.
 
+## Plugin surface: providing constraints (core extracts, plugin folds)
+
+A type library exports a vocabulary of constructors (`InstanceOf`, `ArrayRef`,
+`Enum`, …) of varying arity (0 args: `ArrayRef`; 1: `InstanceOf['Foo']`; N:
+`Enum['a','b']`, `Dict[k=>Str,…]`). So the core can't enumerate "shapes" — it
+hands the plugin a **param list** and the plugin folds it.
+
+Core contract (rule #1 — only the builder walks nodes): for an intercepted
+call `Name[p1, p2, …]`, extract
+```
+params: [ ConstraintParam { string: Option<String>, ty: Option<InferredType> } ]
+```
+(`'Foo'` → `{string:"Foo"}`; a nested `Int` / `InstanceOf[...]` → `{ty:<resolved>}`
+— the `ty` slot is where nesting lands later). The core then wraps the plugin's
+result: `TypeConstraintOf(<result>)`. The plugin never sees a node nor builds
+the `TypeConstraintOf`.
+
+Plugin surface — declare-then-fold (mirrors `has_on_X` + the hook):
+```rhai
+fn type_constraint_names() { ["InstanceOf", "ConsumerOf"] }   // cheap dispatch gate
+fn type_constraint_inner(name, params) {                      // fold → inner type, or ()
+    if params.is_empty() { return (); }
+    type_class(params[0].string)        // InstanceOf['Foo'] -> ClassName(Foo)
+}
+```
+```rust
+fn type_constraint_names(&self) -> &[String] { &[] }
+fn type_constraint_inner(&self, name: &str, params: &[ConstraintParam]) -> Option<InferredType> { None }
+```
+Arity lives in the fold, not the core: `Enum[...]`→`type_string()` (ignores N
+params), `ArrayRef` vs `ArrayRef[Int]`→branch on `params.len()`. New
+constructors = a name + a few lines of fold, zero core change. Any plugin
+(MooseX::Types, Specio, a house lib) does the same.
+
+### Future: registration moves to the injection level
+
+The name-gate (`type_constraint_names()`) is a **global** list now — the cheap
+first cut. But constraint constructors are *synthesized and exported* by a type
+library, not hand-written; `use Types::Standard qw/InstanceOf .../` injects
+exactly those names into the package. So the authoritative source is the
+**import**, not a global list. Next iteration moves name registration to the
+injection seam (the `use` / `SyntheticUse` / `FrameworkImport` handling): a type
+library's plugin declares "I export these constraints, here's each fold" as part
+of its import, making it **import-scoped** (an unrelated `InstanceOf` in a
+package that didn't import it won't mis-fire) and free for synthesized/custom
+libs. crm's `Clove::Types` is a `Type::Library` re-exporting Types::Standard +
+Types::Common — it rides the clove-class kit's `SyntheticUse`, so the same seam
+covers it. **Forward-compatible:** only the *name-gate* migrates; the
+`type_constraint_inner` fold and the `TypeConstraintOf` / `has`-projection
+plumbing are unchanged.
+
 ## What `has` does (uniform, edge-based)
 
 The synthesized accessor's return witness is a **projection edge** to the isa
