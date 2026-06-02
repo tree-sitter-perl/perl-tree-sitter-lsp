@@ -1098,6 +1098,7 @@ mod tests {
             method_name: Some("model".into()),
             receiver_text: Some("$c".into()),
             receiver_type: Some(InferredType::ClassName("Catalyst".into())),
+            receiver_route_defaults: vec![],
             args: vec![
                 ArgInfo {
                     text: "'Foo'".into(),
@@ -1144,6 +1145,7 @@ mod tests {
             method_name: Some("forward".into()),
             receiver_text: Some("$c".into()),
             receiver_type: Some(InferredType::ClassName("Catalyst".into())),
+            receiver_route_defaults: vec![],
             args: vec![
                 ArgInfo {
                     text: "'/Root/index'".into(),
@@ -1190,6 +1192,7 @@ mod tests {
             method_name: Some("model".into()),
             receiver_text: Some("$schema".into()),
             receiver_type: Some(InferredType::ClassName("DBIx::Class::Schema".into())),
+            receiver_route_defaults: vec![],
             args: vec![
                 ArgInfo {
                     text: "'Foo'".into(),

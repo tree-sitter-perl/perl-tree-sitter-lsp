@@ -10,27 +10,33 @@
 //
 // ── $c parameter typing ──────────────────────────────────────────────
 //
-// The ideal is: sub foo :Local { my ($self, $c) = @_; ... } →
-// `$c` typed as `Catalyst`. The manifest's `VarType` action can do this
-// when the plugin sees the sub at definition time, but `on_method_call`
-// and `on_function_call` fire at CALL SITES, not at sub definitions.
-// `on_use` fires once per `use` statement but carries no per-sub spans.
+// `param_types()` with `method: ()` (wildcard — any method name) types
+// the 2nd positional param ($c, param index 1) as `Catalyst` for every
+// method in a class that `isa Catalyst::Controller`. The mechanism:
 //
-// MANIFEST GAP: there is no `on_sub_definition` hook. The builder's
-// `detect_first_param_type` types param 0 as `FirstParam{package}` for
-// methods, but there is no parallel hook for "type param N as X". A
-// future `detect_nth_param_type` (or a `VarType`-like emit from a
-// hypothetical `on_method_definition` hook) would close this gap. Until
-// then, the plugin cannot automatically type `$c` at definition sites
-// in controller action methods.
+//   ParamType { method: None, in_role: "Catalyst::Controller",
+//               param: 1, type_class: "Catalyst" }
 //
-// Work-around path: a user who writes
-//   `my ($self, $c) = @_;  # $c: Catalyst`
-// gets InferredType from the builder's type-constraint machinery if
-// they explicitly annotate. The overrides() declarations below ensure
-// that once $c IS typed as Catalyst (however the user achieves that,
-// or via a future core improvement), all $c->accessor calls return
-// the right types.
+// KNOWN CONSTRAINT — cross-file ClassIsa: `transitive_parents` in the
+// builder walks only `package_parents` populated from the current file's
+// `use parent` / `use base` / `@ISA` / `with` / `extends` declarations.
+// `Catalyst::Controller` is always a CPAN/dependency ancestor — never
+// declared locally. So the `in_role` match fires only when the file
+// itself carries a `use parent 'Catalyst::Controller'` (or equivalent)
+// that gets parsed and recorded in `package_parents`. For files whose
+// controller base is declared locally (rare in Catalyst apps — most
+// controllers DO have an explicit `use parent 'Catalyst::Controller'`),
+// this works correctly. For controllers that inherit transitively via
+// a local intermediate, the intermediate would need the same manifest
+// applied recursively — but `transitive_parents` does walk the full
+// local ancestor chain, so a `MyApp::Controller::Base` with `use parent
+// 'Catalyst::Controller'` and a child with `use parent
+// 'MyApp::Controller::Base'` WILL both get `$c` typed correctly.
+// The only gap is when the parent is cross-file and not in the local
+// `package_parents` snapshot. This is a resolver-layer concern
+// (see PluginRegistry::applicable / trigger cross-file limitation);
+// fixing it requires propagating cross-file parents into the build
+// walk, which is a separate architectural change.
 //
 // ── Component accessors ──────────────────────────────────────────────
 //
@@ -160,6 +166,27 @@ fn overrides() {
             return_type: type_hashref(),
             reason: "body_data returns decoded body (JSON/form); defaults to hashref",
         },
+    ]
+}
+
+// Type the 2nd positional param ($c) as `Catalyst` for every method in a
+// Catalyst::Controller subclass. `method: ()` is the wildcard selector —
+// any method name matches, so all action subs get the context typed.
+//
+// Selector approximation note: `in_role` is matched against the local
+// `package_parents` snapshot (see KNOWN CONSTRAINT above). This covers the
+// common case — a controller with `use parent 'Catalyst::Controller'` or a
+// transitive local chain to it. Cross-file-only inheritance misses; that's
+// a resolver-layer gap, not a manifest gap.
+fn param_types() {
+    [
+        // Every method in a Catalyst::Controller subclass gets $c typed.
+        // `method: ()` = wildcard: applies regardless of the action's name.
+        #{ in_role: "Catalyst::Controller", param: 1, type_class: "Catalyst" },
+        // Catalyst::Model and Catalyst::View controllers also carry $c when
+        // they define action methods (less common, but supported by Catalyst).
+        #{ in_role: "Catalyst::Model", param: 1, type_class: "Catalyst" },
+        #{ in_role: "Catalyst::View", param: 1, type_class: "Catalyst" },
     ]
 }
 

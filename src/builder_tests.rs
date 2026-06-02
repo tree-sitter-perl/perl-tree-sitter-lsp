@@ -9877,7 +9877,7 @@ mod param_types_manifest {
             static PT: OnceLock<Vec<ParamType>> = OnceLock::new();
             PT.get_or_init(|| {
                 vec![ParamType {
-                    method: "run_upgrade".into(),
+                    method: Some("run_upgrade".into()),
                     in_role: "My::Upgrade::Role".into(),
                     param: 1,
                     type_class: "Mojolicious".into(),
@@ -9925,6 +9925,86 @@ mod param_types_manifest {
             fa.inferred_type_via_bag("$app", Point::new(2, 10)),
             None,
             "a class that doesn't do the role must not get the contract param type",
+        );
+    }
+
+    // Wildcard-method param_types: a rule with `method: None` applies to every
+    // sub in the class — the Catalyst pattern where every action gets `$c` typed.
+    struct CatalystPlugin;
+    impl FrameworkPlugin for CatalystPlugin {
+        fn id(&self) -> &str { "catalyst-test" }
+        fn triggers(&self) -> &[Trigger] {
+            static T: [Trigger; 1] = [Trigger::Always];
+            &T
+        }
+        fn param_types(&self) -> &[ParamType] {
+            use std::sync::OnceLock;
+            static PT: OnceLock<Vec<ParamType>> = OnceLock::new();
+            PT.get_or_init(|| {
+                vec![ParamType {
+                    method: None, // wildcard: every method in the class
+                    in_role: "Catalyst::Controller".into(),
+                    param: 1,
+                    type_class: "Catalyst".into(),
+                }]
+            })
+        }
+        fn on_signature_help(&self, _: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> { None }
+        fn on_completion(&self, _: &CompletionQueryContext) -> Option<PluginCompletionAnswer> { None }
+    }
+
+    fn build_with_catalyst(source: &str) -> FileAnalysis {
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(CatalystPlugin));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        crate::builder::build_with_plugins(&tree, source.as_bytes(), Arc::new(reg))
+    }
+
+    #[test]
+    fn catalyst_action_c_typed_via_wildcard_manifest() {
+        // A controller action: $c (param index 1) should type as Catalyst.
+        // The wildcard rule fires regardless of the action method's name.
+        let fa = build_with_catalyst(
+            "package MyApp::Controller::Foo;\nuse parent 'Catalyst::Controller';\nsub index :Local {\n    my ($self, $c) = @_;\n    my $req = $c;\n}\n1;\n",
+        );
+        let ty = fa
+            .inferred_type_via_bag("$c", Point::new(4, 14))
+            .expect("$c should be typed by wildcard param_types manifest");
+        assert!(
+            matches!(&ty, InferredType::ClassName(c) if c == "Catalyst"),
+            "wildcard param_types should make $c a Catalyst in every controller action, got {:?}",
+            ty,
+        );
+    }
+
+    #[test]
+    fn catalyst_wildcard_typed_for_any_action_name() {
+        // A differently-named action — the wildcard covers it too.
+        let fa = build_with_catalyst(
+            "package MyApp::Controller::Bar;\nuse parent 'Catalyst::Controller';\nsub list :Local {\n    my ($self, $c) = @_;\n    my $x = $c;\n}\n1;\n",
+        );
+        let ty = fa
+            .inferred_type_via_bag("$c", Point::new(4, 12))
+            .expect("$c should be typed regardless of action method name");
+        assert!(
+            matches!(&ty, InferredType::ClassName(c) if c == "Catalyst"),
+            "wildcard param_types must apply to any action name, got {:?}",
+            ty,
+        );
+    }
+
+    #[test]
+    fn catalyst_wildcard_not_applied_outside_controller() {
+        // A package without the Catalyst::Controller ancestor must not get $c typed.
+        let fa = build_with_catalyst(
+            "package OtherPackage;\nsub index {\n    my ($self, $c) = @_;\n    my $x = $c;\n}\n1;\n",
+        );
+        assert_eq!(
+            fa.inferred_type_via_bag("$c", Point::new(3, 12)),
+            None,
+            "wildcard rule must not type $c in a package that doesn't isa Catalyst::Controller",
         );
     }
 }

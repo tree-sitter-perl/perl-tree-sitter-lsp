@@ -591,7 +591,11 @@ pub struct ConstraintParam {
 /// this manifest is the *declaration*-site selector that has no hook.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamType {
-    pub method: String,
+    /// Method name to match. `None` matches every method in the class —
+    /// the "any action in a controller" case (Catalyst `$c`, PSGI handlers).
+    /// Plugin authors express this by omitting the `method` key in Rhai.
+    #[serde(default)]
+    pub method: Option<String>,
     /// The enclosing package must do/inherit this role/class (matched against
     /// the package's resolved ancestry — `with` / `extends` / `isa` / `does`).
     pub in_role: String,

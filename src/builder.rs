@@ -234,6 +234,7 @@ fn build_with_plugins_inner(
         type_constraint_names: std::collections::HashSet::new(),
         app_surface_consumers: Vec::new(),
         param_type_manifest: std::collections::HashMap::new(),
+        param_type_wildcards: Vec::new(),
         provisional_dispatches: Vec::new(),
         method_call_invocant: std::collections::HashMap::new(),
         parametric_emitted_refs: std::collections::HashSet::new(),
@@ -257,10 +258,15 @@ fn build_with_plugins_inner(
         .map(|s| s.to_string())
         .collect();
     for pt in b.plugins.param_types() {
-        b.param_type_manifest
-            .entry(pt.method.clone())
-            .or_default()
-            .push(pt.clone());
+        match &pt.method {
+            Some(name) => {
+                b.param_type_manifest
+                    .entry(name.clone())
+                    .or_default()
+                    .push(pt.clone());
+            }
+            None => b.param_type_wildcards.push(pt.clone()),
+        }
     }
 
     // Create file-level scope and walk
@@ -1133,6 +1139,10 @@ struct Builder<'a> {
     /// Plugin `param_types()` manifest, grouped by method name. At a matching
     /// sub declaration in a role-doer, the named param gets a typed TC.
     param_type_manifest: std::collections::HashMap<String, Vec<plugin::ParamType>>,
+    /// Rules from `param_types()` with `method: None` — applied to every sub
+    /// declaration in a matching class, regardless of method name. The
+    /// "every action in a controller" case (Catalyst `$c`).
+    param_type_wildcards: Vec<plugin::ParamType>,
     /// Dispatch candidates recorded during the walk, promoted to refs in
     /// enrichment once the receiver's cross-file class is known. See
     /// `file_analysis::ProvisionalDispatch`.
@@ -3428,30 +3438,31 @@ impl<'a> Builder<'a> {
     }
 
     /// Apply plugin `param_types()` rules to a sub declaration: if a rule's
-    /// `method` matches and the enclosing package does/inherits the rule's
-    /// `in_role`, push a typed TC for the named param — the role contract's
-    /// declared type. Called inside the sub scope (like
-    /// `detect_first_param_type`). The role check uses the parents recorded so
-    /// far (`with` typically precedes the method); a role declared *after* the
-    /// method in the file wouldn't be seen at this walk point.
+    /// `method` matches (or is `None` = any method) and the enclosing package
+    /// does/inherits the rule's `in_role`, push a typed TC for the named param.
+    /// Called inside the sub scope (like `detect_first_param_type`). The role
+    /// check uses parents recorded so far (`with` typically precedes the method);
+    /// a role declared *after* the method in the file wouldn't be seen here.
     fn apply_param_type_manifest(&mut self, method: &str, params: &[ParamInfo], node: Node<'a>) {
-        let Some(rules) = self.param_type_manifest.get(method) else { return };
         let Some(pkg) = self.current_package.clone() else { return };
         // Resolved ancestry of the enclosing package (roles via `with`,
         // parents via extends/isa/use parent), plus the package itself.
         let ancestry = self.transitive_parents(&pkg);
-        // Snapshot the matching (param-index, class) pairs before mutating
-        // self via push_type_constraint (can't hold the manifest borrow).
+
+        // Collect (param-index, class) pairs before mutating self — can't hold
+        // the manifest borrow while calling push_type_constraint.
         let mut to_type: Vec<(String, String)> = Vec::new();
-        for r in rules {
-            let in_scope = pkg == r.in_role || ancestry.iter().any(|a| a == &r.in_role);
-            if !in_scope { continue; }
-            if let Some(p) = params.get(r.param) {
-                if p.name.starts_with('$') {
-                    to_type.push((p.name.clone(), r.type_class.clone()));
-                }
-            }
+
+        // Named rules: only those keyed to exactly this method name.
+        if let Some(rules) = self.param_type_manifest.get(method) {
+            Self::collect_param_type_matches(rules, &pkg, &ancestry, params, &mut to_type);
         }
+
+        // Wildcard rules: method is None — apply to every sub in the class.
+        let wildcards = std::mem::take(&mut self.param_type_wildcards);
+        Self::collect_param_type_matches(&wildcards, &pkg, &ancestry, params, &mut to_type);
+        self.param_type_wildcards = wildcards;
+
         let scope = self.current_scope();
         let span = node_to_span(node);
         for (variable, class) in to_type {
@@ -3461,6 +3472,28 @@ impl<'a> Builder<'a> {
                 constraint_span: span,
                 inferred_type: InferredType::ClassName(class),
             });
+        }
+    }
+
+    /// Inner fold for `apply_param_type_manifest`: given a slice of rules and
+    /// the current package's ancestry, push matching (variable_name, class)
+    /// pairs into `out`. Pure — no self borrow, so it can be called while
+    /// `param_type_wildcards` is temporarily moved out.
+    fn collect_param_type_matches(
+        rules: &[plugin::ParamType],
+        pkg: &str,
+        ancestry: &[String],
+        params: &[ParamInfo],
+        out: &mut Vec<(String, String)>,
+    ) {
+        for r in rules {
+            let in_scope = pkg == r.in_role || ancestry.iter().any(|a| a == &r.in_role);
+            if !in_scope { continue; }
+            if let Some(p) = params.get(r.param) {
+                if p.name.starts_with('$') {
+                    out.push((p.name.clone(), r.type_class.clone()));
+                }
+            }
         }
     }
 
