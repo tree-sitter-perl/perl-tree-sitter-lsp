@@ -565,26 +565,13 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
     // handler. The previous hand-rolled sub/method walk missed decl
     // sites entirely and resolved cross-file invocants with `None`
     // module index, so chained `Class->new->method` callers fell out.
-    let target = match analysis.rename_kind_at(point, Some(&idx)) {
-        Some(file_analysis::RenameKind::Function { name, package }) => resolve::TargetRef {
-            name,
-            kind: resolve::TargetKind::Sub { package },
-        },
-        Some(file_analysis::RenameKind::Method { name, class }) => resolve::TargetRef {
-            name,
-            kind: resolve::TargetKind::Method { class },
-        },
-        Some(file_analysis::RenameKind::Package(name)) => resolve::TargetRef {
-            name,
-            kind: resolve::TargetKind::Package,
-        },
-        Some(file_analysis::RenameKind::Handler { owner, name }) => resolve::TargetRef {
-            name: name.clone(),
-            kind: resolve::TargetKind::Handler { owner, name },
-        },
+    let target = match analysis.rename_kind_at(point, Some(&idx))
+        .and_then(|k| resolve::TargetRef::from_rename_kind(k, &analysis, Some(&idx)))
+    {
+        Some(t) => t,
         // HashKey / Variable / None aren't cross-file callable targets
         // here; emit just the local refs (variables are lexical anyway).
-        _ => {
+        None => {
             let mut results = Vec::new();
             let local = analysis.find_references(point, None, None, Some(&idx));
             for span in &local {
@@ -679,22 +666,12 @@ fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &
     // `cli_references` and the LSP rename handler — both go through `refs_to`
     // with EDITABLE mask so rename and references agree on which call sites
     // qualify and dep files are never edited.
-    let target = match &rename_kind {
-        file_analysis::RenameKind::Function { name, package } => resolve::TargetRef {
-            name: name.clone(),
-            kind: resolve::TargetKind::Sub { package: package.clone() },
-        },
-        file_analysis::RenameKind::Method { name, class } => resolve::TargetRef {
-            name: name.clone(),
-            kind: resolve::TargetKind::Method { class: class.clone() },
-        },
-        file_analysis::RenameKind::Package(name) => resolve::TargetRef {
-            name: name.clone(),
-            kind: resolve::TargetKind::Package,
-        },
-        // Already handled above.
-        _ => unreachable!(),
-    };
+    // Same mapping as `cli_references` and the LSP handlers; the Method arm
+    // precomputes the inheritance chain from this (originating) analysis so
+    // the parent `sub NAME` decl is collected. Handler is single-filed above,
+    // so it never reaches here.
+    let target = resolve::TargetRef::from_rename_kind(rename_kind, &analysis, Some(&idx))
+        .expect("Function/Method/Package map to a target");
 
     // Insert the enriched target file as the freshest workspace copy so its
     // own refs join the cross-file set (the background index may hold a staler

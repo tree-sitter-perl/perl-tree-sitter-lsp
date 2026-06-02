@@ -4654,6 +4654,7 @@ sub run {
                 owner: HandlerOwner::Class("Producer".to_string()),
                 name: "ready".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );

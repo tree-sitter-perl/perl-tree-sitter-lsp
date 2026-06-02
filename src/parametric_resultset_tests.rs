@@ -317,6 +317,7 @@ $schema->resultset('Schema::Result::Users')->search({ name => 'X' });
     let target = TargetRef {
         name: "name".to_string(),
         kind: TargetKind::HashKeyOfClass("Schema::Result::Users".to_string()),
+        method_classes: Vec::new(),
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs
@@ -690,6 +691,7 @@ sub action {
     let target = TargetRef {
         name: "name".to_string(),
         kind: TargetKind::HashKeyOfClass("Schema::Result::Sner".to_string()),
+        method_classes: Vec::new(),
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs
@@ -759,6 +761,7 @@ sub action {
     let target = TargetRef {
         name: "name".to_string(),
         kind: TargetKind::HashKeyOfClass("Schema::Result::Sner".to_string()),
+        method_classes: Vec::new(),
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs

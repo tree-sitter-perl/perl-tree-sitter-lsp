@@ -37,6 +37,71 @@ bitflags::bitflags! {
 pub struct TargetRef {
     pub name: String,
     pub kind: TargetKind,
+    /// For a `Method` target, the inheritance rename-chain
+    /// `[cursor_class, ..., defining_class]` computed ONCE from the
+    /// originating analysis (the only file that knows the cursor class's
+    /// parents). A `sub NAME` declaration in ANY class on this set is a
+    /// declaration of the same callable — see `symbol_defines_target`.
+    /// Empty for non-Method kinds (their decl match is the strict scope).
+    pub method_classes: Vec<String>,
+}
+
+impl TargetRef {
+    /// Build a `Method` target, precomputing the inheritance rename-chain
+    /// from `origin` so declaration matching in any scanned file can admit
+    /// `sub NAME` in an ancestor class — not just the cursor's static class.
+    ///
+    /// The chain can only be derived here: a base file (`BaseWorker.pm`)
+    /// scanned later doesn't know its child `MyWorker`, so it can't recompute
+    /// the chain that links the call's `MyWorker` invocant to the parent decl.
+    pub fn method(
+        name: String,
+        class: String,
+        origin: &FileAnalysis,
+        module_index: Option<&ModuleIndex>,
+    ) -> Self {
+        let method_classes = origin.method_rename_chain(&class, &name, module_index);
+        TargetRef {
+            name,
+            kind: TargetKind::Method { class },
+            method_classes,
+        }
+    }
+
+    /// Build a non-Method target (no inheritance fan-out for declarations).
+    pub fn new(name: String, kind: TargetKind) -> Self {
+        debug_assert!(
+            !matches!(kind, TargetKind::Method { .. }),
+            "use TargetRef::method so the rename chain is populated"
+        );
+        TargetRef { name, kind, method_classes: Vec::new() }
+    }
+
+    /// Map a cursor-resolved `RenameKind` to the cross-file target, sharing
+    /// the one mapping across both LSP handlers and both CLI modes so
+    /// references and rename can't diverge on target identity (rule #5).
+    /// `HashKey`/`Variable` aren't simple cross-file callables — they return
+    /// `None` and the caller keeps its owner-expansion / lexical handling.
+    pub fn from_rename_kind(
+        kind: crate::file_analysis::RenameKind,
+        origin: &FileAnalysis,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<Self> {
+        use crate::file_analysis::RenameKind;
+        Some(match kind {
+            RenameKind::Function { name, package } => {
+                TargetRef::new(name, TargetKind::Sub { package })
+            }
+            RenameKind::Method { name, class } => {
+                TargetRef::method(name, class, origin, module_index)
+            }
+            RenameKind::Package(name) => TargetRef::new(name, TargetKind::Package),
+            RenameKind::Handler { owner, name } => {
+                TargetRef::new(name.clone(), TargetKind::Handler { owner, name })
+            }
+            RenameKind::HashKey(_) | RenameKind::Variable => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,8 +249,19 @@ fn symbol_defines_target(sym: &crate::file_analysis::Symbol, target: &TargetRef)
             matches!(sym.kind, SymKind::Sub | SymKind::Method) && sym.package == *package
         }
         TargetKind::Method { class } => {
-            matches!(sym.kind, SymKind::Sub | SymKind::Method)
-                && sym.package.as_deref() == Some(class.as_str())
+            // A `sub NAME` declaration belongs to this target if it lives in
+            // ANY class on the inheritance rename-chain — the parent that
+            // actually defines an inherited method, not only the cursor's
+            // static class. The chain is precomputed on the target (it can't
+            // be re-derived while scanning the base file, which doesn't know
+            // its children). Empty chain falls back to the strict class match
+            // so a Method built outside `TargetRef::method` still works.
+            let on_chain = target
+                .method_classes
+                .iter()
+                .any(|c| Some(c.as_str()) == sym.package.as_deref())
+                || sym.package.as_deref() == Some(class.as_str());
+            matches!(sym.kind, SymKind::Sub | SymKind::Method) && on_chain
         }
         TargetKind::Package => matches!(
             sym.kind,

@@ -423,19 +423,18 @@ impl LanguageServer for Backend {
         use crate::resolve::{refs_to, TargetKind, TargetRef};
 
         let point = symbols::position_to_point(pos);
-        let target = match doc.analysis.rename_kind_at(point, Some(&self.module_index)) {
-            Some(RenameKind::Function { name, package }) => TargetRef {
-                name,
-                kind: TargetKind::Sub { package },
-            },
-            Some(RenameKind::Method { name, class }) => TargetRef {
-                name,
-                kind: TargetKind::Method { class },
-            },
-            Some(RenameKind::Package(name)) => TargetRef {
-                name,
-                kind: TargetKind::Package,
-            },
+        let rk = doc.analysis.rename_kind_at(point, Some(&self.module_index));
+        let target = match rk {
+            Some(RenameKind::Function { .. })
+            | Some(RenameKind::Method { .. })
+            | Some(RenameKind::Package(_))
+            | Some(RenameKind::Handler { .. }) => {
+                // Single mapping shared with rename + CLI so references and
+                // rename agree on target identity, including the Method
+                // inheritance chain (rule #5).
+                TargetRef::from_rename_kind(rk.unwrap(), &doc.analysis, Some(&self.module_index))
+                    .expect("non-HashKey/Variable kinds map to a target")
+            }
             Some(RenameKind::HashKey(name)) => {
                 // If the cursor is on a HashKeyDef or a HashKeyAccess
                 // whose owner was resolved at build time, do a cross-file walk
@@ -462,13 +461,10 @@ impl LanguageServer for Backend {
                 match owner {
                     Some(HashKeyOwner::Sub { package, name: sub_name }) => {
                         drop(doc);
-                        let t = crate::resolve::TargetRef {
+                        let t = TargetRef::new(
                             name,
-                            kind: crate::resolve::TargetKind::HashKeyOfSub {
-                                package,
-                                name: sub_name,
-                            },
-                        };
+                            TargetKind::HashKeyOfSub { package, name: sub_name },
+                        );
                         let mask = crate::resolve::references_mask_for(
                             &self.files, Some(&self.module_index), &t,
                         );
@@ -479,10 +475,7 @@ impl LanguageServer for Backend {
                     }
                     Some(HashKeyOwner::Class(class_name)) => {
                         drop(doc);
-                        let t = crate::resolve::TargetRef {
-                            name,
-                            kind: crate::resolve::TargetKind::HashKeyOfClass(class_name),
-                        };
+                        let t = TargetRef::new(name, TargetKind::HashKeyOfClass(class_name));
                         let mask = crate::resolve::references_mask_for(
                             &self.files, Some(&self.module_index), &t,
                         );
@@ -508,10 +501,6 @@ impl LanguageServer for Backend {
                 );
                 return Ok(if refs.is_empty() { None } else { Some(refs) });
             }
-            Some(RenameKind::Handler { owner, name }) => TargetRef {
-                name: name.clone(),
-                kind: TargetKind::Handler { owner, name },
-            },
         };
 
         // Cross-file walk. Scope to editable space when the target is a
@@ -553,7 +542,7 @@ impl LanguageServer for Backend {
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         use crate::file_analysis::RenameKind;
-        use crate::resolve::{TargetKind, TargetRef};
+        use crate::resolve::TargetRef;
 
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
@@ -580,27 +569,13 @@ impl LanguageServer for Backend {
                 // Hash keys: single-file for now.
                 Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
             }
-            Some(RenameKind::Function { ref name, ref package }) => {
-                let target = TargetRef {
-                    name: name.clone(),
-                    kind: TargetKind::Sub { package: package.clone() },
-                };
-                drop(doc);
-                Ok(rename_via_refs_to(&self.files, Some(&self.module_index), &target, new_name))
-            }
-            Some(RenameKind::Method { ref name, ref class }) => {
-                let target = TargetRef {
-                    name: name.clone(),
-                    kind: TargetKind::Method { class: class.clone() },
-                };
-                drop(doc);
-                Ok(rename_via_refs_to(&self.files, Some(&self.module_index), &target, new_name))
-            }
-            Some(RenameKind::Package(ref n)) => {
-                let target = TargetRef {
-                    name: n.clone(),
-                    kind: TargetKind::Package,
-                };
+            Some(kind @ (RenameKind::Function { .. }
+            | RenameKind::Method { .. }
+            | RenameKind::Package(_))) => {
+                // Same mapping as references — the Method arm precomputes the
+                // inheritance chain so the parent `sub NAME` decl is collected.
+                let target = TargetRef::from_rename_kind(kind, &doc.analysis, Some(&self.module_index))
+                    .expect("Function/Method/Package map to a target");
                 drop(doc);
                 Ok(rename_via_refs_to(&self.files, Some(&self.module_index), &target, new_name))
             }

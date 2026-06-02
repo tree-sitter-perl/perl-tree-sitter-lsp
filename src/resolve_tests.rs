@@ -33,6 +33,7 @@ fn test_refs_to_finds_sub_across_workspace_files() {
             kind: TargetKind::Sub {
                 package: Some("A".to_string()),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -79,6 +80,7 @@ fn test_refs_to_exporter_extensible_cross_file() {
         &TargetRef {
             name: "foo".to_string(),
             kind: TargetKind::Sub { package: Some("Ext".to_string()) },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -117,6 +119,7 @@ fn test_refs_to_exporter_declare_cross_file() {
         &TargetRef {
             name: "foo".to_string(),
             kind: TargetKind::Sub { package: Some("Decl".to_string()) },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -155,6 +158,7 @@ fn test_refs_to_importer_consumer_cross_file() {
         &TargetRef {
             name: "foo".to_string(),
             kind: TargetKind::Sub { package: Some("Src::Mod".to_string()) },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -186,6 +190,7 @@ fn test_refs_to_export_not_registered_without_use() {
         &TargetRef {
             name: "phantom".to_string(),
             kind: TargetKind::Sub { package: Some("Plain".to_string()) },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -224,6 +229,7 @@ $app->routes->post('/users')->to(controller => 'Users', action => 'create');
             kind: TargetKind::Method {
                 class: "Mojolicious::Controller::_Helper::users".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -251,6 +257,7 @@ $app->routes->post('/users')->to(controller => 'Users', action => 'create');
             kind: TargetKind::Method {
                 class: "Users".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -304,6 +311,7 @@ $b->run;
             kind: TargetKind::Method {
                 class: "Foo".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -339,6 +347,7 @@ $b->run;
             kind: TargetKind::Method {
                 class: "Bar".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -413,6 +422,7 @@ Bler->new->hi;
             kind: TargetKind::Method {
                 class: "Sner".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -458,6 +468,7 @@ Bler->new->hi;
             kind: TargetKind::Method {
                 class: "Bler".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -602,6 +613,7 @@ $b->run;
         Some(RenameKind::Method { name, class }) => TargetRef {
             name,
             kind: TargetKind::Method { class },
+            method_classes: Vec::new(),
         },
         other => panic!(
             "rename_kind_at($f->run) should be Method{{class=Foo}}, got {:?}",
@@ -757,12 +769,14 @@ hi();
             kind: TargetKind::Sub {
                 package: package.clone(),
             },
+            method_classes: Vec::new(),
         },
         Some(RenameKind::Method { name, class }) => TargetRef {
             name: name.clone(),
             kind: TargetKind::Method {
                 class: class.clone(),
             },
+            method_classes: Vec::new(),
         },
         other => panic!("unexpected rename_kind_at = {:?}", other),
     };
@@ -1031,6 +1045,7 @@ $u->create(name => 'alice');
         Some(RenameKind::Method { name, class }) => TargetRef {
             name,
             kind: TargetKind::Method { class },
+            method_classes: Vec::new(),
         },
         other => panic!("expected Method, got {:?}", other),
     };
@@ -1101,6 +1116,7 @@ fn test_refs_to_empty_when_no_hits() {
         &TargetRef {
             name: "nonexistent".to_string(),
             kind: TargetKind::Sub { package: None },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -1135,6 +1151,7 @@ fn test_refs_to_finds_hash_key_def_and_access_same_file() {
                 package: Some("Lib".to_string()),
                 name: "get_config".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -1169,6 +1186,7 @@ fn test_refs_to_finds_cross_file_hash_key_def() {
                 package: Some("Lib".to_string()),
                 name: "get_config".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -1209,6 +1227,7 @@ fn test_refs_to_package_qualified_sub_owner_isolates_name_collisions() {
                 package: Some("Alpha".to_string()),
                 name: "get_config".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -1241,6 +1260,7 @@ fn test_refs_to_role_mask_excludes_workspace() {
         &TargetRef {
             name: "foo".to_string(),
             kind: TargetKind::Sub { package: None },
+            method_classes: Vec::new(),
         },
         RoleMask::OPEN,
     );
@@ -1337,6 +1357,7 @@ $b->touch();
     let target = TargetRef {
         name: "touch".to_string(),
         kind: TargetKind::Method { class: "B".to_string() },
+        method_classes: Vec::new(),
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs.iter().any(|r| {
@@ -1473,6 +1494,7 @@ $x->ping();
         &TargetRef {
             name: "ping".to_string(),
             kind: TargetKind::Method { class: "C".to_string() },
+            method_classes: Vec::new(),
         },
         RoleMask::WORKSPACE,
     );
@@ -1549,6 +1571,7 @@ sub touch  { 1 }
     let target = TargetRef {
         name: "touch".to_string(),
         kind: TargetKind::Method { class: "B".to_string() },
+        method_classes: Vec::new(),
     };
 
     // Warm-up — JIT'd registry caches, lazy index allocs.
@@ -1644,6 +1667,7 @@ $x->makeFoo()->ping();
         &TargetRef {
             name: "ping".to_string(),
             kind: TargetKind::Method { class: "P".to_string() },
+            method_classes: Vec::new(),
         },
         RoleMask::WORKSPACE,
     );
@@ -1753,6 +1777,7 @@ sub fire ($minion) {\n  $minion->enqueue('send_email' => ['a@b']);\n}\n1;\n",
                 owner: crate::file_analysis::HandlerOwner::Class("Minion".to_string()),
                 name: "send_email".to_string(),
             },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -1805,6 +1830,7 @@ fn refs_to_fans_runtime_exported_sub_to_consumer() {
         &TargetRef {
             name: "sweeten".to_string(),
             kind: TargetKind::Sub { package: Some("Sugar::Sub".to_string()) },
+            method_classes: Vec::new(),
         },
         RoleMask::EDITABLE,
     );
@@ -1858,6 +1884,7 @@ fn references_cross_file_sub_fans_out_and_stays_package_scoped() {
     let target = TargetRef {
         name: "info_to_task".to_string(),
         kind: TargetKind::Sub { package: Some("TaskInfo".to_string()) },
+        method_classes: Vec::new(),
     };
     let refs = refs_to(&store, None, &target, RoleMask::EDITABLE);
     let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
@@ -1911,6 +1938,7 @@ fn references_cross_file_method_matches_inheriting_invocant() {
     let target = TargetRef {
         name: "success".to_string(),
         kind: TargetKind::Method { class: "Role::REST".to_string() },
+        method_classes: Vec::new(),
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::EDITABLE);
     let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
@@ -1944,6 +1972,7 @@ fn references_mask_scopes_to_editable_for_project_symbols() {
     let in_ws = TargetRef {
         name: "thing".to_string(),
         kind: TargetKind::Sub { package: Some("Proj".to_string()) },
+        method_classes: Vec::new(),
     };
     assert_eq!(
         references_mask_for(&store, None, &in_ws).bits(),
@@ -1956,6 +1985,7 @@ fn references_mask_scopes_to_editable_for_project_symbols() {
     let dep_only = TargetRef {
         name: "nowhere".to_string(),
         kind: TargetKind::Sub { package: Some("CPAN::Thing".to_string()) },
+        method_classes: Vec::new(),
     };
     assert_eq!(
         references_mask_for(&store, None, &dep_only).bits(),
@@ -2046,6 +2076,7 @@ $d->ping;
     let target = TargetRef {
         name: "ping".to_string(),
         kind: TargetKind::Method { class: "Base".to_string() },
+        method_classes: Vec::new(),
     };
 
     // Rename uses EDITABLE — workspace-only, no dep scan.
@@ -2113,6 +2144,7 @@ $b->ping;
     let target = TargetRef {
         name: "ping".to_string(),
         kind: TargetKind::Method { class: "Base".to_string() },
+        method_classes: Vec::new(),
     };
 
     // EDITABLE mask — rename never scans deps.
@@ -2183,6 +2215,7 @@ $g->hello;
     let target = TargetRef {
         name: "hello".to_string(),
         kind: TargetKind::Method { class: "Greeter".to_string() },
+        method_classes: Vec::new(),
     };
 
     // references uses references_mask_for (EDITABLE when def in workspace).
@@ -2218,5 +2251,77 @@ $g->hello;
         rename_set.iter().any(|(f, _)| f.contains("agree_consumer")),
         "both rename and references must include consumer's $$g->hello call: {:?}",
         rename_set,
+    );
+}
+
+/// Rename invoked AT THE CHILD CALL SITE of an inherited base method must
+/// still edit the parent declaration. Here `rename_kind_at` returns the
+/// cursor's static class (`MyWorker`), not the defining class (`BaseWorker`):
+/// the parent `sub process` decl lives in a class the target's strict
+/// `class` field never names. The fix precomputes the inheritance
+/// rename-chain (`[MyWorker, .., BaseWorker]`) on the target — built from the
+/// originating analysis, the only one that knows MyWorker's parents — so
+/// `symbol_defines_target` admits a `sub NAME` in ANY chain class. Without
+/// it the base declaration edit silently drops (the e2e inheritance rename
+/// regression).
+#[test]
+fn rename_from_child_call_site_includes_inherited_base_declaration() {
+    use crate::file_analysis::RenameKind;
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let base_src = "package BaseWorker;\nsub new { bless {}, shift }\nsub process { 1 }\n1;\n";
+    // Child inherits process; no local override.
+    let child_src = "package MyWorker;\nuse parent 'BaseWorker';\n1;\n";
+    // Script calls process() on a MyWorker instance.
+    let script_src = "use MyWorker;\nmy $worker = MyWorker->new;\n$worker->process();\n";
+
+    let base_path = PathBuf::from("/tmp/cs_base.pm");
+    let child_path = PathBuf::from("/tmp/cs_child.pm");
+    let script_path = PathBuf::from("/tmp/cs_script.pl");
+
+    // The originating analysis (the script) must know MyWorker's parents to
+    // build the chain — production threads the module index for exactly this.
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(base_path.clone(), Arc::new(parse(base_src)));
+    idx.register_workspace_module(child_path.clone(), Arc::new(parse(child_src)));
+
+    let mut script_fa = parse(script_src);
+    script_fa.enrich_imported_types_with_keys(Some(&idx));
+
+    // Resolve the target the way the rename handler does: cursor on the
+    // `process` token of `$worker->process()`, mapped via from_rename_kind.
+    let call_point = tree_sitter::Point { row: 2, column: 9 };
+    let rk = script_fa.rename_kind_at(call_point, Some(&idx));
+    assert!(
+        matches!(&rk, Some(RenameKind::Method { class, .. }) if class == "MyWorker"),
+        "precondition: call-site rename_kind_at should resolve invocant class MyWorker, got {:?}",
+        rk,
+    );
+    let target = TargetRef::from_rename_kind(rk.unwrap(), &script_fa, Some(&idx))
+        .expect("Method maps to a target");
+    assert!(
+        target.method_classes.iter().any(|c| c == "BaseWorker"),
+        "chain must reach the defining ancestor BaseWorker, got {:?}",
+        target.method_classes,
+    );
+
+    let store = FileStore::new();
+    store.insert_workspace(base_path.clone(), parse(base_src));
+    store.insert_workspace(child_path.clone(), parse(child_src));
+    store.insert_workspace(script_path.clone(), script_fa);
+
+    let locs = refs_to(&store, Some(&idx), &target, RoleMask::EDITABLE);
+    let hit = |p: &PathBuf| locs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
+
+    assert!(
+        hit(&base_path),
+        "rename from child call site dropped the BaseWorker::process declaration edit. hits: {:?}",
+        locs,
+    );
+    assert!(
+        hit(&script_path),
+        "rename from child call site missed the $worker->process() call edit. hits: {:?}",
+        locs,
     );
 }
