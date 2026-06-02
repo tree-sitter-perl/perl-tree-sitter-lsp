@@ -2930,3 +2930,142 @@ sub action ($c) {\n\
         "inherited fluent accessor must return the dispatch (child) class, got: {hover}",
     );
 }
+
+/// Spike: Mojo partial route targets inherit the controller down the
+/// route-builder chain via a value brand (`InferredType::BrandedRoute`).
+/// See `docs/prompt-route-default-inheritance.md` (option C, collapsed:
+/// resolved defaults ride the type, no separate brand-id/side-table).
+///
+/// The brand carries the inherited `->to('ctrl#')` controller and rides
+/// the chain through assignment (`my $alerts_r = ...`), method chaining
+/// (`->get('/')->to`), and nesting (`$alerts_r->under(...)` → `$crud`).
+/// A partial `->to('#action')` reads the inherited controller off the
+/// receiver's brand; a sibling group with its own `->to('other#')`
+/// re-brands its descendants without leaking.
+///
+/// Controller-token → class mapping (camelize + workspace search) is
+/// orthogonal and decided elsewhere; here the controller packages are
+/// named to match the raw token so goto-def resolves end to end without
+/// that layer. The route class's fluent verbs return `$self` so the
+/// chain types as `Mojolicious::Routes::Route` locally.
+#[test]
+fn brand_partial_route_targets_inherit_controller() {
+    let src = r#"package Mojolicious::Routes::Route;
+sub new { my $class = shift; return bless {}, $class; }
+sub any { my $self = shift; return $self; }
+sub get { my $self = shift; return $self; }
+sub under { my $self = shift; return $self; }
+sub to { my $self = shift; return $self; }
+
+package alerts;
+sub list { my $c = shift; }
+sub get_alert { my $c = shift; }
+sub read_settings { my $c = shift; }
+
+package other;
+sub thing { my $c = shift; }
+
+package MyApp;
+use Mojolicious::Lite;
+sub startup {
+  my $self = shift;
+  my $r = Mojolicious::Routes::Route->new;
+  my $alerts_r = $r->any('/alerts')->to('alerts#', section => 'admin');
+  $alerts_r->get('/')->to('#list');
+  my $crud = $alerts_r->under('/:type')->to('#get_alert');
+  $crud->get('/settings')->to('#read_settings');
+  my $other_r = $r->any('/other')->to('other#');
+  $other_r->get('/x')->to('#thing');
+}
+1;
+"#;
+    let fa = parse_analysis(src);
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+
+    // Helper: the plugin-emitted MethodCallRef for a partial target —
+    // its invocant class IS the inherited controller, its target the
+    // action.
+    let inherited = |action: &str| -> Option<String> {
+        fa.refs.iter().find_map(|r| {
+            if let crate::file_analysis::RefKind::MethodCall { .. } = &r.kind {
+                if r.target_name == action {
+                    return fa.method_call_invocant_class(r, Some(&idx));
+                }
+            }
+            None
+        })
+    };
+
+    // Direct child: `$alerts_r->get('/')->to('#list')` inherits 'alerts'.
+    assert_eq!(inherited("list").as_deref(), Some("alerts"),
+        "partial '#list' must inherit the parent's 'alerts' controller");
+    // Nested via `under`: `$crud` inherits 'alerts' from `$alerts_r`.
+    assert_eq!(inherited("get_alert").as_deref(), Some("alerts"),
+        "partial '#get_alert' on $crud (under $alerts_r) inherits 'alerts'");
+    // Two hops deep: `$crud->get('/settings')->to('#read_settings')`.
+    assert_eq!(inherited("read_settings").as_deref(), Some("alerts"),
+        "nested partial '#read_settings' still inherits 'alerts'");
+    // Sibling group re-brands; no leak from 'alerts'.
+    assert_eq!(inherited("thing").as_deref(), Some("other"),
+        "sibling group's '#thing' inherits 'other', not 'alerts'");
+
+    // The brand rides assignment + nesting: $alerts_r and $crud both
+    // carry the inherited controller in their type.
+    let ty_at = |needle: &str, var: &str| -> Option<crate::file_analysis::InferredType> {
+        let at = src.find(needle).unwrap();
+        let pre = &src[..at];
+        let pt = tree_sitter::Point {
+            row: pre.matches('\n').count(),
+            column: at - pre.rfind('\n').map(|i| i + 1).unwrap_or(0),
+        };
+        fa.inferred_type_via_bag(var, pt)
+    };
+    assert!(
+        matches!(ty_at("$alerts_r->get", "$alerts_r"),
+            Some(crate::file_analysis::InferredType::BrandedRoute { ref controller, .. })
+                if controller.as_deref() == Some("alerts")),
+        "$alerts_r must type as a BrandedRoute carrying controller='alerts'");
+    assert!(
+        matches!(ty_at("$crud->get", "$crud"),
+            Some(crate::file_analysis::InferredType::BrandedRoute { ref controller, .. })
+                if controller.as_deref() == Some("alerts")),
+        "$crud (nested under $alerts_r) inherits the 'alerts' brand");
+
+    // Stash (beyond controller/action) rides the brand too: the
+    // `section => 'admin'` default set on $alerts_r is queryable via
+    // the rule-#10 `route_default` accessor on a descendant's value.
+    assert_eq!(
+        ty_at("$crud->get", "$crud").as_ref().and_then(|t| t.route_default("section")),
+        Some("admin"),
+        "inherited stash default 'section' is readable off $crud's brand");
+    assert_eq!(
+        ty_at("$crud->get", "$crud").as_ref().and_then(|t| t.route_default("controller")),
+        Some("alerts"),
+        "route_default('controller') reads the distinguished controller key");
+
+    // End-to-end goto-def: cursor on the `list` action inside
+    // `->to('#list')` resolves to `alerts::list` (here the controller
+    // token maps directly to the package).
+    let uri = Url::parse("file:///app.pl").unwrap();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let list_at = src.find("'#list'").unwrap() + "'#".len();
+    let pre = &src[..list_at];
+    let pos = Position {
+        line: pre.matches('\n').count() as u32,
+        character: (list_at - pre.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
+    };
+    let resp = find_definition(&fa, pos, &uri, &idx, &tree, src);
+    let loc = match resp {
+        Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+        Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => v.remove(0),
+        other => panic!("expected goto-def on partial '#list', got {other:?}"),
+    };
+    // `sub list` is declared on line index 9 (0-based) — `package alerts;`
+    // block. Just assert it landed on the `list` sub's line, not on the
+    // app's route line.
+    let list_line = src[..src.find("sub list").unwrap()].matches('\n').count() as u32;
+    assert_eq!(loc.range.start.line, list_line,
+        "goto-def on '#list' lands on `sub list` in the alerts controller");
+}

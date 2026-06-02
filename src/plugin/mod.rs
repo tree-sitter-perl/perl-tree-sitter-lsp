@@ -90,6 +90,15 @@ pub struct CallContext {
     pub receiver_text: Option<String>,
     /// Resolved receiver type if inference succeeded.
     pub receiver_type: Option<InferredType>,
+    /// Route defaults inherited by the receiver value, flattened to a
+    /// `[[key, value], ...]` list the Rhai side can read directly
+    /// (`controller` is the distinguished key). Filled from the
+    /// receiver's `InferredType::BrandedRoute` brand by the builder so
+    /// a partial `->to('#action')` plugin can recover the inherited
+    /// controller without inspecting the enum's serde shape. Empty for
+    /// non-route receivers. See `docs/prompt-route-default-inheritance.md`.
+    #[serde(default)]
+    pub receiver_route_defaults: Vec<(String, String)>,
     pub args: Vec<ArgInfo>,
     pub call_span: Span,
     pub selection_span: Span,

@@ -77,6 +77,10 @@ struct ChainTypingIndex<'a> {
     return_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
     invocant_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
     method_call_args: std::collections::HashMap<(Point, Point), Node<'a>>,
+    /// Every `method_call_expression` node. The partial-route pass
+    /// (`emit_partial_route_targets`) filters this to `->to(...)`
+    /// calls post-fold, when the receiver's brand has resolved.
+    method_call_nodes: Vec<Node<'a>>,
 }
 
 /// Which chain-typing tasks the reducer should apply on this call.
@@ -107,6 +111,7 @@ fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
         return_nodes: std::collections::HashMap::new(),
         invocant_nodes: std::collections::HashMap::new(),
         method_call_args: std::collections::HashMap::new(),
+        method_call_nodes: Vec::new(),
     };
     fn walk<'t>(node: Node<'t>, idx: &mut ChainTypingIndex<'t>) {
         match node.kind() {
@@ -118,6 +123,7 @@ fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
                     .insert((node.start_position(), node.end_position()), node);
             }
             "method_call_expression" => {
+                idx.method_call_nodes.push(node);
                 if let Some(inv) = node.child_by_field_name("invocant") {
                     idx.invocant_nodes
                         .insert((inv.start_position(), inv.end_position()), inv);
@@ -229,6 +235,8 @@ fn build_with_plugins_inner(
         provisional_dispatches: Vec::new(),
         method_call_invocant: std::collections::HashMap::new(),
         parametric_emitted_refs: std::collections::HashSet::new(),
+        method_call_ref_dedup: std::collections::HashSet::new(),
+        route_branded_refs: std::collections::HashSet::new(),
         anon_sub_symbol_by_span: std::collections::HashMap::new(),
     };
     b.dispatch_manifest = b
@@ -357,6 +365,13 @@ fn build_with_plugins_inner(
     // (`invocant_type_at_node`) is the single structure-discovery site;
     // this pass records its answer.
     b.emit_invocant_expr_witnesses(&chain_idx);
+
+    // Partial Mojo route targets (`->to('#action')`) inherit their
+    // controller from a parent `->to('ctrl#')` via the route value's
+    // brand, which only settles after the fold. Re-dispatch the route
+    // plugins now that the brand is resolved. See
+    // `docs/prompt-route-default-inheritance.md`.
+    b.emit_partial_route_targets(&chain_idx);
 
     // Test-only: re-run the worklist fold one more time to pin
     // idempotency. Production callers always pass `false`; only
@@ -1125,6 +1140,21 @@ struct Builder<'a> {
     /// `method_call_invocant`.
     parametric_emitted_refs: std::collections::HashSet<usize>,
 
+    /// Dedup for plugin-emitted `MethodCallRef`s, keyed by
+    /// `(span, method_name)`. The partial-route post-fold re-dispatch
+    /// (`emit_partial_route_targets`) re-runs `->to(...)` plugins after
+    /// the receiver brand resolves; this set keeps the walk-time
+    /// emission (full forms) from being duplicated by the re-run.
+    method_call_ref_dedup: std::collections::HashSet<(Point, Point, String)>,
+
+    /// Refs whose `Expression(refidx)` carries a `route_brand`
+    /// `BrandedRoute` witness. `emit_method_call_return_edges` skips
+    /// these so its `Edge(MethodOnClass{Route, to})` (which folds to a
+    /// brandless `ClassName(Route)`) doesn't mask the brand. Same role
+    /// as `parametric_emitted_refs`. Cleared+refilled each fold
+    /// iteration by `emit_route_brand_witnesses`.
+    route_branded_refs: std::collections::HashSet<usize>,
+
     /// Span (of the `anonymous_subroutine_expression` node) →
     /// SymbolId of the synthesized `(anon)` Sub symbol. Populated by
     /// `visit_anonymous_sub`; read by `coderef_return_edge_for` so
@@ -1690,11 +1720,23 @@ impl<'a> Builder<'a> {
                 let invocant_ty = node
                     .child_by_field_name("invocant")
                     .and_then(|inv| self.invocant_type_at_node(inv));
-                self.bag_query_expression(
+                let call_ty = self.bag_query_expression(
                     crate::witnesses::RefIdx(idx as u32),
                     Some(arity),
-                    invocant_ty,
-                )
+                    invocant_ty.clone(),
+                );
+                // Mojo route brand: when this call's value is a route
+                // builder, overlay the accumulated defaults from the
+                // receiver (and this call's own `->to(...)`) onto the
+                // type so a downstream partial `->to('#action')` reads
+                // the inherited controller. The brand IS the type, so
+                // it rides assignment / chaining / nesting through the
+                // bag for free — see
+                // `docs/prompt-route-default-inheritance.md` (option C).
+                if Self::is_route_type(call_ty.as_ref()) {
+                    return Some(self.brand_route_call(node, invocant_ty.as_ref(), call_ty));
+                }
+                call_ty
             }
             "coderef_call_expression" => {
                 // `$cb->(args)` — value-type IS whatever the operand's
@@ -1838,6 +1880,145 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// The Mojolicious route-builder base class — the class every
+    /// `$r->get/any/under/to/name(...)` value dispatches against.
+    /// Centralized so the brand-overlay logic and any future route
+    /// case agree on one string.
+    const ROUTE_CLASS: &'static str = "Mojolicious::Routes::Route";
+
+    /// True when a resolved call type is a route builder — either a
+    /// plain `ClassName(Route)` (the `_route` override / fluent
+    /// Mojo::Base accessor result) or an already-branded route. The
+    /// brand asks the type, never the method name (rule #10): any
+    /// method whose return types as the route base inherits the brand.
+    fn is_route_type(ty: Option<&InferredType>) -> bool {
+        ty.and_then(|t| t.class_name()) == Some(Self::ROUTE_CLASS)
+    }
+
+    /// Project a `BrandedRoute` to its base `ClassName`. A brand is a
+    /// route-value identity (carries inherited `->to` defaults for a
+    /// partial target to read); it is never a sub-return contract or a
+    /// hover/dispatch type. Sub-return materialization and the
+    /// fixed-point snapshot debrand so the chain-internal artifact
+    /// doesn't leak out or oscillate. Other types pass through.
+    fn debrand(t: InferredType) -> InferredType {
+        match t {
+            InferredType::BrandedRoute { base, .. } => InferredType::ClassName(base),
+            other => other,
+        }
+    }
+
+    /// Overlay this `->...(...)` call's own route defaults onto the
+    /// receiver's accumulated brand, producing the `BrandedRoute` the
+    /// call's value carries. Inheritance is structural: we seed from
+    /// the receiver's brand (its `controller` + `stash`), then a
+    /// `->to(...)` on THIS call overlays its keys. Non-`to` route
+    /// methods (`get`, `any`, `under`, `name`, …) just propagate the
+    /// receiver's brand unchanged — `under` nesting therefore inherits
+    /// the parent's controller automatically, and a sibling group's
+    /// own `->to('other#')` overlays a fresh controller without
+    /// touching the parent (defaults flow down only).
+    fn brand_route_call(
+        &self,
+        node: Node<'a>,
+        invocant_ty: Option<&InferredType>,
+        call_ty: Option<InferredType>,
+    ) -> InferredType {
+        // Seed from the receiver's brand if it had one.
+        let (mut controller, mut stash) = match invocant_ty {
+            Some(InferredType::BrandedRoute { controller, stash, .. }) => {
+                (controller.clone(), stash.clone())
+            }
+            _ => (None, Vec::new()),
+        };
+
+        let method = node
+            .child_by_field_name("method")
+            .and_then(|m| m.utf8_text(self.source).ok());
+        if method == Some("to") {
+            self.merge_to_defaults(node, &mut controller, &mut stash);
+        }
+
+        let base = call_ty
+            .as_ref()
+            .and_then(|t| t.class_name())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| Self::ROUTE_CLASS.to_string());
+        // An empty brand carries no inherited defaults — it's
+        // indistinguishable from a plain `ClassName(base)` and only
+        // adds churn to the fold (a `BrandedRoute{None,[]}` return type
+        // oscillates against `ClassName` in the snapshot). Collapse it.
+        if controller.is_none() && stash.is_empty() {
+            return InferredType::ClassName(base);
+        }
+        InferredType::BrandedRoute { base, controller, stash }
+    }
+
+    /// Parse a `->to(...)` call's args into controller + stash
+    /// overlays. Mirrors mojo-routes.rhai's `to` parsing but on the
+    /// value side: `'ctrl#act'` / `'ctrl#'` set controller;
+    /// `'#act'` leaves the inherited controller intact (action is
+    /// per-route, not inherited); `key => val` pairs (including
+    /// `controller => 'x'`) merge into the stash / controller.
+    fn merge_to_defaults(
+        &self,
+        node: Node<'a>,
+        controller: &mut Option<String>,
+        stash: &mut Vec<(String, String)>,
+    ) {
+        let args = self.extract_call_args(node);
+        if args.is_empty() {
+            return;
+        }
+        // A leading `'ctrl#act'` / `'#act'` string sets the controller
+        // (action is per-route, never inherited). Mojo allows trailing
+        // `key => val` stash pairs after it (`->to('a#', section =>
+        // 'x')`), so consume the string then fall through to the
+        // key/value loop starting one arg later.
+        let mut start = 0;
+        if let Some(first) = args.first() {
+            if matches!(first.kind(), "string_literal" | "interpolated_string_literal") {
+                if let Some(s) = self.extract_string_content(*first) {
+                    if let Some((ctrl, _act)) = s.split_once('#') {
+                        if !ctrl.is_empty() {
+                            *controller = Some(ctrl.to_string());
+                        }
+                        start = 1;
+                    }
+                }
+            }
+        }
+        // Key => value form (controller / arbitrary stash defaults).
+        let mut i = start;
+        while i + 1 < args.len() {
+            let key = self.literal_arg_string(args[i]);
+            let val = self.literal_arg_string(args[i + 1]);
+            if let (Some(k), Some(v)) = (key, val) {
+                if k == "controller" {
+                    *controller = Some(v);
+                } else if k != "action" {
+                    stash.retain(|(ek, _)| ek != &k);
+                    stash.push((k, v));
+                }
+            }
+            i += 2;
+        }
+    }
+
+    /// Read a string-ish arg node's literal value (string content or
+    /// bareword/autoquoted key text). `None` for non-literal args.
+    fn literal_arg_string(&self, arg: Node<'a>) -> Option<String> {
+        match arg.kind() {
+            "string_literal" | "interpolated_string_literal" => {
+                self.extract_string_content(arg)
+            }
+            "autoquoted_bareword" | "bareword" => {
+                arg.utf8_text(self.source).ok().map(|s| s.to_string())
+            }
+            _ => None,
+        }
+    }
+
     /// Resolve a method-call invocant NODE to a class name. Thin
     /// wrapper over `invocant_type_at_node` that projects the
     /// resulting `InferredType` to a class string. Same caller
@@ -1927,6 +2108,7 @@ impl<'a> Builder<'a> {
             method_name: None,
             receiver_text: None,
             receiver_type: None,
+            receiver_route_defaults: Vec::new(),
             args,
             call_span,
             selection_span,
@@ -2168,6 +2350,18 @@ impl<'a> Builder<'a> {
                 name, owner, dispatchers, params, span, selection_span, display,
                 hide_in_outline, outline_label,
             } => {
+                // Dedup: the partial-route re-dispatch re-runs `->to`
+                // plugins post-fold, so the same Handler (same name +
+                // span) can be produced twice. Keep one.
+                let already = self.symbols.iter().any(|s| {
+                    s.name == name
+                        && s.kind == SymKind::Handler
+                        && s.span == span
+                        && s.namespace == ns
+                });
+                if already {
+                    return;
+                }
                 let detail = SymbolDetail::Handler {
                     owner,
                     dispatchers,
@@ -2199,6 +2393,13 @@ impl<'a> Builder<'a> {
                 } else {
                     Some(invocant.clone())
                 };
+                if !self.method_call_ref_dedup.insert((
+                    span.start,
+                    span.end,
+                    method_name.clone(),
+                )) {
+                    return;
+                }
                 let ref_idx = self.refs.len();
                 self.refs.push(Ref {
                     kind: RefKind::MethodCall {
@@ -6189,6 +6390,15 @@ impl<'a> Builder<'a> {
                 ctx.method_name = Some(name.clone());
                 ctx.receiver_text = invocant_text.clone();
                 ctx.receiver_type = self.receiver_type_for(invocant_node);
+                if let Some(InferredType::BrandedRoute { controller, stash, .. }) =
+                    &ctx.receiver_type
+                {
+                    let mut defaults: Vec<(String, String)> = stash.clone();
+                    if let Some(c) = controller {
+                        defaults.push(("controller".to_string(), c.clone()));
+                    }
+                    ctx.receiver_route_defaults = defaults;
+                }
                 self.record_provisional_dispatch(name, &ctx);
                 self.dispatch_method_call_plugins(ctx);
             }
@@ -7414,7 +7624,7 @@ impl<'a> Builder<'a> {
                 break;
             }
             self.run_chain_typing_reducer(idx, ChainPassMode::PreFold);
-            self.resolve_return_types();
+            self.resolve_return_types(idx);
             let cur = self.fold_state_snapshot();
             if cur == prev {
                 break;
@@ -7445,7 +7655,13 @@ impl<'a> Builder<'a> {
                     s.id,
                     self.bag_query_attachment(
                         &crate::witnesses::WitnessAttachment::Symbol(s.id),
-                    ),
+                    )
+                    // A brand is a route VALUE identity, never a sub
+                    // return contract. Project it to its base class for
+                    // the fixed-point snapshot so a branded
+                    // implicit-return doesn't oscillate against the
+                    // brandless writeback push.
+                    .map(Self::debrand),
                 )
             })
             .collect();
@@ -7508,12 +7724,30 @@ impl<'a> Builder<'a> {
             ) else { continue };
             let Some(var) = self.get_var_text_from_lhs(left) else { continue };
             let span = node_to_span(node);
-            // Idempotency: skip if a Variable witness for this var was
-            // already pushed at the assignment's start point.
+            // Compute the fresh type up front so the idempotency check
+            // can compare informativeness. (Cheap: a bag chase on the
+            // already-resolved RHS.)
+            let saved_pkg_probe = self.current_package.clone();
+            self.current_package = self.package_at_pos(span.start).map(|s| s.to_string());
+            let fresh = self
+                .invocant_type_at_node(right)
+                .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName));
+            self.current_package = saved_pkg_probe;
+
+            // Idempotency: skip if an already-pushed Variable witness at
+            // this assignment's start is at least as informative as the
+            // fresh answer. A plain `ClassName(Route)` does NOT subsume a
+            // `BrandedRoute`, so the route brand legitimately upgrades the
+            // walk-time materialization on a later fold iteration; once
+            // the brand is in the bag it subsumes the next (identical)
+            // brand and the loop settles.
             let already_typed = self.bag.all().iter().any(|w| {
+                let crate::witnesses::WitnessPayload::InferredType(t) = &w.payload else {
+                    return false;
+                };
                 matches!(&w.attachment, crate::witnesses::WitnessAttachment::Variable { name, .. } if name == &var)
-                    && matches!(w.payload, crate::witnesses::WitnessPayload::InferredType(_))
                     && w.span.start == span.start
+                    && fresh.as_ref().map_or(true, |f| t.subsumes_narrowing(f))
             });
             if already_typed {
                 continue;
@@ -7550,7 +7784,8 @@ impl<'a> Builder<'a> {
             // class") which the type-aware path doesn't model.
             let ty_opt = self
                 .invocant_type_at_node(right)
-                .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName));
+                .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName))
+                .or(fresh);
             self.current_package = saved_pkg;
 
             if let Some(ty) = ty_opt {
@@ -7602,6 +7837,89 @@ impl<'a> Builder<'a> {
                 self.method_call_invocant.insert(i, class);
             }
         }
+    }
+
+    /// Post-fold: re-dispatch the route plugins for every `->to(...)`
+    /// call now that the receiver's `BrandedRoute` has resolved.
+    ///
+    /// Walk-time plugin dispatch can't resolve a partial
+    /// `->to('#action')` — the inherited controller rides the chain
+    /// brand, which only settles during the worklist fold (variable
+    /// TCs, chained-method types). So the partial emits NOTHING at walk
+    /// time and we re-run the route `on_method_call` here with the
+    /// brand flattened into `ctx.receiver_route_defaults`. Full forms
+    /// (`->to('ctrl#act')`) already emitted at walk time and are kept
+    /// out by `method_call_ref_dedup` / the Handler dedup, so the
+    /// re-run is purely additive for the partials it newly resolves.
+    ///
+    /// This is the consumer side of the brand-on-the-value design
+    /// (`docs/prompt-route-default-inheritance.md`, option C). The
+    /// brand itself is produced in `invocant_type_at_node`'s route
+    /// arm; this pass turns a resolved brand into the cross-file
+    /// MethodCallRef a partial target needs.
+    fn emit_partial_route_targets(&mut self, idx: &ChainTypingIndex<'a>) {
+        if self.plugins.is_empty() {
+            return;
+        }
+        // Snapshot the `->to` call nodes first; dispatching borrows
+        // `self` mutably.
+        let to_calls: Vec<Node<'a>> = idx
+            .method_call_nodes
+            .iter()
+            .copied()
+            .filter(|n| {
+                n.child_by_field_name("method")
+                    .and_then(|m| m.utf8_text(self.source).ok())
+                    == Some("to")
+            })
+            .collect();
+
+        // The walk's scope stack is empty post-walk; emission helpers
+        // (`current_scope`) expect one entry. Seed it with the file
+        // root for the whole pass; the per-node scope is set below.
+        let root_scope = self.scopes.first().map(|s| s.id).unwrap_or(ScopeId(0));
+        self.scope_stack.push(root_scope);
+
+        for node in to_calls {
+            let invocant_node = node.child_by_field_name("invocant");
+            // Restore the package + scope context for this node —
+            // post-walk both are stale (the walk left them at the last
+            // package/scope it visited).
+            let saved_pkg = self.current_package.clone();
+            self.current_package = self.package_for_node(node);
+            let node_scope = self.scope_at_point(node.start_position());
+            *self.scope_stack.last_mut().unwrap() = node_scope;
+
+            let recv_ty = self.receiver_type_for(invocant_node);
+            // Only re-dispatch when the receiver actually carries an
+            // inherited brand — a full-form `->to('ctrl#act')` on an
+            // unbranded root has nothing new to add and already
+            // emitted at walk time.
+            if let Some(InferredType::BrandedRoute { controller, stash, .. }) = &recv_ty {
+                let mut defaults: Vec<(String, String)> = stash.clone();
+                if let Some(c) = controller {
+                    defaults.push(("controller".to_string(), c.clone()));
+                }
+                let method_name_span = node
+                    .child_by_field_name("method")
+                    .map(node_to_span)
+                    .unwrap_or_else(|| node_to_span(node));
+                let args_raw = self.extract_call_args(node);
+                let mut ctx =
+                    self.base_call_context(args_raw, node_to_span(node), method_name_span);
+                ctx.call_kind = plugin::CallKind::Method;
+                ctx.method_name = Some("to".to_string());
+                ctx.receiver_text = invocant_node
+                    .and_then(|n| n.utf8_text(self.source).ok())
+                    .map(|s| s.to_string());
+                ctx.receiver_type = recv_ty;
+                ctx.receiver_route_defaults = defaults;
+                self.dispatch_method_call_plugins(ctx);
+            }
+
+            self.current_package = saved_pkg;
+        }
+        self.scope_stack.pop();
     }
 
     /// Post-walk: emit even-position stringy args of every resolved
@@ -7728,13 +8046,66 @@ impl<'a> Builder<'a> {
     /// (`PluginOverrideReducer`, `ReturnExprReducer`,
     /// `MethodOnClassReducer`, `SubReturnReducer`) lives in
     /// `witnesses.rs` and folds the bag at query time.
-    fn resolve_return_types(&mut self) {
+    fn resolve_return_types(&mut self, idx: &ChainTypingIndex<'a>) {
         self.emit_arity_return_witnesses();
+        // Brand BEFORE method-call edges so `route_branded_refs` is
+        // current when `emit_method_call_return_edges` consults it to
+        // skip route calls — otherwise the skip set lags one iteration
+        // and the bag oscillates (the fold never reaches a fixed point).
+        self.emit_route_brand_witnesses(idx);
         self.emit_method_call_return_edges();
         let (return_types, return_provenance) = self.seed_return_types_from_bag();
         self.write_back_sub_return_types(&return_provenance);
         self.propagate_call_bindings_to_constraints(&return_types);
         self.fixup_call_bound_hash_key_owners(&return_types);
+    }
+
+    /// Re-emittable: stamp the resolved `BrandedRoute` onto the
+    /// `Expression(refidx)` of every route-builder `method_call_expression`,
+    /// so a `my $x = $r->...->to('ctrl#')` declaration (which types via
+    /// `Edge(Expression(refidx))`) carries the brand, and the next
+    /// iteration's chained calls / partial `->to('#action')` read the
+    /// inherited controller off it. The brand is computed by the single
+    /// build-time symbolic executor (`invocant_type_at_node`); this pass
+    /// only publishes its answer onto the bag. Recomputed each iteration
+    /// (clear-and-emit on tag `route_brand`) because the receiver type it
+    /// reads converges as the fold progresses.
+    fn emit_route_brand_witnesses(&mut self, idx: &ChainTypingIndex<'a>) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+        self.bag.remove_by_source_tag("route_brand");
+        self.route_branded_refs.clear();
+
+        // Snapshot (refidx, brand) first — `invocant_type_at_node`
+        // borrows `&self`, so we can't push while iterating.
+        let mut brands: Vec<(usize, InferredType)> = Vec::new();
+        for &node in &idx.method_call_nodes {
+            let span = node_to_span(node);
+            let Some(refidx) = self.refs.iter().position(|r| {
+                matches!(r.kind, RefKind::MethodCall { .. }) && r.span == span
+            }) else {
+                continue;
+            };
+            let ty = self.invocant_type_at_node(node);
+            if let Some(b @ InferredType::BrandedRoute { .. }) = ty {
+                brands.push((refidx, b));
+            }
+        }
+        for (refidx, brand) in brands {
+            let r_span = self.refs[refidx].span;
+            // Claim this ref so `emit_method_call_return_edges` skips
+            // its `Edge(MethodOnClass{Route, to})` — that edge folds to
+            // a plain `ClassName(Route)` and `FrameworkAwareTypeFold`
+            // (which runs before `ExprReturn`) would answer with it,
+            // masking the brand. Same precedent as
+            // `parametric_emitted_refs`.
+            self.route_branded_refs.insert(refidx);
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Expression(crate::witnesses::RefIdx(refidx as u32)),
+                source: WitnessSource::Builder("route_brand".into()),
+                payload: WitnessPayload::InferredType(brand),
+                span: r_span,
+            });
+        }
     }
 
     /// Re-emittable: for every `MethodCall` ref whose
@@ -7765,6 +8136,13 @@ impl<'a> Builder<'a> {
             // class-axis short-circuit. See
             // `parametric_emitted_refs` doc on the Builder struct.
             if self.parametric_emitted_refs.contains(&i) {
+                continue;
+            }
+            // Route-branded calls own their `Expression(refidx)` type
+            // (the `BrandedRoute` from `emit_route_brand_witnesses`);
+            // the method-on-class edge would fold to a brandless
+            // `ClassName(Route)` and mask it.
+            if self.route_branded_refs.contains(&i) {
                 continue;
             }
             let Some(class) = self.method_call_invocant.get(&i) else {

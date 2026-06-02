@@ -182,6 +182,21 @@ fn emit_route_name(ctx, name, span) {
     items
 }
 
+// Read the inherited controller from the receiver's route brand.
+// The builder flattens `InferredType::BrandedRoute` into
+// `ctx.receiver_route_defaults` as `[[key, value], ...]`; `controller`
+// is the distinguished key. `()` when the receiver carries no brand
+// (plain `ClassName(Route)` root, or non-route receiver) — partials on
+// an unbranded receiver degrade quietly (no controller, no emission).
+fn inherited_controller(ctx) {
+    let defs = ctx.receiver_route_defaults;
+    if defs == () { return (); }
+    for pair in defs {
+        if pair[0] == "controller" { return pair[1]; }
+    }
+    ()
+}
+
 fn on_method_call(ctx) {
     let out = [];
 
@@ -220,11 +235,26 @@ fn on_method_call(ctx) {
         if parts.len() == 2 {
             let controller = parts[0];
             let action = parts[1];
+            // Span math is into the ORIGINAL literal — the `#` sits
+            // right after the literal's controller substring (length 0
+            // for a partial `'#action'`), regardless of what the
+            // controller is later inherited to be. Capture it before
+            // overwriting `controller` with the inherited value.
+            let lit_controller_len = controller.len();
+            // Partial target `'#action'`: the controller half is empty,
+            // inherited from a parent `->to('ctrl#')` down the builder
+            // chain. The brand on the receiver value carries it — read
+            // it off `receiver_route_defaults`. `route_emissions`
+            // still early-returns if BOTH stay empty (unresolvable).
+            if controller == "" {
+                let inh = inherited_controller(ctx);
+                if inh != () { controller = inh; }
+            }
             let base = args[0].content_span;
             if base != () {
-                // `#` is right after the controller substring in the
-                // content; action starts one column past that.
-                let action_start = controller.len() + 1;
+                // `#` is right after the literal's controller substring
+                // in the content; action starts one column past that.
+                let action_start = lit_controller_len + 1;
                 let action_end   = action_start + action.len();
                 let action_span = subspan_cols(base, action_start, action_end);
                 return route_emissions(controller, action, action_span, ctx.current_package);
@@ -256,6 +286,12 @@ fn on_method_call(ctx) {
     }
 
     if action_span != () {
+        // Same inheritance as the short form: a long-form target with
+        // an `action` but no `controller` reads the inherited one.
+        if controller == "" {
+            let inh = inherited_controller(ctx);
+            if inh != () { controller = inh; }
+        }
         return route_emissions(controller, action, action_span, ctx.current_package);
     }
 

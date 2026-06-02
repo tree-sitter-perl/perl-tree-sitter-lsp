@@ -550,6 +550,28 @@ pub enum InferredType {
     /// `docs/prompt-type-constraint-types.md`. Kept at the END for
     /// bincode variant-index stability (bump `EXTRACT_VERSION`).
     TypeConstraintOf(Box<InferredType>),
+    /// A Mojolicious route-builder value carrying the **accumulated
+    /// route defaults** in force at this point in the builder chain.
+    /// `base` is the class for method dispatch
+    /// (`Mojolicious::Routes::Route`); `controller` / `stash` are the
+    /// inherited `->to(...)` defaults a partial `->to('#action')`
+    /// reads. This is the "brand on the value" from
+    /// `docs/prompt-route-default-inheritance.md` (option C, collapsed):
+    /// the defaults ride the type through assignment / chaining /
+    /// nesting via the witness bag for free, so there is no separate
+    /// brand-id + side-table to keep cache-stable — the resolved
+    /// defaults ARE the value, content-addressed. Inheritance is baked
+    /// in: each route method that sets a default produces a NEW
+    /// `BrandedRoute` that overlays its own keys onto the receiver's,
+    /// so children never mutate parents and a sibling group with its
+    /// own `->to('other#')` re-brands its descendants without leaking.
+    /// Kept at the END for bincode variant-index stability (bump
+    /// `EXTRACT_VERSION`).
+    BrandedRoute {
+        base: String,
+        controller: Option<String>,
+        stash: Vec<(String, String)>,
+    },
 }
 
 /// Concrete parametric flavors + type-level operators. Each
@@ -676,8 +698,33 @@ impl InferredType {
             InferredType::ClassName(name) => Some(name.as_str()),
             InferredType::FirstParam { package } => Some(package.as_str()),
             InferredType::Parametric(p) => p.class_name(),
+            // A branded route still dispatches methods against its
+            // base class — `$r->get(...)` works the same whether `$r`
+            // carries inherited defaults or not.
+            InferredType::BrandedRoute { base, .. } => Some(base.as_str()),
             _ => None,
         }
+    }
+
+    /// Read the inherited route default for `key` from a branded
+    /// route value, where `controller` is a distinguished key and
+    /// everything else lives in the stash. `None` for non-route
+    /// types or absent keys. This is the "ask the value" entry point
+    /// (rule #10): a partial `->to('#action')` consumer asks the
+    /// receiver value what controller is in force; it never inspects
+    /// the chain shape. The build-time consumer reads the flattened
+    /// `CallContext.receiver_route_defaults`; this is the query-time
+    /// surface for cursor-time stash lookups (hover/completion) — not
+    /// yet wired, hence `allow(dead_code)` for the spike.
+    #[allow(dead_code)]
+    pub fn route_default(&self, key: &str) -> Option<&str> {
+        let InferredType::BrandedRoute { controller, stash, .. } = self else {
+            return None;
+        };
+        if key == "controller" {
+            return controller.as_deref();
+        }
+        stash.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
     /// Project a `TypeConstraintOf(inner)` to its constrained inner type —
@@ -779,6 +826,14 @@ impl InferredType {
                 a == b
             }
             (InferredType::Parametric(a), InferredType::Parametric(b)) => a == b,
+            // A route with strictly more resolved defaults subsumes a
+            // plainer one (more keys = more informative). Keep the
+            // assignment chain from clobbering an accumulated brand
+            // with a freshly-typed bare `ClassName(Route)` re-derivation.
+            (
+                InferredType::BrandedRoute { controller: hc, stash: hs, .. },
+                InferredType::BrandedRoute { controller: wc, stash: ws, .. },
+            ) => (wc.is_none() || hc.is_some()) && ws.len() <= hs.len(),
             // Unit-shape variants subsume themselves; mismatched
             // discriminants don't subsume.
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
@@ -6401,6 +6456,8 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
         // A constraint is a Type::Tiny object; method dispatch (deferred)
         // routes there, so tag it as such rather than as its inner type.
         InferredType::TypeConstraintOf(_) => "Object:Type::Tiny".to_string(),
+        // Method dispatch is against the base; tag like any object.
+        InferredType::BrandedRoute { base, .. } => format!("Object:{}", base),
     }
 }
 
@@ -6452,6 +6509,10 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
         InferredType::TypeConstraintOf(inner) => {
             format!("TypeConstraint<{}>", format_inferred_type(inner))
         }
+        InferredType::BrandedRoute { base, controller, .. } => match controller {
+            Some(c) => format!("{}<controller={}>", base, c),
+            None => base.clone(),
+        },
     }
 }
 

@@ -544,6 +544,13 @@ impl WitnessReducer for FrameworkAwareTypeFold {
 
         let mut class_assertion: Option<String> = None;
         let mut first_param_class: Option<String> = None;
+        // A `BrandedRoute` is a class identity that carries extra
+        // inherited-default data. It must dominate the bare
+        // `ClassName(base)` companion that the same assignment also
+        // pushes (so a partial route target reads the brand, not the
+        // brandless class). Track the latest brand separately and
+        // return it ahead of the class axis.
+        let mut branded: Option<InferredType> = None;
         let mut rep_obs: Option<Rep> = None;
         let mut bless_rep: Option<Rep> = None;
         let mut num = false;
@@ -574,6 +581,7 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                     InferredType::FirstParam { package } => {
                         first_param_class = Some(package.clone())
                     }
+                    b @ InferredType::BrandedRoute { .. } => branded = Some(b.clone()),
                     other => plain_type = Some(other.clone()),
                 },
                 WitnessPayload::Observation(obs) => match obs {
@@ -591,6 +599,12 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                 },
                 _ => {}
             }
+        }
+
+        // A branded route dominates the bare-class companion: the
+        // brand IS the class identity plus inherited defaults.
+        if let Some(b) = branded {
+            return ReducedValue::Type(b);
         }
 
         // Class axis wins when consistent with the rep axis. On
@@ -1043,6 +1057,7 @@ fn receiver_discriminant(r: &Option<InferredType>) -> u8 {
         InferredType::Parametric(_) => 9,
         InferredType::Sequence(_) => 10,
         InferredType::TypeConstraintOf(_) => 11,
+        InferredType::BrandedRoute { .. } => 12,
     }
 }
 
