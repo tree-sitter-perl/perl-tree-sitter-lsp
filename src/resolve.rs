@@ -166,6 +166,105 @@ fn file_key_eq(a: &FileKey, b: &FileKey) -> bool {
     key_for_sort(a) == key_for_sort(b)
 }
 
+/// True when `sym` is a declaration of `target` (decl-span match).
+/// Shared by `collect_from_analysis` (to emit decl locations) and
+/// `mask_for_target` (to decide whether the def lives in editable space).
+fn symbol_defines_target(sym: &crate::file_analysis::Symbol, target: &TargetRef) -> bool {
+    use crate::file_analysis::{HashKeyOwner, SymbolDetail};
+    if sym.name != target.name {
+        return false;
+    }
+    // Treat a sub and a method in the same package as the same
+    // callable — Perl's only distinction between them is call shape.
+    // `Sub { package }` matches exactly that scope (None = top-level
+    // script sub); `Method { class }` is `Sub { package: Some(class) }`
+    // with stricter intent.
+    match &target.kind {
+        TargetKind::Sub { package } => {
+            matches!(sym.kind, SymKind::Sub | SymKind::Method) && sym.package == *package
+        }
+        TargetKind::Method { class } => {
+            matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                && sym.package.as_deref() == Some(class.as_str())
+        }
+        TargetKind::Package => matches!(
+            sym.kind,
+            SymKind::Package | SymKind::Class | SymKind::Module
+        ),
+        TargetKind::HashKeyOfSub { package, name } => matches!(
+            &sym.detail,
+            SymbolDetail::HashKeyDef {
+                owner: HashKeyOwner::Sub { package: op, name: on },
+                ..
+            } if op == package && on == name
+        ),
+        TargetKind::HashKeyOfClass(wanted) => matches!(
+            &sym.detail,
+            SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(n), .. } if n == wanted
+        ),
+        TargetKind::Handler { owner, name: hname } => {
+            sym.name == *hname
+                && matches!(
+                    &sym.detail,
+                    SymbolDetail::Handler { owner: o, .. } if o == owner
+                )
+        }
+    }
+}
+
+/// Pick the role mask for a *references* query: scope to editable space
+/// (OPEN + WORKSPACE) when the target is declared in a file we can edit,
+/// else widen to VISIBLE so refs into a dependency-defined symbol still
+/// surface. "Find references" on a project symbol must not scan CPAN —
+/// see the file-store ADR's RoleMask discipline.
+pub fn references_mask_for(
+    files: &FileStore,
+    module_index: Option<&ModuleIndex>,
+    target: &TargetRef,
+) -> RoleMask {
+    let mut found_in_editable = false;
+    files.for_each_open_mut(|_url, doc| {
+        if doc.analysis.symbols.iter().any(|s| symbol_defines_target(s, target)) {
+            found_in_editable = true;
+        }
+    });
+    if !found_in_editable {
+        for entry in files.workspace_raw().iter() {
+            if entry.value().symbols.iter().any(|s| symbol_defines_target(s, target)) {
+                found_in_editable = true;
+                break;
+            }
+        }
+    }
+    // A class-keyed Method target whose decl we can't see in editable
+    // space (cross-file synthesized accessor, parent in @INC) still wins
+    // EDITABLE if the *class* is a workspace package — the callers we
+    // care about are project files. Fall back to the module index only
+    // when nothing project-side claims it.
+    if !found_in_editable {
+        if let (TargetKind::Method { class }, Some(_idx)) = (&target.kind, module_index) {
+            let mut declared_in_workspace = false;
+            for entry in files.workspace_raw().iter() {
+                if entry.value().symbols.iter().any(|s| {
+                    matches!(s.kind, SymKind::Package | SymKind::Class)
+                        && s.name == *class
+                }) {
+                    declared_in_workspace = true;
+                    break;
+                }
+            }
+            if declared_in_workspace {
+                found_in_editable = true;
+            }
+        }
+    }
+    if found_in_editable {
+        RoleMask::EDITABLE
+    } else {
+        RoleMask::VISIBLE
+    }
+}
+
 fn collect_from_analysis(
     key: &FileKey,
     analysis: &FileAnalysis,
@@ -173,52 +272,11 @@ fn collect_from_analysis(
     module_index: Option<&ModuleIndex>,
     out: &mut Vec<RefLocation>,
 ) {
-    use crate::file_analysis::{HashKeyOwner, SymbolDetail};
+    use crate::file_analysis::HashKeyOwner;
 
     // Include declaration spans when this file defines the target.
     for sym in &analysis.symbols {
-        if sym.name != target.name {
-            continue;
-        }
-        // Treat a sub and a method in the same package as the same
-        // callable — Perl's only distinction between them is call
-        // shape. `Sub { package }` matches exactly that scope (None
-        // = top-level script sub); `Method { class }` is the
-        // `Sub { package: Some(class) }` case with stricter intent.
-        let callable_scope: Option<Option<String>> = match &target.kind {
-            TargetKind::Sub { package } => Some(package.clone()),
-            TargetKind::Method { class } => Some(Some(class.clone())),
-            _ => None,
-        };
-        let matches_kind = match &target.kind {
-            TargetKind::Sub { .. } | TargetKind::Method { .. } => {
-                let scope = callable_scope.as_ref().unwrap();
-                matches!(sym.kind, SymKind::Sub | SymKind::Method)
-                    && sym.package == *scope
-            }
-            TargetKind::Package => matches!(
-                sym.kind,
-                SymKind::Package | SymKind::Class | SymKind::Module
-            ),
-            TargetKind::HashKeyOfSub { package, name } => matches!(
-                &sym.detail,
-                SymbolDetail::HashKeyDef {
-                    owner: HashKeyOwner::Sub { package: op, name: on },
-                    ..
-                } if op == package && on == name
-            ),
-            TargetKind::HashKeyOfClass(wanted) => matches!(
-                &sym.detail,
-                SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(n), .. } if n == wanted
-            ),
-            TargetKind::Handler { owner, name: hname } => {
-                sym.name == *hname && matches!(
-                    &sym.detail,
-                    SymbolDetail::Handler { owner: o, .. } if o == owner
-                )
-            }
-        };
-        if matches_kind {
+        if symbol_defines_target(sym, target) {
             out.push(RefLocation {
                 key: key.clone(),
                 span: sym.selection_span,
@@ -258,9 +316,25 @@ fn collect_from_analysis(
                 // Class still has to be `Some` to match — package-
                 // less subs and genuinely unpinnable invocants stay
                 // out, no cross-linking.
+                //
+                // Inheritance: `$child->m()` is a reference to the
+                // method `m` resolves to. If the target is a class T
+                // that the invocant's class inherits this method from
+                // (T is on the resolution chain, no intermediate
+                // override), the call matches. `method_rename_chain`
+                // is `[invocant_class, ..., defining_class]` — the
+                // same chain rename walks — so references and rename
+                // agree, and unrelated same-named methods on other
+                // classes still stay out (they're never on the chain).
                 let scope = callable_scope_for_refs.as_ref().unwrap();
                 match (analysis.method_call_invocant_class(r, module_index), scope) {
-                    (Some(cn), Some(pkg)) => &cn == pkg,
+                    (Some(cn), Some(pkg)) => {
+                        &cn == pkg
+                            || analysis
+                                .method_rename_chain(&cn, &r.target_name, module_index)
+                                .iter()
+                                .any(|c| c == pkg)
+                    }
                     _ => false,
                 }
             }
