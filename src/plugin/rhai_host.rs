@@ -327,6 +327,7 @@ const BUNDLED: &[(&str, &str)] = &[
     ("mojo-lite", include_str!("../../frameworks/mojo-lite.rhai")),
     ("minion", include_str!("../../frameworks/minion.rhai")),
     ("data-printer", include_str!("../../frameworks/data-printer.rhai")),
+    ("catalyst", include_str!("../../frameworks/catalyst.rhai")),
 ];
 
 pub fn load_bundled(engine: Arc<Engine>) -> Vec<Box<dyn FrameworkPlugin>> {
@@ -552,6 +553,7 @@ mod tests {
             ("mojo-lite", include_str!("../../frameworks/mojo-lite.rhai")),
             ("minion", include_str!("../../frameworks/minion.rhai")),
             ("data-printer", include_str!("../../frameworks/data-printer.rhai")),
+            ("catalyst", include_str!("../../frameworks/catalyst.rhai")),
         ] {
             RhaiPlugin::from_source(src, engine.clone())
                 .unwrap_or_else(|e| panic!("{}.rhai failed to compile: {e}", id));
@@ -722,6 +724,181 @@ mod tests {
         let engine = Arc::new(make_engine());
         let plugin = RhaiPlugin::from_source(src, engine).expect("compiles");
         assert!(plugin.overrides().is_empty());
+    }
+
+    #[test]
+    fn catalyst_plugin_loads_and_has_overrides() {
+        let engine = Arc::new(make_engine());
+        let bundled = load_bundled(engine);
+        let plugin = bundled
+            .into_iter()
+            .find(|p| p.id() == "catalyst")
+            .expect("catalyst plugin is bundled");
+
+        // Static overrides manifest must declare at least req/res/stash.
+        let ovs = plugin.overrides();
+        assert!(!ovs.is_empty(), "catalyst must ship return-type overrides");
+
+        let has_req = ovs.iter().any(|o| {
+            matches!(&o.target, crate::plugin::OverrideTarget::Method { class, name }
+                if class == "Catalyst" && name == "req")
+                && o.return_type == InferredType::ClassName("Catalyst::Request".into())
+        });
+        assert!(has_req, "missing req → Catalyst::Request override");
+
+        let has_res = ovs.iter().any(|o| {
+            matches!(&o.target, crate::plugin::OverrideTarget::Method { class, name }
+                if class == "Catalyst" && name == "res")
+                && o.return_type == InferredType::ClassName("Catalyst::Response".into())
+        });
+        assert!(has_res, "missing res → Catalyst::Response override");
+
+        let has_stash = ovs.iter().any(|o| {
+            matches!(&o.target, crate::plugin::OverrideTarget::Method { class, name }
+                if class == "Catalyst" && name == "stash")
+                && o.return_type == InferredType::HashRef
+        });
+        assert!(has_stash, "missing stash → HashRef override");
+
+        let has_log = ovs.iter().any(|o| {
+            matches!(&o.target, crate::plugin::OverrideTarget::Method { class, name }
+                if class == "Catalyst" && name == "log")
+                && o.return_type == InferredType::ClassName("Catalyst::Log".into())
+        });
+        assert!(has_log, "missing log → Catalyst::Log override");
+    }
+
+    #[test]
+    fn catalyst_model_call_emits_method_call_ref() {
+        use crate::plugin::{ArgInfo, CallKind};
+
+        let engine = Arc::new(make_engine());
+        let bundled = load_bundled(engine);
+        let plugin = bundled
+            .into_iter()
+            .find(|p| p.id() == "catalyst")
+            .expect("catalyst is bundled");
+
+        let name_span = sp(5, 20, 5, 23);
+        let ctx = CallContext {
+            call_kind: CallKind::Method,
+            function_name: None,
+            method_name: Some("model".into()),
+            receiver_text: Some("$c".into()),
+            receiver_type: Some(InferredType::ClassName("Catalyst".into())),
+            args: vec![
+                ArgInfo {
+                    text: "'Foo'".into(),
+                    string_value: Some("Foo".into()),
+                    span: name_span,
+                    content_span: Some(name_span),
+                    inferred_type: Some(InferredType::String),
+                    sub_params: vec![],
+                    callable_return_edge: None,
+                },
+            ],
+            call_span: sp(5, 10, 5, 26),
+            selection_span: sp(5, 13, 5, 18),
+            current_package: Some("MyApp::Controller::Root".into()),
+            current_package_parents: vec!["Catalyst::Controller".into()],
+            current_package_uses: vec![],
+        };
+
+        let emissions = plugin.on_method_call(&ctx);
+        // A MethodCallRef pointing at Foo::new (the component class).
+        let has_ref = emissions.iter().any(|e| {
+            matches!(e, EmitAction::MethodCallRef { method_name, invocant, .. }
+                if method_name == "new" && invocant == "Foo")
+        });
+        assert!(has_ref,
+            "model('Foo') must emit MethodCallRef into class Foo; got: {:?}", emissions);
+    }
+
+    #[test]
+    fn catalyst_forward_emits_dispatch_call() {
+        use crate::plugin::{ArgInfo, CallKind};
+
+        let engine = Arc::new(make_engine());
+        let bundled = load_bundled(engine);
+        let plugin = bundled
+            .into_iter()
+            .find(|p| p.id() == "catalyst")
+            .expect("catalyst is bundled");
+
+        let path_span = sp(7, 20, 7, 38);
+        let ctx = CallContext {
+            call_kind: CallKind::Method,
+            function_name: None,
+            method_name: Some("forward".into()),
+            receiver_text: Some("$c".into()),
+            receiver_type: Some(InferredType::ClassName("Catalyst".into())),
+            args: vec![
+                ArgInfo {
+                    text: "'/Root/index'".into(),
+                    string_value: Some("/Root/index".into()),
+                    span: path_span,
+                    content_span: Some(path_span),
+                    inferred_type: Some(InferredType::String),
+                    sub_params: vec![],
+                    callable_return_edge: None,
+                },
+            ],
+            call_span: sp(7, 10, 7, 40),
+            selection_span: sp(7, 13, 7, 20),
+            current_package: Some("MyApp::Controller::Root".into()),
+            current_package_parents: vec!["Catalyst::Controller".into()],
+            current_package_uses: vec![],
+        };
+
+        let emissions = plugin.on_method_call(&ctx);
+        let has_dispatch = emissions.iter().any(|e| {
+            matches!(e, EmitAction::DispatchCall { name, dispatcher, .. }
+                if name == "/Root/index" && dispatcher == "forward")
+        });
+        assert!(has_dispatch,
+            "forward('/Root/index') must emit DispatchCall; got: {:?}", emissions);
+    }
+
+    #[test]
+    fn catalyst_skips_non_catalyst_receiver() {
+        use crate::plugin::{ArgInfo, CallKind};
+
+        let engine = Arc::new(make_engine());
+        let bundled = load_bundled(engine);
+        let plugin = bundled
+            .into_iter()
+            .find(|p| p.id() == "catalyst")
+            .expect("catalyst is bundled");
+
+        // `$schema->model('Foo')` — DBIx::Class::Schema, NOT Catalyst.
+        // The plugin must not emit for non-Catalyst receivers.
+        let ctx = CallContext {
+            call_kind: CallKind::Method,
+            function_name: None,
+            method_name: Some("model".into()),
+            receiver_text: Some("$schema".into()),
+            receiver_type: Some(InferredType::ClassName("DBIx::Class::Schema".into())),
+            args: vec![
+                ArgInfo {
+                    text: "'Foo'".into(),
+                    string_value: Some("Foo".into()),
+                    span: sp(0, 0, 0, 5),
+                    content_span: None,
+                    inferred_type: Some(InferredType::String),
+                    sub_params: vec![],
+                    callable_return_edge: None,
+                },
+            ],
+            call_span: sp(0, 0, 0, 20),
+            selection_span: sp(0, 10, 0, 15),
+            current_package: Some("MyApp::Controller::Root".into()),
+            current_package_parents: vec!["Catalyst::Controller".into()],
+            current_package_uses: vec![],
+        };
+
+        let emissions = plugin.on_method_call(&ctx);
+        assert!(emissions.is_empty(),
+            "non-Catalyst receiver must not emit; got: {:?}", emissions);
     }
 
     #[test]
