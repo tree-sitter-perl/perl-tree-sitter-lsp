@@ -131,6 +131,17 @@ pub enum WitnessPayload {
     /// `InferredType` witness preserving source + span, then run reducers
     /// against the materialized list. A cycle guard breaks `A → B → A`.
     Edge(WitnessAttachment),
+    /// Edge fact for a **method call at a known arity**: "the value at my
+    /// attachment is `target`'s return type, dispatched at `arity` args."
+    /// Distinct from a plain `Edge` because the call site's arity is
+    /// intrinsic to the *call*, not to whatever outer query reached it —
+    /// a hint-less `$x` type query that chases here must still pick the
+    /// fluent-writer arm of `$obj->setter($v)` (arity ≥ 1), not the
+    /// getter arm a hint-less `UnionOnArgs` defaults to. Emitted by
+    /// `emit_method_call_return_edges` (`Expression(refidx)` → its
+    /// `MethodOnClass{class, method}` at the call's `count_call_args`);
+    /// chased like `Edge` but overrides `q.arity_hint` with `arity`.
+    CallReturn { target: WitnessAttachment, arity: u32 },
     /// **Symbol-declarative return type.** A receiver-relative /
     /// arity-relative expression that `ReturnExprReducer` substitutes at
     /// query time using `q.receiver` and `q.arity_hint`. Subsumes both
@@ -1406,6 +1417,35 @@ impl ReducerRegistry {
                     }
                     // An edge that didn't resolve drops out — same as a
                     // witness no reducer claims.
+                }
+                WitnessPayload::CallReturn { target, arity } => {
+                    // A fresh method dispatch at the call's own arity. The
+                    // receiver is the dispatch class (`target`'s class, for
+                    // a `MethodOnClass`) so a fluent `Receiver` substitutes
+                    // it; the arity is the call site's, NOT the outer
+                    // query's — that's the whole point of this variant.
+                    let receiver = match target {
+                        WitnessAttachment::MethodOnClass { class, .. } => {
+                            Some(InferredType::ClassName(class.clone()))
+                        }
+                        _ => q.receiver.clone(),
+                    };
+                    let sub_q = ReducerQuery {
+                        attachment: target,
+                        point: q.point,
+                        framework: q.framework,
+                        arity_hint: Some(*arity),
+                        receiver,
+                        context: q.context,
+                    };
+                    if let ReducedValue::Type(t) = self.query_rec(bag, &sub_q, visited) {
+                        out.push(Witness {
+                            attachment: w.attachment.clone(),
+                            source: w.source.clone(),
+                            payload: WitnessPayload::InferredType(t),
+                            span: w.span,
+                        });
+                    }
                 }
                 _ => out.push(w.clone()),
             }

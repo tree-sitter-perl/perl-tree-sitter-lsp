@@ -236,6 +236,7 @@ fn build_with_plugins_inner(
         param_type_manifest: std::collections::HashMap::new(),
         provisional_dispatches: Vec::new(),
         method_call_invocant: std::collections::HashMap::new(),
+        method_call_arity: std::collections::HashMap::new(),
         parametric_emitted_refs: std::collections::HashSet::new(),
         method_call_ref_dedup: std::collections::HashSet::new(),
         route_branded_refs: std::collections::HashSet::new(),
@@ -1152,6 +1153,14 @@ struct Builder<'a> {
     /// which queries the bag at read time and so picks up cross-file
     /// enrichment automatically.
     method_call_invocant: std::collections::HashMap<usize, String>,
+
+    /// Per-MethodCall-ref arg count, keyed by ref index. Lets
+    /// `emit_method_call_return_edges` pin the call site's arity onto its
+    /// `Expression(refidx)` return edge (`CallReturn`), so a fluent
+    /// writer `$obj->setter($v)` resolves the writer arm even when the
+    /// type query that reaches the edge is hint-less (`my $x = …`).
+    /// **Build-only**, like `method_call_invocant`.
+    method_call_arity: std::collections::HashMap<usize, u32>,
 
     /// MethodCall ref indices for which we've published an
     /// `InferredType::Parametric` witness on `Expression(refidx)`
@@ -6856,6 +6865,8 @@ impl<'a> Builder<'a> {
                         if let Some(c) = invocant_class.clone() {
                             self.method_call_invocant.insert(idx, c);
                         }
+                        self.method_call_arity
+                            .insert(idx, self.extract_call_args(node).len() as u32);
                     }
                 }
             } else {
@@ -6873,6 +6884,8 @@ impl<'a> Builder<'a> {
                 if let Some(c) = invocant_class.clone() {
                     self.method_call_invocant.insert(idx, c);
                 }
+                self.method_call_arity
+                    .insert(idx, self.extract_call_args(node).len() as u32);
 
                 // Runtime-exporter setup in method-call form:
                 // `Moose::Exporter->setup_import_methods(...)`,
@@ -8763,13 +8776,23 @@ impl<'a> Builder<'a> {
             let Some(class) = self.method_call_invocant.get(&i) else {
                 continue;
             };
+            let target = WitnessAttachment::MethodOnClass {
+                class: class.clone(),
+                name: r.target_name.clone(),
+            };
+            // Pin the call's arity so the chase dispatches the right
+            // overload arm (fluent writer vs getter) regardless of the
+            // outer query's hint. Plugin-emitted refs that never went
+            // through `visit_method_call` have no recorded arity — fall
+            // back to a plain edge (hint-less union dispatch) for them.
+            let payload = match self.method_call_arity.get(&i) {
+                Some(&arity) => WitnessPayload::CallReturn { target, arity },
+                None => WitnessPayload::Edge(target),
+            };
             edges.push(Witness {
                 attachment: WitnessAttachment::Expression(crate::witnesses::RefIdx(i as u32)),
                 source: WitnessSource::Builder("method_call_return".into()),
-                payload: WitnessPayload::Edge(WitnessAttachment::MethodOnClass {
-                    class: class.clone(),
-                    name: r.target_name.clone(),
-                }),
+                payload,
                 span: r.span,
             });
         }

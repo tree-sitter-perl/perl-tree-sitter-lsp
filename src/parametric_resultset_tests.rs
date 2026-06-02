@@ -774,3 +774,138 @@ sub action {
         refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
     );
 }
+
+/// **CROSS-FILE fluent accessor inherited from a CPAN parent.** This
+/// is the real crm gap, not reproducible single-file: the fluent
+/// `app` accessor lives on CPAN `Minion` (a *workspace/dependency*
+/// module here), `Clove::Minion` inherits it, and the open file does
+/// `my $minion = Clove::Minion->new->app($app)`. The `->app(...)` hop
+/// must resolve the inherited fluent-writer return THROUGH the
+/// cross-file parent so the chain keeps ClassName(Clove::Minion).
+/// When this fails, `$minion` is untyped and the helper closure that
+/// returns it produces no type, so `$c->minion->enqueue` never
+/// dispatches.
+#[test]
+fn cross_file_inherited_fluent_chain_types_lexical() {
+    let parent_src = "
+package Minion;
+use Mojo::Base 'Mojo::EventEmitter';
+has app => sub { 1 }, weak => 1;
+has 'backend';
+sub enqueue { my $self = shift; return 1; }
+1;
+";
+    let child_src = "
+package Clove::Minion;
+use Mojo::Base 'Minion';
+sub class_for_task { my $self = shift; return 'X'; }
+1;
+";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(
+        PathBuf::from("/tmp/cf_minion.pm"),
+        Arc::new(parse(parent_src)),
+    );
+    idx.register_workspace_module(
+        PathBuf::from("/tmp/cf_clove_minion.pm"),
+        Arc::new(parse(child_src)),
+    );
+
+    let consumer_src = "
+package MyApp::Plugin;
+use Mojo::Base 'Mojolicious::Plugin';
+sub register {
+    my ($self, $app) = @_;
+    my $minion = Clove::Minion->new(Pg => 1)->app($app);
+    my $after = 1;
+}
+1;
+";
+    let mut fa = parse(consumer_src);
+    fa.enrich_imported_types_with_keys(Some(&idx));
+    let pt = point_at(consumer_src, "$after");
+    let minion_t = fa.inferred_type_via_bag_ctx("$minion", pt, Some(&idx));
+    assert_eq!(
+        minion_t,
+        Some(InferredType::ClassName("Clove::Minion".to_string())),
+        "`my $$minion = Clove::Minion->new->app($$app)` must type $$minion as \
+         Clove::Minion — the inherited fluent `app` writer (on the cross-file \
+         parent Minion) returns the invocant class. got: {:?}",
+        minion_t,
+    );
+}
+
+/// In-file baseline for the cross-file pin above: a fluent Mojo::Base
+/// `has` accessor called with an arg (`->configured(1)`) returns the
+/// invocant class, so the chain `LocalThing->new->configured(1)` types
+/// `$thing` as LocalThing.
+#[test]
+fn fluent_chain_lexical_is_typed() {
+    let src = "
+package LocalThing;
+use Mojo::Base -base;
+has 'configured';
+sub greet { my $self = shift; return 'hi'; }
+
+package Main;
+my $thing = LocalThing->new->configured(1);
+my $after = 1;
+";
+    let fa = parse(src);
+    let pt = point_at(src, "$after");
+    assert_eq!(
+        fa.inferred_type_via_bag("$thing", pt),
+        Some(InferredType::ClassName("LocalThing".to_string())),
+        "`my $$thing = LocalThing->new->configured(1)` must type \
+         $$thing as LocalThing — the fluent `has` accessor returns \
+         ClassName(current_package). raw: {:?}",
+        fa.inferred_type_via_bag("$thing", pt),
+    );
+}
+
+/// **End-to-end: Mojo helper whose closure returns a closed-over
+/// fluent-chain lexical.** This is the crm `minion` shape, made
+/// self-contained: `my $thing = LocalThing->new->configure(...);
+/// $app->helper(thing => sub {{ $thing }})`. A controller's
+/// `$c->thing->greet` must reach `LocalThing::greet`. The helper's
+/// synthesized Method edges to the anon-sub body; the body's last
+/// (and only) expr is the closed-over `$thing`; so `$c->thing`
+/// resolves to LocalThing and `->greet` goto-defs into it. The
+/// load-bearing hop is the implicit-return Variable lookup
+/// scope-walking OUT of the anon-sub body to the enclosing `my
+/// $thing`.
+#[test]
+fn mojo_helper_returning_closed_over_lexical_composes() {
+    let src = "
+package LocalThing;
+use Mojo::Base -base;
+has 'configured';
+sub greet { my $self = shift; return 'hi'; }
+
+package MyApp;
+use Mojo::Base 'Mojolicious';
+my $app;
+my $thing = LocalThing->new->configured(1);
+$app->helper(thing => sub { $thing });
+
+package MyApp::Controller::X;
+use Mojo::Base 'Mojolicious::Controller';
+sub action {
+    my $c = shift;
+    $c->thing->greet;
+}
+1;
+";
+    let (fa, tree) = parse_with_tree(src);
+    let pt = point_at(src, "greet;");
+    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    assert!(
+        def.is_some(),
+        "`$$c->thing->greet` must resolve to LocalThing::greet — the \
+         helper's closure returns the closed-over fluent-chain lexical \
+         $$thing (typed LocalThing). got: {:?}",
+        def,
+    );
+    // `greet` is declared on `sub greet` (row 4, 0-based).
+    assert_eq!(def.unwrap().start.row, 4);
+}
