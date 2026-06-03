@@ -1635,6 +1635,11 @@ pub struct FileAnalysis {
     /// keyed on those two kinds.
     #[serde(skip, default)]
     call_ref_by_start: HashMap<Point, usize>,
+    /// Union of `export` + `export_ok` for O(1) membership tests.
+    /// Rebuilt by `build_indices` (called from `new` and `after_deserialize`),
+    /// so it is valid for freshly-built and SQLite-cached modules alike.
+    #[serde(skip, default)]
+    export_lookup: HashSet<String>,
 }
 
 impl FileAnalysis {
@@ -1686,6 +1691,7 @@ impl FileAnalysis {
             refs_by_name: HashMap::new(),
             refs_by_target: HashMap::new(),
             call_ref_by_start: HashMap::new(),
+            export_lookup: HashSet::new(),
         };
         fa.build_indices();
         // The builder path overwrites `witnesses` with its already-populated
@@ -1785,6 +1791,7 @@ impl FileAnalysis {
         self.refs_by_name.clear();
         self.refs_by_target.clear();
         self.call_ref_by_start.clear();
+        self.export_lookup.clear();
         self.build_indices();
     }
 
@@ -1917,12 +1924,24 @@ impl FileAnalysis {
                 }
             }
         }
+
+        // Export membership set — union of export + export_ok for O(1) lookup.
+        self.export_lookup = self.export.iter()
+            .chain(self.export_ok.iter())
+            .cloned()
+            .collect();
     }
 
     /// All refs that resolve to this symbol — O(1) lookup via the index.
     /// Callers typically combine this with a kind filter.
     pub fn refs_to_symbol(&self, sym_id: SymbolId) -> &[usize] {
         self.refs_by_target.get(&sym_id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// True if `name` appears in `@EXPORT` or `@EXPORT_OK` for this module.
+    /// O(1) via `export_lookup` (built by `build_indices`).
+    pub fn exports_name(&self, name: &str) -> bool {
+        self.export_lookup.contains(name)
     }
 
     // ---- Query methods ----
@@ -2395,9 +2414,7 @@ impl FileAnalysis {
                     if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                         continue;
                     }
-                    if !cached.analysis.export.iter().any(|n| n == &sym.name)
-                        && !cached.analysis.export_ok.iter().any(|n| n == &sym.name)
-                    {
+                    if !cached.analysis.exports_name(&sym.name) {
                         continue;
                     }
                     if matches!(sym.detail, SymbolDetail::Sub { .. }) {
@@ -6471,9 +6488,7 @@ impl FileAnalysis {
                 // must match or goto-def fails for names in @EXPORT_OK.
                 for import in &self.imports {
                     if let Some(cached) = idx.get_cached(&import.module_name) {
-                        if cached.analysis.export.iter().any(|s| s == name)
-                            || cached.analysis.export_ok.iter().any(|s| s == name)
-                        {
+                        if cached.analysis.exports_name(name) {
                             if let Some(sub_info) = cached.sub_info(name) {
                                 return Some(cross_file_resolved(&sub_info));
                             }

@@ -2136,9 +2136,7 @@ fn resolve_imported_function<'a>(
             }
             // Export lists are always in the remote namespace — a name
             // appearing there matches a same-name use at the call site.
-            let in_export_lists = cached.analysis.export.iter().any(|s| s == func_name)
-                || cached.analysis.export_ok.iter().any(|s| s == func_name);
-            if in_export_lists {
+            if cached.analysis.exports_name(func_name) {
                 return Some((import, cached.path.clone(), func_name.to_string()));
             }
         } else if let Some(is) = import.imported_symbols.iter().find(|s| s.local_name == *func_name) {
@@ -2298,9 +2296,7 @@ pub fn collect_diagnostics(
             // flagging them is more confusing than hiding the hint.
             if imp.imported_symbols.is_empty() {
                 if let Some(cached) = module_index.get_cached(&imp.module_name) {
-                    if cached.analysis.export.iter().any(|s| s == name)
-                        || cached.analysis.export_ok.iter().any(|s| s == name)
-                    {
+                    if cached.analysis.exports_name(name) {
                         return true;
                     }
                 }
