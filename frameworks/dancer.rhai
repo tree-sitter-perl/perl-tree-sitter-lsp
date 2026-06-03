@@ -23,6 +23,10 @@
 //       - `upload` → `Dancer2::Core::Request::Upload`
 //       - `dsl` → `Dancer2::Core::DSL`
 //       - `engine` → `Dancer2::Core::Factory::Engine`
+//       - `uri_for_route` → String (URL)
+//       - `encode_json` → String (JSON-encoded)
+//       - `decode_json` → HashRef (decoded structure)
+//       - `runner` → `Dancer2::Core::Runner`
 //
 //   Accessor-shaped keywords (`param`, `var`, `cookie`, `header`,
 //   `status`) return a scalar whose type depends on the argument; they
@@ -58,6 +62,8 @@ fn all_keywords() {
         "hook",
         // App / DSL introspection
         "app", "dancer_app", "dsl",
+        // App version queries
+        "dancer_version", "dancer_major_version",
         // Config
         "config", "set", "setting",
         // Request/response objects
@@ -65,35 +71,48 @@ fn all_keywords() {
         // Request params
         "param", "params", "body_parameters", "query_parameters",
         "route_parameters", "splat", "captures", "upload",
+        // Raw request body data
+        "request_data",
         // Request metadata
-        "uri_for",
-        // Headers
+        "uri_for", "uri_for_route",
+        // Headers — request side
+        "request_header",
+        // Headers — response side (`header`/`headers` are deprecated aliases)
         "header", "headers", "content_type",
+        "response_header", "response_headers", "push_header",
+        "push_response_header",
+        // Streaming / chunked response body
+        "content", "done", "flush",
         // Response control
         "status", "redirect", "forward", "pass", "halt",
-        "push_response_header",
         // Sending data
-        "send_file", "send_as",
+        "send_file", "send_as", "send_error",
         // Template / rendering
         "template",
-        // Engine access
-        "engine",
+        // Engine access + MIME type object
+        "engine", "mime",
         // Session
         "session",
         // Cookies
         "cookie", "cookies",
         // Serialisation helpers
         "to_json", "from_json", "to_yaml", "from_yaml",
+        "encode_json", "decode_json",
+        "to_dumper", "from_dumper",
         // Misc vars
         "var", "vars",
-        // Async / streaming
-        "delayed", "flush",
+        // Async / streaming bootstrap
+        "delayed",
         // Logging
         "debug", "info", "warning", "error",
         // Boolean constants exported by Dancer2::Core::DSL
         "true", "false",
         // App lifecycle
         "dance", "to_app", "start",
+        // PSGI / runner access
+        "psgi_app", "runner",
+        // App startup hook (deprecated `context` is also in dsl_keywords)
+        "prepare_app", "context",
         // Plugin keywords (available after `use Dancer2::Plugin`)
         "plugin_keywords", "plugin_setting",
         // has re-exported from Moo via Dancer2::Plugin
@@ -136,6 +155,17 @@ fn typed_keywords() {
                              "The file-upload object for the named field."],
         ["engine",           #{ ClassName: "Dancer2::Core::Factory::Engine" },
                              "Returns the named engine (template, session, logger, serializer)."],
+        // uri_for_route returns a full URL string, like uri_for but keyed by route name.
+        ["uri_for_route",    #{ String: () },
+                             "Returns the URL for the named route."],
+        // JSON encode/decode: encode → String, decode → unblessed HashRef (typical use).
+        ["encode_json",      #{ String: () },
+                             "Serializes a Perl data structure to a JSON string."],
+        ["decode_json",      #{ HashRef: () },
+                             "Deserializes a JSON string to a Perl data structure (typically a hashref)."],
+        // runner is the Dancer2::Core::Runner singleton — needed for startup / server hooks.
+        ["runner",           #{ ClassName: "Dancer2::Core::Runner" },
+                             "The Dancer2 runner singleton (server state and lifecycle)."],
     ]
 }
 

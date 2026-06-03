@@ -8879,6 +8879,14 @@ post '/login' => sub { my $u = param('user'); session user => $u; };
         "true", "false",
         // Lifecycle
         "dance", "to_app", "start",
+        // Keywords absent from the original set — verified against
+        // Dancer2::Core::DSL::dsl_keywords (the authoritative list).
+        "content", "send_error", "response_header", "request_header",
+        "uri_for_route", "prepare_app", "encode_json", "decode_json",
+        "to_dumper", "from_dumper", "push_header", "response_headers",
+        "psgi_app", "runner", "done", "context",
+        "dancer_version", "dancer_major_version",
+        "mime", "request_data",
     ] {
         assert!(
             fa.framework_imports.contains(*kw),
@@ -8943,6 +8951,42 @@ use Dancer2;
         rt,
         Some(InferredType::HashRef),
         "`config` must return HashRef; got {:?}",
+        rt
+    );
+
+    // `uri_for_route` returns a String (URL).
+    let rt = fa.sub_return_type_at_arity("uri_for_route", None);
+    assert_eq!(
+        rt,
+        Some(InferredType::String),
+        "`uri_for_route` must return String; got {:?}",
+        rt
+    );
+
+    // `encode_json` returns a String (the serialized JSON).
+    let rt = fa.sub_return_type_at_arity("encode_json", None);
+    assert_eq!(
+        rt,
+        Some(InferredType::String),
+        "`encode_json` must return String; got {:?}",
+        rt
+    );
+
+    // `decode_json` returns a HashRef (the deserialized structure).
+    let rt = fa.sub_return_type_at_arity("decode_json", None);
+    assert_eq!(
+        rt,
+        Some(InferredType::HashRef),
+        "`decode_json` must return HashRef; got {:?}",
+        rt
+    );
+
+    // `runner` returns the Dancer2::Core::Runner singleton.
+    let rt = fa.sub_return_type_at_arity("runner", None);
+    assert_eq!(
+        rt,
+        Some(InferredType::ClassName("Dancer2::Core::Runner".into())),
+        "`runner` must return Dancer2::Core::Runner; got {:?}",
         rt
     );
 }
