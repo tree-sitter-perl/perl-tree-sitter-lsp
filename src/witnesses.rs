@@ -1081,7 +1081,12 @@ type VisitedSet = std::collections::HashSet<VisitedKey>;
 /// queries whose context (scopes / module_index / framework) differs.
 struct QueryState {
     visited: VisitedSet,
-    memo: std::collections::HashMap<VisitedKey, ReducedValue>,
+    // `Arc` so a memo store/hit clones one heap pointer, not the
+    // (String-bearing) `ReducedValue`. `HashMap::new()` pre-allocates
+    // no buckets, so a shallow query that never re-reaches a node (the
+    // common hover/completion 1–2-hop case) pays nothing for the memo —
+    // the table is lazily allocated on the first insert.
+    memo: std::collections::HashMap<VisitedKey, std::sync::Arc<ReducedValue>>,
 }
 
 impl QueryState {
@@ -1172,15 +1177,21 @@ impl ReducerRegistry {
     /// mutual-inheritance loops that span files.
     pub fn query(&self, bag: &WitnessBag, q: &ReducerQuery) -> ReducedValue {
         let mut state = QueryState::new();
-        self.query_rec(bag, q, &mut state)
+        // Sole boundary where an owned `ReducedValue` is required; the
+        // internal recursion threads `Arc` to avoid deep clones per hop.
+        (*self.query_rec(bag, q, &mut state)).clone()
     }
 
+    /// Returns an `Arc` so the memo, the cycle-guard early-outs, and the
+    /// edge-chase recursion all share one heap allocation per resolved
+    /// node instead of deep-cloning a (String-bearing) `ReducedValue` on
+    /// every store, hit, and return.
     fn query_rec(
         &self,
         bag: &WitnessBag,
         q: &ReducerQuery,
         state: &mut QueryState,
-    ) -> ReducedValue {
+    ) -> std::sync::Arc<ReducedValue> {
         let depth = QUERY_REC_DEPTH.with(|c| {
             let d = c.get();
             c.set(d + 1);
@@ -1200,7 +1211,7 @@ impl ReducerRegistry {
                 }
             });
             QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
-            return ReducedValue::None;
+            return std::sync::Arc::new(ReducedValue::None);
         }
         let key: VisitedKey = (
             bag as *const _ as usize,
@@ -1212,18 +1223,21 @@ impl ReducerRegistry {
         // isn't on the current path (cycle guard handles on-path keys).
         if let Some(cached) = state.memo.get(&key) {
             QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
-            return cached.clone();
+            return std::sync::Arc::clone(cached);
         }
+        // `key` has two owners (the visited set, transiently; the memo,
+        // for the rest of the query). Clone once for visited, then move
+        // the original into the memo store below.
         if !state.visited.insert(key.clone()) {
             QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
-            return ReducedValue::None;
+            return std::sync::Arc::new(ReducedValue::None);
         }
-        let result = self.query_rec_body(bag, q, state);
+        let result = std::sync::Arc::new(self.query_rec_body(bag, q, state));
         state.visited.remove(&key);
         // Cache the off-path resolution. The query depends only on
         // `(bag, attachment, receiver-class, arity)` (all in `key`) plus
         // the static context, which is fixed for one top-level query.
-        state.memo.insert(key, result.clone());
+        state.memo.insert(key, std::sync::Arc::clone(&result));
         QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
         result
     }
@@ -1295,8 +1309,8 @@ impl ReducerRegistry {
                                 &sub_q,
                                 state,
                             );
-                            if v != ReducedValue::None {
-                                return v;
+                            if *v != ReducedValue::None {
+                                return (*v).clone();
                             }
                         }
                     }
@@ -1325,8 +1339,8 @@ impl ReducerRegistry {
                         context: q.context,
                     };
                     let v = self.query_rec(bag, &sub_q, state);
-                    if v != ReducedValue::None {
-                        return v;
+                    if *v != ReducedValue::None {
+                        return (*v).clone();
                     }
                 }
                 // (3) Cross-file plugin-namespace bridges. Plugin entities
@@ -1439,8 +1453,8 @@ impl ReducerRegistry {
                                 receiver,
                                 context: q.context,
                             };
-                            if let ReducedValue::Type(t) = self.query_rec(bag, &sub_q, state) {
-                                Some(t)
+                            if let ReducedValue::Type(t) = &*self.query_rec(bag, &sub_q, state) {
+                                Some(t.clone())
                             } else {
                                 None
                             }
@@ -1477,11 +1491,11 @@ impl ReducerRegistry {
                         receiver,
                         context: q.context,
                     };
-                    if let ReducedValue::Type(t) = self.query_rec(bag, &sub_q, state) {
+                    if let ReducedValue::Type(t) = &*self.query_rec(bag, &sub_q, state) {
                         out.push(Witness {
                             attachment: w.attachment.clone(),
                             source: w.source.clone(),
-                            payload: WitnessPayload::InferredType(t),
+                            payload: WitnessPayload::InferredType(t.clone()),
                             span: w.span,
                         });
                     }
@@ -1545,8 +1559,8 @@ impl ReducerRegistry {
                 receiver: None,
                 context: Some(&ctx),
             };
-            if let ReducedValue::Type(t) = self.query_rec(bag, &q, state) {
-                return Some(t);
+            if let ReducedValue::Type(t) = &*self.query_rec(bag, &q, state) {
+                return Some(t.clone());
             }
         }
         None

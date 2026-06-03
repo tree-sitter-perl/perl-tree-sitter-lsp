@@ -930,12 +930,12 @@ fn query_memo_keeps_inherited_receiver_per_child_in_one_query() {
     let bar_result = reg.query_rec(&bag, &bar_q, &mut state);
 
     assert_eq!(
-        foo_result,
+        *foo_result,
         ReducedValue::Type(InferredType::ClassName("Foo".into())),
         "Foo->m() returns its own receiver"
     );
     assert_eq!(
-        bar_result,
+        *bar_result,
         ReducedValue::Type(InferredType::ClassName("Bar".into())),
         "Bar->m() must return Bar — NOT Foo's memoized answer for the \
          shared MethodOnClass{{Parent, m}} attachment"
