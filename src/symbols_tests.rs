@@ -3289,3 +3289,86 @@ fn types_standard_instanceof_constraint_typing_still_works() {
         unresolved,
     );
 }
+
+// ── P1.2: bare-use export_ok suppression ────────────────────────────────────
+
+/// A bare `use Foo;` must suppress unresolved-function for names in export_ok.
+/// Runtime exporters (Moose::Exporter->setup_import_methods) write to export_ok,
+/// not export, so the suppression must cover both lists.
+#[test]
+fn bare_use_suppresses_export_ok_names() {
+    // Consumer: bare use, no qw list — should auto-suppress subtype/as/where/coerce.
+    let source = "use FakeTypeConstraints;\nsubtype('Foo', as => 'Str', where => sub { 1 });\nas('Str');\ncoerce('Foo', from => 'Int', via => sub { \"$_[0]\" });\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    // Seed with a module whose names are ONLY in export_ok (runtime-exporter style).
+    let cached = fake_cached("/fake/FakeTypeConstraints.pm", &[], &["subtype", "as", "where", "coerce"]);
+    module_index.insert_cache("FakeTypeConstraints", Some(cached));
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let unresolved: Vec<&str> = diags.iter()
+        .filter_map(|d| {
+            if matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-function") {
+                Some(d.message.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "bare use of a runtime-exporter module must not produce unresolved-function for export_ok names; got: {:?}",
+        unresolved,
+    );
+}
+
+/// Genuinely-undefined functions must still produce a diagnostic even when a
+/// module seeded with export_ok is in scope via a bare use.
+#[test]
+fn genuinely_undefined_still_flags_with_export_ok_module_in_scope() {
+    let source = "use FakeTypeConstraints;\ntruly_undefined_fn();\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let cached = fake_cached("/fake/FakeTypeConstraints.pm", &[], &["subtype", "as"]);
+    module_index.insert_cache("FakeTypeConstraints", Some(cached));
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let unresolved: Vec<&str> = diags.iter()
+        .filter_map(|d| {
+            if matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-function") {
+                Some(d.message.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        unresolved.iter().any(|m| m.contains("truly_undefined_fn")),
+        "truly_undefined_fn must still produce an unresolved-function diagnostic; got: {:?}",
+        unresolved,
+    );
+}
+
+// ── P3: lowercase `does` universal method ───────────────────────────────────
+
+/// `$obj->does(...)` must not be flagged as an unresolved method.
+/// Moose adds lowercase `does` to every class alongside UNIVERSAL's uppercase DOES.
+#[test]
+fn does_method_not_flagged_unresolved() {
+    let source = "package M;\nuse Moose;\nsub check {\n    my ($self, $role) = @_;\n    return $self->does($role);\n}\n1;\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let unresolved_method: Vec<&str> = diags.iter()
+        .filter_map(|d| {
+            if matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-method") {
+                Some(d.message.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !unresolved_method.iter().any(|m| m.contains("does")),
+        "`does` must be in the universal-methods skip list and not flagged; got: {:?}",
+        unresolved_method,
+    );
+}

@@ -2288,10 +2288,19 @@ pub fn collect_diagnostics(
             if imp.imported_symbols.iter().any(|s| s.local_name == *name) {
                 return true;
             }
-            // Bare `use Foo;` — check if function is in @EXPORT (auto-imported)
+            // Bare `use Foo;` — check if function is in @EXPORT or export_ok.
+            // Runtime exporters (Moose::Exporter->setup_import_methods etc.) record
+            // their names in export_ok because the builder can't distinguish
+            // "runtime default" from "explicit opt-in" at parse time.  Suppressing
+            // export_ok here avoids ~684 false positives from modules like
+            // Moose::Util::TypeConstraints.  Trade-off: traditional @EXPORT_OK names
+            // (genuinely opt-in) are also suppressed on a bare use — accepted, since
+            // flagging them is more confusing than hiding the hint.
             if imp.imported_symbols.is_empty() {
                 if let Some(cached) = module_index.get_cached(&imp.module_name) {
-                    if cached.analysis.export.iter().any(|s| s == name) {
+                    if cached.analysis.export.iter().any(|s| s == name)
+                        || cached.analysis.export_ok.iter().any(|s| s == name)
+                    {
                         return true;
                     }
                 }
@@ -2365,7 +2374,10 @@ pub fn collect_diagnostics(
 
     // 5e: Unresolved method diagnostics for locally-defined classes
     let universal_methods = [
-        "new", "AUTOLOAD", "DESTROY", "can", "isa", "DOES", "VERSION",
+        "new", "AUTOLOAD", "DESTROY", "can", "isa", "DOES",
+        // Moose adds lowercase `does` alongside UNIVERSAL's uppercase DOES.
+        "does",
+        "VERSION",
         // DBIC meta-methods (inherited from DBIx::Class::Core)
         "add_columns", "add_column", "set_primary_key", "table", "resultset_class",
         "has_many", "has_one", "belongs_to", "might_have", "many_to_many",
