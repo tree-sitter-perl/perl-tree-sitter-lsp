@@ -849,3 +849,95 @@ fn return_expr_operator_rowof_wraps_receiver() {
         "RowOf(Receiver) over a ResultSet projects eagerly to the row class"
     );
 }
+
+// ---- Query memo soundness: receiver identity in the key ----
+
+/// Regression: the per-query result memo must distinguish receivers by
+/// IDENTITY, not by `InferredType` variant. `Parent` owns a fluent
+/// accessor `m` whose body is `ReturnExpr::Receiver` (returns the
+/// invocant). `Foo` and `Bar` both inherit `m` from `Parent`. Resolving
+/// `MethodOnClass{Foo, m}` then `MethodOnClass{Bar, m}` *within one
+/// top-level query* (one shared `QueryState`) reaches the SAME
+/// `MethodOnClass{Parent, m}` attachment with two different receivers.
+/// Each must resolve to its OWN child class — `m()` returns the receiver.
+///
+/// With a variant-only receiver discriminant, both receivers
+/// (`ClassName("Foo")`, `ClassName("Bar")`) collapse to one memo key, so
+/// the second query gets the first's cached answer: Bar silently resolves
+/// to Foo. The fix keys the memo on the receiver's full identity.
+#[test]
+fn query_memo_keeps_inherited_receiver_per_child_in_one_query() {
+    let mut bag = WitnessBag::new();
+    // Parent::m is a fluent accessor returning its invocant.
+    bag.push(Witness {
+        attachment: WitnessAttachment::MethodOnClass {
+            class: "Parent".into(),
+            name: "m".into(),
+        },
+        source: WitnessSource::Builder("test".into()),
+        payload: WitnessPayload::ReturnExpr(ReturnExpr::Receiver),
+        span: span(0, 0, 0, 0),
+    });
+
+    // Foo and Bar both inherit from Parent.
+    let mut package_parents: HashMap<String, Vec<String>> = HashMap::new();
+    package_parents.insert("Foo".into(), vec!["Parent".into()]);
+    package_parents.insert("Bar".into(), vec!["Parent".into()]);
+    let package_framework: HashMap<String, FrameworkFact> = HashMap::new();
+    let scopes: Vec<Scope> = Vec::new();
+    let consumers: Vec<String> = Vec::new();
+    let ctx = BagContext {
+        scopes: &scopes,
+        package_framework: &package_framework,
+        module_index: None,
+        package_parents: &package_parents,
+        app_surface_consumers: &consumers,
+    };
+
+    let reg = ReducerRegistry::with_defaults();
+
+    // One top-level query → one shared QueryState (memo) across both
+    // child reaches. The inheritance fallback recurses
+    // MethodOnClass{Parent, m} carrying each child's receiver.
+    let mut state = QueryState::new();
+
+    let foo_att = WitnessAttachment::MethodOnClass {
+        class: "Foo".into(),
+        name: "m".into(),
+    };
+    let foo_q = ReducerQuery {
+        attachment: &foo_att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        arity_hint: None,
+        receiver: Some(InferredType::ClassName("Foo".into())),
+        context: Some(&ctx),
+    };
+    let foo_result = reg.query_rec(&bag, &foo_q, &mut state);
+
+    let bar_att = WitnessAttachment::MethodOnClass {
+        class: "Bar".into(),
+        name: "m".into(),
+    };
+    let bar_q = ReducerQuery {
+        attachment: &bar_att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        arity_hint: None,
+        receiver: Some(InferredType::ClassName("Bar".into())),
+        context: Some(&ctx),
+    };
+    let bar_result = reg.query_rec(&bag, &bar_q, &mut state);
+
+    assert_eq!(
+        foo_result,
+        ReducedValue::Type(InferredType::ClassName("Foo".into())),
+        "Foo->m() returns its own receiver"
+    );
+    assert_eq!(
+        bar_result,
+        ReducedValue::Type(InferredType::ClassName("Bar".into())),
+        "Bar->m() must return Bar — NOT Foo's memoized answer for the \
+         shared MethodOnClass{{Parent, m}} attachment"
+    );
+}

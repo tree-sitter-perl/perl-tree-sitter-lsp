@@ -1044,15 +1044,24 @@ fn eval_return_expr(re: &ReturnExpr, q: &ReducerQuery) -> Option<InferredType> {
 
 // ---- Reducer registry ----
 
-/// Cycle guard for recursive bag queries, keyed by
-/// `(bag_ptr, attachment, receiver_disc, arity_hint)`. Per-bag entries
-/// stay separate so a legitimate cross-bag query for the same attachment
-/// (the common `MethodOnClass{C, m}` jump into C's own bag) isn't
-/// misread as a cycle. The receiver discriminant + arity hint widen the
-/// key so two queries differing only in `receiver` / `arity_hint` aren't
-/// treated as duplicates — `UnionOnArgs` and `Receiver` substitution can
-/// produce different answers, and the monotone bag makes re-asking safe.
-type VisitedKey = (usize, WitnessAttachment, u8, Option<u32>);
+/// Cycle guard + result memo key for recursive bag queries, keyed by
+/// `(bag_ptr, attachment, receiver_identity, arity_hint)`. Per-bag
+/// entries stay separate so a legitimate cross-bag query for the same
+/// attachment (the common `MethodOnClass{C, m}` jump into C's own bag)
+/// isn't misread as a cycle. The receiver **identity** + arity hint
+/// widen the key so two queries differing only in `receiver` /
+/// `arity_hint` aren't treated as duplicates — `UnionOnArgs` and
+/// `Receiver` substitution can produce different answers.
+///
+/// The receiver slot is the receiver's FULL structural identity, not a
+/// variant tag. `ReturnExpr::Receiver` substitutes the whole receiver,
+/// so `ClassName("Foo")` and `ClassName("Bar")` reaching one attachment
+/// resolve to different classes; a variant-only discriminant collapses
+/// them to one memo key and the memo hands Foo's answer to Bar (silent
+/// wrong type). A same-receiver diamond (the inheritance walk holds
+/// `q.receiver` constant within one `MethodOnClass` query) still hashes
+/// to one key, so memoization still kills the exponential re-chase.
+type VisitedKey = (usize, WitnessAttachment, Option<String>, Option<u32>);
 type VisitedSet = std::collections::HashSet<VisitedKey>;
 
 /// Per-top-level-`query` traversal state: the cycle guard plus a result
@@ -1084,26 +1093,17 @@ impl QueryState {
     }
 }
 
-/// Cycle-guard discriminant for `q.receiver` — `0` for `None`, else the
-/// `InferredType` variant index. Values aren't load-bearing; only
-/// "different variants compare unequal" matters. Exhaustive match (no
-/// `_ =>`) so a new variant trips the compiler instead of colliding.
-fn receiver_discriminant(r: &Option<InferredType>) -> u8 {
-    let Some(t) = r else { return 0 };
-    match t {
-        InferredType::ClassName(_) => 1,
-        InferredType::FirstParam { .. } => 2,
-        InferredType::HashRef => 3,
-        InferredType::ArrayRef => 4,
-        InferredType::CodeRef { .. } => 5,
-        InferredType::Regexp => 6,
-        InferredType::Numeric => 7,
-        InferredType::String => 8,
-        InferredType::Parametric(_) => 9,
-        InferredType::Sequence(_) => 10,
-        InferredType::TypeConstraintOf(_) => 11,
-        InferredType::BrandedRoute { .. } => 12,
-    }
+/// Hashable full-identity projection of `q.receiver` for the cycle/memo
+/// key. `None` stays `None`; otherwise the receiver's complete structural
+/// identity (Debug projection) so two distinct receivers — including two
+/// `ClassName(_)` with different class names — never share a key. This is
+/// the soundness-load-bearing slot: `ReturnExpr::Receiver` substitutes the
+/// whole receiver, so the memo must keep different receivers apart. Debug
+/// is structurally faithful for every `InferredType` variant (each field
+/// is itself `Debug`), so equality of the string implies equality of the
+/// receiver for keying purposes.
+fn receiver_key(r: &Option<InferredType>) -> Option<String> {
+    r.as_ref().map(|t| format!("{t:?}"))
 }
 
 /// Depth backstop for `query_rec`. The `(bag, attachment)` visited set is
@@ -1205,7 +1205,7 @@ impl ReducerRegistry {
         let key: VisitedKey = (
             bag as *const _ as usize,
             q.attachment.clone(),
-            receiver_discriminant(&q.receiver),
+            receiver_key(&q.receiver),
             q.arity_hint,
         );
         // Memo hit: this key was fully resolved earlier in THIS query and
