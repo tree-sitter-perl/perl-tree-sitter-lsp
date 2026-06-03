@@ -10213,6 +10213,7 @@ mod param_types_manifest {
                     in_role: "My::Upgrade::Role".into(),
                     param: 1,
                     type_class: "Mojolicious".into(),
+                    requires_action_attr: false,
                 }]
             })
         }
@@ -10363,10 +10364,13 @@ mod param_types_manifest {
             static PT: OnceLock<Vec<ParamType>> = OnceLock::new();
             PT.get_or_init(|| {
                 vec![ParamType {
-                    method: None, // wildcard: every method in the class
+                    method: None, // wildcard: every ACTION method in the class
                     in_role: "Catalyst::Controller".into(),
                     param: 1,
                     type_class: "Catalyst".into(),
+                    // Mirror the real catalyst.rhai: only attribute-carrying
+                    // actions get $c, not plain helper subs.
+                    requires_action_attr: true,
                 }]
             })
         }
@@ -10464,6 +10468,73 @@ mod param_types_manifest {
             fa.inferred_type_via_bag("$c", Point::new(3, 12)),
             None,
             "wildcard rule must not type $c in a package that doesn't isa Catalyst::Controller",
+        );
+    }
+
+    /// P1.4 — the real metacpan shape, through the actual hover query path: a
+    /// controller reaches `Catalyst::Controller` through a *workspace
+    /// intermediate* base that is itself a child of the role class. The leaf's
+    /// local `package_parents` only knows its direct parent; reaching the role
+    /// requires `class_isa` to chase the intermediate's parents through the
+    /// module index. The bug was the hover path (`format_symbol_hover_at`)
+    /// dropping the index — this exercises `hover_info` end-to-end so it
+    /// fails on pre-fix code.
+    #[test]
+    fn catalyst_c_typed_through_workspace_intermediate_via_hover() {
+        use crate::module_index::ModuleIndex;
+        use std::path::PathBuf;
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+        // Intermediate base, registered as a workspace module (like a project
+        // `lib/.../Controller.pm`): its parent (`Catalyst::Controller`) lives
+        // only in the index, NOT in the leaf's local `package_parents`.
+        idx.register_workspace_module(
+            PathBuf::from("/fake/MetaCPAN/Web/Controller.pm"),
+            std::sync::Arc::new(build_fa(
+                "package MetaCPAN::Web::Controller;\nuse parent 'Catalyst::Controller';\nsub pageset {\n    my ($self, $page) = @_;\n}\n1;\n",
+            )),
+        );
+        // Leaf controller: extends only the workspace intermediate.
+        let src = "package MetaCPAN::Web::Controller::Author;\nuse parent 'MetaCPAN::Web::Controller';\nsub root :Chained {\n    my ($self, $c, $id) = @_;\n    my $x = $c;\n}\n1;\n";
+        let fa = build_with_catalyst(src);
+        // Hover on the `$c` usage (row 4, the `my $x = $c;` line). The hover
+        // path resolves the variable's type — only typed correctly if the
+        // index is threaded all the way to the gated-param query.
+        let hover = fa
+            .hover_info(Point::new(4, 12), src, Some(&idx))
+            .expect("hover should produce info for $c");
+        assert!(
+            hover.contains("type: Catalyst"),
+            "3-hop cross-file ancestry through a workspace base must type $c in \
+             hover (the path that dropped the index), got: {}",
+            hover,
+        );
+    }
+
+    /// P1.3 — the attribute gate: in the SAME controller, an action (`:Local`)
+    /// gets `$c`, but a plain helper sub (no action attribute) must NOT get its
+    /// 2nd param typed. The honest action signal is the attribute, not the
+    /// parameter position.
+    #[test]
+    fn catalyst_non_action_helper_second_param_not_typed() {
+        let fa = build_with_catalyst(
+            "package MyApp::Controller::Foo;\nuse parent 'Catalyst::Controller';\nsub show :Local {\n    my ($self, $c) = @_;\n    my $a = $c;\n}\nsub pageset {\n    my ($self, $page) = @_;\n    my $b = $page;\n}\n1;\n",
+        );
+        // The action's $c IS typed.
+        let c_ty = fa
+            .inferred_type_via_bag("$c", Point::new(4, 12))
+            .expect("action $c should be typed");
+        assert!(
+            matches!(&c_ty, InferredType::ClassName(c) if c == "Catalyst"),
+            "action method's $c must type as Catalyst, got {:?}",
+            c_ty,
+        );
+        // The plain helper's 2nd param ($page) must NOT be typed — no attribute.
+        assert_eq!(
+            fa.inferred_type_via_bag("$page", Point::new(8, 12)),
+            None,
+            "a non-action helper's 2nd param must NOT be typed Catalyst (P1.3 \
+             over-application); only attribute-carrying actions receive $c",
         );
     }
 }

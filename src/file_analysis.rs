@@ -2882,10 +2882,11 @@ impl FileAnalysis {
         match node.kind() {
             "scalar" => {
                 let text = node.utf8_text(source).ok()?;
-                // Route scalar-type resolution through the witness
-                // bag so framework / branch / arity rules refine the
-                // answer. Legacy `inferred_type` is used as fallback.
-                self.inferred_type_via_bag(text, point)
+                // Route scalar-type resolution through the witness bag so
+                // framework / branch / arity rules refine the answer. Keep the
+                // index so a role-contract param (`$c`) resolves through
+                // cross-file ancestry, not just the local `package_parents`.
+                self.inferred_type_via_bag_ctx(text, point, module_index)
             }
             "package" | "bareword" => {
                 // Bareword = class name
@@ -4076,11 +4077,11 @@ impl FileAnalysis {
                     }
                     if let Some(sym_id) = r.resolves_to {
                         let sym = self.symbol(sym_id);
-                        return Some(self.format_symbol_hover_at(sym, source, point));
+                        return Some(self.format_symbol_hover_at(sym, source, point, module_index));
                     }
                     // Unresolved variable — try resolve ourselves
                     if let Some(sym) = self.resolve_variable(&r.target_name, point) {
-                        return Some(self.format_symbol_hover_at(sym, source, point));
+                        return Some(self.format_symbol_hover_at(sym, source, point, module_index));
                     }
                 }
                 RefKind::FunctionCall { resolved_package } => {
@@ -4090,7 +4091,7 @@ impl FileAnalysis {
                         let sym = self.symbol(sid);
                         if sym.kind != SymKind::Sub { continue; }
                         if sym.package == *resolved_package {
-                            return Some(self.format_symbol_hover(sym, source));
+                            return Some(self.format_symbol_hover(sym, source, module_index));
                         }
                     }
                     // Fall-through: the name might be a function imported
@@ -4184,7 +4185,7 @@ impl FileAnalysis {
                     for &sid in self.symbols_named(&r.target_name) {
                         let sym = self.symbol(sid);
                         if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                            return Some(self.format_symbol_hover(sym, source));
+                            return Some(self.format_symbol_hover(sym, source, module_index));
                         }
                     }
                 }
@@ -4192,7 +4193,7 @@ impl FileAnalysis {
                     for &sid in self.symbols_named(&r.target_name) {
                         let sym = self.symbol(sid);
                         if matches!(sym.kind, SymKind::Package | SymKind::Class) {
-                            return Some(self.format_symbol_hover(sym, source));
+                            return Some(self.format_symbol_hover(sym, source, module_index));
                         }
                     }
                 }
@@ -4233,7 +4234,7 @@ impl FileAnalysis {
             if let SymbolDetail::Handler { owner, .. } = &sym.detail {
                 return Some(self.format_handler_hover(&sym.name, owner, None, module_index));
             }
-            return Some(self.format_symbol_hover(sym, source));
+            return Some(self.format_symbol_hover(sym, source, module_index));
         }
 
         None
@@ -5376,18 +5377,31 @@ impl FileAnalysis {
         None
     }
 
-    fn format_symbol_hover(&self, sym: &Symbol, source: &str) -> String {
-        self.format_symbol_hover_at(sym, source, sym.selection_span.end)
+    fn format_symbol_hover(
+        &self,
+        sym: &Symbol,
+        source: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> String {
+        self.format_symbol_hover_at(sym, source, sym.selection_span.end, module_index)
     }
 
-    fn format_symbol_hover_at(&self, sym: &Symbol, source: &str, at: Point) -> String {
+    fn format_symbol_hover_at(
+        &self,
+        sym: &Symbol,
+        source: &str,
+        at: Point,
+        module_index: Option<&ModuleIndex>,
+    ) -> String {
         let line = source_line_at(source, sym.span.start.row);
         let mut text = format!("```perl\n{}\n```", line.trim());
 
         // Append inferred type for variables/fields (bag-routed so
-        // framework / branch / arity rules refine the answer).
+        // framework / branch / arity rules refine the answer). The index lets
+        // a role-contract param type (`$c` in a Catalyst action) resolve
+        // through cross-file ancestry via the `ReceiverGated` gate.
         if matches!(sym.kind, SymKind::Variable | SymKind::Field) {
-            if let Some(it) = self.inferred_type_via_bag(&sym.name, at) {
+            if let Some(it) = self.inferred_type_via_bag_ctx(&sym.name, at, module_index) {
                 text.push_str(&format!("\n\n*type: {}*", format_inferred_type(&it)));
             }
         }

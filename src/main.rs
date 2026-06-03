@@ -803,7 +803,7 @@ fn cli_dump_package(root: &str, package_name: &str) {
             .iter()
             .map(|p| {
                 let inferred = analysis
-                    .inferred_type_via_bag(&p.name, probe)
+                    .inferred_type_via_bag_ctx(&p.name, probe, Some(&module_index))
                     .as_ref()
                     .map(file_analysis::format_inferred_type);
                 serde_json::json!({

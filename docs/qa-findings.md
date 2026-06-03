@@ -39,13 +39,30 @@ Severity: **P0** regression this sprint · **P1** high-impact · **P2** complete
 - **Where:** metacpan-web — e.g. `$page` in `pageset`, `$path` in `request`, `$dist` in `via_dist` all typed `Catalyst` (15/16 type_constraints wrong on `ReleaseInfo.pm`).
 - **Root cause:** `catalyst.rhai` `param_types()` uses a method-name wildcard (`method: ()`, `param: 1`), typing the 2nd positional param of **every** method in a `Catalyst::Controller`/`Model`/`View` subclass — not just action methods.
 - **Fix:** scope to actual action methods (e.g. attribute-gated `:Local`/`:Path`/`:Chained`), or otherwise distinguish actions from plain methods. The correct hits are `ACCEPT_CONTEXT`/`COMPONENT`; the rest are noise.
-- **Status:** design flaw in the catalyst wildcard approach (this sprint).
+- **Status:** FIXED. `ParamType` gained `requires_action_attr` (`#[serde(default)]`); the
+  builder records whether a sub carries any declaration attribute (`collect_attributes`,
+  rule #1) and skips attribute-gated wildcard rules on attribute-less subs. `catalyst.rhai`'s
+  wildcard `param_types` now set `requires_action_attr: true`; `Catalyst::Model` gets
+  `ACCEPT_CONTEXT`/`COMPONENT` as *named* (un-gated) rules. Verified on metacpan-web:
+  `pageset`/`$page`, `request`/`$path` no longer typed; action `$c` + Model `ACCEPT_CONTEXT`/
+  `COMPONENT` context args do type.
 
 ### P1.4 — cross-file `$c` fails at multi-hop ancestry
 - **Where:** metacpan-web — `$c` untyped in every action controller (`Author → MetaCPAN::Web::Controller → Catalyst::Controller`). Direct-parent classes *do* get typed.
 - **Detail:** Phase 2 (gated `param_types` via `ReceiverGated` + query-time `resolve_for` → `class_isa`) passed its unit probe, but the probe only exercised a shape where `class_isa` could see both classes. On a real app the controller base is a **workspace intermediate**, and the cross-file walk isn't traversing it. Re-verified on a fresh `ce24c81` build (dump and hover agree: `$page` 1-hop → `Catalyst`, `$c` 3-hop → `null`).
 - **Fix:** make `class_isa`'s cross-file walk traverse workspace-file parents (the intermediate base) at query time, not just `module_index` @INC deps. Also confirm the gated param-type fallback is the single read path for *all* variable-type consumers (it's a fallback in `inferred_type_via_bag_ctx`, not type-enforced like the dispatch side — latent drift risk).
-- **Status:** Phase-2 gap; the catalyst-`$c` headline is not actually delivered on real apps. Unit probe gave false confidence.
+- **Status:** FIXED. Root cause was NOT `class_isa` — it already walks local `package_parents`
+  ∪ `parents_cached`, and workspace intermediates ARE registered in the index
+  (`register_workspace_module`). The bug was the *query-site callers dropping the module index*:
+  the variable-type hover/dump paths called the bare `inferred_type_via_bag` (index `None`), so
+  `gated_param_type_for` → `class_isa` could only see the open file's local parents — which carry
+  just the direct-parent edge, never the intermediate's parents. Direct-parent controllers typed
+  (one local hop); 3-hop didn't (needed `parents_cached` on the intermediate, unreachable without
+  the index). Fix: thread `module_index` through `format_symbol_hover`/`_at`, the
+  `resolve_expression_type` scalar arm, and the `--dump-package` param probe. Verified: `$c` in
+  `MetaCPAN::Web::Controller::Author` (Author → MetaCPAN::Web::Controller → Catalyst::Controller)
+  now types `Catalyst` via both `--dump-package` and `--hover`. Benefits ALL gated resolution
+  (dispatch was already index-threaded; this closes the param-type path).
 
 ---
 

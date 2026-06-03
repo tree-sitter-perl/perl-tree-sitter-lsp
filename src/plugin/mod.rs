@@ -650,6 +650,17 @@ pub struct ParamType {
     pub in_role: String,
     pub param: usize,
     pub type_class: String,
+    /// Gate the rule on the sub carrying a declaration attribute (`:Local`,
+    /// `:Chained`, `:Args`, …). The Catalyst `$c` case: only *action* methods
+    /// receive the context object, and the only honest signal separating an
+    /// action from a plain helper is the attribute. A wildcard `param: 1` rule
+    /// without this gate types the 2nd param of EVERY sub in the controller —
+    /// `$page` in a pagination helper, `$path` in a request builder — all
+    /// falsely `Catalyst`. Plugins set `requires_action_attr: true` in Rhai;
+    /// `ACCEPT_CONTEXT`/`COMPONENT` (Models, which have no attribute) stay as
+    /// *named* rules that don't set this.
+    #[serde(default)]
+    pub requires_action_attr: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

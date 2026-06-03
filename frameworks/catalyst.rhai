@@ -10,33 +10,27 @@
 //
 // ── $c parameter typing ──────────────────────────────────────────────
 //
-// `param_types()` with `method: ()` (wildcard — any method name) types
-// the 2nd positional param ($c, param index 1) as `Catalyst` for every
-// method in a class that `isa Catalyst::Controller`. The mechanism:
+// `param_types()` with `method: ()` (wildcard) + `requires_action_attr`
+// types the 2nd positional param ($c, param index 1) as `Catalyst` — but
+// ONLY for methods carrying an action attribute (`:Local` / `:Chained` /
+// `:Args` / …). The attribute is the only honest signal that a sub is a
+// dispatch *action* (the slot Catalyst passes `$c` into); a bare wildcard
+// would type the 2nd param of every helper too (`$page` in a paginator,
+// `$path` in a request builder). Catalyst::Model uses `ACCEPT_CONTEXT`
+// instead of attributes, so it gets a *named* rule with no attr gate.
 //
-//   ParamType { method: None, in_role: "Catalyst::Controller",
-//               param: 1, type_class: "Catalyst" }
+//   ParamType { method: None, in_role: "Catalyst::Controller", param: 1,
+//               type_class: "Catalyst", requires_action_attr: true }
 //
-// KNOWN CONSTRAINT — cross-file ClassIsa: `transitive_parents` in the
-// builder walks only `package_parents` populated from the current file's
-// `use parent` / `use base` / `@ISA` / `with` / `extends` declarations.
-// `Catalyst::Controller` is always a CPAN/dependency ancestor — never
-// declared locally. So the `in_role` match fires only when the file
-// itself carries a `use parent 'Catalyst::Controller'` (or equivalent)
-// that gets parsed and recorded in `package_parents`. For files whose
-// controller base is declared locally (rare in Catalyst apps — most
-// controllers DO have an explicit `use parent 'Catalyst::Controller'`),
-// this works correctly. For controllers that inherit transitively via
-// a local intermediate, the intermediate would need the same manifest
-// applied recursively — but `transitive_parents` does walk the full
-// local ancestor chain, so a `MyApp::Controller::Base` with `use parent
-// 'Catalyst::Controller'` and a child with `use parent
-// 'MyApp::Controller::Base'` WILL both get `$c` typed correctly.
-// The only gap is when the parent is cross-file and not in the local
-// `package_parents` snapshot. This is a resolver-layer concern
-// (see PluginRegistry::applicable / trigger cross-file limitation);
-// fixing it requires propagating cross-file parents into the build
-// walk, which is a separate architectural change.
+// Cross-file ancestry: the `in_role` match is resolved at QUERY time via
+// the `ReceiverGated` seam (the builder is index-free, rule #1). The gated
+// TC rides the FA ungated; `gated_param_type_for` → `class_isa` walks the
+// enclosing package's local `package_parents` ∪ the cross-file
+// `parents_cached` graph — so a controller whose `Catalyst::Controller`
+// ancestor is reached through a *workspace intermediate* base (e.g.
+// `MetaCPAN::Web::Controller::Author` → `MetaCPAN::Web::Controller` →
+// `Catalyst::Controller`) types its `$c` correctly, provided the query
+// caller threads the module index (hover / completion / dump all do).
 //
 // ── Component accessors ──────────────────────────────────────────────
 //
@@ -169,24 +163,34 @@ fn overrides() {
     ]
 }
 
-// Type the 2nd positional param ($c) as `Catalyst` for every method in a
-// Catalyst::Controller subclass. `method: ()` is the wildcard selector —
-// any method name matches, so all action subs get the context typed.
+// Type the 2nd positional param ($c) as `Catalyst` in Catalyst::Controller
+// subclasses. The wildcard rules carry `requires_action_attr: true`, so they
+// only fire on subs with an action attribute (`:Local`/`:Chained`/`:Args`/…)
+// — actual dispatch actions, the only subs Catalyst hands `$c`. A plain
+// helper (`sub pageset { my ($self, $page) = @_; ... }`) has no attribute, so
+// its 2nd param is left untyped.
 //
-// Selector approximation note: `in_role` is matched against the local
-// `package_parents` snapshot (see KNOWN CONSTRAINT above). This covers the
-// common case — a controller with `use parent 'Catalyst::Controller'` or a
-// transitive local chain to it. Cross-file-only inheritance misses; that's
-// a resolver-layer gap, not a manifest gap.
+// `in_role` ancestry resolves cross-file at query time through the
+// `ReceiverGated` seam (`class_isa` over local + `parents_cached`), so a
+// controller reaching `Catalyst::Controller` only through a workspace
+// intermediate base still types `$c`.
 fn param_types() {
     [
-        // Every method in a Catalyst::Controller subclass gets $c typed.
-        // `method: ()` = wildcard: applies regardless of the action's name.
-        #{ in_role: "Catalyst::Controller", param: 1, type_class: "Catalyst" },
-        // Catalyst::Model and Catalyst::View controllers also carry $c when
-        // they define action methods (less common, but supported by Catalyst).
-        #{ in_role: "Catalyst::Model", param: 1, type_class: "Catalyst" },
-        #{ in_role: "Catalyst::View", param: 1, type_class: "Catalyst" },
+        // Controller actions: gated on the attribute the dispatcher requires.
+        #{ in_role: "Catalyst::Controller", param: 1, type_class: "Catalyst",
+           requires_action_attr: true },
+        // Catalyst::View action methods follow the same attribute convention.
+        #{ in_role: "Catalyst::View", param: 1, type_class: "Catalyst",
+           requires_action_attr: true },
+        // Catalyst::Model gets the context through `ACCEPT_CONTEXT($self, $c)`
+        // / `COMPONENT($self, $app)` — fixed contract method names, no action
+        // attribute — so these are *named* rules, not the attribute-gated
+        // wildcard. (`COMPONENT`'s 2nd arg is the application object, also a
+        // `Catalyst`-flavored context for our purposes.)
+        #{ method: "ACCEPT_CONTEXT", in_role: "Catalyst::Model", param: 1,
+           type_class: "Catalyst" },
+        #{ method: "COMPONENT", in_role: "Catalyst::Model", param: 1,
+           type_class: "Catalyst" },
     ]
 }
 

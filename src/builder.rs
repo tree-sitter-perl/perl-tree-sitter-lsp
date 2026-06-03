@@ -3516,18 +3516,23 @@ impl<'a> Builder<'a> {
         if self.param_type_manifest.is_empty() && self.param_type_wildcards.is_empty() {
             return;
         }
+        // Action attributes (`:Local`, `:Chained`, `:Args`, …) are the only
+        // honest signal that a controller sub is a dispatch *action* — the slot
+        // that actually receives `$c`. `requires_action_attr` rules gate on it.
+        let has_action_attr = !self.collect_attributes(node).is_empty();
+
         // Collect (variable, gate-class, type-class) before mutating self —
         // can't hold the manifest borrow while pushing into `gated_param_types`.
         let mut to_gate: Vec<(String, String, String)> = Vec::new();
 
         // Named rules: only those keyed to exactly this method name.
         if let Some(rules) = self.param_type_manifest.get(method) {
-            Self::collect_param_type_matches(rules, params, &mut to_gate);
+            Self::collect_param_type_matches(rules, params, has_action_attr, &mut to_gate);
         }
 
         // Wildcard rules: method is None — apply to every sub in the class.
         let wildcards = std::mem::take(&mut self.param_type_wildcards);
-        Self::collect_param_type_matches(&wildcards, params, &mut to_gate);
+        Self::collect_param_type_matches(&wildcards, params, has_action_attr, &mut to_gate);
         self.param_type_wildcards = wildcards;
 
         let scope = self.current_scope();
@@ -3553,9 +3558,13 @@ impl<'a> Builder<'a> {
     fn collect_param_type_matches(
         rules: &[plugin::ParamType],
         params: &[ParamInfo],
+        has_action_attr: bool,
         out: &mut Vec<(String, String, String)>,
     ) {
         for r in rules {
+            if r.requires_action_attr && !has_action_attr {
+                continue;
+            }
             if let Some(p) = params.get(r.param) {
                 if p.name.starts_with('$') {
                     out.push((p.name.clone(), r.in_role.clone(), r.type_class.clone()));
