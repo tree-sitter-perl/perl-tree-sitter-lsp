@@ -243,6 +243,8 @@ fn build_with_plugins_inner(
         method_call_ref_dedup: std::collections::HashSet::new(),
         route_branded_refs: std::collections::HashSet::new(),
         anon_sub_symbol_by_span: std::collections::HashMap::new(),
+        fold_ref_by_span: std::collections::HashMap::new(),
+        fold_method_sym_by_name: std::collections::HashMap::new(),
         modifier_invocant_pos: None,
     };
     b.dispatch_manifest = b
@@ -1213,6 +1215,20 @@ struct Builder<'a> {
     /// placeholders without any per-shape dispatch in the chase
     /// site.
     anon_sub_symbol_by_span: std::collections::HashMap<Span, SymbolId>,
+
+    /// Fold-loop lookup indices, populated once by `fold_to_fixed_point`
+    /// before the worklist iterates. `refs` and `symbols` are immutable
+    /// during the fold (only the bag + invocant caches change), so these
+    /// stay valid across every iteration. Without them, the per-iteration
+    /// passes (`emit_route_brand_witnesses`, `seed_return_types_from_bag`)
+    /// did a linear `refs.iter().position` / `symbols.iter().find` per
+    /// method-call / sub-scope — O(refs²) / O(scopes·symbols) per
+    /// iteration, the cold-index hot path on dense files (SQL::Abstract).
+    /// `ref_by_span`: method-call ref span → its index in `refs`.
+    /// `method_sym_by_name`: sub/method name → candidate symbol indices
+    /// (multiple packages can declare the same name).
+    fold_ref_by_span: std::collections::HashMap<(Point, Point), usize>,
+    fold_method_sym_by_name: std::collections::HashMap<String, Vec<usize>>,
 
     /// Invocant parameter index for the next anonymous sub to be visited.
     /// Set by `visit_function_call` when it detects a Moose/Moo method
@@ -8394,6 +8410,29 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Build the per-iteration lookup maps the fold passes reuse.
+    /// `refs`/`symbols` are stable across the fold, so this runs once.
+    fn build_fold_lookup_indices(&mut self) {
+        let mut ref_by_span = std::collections::HashMap::with_capacity(self.refs.len());
+        for (i, r) in self.refs.iter().enumerate() {
+            if matches!(r.kind, RefKind::MethodCall { .. }) {
+                // First-wins matches the prior `position(...)` semantics.
+                ref_by_span
+                    .entry((r.span.start, r.span.end))
+                    .or_insert(i);
+            }
+        }
+        let mut sym_by_name: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, s) in self.symbols.iter().enumerate() {
+            if matches!(s.kind, SymKind::Sub | SymKind::Method) {
+                sym_by_name.entry(s.name.clone()).or_default().push(i);
+            }
+        }
+        self.fold_ref_by_span = ref_by_span;
+        self.fold_method_sym_by_name = sym_by_name;
+    }
+
     /// Fixed-point loop driving chain typing + reducer dispatch. Each
     /// iteration runs `ChainPassMode::PreFold` (assignment typing +
     /// return-arm refresh) followed by `resolve_return_types` (the
@@ -8425,6 +8464,7 @@ impl<'a> Builder<'a> {
     /// table is sufficient.
     fn fold_to_fixed_point(&mut self, idx: &ChainTypingIndex<'a>) {
         const MAX_FOLD_ITERATIONS: usize = 64;
+        self.build_fold_lookup_indices();
         let mut iters = 0usize;
         let mut prev = self.fold_state_snapshot();
         loop {
@@ -8464,23 +8504,46 @@ impl<'a> Builder<'a> {
     /// stable across iterations and a flat total bag length means no
     /// new chain-assignment pushes either.
     fn fold_state_snapshot(&self) -> (Vec<(SymbolId, Option<InferredType>)>, usize, usize) {
+        use crate::witnesses::{
+            BagContext, FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
+            WitnessAttachment,
+        };
+        // Build the registry + context ONCE — this snapshot queries
+        // every Sub/Method symbol each iteration; the per-call
+        // `bag_query_attachment` path would re-`with_defaults()` (8 box
+        // allocs) per symbol per iteration.
+        let reg = ReducerRegistry::with_defaults();
+        let ctx = BagContext {
+            scopes: &self.scopes,
+            package_framework: &self.package_framework,
+            module_index: None,
+            package_parents: &self.package_parents,
+            app_surface_consumers: &self.app_surface_consumers,
+        };
         let mut answers: Vec<(SymbolId, Option<InferredType>)> = self
             .symbols
             .iter()
             .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
             .map(|s| {
-                (
-                    s.id,
-                    self.bag_query_attachment(
-                        &crate::witnesses::WitnessAttachment::Symbol(s.id),
-                    )
-                    // A brand is a route VALUE identity, never a sub
-                    // return contract. Project it to its base class for
-                    // the fixed-point snapshot so a branded
-                    // implicit-return doesn't oscillate against the
-                    // brandless writeback push.
-                    .map(Self::debrand),
-                )
+                let att = WitnessAttachment::Symbol(s.id);
+                let q = ReducerQuery {
+                    attachment: &att,
+                    point: None,
+                    framework: FrameworkFact::Plain,
+                    arity_hint: None,
+                    receiver: None,
+                    context: Some(&ctx),
+                };
+                let resolved = match reg.query(&self.bag, &q) {
+                    ReducedValue::Type(t) => Some(t),
+                    _ => None,
+                };
+                // A brand is a route VALUE identity, never a sub
+                // return contract. Project it to its base class for
+                // the fixed-point snapshot so a branded
+                // implicit-return doesn't oscillate against the
+                // brandless writeback push.
+                (s.id, resolved.map(Self::debrand))
             })
             .collect();
         answers.sort_by_key(|(id, _)| id.0);
@@ -8898,9 +8961,7 @@ impl<'a> Builder<'a> {
         let mut brands: Vec<(usize, InferredType)> = Vec::new();
         for &node in &idx.method_call_nodes {
             let span = node_to_span(node);
-            let Some(refidx) = self.refs.iter().position(|r| {
-                matches!(r.kind, RefKind::MethodCall { .. }) && r.span == span
-            }) else {
+            let Some(&refidx) = self.fold_ref_by_span.get(&(span.start, span.end)) else {
                 continue;
             };
             let ty = self.invocant_type_at_node(node);
@@ -9325,13 +9386,12 @@ impl<'a> Builder<'a> {
             };
 
             let sub_sym_id = self
-                .symbols
-                .iter()
-                .find(|s| {
-                    s.name == sub_name
-                        && matches!(s.kind, SymKind::Sub | SymKind::Method)
-                        && s.span.start <= scope.span.start
-                        && scope.span.end <= s.span.end
+                .fold_method_sym_by_name
+                .get(&sub_name)
+                .and_then(|cands| {
+                    cands.iter().map(|&i| &self.symbols[i]).find(|s| {
+                        s.span.start <= scope.span.start && scope.span.end <= s.span.end
+                    })
                 })
                 .map(|s| s.id);
 

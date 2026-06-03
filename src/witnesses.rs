@@ -1055,6 +1055,35 @@ fn eval_return_expr(re: &ReturnExpr, q: &ReducerQuery) -> Option<InferredType> {
 type VisitedKey = (usize, WitnessAttachment, u8, Option<u32>);
 type VisitedSet = std::collections::HashSet<VisitedKey>;
 
+/// Per-top-level-`query` traversal state: the cycle guard plus a result
+/// memo. The bag forms a DAG of edges; without memoization a diamond
+/// (two paths reaching one shared sub-attachment) re-chases the shared
+/// subtree on every path, which is exponential on dense files
+/// (SQL::Abstract's method graph took minutes). The memo caches each
+/// attachment's resolved value *for the duration of one top-level query*
+/// so a re-reached node returns in O(1).
+///
+/// Soundness vs the cycle guard: `query_rec` only consults/stores the
+/// memo for a key that is NOT currently on the path (the visited-guard
+/// has already returned for on-path keys). A cached value is therefore
+/// the node's resolution computed with that node off the path — exactly
+/// what any other off-path reentry would compute. The memo is dropped
+/// when the top-level query returns, so it never leaks state across
+/// queries whose context (scopes / module_index / framework) differs.
+struct QueryState {
+    visited: VisitedSet,
+    memo: std::collections::HashMap<VisitedKey, ReducedValue>,
+}
+
+impl QueryState {
+    fn new() -> Self {
+        QueryState {
+            visited: std::collections::HashSet::new(),
+            memo: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// Cycle-guard discriminant for `q.receiver` — `0` for `None`, else the
 /// `InferredType` variant index. Values aren't load-bearing; only
 /// "different variants compare unequal" matters. Exhaustive match (no
@@ -1142,15 +1171,15 @@ impl ReducerRegistry {
     /// bag) and the inheritance fallback (which crosses bags), closing
     /// mutual-inheritance loops that span files.
     pub fn query(&self, bag: &WitnessBag, q: &ReducerQuery) -> ReducedValue {
-        let mut visited: VisitedSet = std::collections::HashSet::new();
-        self.query_rec(bag, q, &mut visited)
+        let mut state = QueryState::new();
+        self.query_rec(bag, q, &mut state)
     }
 
     fn query_rec(
         &self,
         bag: &WitnessBag,
         q: &ReducerQuery,
-        visited: &mut VisitedSet,
+        state: &mut QueryState,
     ) -> ReducedValue {
         let depth = QUERY_REC_DEPTH.with(|c| {
             let d = c.get();
@@ -1179,12 +1208,22 @@ impl ReducerRegistry {
             receiver_discriminant(&q.receiver),
             q.arity_hint,
         );
-        if !visited.insert(key.clone()) {
+        // Memo hit: this key was fully resolved earlier in THIS query and
+        // isn't on the current path (cycle guard handles on-path keys).
+        if let Some(cached) = state.memo.get(&key) {
+            QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
+            return cached.clone();
+        }
+        if !state.visited.insert(key.clone()) {
             QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
             return ReducedValue::None;
         }
-        let result = self.query_rec_body(bag, q, visited);
-        visited.remove(&key);
+        let result = self.query_rec_body(bag, q, state);
+        state.visited.remove(&key);
+        // Cache the off-path resolution. The query depends only on
+        // `(bag, attachment, receiver-class, arity)` (all in `key`) plus
+        // the static context, which is fixed for one top-level query.
+        state.memo.insert(key, result.clone());
         QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
         result
     }
@@ -1193,9 +1232,9 @@ impl ReducerRegistry {
         &self,
         bag: &WitnessBag,
         q: &ReducerQuery,
-        visited: &mut VisitedSet,
+        state: &mut QueryState,
     ) -> ReducedValue {
-        let materialized = self.materialize(bag, q, visited);
+        let materialized = self.materialize(bag, q, state);
 
         for r in &self.reducers {
             let claimed: Vec<&Witness> =
@@ -1254,7 +1293,7 @@ impl ReducerRegistry {
                             let v = self.query_rec(
                                 &cached.analysis.witnesses,
                                 &sub_q,
-                                visited,
+                                state,
                             );
                             if v != ReducedValue::None {
                                 return v;
@@ -1285,7 +1324,7 @@ impl ReducerRegistry {
                         receiver: q.receiver.clone(),
                         context: q.context,
                     };
-                    let v = self.query_rec(bag, &sub_q, visited);
+                    let v = self.query_rec(bag, &sub_q, state);
                     if v != ReducedValue::None {
                         return v;
                     }
@@ -1344,7 +1383,7 @@ impl ReducerRegistry {
         &self,
         bag: &WitnessBag,
         q: &ReducerQuery,
-        visited: &mut VisitedSet,
+        state: &mut QueryState,
     ) -> Vec<Witness> {
         let raw = bag.for_attachment(q.attachment);
         let mut out: Vec<Witness> = Vec::with_capacity(raw.len());
@@ -1367,7 +1406,7 @@ impl ReducerRegistry {
                                 name,
                                 *scope,
                                 point,
-                                visited,
+                                state,
                             )
                         }
                         _ => {
@@ -1400,7 +1439,7 @@ impl ReducerRegistry {
                                 receiver,
                                 context: q.context,
                             };
-                            if let ReducedValue::Type(t) = self.query_rec(bag, &sub_q, visited) {
+                            if let ReducedValue::Type(t) = self.query_rec(bag, &sub_q, state) {
                                 Some(t)
                             } else {
                                 None
@@ -1438,7 +1477,7 @@ impl ReducerRegistry {
                         receiver,
                         context: q.context,
                     };
-                    if let ReducedValue::Type(t) = self.query_rec(bag, &sub_q, visited) {
+                    if let ReducedValue::Type(t) = self.query_rec(bag, &sub_q, state) {
                         out.push(Witness {
                             attachment: w.attachment.clone(),
                             source: w.source.clone(),
@@ -1469,7 +1508,7 @@ impl ReducerRegistry {
         var: &str,
         scope: ScopeId,
         point: Point,
-        visited: &mut VisitedSet,
+        state: &mut QueryState,
     ) -> Option<InferredType> {
         let mut chain: Vec<ScopeId> = Vec::new();
         let mut cur = Some(scope);
@@ -1506,7 +1545,7 @@ impl ReducerRegistry {
                 receiver: None,
                 context: Some(&ctx),
             };
-            if let ReducedValue::Type(t) = self.query_rec(bag, &q, visited) {
+            if let ReducedValue::Type(t) = self.query_rec(bag, &q, state) {
                 return Some(t);
             }
         }
@@ -1660,7 +1699,7 @@ pub fn query_variable_type(
     point: Point,
 ) -> Option<InferredType> {
     let reg = ReducerRegistry::with_defaults();
-    let mut visited: VisitedSet = std::collections::HashSet::new();
+    let mut state = QueryState::new();
     reg.query_variable_with_visited(
         bag,
         scopes,
@@ -1671,7 +1710,7 @@ pub fn query_variable_type(
         var,
         scope,
         point,
-        &mut visited,
+        &mut state,
     )
 }
 
