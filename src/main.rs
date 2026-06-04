@@ -118,6 +118,9 @@ fn print_usage() {
     eprintln!("USAGE:");
     eprintln!("  perl-lsp                                              Start LSP server (stdio)");
     eprintln!();
+    eprintln!("  Positions: <line> <col> input is 0-based (col = byte offset);");
+    eprintln!("             printed line:col output is 1-based (col = character).");
+    eprintln!();
     eprintln!("ANALYSIS:");
     eprintln!("  perl-lsp --check [<root>] [--severity error|warning]    Batch diagnostics (CI)");
     eprintln!("                           [--format json|human]");
@@ -306,6 +309,46 @@ fn span_to_json(span: file_analysis::Span, text: String) -> serde_json::Value {
         "end_line": span.end.row, "end_col": span.end.column,
         "new_text": text
     })
+}
+
+/// One-based, character-counted `(line, col)` for human/editor-facing CLI
+/// output. Tree-sitter `Point.column` is a 0-based **byte** offset within the
+/// line; an editor shows a 1-based **character** column. Without the byte→char
+/// step a line with multi-byte UTF-8 before the token reports a column past the
+/// visible position (the "phantom column" QA saw on unicode lines). `source` is
+/// the file's full text; rows past its end fall back to byte+1 (best effort).
+fn display_line_col(source: &str, row: usize, byte_col: usize) -> (usize, usize) {
+    let char_col = source
+        .lines()
+        .nth(row)
+        .map(|line| {
+            let upto = line.get(..byte_col.min(line.len())).unwrap_or(line);
+            upto.chars().count()
+        })
+        .unwrap_or(byte_col);
+    (row + 1, char_col + 1)
+}
+
+/// Per-file source cache for `display_line_col` — references can fan out across
+/// many files; read each at most once. Misses (unreadable file) degrade to the
+/// raw byte column via `display_line_col`'s fallback.
+struct SourceCache(std::collections::HashMap<String, Option<String>>);
+
+impl SourceCache {
+    fn new() -> Self {
+        SourceCache(std::collections::HashMap::new())
+    }
+
+    fn display(&mut self, path: &str, row: usize, byte_col: usize) -> (usize, usize) {
+        let src = self
+            .0
+            .entry(path.to_string())
+            .or_insert_with(|| std::fs::read_to_string(path).ok());
+        match src {
+            Some(s) => display_line_col(s, row, byte_col),
+            None => (row + 1, byte_col + 1),
+        }
+    }
 }
 
 // ---- CLI Commands ----
@@ -560,9 +603,14 @@ fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
             let path = loc.uri.to_file_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| loc.uri.to_string());
-            println!("{}:{}:{}", path,
-                loc.range.start.line + 1,
-                loc.range.start.character + 1);
+            // Same 1-based, char-counted rendering as `--references` so the two
+            // subcommands never disagree on a token's position.
+            let (line, col) = SourceCache::new().display(
+                &path,
+                loc.range.start.line as usize,
+                loc.range.start.character as usize,
+            );
+            println!("{}:{}:{}", path, line, col);
             return;
         }
     }
@@ -597,13 +645,16 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
         // HashKey / Variable / None aren't cross-file callable targets
         // here; emit just the local refs (variables are lexical anyway).
         None => {
+            let mut sources = SourceCache::new();
             let mut results = Vec::new();
             let local = analysis.find_references(point, None, None, Some(&idx));
+            let path_str = file_path.display().to_string();
             for span in &local {
+                let (line, col) = sources.display(&path_str, span.start.row, span.start.column);
                 results.push(serde_json::json!({
-                    "file": file_path.display().to_string(),
-                    "line": span.start.row,
-                    "col": span.start.column,
+                    "file": path_str,
+                    "line": line,
+                    "col": col,
                 }));
             }
             println!("{}", serde_json::to_string_pretty(&results).unwrap());
@@ -622,6 +673,7 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
     let mask = resolve::references_mask_for(&ws, Some(&idx), &target);
     let hits = resolve::refs_to(&ws, Some(&idx), &target, mask);
 
+    let mut sources = SourceCache::new();
     let mut results = Vec::new();
     for loc in hits {
         let path = match &loc.key {
@@ -631,10 +683,11 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| u.to_string()),
         };
+        let (line, col) = sources.display(&path, loc.span.start.row, loc.span.start.column);
         results.push(serde_json::json!({
             "file": path,
-            "line": loc.span.start.row,
-            "col": loc.span.start.column,
+            "line": line,
+            "col": col,
         }));
     }
     println!("{}", serde_json::to_string_pretty(&results).unwrap());
