@@ -3531,3 +3531,125 @@ sub private_helper { 2 }
         diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
     );
 }
+
+/// TASK B.1 — goto-def on an imported-function CALL SITE one-hops to the
+/// DEFINING sub in the provider module, not the consumer's local `use` line.
+/// The producer module is cached, so `sub_info(remote).def_line()` resolves;
+/// the response must be a Scalar landing on that line in the .pm.
+#[test]
+fn imported_function_call_goto_def_reaches_module_sub() {
+    let provider_src = "package My::Util;\n\
+our @EXPORT_OK = qw(helper_fn);\n\
+sub helper_fn {\n\
+  my ($x) = @_;\n\
+  return $x * 2;\n\
+}\n\
+1;\n";
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    idx.register_workspace_module(
+        std::path::PathBuf::from("/tmp/perl_lsp_pin_My_Util.pm"),
+        std::sync::Arc::new(parse_analysis(provider_src)),
+    );
+
+    let consumer_src = "use My::Util qw(helper_fn);\n\
+my $v = helper_fn(21);\n";
+    let consumer = parse_analysis(consumer_src);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(consumer_src, None).unwrap();
+
+    // Cursor on the `helper_fn` token at the call site (line 1, not the use line).
+    let byte = consumer_src.find("helper_fn(21)").expect("call site present");
+    let prefix = &consumer_src[..byte];
+    let pos = Position {
+        line: prefix.matches('\n').count() as u32,
+        character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
+    };
+
+    let uri = Url::parse("file:///consumer.pl").unwrap();
+    let resp = find_definition(&consumer, pos, &uri, &idx, &tree, consumer_src);
+    let loc = match resp {
+        Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+        other => panic!("expected a single-hop Scalar to the module sub, got {other:?}"),
+    };
+    assert!(
+        loc.uri.path().ends_with("My_Util.pm"),
+        "goto-def should land in the provider file, got {}",
+        loc.uri,
+    );
+    // `sub helper_fn` is the 3rd line (0-based row 2) of the provider source.
+    assert_eq!(
+        loc.range.start.line, 2,
+        "should land on the defining `sub helper_fn` line, not the consumer's use stmt",
+    );
+}
+
+/// TASK B.2 — goto-def on the INVOCANT class-name token in `Foo->bar()`
+/// resolves to the `package Foo` decl (a PackageRef), exactly like `use Foo`.
+/// The narrower PackageRef at the bareword span must win over the wider
+/// MethodCall ref describing `bar`.
+#[test]
+fn class_invocant_goto_def_reaches_package_decl() {
+    let source = "package Foo;\n\
+sub bar { 42 }\n\
+sub new { bless {}, shift }\n\
+package main;\n\
+Foo->bar();\n";
+    let analysis = parse_analysis(source);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+
+    // Cursor on the `Foo` invocant in `Foo->bar()`.
+    let byte = source.find("Foo->bar").expect("invocant present");
+    let prefix = &source[..byte];
+    let pos = Position {
+        line: prefix.matches('\n').count() as u32,
+        character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32 + 1,
+    };
+    let uri = Url::parse("file:///test.pl").unwrap();
+    let resp = find_definition(&analysis, pos, &uri, &idx, &tree, source);
+    let loc = match resp {
+        Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+        other => panic!("expected goto-def on class invocant, got {other:?}"),
+    };
+    assert_eq!(
+        loc.range.start.line, 0,
+        "`Foo` invocant should resolve to `package Foo;` (line 0), not the constructor or method",
+    );
+}
+
+/// TASK B.2 regression guard — the METHOD token (`bar`) in `Foo->bar()` must
+/// still resolve to the `sub bar` decl (NAV-A's precise method ref), NOT the
+/// package. Emitting the invocant PackageRef must not shadow the method token.
+#[test]
+fn method_token_goto_def_unaffected_by_invocant_package_ref() {
+    let source = "package Foo;\n\
+sub bar { 42 }\n\
+package main;\n\
+Foo->bar();\n";
+    let analysis = parse_analysis(source);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+
+    // Cursor on the `bar` method token.
+    let byte = source.rfind("bar()").expect("method token present");
+    let prefix = &source[..byte];
+    let pos = Position {
+        line: prefix.matches('\n').count() as u32,
+        character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
+    };
+    let uri = Url::parse("file:///test.pl").unwrap();
+    let resp = find_definition(&analysis, pos, &uri, &idx, &tree, source);
+    let loc = match resp {
+        Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+        other => panic!("expected goto-def on method token, got {other:?}"),
+    };
+    assert_eq!(
+        loc.range.start.line, 1,
+        "`bar` method token should resolve to `sub bar` (line 1), not the package decl",
+    );
+}

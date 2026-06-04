@@ -209,38 +209,39 @@ pub fn find_definition(
                 // sub_info lookup uses REMOTE name — distinct from
                 // target_name for renaming imports.
                 if let Ok(module_uri) = Url::from_file_path(&module_path) {
-                    // Try to get the actual definition line from the module index.
+                    // The defining sub's line in the .pm — `Some` only when the
+                    // module is cached and the remote name resolves to a sub.
                     let def_line = module_index
                         .get_cached(&import.module_name)
                         .and_then(|cached| cached.sub_info(&remote_name).map(|s| s.def_line()));
-                    let def_range = match def_line {
-                        Some(line) => Range {
-                            start: Position { line, character: 0 },
-                            end: Position { line, character: 0 },
-                        },
-                        None => Range::default(),
-                    };
 
-                    let pm_location = Location {
-                        uri: module_uri,
-                        range: def_range,
-                    };
-
-                    // If cursor is inside the use statement itself (on the import name),
-                    // jump directly to the .pm definition — no need to also show the use stmt.
-                    if contains_point(&import.span, point) {
-                        return Some(GotoDefinitionResponse::Scalar(pm_location));
+                    // One-hop to the defining sub whenever we actually know
+                    // where it is (cursor on the call site OR on the import
+                    // name). Landing on the local `use` line was never the
+                    // goal — it's the consumer's import, not the definition.
+                    // The two-element Array (use stmt + def) made many editors
+                    // jump to the first entry = the `use` line. When the module
+                    // isn't cached (`def_line` is None) we can't pin the sub, so
+                    // fall back to the local `use` statement — an acceptable
+                    // landing until the resolver warms that module.
+                    if let Some(line) = def_line {
+                        return Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: module_uri,
+                            range: Range {
+                                start: Position { line, character: 0 },
+                                end: Position { line, character: 0 },
+                            },
+                        }));
                     }
 
-                    return Some(GotoDefinitionResponse::Array(vec![
-                        // First: the use statement in this file
-                        Location {
-                            uri: uri.clone(),
-                            range: span_to_range(import.span),
-                        },
-                        // Second: the sub definition in the .pm file
-                        pm_location,
-                    ]));
+                    // Cursor on the import name with an unresolved def: jump to
+                    // the top of the .pm (better than the consumer's use line).
+                    if contains_point(&import.span, point) {
+                        return Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: module_uri,
+                            range: Range::default(),
+                        }));
+                    }
                 }
                 // Fall back to just the use statement
                 return Some(GotoDefinitionResponse::Scalar(Location {

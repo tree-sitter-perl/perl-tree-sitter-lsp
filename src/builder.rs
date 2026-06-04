@@ -8052,7 +8052,7 @@ impl<'a> Builder<'a> {
         // wins), which lets the existing FunctionCall paths (semantic
         // tokens, hover, gd) light up the bareword as the call it is.
         if let Some(inv_node) = invocant_node {
-            if inv_node.kind() == "bareword" {
+            if matches!(inv_node.kind(), "bareword" | "package") {
                 if let Ok(bw_text) = inv_node.utf8_text(self.source) {
                     // Find the matching sub and capture its package so
                     // the FunctionCall ref's `resolved_package` points
@@ -8066,6 +8066,22 @@ impl<'a> Builder<'a> {
                     if let Some(pkg) = matched_pkg {
                         self.add_ref(
                             RefKind::FunctionCall { resolved_package: pkg },
+                            node_to_span(inv_node),
+                            bw_text.to_string(),
+                            AccessKind::Read,
+                        );
+                    } else if bw_text != "__PACKAGE__" {
+                        // Class-name invocant (`Foo->bar`): the bareword is a
+                        // package, not a local sub. Emit a narrower PackageRef
+                        // at the invocant span so cursor-on-`Foo` resolves to
+                        // the `package Foo` decl (local via find_package_or_class,
+                        // cross-file via the module index) exactly like `use Foo`,
+                        // instead of falling through to the wider MethodCall ref
+                        // that describes `bar`. ref_at prefers the narrower span,
+                        // so the `bar` method-token goto-def (NAV-A) is untouched.
+                        // `__PACKAGE__` is excluded — it's a keyword, not a name.
+                        self.add_ref(
+                            RefKind::PackageRef,
                             node_to_span(inv_node),
                             bw_text.to_string(),
                             AccessKind::Read,
