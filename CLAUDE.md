@@ -68,7 +68,7 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 
 ### File map
 
-- `main.rs` — entry, CLI modes (`--rename`, `--workspace-symbol`, `--dump-package`, `--parse`, `--version`). `cli_full_startup(root)` = "act like LSP just started". `perl-lsp --parse <file|-->` prints the tree-sitter parse tree (`--` reads stdin) — use it to check node kinds/fields instead of guessing.
+- `main.rs` — entry, CLI modes (`--rename`, `--workspace-symbol`, `--dump-package`, `--parse`, `--clear-cache`, `--version`). `cli_full_startup(root)` = "act like LSP just started". `perl-lsp --parse <file|-->` prints the tree-sitter parse tree (`--` reads stdin) — use it to check node kinds/fields instead of guessing. `perl-lsp --clear-cache [<root>]` wipes the SQLite module cache — with `<root>` only that project's hashed cache dir, without it the whole `~/.cache/perl-lsp` tree. Prefer this over `rm -rf` (it canonicalizes `<root>` to the same hash the server writes under).
 - `backend.rs` — `LanguageServer` impl, request routing.
 - `document.rs` — open-file `Document` (tree + text + analysis + stable_outline).
 - `file_store.rs` — unified store for open + workspace FileAnalyses, role-tagged, dedup'd by path.
@@ -89,7 +89,7 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 - `ModuleIndex` runs a dedicated `std::thread` for FS I/O (never blocks tokio). `Arc<DashMap>` shared with async handlers.
 - `CachedModule { path, analysis: Arc<FileAnalysis> }` — full FileAnalysis survives module boundary (refs, type_constraints, call_bindings, framework_imports, package_parents). `SubInfo<'_>` view gives ExportedSub-style accessors.
 - Reverse index: `DashMap<func_name, Vec<module_name>>` for O(1) exporter lookup.
-- SQLite cache per project at `~/.cache/perl-lsp/<hash>/modules.db`. `EXTRACT_VERSION` bump triggers priority re-resolution without dropping the table.
+- SQLite cache per project at `~/.cache/perl-lsp/<hash>/modules.db` (honors `$XDG_CACHE_HOME`). `EXTRACT_VERSION` bump triggers priority re-resolution without dropping the table. To nuke it (e.g. before a cold-start repro), use `perl-lsp --clear-cache [<root>]` — not `rm -rf`.
 - **Plugin fingerprint** — bundled plugin sources + every `.rhai` in `$PERL_LSP_PLUGIN_DIR` are hashed. Mismatch on startup hard-clears modules table (same machinery as `validate_inc_paths`). Editing a plugin invalidates cache so QA isn't served stale blobs.
 - Async handlers only call `_cached` methods (zero I/O).
 - After resolution, diagnostics refresh for all open files (clears stale false positives).
