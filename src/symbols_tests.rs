@@ -4081,41 +4081,4 @@ fn diagnostic_and_gotodef_agree_on_bound_set() {
     }
 }
 
-#[test]
-fn dbg_fq_var() {
-    let provider_src = "package My::Vars;\nour $config = 1;\n1;\n";
-    let provider = parse_analysis(provider_src);
-    eprintln!("SYMS: {:?}", provider.symbols.iter().map(|s| (&s.name, &s.kind, &s.package)).collect::<Vec<_>>());
-    let idx = crate::module_index::ModuleIndex::new_for_test();
-    idx.register_workspace_module(std::path::PathBuf::from("/tmp/perl_lsp_pin_My_Vars.pm"), std::sync::Arc::new(provider));
-    eprintln!("path_cached: {:?}", idx.module_path_cached("My::Vars"));
-    eprintln!("get_cached present: {:?}", idx.get_cached("My::Vars").is_some());
-    if let Some(c) = idx.get_cached("My::Vars") {
-        eprintln!("var_def_line: {:?}", c.package_var_def_line("$config", "My::Vars"));
-    }
-    let consumer_src = "package Main;\nmy $h = $My::Vars::config;\n1;\n";
-    let consumer = parse_analysis(consumer_src);
-    for r in &consumer.refs {
-        eprintln!("REF: {} kind={:?} qvt={:?}", r.target_name, r.kind, r.qualified_var_target());
-    }
-}
 
-#[test]
-fn dbg_fq_var2() {
-    let provider_src = "package My::Vars;\nour $config = 1;\n1;\n";
-    let provider = parse_analysis(provider_src);
-    let idx = crate::module_index::ModuleIndex::new_for_test();
-    idx.register_workspace_module(std::path::PathBuf::from("/tmp/perl_lsp_pin_My_Vars.pm"), std::sync::Arc::new(provider));
-    let consumer_src = "package Main;\nmy $h = $My::Vars::config;\n1;\n";
-    let consumer = parse_analysis(consumer_src);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(consumer_src, None).unwrap();
-    let byte = consumer_src.find("config;").unwrap();
-    let prefix = &consumer_src[..byte];
-    let pos = Position { line: prefix.matches('\n').count() as u32, character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32 };
-    eprintln!("POS: {:?}", pos);
-    let pt = position_to_point(pos);
-    eprintln!("ref_at: {:?}", consumer.ref_at(pt).map(|r| (&r.target_name, &r.kind)));
-    eprintln!("local find_def: {:?}", consumer.find_definition(pt, Some(&tree), Some(consumer_src.as_bytes()), Some(&idx)));
-}
