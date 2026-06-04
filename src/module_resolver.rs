@@ -434,6 +434,14 @@ fn insert_into_cache(
                 .or_default()
                 .push(module_name.to_string());
         }
+    } else if matches!(cache.get(module_name).as_deref(), Some(Some(_))) {
+        // On-demand @INC resolution missed this module (`None`), but the
+        // workspace indexer already built it (e.g. a project module under a
+        // relative `use lib` the resolver's @INC doesn't cover). Don't let
+        // the miss clobber the indexed copy — and don't leave the reverse
+        // index pointing at a module the cache no longer holds (the orphan
+        // that broke cross-file Handler / dispatch lookup). Keep the Some.
+        return;
     }
     cache.insert(module_name.to_string(), result);
 }
