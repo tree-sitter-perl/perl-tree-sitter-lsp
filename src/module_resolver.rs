@@ -547,9 +547,16 @@ fn resolve_and_parse_inner(
     }
     let bytes = metadata.len();
     let source = std::fs::read_to_string(&path).ok()?;
-    let tree = parser.parse(&source, None)?;
 
+    let timing = crate::timings::is_enabled();
+    let t_parse = if timing { Some(std::time::Instant::now()) } else { None };
+    let tree = parser.parse(&source, None)?;
+    let parse_dur = t_parse.map(|s| s.elapsed()).unwrap_or_default();
+
+    let t_build = if timing { Some(std::time::Instant::now()) } else { None };
     let mut analysis = crate::builder::build(&tree, source.as_bytes());
+    let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
+    crate::timings::record_built(module_name, parse_dur, build_dur);
 
     // If this module has no exports but inherits via @ISA (e.g. DDP → Data::Printer),
     // fall back to the first parent's exports. This only patches `export`/`export_ok`;
@@ -647,12 +654,25 @@ pub fn index_workspace_with_index(
 
     let count = AtomicUsize::new(0);
 
+    let timing = crate::timings::is_enabled();
     paths.par_iter().for_each(|path| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let source = std::fs::read_to_string(path).ok()?;
             let mut parser = create_parser();
+            let t_parse = if timing { Some(std::time::Instant::now()) } else { None };
             let tree = parser.parse(&source, None)?;
-            Some(crate::builder::build(&tree, source.as_bytes()))
+            let parse_dur = t_parse.map(|s| s.elapsed()).unwrap_or_default();
+            let t_build = if timing { Some(std::time::Instant::now()) } else { None };
+            let analysis = crate::builder::build(&tree, source.as_bytes());
+            let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
+            if timing {
+                crate::timings::record_built(
+                    path.strip_prefix(root).unwrap_or(path).display().to_string(),
+                    parse_dur,
+                    build_dur,
+                );
+            }
+            Some(analysis)
         }));
 
         match result {
