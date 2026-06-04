@@ -1202,6 +1202,30 @@ fn receiver_key(r: &Option<InferredType>) -> Option<String> {
     r.as_ref().map(|t| format!("{t:?}"))
 }
 
+/// Receiver to substitute when a chase reaches a *fresh* method dispatch
+/// on `MethodOnClass{class}` (an `Edge` or `CallReturn` into a class's
+/// method): the receiver is that call's invocant, i.e. `class`. A fluent
+/// `ReturnExpr(Receiver)` substitutes the dispatch class.
+///
+/// But when the outer query already carries the invocant's *resolved
+/// value* and that value's class identity IS `class`, prefer the richer
+/// value — it carries parametric structure (`Parametric(ResultSet{base,
+/// row})`) that a bare `ClassName(class)` drops, which is exactly what
+/// `Operator(RowOf(Receiver))` (DBIC `find`) needs to project the row
+/// class. Same class, strictly more information; the value answers the
+/// projection (rule #10), the chase never inspects the shape.
+fn fresh_dispatch_receiver(
+    incoming: &Option<InferredType>,
+    class: &str,
+) -> Option<InferredType> {
+    if let Some(t) = incoming {
+        if t.class_name() == Some(class) {
+            return Some(t.clone());
+        }
+    }
+    Some(InferredType::ClassName(class.to_string()))
+}
+
 /// Depth backstop for `query_rec`. The `(bag, attachment)` visited set is
 /// the primary cycle guard; this cap is belt-and-braces against a new,
 /// unaccounted-for recursion shape blowing the stack. On hit, log once
@@ -1537,7 +1561,7 @@ impl ReducerRegistry {
                                         WitnessAttachment::MethodOnClass { .. }
                                     ) =>
                                 {
-                                    Some(InferredType::ClassName(class.clone()))
+                                    fresh_dispatch_receiver(&q.receiver, class)
                                 }
                                 _ => q.receiver.clone(),
                             };
@@ -1575,7 +1599,7 @@ impl ReducerRegistry {
                     // query's — that's the whole point of this variant.
                     let receiver = match target {
                         WitnessAttachment::MethodOnClass { class, .. } => {
-                            Some(InferredType::ClassName(class.clone()))
+                            fresh_dispatch_receiver(&q.receiver, class)
                         }
                         _ => q.receiver.clone(),
                     };

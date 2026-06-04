@@ -2499,12 +2499,43 @@ impl FileAnalysis {
             package_parents: &self.package_parents,
             app_surface_consumers: &self.app_surface_consumers,
             };
+        // Thread the receiver's resolved type so a receiver-relative
+        // return (`Operator(RowOf(Receiver))` — DBIC `find`/`search`)
+        // projects at query time, exactly as the build-time chain typer
+        // threads `q.receiver`. The receiver lives at the call ref's
+        // `invocant_span`; resolve it tree-free via `expr_type_at_span`
+        // (recurses through inner chain hops). This is what lets a
+        // chained-method-return invocant — `$rs->find(1)->name`, where
+        // `->name`'s receiver is the `find` call, not a variable — type
+        // `find`'s return as the Row class without an intermediate var.
+        let own_span = self.refs[ref_idx].span;
+        let receiver = if let RefKind::MethodCall { invocant_span: Some(span), .. } =
+            &self.refs[ref_idx].kind
+        {
+            // Only chase a receiver whose span is STRICTLY inside the
+            // call's own span — a genuine inner chain hop. Equal-or-wider
+            // spans (degenerate overlapping refs route branding can emit)
+            // would recurse back onto this same call; skipping them keeps
+            // the receiver `None` (build-time chain typing already pinned
+            // those via `bag_query_expression`).
+            let strictly_inside = (span.start.row, span.start.column)
+                >= (own_span.start.row, own_span.start.column)
+                && (span.end.row, span.end.column) <= (own_span.end.row, own_span.end.column)
+                && *span != own_span;
+            if strictly_inside {
+                self.expr_type_at_span(*span, module_index)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let q = ReducerQuery {
             attachment: &att,
             point: None,
             framework: FrameworkFact::Plain,
             arity_hint: None,
-            receiver: None,
+            receiver,
             context: Some(&ctx),
         };
         match reg.query(&self.witnesses, &q) {
@@ -2581,6 +2612,33 @@ impl FileAnalysis {
         span: Span,
         module_index: Option<&ModuleIndex>,
     ) -> Option<InferredType> {
+        // Depth backstop for the `expr_type_at_span` ⇄
+        // `method_call_return_type_via_bag` mutual recursion (the latter
+        // resolves a chained call's receiver by recursing here on the
+        // receiver's span). Spans shrink monotonically per hop, so a
+        // healthy chain bottoms out fast; this cap guards against a
+        // degenerate ref topology (overlapping same-span refs the
+        // builder can emit for route-branded chains) spinning the stack.
+        thread_local! {
+            static EXPR_SPAN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        const EXPR_SPAN_DEPTH_CAP: u32 = 64;
+        let depth = EXPR_SPAN_DEPTH.with(|d| {
+            let n = d.get();
+            d.set(n + 1);
+            n
+        });
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                EXPR_SPAN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        let _guard = DepthGuard;
+        if depth >= EXPR_SPAN_DEPTH_CAP {
+            return None;
+        }
+
         // A call whose span IS this expression — its return type. The
         // exact-span match is what distinguishes "the value of
         // `$f->get_bar()->get_name()`" (the outer call's return) from
@@ -4109,36 +4167,25 @@ impl FileAnalysis {
                         }
                     }
 
-                    // Method dispatch reads the frozen edge: `Local` lands
-                    // directly on the local symbol; `CrossFile` returns None
-                    // so the LSP adapter resolves via ModuleIndex with the
-                    // correct URI. A `None` edge (invocant didn't infer) also
-                    // returns None — honest miss, never a confident wrong jump
-                    // to the package decl (NAV (a)).
+                    // Method dispatch is the frozen edge, full stop.
+                    // `Local` lands on the local symbol; `CrossFile`
+                    // returns None so the LSP adapter resolves via the
+                    // ModuleIndex; a `None` edge (invocant didn't infer —
+                    // genuinely untyped receiver, e.g. `my $x = external();
+                    // $x->m`) returns None: honest miss. There is NO
+                    // same-name fallback — a typed OR chained-method-return
+                    // receiver now carries a real edge
+                    // (`method_call_invocant_class` resolves chain
+                    // receivers via `expr_type_at_span`), so jumping to an
+                    // arbitrary same-named sub when the class can't infer is
+                    // never right (the `->new` / `'Users#create'` flood, the
+                    // libwww untyped-receiver case).
                     match &r.resolved_method_target {
                         Some(MethodTarget::Local { sym_id, .. }) => {
                             return Some(self.symbol(*sym_id).selection_span);
                         }
-                        Some(MethodTarget::CrossFile { .. }) => {
+                        Some(MethodTarget::CrossFile { .. }) | None => {
                             return None;
-                        }
-                        None => {}
-                    }
-                    // Last-resort "any sub/method with that name" fallback.
-                    // Only fires when we couldn't resolve the invocant at
-                    // all — if we knew the target class but couldn't find
-                    // the method there, jumping to an unrelated sub is
-                    // actively harmful (plugin-emitted MethodCallRefs
-                    // targeting `'Users#create'` would otherwise latch
-                    // onto a `create` helper synthesized on some unrelated
-                    // class). Returning None is better — the LSP adapter
-                    // can still try cross-file paths.
-                    if class_name.is_none() {
-                        for &sid in self.symbols_named(&r.target_name) {
-                            let sym = self.symbol(sid);
-                            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                                return Some(sym.selection_span);
-                            }
                         }
                     }
                 }

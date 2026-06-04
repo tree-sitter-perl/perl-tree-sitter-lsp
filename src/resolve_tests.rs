@@ -484,6 +484,67 @@ sub run {
     );
 }
 
+/// NAV honest-miss: a genuinely-untyped receiver — `my $x =
+/// external(); $x->m()` — has no inferable class, so NO dispatch edge
+/// is stamped, and goto-def returns `None`. It must NEVER jump to an
+/// arbitrary same-named sub (the deleted same-name fallback). This is
+/// the libwww case: `$ua->get` where `$ua` came from an opaque
+/// constructor we can't see.
+#[test]
+fn goto_def_untyped_receiver_is_honest_miss() {
+    use tree_sitter::{Parser, Point};
+    let src = r#"package Foo;
+sub m { 1 }
+package main;
+my $x = external();
+$x->m();
+"#;
+    let mut parser = Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let fa = crate::builder::build(&tree, src.as_bytes());
+    // Cursor on `m` in `$x->m()`.
+    let row = src.lines().position(|l| l.starts_with("$x->m")).unwrap();
+    let col = "$x->".len();
+    let def = fa.find_definition(Point::new(row, col), Some(&tree), Some(src.as_bytes()), None);
+    assert_eq!(
+        def, None,
+        "untyped `$x->m` (where $x = external()) must be an honest miss, \
+         never a same-name jump to Foo::m. got: {:?}",
+        def,
+    );
+}
+
+/// NAV honest-miss, multi-candidate flood guard: two unrelated classes
+/// both define `frob`. An untyped `$x->frob` must resolve to `None` —
+/// no flood of arbitrary same-named subs. With the same-name fallback
+/// gone, the absence of an edge is the only answer.
+#[test]
+fn goto_def_untyped_receiver_multi_candidate_no_flood() {
+    use tree_sitter::{Parser, Point};
+    let src = r#"package A;
+sub frob { 1 }
+package B;
+sub frob { 2 }
+package main;
+my $x = make_something();
+$x->frob;
+"#;
+    let mut parser = Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let fa = crate::builder::build(&tree, src.as_bytes());
+    let row = src.lines().position(|l| l.starts_with("$x->frob")).unwrap();
+    let col = "$x->".len();
+    let def = fa.find_definition(Point::new(row, col), Some(&tree), Some(src.as_bytes()), None);
+    assert_eq!(
+        def, None,
+        "untyped `$x->frob` with two unrelated `frob` definitions must \
+         be None — no same-name flood. got: {:?}",
+        def,
+    );
+}
+
 /// Adversarial #3: Corinna classes with same method name. Both
 /// call shapes must class-resolve correctly:
 ///

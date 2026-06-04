@@ -387,6 +387,73 @@ my $name = $schema->resultset('Schema::Result::Users')->find(1)->name;
     );
 }
 
+/// NAV chained-return edge: the `$rs->find(1)->name` dispatch must
+/// resolve through a REAL stamped `resolved_method_target` edge — not
+/// the deleted same-name fallback. The receiver of `->name` is the
+/// `find` method call (a chained method return, not a variable);
+/// `method_call_invocant_class` resolves it via `expr_type_at_span`
+/// (RowOf projection over the parametric `find` receiver) and freezes a
+/// `Local` edge to the Row accessor. Pins that the edge is present so
+/// the fallback's removal is provably safe; goto-def + references both
+/// ride the edge.
+#[test]
+fn chained_method_return_dispatch_resolves_via_stamped_edge() {
+    let src = format!(
+        "{}
+package main;
+my $schema;
+my $name = $schema->resultset('Schema::Result::Users')->find(1)->name;
+",
+        USERS_RESULT,
+    );
+    let (fa, _tree) = parse_with_tree(&src);
+    // The trailing `->name` MethodCall ref must carry a stamped Local
+    // edge (the load-bearing fact, not just the goto-def output).
+    let name_ref = fa
+        .refs
+        .iter()
+        .find(|r| matches!(&r.kind, RefKind::MethodCall { invocant, .. }
+            if invocant.ends_with("->find(1)"))
+            && r.target_name == "name")
+        .expect("trailing ->name MethodCall ref");
+    assert!(
+        matches!(
+            &name_ref.resolved_method_target,
+            Some(crate::file_analysis::MethodTarget::Local { invocant_class, .. })
+                if invocant_class == "Schema::Result::Users"
+        ),
+        "chained `$$rs->find(1)->name` must carry a stamped Local edge \
+         to the Row accessor (class Schema::Result::Users), proving \
+         resolution rides the edge not the deleted same-name fallback. \
+         got: {:?}",
+        name_ref.resolved_method_target,
+    );
+
+    // References for the Row's `name` method must include the chained
+    // call site — it resolves through the same frozen edge as goto-def.
+    let store = FileStore::new();
+    store.insert_workspace(PathBuf::from("/tmp/nav_chained_return.pm"), fa);
+    let refs = refs_to(
+        &store,
+        None,
+        &TargetRef {
+            name: "name".to_string(),
+            kind: TargetKind::Method {
+                class: "Schema::Result::Users".to_string(),
+            },
+            method_classes: Vec::new(),
+        },
+        RoleMask::EDITABLE,
+    );
+    let call_row = point_at(&src, "->name").row;
+    assert!(
+        refs.iter().any(|r| r.span.start.row == call_row),
+        "references for the Row `name` method must include the chained \
+         `->name` call site (row {call_row}). got: {:?}",
+        refs.iter().map(|r| r.span.start.row).collect::<Vec<_>>(),
+    );
+}
+
 /// (j) **Custom ResultSet method discovery**. `$schema->resultset('Users')`
 /// should offer methods defined on the `*::ResultSet::Users`
 /// class (a custom resultset that inherits from
