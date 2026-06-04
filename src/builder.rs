@@ -209,6 +209,8 @@ fn build_with_plugins_inner(
         framework_modes: std::collections::HashMap::new(),
         framework_imports: std::collections::HashSet::new(),
         constant_strings: std::collections::HashMap::new(),
+        declared_constants: std::collections::HashMap::new(),
+        export_member_sites: Vec::new(),
         export: Vec::new(),
         export_ok: Vec::new(),
         plugin_namespaces: Vec::new(),
@@ -310,6 +312,11 @@ fn build_with_plugins_inner(
 
     // Post-pass 1: resolve variable refs -> resolves_to
     b.resolve_variable_refs();
+
+    // Export-list member refs: a `@EXPORT` / `@EXPORT_OK` / `%EXPORT_TAGS`
+    // member naming a local sub gets a FunctionCall ref back to it. Runs
+    // post-walk because subs are usually declared after the export list.
+    b.emit_export_member_refs();
 
     // Post-pass 2: resolve hash key owners from type constraints
     b.resolve_hash_key_owners();
@@ -1069,6 +1076,18 @@ struct Builder<'a> {
     /// Known compile-time string values, accumulated during the walk.
     /// Keyed by variable/constant name (e.g. "@COMMON", "BASE_CLASS", "$PREFIX").
     constant_strings: std::collections::HashMap<String, Vec<String>>,
+    /// Names declared via `use constant` (NAME and block forms), per the
+    /// enclosing package. A standalone bareword whose text is in this set is
+    /// a usage of the constant sub, so it earns a `FunctionCall` ref back to
+    /// the def (rule #7). Recognized by set membership, never by name pattern.
+    declared_constants: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Export-list member token sites: (member name, span, enclosing package).
+    /// Each member of `@EXPORT` / `@EXPORT_OK` / `%EXPORT_TAGS` value arrays
+    /// that names a local sub earns a `FunctionCall` ref to that sub, emitted
+    /// in a post-walk pass (subs are typically declared after the export list,
+    /// so the local-sub filter can't run live). Tag-name keys never enter this
+    /// list, so they get no ref (rule #7 narrow scope).
+    export_member_sites: Vec<(String, Span, Option<String>)>,
     /// Exported function names from @EXPORT assignments.
     export: Vec<String>,
     /// Exported function names from @EXPORT_OK assignments.
@@ -2842,6 +2861,16 @@ impl<'a> Builder<'a> {
                 }
             }
 
+            // Standalone bareword usage of a `use constant` name:
+            // `my $n = MAX_RETRIES`, `foo(TIMEOUT)`, `$n > MAX_RETRIES`.
+            // The def is a local parameterless Sub symbol; emit a FunctionCall
+            // ref so goto-def reaches it and references lists the usage (rule
+            // #7). Recognized by membership in `declared_constants`, never by
+            // name pattern (rule #10). The call-name position (`MAX_RETRIES()`)
+            // is already reffed by `visit_function_call`; skip it here so the
+            // narrowest-span ref isn't duplicated.
+            "bareword" => self.visit_const_usage(node),
+
             // Hash construction
             "anonymous_hash_expression" => self.visit_anon_hash(node),
 
@@ -4362,8 +4391,50 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Emit a `FunctionCall` ref for a standalone bareword that names a
+    /// `use constant` declared in the enclosing package. Resolution is
+    /// by-name post-walk (same as any FunctionCall ref), so it points at the
+    /// constant's Sub symbol — giving goto-def and references on the usage.
+    fn visit_const_usage(&mut self, node: Node<'a>) {
+        let pkg = match self.current_package.as_ref() {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let name = match node.utf8_text(self.source) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let is_declared = self
+            .declared_constants
+            .get(&pkg)
+            .is_some_and(|set| set.contains(name));
+        if !is_declared {
+            return;
+        }
+        // A `MAX_RETRIES()` call already gets its FunctionCall ref from
+        // `visit_function_call` (the `function` field). Don't double-emit.
+        if let Some(parent) = node.parent() {
+            if matches!(
+                parent.kind(),
+                "function_call_expression" | "ambiguous_function_call_expression"
+            ) && parent.child_by_field_name("function").map(|f| f.id()) == Some(node.id())
+            {
+                return;
+            }
+        }
+        self.add_ref(
+            RefKind::FunctionCall { resolved_package: Some(pkg) },
+            node_to_span(node),
+            name.to_string(),
+            AccessKind::Read,
+        );
+    }
+
     /// Register a single `use constant` name as a parameterless Sub symbol.
     fn register_constant_symbol(&mut self, name: &str, name_node: Node<'a>) {
+        if let Some(pkg) = self.current_package.clone() {
+            self.declared_constants.entry(pkg).or_default().insert(name.to_string());
+        }
         let span = node_to_span(name_node);
         self.add_symbol(
             name.to_string(),
@@ -4788,6 +4859,7 @@ impl<'a> Builder<'a> {
                 for i in 0..node.named_child_count() {
                     if let Some(child) = node.named_child(i) {
                         names.extend(self.extract_string_names(child));
+                        self.record_export_member_sites(child);
                     }
                 }
                 // Union, not clobber: runtime-exporter discovery (`:Export`
@@ -5996,6 +6068,7 @@ impl<'a> Builder<'a> {
             // bareword/string keys are selectors, not subs, so they're skipped.
             if child.kind() == "anonymous_array_expression" {
                 names.extend(self.extract_string_names(child));
+                self.record_export_member_sites(child);
             }
         }
         // Tag members are sub names exactly like `@EXPORT_OK` entries; drop
@@ -6031,6 +6104,55 @@ impl<'a> Builder<'a> {
             {
                 self.fold_export_tags_table(child);
             }
+        }
+    }
+
+    /// Record export-list member tokens under `node` (their per-word spans)
+    /// so the post-walk pass can ref the ones that name a local sub. Applies
+    /// the same sub-name filter as the export-surface folds: sigil'd globals
+    /// and `-tag` / `:group` selectors aren't subs and never get a ref.
+    fn record_export_member_sites(&mut self, node: Node<'a>) {
+        let pkg = self.current_package.clone();
+        for (text, span) in self.extract_string_list(node) {
+            if text
+                .chars()
+                .next()
+                .map_or(false, |c| c == '_' || c.is_ascii_alphabetic())
+            {
+                self.export_member_sites.push((text, span, pkg.clone()));
+            }
+        }
+    }
+
+    /// Emit a `FunctionCall` ref for each recorded export-member site whose
+    /// name matches a local `Sub`/`Method` symbol in the same package. Runs
+    /// post-walk so forward-declared subs (the export list precedes them) are
+    /// visible. A member that names no local sub (or a tag-name key, which is
+    /// never recorded) produces no ref — so references/goto-def stay clean.
+    fn emit_export_member_refs(&mut self) {
+        let sites = std::mem::take(&mut self.export_member_sites);
+        for (name, span, pkg) in sites {
+            let is_local_sub = self.symbols.iter().any(|s| {
+                s.name == name
+                    && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                    && s.package == pkg
+            });
+            if !is_local_sub {
+                continue;
+            }
+            // Post-walk: the scope stack is empty, so `add_ref`'s
+            // `current_scope()` would panic. The file scope is the right home
+            // for an export-list ref anyway (it sits at package top level).
+            let scope = self.scopes.first().map(|s| s.id).unwrap_or(ScopeId(0));
+            self.refs.push(Ref {
+                kind: RefKind::FunctionCall { resolved_package: pkg },
+                span,
+                scope,
+                target_name: name,
+                access: AccessKind::Read,
+                resolves_to: None,
+                resolved_method_target: None,
+            });
         }
     }
 
