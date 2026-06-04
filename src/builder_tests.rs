@@ -12589,3 +12589,96 @@ sub run { return MAX_RETRIES(); }
         .count();
     assert_eq!(n, 1, "MAX_RETRIES() call must get exactly one FunctionCall ref");
 }
+
+/// AutoLoader-backed package: subs after `__END__` live in the opaque
+/// `data_section`, but they are runtime-live via AUTOLOAD. They must surface
+/// as navigable Sub symbols with file-offset spans, with POD between them
+/// skipped, and goto-def from an in-package caller must reach them.
+#[test]
+fn autoloader_data_section_subs_synthesized() {
+    let src = "package My::AL;\n\
+               use AutoLoader qw(AUTOLOAD);\n\
+               sub uses_them { want_read(); }\n\
+               1;\n\
+               __END__\n\
+               sub want_read { return 42 }\n\
+               sub get_https { do_httpx2(GET => 1, @_) }\n\
+               =pod\n\
+               junk\n\
+               =cut\n\
+               sub after_pod ($;$) { return 1 }\n";
+    let fa = build_fa(src);
+
+    let names: std::collections::HashSet<&str> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.kind == SymKind::Sub)
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(names.contains("want_read"), "want_read must be synthesized");
+    assert!(names.contains("get_https"), "get_https must be synthesized");
+    assert!(names.contains("after_pod"), "sub after POD must be synthesized");
+
+    // Spans land in the data section (row 5 = first sub after __END__).
+    let want_read = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "want_read" && s.kind == SymKind::Sub)
+        .expect("want_read symbol");
+    assert_eq!(want_read.selection_span.start.row, 5, "want_read at file row 5");
+    assert_eq!(want_read.package.as_deref(), Some("My::AL"));
+
+    // Goto-def from the in-package caller reaches the data-section def.
+    let def = fa.find_definition(Point::new(2, 16), None, None, None);
+    assert_eq!(
+        def.map(|s| s.start.row),
+        Some(5),
+        "goto-def on want_read() should land on the data-section sub"
+    );
+}
+
+/// The gate: a package that does NOT use AutoLoader/SelfLoader must not have
+/// its trailing `__END__` / `__DATA__` payload mined for subs — that text is
+/// genuine data or POD, not code.
+#[test]
+fn non_autoloader_data_section_synthesizes_nothing() {
+    let src = "package My::Plain;\n\
+               use strict;\n\
+               sub real_sub { 1 }\n\
+               1;\n\
+               __END__\n\
+               sub looks_like_a_sub { return 99 }\n\
+               =pod\n\
+               docs\n\
+               =cut\n\
+               plain documentation text\n";
+    let fa = build_fa(src);
+    assert!(
+        fa.symbols
+            .iter()
+            .all(|s| s.name != "looks_like_a_sub"),
+        "data-section subs must NOT be synthesized without AutoLoader/SelfLoader"
+    );
+    assert!(
+        fa.symbols.iter().any(|s| s.name == "real_sub"),
+        "the real pre-__END__ sub is still present"
+    );
+}
+
+/// Inheritance-form gate: `use base 'AutoLoader'` (parents, not a direct
+/// `use AutoLoader`) also enables data-section synthesis.
+#[test]
+fn autoloader_via_use_base_enables_synthesis() {
+    let src = "package My::Sub;\n\
+               use base 'AutoLoader';\n\
+               1;\n\
+               __END__\n\
+               sub inherited_loader_sub { return 1 }\n";
+    let fa = build_fa(src);
+    assert!(
+        fa.symbols
+            .iter()
+            .any(|s| s.name == "inherited_loader_sub" && s.kind == SymKind::Sub),
+        "use base 'AutoLoader' must enable data-section synthesis"
+    );
+}
