@@ -76,6 +76,15 @@ pub struct ArgInfo {
     /// (params typed `CodeRef`, deref-shape narrowing, etc.).
     #[serde(default)]
     pub callable_return_edge: Option<crate::witnesses::WitnessAttachment>,
+    /// If this arg is a refgen of a named sub (`\&foo`, `\&Foo::bar`,
+    /// `\&$const_folded`), the referenced sub name (qualified or bare,
+    /// exactly as `extract_names_from_refgen` yields). Lets a
+    /// registration plugin (`->helper(name => \&_greet)`) carry the
+    /// callback's first-param typing to the *named* sub's body, the
+    /// same as it does for an inline `sub { ... }` via `sub_params`.
+    /// `None` for non-refgen args and unresolvable `\&$var` names.
+    #[serde(default)]
+    pub ref_sub_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +486,24 @@ pub enum EmitAction {
     VarType {
         variable: String,
         at: Span,
+        inferred_type: InferredType,
+    },
+
+    /// Type the `param_index`-th positional of a *named* sub by name.
+    /// The named-sub analogue of `VarType`: `->helper(name => \&_greet)`
+    /// types `_greet`'s first positional as `Mojolicious::Controller`,
+    /// just as the inline `->helper(name => sub ($c) {...})` form types
+    /// the closure's first positional. The plugin can't anchor a
+    /// `VarType` at the sub's body — a `\&name` arg carries no body span,
+    /// and the sub may be a forward reference not yet walked. The builder
+    /// defers resolution to end-of-build (`deferred_named_sub_param_types`):
+    /// it finds the sub's scope + the named param's variable, then pushes
+    /// the TC. Independent of the sub's name allowlist — driven purely by
+    /// the registration shape (rule #10). `class` matches via the
+    /// enclosing package (bare names) or qualifier (`Foo::bar`).
+    NamedSubParamType {
+        sub_name: String,
+        param_index: usize,
         inferred_type: InferredType,
     },
 

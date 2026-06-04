@@ -1026,6 +1026,7 @@ pub fn build_plugin_query_context(
                 inferred_type: Some(InferredType::String),
                 sub_params: Vec::new(),
                 callable_return_edge: None,
+                ref_sub_name: None,
             }],
             None => Vec::new(),
         };

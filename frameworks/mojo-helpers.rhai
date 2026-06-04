@@ -80,6 +80,22 @@ fn on_method_call(ctx) {
         };
     }
 
+    // Named-sub registration: `$app->helper(greet => \&_greet)`. The
+    // callback's body lives in a separate named sub, so there's no
+    // `sub_params` / body span on the arg — `ref_sub_name` carries the
+    // sub name and the builder types that sub's first positional the same
+    // way (deferred, so a forward-declared `_greet` resolves too). Same
+    // first-param-is-the-controller rule, just keyed by name.
+    if args[1].ref_sub_name != () {
+        out += #{
+            NamedSubParamType: #{
+                sub_name: args[1].ref_sub_name,
+                param_index: 0,
+                inferred_type: #{ ClassName: "Mojolicious::Controller" },
+            }
+        };
+    }
+
     // Split on '.' — single-segment names are the common case and
     // produce exactly one Method. Dotted names chain.
     let segments = name.split(".");

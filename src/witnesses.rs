@@ -567,7 +567,12 @@ impl WitnessReducer for FrameworkAwareTypeFold {
             }
         }
 
+        // Class assertions break ties on source priority first, then
+        // iteration order — a `Plugin`-sourced assertion (the helper-`$c`
+        // override) dominates a `Builder` one (`my $c = shift` typed as the
+        // enclosing class). Same axis as `PluginOverrideReducer` on Symbols.
         let mut class_assertion: Option<String> = None;
+        let mut class_assertion_priority: u8 = 0;
         let mut first_param_class: Option<String> = None;
         // A `BrandedRoute` is a class identity that carries extra
         // inherited-default data. It must dominate the bare
@@ -600,9 +605,15 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                     continue;
                 }
             }
+            let prio = w.source.priority();
             match &w.payload {
                 WitnessPayload::InferredType(t) => match t {
-                    InferredType::ClassName(name) => class_assertion = Some(name.clone()),
+                    InferredType::ClassName(name) => {
+                        if prio >= class_assertion_priority {
+                            class_assertion = Some(name.clone());
+                            class_assertion_priority = prio;
+                        }
+                    }
                     InferredType::FirstParam { package } => {
                         first_param_class = Some(package.clone())
                     }
@@ -610,7 +621,12 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                     other => plain_type = Some(other.clone()),
                 },
                 WitnessPayload::Observation(obs) => match obs {
-                    TypeObservation::ClassAssertion(name) => class_assertion = Some(name.clone()),
+                    TypeObservation::ClassAssertion(name) => {
+                        if prio >= class_assertion_priority {
+                            class_assertion = Some(name.clone());
+                            class_assertion_priority = prio;
+                        }
+                    }
                     TypeObservation::FirstParamInMethod { package } => {
                         first_param_class = Some(package.clone())
                     }

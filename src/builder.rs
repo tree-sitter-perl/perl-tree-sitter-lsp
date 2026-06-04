@@ -214,6 +214,7 @@ fn build_with_plugins_inner(
         symbols: Vec::new(),
         refs: Vec::new(),
         deferred_var_types: Vec::new(),
+        deferred_named_sub_param_types: Vec::new(),
         fold_ranges: Vec::new(),
         imports: Vec::new(),
         return_infos: Vec::new(),
@@ -332,13 +333,21 @@ fn build_with_plugins_inner(
             .find(|s| crate::file_analysis::contains_point(&s.span, d.at.start))
             .map(|s| s.id)
             .unwrap_or(ScopeId(0));
-        b.push_type_constraint(TypeConstraint {
-            variable: d.variable,
-            scope,
-            constraint_span: d.at,
-            inferred_type: d.inferred_type,
-        });
+        b.push_plugin_type_constraint(
+            TypeConstraint {
+                variable: d.variable,
+                scope,
+                constraint_span: d.at,
+                inferred_type: d.inferred_type,
+            },
+            d.plugin_id,
+        );
     }
+
+    // Named-sub param typing (`->helper(_ => \&sub)`): same flush window —
+    // every sub scope + its params now exist, including forward-declared
+    // ones.
+    b.flush_deferred_named_sub_param_types();
 
     // Post-pass 1: resolve variable refs -> resolves_to
     b.resolve_variable_refs();
@@ -514,13 +523,32 @@ impl<'a> Builder<'a> {
     /// shape (the FA helper handles enrichment-time pushes after the
     /// builder's bag has been moved into the FA).
     pub(crate) fn push_type_constraint(&mut self, tc: TypeConstraint) {
+        self.push_type_constraint_from(tc, crate::witnesses::WitnessSource::Builder("type_constraint".into()));
+    }
+
+    /// `push_type_constraint` with a plugin source so the witness carries
+    /// `Plugin` priority. A plugin that knows a variable's type
+    /// (`->helper(_ => sub/\&sub)` → `$c` is a controller) must dominate
+    /// builder heuristics for that variable — the `my $c = shift` idiom
+    /// otherwise types `$c` as the enclosing class. `FrameworkAwareTypeFold`
+    /// prefers the higher-priority class assertion (source-priority axis,
+    /// CLAUDE.md "Source priority breaks ties").
+    pub(crate) fn push_plugin_type_constraint(&mut self, tc: TypeConstraint, plugin_id: String) {
+        self.push_type_constraint_from(tc, crate::witnesses::WitnessSource::Plugin(plugin_id));
+    }
+
+    fn push_type_constraint_from(
+        &mut self,
+        tc: TypeConstraint,
+        source: crate::witnesses::WitnessSource,
+    ) {
         use crate::witnesses::{
-            TypeObservation, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
+            TypeObservation, Witness, WitnessAttachment, WitnessPayload,
         };
         let TypeConstraint { variable, scope, constraint_span: span, inferred_type: ty } = tc;
         self.bag.push(Witness {
             attachment: WitnessAttachment::Variable { name: variable.clone(), scope },
-            source: WitnessSource::Builder("type_constraint".into()),
+            source: source.clone(),
             payload: WitnessPayload::InferredType(ty.clone()),
             span: Span { start: span.start, end: span.start },
         });
@@ -528,7 +556,7 @@ impl<'a> Builder<'a> {
             InferredType::ClassName(n) => {
                 self.bag.push(Witness {
                     attachment: WitnessAttachment::Variable { name: variable, scope },
-                    source: WitnessSource::Builder("type_constraint".into()),
+                    source,
                     payload: WitnessPayload::Observation(TypeObservation::ClassAssertion(n)),
                     span,
                 });
@@ -536,7 +564,7 @@ impl<'a> Builder<'a> {
             InferredType::FirstParam { package } => {
                 self.bag.push(Witness {
                     attachment: WitnessAttachment::Variable { name: variable, scope },
-                    source: WitnessSource::Builder("type_constraint".into()),
+                    source,
                     payload: WitnessPayload::Observation(TypeObservation::FirstParamInMethod {
                         package,
                     }),
@@ -1132,6 +1160,27 @@ struct DeferredVarType {
     variable: String,
     at: Span,
     inferred_type: InferredType,
+    /// Emitting plugin id — the flushed TC rides a `Plugin`-priority
+    /// witness so the plugin's explicit knowledge (`$c` is a controller)
+    /// dominates builder heuristics (`my $c = shift` typing `$c` as the
+    /// enclosing class).
+    plugin_id: String,
+}
+
+/// Plugin-emitted `NamedSubParamType` request, resolved at end-of-build.
+/// Keyed by sub name + positional index rather than a span: a `\&name`
+/// registration arg carries no callback body span, and the named sub may
+/// be a forward reference not yet walked when the plugin fires.
+struct DeferredNamedSubParamType {
+    sub_name: String,
+    /// `None` for a bare `\&name` (current package), `Some(pkg)` for a
+    /// qualified `\&Foo::bar`. The resolver matches the sub's enclosing
+    /// package against this.
+    package: Option<String>,
+    param_index: usize,
+    inferred_type: InferredType,
+    /// Emitting plugin id — see `DeferredVarType::plugin_id`.
+    plugin_id: String,
 }
 
 struct Builder<'a> {
@@ -1145,6 +1194,10 @@ struct Builder<'a> {
     /// before we recurse into call args, so at emit-time the target
     /// scope usually doesn't exist yet).
     deferred_var_types: Vec<DeferredVarType>,
+    /// Plugin-emitted `NamedSubParamType` requests (`->helper(_ => \&sub)`),
+    /// resolved by sub name + index at end-of-build alongside
+    /// `deferred_var_types`.
+    deferred_named_sub_param_types: Vec<DeferredNamedSubParamType>,
     fold_ranges: Vec<FoldRange>,
     imports: Vec<Import>,
     /// Return values collected during the walk (explicit `return` + implicit last expr).
@@ -1755,6 +1808,15 @@ impl<'a> Builder<'a> {
                     .and_then(InferredType::callable_return_edge)
                     .cloned()
             });
+        // `\&name` refgen — the named sub a registration plugin may want to
+        // type the first param of. Same name extraction the return-edge path
+        // uses; bare names stay bare so the deferred resolver scopes them to
+        // the current package.
+        let ref_sub_name = if arg.kind() == "refgen_expression" {
+            self.extract_names_from_refgen(arg).into_iter().next()
+        } else {
+            None
+        };
         plugin::ArgInfo {
             text,
             string_value,
@@ -1763,6 +1825,7 @@ impl<'a> Builder<'a> {
             inferred_type,
             sub_params,
             callable_return_edge,
+            ref_sub_name,
         }
     }
 
@@ -2775,6 +2838,25 @@ impl<'a> Builder<'a> {
                     variable,
                     at,
                     inferred_type,
+                    plugin_id: plugin_id.clone(),
+                });
+            }
+            plugin::EmitAction::NamedSubParamType { sub_name, param_index, inferred_type } => {
+                // `->helper(_ => \&sub)` — type the named sub's positional.
+                // A qualifier (`Foo::bar`) pins the enclosing package; a bare
+                // name defaults to the package the registration sits in (the
+                // sub is local to it). Resolution is deferred so a forward-
+                // declared sub still resolves.
+                let (package, sub_name) = match sub_name.rsplit_once("::") {
+                    Some((pkg, n)) => (Some(pkg.to_string()), n.to_string()),
+                    None => (self.current_package.clone(), sub_name),
+                };
+                self.deferred_named_sub_param_types.push(DeferredNamedSubParamType {
+                    sub_name,
+                    package,
+                    param_index,
+                    inferred_type,
+                    plugin_id: plugin_id.clone(),
                 });
             }
             plugin::EmitAction::SyntheticUse { module, args, imports, span } => {
@@ -5645,6 +5727,68 @@ impl<'a> Builder<'a> {
             cursor = s.parent;
         }
         None
+    }
+
+    /// Resolve plugin-queued `NamedSubParamType` requests once the whole CST
+    /// is walked. For each `(sub_name, package, param_index)` find the
+    /// matching local Sub/Method symbol, read its `param_index`-th positional
+    /// variable name, locate that sub's scope, and push the requested TC —
+    /// the same `push_type_constraint` path the inline `VarType` form uses,
+    /// just keyed by name instead of an anchor span. Forward-declared subs
+    /// resolve because every symbol + scope exists by now.
+    fn flush_deferred_named_sub_param_types(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_named_sub_param_types);
+        for d in deferred {
+            // Pick the sub symbol matching name + (when known) package, so a
+            // qualified `\&Foo::bar` only types a sub that actually lives in
+            // `Foo`. A bare name resolved to a package at emit time (the
+            // registration's enclosing package); match that too.
+            let target = self.symbols.iter().find(|sym| {
+                sym.name == d.sub_name
+                    && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                    && match &d.package {
+                        Some(pkg) => sym.package.as_deref() == Some(pkg.as_str()),
+                        None => true,
+                    }
+            });
+            let target = match target {
+                Some(t) => t,
+                None => continue,
+            };
+            let params = match &target.detail {
+                SymbolDetail::Sub { params, .. } => params,
+                _ => continue,
+            };
+            let var_name = match params.get(d.param_index) {
+                Some(p) if p.name.starts_with('$') => p.name.clone(),
+                _ => continue,
+            };
+            let sub_span = target.span;
+            // The sub's body scope: a Sub/Method scope whose span matches the
+            // declaration span. `record_signature_params` / `my $c = shift`
+            // both put the param variable in this scope.
+            let scope = self
+                .scopes
+                .iter()
+                .find(|s| {
+                    matches!(&s.kind, ScopeKind::Sub { name } | ScopeKind::Method { name } if *name == d.sub_name)
+                        && s.span == sub_span
+                })
+                .map(|s| s.id);
+            let scope = match scope {
+                Some(s) => s,
+                None => continue,
+            };
+            self.push_plugin_type_constraint(
+                TypeConstraint {
+                    variable: var_name,
+                    scope,
+                    constraint_span: sub_span,
+                    inferred_type: d.inferred_type.clone(),
+                },
+                d.plugin_id.clone(),
+            );
+        }
     }
 
     /// Compute the right `WitnessPayload` shape for an expression node.

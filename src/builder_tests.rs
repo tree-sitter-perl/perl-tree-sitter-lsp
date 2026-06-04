@@ -5304,6 +5304,133 @@ $app->helper(current_user => sub {
     }
 }
 
+/// Helper-fn `at` for `inferred_type_via_bag`: column past `my $c = shift;`
+/// (or anywhere inside the sub body) so the TC's scope contains the point.
+fn first_param_type(fa: &FileAnalysis, var: &str, body_line: usize, col: usize) -> Option<InferredType> {
+    fa.inferred_type_via_bag(var, Point::new(body_line, col))
+}
+
+/// Named-sub helper registration (`->helper(greet => \&_greet)`): the
+/// referenced sub's first positional is the controller, exactly like the
+/// inline `sub ($c) {...}` form. `my $c = shift` unpacking.
+#[test]
+fn plugin_mojo_helpers_named_sub_typed_via_shift() {
+    let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(greet => \&_greet);
+
+sub _greet {
+    my $c = shift;
+    $c->render(text => 'hi');
+}
+"#;
+    let fa = build_fa(src);
+    // `$c` is declared on line 8 (`my $c = shift;`); query just after it.
+    let ty = first_param_type(&fa, "$c", 8, 14);
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Mojolicious::Controller".into())),
+        "named-sub helper's first positional types as the controller"
+    );
+}
+
+/// Same, signature form `sub _greet ($c, $name) {...}`.
+#[test]
+fn plugin_mojo_helpers_named_sub_typed_via_signature() {
+    let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(greet => \&_greet);
+
+sub _greet ($c, $name) {
+    $c->render(text => $name);
+}
+"#;
+    let fa = build_fa(src);
+    let ty = first_param_type(&fa, "$c", 8, 8);
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Mojolicious::Controller".into())),
+        "signature-form named-sub helper's first positional types as the controller"
+    );
+}
+
+/// Plain-comma spelling `helper('greet', \&_greet)` is identical to the
+/// fat-comma form — fat-comma carries no code semantics (CLAUDE.md).
+#[test]
+fn plugin_mojo_helpers_named_sub_plain_comma() {
+    let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper('greet', \&_greet);
+
+sub _greet {
+    my $c = shift;
+    $c->render;
+}
+"#;
+    let fa = build_fa(src);
+    let ty = first_param_type(&fa, "$c", 8, 14);
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Mojolicious::Controller".into())),
+        "plain-comma helper registration types the named sub identically"
+    );
+}
+
+/// Regression: the inline-callback form still types `$c`.
+#[test]
+fn plugin_mojo_helpers_inline_callback_still_typed() {
+    let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $app = Mojolicious->new;
+$app->helper(greet => sub {
+    my $c = shift;
+    $c->render;
+});
+"#;
+    let fa = build_fa(src);
+    let ty = first_param_type(&fa, "$c", 6, 14);
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Mojolicious::Controller".into())),
+        "inline-callback helper still types its first positional"
+    );
+}
+
+/// A named sub NOT registered as a helper (referenced via `\&` elsewhere,
+/// plus a plain `sub`) gets no spurious controller typing.
+#[test]
+fn plugin_mojo_helpers_non_helper_named_sub_unaffected() {
+    let src = r#"
+package MyApp::Lite;
+use Mojolicious::Lite;
+
+my $cb = \&_other;
+
+sub _other {
+    my $c = shift;
+    return $c;
+}
+"#;
+    let fa = build_fa(src);
+    let ty = first_param_type(&fa, "$c", 7, 14);
+    assert_ne!(
+        ty,
+        Some(InferredType::ClassName("Mojolicious::Controller".into())),
+        "a non-helper named sub must not be typed as a controller"
+    );
+}
+
 /// Dotted helpers chain into namespace methods: `users.create` means
 /// `$c->users->create`. Each non-leaf segment emits a parameterless
 /// Method returning a synthetic proxy class; the leaf emits on the
