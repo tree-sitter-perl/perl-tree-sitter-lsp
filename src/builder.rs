@@ -2080,11 +2080,16 @@ impl<'a> Builder<'a> {
                     .and_then(|t| t.element_at(idx).cloned())
             }
             "hash_element_expression" => {
-                // Chaining base: resolve the container expression's type
-                // (`$obj->{k}` where `$obj` chains further). Mirror of
-                // `FileAnalysis::resolve_expression_type`'s hash arm.
-                let base = node.named_child(0)?;
-                self.invocant_type_at_node(base)
+                // A hash element's VALUE type is independent of the
+                // container's class: `$self->{helper}` is whatever was
+                // stored under `helper`, not a `$self`. Resolving the
+                // base's type here mistyped the element as the
+                // container's class (`my $h = $self->{helper}` →
+                // `$h: Foo`), producing confident-wrong dispatch on
+                // `$h->method`. We know no honest value type for the
+                // slot today, so yield None (honest-untyped) rather
+                // than the container's class.
+                None
             }
             "function_call_expression" | "ambiguous_function_call_expression" => {
                 if self.is_shift_call(node) {

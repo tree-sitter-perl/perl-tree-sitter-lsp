@@ -588,6 +588,42 @@ fn test_goto_def_typed_same_file_method_resolves() {
     );
 }
 
+/// OVER-TYPING PIN: a hash element extracted to a scalar must NOT be
+/// typed as the container's class. `my $h = $self->{helper}` carries
+/// the value of `$self->{helper}`, whose type is independent of
+/// `$self`'s class (Foo). The chain typer used to push a spurious
+/// `TypeConstraint $h = Foo` because `$self->{helper}` resolved to
+/// `$self`'s class. `$h` must be honest-UNTYPED (no real value type is
+/// known), and `$h->do_thing` must be an honest miss — not a
+/// confident-wrong jump to a Foo sub.
+#[test]
+fn test_hash_element_extracted_to_scalar_is_not_container_class() {
+    let source = "package Foo;\nsub new { bless {}, shift }\nsub use_it { my $self = shift; $self->{helper} = Helper->new; my $h = $self->{helper}; $h->do_thing(); }\n1;\n";
+    let fa = build_fa(source);
+
+    // `$h` is declared on row 2. Probe just past its declaration.
+    let line = source.lines().nth(2).unwrap();
+    let h_decl_col = line.find("my $h").unwrap();
+    let probe = tree_sitter::Point::new(2, h_decl_col + "my $h = $self->{helper}; ".len());
+
+    let ty = fa.inferred_type("$h", probe);
+    assert!(
+        !matches!(ty, Some(InferredType::ClassName(c)) if c == "Foo"),
+        "$h must NOT be typed as the container's class Foo; got {:?}",
+        ty
+    );
+
+    // goto-def on `$h->do_thing` must be an honest miss, never a jump
+    // to a Foo sub.
+    let do_thing_col = line.rfind("do_thing").unwrap();
+    let def = fa.find_definition(tree_sitter::Point::new(2, do_thing_col + 1), None, None, None);
+    assert!(
+        def.is_none(),
+        "$h->do_thing must be an honest miss, not a confident jump to a Foo sub; got {:?}",
+        def
+    );
+}
+
 
 #[test]
 fn test_use_symbol() {
