@@ -11399,3 +11399,215 @@ has my_setting => (is => 'ro', isa => 'Str');
         );
     }
 }
+
+// ---- Framework synthesis/detection: requires / Role::Tiny / DBIC ancestry /
+//      mk_group_accessors / Mojo -base parent / has comma-form ----
+
+#[test]
+fn test_moo_role_requires_is_framework_import() {
+    let fa = build_fa(
+        "
+package My::Role;
+use Moo::Role;
+requires 'must_implement';
+",
+    );
+    assert!(
+        fa.framework_imports.contains("requires"),
+        "Moo::Role exports `requires` — should register as a framework import"
+    );
+}
+
+#[test]
+fn test_moose_role_requires_is_framework_import() {
+    let fa = build_fa(
+        "
+package My::Role;
+use Moose::Role;
+requires 'foo';
+",
+    );
+    assert!(fa.framework_imports.contains("requires"));
+}
+
+#[test]
+fn test_role_tiny_behaves_like_moo_role() {
+    let fa = build_fa(
+        "
+package My::Role;
+use Role::Tiny;
+requires 'bar';
+with 'Other::Role';
+",
+    );
+    assert!(
+        fa.framework_imports.contains("requires"),
+        "Role::Tiny exports `requires`"
+    );
+    assert!(
+        fa.framework_imports.contains("with"),
+        "Role::Tiny exports `with`"
+    );
+}
+
+#[test]
+fn test_role_tiny_with_behaves_like_moo_role() {
+    let fa = build_fa(
+        "
+package My::Class;
+use Role::Tiny::With;
+with 'Some::Role';
+",
+    );
+    assert!(fa.framework_imports.contains("with"));
+}
+
+#[test]
+fn test_dbic_two_level_ancestry_synthesizes_columns() {
+    // Result → BaseResult → DBIx::Class::Core: the DBIC base is two hops up.
+    // The shallow direct-parent check missed this; full-ancestry walk catches it.
+    let fa = build_fa(
+        "
+package My::Schema::BaseResult;
+use base 'DBIx::Class::Core';
+
+package My::Schema::Result::User;
+use base 'My::Schema::BaseResult';
+__PACKAGE__->add_columns(qw/id username/);
+",
+    );
+    let id: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "id" && s.kind == SymKind::Method)
+        .collect();
+    let username: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "username" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(id.len(), 1, "2-level DBIC inheritance should synthesize `id`");
+    assert_eq!(username.len(), 1, "and `username`");
+}
+
+#[test]
+fn test_mk_group_accessors_synthesizes_methods() {
+    let fa = build_fa(
+        "
+package My::Thing;
+use base 'Class::Accessor::Grouped';
+__PACKAGE__->mk_group_accessors('simple', qw/alpha beta/);
+__PACKAGE__->mk_group_ro_accessors('inflated', 'gamma', 'delta');
+",
+    );
+    for name in ["alpha", "beta", "gamma", "delta"] {
+        let hits: Vec<_> = fa
+            .symbols
+            .iter()
+            .filter(|s| s.name == name && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(hits.len(), 1, "mk_group accessor `{name}` should be synthesized");
+    }
+    // The group name itself is NOT an accessor.
+    assert!(
+        !fa.symbols.iter().any(|s| s.name == "simple" && s.kind == SymKind::Method),
+        "the leading group name must not become an accessor"
+    );
+}
+
+#[test]
+fn test_mk_classdata_synthesizes_method() {
+    let fa = build_fa(
+        "
+package My::Thing;
+use base 'Class::Accessor::Grouped';
+__PACKAGE__->mk_classdata('config');
+",
+    );
+    let hits: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "config" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(hits.len(), 1, "mk_classdata should synthesize the named accessor");
+}
+
+#[test]
+fn test_use_module_dash_base_registers_parent_and_mojo_behavior() {
+    let fa = build_fa(
+        "
+package My::Emitter;
+use Mojo::EventEmitter -base;
+has 'value';
+",
+    );
+    // The module imported with -base becomes a parent...
+    assert!(
+        fa.package_parents
+            .get("My::Emitter")
+            .map(|v| v.iter().any(|p| p == "Mojo::EventEmitter"))
+            .unwrap_or(false),
+        "`use X -base` should register X as a parent"
+    );
+    // ...and Mojo::Base accessor synthesis (getter + setter) applies.
+    let methods: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "value" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(methods.len(), 2, "`-base` pulls Mojo::Base has-synthesis");
+}
+
+#[test]
+fn test_mojo_base_dash_base_carries_mojo_base_as_parent() {
+    let fa = build_fa(
+        "
+package My::Class;
+use Mojo::Base -base;
+has 'x';
+",
+    );
+    assert!(
+        fa.package_parents
+            .get("My::Class")
+            .map(|v| v.iter().any(|p| p == "Mojo::Base"))
+            .unwrap_or(false),
+        "`Mojo::Base -base` should carry Mojo::Base itself as a parent so tap/attr/new resolve"
+    );
+}
+
+#[test]
+fn test_moo_has_comma_form_synthesizes_accessor() {
+    // The comma-separated option form (not the fat-arrow `name => (...)` form).
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+has 'name', is => 'ro', default => sub { 1 };
+has age => (is => 'rw');
+",
+    );
+    let name_acc: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "name" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(
+        name_acc.len(),
+        1,
+        "comma-form `has 'name', is => 'ro'` should synthesize a `name` accessor"
+    );
+    // The fat-arrow form on the next line still works (no regression).
+    // `is => 'rw'` synthesizes a getter + a writer (2 symbols named `age`).
+    let age_acc: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "age" && s.kind == SymKind::Method)
+        .collect();
+    assert_eq!(age_acc.len(), 2, "fat-arrow rw form still synthesizes getter+setter");
+    // `is`/`default` must not become phantom accessors.
+    assert!(
+        !fa.symbols.iter().any(|s| (s.name == "is" || s.name == "ro") && s.kind == SymKind::Method),
+        "option keywords/values must not mint phantom methods in comma form"
+    );
+}

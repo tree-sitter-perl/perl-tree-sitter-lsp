@@ -3927,10 +3927,21 @@ impl<'a> Builder<'a> {
             match module_name.as_str() {
                 // Dancer2::Plugin re-exports Moo's `has`/`with`/etc. into the
                 // consuming plugin package, so it gets Moo-mode accessor synthesis.
-                "Moo" | "Moo::Role" | "Dancer2::Plugin" => {
+                // Role::Tiny / Role::Tiny::With behave like Moo::Role for our
+                // purposes: they export `with` (and `requires`, via the role
+                // sugar) into the consuming package.
+                "Moo" | "Moo::Role" | "Dancer2::Plugin"
+                | "Role::Tiny" | "Role::Tiny::With" => {
                     self.framework_modes.insert(pkg, FrameworkMode::Moo);
                     for kw in &["has", "with", "extends", "around", "before", "after"] {
                         self.framework_imports.insert(kw.to_string());
+                    }
+                    // `requires` is role-only sugar; harmless to register for
+                    // plain Moo too (a class never calls it).
+                    if matches!(module_name.as_str(),
+                        "Moo::Role" | "Role::Tiny" | "Role::Tiny::With")
+                    {
+                        self.framework_imports.insert("requires".to_string());
                     }
                 }
                 "Moose" | "Moose::Role" => {
@@ -3939,29 +3950,32 @@ impl<'a> Builder<'a> {
                                 "override", "super", "inner", "augment", "confess", "blessed"] {
                         self.framework_imports.insert(kw.to_string());
                     }
+                    if module_name == "Moose::Role" {
+                        self.framework_imports.insert("requires".to_string());
+                    }
                 }
                 "Mojo::Base" => {
-                    // Check args: -strict means no accessors, -base or 'Parent' means MojoBase mode
+                    // `-strict` means strict-mode only, no accessor machinery.
                     let is_strict = raw_args.iter().any(|a| a == "-strict");
                     if !is_strict {
-                        self.framework_modes.insert(pkg.clone(), FrameworkMode::MojoBase);
-                        self.framework_imports.insert("has".to_string());
-                        // 'Parent' arg (not starting with -) is an inheritance declaration
-                        let parents: Vec<String> = raw_args.iter()
+                        // `Mojo::Base -base` (or `'Parent'`) — the package IS-A
+                        // Mojo::Base, so register it as a parent too: `tap` /
+                        // `attr` / `new` resolve through the inheritance walk.
+                        let mut parents: Vec<String> = raw_args.iter()
                             .filter(|s| !s.starts_with('-'))
                             .cloned()
                             .collect();
-                        if !parents.is_empty() {
-                            if let Some(node) = node {
-                                let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
-                                self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
-                            }
-                            self.package_parents
-                                .entry(pkg)
-                                .or_default()
-                                .extend(parents);
+                        if raw_args.iter().any(|a| a == "-base") {
+                            parents.push("Mojo::Base".to_string());
                         }
+                        self.apply_mojo_base_mode(pkg, parents, node);
                     }
+                }
+                // `use Mojo::EventEmitter -base` / any `use X -base`: X becomes a
+                // parent AND the package inherits Mojo::Base's `has`/`attr`/`tap`/
+                // `new` (the `-base` flag is Mojo::Base's "inherit from me" sugar).
+                _ if raw_args.iter().any(|a| a == "-base") => {
+                    self.apply_mojo_base_mode(pkg, vec![module_name.clone()], node);
                 }
                 _ => {}
             }
@@ -6036,7 +6050,7 @@ impl<'a> Builder<'a> {
         let mut is_value: Option<String> = None;
         let mut isa_value: Option<String> = None;
         // The `isa` value NODE — for a parametric constraint
-        // (`InstanceOf['Foo']`) `extract_fat_comma_pairs` drops the value
+        // (`InstanceOf['Foo']`) `extract_node_string` drops the value
         // (it isn't a bareword/string), so the node is the only handle.
         // Read structurally, never re-parsed.
         let mut isa_value_node: Option<Node<'a>> = None;
@@ -6056,60 +6070,62 @@ impl<'a> Builder<'a> {
             vec![args]
         };
 
-        let mut found_first_arg = false;
-        for child in &args_children {
+        let mut first_named_idx: Option<usize> = None;
+        for (idx, child) in args_children.iter().enumerate() {
             if !child.is_named() { continue; }
-
-            if !found_first_arg {
-                found_first_arg = true;
-                match child.kind() {
-                    "string_literal" | "interpolated_string_literal" => {
-                        if let Some(text) = self.extract_string_content(*child) {
-                            if !text.starts_with('+') {
-                                attr_names.push((text, self.string_content_span(*child)));
-                            }
+            first_named_idx = Some(idx);
+            match child.kind() {
+                "string_literal" | "interpolated_string_literal" => {
+                    if let Some(text) = self.extract_string_content(*child) {
+                        if !text.starts_with('+') {
+                            attr_names.push((text, self.string_content_span(*child)));
                         }
                     }
-                    "bareword" | "autoquoted_bareword" => {
-                        if let Ok(text) = child.utf8_text(self.source) {
-                            attr_names.push((text.to_string(), node_to_span(*child)));
-                        }
-                    }
-                    "array_ref_expression" | "anonymous_array_expression" => {
-                        self.extract_array_attr_names(*child, &mut attr_names);
-                    }
-                    _ => {}
                 }
-                continue;
+                "bareword" | "autoquoted_bareword" => {
+                    if let Ok(text) = child.utf8_text(self.source) {
+                        attr_names.push((text.to_string(), node_to_span(*child)));
+                    }
+                }
+                "array_ref_expression" | "anonymous_array_expression" => {
+                    self.extract_array_attr_names(*child, &mut attr_names);
+                }
+                _ => {}
             }
-
-            // After first arg: options (Moo/Moose) or default value (Mojo::Base)
-            if mode == FrameworkMode::MojoBase {
-                // Capture default value node for type inference
-                if mojo_default_node.is_none() {
-                    mojo_default_node = Some(*child);
-                }
-            } else {
-                match child.kind() {
-                    "list_expression" | "parenthesized_expression" => {
-                        let pairs = self.extract_fat_comma_pairs(*child);
-                        for (key, val) in &pairs {
-                            match key.as_str() {
-                                "is" => is_value = Some(val.clone()),
-                                "isa" => isa_value = Some(val.clone()),
-                                _ => {}
-                            }
-                        }
-                        if isa_value_node.is_none() {
-                            isa_value_node = self.value_node_after_key(*child, "isa");
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            break;
         }
 
         if attr_names.is_empty() { return; }
+
+        // After first arg: options (Moo/Moose) or default value (Mojo::Base).
+        // Both the nested `=> (is => ...)` and the flat `, is => ...` forms
+        // route through `for_each_has_option_pair`.
+        let rest: Vec<Node> = first_named_idx
+            .map(|first| args_children[first + 1..].to_vec())
+            .unwrap_or_default();
+        if mode == FrameworkMode::MojoBase {
+            mojo_default_node = rest.iter().copied().find(|c| c.is_named());
+        } else {
+            self.for_each_has_option_pair(&rest, |key, val_node| {
+                match key {
+                    "is" => {
+                        if is_value.is_none() {
+                            is_value = self.extract_node_string(val_node);
+                        }
+                    }
+                    "isa" => {
+                        if isa_value.is_none() {
+                            isa_value = self.extract_node_string(val_node);
+                        }
+                        if isa_value_node.is_none() {
+                            isa_value_node = Some(val_node);
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            });
+        }
 
         // Map isa value to InferredType
         let return_type = match mode {
@@ -6445,39 +6461,39 @@ impl<'a> Builder<'a> {
         let mut isa_value_node: Option<Node<'a>> = None;
         let mut option_nodes: Vec<(String, Node<'a>)> = Vec::new();
 
-        let mut found_first = false;
-        for child in &args_children {
+        let mut first_named_idx: Option<usize> = None;
+        for (idx, child) in args_children.iter().enumerate() {
             if !child.is_named() { continue; }
-            if !found_first {
-                found_first = true;
-                match child.kind() {
-                    "string_literal" | "interpolated_string_literal" => {
-                        if let Some(text) = self.extract_string_content(*child) {
-                            if !text.starts_with('+') {
-                                attr_names.push((text, self.string_content_span(*child)));
-                            }
+            first_named_idx = Some(idx);
+            match child.kind() {
+                "string_literal" | "interpolated_string_literal" => {
+                    if let Some(text) = self.extract_string_content(*child) {
+                        if !text.starts_with('+') {
+                            attr_names.push((text, self.string_content_span(*child)));
                         }
                     }
-                    "bareword" | "autoquoted_bareword" => {
-                        if let Ok(text) = child.utf8_text(self.source) {
-                            attr_names.push((text.to_string(), node_to_span(*child)));
-                        }
-                    }
-                    "array_ref_expression" | "anonymous_array_expression" => {
-                        self.extract_array_attr_names(*child, &mut attr_names);
-                    }
-                    _ => {}
                 }
-                continue;
+                "bareword" | "autoquoted_bareword" => {
+                    if let Ok(text) = child.utf8_text(self.source) {
+                        attr_names.push((text.to_string(), node_to_span(*child)));
+                    }
+                }
+                "array_ref_expression" | "anonymous_array_expression" => {
+                    self.extract_array_attr_names(*child, &mut attr_names);
+                }
+                _ => {}
             }
-            if matches!(child.kind(), "list_expression" | "parenthesized_expression") {
-                self.collect_has_option_value_nodes(
-                    *child, &mut isa_value, &mut isa_value_node, &mut option_nodes,
-                );
-            }
+            break;
         }
 
         if attr_names.is_empty() { return None; }
+
+        if let Some(first) = first_named_idx {
+            let rest = &args_children[first + 1..];
+            self.collect_has_option_value_nodes(
+                rest, &mut isa_value, &mut isa_value_node, &mut option_nodes,
+            );
+        }
 
         let isa_type = isa_value
             .as_deref()
@@ -6525,14 +6541,35 @@ impl<'a> Builder<'a> {
     /// (rule #10); core only does the CST walk (rule #1) and hands the full
     /// option list to the plugin, which decides which keywords matter. Keeps
     /// the raw value nodes so the classifier can read the value shape.
+    /// Drive `f(key, value_node)` over a `has` call's option tail, regardless
+    /// of which surface form was written:
+    ///   `has 'name' => (is => 'ro')`  — options live in one nested list node
+    ///   `has 'name', is => 'ro'`      — options are flat siblings of the name
+    /// `rest` is the slice of `arguments` children *after* the first (name)
+    /// arg. A single nested list/paren delegates to the container walker; any
+    /// other shape is read as a flat fat-comma run.
+    fn for_each_has_option_pair<F>(&self, rest: &[Node<'a>], f: F)
+    where
+        F: FnMut(&str, Node<'a>) -> bool,
+    {
+        let named: Vec<Node<'a>> = rest.iter().copied().filter(|n| n.is_named()).collect();
+        if let [only] = named.as_slice() {
+            if matches!(only.kind(), "list_expression" | "parenthesized_expression") {
+                self.for_each_fat_comma_pair(*only, f);
+                return;
+            }
+        }
+        self.for_each_fat_comma_pair_in_children(rest, f);
+    }
+
     fn collect_has_option_value_nodes(
         &self,
-        opts_node: Node<'a>,
+        rest: &[Node<'a>],
         isa_value: &mut Option<String>,
         isa_value_node: &mut Option<Node<'a>>,
         option_nodes: &mut Vec<(String, Node<'a>)>,
     ) {
-        self.for_each_fat_comma_pair(opts_node, |key, val_node| {
+        self.for_each_has_option_pair(rest, |key, val_node| {
             // `isa` feeds the resolved attribute type, not an accessor option.
             if key == "isa" {
                 if isa_value.is_none() {
@@ -6646,6 +6683,22 @@ impl<'a> Builder<'a> {
     }
 
     /// Extract arguments from `use Mojo::Base ...` including barewords like -strict, -base.
+    /// Put `pkg` into Mojo::Base mode (accessor synthesis via `has`) and wire
+    /// `parents` into `package_parents` so the universal Mojo::Base methods
+    /// (`tap`/`attr`/`new`) resolve through inheritance. Shared by the literal
+    /// `use Mojo::Base ...` arm and the generic `use X -base` arm.
+    fn apply_mojo_base_mode(&mut self, pkg: String, parents: Vec<String>, node: Option<Node<'a>>) {
+        self.framework_modes.insert(pkg.clone(), FrameworkMode::MojoBase);
+        self.framework_imports.insert("has".to_string());
+        if parents.is_empty() { return; }
+        if let Some(node) = node {
+            let parent_set: std::collections::HashSet<&str> =
+                parents.iter().map(|s| s.as_str()).collect();
+            self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
+        }
+        self.package_parents.entry(pkg).or_default().extend(parents);
+    }
+
     fn extract_mojo_base_args(&self, node: Node<'a>) -> Vec<String> {
         let mut args = Vec::new();
         let module_end = node.child_by_field_name("module")
@@ -6754,21 +6807,6 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Extract key-value pairs from a fat-comma list expression.
-    /// Returns pairs like [("is", "ro"), ("isa", "Str")].
-    fn extract_fat_comma_pairs(&self, node: Node<'a>) -> Vec<(String, String)> {
-        let mut pairs = Vec::new();
-        // Only string-valued pairs survive — complex values (refs, calls) drop.
-        self.for_each_fat_comma_pair(node, |key, val_node| {
-            if let Some(v) = self.extract_node_string(val_node) {
-                pairs.push((key.to_string(), v));
-            }
-            true
-        });
-        pairs
-    }
-
-
     // ---- Runtime exporter modeling ----
     //
     // Static analysis can't run an exporter's import(), so we model the
@@ -6790,7 +6828,7 @@ impl<'a> Builder<'a> {
     /// inner list is unwrapped). Keys are barewords, autoquoted barewords
     /// (`-setup`), or strings; non-key/non-value tokens (commas, `=>`) skip.
     /// Stops early when `f` returns `false`.
-    fn for_each_fat_comma_pair<F>(&self, container: Node<'a>, mut f: F)
+    fn for_each_fat_comma_pair<F>(&self, container: Node<'a>, f: F)
     where
         F: FnMut(&str, Node<'a>) -> bool,
     {
@@ -6802,17 +6840,33 @@ impl<'a> Builder<'a> {
         } else {
             container
         };
-        let count = list.child_count();
+        let children: Vec<Node<'a>> = (0..list.child_count())
+            .filter_map(|i| list.child(i))
+            .collect();
+        self.for_each_fat_comma_pair_in_children(&children, f);
+    }
+
+    /// Slice variant of `for_each_fat_comma_pair`: walk a flat sequence of
+    /// sibling nodes (including the inter-token commas / `=>`) as fat-comma
+    /// pairs. Lets callers feed a *sub-range* of a container's children —
+    /// e.g. the option tail of `has 'name', is => 'ro', ...`, where the name
+    /// and the options share one `list_expression` parent and there's no
+    /// nested options node to hand to the container variant.
+    fn for_each_fat_comma_pair_in_children<F>(&self, children: &[Node<'a>], mut f: F)
+    where
+        F: FnMut(&str, Node<'a>) -> bool,
+    {
+        let count = children.len();
         let mut i = 0;
         while i < count {
-            let Some(k_node) = list.child(i) else { i += 1; continue; };
+            let k_node = children[i];
             i += 1;
             if !k_node.is_named() { continue; }
             let Some(key) = self.extract_node_string(k_node) else { continue; };
             // Skip the fat comma / commas to the next named node (the value).
             let val = loop {
-                match list.child(i) {
-                    Some(c) if c.is_named() => break Some(c),
+                match children.get(i) {
+                    Some(c) if c.is_named() => break Some(*c),
                     Some(_) => i += 1,
                     None => break None,
                 }
@@ -7203,6 +7257,12 @@ impl<'a> Builder<'a> {
                 if self.is_dbic_class() {
                     self.visit_dbic_class_method(node, name);
                 }
+                // Class::Accessor::Grouped accessor synthesis. Not DBIC-gated:
+                // any package can `use parent 'Class::Accessor::Grouped'`. The
+                // call shape is the signal — `mk_*_accessors('group', @names)`
+                // (first arg is the group, the rest are accessor names) and
+                // `mk_classdata('name')` (single name).
+                self.visit_group_accessors(node, name);
             }
         }
 
@@ -7249,14 +7309,21 @@ impl<'a> Builder<'a> {
         self.visit_children(node);
     }
 
-    /// Check if the current package inherits from a DBIx::Class package.
+    /// Check if the current package inherits from a DBIx::Class package,
+    /// at any depth. Walks the full local ancestry (`package_parents`),
+    /// so multi-level chains (`Result → BaseResult → DBIx::Class::Core`)
+    /// still get column/relationship synthesis — not just direct parents.
+    /// The builder has no `module_index` during the live walk, but the
+    /// resolver re-runs the full builder per file, so each file's own
+    /// `package_parents` carries the edges it declares.
     fn is_dbic_class(&self) -> bool {
-        if let Some(ref pkg) = self.current_package {
-            if let Some(parents) = self.package_parents.get(pkg) {
-                return parents.iter().any(|p| p.starts_with("DBIx::Class"));
-            }
-        }
-        false
+        let Some(ref pkg) = self.current_package else { return false };
+        crate::file_analysis::any_ancestor(
+            pkg,
+            &self.package_parents,
+            None,
+            |c| c.starts_with("DBIx::Class"),
+        )
     }
 
     /// Synthesize accessor methods from DBIC class method calls.
@@ -7272,6 +7339,74 @@ impl<'a> Builder<'a> {
                 self.visit_dbic_relationship(node, false);
             }
             _ => {}
+        }
+    }
+
+    /// Class::Accessor::Grouped accessor synthesis. The `mk_group_*_accessors`
+    /// family takes a leading group name and then a list of accessor names
+    /// (strings / barewords / qw lists); `mk_classdata` is just a name list.
+    /// We synthesize a stub `Method` symbol per accessor name — same as DBIC
+    /// `add_columns`. The accessor-name list is the authoritative source.
+    fn visit_group_accessors(&mut self, node: Node<'a>, method_name: &str) {
+        let skip_first = match method_name {
+            "mk_group_accessors"
+            | "mk_group_ro_accessors"
+            | "mk_group_rw_accessors"
+            | "mk_group_wo_accessors" => true,
+            "mk_classdata" | "mk_classaccessor" => false,
+            _ => return,
+        };
+        let Some(args) = node.child_by_field_name("arguments") else { return };
+        let arg_nodes: Vec<Node> = match args.kind() {
+            "list_expression" | "parenthesized_expression" => {
+                (0..args.named_child_count())
+                    .filter_map(|i| args.named_child(i))
+                    .collect()
+            }
+            // Single bare arg, e.g. `mk_classdata('config')`.
+            _ => vec![args],
+        };
+
+        let mut names: Vec<(String, Span)> = Vec::new();
+        for child in arg_nodes.iter().skip(skip_first as usize) {
+            match child.kind() {
+                "string_literal" | "interpolated_string_literal" => {
+                    if let Some(text) = self.extract_string_content(*child) {
+                        names.push((text, self.string_content_span(*child)));
+                    }
+                }
+                "bareword" | "autoquoted_bareword" => {
+                    if let Ok(text) = child.utf8_text(self.source) {
+                        names.push((text.to_string(), node_to_span(*child)));
+                    }
+                }
+                "quoted_word_list" | "array_ref_expression" | "anonymous_array_expression" => {
+                    self.extract_array_attr_names(*child, &mut names);
+                }
+                _ => {}
+            }
+        }
+
+        for (name, sel_span) in &names {
+            self.add_symbol(
+                name.clone(),
+                SymKind::Method,
+                node_to_span(node),
+                *sel_span,
+                SymbolDetail::Sub {
+                    params: vec![ParamInfo {
+                        name: "$val".into(),
+                        default: None,
+                        is_slurpy: false,
+                        is_invocant: false,
+                    }],
+                    is_method: true,
+                    doc: None,
+                    display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                },
+            );
         }
     }
 
