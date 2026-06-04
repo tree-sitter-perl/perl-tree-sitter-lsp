@@ -267,6 +267,12 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     }
     eprintln!("Modules: {} cached, {} resolved, {} total", already_cached, resolved, needed.len());
 
+    // `warm_cache` populated `cache_raw()` directly, bypassing the reverse
+    // index, and `insert_cache` only indexes export/export_ok. Rebuild the
+    // full `func → modules` index from the cache so `find_exporters` answers
+    // identically on cold and warm runs (B6 export-attribution regression).
+    module_index.rebuild_reverse_index_from_cache();
+
     (ws, module_index)
 }
 
