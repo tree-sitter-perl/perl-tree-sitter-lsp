@@ -263,6 +263,41 @@ its `&&`-RHS are mis-modeled at every such site.
 
 ---
 
+## G4 — bareword filehandle in the indirect-object slot parsed as a function call
+
+The grammar **already models** the indirect-object filehandle for the scalar
+and block forms — `print $fh LIST` emits an `indirect_object` node wrapping a
+`scalar`, and `print {$fh} LIST` emits `indirect_object` wrapping a `block`.
+But the **bareword** form (`print STDERR ...`, `print FH ...`) is NOT routed
+through `indirect_object`: the bareword degrades to a nested
+`ambiguous_function_call_expression` (function = the filehandle, arguments =
+the print list), i.e. the filehandle is parsed as a *function call*. Same
+family as the `not`-operator gap (tree-sitter-perl#230).
+
+**Repro:**
+```
+printf 'print STDERR "x";\nprint FH @list;\nprint {$fh} "y";\nprint $fh "z";\n' > /tmp/fh.pl
+perl-lsp --parse /tmp/fh.pl
+#  print STDERR "x"  -> ambiguous_function_call_expression (function: STDERR)   ❌
+#  print FH @list    -> ambiguous_function_call_expression (function: FH)        ❌
+#  print {$fh} "y"   -> indirect_object (block (... $fh ...))                    ✓
+#  print $fh "z"     -> indirect_object (scalar $fh)                             ✓
+```
+
+**Expected** — extend the existing `indirect_object` production to accept a
+bareword filehandle (the `print`/`printf`/`say` indirect-object slot: a
+bareword immediately following the verb with no comma/paren before the list),
+matching what it already does for `$fh`/`{$fh}`.
+
+**Downstream impact** — the bareword filehandle flags as
+`unresolved-function` (the #1 recurring FP on classic-Perl corpora — 458 in
+perltidy alone). The LSP currently papers over this with a builder-side guard
+(`is_indirect_object_filehandle_call` in `src/builder.rs`) that sniffs out the
+function-call shape and suppresses the ref; that **kludge can be deleted** once
+the grammar emits `indirect_object` for the bareword form.
+
+---
+
 ## TO VERIFY (parser vs builder — likely parser, confirm intent)
 
 These two reproduce as questionable CST shapes. They look like grammar

@@ -5663,6 +5663,13 @@ impl<'a> Builder<'a> {
     /// the verb's `arguments` slot. The parenthesized form `print foo(...)`
     /// parses as a `function_call_expression` instead, so it's a real call
     /// and never matches here.
+    ///
+    /// KLUDGE — works around a parser gap (docs/parser-shortcomings.md G4):
+    /// the grammar already emits an `indirect_object` node for `print $fh`
+    /// and `print {$fh}`, but NOT for the bareword form, which degrades to
+    /// the function-call shape this guard sniffs out. Once upstream extends
+    /// `indirect_object` to accept a bareword filehandle, delete this guard
+    /// and consume the `indirect_object` node directly.
     fn is_indirect_object_filehandle_call(&self, node: Node<'a>) -> bool {
         if node.kind() != "ambiguous_function_call_expression" {
             return false;
