@@ -3841,7 +3841,130 @@ impl<'a> Builder<'a> {
         if module_name == "Sub::Exporter" {
             self.detect_sub_exporter_use(node);
         }
+        // `use Class::Tiny qw/a b/` / `use Class::Tiny { a => ..., b => ... }`
+        // declares rw accessors at the use site (no `has` keyword), so
+        // synthesis hangs off the `use` node rather than a framework-mode
+        // `has` dispatch. Recognized by the import shape, not a name list.
+        if module_name == "Class::Tiny" {
+            self.visit_class_tiny_use(node);
+        }
         // Don't recurse — use statements don't contain interesting sub-nodes
+    }
+
+    /// `use Class::Tiny` synthesizes a rw accessor per attribute name plus the
+    /// constructor hash key, mirroring the Moo/Moose `has 'x' => (is=>'rw')`
+    /// artifacts (Method symbol + constructor `HashKeyDef`). Class::Tiny
+    /// accessors carry no isa constraint, so there's no return type to
+    /// publish — just provenance, so `--dump-package` shows the synth origin.
+    ///
+    /// Two import shapes, both rw:
+    ///   `use Class::Tiny qw( a b c );`            — qw list, each word an attr
+    ///   `use Class::Tiny { a => $def, b => sub };` — hashref, each KEY an attr
+    fn visit_class_tiny_use(&mut self, node: Node<'a>) {
+        let Some(pkg) = self.current_package.clone() else { return };
+        let mut attr_names: Vec<(String, Span)> = Vec::new();
+        // The combined form `use Class::Tiny qw(a), { b => ... }` wraps both
+        // arg shapes in a `list_expression`, so descend into it.
+        self.collect_class_tiny_attrs(node, &mut attr_names);
+        if attr_names.is_empty() {
+            return;
+        }
+
+        let owner = HashKeyOwner::Sub {
+            package: Some(pkg),
+            name: "new".to_string(),
+        };
+        for (name, sel_span) in &attr_names {
+            // rw accessor: one Method symbol serves getter and writer. No isa
+            // → no return type, so no accessor witness (only provenance).
+            let acc_id = self.add_symbol(
+                name.clone(),
+                SymKind::Method,
+                node_to_span(node),
+                *sel_span,
+                SymbolDetail::Sub {
+                    params: vec![],
+                    is_method: true,
+                    doc: None,
+                    display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                },
+            );
+            self.record_framework_accessor_witness(
+                acc_id,
+                name,
+                None,
+                "Class::Tiny",
+                format!("Class::Tiny `use` accessor `{}` (rw)", name),
+            );
+            // Constructor key: `Pkg->new(name => ...)` connects to the attr.
+            self.add_symbol(
+                name.clone(),
+                SymKind::HashKeyDef,
+                node_to_span(node),
+                *sel_span,
+                SymbolDetail::HashKeyDef {
+                    owner: owner.clone(),
+                    is_dynamic: false,
+                },
+            );
+        }
+    }
+
+    /// Walk a `use Class::Tiny ...` node's args for attribute names, handling
+    /// the qw-list, hashref, and combined (`qw(a), { b => ... }`) shapes. The
+    /// combined form nests both arg shapes under a `list_expression`, so recurse.
+    fn collect_class_tiny_attrs(&self, node: Node<'a>, names: &mut Vec<(String, Span)>) {
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i) else { continue };
+            match child.kind() {
+                "quoted_word_list" => self.extract_qw_word_spans(child, names),
+                "anonymous_hash_expression" => self.extract_class_tiny_hash_keys(child, names),
+                "list_expression" => self.collect_class_tiny_attrs(child, names),
+                _ => {}
+            }
+        }
+    }
+
+    /// Collect the KEYS of a Class::Tiny hashref-form `use` (`{ a => $def, ... }`)
+    /// as attribute names. Only every other element is a key; the value after
+    /// each (default scalar / coderef) is skipped. The grammar nests trailing
+    /// pairs as a right-leaning `list_expression`, so recurse into those.
+    fn extract_class_tiny_hash_keys(&self, node: Node<'a>, names: &mut Vec<(String, Span)>) {
+        // Flatten the (possibly right-nested) list of pair elements.
+        let mut elems: Vec<Node<'a>> = Vec::new();
+        fn flatten<'a>(n: Node<'a>, out: &mut Vec<Node<'a>>) {
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i) {
+                    if c.kind() == "list_expression" {
+                        flatten(c, out);
+                    } else {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        flatten(node, &mut elems);
+        // Keys are at even indices (key, value, key, value, ...).
+        let mut i = 0;
+        while i < elems.len() {
+            let key = elems[i];
+            match key.kind() {
+                "autoquoted_bareword" | "bareword" => {
+                    if let Ok(text) = key.utf8_text(self.source) {
+                        names.push((text.to_string(), node_to_span(key)));
+                    }
+                }
+                "string_literal" | "interpolated_string_literal" => {
+                    if let Some(text) = self.extract_string_content(key) {
+                        names.push((text, self.string_content_span(key)));
+                    }
+                }
+                _ => {}
+            }
+            i += 2; // skip the value element
+        }
     }
 
     /// Value-taking core of `use` handling. Shared by real source uses

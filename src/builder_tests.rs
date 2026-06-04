@@ -11700,3 +11700,115 @@ has age => (is => 'rw');
         "option keywords/values must not mint phantom methods in comma form"
     );
 }
+
+// ---- Class::Tiny accessor synthesis (CG-2) ----
+
+#[test]
+fn test_class_tiny_list_form_synthesizes_accessors() {
+    let fa = build_fa(
+        "
+package Foo;
+use Class::Tiny qw( resolvers cache );
+",
+    );
+    for attr in ["resolvers", "cache"] {
+        let acc: Vec<_> = fa
+            .symbols
+            .iter()
+            .filter(|s| s.name == attr && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(
+            acc.len(),
+            1,
+            "Class::Tiny qw list should synthesize one rw accessor for `{attr}`"
+        );
+        // Constructor key so `Foo->new(resolvers => ...)` connects.
+        let key_def: Vec<_> = fa
+            .symbols
+            .iter()
+            .filter(|s| s.name == attr && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
+            .collect();
+        assert!(
+            !key_def.is_empty(),
+            "Class::Tiny attr `{attr}` should mint a constructor HashKeyDef"
+        );
+        if let SymbolDetail::HashKeyDef { ref owner, .. } = key_def[0].detail {
+            assert_eq!(
+                owner,
+                &HashKeyOwner::Sub {
+                    package: Some("Foo".to_string()),
+                    name: "new".to_string(),
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn test_class_tiny_hashref_form_synthesizes_accessors_from_keys() {
+    let fa = build_fa(
+        "
+package Foo;
+use Class::Tiny {
+  name => 'default',
+  builder => sub { [] },
+};
+",
+    );
+    // Keys are accessors; default values (string / coderef) are NOT.
+    for attr in ["name", "builder"] {
+        let acc: Vec<_> = fa
+            .symbols
+            .iter()
+            .filter(|s| s.name == attr && s.kind == SymKind::Method)
+            .collect();
+        assert_eq!(
+            acc.len(),
+            1,
+            "Class::Tiny hashref key `{attr}` should synthesize an accessor"
+        );
+    }
+    // The default value `'default'` must not become an accessor.
+    assert!(
+        !fa.symbols
+            .iter()
+            .any(|s| s.name == "default" && s.kind == SymKind::Method),
+        "hashref default value must not mint a phantom accessor"
+    );
+}
+
+#[test]
+fn test_class_tiny_combined_list_and_hashref() {
+    // `use Class::Tiny qw( ssn ), { name => undef };` — both shapes on one line.
+    let fa = build_fa(
+        "
+package Foo;
+use Class::Tiny qw( ssn ), { name => undef };
+",
+    );
+    for attr in ["ssn", "name"] {
+        assert!(
+            fa.symbols
+                .iter()
+                .any(|s| s.name == attr && s.kind == SymKind::Method),
+            "combined qw+hashref form should synthesize accessor `{attr}`"
+        );
+    }
+}
+
+#[test]
+fn test_non_class_tiny_use_unaffected() {
+    // Regression: an unrelated `use X qw(...)` must NOT synthesize accessors.
+    let fa = build_fa(
+        "
+package Foo;
+use List::Util qw( max min );
+",
+    );
+    assert!(
+        !fa.symbols
+            .iter()
+            .any(|s| (s.name == "max" || s.name == "min") && s.kind == SymKind::Method),
+        "non-Class::Tiny use must not synthesize accessor methods"
+    );
+}
