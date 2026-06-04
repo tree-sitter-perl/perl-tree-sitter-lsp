@@ -1837,8 +1837,8 @@ impl<'a> Builder<'a> {
     /// than falling back to name-only union.
     fn resolve_call_package(&self, call_name: &str) -> Option<String> {
         // (1) Qualified: `Foo::bar` → `Foo`.
-        if let Some(idx) = call_name.rfind("::") {
-            return Some(call_name[..idx].to_string());
+        if let (Some(pkg), _) = crate::file_analysis::split_qualified(call_name) {
+            return Some(pkg.to_string());
         }
         // (2) Enclosing package defines the sub locally.
         if let Some(ref pkg) = self.current_package {
@@ -5184,7 +5184,7 @@ impl<'a> Builder<'a> {
             .strip_prefix('@')
             .or_else(|| stripped.strip_prefix('%'))
             .unwrap_or(stripped);
-        match no_sigil.rsplit("::").next().unwrap_or(no_sigil) {
+        match crate::file_analysis::split_qualified(no_sigil).1 {
             "EXPORT_OK" => Some("@EXPORT_OK"),
             "EXPORT" => Some("@EXPORT"),
             "EXPORT_TAGS" => Some("%EXPORT_TAGS"),
@@ -6066,9 +6066,24 @@ impl<'a> Builder<'a> {
 
         if let Ok(text) = node.utf8_text(self.source) {
             let access = self.determine_access(node);
+            // Fully-qualified read (`$Foo::Bar::x`): narrow the span to the
+            // bare tail (rule #7) so rename rewrites only `x` and the
+            // qualifier survives, mirroring the FQ-call narrowing. The full
+            // `target_name` keeps the path; `qualified_var_target()` decodes
+            // `(pkg, sigil+basename)` for cross-package resolution.
+            let ref_span = match text.rfind("::") {
+                Some(idx) => {
+                    let s = node.start_position();
+                    Span {
+                        start: Point { row: s.row, column: s.column + idx + 2 },
+                        end: node.end_position(),
+                    }
+                }
+                None => node_to_span(node),
+            };
             self.add_ref(
                 RefKind::Variable,
-                node_to_span(node),
+                ref_span,
                 text.to_string(),
                 access,
             );
@@ -10163,6 +10178,26 @@ impl<'a> Builder<'a> {
             let ref_span_start = self.refs[idx].span.start;
             let ref_target = self.refs[idx].target_name.clone();
             let ref_scope = self.refs[idx].scope;
+
+            // Fully-qualified read (`$Foo::Bar::x`): resolve by
+            // `(package, sigil+basename)` against the declaring symbol, not
+            // by lexical scope — the qualifier names the package directly,
+            // so the lexical chain is irrelevant (same seam as FQ calls).
+            // Cross-package goto-def for non-local packages happens at query
+            // time via `qualified_var_target()` + module_index.
+            if let Some((pkg, name)) = self.refs[idx]
+                .qualified_var_target()
+                .map(|(p, n)| (p.to_string(), n))
+            {
+                if let Some(sym) = self.symbols.iter().find(|s| {
+                    matches!(s.kind, SymKind::Variable | SymKind::Field)
+                        && s.name == name
+                        && s.package.as_deref() == Some(pkg.as_str())
+                }) {
+                    self.refs[idx].resolves_to = Some(sym.id);
+                }
+                continue;
+            }
 
             let use_pkg = self.package_at_pos(ref_span_start).map(|s| s.to_string());
 

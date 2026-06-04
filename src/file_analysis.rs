@@ -396,6 +396,26 @@ pub struct Ref {
     pub resolved_method_target: Option<MethodTarget>,
 }
 
+/// Split a possibly-qualified name into `(Option<package>, basename)`.
+///
+/// A name token may carry a `Pkg::` qualifier (`Foo::Bar::baz`, `@Pkg::EXPORT`,
+/// `$Foo::Bar::x`). Resolution is always `(qualifier ?? current_package,
+/// basename)`. This is the ONE place that decides "is this name qualified" —
+/// every per-construct stripper (`Ref::unqualified_target_name`,
+/// `Builder::export_var_basename`, FQ-variable ref emission) routes through it
+/// (rule #10: encode the "is qualified" property once).
+///
+/// Input must be sigil-free (callers strip `$`/`@`/`%`/`&` first). The text
+/// after the last `::` is the basename; everything before it is the package.
+/// An unqualified name yields `(None, name)`. A leading `::` (`::foo`, the
+/// `main::` shorthand) yields an empty-string package, preserved verbatim.
+pub fn split_qualified(name: &str) -> (Option<&str>, &str) {
+    match name.rsplit_once("::") {
+        Some((pkg, base)) => (Some(pkg), base),
+        None => (None, name),
+    }
+}
+
 impl Ref {
     /// The unqualified callable name for a `FunctionCall` ref. A
     /// fully-qualified call (`Foo::Bar::baz(...)`) keeps the whole path in
@@ -406,7 +426,25 @@ impl Ref {
     /// (= the qualifier) so `Foo::baz()` lands on `sub baz` in package
     /// `Foo`.
     pub fn unqualified_target_name(&self) -> &str {
-        self.target_name.rsplit("::").next().unwrap_or(&self.target_name)
+        split_qualified(&self.target_name).1
+    }
+
+    /// For a fully-qualified variable read (`$Foo::Bar::x`, `@Pkg::arr`,
+    /// `%Pkg::h`) return `(package, sigil+basename)` — the package the
+    /// global lives in, paired with the sigil-bearing bare name that keys
+    /// the declaring symbol (`("Foo::Bar", "$x")`). `None` for unqualified
+    /// reads (those resolve lexically via `resolves_to`). The sigil rides
+    /// the basename because variable symbols are keyed with their sigil
+    /// (`$x`, `@arr`, `%h`); a leading-`::` `main::` spelling yields an
+    /// empty-string package, matching how package-globals in `main` key.
+    pub fn qualified_var_target(&self) -> Option<(&str, String)> {
+        let mut chars = self.target_name.chars();
+        let sigil = chars.next()?;
+        if !matches!(sigil, '$' | '@' | '%') {
+            return None;
+        }
+        let (pkg, base) = split_qualified(chars.as_str());
+        pkg.map(|p| (p, format!("{sigil}{base}")))
     }
 }
 
