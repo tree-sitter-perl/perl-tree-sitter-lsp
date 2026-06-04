@@ -3,6 +3,20 @@ set -euo pipefail
 
 export PERL5LIB="${PERL5LIB:-$PWD/test_files/lib}"
 
+bin="${PERL_LSP_BIN:-./target/release/perl-lsp}"
+
+# Warm the fixture cache synchronously before the suite loop. The cross-file
+# suites poll a fixed 10s for the workspace index; with a cold cache the async
+# resolver loses that race in isolation, and the full run only passes because
+# earlier suites incidentally warm it. `--check` runs `cli_full_startup` (the
+# same workspace-index + SQLite warm an LSP launch does), populating the cache
+# so every suite below starts warm and the poll is deterministic. The cache is
+# keyed on the canonicalized workspace root, so warm "$PWD" — the same root the
+# nvim test harness resolves via root_markers (`.git`), not `test_files`. Clear
+# first so the warm reflects the current build, not a stale blob.
+"$bin" --clear-cache "$PWD" >/dev/null 2>&1 || true
+"$bin" --check "$PWD" --severity warning >/dev/null 2>&1 || true
+
 suites=(
   test_e2e.lua
   test_e2e_types.lua

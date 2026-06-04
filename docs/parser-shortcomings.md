@@ -298,6 +298,155 @@ the grammar emits `indirect_object` for the bareword form.
 
 ---
 
+## G5 — empty-delimiter heredoc `<<""` body bleeds into the token stream
+
+The double-quoted empty-delimiter heredoc (`<<""`, terminated by the next
+blank line) is not recognized — the same class of bug as **G3** (`<<''`),
+but the double-quote variant lexes differently: the `<<` errors and the
+trailing `""` becomes an empty `interpolated_string_literal` (G3's `''`
+becomes a `string_literal`), and the heredoc **body** is then re-lexed as
+ordinary Perl, swallowing the statements that follow.
+
+**Repro** (minimal):
+```perl
+my $x = <<"";
+line one
+line two
+
+my $y = foo();
+```
+
+**Actual** — `<<` is an ERROR child, `""` is an empty
+`interpolated_string_literal`, and the body lines are parsed as code: each
+becomes a nested `ambiguous_function_call_expression` (`line` as a function
+taking `one`/`two` as arguments), and the bleed runs all the way through the
+post-blank-line `my $y = foo();`, dragging it inside the same nested call:
+```
+(assignment_expression
+  left: (variable_declaration (scalar))   # my $x
+  (ERROR [0, 8] - [0, 10])                 # <<
+  right: (interpolated_string_literal))    # ""
+(ambiguous_function_call_expression
+  function: (function [1,0]-[1,4])          # "line"  <-- body-as-code
+  arguments: (ambiguous_function_call_expression ...   # one / two / ... my $y
+```
+
+**Expected** — `<<""` recognized as a heredoc operator (the empty-string
+delimiter form, body terminated by the next empty line); the body consumed
+as `string_content`, not re-lexed as statements. Same fix surface as G3 — a
+heredoc-delimiter lexer that accepts the empty quoted delimiter for both
+`''` and `""`.
+
+**Real-world repro** — Catalyst-Runtime
+`lib/Catalyst/Engine.pm:295` (`$infos = <<"";`), a multi-language message
+table whose body lines (`(en) Please come back later`, …) leak into the
+token stream as bareword calls.
+
+**Downstream impact** — body lines surface as `unresolved-function` false
+positives (`line`, `(en)`-prefixed words → call shapes), and the statement
+after the blank-line terminator is dragged into the bleed and lost from the
+symbol table. Contagion class, same as G1/G3.
+
+---
+
+## G6 — `-t FILEHANDLE` filetest: bareword filehandle parsed as a function call
+
+The `-t` filetest (and its `-X` siblings) applied to a **bareword
+filehandle** (`-t STDOUT`, `-t STDERR`) parses the filehandle as a function
+call rather than a filehandle operand. Same family as **G4** (bareword FH in
+the indirect-object slot) — the bareword-filehandle-as-function-call shape —
+surfacing here in the filetest-operand position. With a `$fh` scalar the
+operand parses cleanly; only the bareword form breaks.
+
+**Repro** (minimal — the bareword FH breaks only in combination with a
+following operator, matching the real `&&` site):
+```perl
+my $r = -t STDOUT && 1;
+```
+
+**Actual** — `STDOUT` becomes the `function:` of an
+`ambiguous_function_call_expression` nested inside the `func1op_call_expression`
+for `-t`, and it greedily swallows the following `&& 1` (the `&&`/operand land
+in an ERROR node):
+```
+(func1op_call_expression                    # -t
+  (ambiguous_function_call_expression
+    function: (function [0,11]-[0,17])        # "STDOUT"  <-- FH as a function
+    arguments: (function_call_expression ...)))  # && 1  mis-attached
+(ERROR (number))                              # trailing operand orphaned
+```
+For contrast, the scalar-FH and the bare no-operator forms parse correctly:
+```perl
+my $r = -t $fh;       # => func1op_call_expression (scalar $fh)   -- fine
+my $r = -t STDOUT;    # => func1op_call_expression (bareword)     -- fine (bareword, not a call)
+```
+so it is the bareword-FH + trailing-operator interaction (a precedence/
+ambiguity cousin of GR-2), not the filetest operator per se.
+
+**Expected** — the bareword in a filetest-operand slot is a filehandle
+operand (a `bareword`, as it already is for the no-operator form), not a
+function call that consumes the following operator — analogous to extending
+G4's `indirect_object` to the bareword form.
+
+**Real-world repro** — Catalyst-Runtime
+`lib/Catalyst/Utils.pm:410`: `if (!-t STDOUT && !-t STDERR) { ... }`
+(terminal-width detection guard).
+
+**Downstream impact** — `STDOUT`/`STDERR` flag as `unresolved-function`, and
+the swallowed `&&`-RHS truncates the surrounding boolean's structure. Same
+builder-side suppression surface as G4's `is_indirect_object_filehandle_call`
+could cover it, but the clean fix is the grammar treating the bareword as a
+filehandle operand.
+
+---
+
+## GR-3 — symbolic code-deref `\&{"$pkg::$sym"}` target string parsed as a literal fn name
+
+A symbolic code-reference deref whose target is a **string expression**
+(`\&{"$pkg::$sym"}`, and the glob-assign idiom `*{"..."} = \&{"..."}`) buries
+the target string under a `function` node, modeling it as the literal *name*
+of a sub rather than a symbolic reference to whatever the string evaluates to
+at runtime. This is the string-target sibling of the existing `\&{$expr}`
+"TO VERIFY" note (whose target is a bare scalar); the interpolated-string
+target and the symbol-table-munging `*{...} = \&{...}` idiom are the real
+drivers, so it is promoted to its own entry.
+
+**Repro** (minimal):
+```perl
+my $code = \&{"$pkg::$sym"};
+*{"${pkg}::$sym"} = \&{"$def::$sym"};
+```
+
+**Actual** — the deref target string nests under
+`refgen_expression → function → varname → block → interpolated_string_literal`;
+the string is presented as the function's *name* (its interpolated `$pkg` /
+`$sym` scalars buried inside), no ERROR, no contagion:
+```
+(refgen_expression
+  (function (varname (block (expression_statement
+    (interpolated_string_literal                  # "$pkg::$sym"
+      content: (string_content (scalar) (scalar))))))))   # buried, presented as a fn name
+```
+
+**Expected** — a dedicated code-dereference node (analogous to the `${...}` /
+`@{...}` deref forms) whose operand is the target expression, so the builder
+can tell "take-a-ref-of / call the coderef named by this string at runtime"
+from "call the sub literally named by a block." The glob LHS `*{"..."}` should
+likewise present the string as a symbolic glob-deref operand, not a name.
+
+**Real-world repro** — CGI-pm `lib/CGI.pm:299`:
+`*{"${callpack}::$sym"} = \&{"$def\:\:$sym"};` (the `import`-time symbol-table
+aliasing that installs CGI's exported subs into the caller's package).
+
+**Downstream impact** — lower severity than G1/G3/G5 (no ERROR, no
+contagion), but the builder risks emitting a spurious call/def ref for the
+synthetic interpolated-string "function name" (a malformed `unresolved-function`
+whose name is the literal `"$pkg::$sym"` text). Confirm whether the parser
+team intends a symbolic-deref node or expects the consumer to special-case
+this shape.
+
+---
+
 ## TO VERIFY (parser vs builder — likely parser, confirm intent)
 
 These two reproduce as questionable CST shapes. They look like grammar
