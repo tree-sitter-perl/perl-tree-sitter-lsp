@@ -1801,8 +1801,11 @@ fn test_hash_key_def_in_return_gets_sub_owner() {
 }
 
 #[test]
-fn test_hash_key_refs_chained_tree_fallback() {
-    // Chained method calls produce refs with owner: None that need tree-based resolution
+fn test_hash_key_refs_chained_resolved_at_build() {
+    // Chained method calls returning a Sub-keyed hash: the build-time
+    // `emit_chained_hash_key_refs` pass resolves the owner to
+    // `Sub{Calculator, get_config}` (the implicit-return keys), so the
+    // stored ref carries it — no tree fallback needed.
     let src = r#"package Calculator;
 sub new { bless {}, shift }
 sub get_self { my ($self) = @_; return $self; }
@@ -1822,29 +1825,33 @@ $calc->get_self->get_config->{host};
         .collect();
     assert!(!host_defs.is_empty(), "should find HashKeyDef for 'host'");
 
-    // The chained ref should have owner: None (can't resolve at build time)
-    let chained_refs: Vec<_> = fa
+    // The chained ref now carries its resolved owner at build time.
+    let owner = fa
         .refs
         .iter()
-        .filter(|r| {
-            r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { owner: None, .. })
+        .find_map(|r| match &r.kind {
+            RefKind::HashKeyAccess { owner: Some(o), .. } if r.target_name == "host" => {
+                Some(o.clone())
+            }
+            _ => None,
         })
-        .collect();
-    assert!(
-        !chained_refs.is_empty(),
-        "chained hash access should have owner: None, refs: {:?}",
-        fa.refs
-            .iter()
-            .filter(|r| r.target_name == "host")
-            .collect::<Vec<_>>()
+        .expect("chained hash access should carry a resolved owner");
+    assert_eq!(
+        owner,
+        HashKeyOwner::Sub {
+            package: Some("Calculator".to_string()),
+            name: "get_config".to_string(),
+        },
+        "owner should be the return-hash sub of the last chain hop, got {:?}",
+        owner
     );
 
-    // find_references from the def should find the chained usage via tree fallback
+    // find_references from the def finds the chained usage.
     let host_def_point = host_defs[0].selection_span.start;
     let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()), None);
     assert!(
         refs.len() >= 1,
-        "should find chained usage via tree fallback, got {} refs",
+        "should find chained usage, got {} refs",
         refs.len()
     );
 }
@@ -12842,5 +12849,147 @@ fn autoloader_via_use_base_enables_synthesis() {
             .iter()
             .any(|s| s.name == "inherited_loader_sub" && s.kind == SymKind::Sub),
         "use base 'AutoLoader' must enable data-section synthesis"
+    );
+}
+
+/// CHAINED hashref-key ref: `$obj->get_config->{host}` — get_config's
+/// return type is a known class (here a blessed Config), so the `host`
+/// key is knowable and must get its own narrow HashKeyAccess ref owned
+/// by that class. Without it, references/goto-def on `host` are dropped.
+#[test]
+fn chained_method_call_hash_key_emits_owned_ref() {
+    let src = "\
+package Config;
+sub new { bless { host => 'localhost', port => 5432 }, shift }
+package Foo;
+sub new { bless {}, shift }
+sub get_config { return Config->new() }
+package main;
+my $obj = Foo->new();
+$obj->get_config->{host};
+";
+    let tree = parse(src);
+    let fa = build(&tree, src.as_bytes());
+
+    // The `host` token (line 7, after `->{`) gets a HashKeyAccess ref
+    // owned by Config — the chain receiver's class.
+    let host_refs: Vec<_> = fa
+        .refs
+        .iter()
+        .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+        .collect();
+    assert!(
+        !host_refs.is_empty(),
+        "chained hash-key access should emit a HashKeyAccess ref for 'host'"
+    );
+    let owner = host_refs
+        .iter()
+        .find_map(|r| match &r.kind {
+            RefKind::HashKeyAccess { owner: Some(o), .. } => Some(o.clone()),
+            _ => None,
+        })
+        .expect("chained hash-key ref should carry a resolved owner");
+    assert_eq!(
+        owner,
+        HashKeyOwner::Class("Config".to_string()),
+        "owner should be the chain receiver's class, got {:?}",
+        owner
+    );
+
+    // Goto-def from the `host` token reaches the bless'd key in Config::new.
+    let key_ref = host_refs[0];
+    let def = fa.find_definition(key_ref.span.start, Some(&tree), Some(src.as_bytes()), None);
+    assert!(
+        def.is_some(),
+        "goto-def on chained `->{{host}}` should resolve to Config's key def"
+    );
+    assert_eq!(def.unwrap().start.row, 1, "host def is the bless key on line 1");
+}
+
+/// Regression: an untyped chain (`$obj->mystery->{host}` where `mystery`
+/// has no resolvable return type) must emit NO key ref — honest about
+/// ignorance rather than latching onto a wrong owner.
+#[test]
+fn untyped_chain_emits_no_hash_key_ref() {
+    let src = "\
+package main;
+my $obj = bless {}, 'Foo';
+$obj->totally_unknown_method->{host};
+";
+    let tree = parse(src);
+    let fa = build(&tree, src.as_bytes());
+    let host_refs: Vec<_> = fa
+        .refs
+        .iter()
+        .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
+        .collect();
+    assert!(
+        host_refs.is_empty(),
+        "untyped chain must not emit a hash-key ref, got {:?}",
+        host_refs
+    );
+}
+
+/// CG-3b cross-package glob attribution: `*{ 'DateTime::' . $sub } = …`
+/// inside `package DateTime::PP` synthesizes the tail (`_ymd2rd`) under
+/// the *named* package (`DateTime`), not the file's own package.
+#[test]
+fn cross_package_glob_synthesizes_under_target_package() {
+    let src = r#"package DateTime::PP;
+sub _ymd2rd { 1 }
+sub _rd2ymd { 2 }
+my @subs = qw( _ymd2rd _rd2ymd );
+for my $sub (@subs) {
+    no strict 'refs';
+    *{ 'DateTime::' . $sub } = __PACKAGE__->can($sub);
+}
+1;
+"#;
+    let fa = build_fa(src);
+    for tail in ["_ymd2rd", "_rd2ymd"] {
+        let under_datetime = fa.symbols.iter().any(|s| {
+            s.name == tail
+                && matches!(s.kind, SymKind::Sub)
+                && s.package.as_deref() == Some("DateTime")
+        });
+        assert!(
+            under_datetime,
+            "glob-synthesized `{}` should be attributed to DateTime, symbols: {:?}",
+            tail,
+            fa.symbols
+                .iter()
+                .filter(|s| s.name == tail)
+                .map(|s| (&s.name, &s.package))
+                .collect::<Vec<_>>()
+        );
+    }
+    // The real definitions (under DateTime::PP) are untouched.
+    assert!(
+        fa.symbols.iter().any(|s| s.name == "_ymd2rd"
+            && matches!(s.kind, SymKind::Sub)
+            && s.package.as_deref() == Some("DateTime::PP")),
+        "the original DateTime::PP::_ymd2rd sub must still exist"
+    );
+}
+
+/// Regression: a same-package glob (`*name = sub {…}`, no `::` prefix)
+/// still synthesizes under the current package.
+#[test]
+fn same_package_glob_synthesizes_under_current_package() {
+    let src = r#"package Acme::Widget;
+*frobnicate = sub { 42 };
+1;
+"#;
+    let fa = build_fa(src);
+    assert!(
+        fa.symbols.iter().any(|s| s.name == "frobnicate"
+            && matches!(s.kind, SymKind::Sub)
+            && s.package.as_deref() == Some("Acme::Widget")),
+        "same-package glob must stay under the current package, symbols: {:?}",
+        fa.symbols
+            .iter()
+            .filter(|s| s.name == "frobnicate")
+            .map(|s| (&s.name, &s.package))
+            .collect::<Vec<_>>()
     );
 }

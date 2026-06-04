@@ -81,6 +81,14 @@ struct ChainTypingIndex<'a> {
     /// (`emit_partial_route_targets`) filters this to `->to(...)`
     /// calls post-fold, when the receiver's brand has resolved.
     method_call_nodes: Vec<Node<'a>>,
+    /// `hash_element_expression` nodes whose container is itself a
+    /// method-call result (`$obj->get_config->{host}`). The container
+    /// type — and thus the key's owner class — is only knowable after
+    /// the fold resolves the method's return type, so the chained-key
+    /// HashKeyAccess emission (`emit_chained_hash_key_refs`) waits for
+    /// it. Plain `$var->{key}` keys are emitted during the walk
+    /// (`visit_hash_element`) and owner-resolved at phase 3.
+    chained_hash_elements: Vec<Node<'a>>,
 }
 
 /// Which chain-typing tasks the reducer should apply on this call.
@@ -112,6 +120,7 @@ fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
         invocant_nodes: std::collections::HashMap::new(),
         method_call_args: std::collections::HashMap::new(),
         method_call_nodes: Vec::new(),
+        chained_hash_elements: Vec::new(),
     };
     fn walk<'t>(node: Node<'t>, idx: &mut ChainTypingIndex<'t>) {
         match node.kind() {
@@ -131,6 +140,18 @@ fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
                 if let Some(args) = node.child_by_field_name("arguments") {
                     idx.method_call_args
                         .insert((node.start_position(), node.end_position()), args);
+                }
+            }
+            "hash_element_expression" => {
+                // Container is the first named child; index only the
+                // chained shape where it's a method call — plain
+                // `$var->{key}` is handled by the walk.
+                if node
+                    .named_child(0)
+                    .map(|c| c.kind() == "method_call_expression")
+                    .unwrap_or(false)
+                {
+                    idx.chained_hash_elements.push(node);
                 }
             }
             _ => {}
@@ -437,6 +458,11 @@ fn build_with_plugins_inner(
     // a single post-walk pass that joins refs to args via the chain
     // typing index.
     b.emit_method_call_arg_keys(&chain_idx);
+
+    // Post-pass: chained hashref-key accesses (`$obj->get_config->{host}`).
+    // Runs post-fold so the method's return type is canonical — the
+    // owner class is the chain receiver's type, unknowable until then.
+    b.emit_chained_hash_key_refs(&chain_idx);
 
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
     b.resolve_tail_pod_docs();
@@ -1456,6 +1482,28 @@ impl<'a> Builder<'a> {
         detail: SymbolDetail,
         namespace: Namespace,
     ) -> SymbolId {
+        let pkg = self.current_package.clone();
+        self.add_symbol_in_package(name, kind, span, selection_span, detail, namespace, pkg)
+    }
+
+    /// `add_symbol` with an explicit package override. Cross-package
+    /// glob installs (`*{'DateTime::'.$sub} = …`) name a target package
+    /// in the glob string that differs from `current_package` (the file
+    /// declares e.g. `package DateTime::PP`). The synthesized tail
+    /// (`_ymd2rd`) must be keyed under the *named* package so
+    /// `MethodOnClass{DateTime, _ymd2rd}` resolves — not the file's
+    /// own package. Every other caller keeps `current_package` via
+    /// `add_symbol_ns`.
+    fn add_symbol_in_package(
+        &mut self,
+        name: String,
+        kind: SymKind,
+        span: Span,
+        selection_span: Span,
+        detail: SymbolDetail,
+        namespace: Namespace,
+        package: Option<String>,
+    ) -> SymbolId {
         let id = SymbolId(self.next_symbol_id);
         self.next_symbol_id += 1;
         // Every symbol attaches to the current lexical scope. Package
@@ -1470,7 +1518,7 @@ impl<'a> Builder<'a> {
             span,
             selection_span,
             scope: self.current_scope(),
-            package: self.current_package.clone(),
+            package,
             detail,
             namespace,
             outline_label: None,
@@ -6535,20 +6583,22 @@ impl<'a> Builder<'a> {
         let def_span = node_to_span(assign_node);
         for name in names {
             // Glob into another package (`*Other::foo = ...`) installs `foo`;
-            // local call sites and goto use the unqualified tail.
-            //
-            // CG-3b deferred: cross-package attribution. `*{ 'DateTime::' . $sub }
-            // = __PACKAGE__->can($sub)` should attribute `$sub` under `DateTime`,
-            // but symbols are keyed by `self.current_package` at the call site
-            // (see `add_symbol`), with no per-symbol package override. So the
-            // qualified target (`DateTime::foo`) is synthesized as a local `foo`
-            // under the current package. Correct attribution needs an
-            // add_symbol-with-package seam; not built here.
-            let local = name.rsplit("::").next().unwrap_or(&name).to_string();
+            // local call sites and goto use the unqualified tail. The glob
+            // string's package prefix is authoritative for attribution:
+            // `*{ 'DateTime::' . $sub } = __PACKAGE__->can($sub)` synthesizes
+            // the tail under `DateTime`, not the file's own `current_package`
+            // (`DateTime::PP`), so `MethodOnClass{DateTime, _ymd2rd}` resolves.
+            // Unqualified names stay under the current package.
+            let (target_pkg, local) = match name.rsplit_once("::") {
+                Some((prefix, tail)) if !prefix.is_empty() => {
+                    (Some(prefix.to_string()), tail.to_string())
+                }
+                _ => (self.current_package.clone(), name.clone()),
+            };
             if local.is_empty() {
                 continue;
             }
-            self.add_symbol(
+            self.add_symbol_in_package(
                 local,
                 SymKind::Sub,
                 def_span,
@@ -6561,6 +6611,8 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                 },
+                Namespace::Language,
+                target_pkg,
             );
         }
     }
@@ -8764,19 +8816,33 @@ impl<'a> Builder<'a> {
         // Write. Needed for invocant mutations.
         let element_access = self.determine_access(node);
 
+        // A method-call container (`$obj->get_config->{host}`) has no
+        // variable identity to anchor the key on — its owner is the
+        // chain receiver's *return type*, knowable only post-fold. The
+        // `emit_chained_hash_key_refs` pass owns that shape: it emits a
+        // ref only when the type resolves (and stays silent otherwise,
+        // so no orphan owner-`None` ref is left behind). Emit here only
+        // for the variable-container shape.
+        let container_is_method_call = node
+            .named_child(0)
+            .map(|c| c.kind() == "method_call_expression")
+            .unwrap_or(false);
+
         // Record the key access
-        if let Some(key_node) = node.child_by_field_name("key") {
-            if let Some((key_text, is_dynamic)) = self.extract_key_text(key_node) {
-                if !is_dynamic {
-                    self.add_ref(
-                        RefKind::HashKeyAccess {
-                            var_text: var_text.clone().unwrap_or_default(),
-                            owner: None, // resolved in post-pass
-                        },
-                        node_to_span(key_node),
-                        key_text,
-                        element_access,
-                    );
+        if !container_is_method_call {
+            if let Some(key_node) = node.child_by_field_name("key") {
+                if let Some((key_text, is_dynamic)) = self.extract_key_text(key_node) {
+                    if !is_dynamic {
+                        self.add_ref(
+                            RefKind::HashKeyAccess {
+                                var_text: var_text.clone().unwrap_or_default(),
+                                owner: None, // resolved in post-pass
+                            },
+                            node_to_span(key_node),
+                            key_text,
+                            element_access,
+                        );
+                    }
                 }
             }
         }
@@ -10327,6 +10393,99 @@ impl<'a> Builder<'a> {
                     self.emit_call_arg_key_accesses(args, Gate::Deferred);
                 }
             }
+        }
+    }
+
+    /// Emit a `HashKeyAccess` ref for a hash-key access applied to a
+    /// method-call result whose return type is known
+    /// (`$obj->get_config->{host}`). Mirrors `resolve_hash_owner_from_tree`'s
+    /// query-time logic at build time so the stored ref carries a
+    /// resolvable owner (cross-file `refs_to` + the O(1) `resolves_to`
+    /// link both consult the stored owner, not the tree fallback):
+    ///   - method returns a Sub-keyed hash (`return { host => … }`) →
+    ///     `Sub{package, method}` owner, matching the implicit-return
+    ///     HashKeyDefs.
+    ///   - method returns a class instance → `Class(C)` via
+    ///     `hash_key_class()` (Parametric row-class or dispatch class).
+    /// Honest about ignorance: a chain whose return type doesn't resolve
+    /// to either emits nothing, so a should-miss stays a miss rather
+    /// than a wrong-owner latch.
+    ///
+    /// Runs post-fold (after `emit_method_call_arg_keys`) so
+    /// `invocant_type_at_node` answers against the canonical bag.
+    fn emit_chained_hash_key_refs(&mut self, idx: &ChainTypingIndex<'a>) {
+        // Snapshot resolved (key_span, key_text, access, owner) first
+        // so the emit loop can `&mut self`.
+        let mut pending: Vec<(Span, String, AccessKind, HashKeyOwner)> = Vec::new();
+        for &node in &idx.chained_hash_elements {
+            let Some(container) = node.named_child(0) else { continue };
+            let Some(key_node) = node.child_by_field_name("key") else { continue };
+            let Some((key_text, is_dynamic)) = self.extract_key_text(key_node) else { continue };
+            if is_dynamic { continue; }
+
+            // First the Sub-keyed-return path: the called method's
+            // implicit/explicit `return { k => … }` registers its keys
+            // under `Sub{package, method}`. If such a def exists for our
+            // key name, that's the precise owner. This case has no class
+            // identity (the value is a plain HashRef), so it must be
+            // tried before the `hash_key_class()` fallback.
+            let method_name = container
+                .child_by_field_name("method")
+                .and_then(|n| n.utf8_text(self.source).ok())
+                .map(|s| s.to_string());
+            let sub_owner = method_name.as_ref().and_then(|name| {
+                let mut candidates: Vec<HashKeyOwner> = self
+                    .symbols
+                    .iter()
+                    .filter(|s| {
+                        matches!(s.kind, SymKind::Sub | SymKind::Method) && &s.name == name
+                    })
+                    .map(|s| HashKeyOwner::Sub {
+                        package: s.package.clone(),
+                        name: name.clone(),
+                    })
+                    .collect();
+                // Imported synthetic defs carry a None package.
+                candidates.push(HashKeyOwner::Sub { package: None, name: name.clone() });
+                candidates
+                    .into_iter()
+                    .find(|owner| self.has_hash_key_def(&key_text, owner))
+            });
+
+            let owner = match sub_owner {
+                Some(o) => o,
+                None => {
+                    // Class-instance return: project to the hash-key
+                    // class (Parametric row-class else dispatch class).
+                    let Some(class) = self
+                        .invocant_type_at_node(container)
+                        .and_then(|ty| ty.hash_key_class().map(|s| s.to_string()))
+                    else {
+                        continue;
+                    };
+                    HashKeyOwner::Class(class)
+                }
+            };
+            pending.push((
+                node_to_span(key_node),
+                key_text,
+                self.determine_access(node),
+                owner,
+            ));
+        }
+        for (span, key_text, access, owner) in pending {
+            self.refs.push(Ref {
+                kind: RefKind::HashKeyAccess {
+                    var_text: String::new(),
+                    owner: Some(owner),
+                },
+                span,
+                scope: self.scope_at_point(span.start),
+                target_name: key_text,
+                access,
+                resolves_to: None,
+                resolved_method_target: None,
+            });
         }
     }
 

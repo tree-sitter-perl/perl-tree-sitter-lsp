@@ -2748,6 +2748,73 @@ sub action ($c) {\n\
     );
 }
 
+/// CG-3b cross-package glob attribution, cross-file: `DateTime::PP`
+/// installs `_ymd2rd` into `DateTime` via
+/// `*{ 'DateTime::' . $sub } = __PACKAGE__->can($sub)`. A `$self->_ymd2rd`
+/// call in `DateTime` (a different file) must goto-def to the real sub in
+/// PP.pm — the method is a DateTime method even though it's declared in a
+/// differently-named module file.
+#[test]
+fn cross_package_glob_method_resolves_cross_file() {
+    let provider_src = "package DateTime::PP;\n\
+sub _ymd2rd { my ($class, $y, $m, $d) = @_; return 1; }\n\
+my @subs = qw( _ymd2rd );\n\
+for my $sub (@subs) {\n\
+  no strict 'refs';\n\
+  *{ 'DateTime::' . $sub } = __PACKAGE__->can($sub);\n\
+}\n\
+1;\n";
+    let provider = parse_analysis(provider_src);
+    // Sanity: the glob really attributed `_ymd2rd` to DateTime.
+    assert!(
+        provider.symbols.iter().any(|s| s.name == "_ymd2rd"
+            && matches!(s.kind, crate::file_analysis::SymKind::Sub)
+            && s.package.as_deref() == Some("DateTime")),
+        "provider must attribute the glob-installed _ymd2rd to DateTime",
+    );
+
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let provider_path = std::path::PathBuf::from("/tmp/perl_lsp_pin_DateTime_PP.pm");
+    idx.register_workspace_module(provider_path.clone(), std::sync::Arc::new(provider));
+
+    let consumer_src = "package DateTime;\n\
+sub new { my $class = shift; return bless {}, $class; }\n\
+sub day_of_week {\n\
+  my $self = shift;\n\
+  return $self->_ymd2rd( 2024, 1, 1 );\n\
+}\n\
+1;\n";
+    let consumer = parse_analysis(consumer_src);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(consumer_src, None).unwrap();
+
+    let byte = consumer_src.find("_ymd2rd( 2024").expect("call site present");
+    let prefix = &consumer_src[..byte];
+    let pos = Position {
+        line: prefix.matches('\n').count() as u32,
+        character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
+    };
+
+    let uri = Url::parse("file:///datetime.pl").unwrap();
+    let resp = find_definition(&consumer, pos, &uri, &idx, &tree, consumer_src);
+    let loc = match resp {
+        Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+        Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => v.remove(0),
+        other => panic!("expected goto-def for cross-package glob method, got {other:?}"),
+    };
+    assert!(
+        loc.uri.path().ends_with("DateTime_PP.pm"),
+        "goto-def should land in the provider (PP) file, got {}",
+        loc.uri,
+    );
+    assert_eq!(
+        loc.range.start.line, 1,
+        "should land on the real `sub _ymd2rd` (line 1), got {}",
+        loc.range.start.line
+    );
+}
+
 /// Pin: cross-file hover on a plugin-synthesized helper. Same shape as
 /// `cross_file_plugin_helper_goto_def_resolves` but exercises the hover
 /// consumer arm, which shared the same lossy `get_cached(class).sub_info`
