@@ -12052,3 +12052,292 @@ use List::Util qw( max min );
         "non-Class::Tiny use must not synthesize accessor methods"
     );
 }
+
+// ── Task A: rule #7 ref-emission for use-constant usages + export-list members ──
+
+/// `use constant NAME => ...` usage sites (plain expr + call arg) each get a
+/// FunctionCall ref back to the constant def, so goto-def and references work.
+#[test]
+fn const_usage_name_form_emits_function_call_ref() {
+    let src = r#"
+package QA::C;
+use constant MAX_RETRIES => 5;
+sub retry {
+    my $limit = MAX_RETRIES;
+    return _attempt($limit, MAX_RETRIES);
+}
+sub _attempt { return 1 }
+"#;
+    let fa = build_fa(src);
+    let usages: Vec<&Ref> = fa
+        .refs
+        .iter()
+        .filter(|r| {
+            r.target_name == "MAX_RETRIES"
+                && matches!(
+                    &r.kind,
+                    RefKind::FunctionCall { resolved_package } if resolved_package.as_deref() == Some("QA::C")
+                )
+        })
+        .collect();
+    assert_eq!(
+        usages.len(),
+        2,
+        "both MAX_RETRIES usages (plain + call-arg) should ref the const def; got {:?}",
+        fa.refs
+            .iter()
+            .filter(|r| r.target_name == "MAX_RETRIES")
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Block form `use constant { TIMEOUT => 30, BACKOFF => 2 }` — usages of a
+/// block-declared constant get the same FunctionCall ref.
+#[test]
+fn const_usage_block_form_emits_function_call_ref() {
+    let src = r#"
+package QA::C;
+use constant {
+    TIMEOUT => 30,
+    BACKOFF => 2,
+};
+sub run {
+    my $t = TIMEOUT;
+    return $t + BACKOFF;
+}
+"#;
+    let fa = build_fa(src);
+    for name in ["TIMEOUT", "BACKOFF"] {
+        let n = fa
+            .refs
+            .iter()
+            .filter(|r| {
+                r.target_name == name
+                    && matches!(&r.kind, RefKind::FunctionCall { .. })
+            })
+            .count();
+        assert_eq!(n, 1, "{name} usage should ref the block-form const def");
+    }
+}
+
+/// goto-def from a constant usage lands on the const def via `ref_at` +
+/// `refs_to`; references on the const lists the def + every usage.
+#[test]
+fn const_usage_goto_def_and_references() {
+    use crate::file_store::FileStore;
+    use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
+    use std::path::PathBuf;
+
+    let src = r#"package QA::C;
+use constant MAX_RETRIES => 5;
+sub retry {
+    my $limit = MAX_RETRIES;
+    return MAX_RETRIES;
+}
+"#;
+    let fa = build_fa(src);
+
+    // ref_at the first usage (`my $limit = MAX_RETRIES;`) is a FunctionCall
+    // ref naming the const — that's the goto-def routing token.
+    let usage_pt = Point::new(3, 16); // inside MAX_RETRIES on the `my $limit` line
+    let r = fa
+        .ref_at(usage_pt)
+        .expect("a ref should sit on the constant usage");
+    assert_eq!(r.target_name, "MAX_RETRIES");
+    assert!(matches!(r.kind, RefKind::FunctionCall { .. }));
+
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/qa_const.pm");
+    store.insert_workspace(path.clone(), fa);
+
+    let results = refs_to(
+        &store,
+        None,
+        &TargetRef {
+            name: "MAX_RETRIES".to_string(),
+            kind: TargetKind::Sub {
+                package: Some("QA::C".to_string()),
+            },
+            method_classes: Vec::new(),
+        },
+        RoleMask::EDITABLE,
+    );
+    // def + 2 usages = 3 hits.
+    assert_eq!(
+        results.len(),
+        3,
+        "references on MAX_RETRIES should list the def and both usages; got {results:?}"
+    );
+}
+
+/// Regression: a bareword that is NOT a declared constant gets no spurious
+/// constant-usage ref.
+#[test]
+fn non_constant_bareword_gets_no_const_ref() {
+    let src = r#"
+package QA::C;
+use constant MAX_RETRIES => 5;
+sub run {
+    my $x = SOME_OTHER;
+    return $x;
+}
+"#;
+    let fa = build_fa(src);
+    assert!(
+        !fa.refs
+            .iter()
+            .any(|r| r.target_name == "SOME_OTHER"),
+        "a non-constant bareword must not get a constant-usage ref"
+    );
+}
+
+/// `@EXPORT` / `@EXPORT_OK` / `%EXPORT_TAGS` member tokens that name a local
+/// sub each get a FunctionCall ref to that sub (forward-declared subs work).
+#[test]
+fn export_list_members_ref_local_subs() {
+    let src = r#"
+package QA::E;
+use Exporter 'import';
+our @EXPORT      = qw(always_on);
+our @EXPORT_OK   = qw(opt_a opt_b opt_c);
+our %EXPORT_TAGS = (
+    group_one => [qw(opt_a opt_b)],
+    group_two => [qw(opt_c)],
+);
+sub always_on { 1 }
+sub opt_a { 'a' }
+sub opt_b { 'b' }
+sub opt_c { 'c' }
+"#;
+    let fa = build_fa(src);
+    let count = |name: &str| {
+        fa.refs
+            .iter()
+            .filter(|r| {
+                r.target_name == name
+                    && matches!(
+                        &r.kind,
+                        RefKind::FunctionCall { resolved_package } if resolved_package.as_deref() == Some("QA::E")
+                    )
+            })
+            .count()
+    };
+    // always_on: 1 (@EXPORT). opt_a: @EXPORT_OK + %EXPORT_TAGS group_one = 2.
+    // opt_b: @EXPORT_OK + group_one = 2. opt_c: @EXPORT_OK + group_two = 2.
+    assert_eq!(count("always_on"), 1, "@EXPORT member should ref its sub");
+    assert_eq!(count("opt_a"), 2, "opt_a appears in @EXPORT_OK and a tag array");
+    assert_eq!(count("opt_b"), 2, "opt_b appears in @EXPORT_OK and a tag array");
+    assert_eq!(count("opt_c"), 2, "opt_c appears in @EXPORT_OK and a tag array");
+}
+
+/// goto-def / references on an export-list member resolve to the sub def.
+#[test]
+fn export_member_goto_def_and_references() {
+    use crate::file_store::FileStore;
+    use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
+    use std::path::PathBuf;
+
+    let src = r#"package QA::E;
+use Exporter 'import';
+our @EXPORT_OK = qw(opt_a opt_b);
+sub opt_a { 'a' }
+sub opt_b { 'b' }
+"#;
+    let fa = build_fa(src);
+
+    // ref_at the `opt_a` token in the export list.
+    let opt_a_def_span = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "opt_a")
+        .map(|s| s.selection_span)
+        .expect("opt_a sub symbol");
+    // The export-list member ref must NOT be the def span itself.
+    let export_ref = fa
+        .refs
+        .iter()
+        .find(|r| {
+            r.target_name == "opt_a"
+                && matches!(&r.kind, RefKind::FunctionCall { .. })
+                && r.span != opt_a_def_span
+        })
+        .expect("an export-list FunctionCall ref for opt_a");
+    let r = fa
+        .ref_at(export_ref.span.start)
+        .expect("ref_at the export member token");
+    assert_eq!(r.target_name, "opt_a");
+
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/qa_export.pm");
+    store.insert_workspace(path.clone(), fa);
+    let results = refs_to(
+        &store,
+        None,
+        &TargetRef {
+            name: "opt_a".to_string(),
+            kind: TargetKind::Sub {
+                package: Some("QA::E".to_string()),
+            },
+            method_classes: Vec::new(),
+        },
+        RoleMask::EDITABLE,
+    );
+    // def + 1 export-list mention = 2.
+    assert_eq!(
+        results.len(),
+        2,
+        "references on opt_a should list the def and its @EXPORT_OK mention; got {results:?}"
+    );
+}
+
+/// Regression: a `%EXPORT_TAGS` tag-NAME key (`group_one`) is NOT a sub, so it
+/// gets no ref even though it sits in the export table.
+#[test]
+fn export_tag_name_key_gets_no_ref() {
+    let src = r#"
+package QA::E;
+use Exporter 'import';
+our %EXPORT_TAGS = (
+    group_one => [qw(opt_a)],
+);
+sub opt_a { 'a' }
+sub group_one { 'not a tag' }
+"#;
+    let fa = build_fa(src);
+    // The fixture defines a sub literally named `group_one` to make the test
+    // sharp: if the tag-name key were (wrongly) recorded as a member, it would
+    // resolve to this sub. The key must still get no ref — only the value-array
+    // member `opt_a` does.
+    let group_one_refs = fa
+        .refs
+        .iter()
+        .filter(|r| {
+            r.target_name == "group_one"
+                && matches!(&r.kind, RefKind::FunctionCall { .. })
+        })
+        .count();
+    assert_eq!(
+        group_one_refs, 0,
+        "a tag-name key must not be reffed even when a same-named sub exists"
+    );
+}
+
+/// A constant invoked as a call (`MAX_RETRIES()`) is reffed once by the
+/// function-call path; the bareword arm must not double-emit at that span.
+#[test]
+fn const_call_form_not_double_reffed() {
+    let src = r#"
+package QA::C;
+use constant MAX_RETRIES => 5;
+sub run { return MAX_RETRIES(); }
+"#;
+    let fa = build_fa(src);
+    let n = fa
+        .refs
+        .iter()
+        .filter(|r| {
+            r.target_name == "MAX_RETRIES" && matches!(&r.kind, RefKind::FunctionCall { .. })
+        })
+        .count();
+    assert_eq!(n, 1, "MAX_RETRIES() call must get exactly one FunctionCall ref");
+}
