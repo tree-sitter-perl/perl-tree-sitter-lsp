@@ -396,6 +396,20 @@ pub struct Ref {
     pub resolved_method_target: Option<MethodTarget>,
 }
 
+impl Ref {
+    /// The unqualified callable name for a `FunctionCall` ref. A
+    /// fully-qualified call (`Foo::Bar::baz(...)`) keeps the whole path in
+    /// `target_name` (the qualified-name hash-key binding logic and rename
+    /// rely on it), while symbols are keyed by their bare name (`baz`)
+    /// inside their package. Resolution sites that match a call against a
+    /// `Sub` symbol pair this bare tail with the ref's `resolved_package`
+    /// (= the qualifier) so `Foo::baz()` lands on `sub baz` in package
+    /// `Foo`.
+    pub fn unqualified_target_name(&self) -> &str {
+        self.target_name.rsplit("::").next().unwrap_or(&self.target_name)
+    }
+}
+
 /// Build-time-resolved dispatch target for a `MethodCall` ref.
 /// `invocant_class` is the class the invocant resolved to at build time
 /// (frozen); it drives the inheritance rename-chain match in `refs_to`,
@@ -3841,8 +3855,11 @@ impl FileAnalysis {
                     // local-package match), we MUST NOT jump to a
                     // same-named sub in a different package — that's
                     // the cross-class collision we're specifically
-                    // guarding against.
-                    for &sid in self.symbols_named(&r.target_name) {
+                    // guarding against. Qualified calls (`Foo::baz()`)
+                    // carry the full path in `target_name` but symbols are
+                    // keyed by bare name — match on the unqualified tail and
+                    // pin via `resolved_package` (the qualifier).
+                    for &sid in self.symbols_named(r.unqualified_target_name()) {
                         let sym = self.symbol(sid);
                         if sym.kind != SymKind::Sub { continue; }
                         if sym.package == *resolved_package {
@@ -4107,15 +4124,21 @@ impl FileAnalysis {
         if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
             let sym_package = sym.package.clone();
             for r in &self.refs {
-                if r.target_name == sym.name && r.resolves_to.is_none() {
-                    match (&r.kind, &sym.kind) {
+                if r.resolves_to.is_some() { continue; }
+                match (&r.kind, &sym.kind) {
                         (RefKind::FunctionCall { resolved_package }, SymKind::Sub) => {
-                            if *resolved_package == sym_package {
+                            // Match the bare callable name so qualified call
+                            // sites (`Foo::baz()`, target_name "Foo::baz")
+                            // pair with `sub baz`; `resolved_package` (the
+                            // qualifier) still isolates same-named subs
+                            // across packages.
+                            if r.unqualified_target_name() == sym.name
+                                && *resolved_package == sym_package {
                                 results.push((r.span, r.access));
                             }
                         }
                         (RefKind::MethodCall { method_name_span, .. },
-                         SymKind::Sub | SymKind::Method) => {
+                         SymKind::Sub | SymKind::Method) if r.target_name == sym.name => {
                             // Same-class match only; unresolved or
                             // different-class invocants are excluded.
                             // Method-call ref.span covers the whole
@@ -4129,9 +4152,10 @@ impl FileAnalysis {
                                 _ => {}
                             }
                         }
-                        (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module) => results.push((r.span, r.access)),
+                        (RefKind::PackageRef, SymKind::Package | SymKind::Class | SymKind::Module)
+                            if r.target_name == sym.name =>
+                            results.push((r.span, r.access)),
                         _ => {}
-                    }
                 }
             }
         }
@@ -4237,8 +4261,10 @@ impl FileAnalysis {
                 }
                 RefKind::FunctionCall { resolved_package } => {
                     // Package-scoped: hover shows the sub whose
-                    // package matches what the ref resolved to.
-                    for &sid in self.symbols_named(&r.target_name) {
+                    // package matches what the ref resolved to. Qualified
+                    // calls match on the bare tail (symbols are keyed by
+                    // bare name); `resolved_package` pins the package.
+                    for &sid in self.symbols_named(r.unqualified_target_name()) {
                         let sym = self.symbol(sid);
                         if sym.kind != SymKind::Sub { continue; }
                         if sym.package == *resolved_package {
@@ -4445,8 +4471,11 @@ impl FileAnalysis {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => return Some(RenameKind::Variable),
                 RefKind::FunctionCall { resolved_package } => {
+                    // A qualified call (`Foo::baz()`) carries the whole path
+                    // in `target_name`; the renamable identifier is the bare
+                    // tail, scoped by `resolved_package` (the qualifier).
                     return Some(RenameKind::Function {
-                        name: r.target_name.clone(),
+                        name: r.unqualified_target_name().to_string(),
                         package: resolved_package.clone(),
                     });
                 }
@@ -4622,7 +4651,9 @@ impl FileAnalysis {
                     }
                 }
                 RefKind::FunctionCall { resolved_package } => {
-                    for &sid in self.symbols_named(&r.target_name) {
+                    // Qualified calls carry the full path in `target_name`;
+                    // symbols are keyed by bare name + `resolved_package`.
+                    for &sid in self.symbols_named(r.unqualified_target_name()) {
                         let sym = self.symbol(sid);
                         if sym.kind != SymKind::Sub { continue; }
                         if sym.package == *resolved_package {

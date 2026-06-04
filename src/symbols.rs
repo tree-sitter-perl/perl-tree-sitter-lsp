@@ -249,6 +249,29 @@ pub fn find_definition(
                     range: span_to_range(import.span),
                 }));
             }
+
+            // Fully-qualified call (`Foo::Bar::baz()`) with no import: the
+            // qualifier names the package directly. `find_definition`
+            // already handled the same-file case; here the defining package
+            // lives in another module. Resolve via `resolved_package` (the
+            // qualifier) and the bare sub name.
+            if let RefKind::FunctionCall { resolved_package: Some(pkg) } = &r.kind {
+                let bare = r.unqualified_target_name();
+                if let Some(path) = module_index.module_path_cached(pkg) {
+                    if let Ok(module_uri) = Url::from_file_path(&path) {
+                        let def_line = module_index
+                            .get_cached(pkg)
+                            .and_then(|cached| cached.sub_info(bare).map(|s| s.def_line()));
+                        return Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: module_uri,
+                            range: Range {
+                                start: Position { line: def_line.unwrap_or(0), character: 0 },
+                                end: Position { line: def_line.unwrap_or(0), character: 0 },
+                            },
+                        }));
+                    }
+                }
+            }
         }
 
         // Cross-file package goto-def: resolve module name via module index
@@ -997,6 +1020,29 @@ pub fn hover_info(
                     }),
                     range: None,
                 });
+            }
+
+            // Fully-qualified call with no import: resolve the sub in the
+            // package named by the qualifier (`resolved_package`).
+            if let RefKind::FunctionCall { resolved_package: Some(pkg) } = &r.kind {
+                let bare = r.unqualified_target_name();
+                if let Some(cached) = module_index.get_cached(pkg) {
+                    if let Some(sub_info) = cached.sub_info(bare) {
+                        let sig = format_imported_signature(bare, &sub_info);
+                        let mut parts = vec![format!("```perl\n{}\n```", sig)];
+                        if let Some(doc) = sub_info.doc() {
+                            parts.push(doc.to_string());
+                        }
+                        parts.push(format!("*from `{}`*", pkg));
+                        return Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: parts.join("\n\n"),
+                            }),
+                            range: None,
+                        });
+                    }
+                }
             }
         }
     }

@@ -375,7 +375,16 @@ fn collect_from_analysis(
         _ => None,
     };
     for r in &analysis.refs {
-        if r.target_name != target.name {
+        // A qualified call (`Foo::baz()`) keeps its whole path in
+        // `target_name`; match it on the bare callable tail (the
+        // `resolved_package` check in the FunctionCall arm below still pins
+        // the right package). Every other ref kind matches by exact name.
+        let name_matches = if matches!(r.kind, RefKind::FunctionCall { .. }) {
+            r.unqualified_target_name() == target.name
+        } else {
+            r.target_name == target.name
+        };
+        if !name_matches {
             continue;
         }
         // Sub + Method both match any call into that scope — function

@@ -1357,6 +1357,83 @@ fn test_refs_to_package_qualified_sub_owner_isolates_name_collisions() {
     );
 }
 
+/// Fully-qualified call (`A::foo()`) references must reach the def in
+/// package A, even though the call's `target_name` is the whole path
+/// `A::foo` while the symbol is keyed by the bare name `foo`. The
+/// `resolved_package` qualifier pins package A.
+#[test]
+fn test_refs_to_qualified_call_resolves_to_def() {
+    let store = FileStore::new();
+    let path_a = PathBuf::from("/tmp/resolve_qual_a.pm");
+    let path_b = PathBuf::from("/tmp/resolve_qual_b.pm");
+
+    let fa_a = parse("package A;\nsub foo { 42 }\n1;\n");
+    store.insert_workspace(path_a.clone(), fa_a);
+
+    // No import — the qualifier names the package directly.
+    let fa_b = parse("package B;\nsub bar { A::foo(); A::foo() }\n1;\n");
+    store.insert_workspace(path_b.clone(), fa_b);
+
+    let results = refs_to(
+        &store,
+        None,
+        &TargetRef {
+            name: "foo".to_string(),
+            kind: TargetKind::Sub {
+                package: Some("A".to_string()),
+            },
+            method_classes: Vec::new(),
+        },
+        RoleMask::EDITABLE,
+    );
+
+    // Decl in A.
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(&r.key, FileKey::Path(p) if p == &path_a)),
+        "expected the def in A, got {:?}",
+        results,
+    );
+    // Both qualified call sites in B.
+    let b_hits = results
+        .iter()
+        .filter(|r| matches!(&r.key, FileKey::Path(p) if p == &path_b))
+        .count();
+    assert_eq!(b_hits, 2, "expected both A::foo() call sites, got {:?}", results);
+}
+
+/// A qualified call to package A's `foo` must not match a same-named
+/// `foo` in package C — `resolved_package` isolates the qualifier.
+#[test]
+fn test_refs_to_qualified_call_isolates_package() {
+    let store = FileStore::new();
+    let path_b = PathBuf::from("/tmp/resolve_qual_iso_b.pm");
+
+    let fa_b = parse("package B;\nsub bar { A::foo(); C::foo() }\n1;\n");
+    store.insert_workspace(path_b.clone(), fa_b);
+
+    let results = refs_to(
+        &store,
+        None,
+        &TargetRef {
+            name: "foo".to_string(),
+            kind: TargetKind::Sub {
+                package: Some("A".to_string()),
+            },
+            method_classes: Vec::new(),
+        },
+        RoleMask::EDITABLE,
+    );
+
+    // Only the A::foo() site, never C::foo().
+    let b_hits = results
+        .iter()
+        .filter(|r| matches!(&r.key, FileKey::Path(p) if p == &path_b))
+        .count();
+    assert_eq!(b_hits, 1, "only A::foo() should match, got {:?}", results);
+}
+
 #[test]
 fn test_refs_to_role_mask_excludes_workspace() {
     let store = FileStore::new();

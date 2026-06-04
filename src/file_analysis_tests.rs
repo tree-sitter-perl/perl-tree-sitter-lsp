@@ -298,6 +298,53 @@ fn build_fa_from_source(source: &str) -> FileAnalysis {
     crate::builder::build(&tree, source.as_bytes())
 }
 
+/// Fully-qualified same-file call (`Foo::baz()`) — goto-def lands on the
+/// local `sub baz` in package Foo, and references on the def includes the
+/// qualified call site. The ref's `target_name` is the whole `Foo::baz`
+/// path; resolution matches on the bare tail + `resolved_package`.
+#[test]
+fn test_qualified_call_local_goto_def_and_references() {
+    let src = "package Foo;\nsub baz { 42 }\npackage main;\nFoo::baz();\n";
+    let fa = build_fa_from_source(src);
+
+    // Cursor on `baz` in `Foo::baz()` (line 3 = 0-indexed; `baz` starts
+    // at col 5 after `Foo::`).
+    let def = fa
+        .find_definition(Point::new(3, 6), None, None, None)
+        .expect("goto-def on Foo::baz() should resolve to the local sub");
+    // The def is `sub baz` on line 1.
+    assert_eq!(def.start.row, 1, "should land on `sub baz`, got {:?}", def);
+
+    // References anchored on the call site must include the call span.
+    let refs = fa.find_references(Point::new(3, 6), None, None, None);
+    assert!(
+        refs.iter().any(|s| s.start.row == 3),
+        "references should include the Foo::baz() call site, got {:?}",
+        refs,
+    );
+    // And the declaration.
+    assert!(
+        refs.iter().any(|s| s.start.row == 1),
+        "references should include the sub baz declaration, got {:?}",
+        refs,
+    );
+}
+
+/// A qualified call to package Foo's `baz` must not resolve to a same-named
+/// `baz` in another package — `resolved_package` isolates the qualifier.
+#[test]
+fn test_qualified_call_does_not_cross_package() {
+    let src = "package Foo;\nsub baz { 1 }\npackage Bar;\nsub baz { 2 }\npackage main;\nBar::baz();\n";
+    let fa = build_fa_from_source(src);
+
+    // Cursor on `baz` in `Bar::baz()` (line 5, col 5).
+    let def = fa
+        .find_definition(Point::new(5, 6), None, None, None)
+        .expect("Bar::baz() should resolve");
+    // Bar's `sub baz` is on line 3, not Foo's on line 1.
+    assert_eq!(def.start.row, 3, "should land on Bar's sub baz, got {:?}", def);
+}
+
 /// Dynamic method dispatch: `my $m = 'get_config'; __PACKAGE__->$m()`.
 /// Constant folding recovers the method name "get_config" from the
 /// string assignment, so the MethodCallBinding fires and $c picks up

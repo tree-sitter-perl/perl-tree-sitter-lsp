@@ -5885,9 +5885,25 @@ impl<'a> Builder<'a> {
         if let Some(func_node) = node.child_by_field_name("function") {
             if let Ok(name) = func_node.utf8_text(self.source) {
                 let resolved_package = self.resolve_call_package(name);
+                // Narrowest span (rule #7): for a qualified call
+                // (`Foo::Bar::baz()`) the renamable/highlightable token is
+                // the bare tail, not the whole `::` path — so rename rewrites
+                // only `baz` and the qualifier survives. `target_name` keeps
+                // the full path (the hash-key binding + provenance rely on
+                // it); resolution sites read `unqualified_target_name()`.
+                let ref_span = match name.rfind("::") {
+                    Some(idx) => {
+                        let s = func_node.start_position();
+                        Span {
+                            start: Point { row: s.row, column: s.column + idx + 2 },
+                            end: func_node.end_position(),
+                        }
+                    }
+                    None => node_to_span(func_node),
+                };
                 self.add_ref(
                     RefKind::FunctionCall { resolved_package: resolved_package.clone() },
-                    node_to_span(func_node),
+                    ref_span,
                     name.to_string(),
                     AccessKind::Read,
                 );
