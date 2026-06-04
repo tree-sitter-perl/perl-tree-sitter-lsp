@@ -2183,6 +2183,10 @@ fn format_imported_signature(name: &str, sub_info: &SubInfo<'_>) -> String {
 /// Sorted list of Perl built-in functions. Used to avoid false-positive
 /// "unresolved function" diagnostics. Checked via binary_search.
 static PERL_BUILTINS: &[&str] = &[
+    // Core bareword filehandles. Uppercase sorts before the lowercase
+    // builtin names below (ASCII), so the slice stays binary-searchable.
+    // Suppresses `print DATA`, `STDOUT->autoflush`, `-t STDIN` style FPs.
+    "ARGV", "ARGVOUT", "DATA", "STDERR", "STDIN", "STDOUT",
     "abs", "accept", "alarm", "atan2",
     "bind", "binmode", "bless",
     "caller", "chdir", "chmod", "chomp", "chop", "chown", "chr", "chroot", "close",

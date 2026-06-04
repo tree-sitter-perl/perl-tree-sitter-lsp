@@ -3372,3 +3372,76 @@ fn does_method_not_flagged_unresolved() {
         unresolved_method,
     );
 }
+
+
+#[test]
+fn classic_perl_filehandle_fps_suppressed() {
+    // `print FH LIST` / `say FH` / `printf FH` must not flag the bareword
+    // filehandle as an unresolved function.
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    for src in [
+        "print STDERR \"hi\";\n",
+        "printf STDERR \"%s\", $x;\n",
+        "say STDOUT \"hi\";\n",
+        "print DATA;\n",
+        "STDOUT->autoflush(1);\n",
+        "my $t = -t STDIN;\n",
+    ] {
+        let analysis = parse_analysis(src);
+        let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+        assert!(
+            diags.is_empty(),
+            "filehandle FP for `{}`: {:?}",
+            src.trim(),
+            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn print_with_real_call_in_list_still_flags() {
+    // The filehandle suppression must not swallow real calls in the list.
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let analysis = parse_analysis("print STDERR \"a\", frobnicate();\n");
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    assert!(
+        diags.iter().any(|d| d.message.contains("frobnicate")),
+        "real call `frobnicate` in print list must still flag; got: {:?}",
+        diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn use_constant_callsites_not_flagged() {
+    // Both scalar and block forms register the constant as a local sub, so
+    // same-file callsites no longer flag as unresolved functions.
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    for src in [
+        "use constant DEBUG => 1;\nmy $y = DEBUG && 2;\n",
+        "use constant { A => 1, B => 2 };\nmy $z = A() + B();\n",
+    ] {
+        let analysis = parse_analysis(src);
+        let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+        assert!(
+            diags.is_empty(),
+            "use-constant callsite FP for `{}`: {:?}",
+            src.trim(),
+            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn require_bareword_not_flagged() {
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    for src in ["require Carp;\n", "require Foo::Bar;\n"] {
+        let analysis = parse_analysis(src);
+        let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+        assert!(
+            diags.is_empty(),
+            "require-bareword FP for `{}`: {:?}",
+            src.trim(),
+            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+        );
+    }
+}

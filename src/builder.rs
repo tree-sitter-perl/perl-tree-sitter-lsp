@@ -4054,42 +4054,128 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Accumulate `use constant NAME => value` into constant_strings.
+    /// Accumulate `use constant NAME => value` into constant_strings and
+    /// register each declared constant as a local Sub symbol.
+    ///
+    /// Two source shapes, both handled:
+    ///   * scalar form `use constant NAME => VAL` → `list_expression`
+    ///     child whose first named entry is the name, rest the value.
+    ///   * block form `use constant { A => 1, B => 2 }` →
+    ///     `anonymous_hash_expression` wrapping a flat name/value list.
+    ///
+    /// `constant`-declared names are package-global subs (no params, no
+    /// return shape we track), so emitting a `Sub` symbol satisfies
+    /// goto-def and silences the unresolved-function hint at every
+    /// same-file callsite.
     fn accumulate_use_constant(&mut self, node: Node<'a>) {
-        // CST: use_statement → module:"constant", list_expression(autoquoted_bareword, value...)
-        // Find the list_expression child that contains the constant definition
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                if child.kind() == "list_expression" {
-                    // First named child should be the constant name (autoquoted_bareword)
-                    let mut name = None;
-                    let mut saw_name = false;
-                    for j in 0..child.child_count() {
-                        if let Some(c) = child.child(j) {
-                            if !c.is_named() { continue; }
-                            if !saw_name {
-                                if c.kind() == "autoquoted_bareword" || c.kind() == "bareword" {
-                                    name = c.utf8_text(self.source).ok().map(|s| s.to_string());
-                                }
-                                saw_name = true;
-                                continue;
-                            }
-                            // Everything after the name is the value — extract strings
-                            if let Some(ref n) = name {
-                                let values = self.extract_string_names(c);
-                                if !values.is_empty() {
-                                    self.constant_strings
-                                        .entry(n.clone())
-                                        .or_default()
-                                        .extend(values);
-                                }
-                            }
+            let child = match node.child(i) {
+                Some(c) if c.is_named() => c,
+                _ => continue,
+            };
+            match child.kind() {
+                "list_expression" => {
+                    self.accumulate_constant_pair(child);
+                    return;
+                }
+                "anonymous_hash_expression" => {
+                    self.accumulate_constant_block(child);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Scalar `use constant`: first named entry is the name, the rest is
+    /// the value side (extracted into `constant_strings`).
+    fn accumulate_constant_pair(&mut self, list: Node<'a>) {
+        let mut name: Option<(String, Node)> = None;
+        for j in 0..list.child_count() {
+            let c = match list.child(j) {
+                Some(c) if c.is_named() => c,
+                _ => continue,
+            };
+            match &name {
+                None => {
+                    if matches!(c.kind(), "autoquoted_bareword" | "bareword") {
+                        if let Ok(text) = c.utf8_text(self.source) {
+                            name = Some((text.to_string(), c));
                         }
                     }
-                    return;
+                }
+                Some((n, _)) => {
+                    let values = self.extract_string_names(c);
+                    if !values.is_empty() {
+                        self.constant_strings.entry(n.clone()).or_default().extend(values);
+                    }
                 }
             }
         }
+        if let Some((n, name_node)) = name {
+            self.register_constant_symbol(&n, name_node);
+        }
+    }
+
+    /// Block `use constant { ... }`: a flat (possibly right-nested) list of
+    /// alternating name/value entries. Register every name as a Sub symbol
+    /// and accumulate string values keyed by name.
+    fn accumulate_constant_block(&mut self, hash: Node<'a>) {
+        let mut entries: Vec<Node> = Vec::new();
+        self.collect_constant_block_entries(hash, &mut entries);
+        let mut idx = 0;
+        while idx < entries.len() {
+            let name_node = entries[idx];
+            if matches!(name_node.kind(), "autoquoted_bareword" | "bareword") {
+                if let Ok(text) = name_node.utf8_text(self.source) {
+                    let n = text.to_string();
+                    self.register_constant_symbol(&n, name_node);
+                    if let Some(val) = entries.get(idx + 1) {
+                        let values = self.extract_string_names(*val);
+                        if !values.is_empty() {
+                            self.constant_strings.entry(n).or_default().extend(values);
+                        }
+                    }
+                }
+            }
+            idx += 2;
+        }
+    }
+
+    /// Flatten the name/value entries of a block-form constant hash. The
+    /// parser right-nests trailing pairs inside a `list_expression`, so we
+    /// recurse into nested lists, collecting named leaves in source order.
+    fn collect_constant_block_entries(&self, node: Node<'a>, out: &mut Vec<Node<'a>>) {
+        for k in 0..node.child_count() {
+            let c = match node.child(k) {
+                Some(c) if c.is_named() => c,
+                _ => continue,
+            };
+            if matches!(c.kind(), "list_expression" | "anonymous_hash_expression") {
+                self.collect_constant_block_entries(c, out);
+            } else {
+                out.push(c);
+            }
+        }
+    }
+
+    /// Register a single `use constant` name as a parameterless Sub symbol.
+    fn register_constant_symbol(&mut self, name: &str, name_node: Node<'a>) {
+        let span = node_to_span(name_node);
+        self.add_symbol(
+            name.to_string(),
+            SymKind::Sub,
+            span,
+            span,
+            SymbolDetail::Sub {
+                params: Vec::new(),
+                is_method: false,
+                doc: None,
+                display: None,
+                hide_in_outline: false,
+                opaque_return: false,
+            },
+        );
     }
 
     /// Extract strings from a node's children: qw(), paren lists, bare strings.
@@ -5259,6 +5345,16 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_function_call(&mut self, node: Node<'a>) {
+        // Indirect-object filehandle: `print FH LIST` / `say FH ...` /
+        // `printf FH ...` parses as the print verb whose `arguments` is a
+        // nested call with `function` = the bareword filehandle. The
+        // bareword is a filehandle, not a sub — don't emit a FunctionCall
+        // ref for it (otherwise every `print STDERR ...` flags STDERR as
+        // unresolved). Visit the real payload args; skip the verb-as-func.
+        if self.is_indirect_object_filehandle_call(node) {
+            self.visit_children(node);
+            return;
+        }
         if let Some(func_node) = node.child_by_field_name("function") {
             if let Ok(name) = func_node.utf8_text(self.source) {
                 let resolved_package = self.resolve_call_package(name);
@@ -5413,6 +5509,55 @@ impl<'a> Builder<'a> {
         // (malformed or modifier-without-sub-body code), clear it so it doesn't leak
         // to the next anonymous sub in the file.
         self.modifier_invocant_pos = None;
+    }
+
+    /// True when `node` is the bareword-filehandle argument of a
+    /// `print`/`printf`/`say` call: `print FH LIST`. Perl parses the
+    /// leading no-paren bareword as the indirect-object filehandle, which
+    /// tree-sitter models as a nested `ambiguous_function_call_expression`
+    /// (function = the filehandle, arguments = the print list) sitting in
+    /// the verb's `arguments` slot. The parenthesized form `print foo(...)`
+    /// parses as a `function_call_expression` instead, so it's a real call
+    /// and never matches here.
+    fn is_indirect_object_filehandle_call(&self, node: Node<'a>) -> bool {
+        if node.kind() != "ambiguous_function_call_expression" {
+            return false;
+        }
+        // The filehandle must be a plain bareword identifier (no sigil).
+        let func = match node.child_by_field_name("function") {
+            Some(f) => f,
+            None => return false,
+        };
+        let fh_text = match func.utf8_text(self.source) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        if fh_text.is_empty()
+            || !fh_text.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+            || !fh_text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        {
+            return false;
+        }
+        // Parent must be a print-family verb, with `node` in its argument slot.
+        let parent = match node.parent() {
+            Some(p) => p,
+            None => return false,
+        };
+        if !matches!(
+            parent.kind(),
+            "ambiguous_function_call_expression" | "function_call_expression"
+        ) {
+            return false;
+        }
+        if parent.child_by_field_name("arguments").map(|a| a.id()) != Some(node.id()) {
+            return false;
+        }
+        matches!(
+            parent
+                .child_by_field_name("function")
+                .and_then(|f| f.utf8_text(self.source).ok()),
+            Some("print" | "printf" | "say")
+        )
     }
 
     /// Handle `push @EXPORT, 'foo', 'bar'` — append to export lists.

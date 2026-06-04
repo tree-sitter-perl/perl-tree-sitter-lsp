@@ -11399,3 +11399,92 @@ has my_setting => (is => 'ro', isa => 'Str');
         );
     }
 }
+
+#[test]
+fn use_constant_scalar_form_registers_sub_symbol() {
+    // `use constant NAME => VAL` declares a package-global sub. Registering
+    // it as a Sub symbol silences the unresolved-function hint at callsites
+    // and gives goto-def.
+    let fa = build_fa("use constant DEBUG => 1;\nmy $y = DEBUG && 2;\n");
+    assert!(
+        fa.symbols.iter().any(|s| s.name == "DEBUG" && s.kind == SymKind::Sub),
+        "DEBUG must be registered as a Sub symbol; got: {:?}",
+        fa.symbols.iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn use_constant_block_form_registers_each_name() {
+    let fa = build_fa("use constant { A => 1, B => 2, C => 3 };\n");
+    for n in ["A", "B", "C"] {
+        assert!(
+            fa.symbols.iter().any(|s| s.name == n && s.kind == SymKind::Sub),
+            "block-form constant `{n}` must be a Sub symbol; got: {:?}",
+            fa.symbols.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn use_constant_between_subs_at_file_scope() {
+    // Constants declared between subs must still register.
+    let src = "sub one {}\nuse constant MID => 'x';\nsub two {}\n";
+    let fa = build_fa(src);
+    assert!(
+        fa.symbols.iter().any(|s| s.name == "MID" && s.kind == SymKind::Sub),
+        "MID declared between subs must register as a Sub symbol",
+    );
+}
+
+#[test]
+fn indirect_object_filehandle_not_a_function_ref() {
+    // `print FH LIST` — the bareword filehandle must NOT become a
+    // FunctionCall ref (otherwise STDERR/STDOUT/DATA flag as unresolved).
+    for src in [
+        "print STDERR \"hi\";\n",
+        "printf STDERR \"%s\", $x;\n",
+        "say STDOUT \"hi\";\n",
+    ] {
+        let fa = build_fa(src);
+        let fh = src.split_whitespace().nth(1).unwrap().trim_matches(|c| c == '"');
+        assert!(
+            !fa.refs.iter().any(|r|
+                matches!(r.kind, RefKind::FunctionCall { .. }) && r.target_name == fh),
+            "filehandle `{fh}` must not be a FunctionCall ref for `{}`; refs: {:?}",
+            src.trim(),
+            fa.refs.iter().filter(|r| matches!(r.kind, RefKind::FunctionCall { .. }))
+                .map(|r| r.target_name.clone()).collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn print_with_paren_call_still_emits_function_ref() {
+    // `print foo("x")` is a real call — foo must keep its FunctionCall ref.
+    let fa = build_fa("print foo(\"x\");\n");
+    assert!(
+        fa.refs.iter().any(|r|
+            matches!(r.kind, RefKind::FunctionCall { .. }) && r.target_name == "foo"),
+        "parenthesized call `foo(...)` inside print must keep its FunctionCall ref",
+    );
+}
+
+#[test]
+fn shift_invocant_typed_like_at_underscore() {
+    // `my $self = shift;` types $self as the enclosing class, exactly like
+    // `my ($self) = @_;` — so method calls on $self resolve in-package.
+    // Each body is on line 2 (0-indexed); query $self at its use point.
+    let at_point = tree_sitter::Point { row: 2, column: 28 };
+    let is_class_w = |fa: &FileAnalysis| {
+        matches!(
+            fa.inferred_type_via_bag("$self", at_point),
+            Some(InferredType::ClassName(ref c)) if c == "W"
+        )
+    };
+    let shift_fa =
+        build_fa("package W;\nsub go { 1 }\nsub f { my $self = shift; $self->go(); }\n");
+    let at_fa =
+        build_fa("package W;\nsub go { 1 }\nsub f { my ($self) = @_; $self->go(); }\n");
+    assert!(is_class_w(&shift_fa), "shift-extracted $self must type as ClassName(W)");
+    assert!(is_class_w(&at_fa), "@_-extracted $self must type as ClassName(W)");
+}
