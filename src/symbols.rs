@@ -272,6 +272,31 @@ pub fn find_definition(
                     }
                 }
             }
+
+        }
+
+        // Fully-qualified variable read (`$Foo::Bar::x`, `@Pkg::arr`):
+        // the package lives in another module. `find_definition` handled
+        // the same-file case via `resolves_to`; here resolve the package
+        // global through the module index, mirroring the FQ-call path.
+        // Honest miss (no jump) when the package or its decl is absent.
+        if let Some((pkg, name)) = r.qualified_var_target() {
+            if let Some(path) = module_index.module_path_cached(pkg) {
+                if let Ok(module_uri) = Url::from_file_path(&path) {
+                    if let Some(def_line) = module_index
+                        .get_cached(pkg)
+                        .and_then(|cached| cached.package_var_def_line(&name, pkg))
+                    {
+                        return Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: module_uri,
+                            range: Range {
+                                start: Position { line: def_line, character: 0 },
+                                end: Position { line: def_line, character: 0 },
+                            },
+                        }));
+                    }
+                }
+            }
         }
 
         // Cross-file package goto-def: resolve module name via module index

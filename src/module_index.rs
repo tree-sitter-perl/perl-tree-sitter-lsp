@@ -72,6 +72,23 @@ impl CachedModule {
         })
     }
 
+    /// Locate a package-global variable declaration (`our $x` / `our @arr`
+    /// / `our %h`) by its sigil-bearing name within `package`. Powers
+    /// cross-file goto-def for a fully-qualified read (`$Foo::Bar::x`).
+    /// `name` includes the sigil (`$x`, `@arr`, `%h`) to match how variable
+    /// symbols are keyed.
+    pub fn package_var_def_line(&self, name: &str, package: &str) -> Option<u32> {
+        self.analysis
+            .symbols
+            .iter()
+            .find(|s| {
+                matches!(s.kind, SymKind::Variable | SymKind::Field)
+                    && s.name == name
+                    && s.package.as_deref() == Some(package)
+            })
+            .map(|s| s.span.start.row as u32)
+    }
+
     /// True if any sub/method with this name is declared in this module.
     pub fn has_sub(&self, name: &str) -> bool {
         self.analysis.symbols.iter().any(|s| {

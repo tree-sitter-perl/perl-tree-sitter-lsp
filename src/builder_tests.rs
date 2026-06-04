@@ -11117,6 +11117,87 @@ fn refgen_goto_def_lands_on_sub_definition() {
     );
 }
 
+// ---- Fully-qualified variable reads → (pkg, basename) ----
+
+#[test]
+fn split_qualified_basics() {
+    use crate::file_analysis::split_qualified;
+    assert_eq!(split_qualified("Foo::Bar::baz"), (Some("Foo::Bar"), "baz"));
+    assert_eq!(split_qualified("baz"), (None, "baz"));
+    assert_eq!(split_qualified("Foo::bar"), (Some("Foo"), "bar"));
+    // Leading `::` (main:: shorthand) → empty-string package, preserved.
+    assert_eq!(split_qualified("::foo"), (Some(""), "foo"));
+}
+
+#[test]
+fn fq_scalar_read_resolves_same_file() {
+    // `our $x` in package Pkg; `$Pkg::x` read in another package, same file.
+    let src = "package Pkg;\nour $x = 1;\npackage Main;\nmy $a = $Pkg::x;\n";
+    let fa = build_fa(src);
+    let decl = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "$x" && s.package.as_deref() == Some("Pkg"))
+        .expect("our $x in Pkg should be a symbol");
+    // Cursor on the `x` tail of `$Pkg::x` (line 3).
+    let read = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "$Pkg::x")
+        .expect("$Pkg::x should emit a Variable ref");
+    assert_eq!(
+        read.resolves_to,
+        Some(decl.id),
+        "FQ scalar read should resolve to the Pkg::x declaration"
+    );
+    let def = fa.find_definition(read.span.start, None, None, None);
+    assert_eq!(def, Some(decl.selection_span));
+}
+
+#[test]
+fn fq_array_read_resolves_same_file() {
+    let src = "package Pkg;\nour @arr = (1, 2);\npackage Main;\nmy @b = @Pkg::arr;\n";
+    let fa = build_fa(src);
+    let decl = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "@arr" && s.package.as_deref() == Some("Pkg"))
+        .expect("our @arr in Pkg should be a symbol");
+    let read = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "@Pkg::arr")
+        .expect("@Pkg::arr should emit a Variable ref");
+    assert_eq!(read.resolves_to, Some(decl.id));
+}
+
+#[test]
+fn fq_var_ref_span_narrowed_to_tail() {
+    // rule #7: rename/highlight token is the bare tail, not the whole path.
+    let src = "package Pkg;\nour $x = 1;\npackage Main;\nmy $a = $Pkg::x;\n";
+    let fa = build_fa(src);
+    let read = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "$Pkg::x")
+        .expect("$Pkg::x ref");
+    // `$Pkg::x` on line 3: `my $a = ` is 8 cols, `$Pkg::` is 6 → `x` at col 14.
+    assert_eq!(read.span.start.row, 3);
+    assert_eq!(read.span.start.column, 14, "span should start at the `x` tail");
+}
+
+#[test]
+fn unqualified_var_still_resolves_lexically() {
+    // Regression: the FQ fast-path must not break plain lexical resolution.
+    let fa = build_fa("my $x = 1;\nprint $x;\n");
+    let read = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "$x" && r.access == AccessKind::Read)
+        .expect("plain $x read");
+    assert!(read.resolves_to.is_some(), "unqualified read still resolves");
+}
+
 // ---- Fix #3: around/before/after modifier bodies ----
 
 /// In `around foo => sub { my ($orig, $self) = @_; ... }`, `$self` (param index 1)
