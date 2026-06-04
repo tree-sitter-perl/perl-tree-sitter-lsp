@@ -588,6 +588,7 @@ fn test_goto_def_typed_same_file_method_resolves() {
     );
 }
 
+
 #[test]
 fn test_use_symbol() {
     let fa = build_fa("use Foo::Bar;");
@@ -798,6 +799,64 @@ fn test_type_inference_first_param() {
     let fa = build_fa("package Calculator;\nsub new {\n    my ($self) = @_;\n}");
     let ty = fa.inferred_type_via_bag("$self", Point::new(2, 10));
     assert_eq!(ty, Some(InferredType::ClassName("Calculator".into())));
+}
+
+#[test]
+fn test_bless_promotes_var_to_class() {
+    // `my $self = {}; bless $self, $class;` — after the bless, $self is an
+    // instance of the enclosing class, not a bare HashRef.
+    let src = "package Point;\nsub new {\n  my $class = shift;\n  my $self = {};\n  bless $self, $class;\n  return $self;\n}\n";
+    let fa = build_fa(src);
+    // Query $self at the `return $self` line (after the bless).
+    let ty = fa.inferred_type_via_bag("$self", Point::new(5, 9));
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Point".into())),
+        "post-bless $self should be ClassName(Point), got {:?}",
+        ty
+    );
+}
+
+#[test]
+fn test_bless_fat_arrow_and_package() {
+    // `bless $self => __PACKAGE__` form.
+    let src = "package Widget;\nsub build {\n  my $self = {};\n  bless $self => __PACKAGE__;\n  return $self;\n}\n";
+    let fa = build_fa(src);
+    let ty = fa.inferred_type_via_bag("$self", Point::new(4, 9));
+    assert_eq!(ty, Some(InferredType::ClassName("Widget".into())));
+}
+
+#[test]
+fn test_bless_literal_class() {
+    // `bless $self, "Other"` — explicit literal class wins.
+    let src = "package Factory;\nsub mk {\n  my $self = {};\n  bless $self, \"Other\";\n  return $self;\n}\n";
+    let fa = build_fa(src);
+    let ty = fa.inferred_type_via_bag("$self", Point::new(4, 9));
+    assert_eq!(ty, Some(InferredType::ClassName("Other".into())));
+}
+
+#[test]
+fn test_return_bless_anon_hash_class() {
+    // `return bless {}, $class` — the sub returns a ClassName instance even
+    // though there's no variable to promote.
+    let src = "package Maker;\nsub new {\n  my $class = shift;\n  return bless {}, $class;\n}\n";
+    let fa = build_fa(src);
+    let ty = fa.sub_return_type_at_arity("new", Some(0));
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Maker".into())),
+        "return bless should type the sub return, got {:?}",
+        ty
+    );
+}
+
+#[test]
+fn test_non_bless_hashref_stays_hashref() {
+    // Regression: a hashref that's never blessed keeps its HashRef type.
+    let src = "sub mk {\n  my $h = {};\n  return $h;\n}\n";
+    let fa = build_fa(src);
+    let ty = fa.inferred_type_via_bag("$h", Point::new(2, 9));
+    assert_eq!(ty, Some(InferredType::HashRef), "unblessed hashref stays HashRef");
 }
 
 // ---- Literal constructor extraction tests (via build_fa) ----
@@ -1575,6 +1634,36 @@ fn test_two_packages_scoped() {
     // At the alpha sub, package should be "Foo"
     let pkg = fa.package_at(Point::new(1, 5));
     assert_eq!(pkg, Some("Foo"));
+}
+
+#[test]
+fn test_block_scoped_package_reverts() {
+    // A `package Inner;` inside a bare `{ }` block must NOT leak past the
+    // block close — `sub o` after the block belongs to Outer.
+    let src = "package Outer;\n{\n  package Inner;\n  sub i { }\n}\nsub o { }\n";
+    let fa = build_fa(src);
+
+    let o = fa.symbols.iter().find(|s| s.name == "o").expect("sub o");
+    assert_eq!(o.package.as_deref(), Some("Outer"), "sub o must be in Outer, not Inner");
+
+    let i = fa.symbols.iter().find(|s| s.name == "i").expect("sub i");
+    assert_eq!(i.package.as_deref(), Some("Inner"), "sub i must be in Inner");
+
+    // package_at must also revert: line 5 (`sub o`) is Outer.
+    assert_eq!(fa.package_at(Point::new(5, 4)), Some("Outer"));
+    // line 3 (`sub i`) is Inner.
+    assert_eq!(fa.package_at(Point::new(3, 6)), Some("Inner"));
+}
+
+#[test]
+fn test_non_block_package_unaffected() {
+    // Regression: a normal statement-form `package Bar;` (no block) still
+    // flows to end of file.
+    let fa = build_fa("package Foo;\nsub a { }\npackage Bar;\nsub b { }\nsub c { }\n");
+    let b = fa.symbols.iter().find(|s| s.name == "b").expect("sub b");
+    let c = fa.symbols.iter().find(|s| s.name == "c").expect("sub c");
+    assert_eq!(b.package.as_deref(), Some("Bar"));
+    assert_eq!(c.package.as_deref(), Some("Bar"));
 }
 
 // ---- High-level query tests ----
