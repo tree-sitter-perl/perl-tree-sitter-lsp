@@ -2815,6 +2815,15 @@ impl<'a> Builder<'a> {
             "use_statement" => self.visit_use(node),
             "assignment_expression" => self.visit_assignment(node),
 
+            // A bare `{ ... }` statement is its own block node in this
+            // grammar (no separate `block` child). It's a hard package
+            // boundary like any other block — `{ package Inner; }` must not
+            // leak Inner to following statements.
+            "block_statement" => {
+                self.add_fold_range(node);
+                self.walk_block_package_scoped(node);
+            }
+
             // Blocks create scopes (but only standalone blocks, not sub/class/for bodies)
             "block" | "do_block" => {
                 // Only create a Block scope if parent isn't already a scope-creator
@@ -2826,7 +2835,7 @@ impl<'a> Builder<'a> {
                 ) {
                     self.add_fold_range(node);
                     self.push_scope(ScopeKind::Block, node_to_span(node), None);
-                    self.visit_children(node);
+                    self.walk_block_package_scoped(node);
                     self.pop_scope();
                     return;
                 }
@@ -3163,6 +3172,38 @@ impl<'a> Builder<'a> {
                 self.visit_node(child);
             }
         }
+    }
+
+    /// Walk a `{ ... }` block's children, reverting package context at block
+    /// close. `package Foo;` is file-scoped in Perl, but a `{ }` block is a
+    /// hard boundary: `{ package Inner; }` must not leak Inner to the
+    /// statements that follow. Saves the walk-time package name and the open
+    /// statement-range cursor, restores both on exit, and repairs the
+    /// `package_ranges` spans so `package_at` reverts past the block too.
+    fn walk_block_package_scoped(&mut self, node: Node<'a>) {
+        let saved_pkg = self.current_package.clone();
+        let saved_stmt_range = self.open_statement_package;
+        self.visit_children(node);
+        if self.open_statement_package != saved_stmt_range {
+            // A `package Inner;` inside the block opened a range to file-end;
+            // trim it to block close so it doesn't shadow the enclosing pkg.
+            if let Some(idx) = self.open_statement_package {
+                self.package_ranges[idx].span.end = node.end_position();
+            }
+            // The enclosing `package Outer;` range (if any) was truncated to
+            // Inner's start when Inner opened — resume it to file-end so
+            // Outer covers the post-block tail.
+            if let Some(idx) = saved_stmt_range {
+                let file_end = self
+                    .scope_stack
+                    .first()
+                    .map(|id| self.scopes[id.0 as usize].span.end)
+                    .unwrap_or_else(|| node.end_position());
+                self.package_ranges[idx].span.end = file_end;
+            }
+            self.open_statement_package = saved_stmt_range;
+        }
+        self.current_package = saved_pkg;
     }
 
     // ---- Node visitors ----
@@ -5635,6 +5676,23 @@ impl<'a> Builder<'a> {
             // (target not yet in symbol table) are recovered post-walk by
             // `resolve_forward_expr_witnesses`, which re-calls this same
             // `expr_payload` against the final symbol table.
+            // `bless $ref, $class` is a value of type `ClassName($class)`
+            // — closed under syntax when the class resolves. Covers the
+            // anonymous-ref forms (`return bless {}, $class`) that have no
+            // variable to promote; the variable form is additionally
+            // promoted via `visit_bless_call`'s TC. Honest-miss (fall
+            // through) when the class isn't determinable.
+            "function_call_expression" | "ambiguous_function_call_expression"
+                if self.is_bless_call(node) =>
+            {
+                let args = self.extract_call_args(node);
+                let class = match args.get(1) {
+                    Some(c) => self.bless_class_of(*c),
+                    None => self.current_package.clone(),
+                };
+                class.map(|c| WitnessPayload::InferredType(InferredType::ClassName(c)))
+            }
+
             "function_call_expression"
             | "ambiguous_function_call_expression"
             | "bareword"
@@ -6209,6 +6267,11 @@ impl<'a> Builder<'a> {
                     if let Some(first_arg) = self.first_call_arg(node) {
                         self.push_var_type_constraint(first_arg, node, arg_type);
                     }
+                }
+                // `bless $self, $class` promotes $self to ClassName($class)
+                // so post-bless `$self->method` resolves (H4).
+                if name == "bless" {
+                    self.visit_bless_call(node);
                 }
                 // Framework accessor synthesis: `has` calls in Moo/Moose/Mojo::Base packages
                 if name == "has" {
@@ -9707,6 +9770,58 @@ impl<'a> Builder<'a> {
             }
         }
         false
+    }
+
+    /// `bless $ref, $class` promotes `$ref`'s type from its hashref/
+    /// arrayref rep to `ClassName($class)` — after the bless the value IS
+    /// an instance, so `$self->method` resolves. We push a `ClassName` TC
+    /// on the first arg scoped at the bless statement; the temporal fold
+    /// makes it win for queries past this point. Honest-miss when the class
+    /// isn't statically determinable (a computed `$class` that doesn't
+    /// resolve to a class name) — no TC, the value keeps its rep type.
+    ///
+    /// Class resolution for the 2nd arg: `$class`/`shift`/`$_[0]` →
+    /// enclosing class via the bag's FirstParam projection; `__PACKAGE__`
+    /// → current package; a string/bareword literal → its text; a missing
+    /// 2nd arg (`bless {}`) → current package (Perl's one-arg bless blesses
+    /// into the caller's package).
+    fn visit_bless_call(&mut self, node: Node<'a>) {
+        let args = self.extract_call_args(node);
+        let obj = match args.first() {
+            Some(n) => *n,
+            None => return,
+        };
+        let class = match args.get(1) {
+            Some(class_node) => match self.bless_class_of(*class_node) {
+                Some(c) => c,
+                None => return, // honest miss — class undeterminable
+            },
+            // One-arg `bless {}` blesses into the current package.
+            None => match self.current_package.clone() {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        self.push_var_type_constraint(obj, node, InferredType::ClassName(class));
+    }
+
+    /// Resolve a `bless`'s class argument to a class name. String/bareword
+    /// literals read directly; everything else routes through the same
+    /// invocant-class resolver used for method receivers (so `$class` from
+    /// `shift`, `__PACKAGE__`, etc. resolve identically).
+    fn bless_class_of(&self, class_node: Node<'a>) -> Option<String> {
+        // `__PACKAGE__` parses as a func0op call here (not a bareword), so
+        // `invocant_type_at_node`'s bareword arm doesn't catch it — resolve
+        // it to the enclosing package directly.
+        if class_node.utf8_text(self.source).ok() == Some("__PACKAGE__") {
+            return self.package_for_node(class_node);
+        }
+        if let Some(s) = self.literal_arg_string(class_node) {
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+        self.resolve_invocant_class_tree(class_node)
     }
 
     /// Emit a `HashKeyAccess` ref at every odd-indexed (1st, 3rd, …)
