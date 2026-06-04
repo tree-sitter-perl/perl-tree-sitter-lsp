@@ -428,7 +428,7 @@ fn insert_into_cache(
     result: Option<Arc<CachedModule>>,
 ) {
     if let Some(ref cached) = result {
-        for name in indexable_symbol_names(&cached.analysis) {
+        for name in reverse_index_names(&cached.analysis) {
             reverse_index
                 .entry(name)
                 .or_default()
@@ -438,6 +438,19 @@ fn insert_into_cache(
     cache.insert(module_name.to_string(), result);
 }
 
+/// Every name `find_exporters` might need to locate this module by: declared
+/// symbols plus the export/export_ok lists. XS exporters (e.g. Scalar::Util's
+/// `weaken`) name functions with no Perl body, so they live only in the export
+/// lists, never in `symbols` — indexing symbols alone leaves a warmed module
+/// invisible to export-attribution diagnostics (B6).
+pub fn reverse_index_names(analysis: &crate::file_analysis::FileAnalysis) -> Vec<String> {
+    let mut names: std::collections::HashSet<String> =
+        indexable_symbol_names(analysis).into_iter().collect();
+    names.extend(analysis.export.iter().cloned());
+    names.extend(analysis.export_ok.iter().cloned());
+    names.into_iter().collect()
+}
+
 /// Rebuild reverse index from existing cache (e.g. after warming from SQLite).
 fn rebuild_reverse_index(
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
@@ -445,7 +458,7 @@ fn rebuild_reverse_index(
 ) {
     for entry in cache.iter() {
         if let Some(ref cached) = *entry.value() {
-            for name in indexable_symbol_names(&cached.analysis) {
+            for name in reverse_index_names(&cached.analysis) {
                 reverse_index
                     .entry(name)
                     .or_default()

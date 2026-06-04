@@ -114,6 +114,29 @@ fn test_find_exporters_uses_reverse_index() {
 }
 
 #[test]
+fn test_rebuild_reverse_index_recovers_warm_path_exporters() {
+    // The warm path (`warm_cache`) writes straight into `cache_raw()` and
+    // never touches the reverse index, so `find_exporters` is blind until a
+    // rebuild. The export-only name (`weaken`-style XS export with no Perl
+    // body, hence no `symbols` entry) is the case `indexable_symbol_names`
+    // alone misses — the B6 cold/warm attribution regression.
+    let idx = ModuleIndex::new_for_test();
+    let src = "package Scalar::Util;\nour @EXPORT_OK = qw(weaken blessed);\n1;";
+    let cached = parse_source_to_cached(src, "Scalar::Util");
+
+    // Simulate warm_cache: direct insert, no reverse-index update.
+    idx.cache_raw().insert("Scalar::Util".to_string(), Some(cached));
+    assert!(
+        idx.find_exporters("weaken").is_empty(),
+        "warm insert must not populate the reverse index on its own"
+    );
+
+    idx.rebuild_reverse_index_from_cache();
+    assert_eq!(idx.find_exporters("weaken"), vec!["Scalar::Util"]);
+    assert_eq!(idx.find_exporters("blessed"), vec!["Scalar::Util"]);
+}
+
+#[test]
 fn test_find_exporters_exporter_extensible() {
     // Names declared via `export(...)` and `:Export` attributes are
     // discoverable cross-file — the goto-def proxy for a consumer's import.
