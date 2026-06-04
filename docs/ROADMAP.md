@@ -210,3 +210,7 @@ type-inference phases when an engine refactor needs cooling time.
 3. This roadmap — what's queued, what blocks what.
 4. `docs/open-problems.md` — the hard boundaries deferred deliberately.
 5. The relevant `prompt-*.md` for the workstream you're picking up.
+6. `docs/qa-findings.md` — open false-positive worklist from the QA sweeps;
+   `docs/qa-design-items.md` for the subset needing design first;
+   `docs/parser-shortcomings.md` for the upstream tree-sitter-perl gaps
+   (hand-off to the parser team — repros + downstream impact).
