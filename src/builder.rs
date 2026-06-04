@@ -219,6 +219,7 @@ fn build_with_plugins_inner(
         return_infos: Vec::new(),
         pending_array_pushes: Vec::new(),
         last_expr_span: std::collections::HashMap::new(),
+        slot_write_rhs_span: std::collections::HashMap::new(),
         call_bindings: Vec::new(),
         method_call_bindings: Vec::new(),
         pod_texts: Vec::new(),
@@ -586,7 +587,18 @@ impl<'a> Builder<'a> {
         }
 
         // Invocant mutations on hash keys.
+        //
+        // Two seeds per typed-owner write: the untyped `mutation` Fact
+        // (key-name completion via `mutated_keys_on_class`) and — when
+        // the owner resolves to a CLASS and the RHS has a recorded span
+        // and a bag-resolved type — a typed `SlotType{class, key} →
+        // Edge(Expr(rhs_span))`. The edge routes through the same
+        // canonical chase as implicit-return chains; `SlotTypeFold`
+        // agrees the per-write arms. Honest-skip if the owner is a
+        // `Sub` (not a class), or the RHS is unknown — never a bare
+        // SlotType seed.
         let mut mutations: Vec<(HashKeyOwner, String, Span)> = Vec::new();
+        let mut slot_writes: Vec<(String, String, Span, Span)> = Vec::new();
         for r in &self.refs {
             if let (RefKind::HashKeyAccess { owner, var_text }, AccessKind::Write) =
                 (&r.kind, r.access)
@@ -603,6 +615,16 @@ impl<'a> Builder<'a> {
                     }
                 };
                 if let Some(o) = resolved_owner {
+                    if let HashKeyOwner::Class(class) = &o {
+                        if let Some(rhs_span) = self.slot_write_rhs_span.get(&r.span) {
+                            slot_writes.push((
+                                class.clone(),
+                                r.target_name.clone(),
+                                r.span,
+                                *rhs_span,
+                            ));
+                        }
+                    }
                     mutations.push((o, r.target_name.clone(), r.span));
                 }
             }
@@ -616,6 +638,21 @@ impl<'a> Builder<'a> {
                     key: "written_at".into(),
                     value: crate::witnesses::FactValue::Str(key),
                 },
+                span,
+            });
+        }
+        for (class, key, span, rhs_span) in slot_writes {
+            // Only seed when the RHS actually resolves to a type — a bare
+            // `Edge(Expr(rhs_span))` to an unresolved span folds to None,
+            // which is honest, but emitting nothing for `= shift` / `= $param`
+            // keeps the attachment absent entirely (no guess).
+            if self.bag_query_expr_span(rhs_span).is_none() {
+                continue;
+            }
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::SlotType { class, key },
+                source: WitnessSource::Builder("slot_type".into()),
+                payload: WitnessPayload::Edge(WitnessAttachment::Expr(rhs_span)),
                 span,
             });
         }
@@ -1128,6 +1165,13 @@ struct Builder<'a> {
     /// Types ride the bag; this map only carries the structural
     /// pointer to the source span.
     last_expr_span: std::collections::HashMap<ScopeId, Span>,
+    /// For each `$obj->{k} = <rhs>` hash-key WRITE, maps the key node's
+    /// span (the span the matching `HashKeyAccess` Write ref carries) to
+    /// the RHS expression's span. `populate_witness_bag`'s mutation loop
+    /// reads it to seed `SlotType{class, key} → Edge(Expr(rhs_span))`
+    /// alongside the untyped mutation Fact. Hash-element LHS only; plain
+    /// variable assignments never enter it.
+    slot_write_rhs_span: std::collections::HashMap<Span, Span>,
     /// Assignments where RHS is a function call — resolved in return-type post-pass.
     call_bindings: Vec<CallBinding>,
     /// Assignments where RHS is a method call — resolved in FileAnalysis post-pass.
@@ -5497,6 +5541,18 @@ impl<'a> Builder<'a> {
                 if right.kind() == "conditional_expression" {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
                         self.emit_branch_arm_witnesses_for_ternary(&vt, right, node);
+                    }
+                }
+                // `$obj->{k} = <rhs>` slot-type seed. Record key-span →
+                // rhs-span so `populate_witness_bag` can mint
+                // `SlotType{owner_class, k} → Edge(Expr(rhs_span))`
+                // keyed off the matching HashKeyAccess Write ref (whose
+                // span is this key node's span). `emit_expr_witness(right)`
+                // already published the RHS's `Expr(rhs_span)`.
+                if left.kind() == "hash_element_expression" {
+                    if let Some(key_node) = left.child_by_field_name("key") {
+                        self.slot_write_rhs_span
+                            .insert(node_to_span(key_node), node_to_span(right));
                     }
                 }
             }

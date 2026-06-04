@@ -85,6 +85,15 @@ pub enum WitnessAttachment {
     /// have to exclude branch-arm witnesses from the shared `Expr` /
     /// `Variable` attachments.
     BranchArm(Span),
+    /// Typed-slot collector: "what type does instance slot `key` hold on
+    /// class `class`?" Seeded from typed hash-key WRITEs
+    /// (`$obj->{key} = <rhs>`) as one `Edge(Expr(rhs_span))` per write;
+    /// `SlotTypeFold` agrees the arms via `resolve_return_type` (1+ agree
+    /// → that type, disagree → None). Class-keyed so `$self->{h}` and a
+    /// differently-typed `$other->{h}` don't cross-contaminate. Nothing
+    /// consumes this yet — `$obj->{h}->m()` typing through it is a later
+    /// step.
+    SlotType { class: String, key: String },
 }
 
 /// Index into `FileAnalysis::refs`.
@@ -783,6 +792,62 @@ impl WitnessReducer for SymbolReturnArmFold {
     }
 }
 
+// ---- Typed-slot fold ----
+//
+// Claims `SlotType{class, key}` attachments carrying `InferredType`
+// payloads (per-write `Edge(Expr(rhs_span))` witnesses, materialized to
+// types by the registry). Each witness is one `$obj->{key} = <rhs>`
+// WRITE; the per-write arms agree via `resolve_return_type` (1+ agree →
+// that type, HashRef subsumed by an Object) with one added guard: two
+// DISTINCT concrete classes are honest disagreement → None. The guard
+// matters here because `resolve_return_type`'s Object/HashRef
+// subsumption was tuned for return arms (one Object absorbs sibling
+// HashRefs) and otherwise picks the last of two different classes —
+// the wrong answer when `$self->{h} = A->new` in one method and
+// `= B->new` in another genuinely conflict. Nothing consumes this
+// attachment yet — it's the typed half of the hash-key-write seed,
+// paired with the untyped `mutation` Fact.
+
+pub struct SlotTypeFold;
+
+impl WitnessReducer for SlotTypeFold {
+    fn name(&self) -> &str {
+        "slot_type_fold"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::SlotType { .. })
+            && matches!(w.payload, WitnessPayload::InferredType(_))
+    }
+
+    fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
+        let arms: Vec<InferredType> = ws
+            .iter()
+            .filter_map(|w| match &w.payload {
+                WitnessPayload::InferredType(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        // Two distinct class identities never agree: a slot can't be
+        // both `A` and `B`. `class_name()` is the value's own "what
+        // class am I" answer (rule #10) — distinct answers → None.
+        let mut seen_class: Option<String> = None;
+        for t in &arms {
+            if let Some(cn) = t.class_name() {
+                match &seen_class {
+                    None => seen_class = Some(cn.to_string()),
+                    Some(prev) if prev != cn => return ReducedValue::None,
+                    _ => {}
+                }
+            }
+        }
+        match crate::file_analysis::resolve_return_type(&arms) {
+            Some(t) => ReducedValue::Type(t),
+            None => ReducedValue::None,
+        }
+    }
+}
+
 // Sub-return delegation chains (`return other()`, `shift->method(...)`)
 // are `Edge(Symbol(...))` / `Edge(MethodOnClass{...})` payloads; registry
 // materialization chases them, so no procedural delegation pass remains.
@@ -1157,6 +1222,11 @@ impl ReducerRegistry {
         // shape; single-arm answers surface here, where BranchArmFold's
         // ≥2-arm rule would reject them.
         r.register(Box::new(SymbolReturnArmFold));
+        // SlotTypeFold claims the dedicated `SlotType{..}` shape. Nothing
+        // consumes it yet (typed `$obj->{k}` resolution is a later step),
+        // so placement here is non-load-bearing — grouped with the other
+        // arm-agreement folds for legibility.
+        r.register(Box::new(SlotTypeFold));
         // BranchArmFold claims the dedicated `BranchArm(_)` shape, so its
         // order relative to the Variable/Expr folds below is no longer
         // load-bearing — they no longer overlap.
