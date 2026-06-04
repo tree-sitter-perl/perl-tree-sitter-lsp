@@ -5344,6 +5344,59 @@ impl FileAnalysis {
         result
     }
 
+    /// Does `class` (or any ancestor we CAN reach) name a parent that
+    /// resolves to nothing — not a package/class defined in this file,
+    /// not a cached module in `module_index`/@INC, and not the synthetic
+    /// app-surface edge? If so the ISA chain is incomplete: a method we
+    /// can't find locally might be inherited from the unresolvable parent,
+    /// so consumers (the `unresolved-method` diagnostic) must stay honest-
+    /// silent rather than emit a confident false positive.
+    ///
+    /// The SINGLE source of the "is the inheritance chain incomplete"
+    /// property, so every invocant-typing path (direct `Pkg->m`, `$self`/
+    /// FirstParam, variable-typed) asks the same question and can't drift
+    /// (rule #10). Walks via `for_each_ancestor_class` so the MRO + seen-set
+    /// + depth cap match `resolve_method_in_ancestors` exactly.
+    pub fn class_has_unresolved_ancestor(
+        &self,
+        class_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> bool {
+        let class_is_known = |name: &str| -> bool {
+            if name == APP_SURFACE_CLASS {
+                return true;
+            }
+            let local = self.symbols.iter().any(|s| {
+                matches!(s.kind, SymKind::Class | SymKind::Package | SymKind::Module)
+                    && s.name == name
+            });
+            if local {
+                return true;
+            }
+            module_index
+                .map(|idx| idx.get_cached(name).is_some())
+                .unwrap_or(false)
+        };
+
+        let mut incomplete = false;
+        self.for_each_ancestor_class(class_name, module_index, |cls| {
+            let parents = parents_of(
+                cls,
+                &self.package_parents,
+                module_index,
+                &self.app_surface_consumers,
+            );
+            for p in &parents {
+                if !class_is_known(p) {
+                    incomplete = true;
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        incomplete
+    }
+
     /// Collect every Handler visible from `class_name` whose `dispatchers`
     /// list contains `dispatcher`. Walks the inheritance chain and at
     /// each level pulls Handlers from (1) this file's symbols with

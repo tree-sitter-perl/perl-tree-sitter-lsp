@@ -3440,6 +3440,112 @@ fn does_method_not_flagged_unresolved() {
     );
 }
 
+// ── Incomplete ISA chain → honest-silent unresolved-method ───────────────────
+// A class whose `@ISA` names a parent we can't resolve (not in the workspace,
+// not in @INC) has an INCOMPLETE chain: the called method might be inherited
+// from the unresolvable parent. Every invocant-typing path must consult the
+// SAME `class_has_unresolved_ancestor` predicate so they can't drift (rule #10).
+
+fn unresolved_method_messages(diags: &[Diagnostic]) -> Vec<String> {
+    diags.iter()
+        .filter(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-method"))
+        .map(|d| d.message.clone())
+        .collect()
+}
+
+/// THE FIX: `$self = shift; $self->inherited()` where the class `use base`s an
+/// unresolvable parent must NOT emit unresolved-method. The `$self`/FirstParam
+/// path was the one that leaked before the shared guard.
+#[test]
+fn self_invocant_unresolvable_parent_no_unresolved_method_use_base() {
+    let source = "package Child;\nuse base qw(MyDep);\nsub new { bless {}, shift }\nsub local_thing {\n    my $self = shift;\n    return $self->dep_method();\n}\n1;\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let um = unresolved_method_messages(&diags);
+    assert!(
+        um.is_empty(),
+        "$self->dep_method with unresolvable `use base` parent must stay silent; got: {:?}",
+        um,
+    );
+}
+
+/// Same gate via `use parent`.
+#[test]
+fn self_invocant_unresolvable_parent_no_unresolved_method_use_parent() {
+    let source = "package Child;\nuse parent -norequire, 'MyDep';\nsub new { bless {}, shift }\nsub local_thing {\n    my $self = shift;\n    return $self->dep_method();\n}\n1;\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let um = unresolved_method_messages(&diags);
+    assert!(um.is_empty(), "unresolvable `use parent` parent must stay silent; got: {:?}", um);
+}
+
+/// Same gate via `our @ISA =`.
+#[test]
+fn self_invocant_unresolvable_parent_no_unresolved_method_at_isa() {
+    let source = "package Child;\nour @ISA = ('MyDep');\nsub new { bless {}, shift }\nsub local_thing {\n    my $self = shift;\n    return $self->dep_method();\n}\n1;\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let um = unresolved_method_messages(&diags);
+    assert!(um.is_empty(), "unresolvable `our @ISA` parent must stay silent; got: {:?}", um);
+}
+
+/// Regression: the direct-invocant paths (`Pkg->new->m`, `Pkg->m`) on a class
+/// with an unresolvable parent must also stay silent — same predicate.
+#[test]
+fn direct_invocant_unresolvable_parent_no_unresolved_method() {
+    let source = "package Child;\nuse base qw(MyDep);\nsub new { bless {}, shift }\nsub callers {\n    Child->dep_method();\n    my $c = Child->new;\n    $c->dep_method();\n}\n1;\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let um = unresolved_method_messages(&diags);
+    assert!(
+        um.is_empty(),
+        "direct-invocant calls on a class with an unresolvable parent must stay silent; got: {:?}",
+        um,
+    );
+}
+
+/// No over-suppression: a class with NO parents calling a genuinely missing
+/// method STILL flags. The chain is complete, so the FP is a real TP.
+#[test]
+fn no_parents_missing_method_still_flags() {
+    let source = "package Foo;\nsub new { bless {}, shift }\nsub real { 1 }\npackage main;\nmy $f = Foo->new;\n$f->totally_bogus_xyz();\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let um = unresolved_method_messages(&diags);
+    assert!(
+        um.iter().any(|m| m.contains("totally_bogus_xyz")),
+        "a parentless class calling a missing method must still flag; got: {:?}",
+        um,
+    );
+}
+
+/// No over-suppression on a fully-resolved 2-hop chain: an inherited method
+/// resolves (silent) AND a genuinely missing one still flags. All packages are
+/// local here, so the whole chain is known.
+#[test]
+fn fully_resolved_two_hop_chain_resolves_inherited_and_flags_missing() {
+    let source = "package GrandPa;\nsub new { bless {}, shift }\nsub gp_method { 1 }\npackage Pa;\nuse parent -norequire, 'GrandPa';\npackage Kid;\nuse parent -norequire, 'Pa';\nsub use_things {\n    my $self = shift;\n    $self->gp_method();\n    $self->missing_method();\n}\n1;\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let um = unresolved_method_messages(&diags);
+    assert!(
+        !um.iter().any(|m| m.contains("gp_method")),
+        "gp_method is inherited 2 hops on a fully-resolved chain — must NOT flag; got: {:?}",
+        um,
+    );
+    assert!(
+        um.iter().any(|m| m.contains("missing_method")),
+        "missing_method on a fully-resolved chain must still flag; got: {:?}",
+        um,
+    );
+}
+
 
 #[test]
 fn classic_perl_filehandle_fps_suppressed() {

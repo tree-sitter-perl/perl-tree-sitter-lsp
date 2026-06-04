@@ -2556,6 +2556,15 @@ pub fn collect_diagnostics(
             continue;
         }
 
+        // Honest-silent on an incomplete ISA chain: if `class_name` (or any
+        // resolvable ancestor) names a parent we can't resolve in the
+        // workspace or @INC, the method might be inherited from there. One
+        // predicate gates EVERY invocant-typing path (`$self`/FirstParam and
+        // direct `Pkg->m` alike), so they can't drift (rule #10).
+        if analysis.class_has_unresolved_ancestor(&class_name, Some(module_index)) {
+            continue;
+        }
+
         diagnostics.push(Diagnostic {
             range: span_to_range(r.span),
             severity: Some(DiagnosticSeverity::HINT),
