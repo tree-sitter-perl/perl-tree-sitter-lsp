@@ -14,6 +14,7 @@ mod pod;
 mod query_cache;
 mod resolve;
 mod symbols;
+mod timings;
 mod witnesses;
 
 use backend::Backend;
@@ -120,6 +121,7 @@ fn print_usage() {
     eprintln!("ANALYSIS:");
     eprintln!("  perl-lsp --check [<root>] [--severity error|warning]    Batch diagnostics (CI)");
     eprintln!("                           [--format json|human]");
+    eprintln!("                           [--timings]                    Per-module build-timing report (stderr, slowest-first)");
     eprintln!("  perl-lsp --outline <file>                              Document symbol outline");
     eprintln!("  perl-lsp --hover [<root>] <file> <line> <col>         Type info and docs (root = cross-file)");
     eprintln!("  perl-lsp --type-at <file> <line> <col>                 Single type query");
@@ -198,6 +200,9 @@ fn canonical_root_and_uri(root: &str) -> (std::path::PathBuf, String) {
 /// CLI command that needs cross-file resolution to behave like the
 /// running server.
 fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleIndex) {
+    // `--check --timings` already flipped this on; the env var lets any
+    // startup-driven CLI mode (dump-package, etc.) opt in too.
+    timings::enable_from_env();
     let (root_path, root_uri) = canonical_root_and_uri(root);
     // Pin repo-local `.perl-lsp/` plugin discovery to the same root the
     // cache keys on, before the first build() (workspace indexing) fires.
@@ -250,6 +255,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     for name in &needed {
         if module_index.cache_raw().contains_key(name.as_str()) && !stale_set.contains(name) {
             already_cached += 1;
+            timings::record_cached(name);
             continue;
         }
         if stale_set.contains(name) {
@@ -318,7 +324,16 @@ fn cli_check(args: &[String]) {
         unresolved_dispatch: args.iter().any(|a| a == "--unresolved-dispatch"),
     };
 
+    if args.iter().any(|a| a == "--timings") {
+        timings::enable();
+    }
+    timings::enable_from_env();
+
     let (ws, module_index) = cli_full_startup(root);
+
+    // Dump the per-module breakdown before diagnostics output so the table
+    // isn't buried under (and the early `exit(1)` below doesn't swallow it).
+    timings::report();
 
     let mut all_diagnostics = Vec::new();
 
