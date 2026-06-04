@@ -3040,8 +3040,8 @@ impl<'a> Builder<'a> {
         // inherited goto-def/references across subclasses. Recover those
         // declarations from raw source text inside the ERROR span. Generic:
         // gated only on "we are inside a parse ERROR", never on any module.
-        // See docs/parser-shortcomings.md (G1/TASK-C) and
-        // docs/adr/error-recovery.md.
+        // See docs/parser-shortcomings.md (G7 — `"${@}"` bleed) and
+        // docs/adr/error-recovery.md. KLUDGE: removable once upstream fixes G7.
         self.recover_subs_from_error_text(error_node);
     }
 
@@ -3051,6 +3051,16 @@ impl<'a> Builder<'a> {
     /// already captured (structurally, or on this row). Only declarations
     /// inside the ERROR span are considered — outside it tree-sitter parsed
     /// correctly and owns the symbol.
+    ///
+    /// KLUDGE (medium, re-evaluate) — this is a regex-ish raw-byte rescue for
+    /// the `"${@}"` block-interp lexer bleed (docs/parser-shortcomings.md G7).
+    /// It only recovers the declaration *skeleton* (params/return/POD are lost
+    /// because the bodies are dissolved). It exists only because the bug
+    /// dissolves subs entirely rather than leaving them as ERROR children, so
+    /// the normal structural recovery can't see them. **Delete / re-evaluate
+    /// once upstream tree-sitter-perl fixes the `"${@}"` lex** — at that point
+    /// the subs parse normally and this byte-scan is dead weight (and a latent
+    /// source of false-positive "sub" matches in pathological ERROR text).
     fn recover_subs_from_error_text(&mut self, error_node: Node<'a>) {
         let start_row = error_node.start_position().row;
         let start_col = error_node.start_position().column;
