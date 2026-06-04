@@ -5276,6 +5276,19 @@ impl FileAnalysis {
                         return std::ops::ControlFlow::Break(());
                     }
                 }
+                // Cross-package typeglob install: the method is attributed
+                // to `cls` but lives in a differently-named module file
+                // (`*{'DateTime::'.$sub} = …` inside `package DateTime::PP`).
+                // The class's own module doesn't declare it; the symbol's
+                // package does. Record the actual home module so the def
+                // lookup hits the right file.
+                if let Some(home) = idx.module_declaring_method_in_package(method_name, cls) {
+                    result = Some(MethodResolution::CrossFile {
+                        class: cls.to_string(),
+                        def_module: Some(home),
+                    });
+                    return std::ops::ControlFlow::Break(());
+                }
                 // Plugin-bridged method (e.g. a Mojo helper synthesized in
                 // another file, bridged to `cls`). The SAME bridge walk
                 // completion uses — record which module the symbol actually

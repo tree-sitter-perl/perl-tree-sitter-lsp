@@ -78,6 +78,21 @@ impl CachedModule {
             s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Method)
         })
     }
+
+    /// True if a sub/method with this name is declared in this module
+    /// *attributed to `package`* — distinct from `has_sub`, which keys
+    /// on declaration only. Cross-package typeglob installs
+    /// (`*{'DateTime::'.$sub} = …` inside `package DateTime::PP`)
+    /// synthesize a symbol whose `package` (DateTime) differs from the
+    /// file's own module name (DateTime::PP), so a class-keyed method
+    /// lookup must ask by package, not by module-name match.
+    pub fn has_sub_in_package(&self, name: &str, package: &str) -> bool {
+        self.analysis.symbols.iter().any(|s| {
+            s.name == name
+                && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                && s.package.as_deref() == Some(package)
+        })
+    }
 }
 
 /// A view into a module's metadata for a named sub/method.
@@ -457,6 +472,27 @@ impl ModuleIndex {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Find the module that declares method `name` *attributed to class*
+    /// `class` in a file whose own module name differs (cross-package
+    /// typeglob install). Returns the registration key for a follow-up
+    /// `get_cached`. The reverse index (keyed by symbol name) scopes the
+    /// scan; the per-module `has_sub_in_package` filter pins the package.
+    /// `None` when no such cross-package symbol exists — callers fall
+    /// back to the class's own module / bridges.
+    pub fn module_declaring_method_in_package(
+        &self,
+        name: &str,
+        class: &str,
+    ) -> Option<String> {
+        self.modules_with_symbol(name)
+            .into_iter()
+            .find(|mod_name| {
+                self.get_cached(mod_name)
+                    .map(|c| c.has_sub_in_package(name, class))
+                    .unwrap_or(false)
+            })
     }
 
     /// Create a minimal ModuleIndex for CLI mode (no resolver thread, no @INC scan).
