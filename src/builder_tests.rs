@@ -11012,6 +11012,168 @@ fn sub_exporter_generator_hashref_records_keys() {
 }
 
 #[test]
+fn sub_exporter_setup_array_members_and_groups_join_surface() {
+    // `-setup => { exports => [ qw(foo bar), baz => \&_gen ], groups => {...} }`:
+    // every member name joins the export surface (incl. the `name => \&gen`
+    // generator entry's name and the group member arrays). The group keys
+    // (`default`/`extra`) are selectors, not subs — they must NOT join.
+    let fa = build_fa(
+        "package My::Exp;\n\
+         use Sub::Exporter -setup => {\n\
+           exports => [ qw(foo bar), baz => \\&_build_baz ],\n\
+           groups  => { default => [qw(foo)], extra => [qw(bar baz)] },\n\
+         };\n\
+         sub foo {}\n\
+         sub bar {}\n\
+         sub _build_baz {}\n\
+         1;\n",
+    );
+    for name in ["foo", "bar", "baz"] {
+        assert!(
+            fa.exports_name(name),
+            "exports_name({name}) should be true; export_ok={:?}",
+            fa.export_ok
+        );
+    }
+    assert!(
+        !fa.export_ok.contains(&"default".to_string())
+            && !fa.export_ok.contains(&"extra".to_string()),
+        "group selector keys must not join the surface; got {:?}",
+        fa.export_ok
+    );
+}
+
+#[test]
+fn sub_exporter_member_refs_local_subs() {
+    // Each member that names a local sub gets a FunctionCall ref at its
+    // export-list mention (rule #7); a member naming no local sub (the public
+    // generator name) gets none.
+    let fa = build_fa(
+        "package My::Exp;\n\
+         use Sub::Exporter -setup => {\n\
+           exports => [ qw(foo bar), baz => \\&_build_baz ],\n\
+           groups  => { extra => [qw(bar baz)] },\n\
+         };\n\
+         sub foo {}\n\
+         sub bar {}\n\
+         sub baz {}\n\
+         1;\n",
+    );
+    let count = |name: &str| {
+        fa.refs
+            .iter()
+            .filter(|r| {
+                r.target_name == name
+                    && matches!(
+                        &r.kind,
+                        RefKind::FunctionCall { resolved_package }
+                            if resolved_package.as_deref() == Some("My::Exp")
+                    )
+            })
+            .count()
+    };
+    // foo: exports list only = 1. bar: exports + group `extra` = 2.
+    // baz: exports + group `extra` = 2.
+    assert_eq!(count("foo"), 1, "foo member ref; got refs {:?}", fa.refs.iter().filter(|r| r.target_name=="foo").collect::<Vec<_>>());
+    assert_eq!(count("bar"), 2, "bar in exports + group extra");
+    assert_eq!(count("baz"), 2, "baz in exports + group extra");
+}
+
+#[test]
+fn sub_exporter_member_goto_def_and_references() {
+    use crate::file_store::FileStore;
+    use crate::resolve::{refs_to, RoleMask, TargetKind, TargetRef};
+    use std::path::PathBuf;
+
+    let src = "package My::Exp;\n\
+         use Sub::Exporter -setup => { exports => [ qw(foo bar) ] };\n\
+         sub foo {}\n\
+         sub bar {}\n\
+         1;\n";
+    let fa = build_fa(src);
+
+    let foo_def_span = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "foo")
+        .map(|s| s.selection_span)
+        .expect("foo sub symbol");
+    let export_ref = fa
+        .refs
+        .iter()
+        .find(|r| {
+            r.target_name == "foo"
+                && matches!(&r.kind, RefKind::FunctionCall { .. })
+                && r.span != foo_def_span
+        })
+        .expect("an export-list FunctionCall ref for foo");
+    let r = fa
+        .ref_at(export_ref.span.start)
+        .expect("ref_at the export member token");
+    assert_eq!(r.target_name, "foo");
+
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/qa_sub_exporter.pm");
+    store.insert_workspace(path.clone(), fa);
+    let results = refs_to(
+        &store,
+        None,
+        &TargetRef {
+            name: "foo".to_string(),
+            kind: TargetKind::Sub {
+                package: Some("My::Exp".to_string()),
+            },
+            method_classes: Vec::new(),
+        },
+        RoleMask::EDITABLE,
+    );
+    // def + 1 exports-list mention = 2.
+    assert_eq!(
+        results.len(),
+        2,
+        "references on foo should list the def and its exports-list mention; got {results:?}"
+    );
+}
+
+#[test]
+fn sub_exporter_setup_exporter_call_with_groups() {
+    // The function-call setup form folds exports + groups the same way.
+    let fa = build_fa(
+        "package My::Exp;\n\
+         use Sub::Exporter ();\n\
+         Sub::Exporter::setup_exporter({\n\
+           exports => [qw/gamma delta/],\n\
+           groups  => { all => [qw/gamma delta/] },\n\
+         });\n\
+         sub gamma {}\n\
+         sub delta {}\n\
+         1;\n",
+    );
+    assert!(fa.exports_name("gamma") && fa.exports_name("delta"),
+        "setup_exporter exports should join surface; got {:?}", fa.export_ok);
+    assert!(!fa.export_ok.contains(&"all".to_string()),
+        "group selector `all` must not join the surface");
+}
+
+#[test]
+fn non_sub_exporter_use_unaffected() {
+    // Regression: a plain `use` of an unrelated module with a `-setup`-shaped
+    // arg must not record exports (only Sub::Exporter's use is folded).
+    let fa = build_fa(
+        "package My::Thing;\n\
+         use Some::Other -setup => { exports => [qw/leak/] };\n\
+         sub leak {}\n\
+         1;\n",
+    );
+    assert!(!fa.export_ok.contains(&"leak".to_string()),
+        "non-Sub::Exporter use must not record exports; got {:?}", fa.export_ok);
+    // And no spurious export-member ref on the local sub.
+    let leak_refs = fa.refs.iter().filter(|r| r.target_name == "leak"
+        && matches!(&r.kind, RefKind::FunctionCall { .. })).count();
+    assert_eq!(leak_refs, 0, "no member ref for an unrelated use's pseudo-export");
+}
+
+#[test]
 fn moose_exporter_setup_import_methods_records_exports() {
     let fa = build_fa(
         "package My::Sugar;\n\

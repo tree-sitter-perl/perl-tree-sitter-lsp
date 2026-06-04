@@ -7753,10 +7753,33 @@ impl<'a> Builder<'a> {
         } else {
             container
         };
-        let children: Vec<Node<'a>> = (0..list.child_count())
-            .filter_map(|i| list.child(i))
-            .collect();
+        let mut children: Vec<Node<'a>> = Vec::new();
+        Self::flatten_fat_comma_children(list, &mut children);
         self.for_each_fat_comma_pair_in_children(&children, f);
+    }
+
+    /// Flatten a fat-comma container's children into one token stream,
+    /// descending tree-sitter-perl's right-associative nesting: `a => 1, b =>
+    /// 2` parses as `a, =>, 1, (b, =>, 2)` — the tail pairs hide inside a
+    /// nested `list_expression`. We splice that nested list's children inline
+    /// (in place of the wrapper node) so a single linear scan sees every pair.
+    /// A `list_expression` that is itself a *value* (e.g. `key => (a, b)`) only
+    /// nests when it's the last child, so descending the trailing wrapper is
+    /// safe — a non-trailing list is a genuine multi-element value and is kept
+    /// whole.
+    fn flatten_fat_comma_children(list: Node<'a>, out: &mut Vec<Node<'a>>) {
+        let count = list.child_count();
+        for i in 0..count {
+            let Some(child) = list.child(i) else { continue };
+            // The trailing `list_expression` is the right-assoc continuation of
+            // the pair stream; everything else (including a non-trailing list
+            // that is a real value) stays as-is.
+            if child.kind() == "list_expression" && i + 1 == count {
+                Self::flatten_fat_comma_children(child, out);
+            } else {
+                out.push(child);
+            }
+        }
     }
 
     /// Slice variant of `for_each_fat_comma_pair`: walk a flat sequence of
@@ -7805,9 +7828,11 @@ impl<'a> Builder<'a> {
         found
     }
 
-    /// `use Sub::Exporter -setup => { exports => [...] }` — pull the
-    /// `exports` arrayref names. Also accepts a bare `exports => [...]`
-    /// at the top of the use args (the common minimal form).
+    /// `use Sub::Exporter -setup => { exports => [...], groups => {...} }` —
+    /// fold the `exports` and `groups` member names into the export surface
+    /// and record per-member sites so the post-walk pass refs the ones that
+    /// name a local sub. Also accepts a bare `exports => [...]` at the top of
+    /// the use args (the common minimal form).
     fn detect_sub_exporter_use(&mut self, use_node: Node<'a>) {
         // The args live in the use statement's list_expression child.
         let args = (0..use_node.named_child_count())
@@ -7816,31 +7841,193 @@ impl<'a> Builder<'a> {
         let Some(args) = args else { return; };
         let setup = self.value_node_after_key(args, "-setup");
         // `-setup => { exports => [...] }` or top-level `exports => [...]`.
-        let exports_owner = setup.unwrap_or(args);
-        if let Some(list) = self.value_node_after_key(exports_owner, "exports") {
-            let names = self.exported_names_from_list(list);
-            self.record_runtime_exports(names);
+        let config = setup.unwrap_or(args);
+        self.fold_sub_exporter_config(config);
+    }
+
+    /// Fold a Sub::Exporter config (the `{ exports => ..., groups => ... }`
+    /// hashref, or the bare top-level use args) into the export surface.
+    /// `exports` members are the public export names; `groups` member arrays
+    /// list exports that make up each named group (the group name itself is a
+    /// `:tag` selector, not a sub, so it never joins the surface — only its
+    /// members do). Records per-member sites for the post-walk ref pass.
+    fn fold_sub_exporter_config(&mut self, config: Node<'a>) {
+        if let Some(list) = self.value_node_after_key(config, "exports") {
+            let members = self.sub_exporter_member_sites(list);
+            self.record_sub_exporter_members(members);
+        }
+        // Group definitions list the exports that compose each group; those
+        // member names join the same surface as `exports`. The group key is a
+        // selector, never folded — it's a fat-comma key we descend past to its
+        // value (the member array), not a member itself.
+        if let Some(groups) = self.value_node_after_key(config, "groups") {
+            // `for_each_fat_comma_pair` holds a shared borrow; collect the
+            // group member nodes first, then fold them.
+            let mut member_nodes: Vec<Node<'a>> = Vec::new();
+            self.for_each_fat_comma_pair(groups, |_group_name, members_node| {
+                member_nodes.push(members_node);
+                true
+            });
+            for members_node in member_nodes {
+                let members = self.sub_exporter_member_sites(members_node);
+                self.record_sub_exporter_members(members);
+            }
         }
     }
 
-    /// Extract exported names from a Sub::Exporter `exports` value, which is
-    /// either an arrayref of names (`[qw/a b/]`) or a hashref of
-    /// name→generator pairs (`{ a => \&gen }` — best-effort: the keys are
-    /// the exported names). `extract_string_names` already collects qw /
-    /// string / bareword leaves recursively; for the hashref-of-generators
-    /// shape we additionally take the fat-comma keys.
-    fn exported_names_from_list(&self, list: Node<'a>) -> Vec<String> {
-        let mut names = self.extract_string_names(list);
-        // Generator hashref: `{ name => \&gen }`. The values are coderefs,
-        // not strings, so `extract_string_names` won't have grabbed the
-        // names — they're the keys.
-        if list.kind() == "anonymous_hash_expression" {
-            self.for_each_fat_comma_pair(list, |key, _val| {
-                names.push(key.to_string());
-                true
-            });
+    /// Feed Sub::Exporter member `(name, span)` pairs into the export surface
+    /// (`export_ok`) and queue per-member sites for the ref pass.
+    fn record_sub_exporter_members(&mut self, members: Vec<(String, Span)>) {
+        let pkg = self.current_package.clone();
+        let names: Vec<String> = members.iter().map(|(n, _)| n.clone()).collect();
+        self.record_runtime_exports(names);
+        for (name, span) in members {
+            self.export_member_sites.push((name, span, pkg.clone()));
         }
-        names
+    }
+
+    /// Collect `(name, span)` for every exported member under a Sub::Exporter
+    /// `exports` / `groups`-member value. The value is either an arrayref
+    /// (`[ qw(foo bar), baz => \&_gen ]`) or a hashref of name→generator pairs
+    /// (`{ name => \&gen }`). The NAME is the export in every case — the
+    /// generator coderef / sub body is opaque. `quoted_word_list`, string
+    /// literals, and barewords are names directly (unlike `extract_string_list`
+    /// we do NOT gate barewords on constant resolution — an export name written
+    /// bare is a literal name, not a folded constant). Fat-comma generator
+    /// values (`\&gen`, `sub {...}`, `undef`) are skipped: only their keys are
+    /// exports. Recurses into nested list/array nodes.
+    fn sub_exporter_member_sites(&self, node: Node<'a>) -> Vec<(String, Span)> {
+        let mut out = Vec::new();
+        self.collect_sub_exporter_members(node, &mut out);
+        out
+    }
+
+    fn collect_sub_exporter_members(&self, node: Node<'a>, out: &mut Vec<(String, Span)>) {
+        match node.kind() {
+            "quoted_word_list" => self.extract_qw_word_spans(node, out),
+            "string_literal" | "interpolated_string_literal" => {
+                if let Some(text) = self.extract_string_content(node) {
+                    out.push((text, self.string_content_span(node)));
+                }
+            }
+            "bareword" | "autoquoted_bareword" => {
+                if let Ok(text) = node.utf8_text(self.source) {
+                    out.push((text.to_string(), node_to_span(node)));
+                }
+            }
+            "anonymous_hash_expression" => {
+                // Generator hashref: keys are export names, values opaque.
+                self.collect_sub_exporter_hash_keys(node, out);
+            }
+            "parenthesized_expression" | "list_expression"
+            | "anonymous_array_expression" => {
+                self.collect_sub_exporter_list_members(node, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Generator-hashref keys (`{ name => \&gen }`) → `(name, key-span)`. The
+    /// key token carries the right span for a member ref; the value is opaque.
+    fn collect_sub_exporter_hash_keys(&self, node: Node<'a>, out: &mut Vec<(String, Span)>) {
+        let list = (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .find(|c| c.kind() == "list_expression")
+            .unwrap_or(node);
+        let children: Vec<Node<'a>> = (0..list.child_count())
+            .filter_map(|i| list.child(i))
+            .collect();
+        let mut i = 0;
+        while i < children.len() {
+            let k = children[i];
+            i += 1;
+            if !k.is_named() {
+                continue;
+            }
+            if let Some((name, span)) = self.sub_exporter_name_token(k) {
+                out.push((name, span));
+            }
+            // Skip past this key's value to the next key.
+            while let Some(c) = children.get(i) {
+                if c.is_named() {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// Walk a Sub::Exporter array/list, treating `name => <opaque>` fat-comma
+    /// pairs by keeping the key and skipping the value, and bare `qw()` /
+    /// string / bareword entries as standalone names.
+    fn collect_sub_exporter_list_members(&self, list: Node<'a>, out: &mut Vec<(String, Span)>) {
+        let children: Vec<Node<'a>> = (0..list.child_count())
+            .filter_map(|i| list.child(i))
+            .collect();
+        let mut i = 0;
+        while i < children.len() {
+            let c = children[i];
+            if !c.is_named() {
+                i += 1;
+                continue;
+            }
+            if matches!(
+                c.kind(),
+                "parenthesized_expression" | "list_expression" | "anonymous_array_expression"
+            ) {
+                self.collect_sub_exporter_list_members(c, out);
+                i += 1;
+                continue;
+            }
+            if c.kind() == "quoted_word_list" {
+                self.extract_qw_word_spans(c, out);
+                i += 1;
+                continue;
+            }
+            if let Some((name, span)) = self.sub_exporter_name_token(c) {
+                // Look ahead for a fat-comma generator value to skip.
+                let mut j = i + 1;
+                let next_named = loop {
+                    match children.get(j) {
+                        Some(n) if n.is_named() => break Some(*n),
+                        Some(_) => j += 1,
+                        None => break None,
+                    }
+                };
+                out.push((name, span));
+                if let Some(nv) = next_named {
+                    if matches!(
+                        nv.kind(),
+                        "refgen_expression"
+                            | "anonymous_subroutine_expression"
+                            | "undef_expression"
+                            | "anonymous_hash_expression"
+                            | "scalar"
+                    ) {
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// A standalone export-name token (bareword / autoquoted bareword / string
+    /// literal) → its literal name + span. Barewords are NOT constant-folded:
+    /// an export name written bare is a literal name.
+    fn sub_exporter_name_token(&self, node: Node<'a>) -> Option<(String, Span)> {
+        match node.kind() {
+            "bareword" | "autoquoted_bareword" => node
+                .utf8_text(self.source)
+                .ok()
+                .map(|t| (t.to_string(), node_to_span(node))),
+            "string_literal" | "interpolated_string_literal" => self
+                .extract_string_content(node)
+                .map(|t| (t, self.string_content_span(node))),
+            _ => None,
+        }
     }
 
     /// `Moose::Exporter->setup_import_methods(with_meta => [...], as_is => [...])`
@@ -7861,11 +8048,15 @@ impl<'a> Builder<'a> {
                 self.record_runtime_exports(names);
             }
             "setup_exporter" => {
-                // Sub::Exporter::setup_exporter({ exports => [...] }).
-                if let Some(list) = self.value_node_after_key(args, "exports") {
-                    let names = self.exported_names_from_list(list);
-                    self.record_runtime_exports(names);
-                }
+                // Sub::Exporter::setup_exporter({ exports => [...], groups => {...} }).
+                // The config hashref is the first positional; fold it the same
+                // as the `-setup` use form so exports + groups + member refs
+                // ride one path.
+                let config = args
+                    .named_child(0)
+                    .filter(|c| c.kind() == "anonymous_hash_expression")
+                    .unwrap_or(args);
+                self.fold_sub_exporter_config(config);
             }
             "add_type" => {
                 // Type::Library / Exporter::Tiny: __PACKAGE__->add_type({ name => 'X' })
