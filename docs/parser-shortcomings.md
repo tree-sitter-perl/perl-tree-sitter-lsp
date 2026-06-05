@@ -532,11 +532,11 @@ this shape.
 
 ---
 
-## X1 — external scanner `serialize` ABORTS under concurrent parsing (thread-safety)
+## X1 — external scanner state grows unbounded per `s{}{}`/`tr{}{}`, overflowing the 1024-byte serialize buffer
 
-**Severity: HIGH — process `abort()`, uncatchable from Rust.** Unlike G1–G7
-(parse-shape gaps), this is a robustness/concurrency bug in the C external
-scanner: it crashes the whole LSP, not just one file's tree.
+**Severity: HIGH — process `abort()`, uncatchable from Rust** (it's a C
+`assert`/`abort()` inside libtree-sitter; `catch_unwind` does not catch it, so a
+single bad file kills the whole LSP). Deterministic, single-file, isolatable.
 
 **Symptom:**
 ```
@@ -544,29 +544,44 @@ perl-lsp: .../tree-sitter-0.25.10/src/./parser.c:415:
 ts_parser__external_scanner_serialize: Assertion `length <= 1024' failed.
 Aborted (core dumped)
 ```
+`1024` is tree-sitter's `TREE_SITTER_SERIALIZATION_BUFFER_SIZE` — the fixed cap
+on what a scanner's `serialize()` may emit.
 
-**Trigger — rare, load-dependent.** Fired exactly ONCE, when many parses ran
-concurrently (the LSP indexes the workspace via Rayon `par_iter`, and a second
-parse loop runs on the module-resolver thread). Not reproducible at low load.
+**Minimal repro** (`docs/repro-scanner-serialize-overflow.pl`):
+```perl
+$s =~ s{a}{b};   # this exact line, repeated 81 times in one file
+```
+`perl-lsp --parse` that file → abort. **80 occurrences pass, 81 abort** — i.e.
+each paired-delimiter substitution adds ~12 bytes of scanner state that is
+**never popped**, and the 81st pushes the serialized state past 1024.
 
-**Ruled out — it is NOT a single bad file / not a stacked-heredoc serialize
-overflow.** Every `.pm`/`.pl`/`.t` in `@INC` + a large corpus (819 files) parses
-clean individually with `--parse` (0 aborts); a deterministic content overflow
-would fire every time that file is parsed. And the consumer side uses a **fresh
-`Parser` per parse** (no parser sharing).
+**Scope — paired-delimiter quote-likes only:**
+| form | leaks? |
+|---|---|
+| `s{}{}`, `s[][]`, `s()()`, `s<><>`, `tr{}{}`, `y{}{}` | **YES** — ~12 B each, abort at 81 |
+| `s///`, `tr///` (single delimiter) | no |
+| `m{}`, `qr{}`, `q{}`, `qw{}`, plain `{ }` hashref | no (3000+ clean) |
 
-**Diagnosis.** The abort is internal to the external scanner's `serialize`,
-fires only under *concurrent* parsing despite separate `Parser` instances ⇒
-**non-thread-local (static / file-scope) state inside the external scanner**
-being raced by simultaneous parses. The serialized `length` is corrupted by a
-concurrent writer, tripping the `length <= 1024` bound. The stacked-heredoc
-state machine is the most likely home of that shared state.
+So it is specifically the **two-part bracketed delimiter** (`s`/`tr`/`y` with a
+nesting delimiter pair) whose open/close bookkeeping the scanner stacks and
+forgets to release.
 
-**Fix direction (upstream).** Make the scanner's state strictly
-per-scanner-instance / thread-local; audit `serialize`/`deserialize` and any
-`static`/global in the scanner C for cross-parse sharing. (Until fixed, any
-heavily-parallel parse path in the LSP shares this latent hazard — it's why the
-re-export resolver, which adds a second concurrent parse loop, surfaced it.)
+**How it surfaced.** Not load/concurrency (it reproduces single-threaded,
+`RAYON_NUM_THREADS=1`, with a fresh `Parser` per file). It's purely per-file
+content: any single source with ≥81 paired-delimiter substitutions aborts on its
+own. The re-export resolver hit it because re-export follows transitive `use`
+edges into `@INC` and so parses large system modules the base index never
+touched — e.g. `XML/Twig.pm` (14k lines, 273 `s{}{}` in one span) reliably
+aborts (`perl-lsp --parse /usr/share/perl5/XML/Twig.pm`, 10/10). Bugzilla pulls
+in XML::Twig transitively, so Bugzilla-cold + re-export = guaranteed abort.
+
+**Fix direction (upstream).** In the external scanner, the state pushed when a
+paired-delimiter `s`/`tr`/`y` opens must be **popped when it closes** (or not
+stacked at all) — audit the `serialize`/`deserialize` + the delimiter-stack for
+the `s{}{}`/`tr{}{}` path; today serialized size is O(number of such operators in
+the file) when it must be O(open-nesting-depth). This is a latent landmine for
+*any* parse path that touches a large real-world module, not just re-export —
+re-export only widened the set of files we parse into `@INC`.
 
 ---
 
