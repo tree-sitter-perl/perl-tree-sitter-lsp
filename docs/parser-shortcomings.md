@@ -556,14 +556,12 @@ Aborted (core dumped)
 `1024` is tree-sitter's `TREE_SITTER_SERIALIZATION_BUFFER_SIZE` — the fixed cap
 on what a scanner's `serialize()` may emit.
 
-**Minimal repro** (`docs/repro-scanner-serialize-overflow.txt` — kept as `.txt`,
-NOT `.pl`, so the workspace indexer / `--check` doesn't parse it and abort; run
-it explicitly):
-```perl
-$s =~ s{a}{b};   # this exact line, repeated 81 times in one file
+**Minimal repro** — regenerate and parse (the file is not kept in-tree: as a
+`.pl` it's a landmine the workspace indexer / `--check` would parse and abort on):
+```sh
+perl -e 'print "\$s =~ s{a}{b};\n" for 1..81' > /tmp/x.pl && perl-lsp --parse /tmp/x.pl
 ```
-`perl-lsp --parse docs/repro-scanner-serialize-overflow.txt` → abort. **80
-occurrences pass, 81 abort** — i.e.
+→ abort. **80 occurrences pass, 81 abort** — i.e.
 each paired-delimiter substitution adds ~12 bytes of scanner state that is
 **never popped**, and the 81st pushes the serialized state past 1024.
 
