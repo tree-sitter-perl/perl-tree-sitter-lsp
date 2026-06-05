@@ -51,6 +51,27 @@ Exporter recognition→**plugin extraction** (the `ExportSurface` seam) · **eff
 `docs/prompt-type-system-futures.md`) · **A4 v2: cross-FILE slot writes** (module_index bridge, the
 `MethodOnClass` pattern).
 
+## Gold-corpus gaps (confirmed real, gold confidence)
+Surfaced by the adversarially-verified gold corpus (`docs/gold-corpus/`, 157 gold rows). Each is a *true*
+known-failing row (expected confirmed correct, tool genuinely wrong). Grouped by theme:
+- **Ref/rename completeness** (largest cluster — rename rides the ref graph): in-body call sites not cross-linked
+  (`ref-expt-mkopt`, `rename-06-build-exporter`); FQ refs to **non-exported** subs/constants don't link to def
+  (`ref-uri-escape_char-fq`, `ref-uri-const-fq`); disjoint **def-side vs call-site** rename buckets
+  (`rename-01/02-mkopt`); a `use constant` occurrence dropped (`rename-09-base-constant`); lexical deref spellings
+  dropped — `%$tag_opts` (`ref-expt-tag_opts-lexical`), `$p{k}` inside a paren-wrapped ternary
+  (`le-dt-p-hash-slices`, 27/30).
+- **Diagnostics false-positives** (FP-suppression tail): own export called within its defining package (`diag-06`);
+  dynamic typeglob-codegen methods flagged (`diag-09/10`); nested export `:tag` not recursively expanded
+  (`diag-11`); `Test::More` plan directive misread as restricting the import list (`diag-12`).
+- **Completion gaps**: `$self->{` offers 2 of 13 mutated keys — mutated-key harvest misses `$self->{k}=...` writes in
+  constructors (`completion-datetime-hashkey`); imported subs absent from bareword completion
+  (`completion-typetiny-imported-blessed`).
+- **Semantic-token dead code**: `TOK_ENUM_MEMBER` never emitted — `use constant` names tag as `function`
+  (`st-uri-constant-name-enummember`); `TOK_REGEXP` never emitted — `qr//` gets no token (`st-tt-regex-literal-regexp`).
+- **Misc**: codegen type-fn (`Types::Standard::Any`) has no navigable target (`def-16`); imported-fn hover empty in
+  `.t` consumers (`hover-jsonpp-encode-json-imported-t`); `$path` wrongly elided as invocant on a *plain function*
+  call (`sig-uri-check-path-function-noinvocant`).
+
 ## Reference — confirmed NOT bugs
 XS methods (DBI, PPI-on-untyped-param) · truly-dynamic `*{$runtime}=…` installs · methods from not-installed
 deps · `--dump-package` faithfully mirrors the editor query path.
