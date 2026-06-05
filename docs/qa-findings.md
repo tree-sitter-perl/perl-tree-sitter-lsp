@@ -52,7 +52,7 @@ Exporter recognition→**plugin extraction** (the `ExportSurface` seam) · **eff
 `MethodOnClass` pattern).
 
 ## Gold-corpus gaps (confirmed real, gold confidence)
-Surfaced by the adversarially-verified gold corpus (`docs/gold-corpus/`, 157 gold rows). Each is a *true*
+Surfaced by the adversarially-verified gold corpus (`gold-corpus/`, 157 gold rows). Each is a *true*
 known-failing row (expected confirmed correct, tool genuinely wrong). Grouped by theme:
 - **Ref/rename completeness** (largest cluster — rename rides the ref graph): in-body call sites not cross-linked
   (`ref-expt-mkopt`, `rename-06-build-exporter`); FQ refs to **non-exported** subs/constants don't link to def

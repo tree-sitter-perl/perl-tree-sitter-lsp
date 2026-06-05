@@ -2,6 +2,17 @@
 
 A reproducible regression net of verified LSP-capability rows, captured against the **current usability-sprint binary**. Every row reproduces deterministically via the CLI query modes; each carries the exact cursor (`file:line:col`), expected behavior, actual output, a verdict, and a confidence. Positions are **0-based on input, 1-based on output**. `gold` = high-confidence verified; `provisional` = verified but with a soft/open-ended expected or a cosmetic drift; `reject` = the row's expected was indefensible and the row is excluded (kept visible in a Rejected section per file so the exclusion is not silent).
 
+## Harness
+
+`gold-corpus/run.pl` re-runs every row against the current binary. It needs the QA corpus checked out (default `~/perl-qa-corpus`, override with `CORPUS=`) and a release build (override with `BIN=`); it is **not** a cargo/CI test (it depends on that external corpus).
+
+```sh
+gold-corpus/run.pl                 # all capabilities  (~1m, exits non-zero on any crash/regression)
+gold-corpus/run.pl definition hover
+```
+
+It is a **smoke + liveness** guard, not an exact-assertion runner — the `expected`/`actual` columns are human prose, not machine fixtures. It flags two things, both high-value: **CRASH** (a query that aborts the process — the check that catches the scanner-overflow class) and **REGRESS** (a row recorded `PASS` that now returns empty — a resolution that used to work and no longer does). Wrong-but-non-empty answers are *not* caught; exact target-matching would need a structured (JSON) fixture sidecar generated alongside this markdown — deliberately future work.
+
 ## Capabilities
 
 | capability | file | gold | provisional | reject |
@@ -25,8 +36,8 @@ A reproducible regression net of verified LSP-capability rows, captured against 
 
 Two earlier repo-keyed matrices cover definition + type-inference rows organized by repo and predate this capability-keyed corpus:
 
-- [`docs/qa-def-type-matrix-A.md`](../qa-def-type-matrix-A.md) — Moo / Plack / Catalyst / Minion
-- [`docs/qa-def-type-matrix-B.md`](../qa-def-type-matrix-B.md) — Exporter-Tiny / Sub-Exporter / URI / DateTime / Log-Log4perl
+- [`matrix-A-oo-framework.md`](matrix-A-oo-framework.md) — Moo / Plack / Catalyst / Minion
+- [`matrix-B-exporter-classic.md`](matrix-B-exporter-classic.md) — Exporter-Tiny / Sub-Exporter / URI / DateTime / Log-Log4perl
 
 ## Editor-only capabilities (not CLI-queryable — covered by e2e)
 
