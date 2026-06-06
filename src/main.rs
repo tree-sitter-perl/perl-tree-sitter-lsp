@@ -95,6 +95,10 @@ async fn main() {
             cli_workspace_symbol(&args[2], &args[3]);
             return;
         }
+        Some("--batch") if args.len() >= 3 => {
+            cli_batch(&args[2]);
+            return;
+        }
         Some("--plugin-check") => {
             plugin::cli::cli_plugin_check(&args[2..]);
             return;
@@ -159,6 +163,7 @@ fn print_usage() {
     eprintln!("REFACTORING:");
     eprintln!("  perl-lsp --rename <root> <file> <line> <col> <new>     Cross-file rename");
     eprintln!("  perl-lsp --workspace-symbol <root> <query>             Search symbols");
+    eprintln!("  perl-lsp --batch <root>                                Stream JSONL queries (one startup, many)");
     eprintln!();
     eprintln!("PLUGIN AUTHORING:");
     eprintln!("  perl-lsp --plugin-check <file.rhai>                    Lint a Rhai plugin");
@@ -893,6 +898,382 @@ fn cli_open_document(file: &str, idx: &module_index::ModuleIndex) -> document::D
     });
     doc.analysis.enrich_imported_types_with_keys(Some(idx));
     doc
+}
+
+#[derive(serde::Deserialize)]
+struct BatchReq {
+    id: String,
+    q: String,
+    #[serde(default)] file: String,
+    #[serde(default)] line: usize,
+    #[serde(default)] col: usize,
+    #[serde(default)] query: Option<String>,
+    #[serde(default)] newname: Option<String>,
+}
+
+/// Single source of truth for every cursor/query CLI capability. Both the
+/// single-mode `cli_*` wrappers and `--batch` call this, so their stdout can
+/// never drift. The expensive startup state (`ws` + `idx`) is built once by the
+/// caller and shared; this re-parses only the one target file per call. Returns
+/// the exact text the command prints (Ok) or the stderr message (Err).
+fn run_one(
+    ws: &file_store::FileStore,
+    idx: &module_index::ModuleIndex,
+    req: &BatchReq,
+) -> Result<String, String> {
+    use tower_lsp::lsp_types::Position;
+    let file = req.file.as_str();
+    let point = tree_sitter::Point { row: req.line, column: req.col };
+    let pos = Position { line: req.line as u32, character: req.col as u32 };
+
+    // Graceful miss instead of process exit — a bad path must not kill --batch.
+    let needs_file = !matches!(req.q.as_str(), "workspace-symbol" | "diagnostics");
+    if needs_file && (file.is_empty() || !std::path::Path::new(file).exists()) {
+        return Err(format!("file not found: {}", file));
+    }
+
+    match req.q.as_str() {
+        "definition" => {
+            let (source, tree, mut analysis) = parse_file(file);
+            analysis.enrich_imported_types_with_keys(Some(idx));
+            let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let uri = tower_lsp::lsp_types::Url::from_file_path(&abs)
+                .unwrap_or_else(|_| tower_lsp::lsp_types::Url::parse("file:///unknown").unwrap());
+            if let Some(resp) = symbols::find_definition(&analysis, pos, &uri, idx, &tree, &source) {
+                use tower_lsp::lsp_types::GotoDefinitionResponse;
+                let first = match resp {
+                    GotoDefinitionResponse::Scalar(loc) => Some(loc),
+                    GotoDefinitionResponse::Array(v) => v.into_iter().next(),
+                    GotoDefinitionResponse::Link(v) => v.into_iter().next().map(|l| {
+                        tower_lsp::lsp_types::Location { uri: l.target_uri, range: l.target_range }
+                    }),
+                };
+                if let Some(loc) = first {
+                    let path = loc.uri.to_file_path().map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| loc.uri.to_string());
+                    let (line, col) = SourceCache::new().display(
+                        &path, loc.range.start.line as usize, loc.range.start.character as usize);
+                    return Ok(format!("{}:{}:{}", path, line, col));
+                }
+            }
+            Err(format!("No definition found at {}:{}", req.line, req.col))
+        }
+        "references" => {
+            let (_s, _t, mut analysis) = parse_file(file);
+            analysis.enrich_imported_types_with_keys(Some(idx));
+            let file_path = std::path::Path::new(file).canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let target = analysis.rename_kind_at(point, Some(idx))
+                .and_then(|k| resolve::TargetRef::from_rename_kind(k, &analysis, Some(idx)));
+            let mut sources = SourceCache::new();
+            let mut results = Vec::new();
+            match target {
+                None => {
+                    let path_str = file_path.display().to_string();
+                    for span in &analysis.find_references(point, None, None, Some(idx)) {
+                        let (line, col) = sources.display(&path_str, span.start.row, span.start.column);
+                        results.push(serde_json::json!({"file": path_str, "line": line, "col": col}));
+                    }
+                }
+                Some(target) => {
+                    ws.insert_workspace(file_path.clone(), analysis);
+                    let mask = resolve::references_mask_for(ws, Some(idx), &target);
+                    for loc in resolve::refs_to(ws, Some(idx), &target, mask) {
+                        let path = match &loc.key {
+                            file_store::FileKey::Path(p) => p.display().to_string(),
+                            file_store::FileKey::Url(u) => u.to_file_path()
+                                .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
+                        };
+                        let (line, col) = sources.display(&path, loc.span.start.row, loc.span.start.column);
+                        results.push(serde_json::json!({"file": path, "line": line, "col": col}));
+                    }
+                }
+            }
+            Ok(serde_json::to_string_pretty(&results).unwrap())
+        }
+        "hover" => {
+            let (source, _t, mut analysis) = parse_file(file);
+            analysis.enrich_imported_types_with_keys(Some(idx));
+            analysis.hover_info(point, &source, Some(idx))
+                .ok_or_else(|| format!("No hover info at {}:{}", req.line, req.col))
+        }
+        "type-at" => {
+            let (_s, _t, analysis) = parse_file(file);
+            if let Some(r) = analysis.ref_at(point) {
+                if let Some(ty) = analysis.inferred_type_via_bag(&r.target_name, point) {
+                    return Ok(file_analysis::format_inferred_type(&ty));
+                }
+            }
+            if let Some(sym) = analysis.symbol_at(point) {
+                if let Some(ty) = analysis.inferred_type_via_bag(&sym.name, point) {
+                    return Ok(file_analysis::format_inferred_type(&ty));
+                }
+            }
+            Err(format!("No type info at {}:{}", req.line, req.col))
+        }
+        "completion" => {
+            let doc = cli_open_document(file, idx);
+            let items = symbols::completion_items(
+                &doc.analysis, &doc.tree, &doc.text, pos, idx,
+                Some(doc.stable_outline.package_lines()));
+            let mut out = String::new();
+            for it in &items {
+                match &it.detail {
+                    Some(d) if !d.is_empty() => out.push_str(&format!("{}\t{}\n", it.label, d)),
+                    _ => out.push_str(&format!("{}\n", it.label)),
+                }
+            }
+            Ok(out.trim_end_matches('\n').to_string())
+        }
+        "signature-help" => {
+            let doc = cli_open_document(file, idx);
+            match symbols::signature_help(&doc.analysis, &doc.tree, &doc.text, pos, idx) {
+                Some(sh) => {
+                    let active = sh.active_signature.unwrap_or(0) as usize;
+                    let mut out = String::new();
+                    for (i, sig) in sh.signatures.iter().enumerate() {
+                        let marker = if i == active { "* " } else { "  " };
+                        out.push_str(&format!("{}{}\n", marker, sig.label));
+                        if i == active {
+                            if let Some(p) = sh.active_parameter {
+                                let plabel = sig.parameters.as_ref()
+                                    .and_then(|ps| ps.get(p as usize))
+                                    .map(|pi| match &pi.label {
+                                        tower_lsp::lsp_types::ParameterLabel::Simple(s) => s.clone(),
+                                        tower_lsp::lsp_types::ParameterLabel::LabelOffsets([a, b]) =>
+                                            sig.label.get(*a as usize..*b as usize).unwrap_or("").to_string(),
+                                    })
+                                    .unwrap_or_default();
+                                out.push_str(&format!("    active param: {} ({})\n", p, plabel));
+                            }
+                        }
+                    }
+                    Ok(out.trim_end_matches('\n').to_string())
+                }
+                None => Err(format!("No signature help at {}:{}", req.line, req.col)),
+            }
+        }
+        "document-highlight" => {
+            let doc = cli_open_document(file, idx);
+            let highlights = symbols::document_highlights(&doc.analysis, pos, &doc.tree, &doc.text, Some(idx));
+            let mut sources = SourceCache::new();
+            let path = std::fs::canonicalize(file).map(|p| p.display().to_string())
+                .unwrap_or_else(|_| file.to_string());
+            let mut out = String::new();
+            for h in &highlights {
+                let (line, col) = sources.display(&path, h.range.start.line as usize, h.range.start.character as usize);
+                let kind = match h.kind {
+                    Some(tower_lsp::lsp_types::DocumentHighlightKind::WRITE) => "WRITE",
+                    _ => "READ",
+                };
+                out.push_str(&format!("{}:{}:{}\t{}\n", path, line, col, kind));
+            }
+            Ok(out.trim_end_matches('\n').to_string())
+        }
+        "linked-editing" => {
+            let doc = cli_open_document(file, idx);
+            let path = std::fs::canonicalize(file).map(|p| p.display().to_string())
+                .unwrap_or_else(|_| file.to_string());
+            match symbols::linked_editing_ranges(&doc.analysis, pos, Some(idx)) {
+                Some(ranges) => {
+                    let mut sources = SourceCache::new();
+                    let mut out = String::new();
+                    for r in &ranges {
+                        let (line, col) = sources.display(&path, r.start.line as usize, r.start.character as usize);
+                        out.push_str(&format!("{}:{}:{}\n", path, line, col));
+                    }
+                    Ok(out.trim_end_matches('\n').to_string())
+                }
+                None => Err(format!("No linked-editing ranges at {}:{} (need >= 2 occurrences)", req.line, req.col)),
+            }
+        }
+        "semantic-tokens" => {
+            let doc = cli_open_document(file, idx);
+            let tokens = symbols::semantic_tokens(&doc.analysis);
+            let legend = symbols::semantic_token_types();
+            let (mut line, mut col): (u32, u32) = (0, 0);
+            let mut out = String::new();
+            for t in &tokens {
+                line += t.delta_line;
+                if t.delta_line == 0 { col += t.delta_start; } else { col = t.delta_start; }
+                let name = legend.get(t.token_type as usize).map(|tt| tt.as_str()).unwrap_or("?");
+                out.push_str(&format!("{}:{} len={} {}\n", line + 1, col, t.length, name));
+            }
+            Ok(out.trim_end_matches('\n').to_string())
+        }
+        "outline" => {
+            let (_s, _t, analysis) = parse_file(file);
+            Ok(outline_json(&analysis))
+        }
+        "workspace-symbol" => {
+            let q = req.query.clone().unwrap_or_default().to_lowercase();
+            let mut results = Vec::new();
+            for entry in ws.workspace_raw().iter() {
+                for sym in &entry.value().symbols {
+                    if sym.name.to_lowercase().contains(&q) {
+                        results.push(serde_json::json!({
+                            "name": sym.name, "kind": format!("{:?}", sym.kind),
+                            "file": entry.key().display().to_string(),
+                            "line": sym.selection_span.start.row, "col": sym.selection_span.start.column,
+                        }));
+                    }
+                }
+            }
+            Ok(serde_json::to_string_pretty(&results).unwrap())
+        }
+        "rename" => {
+            let new_name = req.newname.clone().unwrap_or_else(|| "RENAMED".to_string());
+            run_rename(ws, idx, file, point, &new_name)
+        }
+        "diagnostics" => Ok(batch_diagnostics(ws, idx)),
+        other => Err(format!("unknown query: {}", other)),
+    }
+}
+
+/// Document-symbol outline as the pretty-JSON array string (shared by
+/// `cli_outline` and `run_one`).
+fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
+    let mut results = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String, usize, usize)> =
+        std::collections::HashSet::new();
+    for sym in &analysis.symbols {
+        match sym.kind {
+            file_analysis::SymKind::Sub | file_analysis::SymKind::Method
+            | file_analysis::SymKind::Package | file_analysis::SymKind::Class
+            | file_analysis::SymKind::Variable | file_analysis::SymKind::Handler => {}
+            _ => continue,
+        }
+        let hidden = match &sym.detail {
+            file_analysis::SymbolDetail::Sub { hide_in_outline, .. } => *hide_in_outline,
+            file_analysis::SymbolDetail::Handler { hide_in_outline, .. } => *hide_in_outline,
+            _ => false,
+        };
+        if hidden { continue; }
+        if sym.kind == file_analysis::SymKind::Variable && analysis.scope_within_sub_body(sym.scope) {
+            continue;
+        }
+        let entry = serde_json::json!({
+            "name": sym.name,
+            "kind": format!("{:?}", sym.kind),
+            "line": sym.selection_span.start.row,
+            "col": sym.selection_span.start.column,
+        });
+        use file_analysis::Namespace;
+        let is_framework = matches!(sym.namespace, Namespace::Framework { .. });
+        let is_dupeable = is_framework && matches!(sym.kind,
+            file_analysis::SymKind::Sub | file_analysis::SymKind::Method);
+        if is_dupeable {
+            let key = (format!("{:?}", sym.kind), sym.name.clone(),
+                sym.span.start.row, sym.span.start.column);
+            if !seen.insert(key) { continue; }
+        }
+        results.push(entry);
+    }
+    serde_json::to_string_pretty(&results).unwrap()
+}
+
+/// Cross-file rename edit-set as the pretty-JSON object string (shared by
+/// `cli_rename` and `run_one`). `file` is the originating file; `point` the cursor.
+fn run_rename(
+    ws: &file_store::FileStore,
+    idx: &module_index::ModuleIndex,
+    file: &str,
+    point: tree_sitter::Point,
+    new_name: &str,
+) -> Result<String, String> {
+    use std::collections::HashMap;
+    let file_path = std::path::Path::new(file).canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(file));
+    let (_s, _t, mut analysis) = parse_file(file);
+    analysis.enrich_imported_types_with_keys(Some(idx));
+    let rename_kind = analysis.rename_kind_at(point, Some(idx))
+        .ok_or_else(|| format!("Nothing renameable at {}:{}", point.row, point.column))?;
+    let mut all_edits: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    match &rename_kind {
+        file_analysis::RenameKind::Variable
+        | file_analysis::RenameKind::HashKey(_)
+        | file_analysis::RenameKind::Handler { .. } => {
+            let source = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
+            let mut parser = module_resolver::create_parser();
+            let tree = parser.parse(&source, None).ok_or("parse failed")?;
+            if let Some(edits) = analysis.rename_at(point, new_name, Some(&tree), Some(source.as_bytes())) {
+                let json_edits: Vec<_> = edits.into_iter()
+                    .map(|(span, text)| span_to_json(span, text)).collect();
+                all_edits.insert(file_path.display().to_string(), json_edits);
+            }
+            return Ok(serde_json::to_string_pretty(&serde_json::json!(all_edits)).unwrap());
+        }
+        _ => {}
+    }
+    let target = resolve::TargetRef::from_rename_kind(rename_kind, &analysis, Some(idx))
+        .ok_or("Function/Method/Package map to a target")?;
+    ws.insert_workspace(file_path, analysis);
+    for loc in resolve::refs_to(ws, Some(idx), &target, resolve::RoleMask::EDITABLE) {
+        let path = match &loc.key {
+            file_store::FileKey::Path(p) => p.display().to_string(),
+            file_store::FileKey::Url(u) => u.to_file_path()
+                .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
+        };
+        all_edits.entry(path).or_default().push(span_to_json(loc.span, new_name.to_string()));
+    }
+    Ok(serde_json::to_string_pretty(&serde_json::json!(all_edits)).unwrap())
+}
+
+/// Whole-tree diagnostics as the pretty-JSON array string (warning+; shared by
+/// `--batch` diagnostics requests). Mirrors `cli_check`'s JSON path.
+fn batch_diagnostics(ws: &file_store::FileStore, idx: &module_index::ModuleIndex) -> String {
+    let options = symbols::DiagnosticOptions { unresolved_dispatch: false };
+    let mut all = Vec::new();
+    for entry in ws.workspace_raw().iter() {
+        let file = entry.key().display().to_string();
+        for d in symbols::collect_diagnostics(entry.value(), idx, options) {
+            let sev = match d.severity {
+                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::ERROR => "error",
+                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::WARNING => "warning",
+                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION => "info",
+                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::HINT => "hint",
+                _ => "warning",
+            };
+            all.push(serde_json::json!({
+                "file": file, "line": d.range.start.line, "col": d.range.start.character,
+                "severity": sev,
+                "code": d.code.map(|c| match c {
+                    tower_lsp::lsp_types::NumberOrString::String(s) => s,
+                    tower_lsp::lsp_types::NumberOrString::Number(n) => n.to_string(),
+                }).unwrap_or_default(),
+                "message": d.message,
+            }));
+        }
+    }
+    serde_json::to_string_pretty(&all).unwrap()
+}
+
+/// --batch <root> — read JSONL queries on stdin, share one startup, print one
+/// JSON response per line. The harness substrate: amortizes the workspace-index
+/// + @INC cost across every query instead of paying it per process.
+fn cli_batch(root: &str) {
+    use std::io::{BufRead, Write};
+    let (ws, idx) = cli_full_startup(root);
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in stdin.lock().lines() {
+        let line = match line { Ok(l) => l, Err(_) => break };
+        if line.trim().is_empty() { continue; }
+        let req: BatchReq = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = writeln!(out, "{}", serde_json::json!({"ok": false, "err": format!("bad request: {}", e)}));
+                continue;
+            }
+        };
+        let resp = match run_one(&ws, &idx, &req) {
+            Ok(s)  => serde_json::json!({"id": req.id, "ok": true,  "out": s}),
+            Err(e) => serde_json::json!({"id": req.id, "ok": false, "err": e}),
+        };
+        let _ = writeln!(out, "{}", serde_json::to_string(&resp).unwrap());
+        let _ = out.flush();   // flush per line so a later abort still localizes
+    }
 }
 
 /// --rename <root> <file> <line> <col> <new_name> — Cross-file rename
