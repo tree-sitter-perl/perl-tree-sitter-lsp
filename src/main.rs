@@ -872,12 +872,45 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
         if sym.kind == file_analysis::SymKind::Variable && analysis.scope_within_sub_body(sym.scope) {
             continue;
         }
-        let entry = serde_json::json!({
+        let mut entry = serde_json::json!({
             "name": sym.name,
             "kind": format!("{:?}", sym.kind),
             "line": sym.selection_span.start.row,
             "col": sym.selection_span.start.column,
         });
+        // Richer per-symbol detail (package, params, inferred return type,
+        // method flag, display flavor, handler dispatchers) — the QA/debug
+        // signal the outline carries beyond name/kind/line/col.
+        if let Some(ref pkg) = sym.package {
+            entry["package"] = serde_json::json!(pkg);
+        }
+        if let file_analysis::SymbolDetail::Sub { ref params, is_method, ref display, .. } = sym.detail {
+            if params.iter().any(|p| !p.is_invocant) {
+                let param_names: Vec<&str> = params.iter()
+                    .filter(|p| !p.is_invocant)
+                    .map(|p| p.name.as_str())
+                    .collect();
+                entry["params"] = serde_json::json!(param_names);
+            }
+            if let Some(rt) = analysis.symbol_return_type_via_bag(sym.id, None) {
+                entry["return_type"] = serde_json::json!(file_analysis::format_inferred_type(&rt));
+            }
+            if is_method {
+                entry["is_method"] = serde_json::json!(true);
+            }
+            if let Some(d) = display {
+                entry["display"] = serde_json::json!(format!("{:?}", d));
+            }
+        }
+        if let file_analysis::SymbolDetail::Handler { ref params, ref dispatchers, ref display, .. } = sym.detail {
+            let param_names: Vec<&str> = params.iter()
+                .filter(|p| !p.is_invocant)
+                .map(|p| p.name.as_str())
+                .collect();
+            entry["params"] = serde_json::json!(param_names);
+            entry["dispatchers"] = serde_json::json!(dispatchers);
+            entry["display"] = serde_json::json!(format!("{:?}", display));
+        }
         use file_analysis::Namespace;
         let is_framework = matches!(sym.namespace, Namespace::Framework { .. });
         let is_dupeable = is_framework && matches!(sym.kind,
