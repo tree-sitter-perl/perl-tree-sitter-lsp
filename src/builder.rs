@@ -4988,9 +4988,21 @@ impl<'a> Builder<'a> {
         // names a constant sub in another package. Mirror the FQ function-call
         // ref shape so it resolves cross-file to that sub: `target_name` keeps
         // the full path, `resolved_package` = the qualifier, span = bare tail
-        // (narrowest renamable token, rule #7). The method-invocant /
-        // `use`/`require` / isa positions never reach this arm (they route to
-        // dedicated visitors), so this is value-position only.
+        // (narrowest renamable token, rule #7).
+        //
+        // BUT the method-invocant slot DOES reach this arm — `Foo::Bar->new`
+        // recurses the `Foo::Bar` bareword via visit_method_call's children.
+        // That's a class name, not a constant call; skip it (visit_method_call
+        // already emits the PackageRef for the invocant). Without this guard,
+        // references/rename on a sub `Bar` in package `Foo` wrongly matched the
+        // `Foo::Bar->new` class invocant.
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "method_call_expression"
+                && parent.child_by_field_name("invocant").map(|i| i.id()) == Some(node.id())
+            {
+                return;
+            }
+        }
         if let (Some(qualifier), _) = crate::file_analysis::split_qualified(name) {
             let ref_span = match name.rfind("::") {
                 Some(idx) => {
@@ -7334,10 +7346,10 @@ impl<'a> Builder<'a> {
     fn pin_unresolved_call_packages(&mut self) {
         use std::collections::HashMap;
         // Local sub/method name → the package(s) that define it.
-        let mut sub_pkgs: HashMap<&str, Vec<String>> = HashMap::new();
+        let mut sub_pkgs: HashMap<&str, Vec<&str>> = HashMap::new();
         for s in &self.symbols {
             if matches!(s.kind, SymKind::Sub | SymKind::Method) {
-                if let Some(pkg) = s.package.clone() {
+                if let Some(pkg) = s.package.as_deref() {
                     sub_pkgs.entry(s.name.as_str()).or_default().push(pkg);
                 }
             }
@@ -7345,17 +7357,6 @@ impl<'a> Builder<'a> {
         if sub_pkgs.is_empty() {
             return;
         }
-        // Package decls in file order — the enclosing package of a position is
-        // the last one declared at or before it (Perl packages are
-        // file-sequential; block-scoped `{ package X; }` is the documented edge).
-        let mut marks: Vec<((usize, usize), String)> = self
-            .symbols
-            .iter()
-            .filter(|s| matches!(s.kind, SymKind::Package | SymKind::Class))
-            .map(|s| ((s.span.start.row, s.span.start.column), s.name.clone()))
-            .collect();
-        marks.sort_by(|a, b| a.0.cmp(&b.0));
-
         let mut pins: Vec<(usize, String)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
             let RefKind::FunctionCall { resolved_package: None } = &r.kind else { continue };
@@ -7363,15 +7364,15 @@ impl<'a> Builder<'a> {
                 continue; // qualified calls already pin at walk time (step 1)
             }
             let Some(pkgs) = sub_pkgs.get(r.target_name.as_str()) else { continue };
-            let pos = (r.span.start.row, r.span.start.column);
-            let encl = marks.iter().rev().find(|(p, _)| *p <= pos).map(|(_, n)| n.as_str());
-            // Prefer a sub in the call's enclosing package; else, if the name
-            // is defined in exactly one package, that's unambiguous.
-            let chosen = encl
-                .and_then(|e| pkgs.iter().find(|p| p.as_str() == e).cloned())
-                .or_else(|| if pkgs.len() == 1 { Some(pkgs[0].clone()) } else { None });
-            if let Some(pkg) = chosen {
-                pins.push((i, pkg));
+            // Pin ONLY to a local sub in the call's OWN enclosing package
+            // (`package_at_pos` is the canonical span-containment query — block-
+            // scoped `{ package X; }` aware). A same-named sub in a DIFFERENT
+            // local package is NOT this call's target: it may be an imported sub
+            // of that name, which cross-file resolution owns. (An earlier
+            // unique-local fallback pinned to it and hijacked the import.)
+            let Some(encl) = self.package_at_pos(r.span.start) else { continue };
+            if pkgs.iter().any(|p| *p == encl) {
+                pins.push((i, encl.to_string()));
             }
         }
         for (i, pkg) in pins {
