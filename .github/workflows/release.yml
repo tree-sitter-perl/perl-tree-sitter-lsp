@@ -37,7 +37,9 @@ jobs:
 
       - name: Install pinned substrate (cpm + snapshot)
         working-directory: gold-corpus
-        run: cpm install -L local --resolver snapshot
+        run: |
+          cpm install -g Carton::Snapshot   # --resolver snapshot needs this to read cpanfile.snapshot
+          cpm install -L local --resolver snapshot
 
       - name: Build release binary
         run: cargo build --release
