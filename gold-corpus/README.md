@@ -72,7 +72,7 @@ The following capabilities have **no CLI query mode** and are therefore **not** 
 
 ## Known failing (xfail rows)
 
-Confirmed gaps captured at xfail — the correct assertion does not currently hold, so the runner pins the gap (XPASS the day it's fixed):
+Confirmed gaps captured at xfail — the correct assertion does not currently hold, so the runner pins the gap (XPASS the day it's fixed). Full write-up (root cause + fix sketch + difficulty per gap): [`KNOWN-GAPS.md`](KNOWN-GAPS.md).
 
 - **def-16-codegen-type-function** (definition) — `Types::Standard::Any` has no literal `sub`; Type::Library codegen mints it at runtime, so goto-def degrades to the package decl (`Standard.pm:1:1`) instead of the `name => "Any"` declaration at `Standard.pm:215`.
 - **diag-08** (diagnostics) — XS-bootstrapped `bootstrap` at `SSLeay.pm:1023` flagged unresolved-function; should be suppressed (XS-installed sub).
