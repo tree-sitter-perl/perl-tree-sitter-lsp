@@ -3239,21 +3239,28 @@ impl<'a> Builder<'a> {
                 self.visit_children(node);
             }
             "substitution_regexp" => {
-                self.regex_spans.push(node_to_span(node));
                 // `s///e`: the replacement is Perl *code*, but the grammar
                 // emits it as a plain `replacement` node (not parsed as code).
                 // Re-parse it so calls/vars inside resolve (rule #7), mapping
                 // spans back to the file. Same idea as the __END__/ISA re-parses.
-                if self.subst_replacement_is_eval(node) {
-                    let mut repl = None;
-                    for i in 0..node.named_child_count() {
-                        if let Some(c) = node.named_child(i) {
-                            if c.kind() == "replacement" { repl = Some(c); break; }
-                        }
-                    }
-                    if let Some(repl) = repl {
-                        self.emit_refs_in_eval_replacement(repl);
-                    }
+                let repl = self.subst_replacement_is_eval(node).then(|| {
+                    (0..node.named_child_count())
+                        .filter_map(|i| node.named_child(i))
+                        .find(|c| c.kind() == "replacement")
+                }).flatten();
+                if let Some(repl) = repl {
+                    // Color only the pattern region as a regex literal, stopping
+                    // where the code replacement begins — the replacement's own
+                    // refs color the code, and overlapping semantic tokens are
+                    // invalid LSP. (Non-/e keeps the whole-literal span: the
+                    // replacement there is a plain string, not code.)
+                    self.regex_spans.push(Span {
+                        start: node_to_span(node).start,
+                        end: node_to_span(repl).start,
+                    });
+                    self.emit_refs_in_eval_replacement(repl);
+                } else {
+                    self.regex_spans.push(node_to_span(node));
                 }
                 self.visit_children(node);
             }

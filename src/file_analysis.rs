@@ -6358,10 +6358,16 @@ impl FileAnalysis {
             .flat_map(|imp| imp.imported_symbols.iter().map(|s| s.local_name.as_str()))
             .collect();
 
-        // Local `use constant` names — usages color like the declaration.
-        let constant_names: std::collections::HashSet<&str> = self.symbols.iter()
-            .filter(|s| matches!(s.detail, SymbolDetail::Sub { is_constant: true, .. }))
-            .map(|s| s.name.as_str())
+        // Local `use constant` decls, keyed by (package, name) — usages color
+        // like the declaration. Package-keyed so a same-named non-constant sub
+        // in a different package isn't mis-colored as a constant (the recolor
+        // matches the call's resolved_package, not just the bare name).
+        let constant_names: std::collections::HashSet<(&str, &str)> = self.symbols.iter()
+            .filter_map(|s| match &s.detail {
+                SymbolDetail::Sub { is_constant: true, .. } =>
+                    s.package.as_deref().map(|p| (p, s.name.as_str())),
+                _ => None,
+            })
             .collect();
 
         for r in &self.refs {
@@ -6379,9 +6385,12 @@ impl FileAnalysis {
                     if matches!(r.access, AccessKind::Write) { mods |= 1 << MOD_MODIFICATION; }
                     tokens.push(PerlSemanticToken { span: r.span, token_type, modifiers: mods });
                 }
-                RefKind::FunctionCall { .. } => {
+                RefKind::FunctionCall { resolved_package } => {
                     // Constant usages color like the decl; framework DSL keywords → macro.
-                    let token_type = if constant_names.contains(r.target_name.as_str()) {
+                    let is_const = resolved_package.as_deref().map_or(false, |pkg| {
+                        constant_names.contains(&(pkg, r.unqualified_target_name()))
+                    });
+                    let token_type = if is_const {
                         TOK_ENUM_MEMBER
                     } else if self.framework_imports.contains(r.target_name.as_str()) {
                         TOK_MACRO
