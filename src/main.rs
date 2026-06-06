@@ -1066,6 +1066,7 @@ fn cli_dump_package(root: &str, package_name: &str) {
             hide_in_outline,
             opaque_return,
             ref doc,
+            ..
         } = sym.detail
         else {
             continue;

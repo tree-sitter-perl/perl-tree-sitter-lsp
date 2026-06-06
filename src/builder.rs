@@ -254,6 +254,7 @@ fn build_with_plugins_inner(
         next_scope_id: 0,
         next_symbol_id: 0,
         package_ranges: Vec::new(),
+        regex_spans: Vec::new(),
         open_statement_package: None,
         plugins,
         dispatch_manifest: std::collections::HashMap::new(),
@@ -501,6 +502,7 @@ fn build_with_plugins_inner(
     fa.package_framework = package_framework;
     fa.export_tags = std::mem::take(&mut b.export_tags);
     fa.app_surface_consumers = b.app_surface_consumers.clone();
+    fa.regex_spans = b.regex_spans;
     fa.witnesses = bag;
     fa.witnesses.rebuild_index();
     fa.provisional_dispatches = std::mem::take(&mut b.provisional_dispatches);
@@ -1354,6 +1356,9 @@ struct Builder<'a> {
     /// the file end and gets trimmed when a same-level successor
     /// appears.
     package_ranges: Vec<crate::file_analysis::PackageRange>,
+    /// Spans of regex literals (`qr//`, `m//`, `s///`), collected during the
+    /// walk and copied onto `FileAnalysis.regex_spans` for `TOK_REGEXP`.
+    regex_spans: Vec<Span>,
     /// Index in `package_ranges` of the currently-open statement-form
     /// declaration (the one a successor `package X;` / `class X;`
     /// would supplant), if any.
@@ -2599,6 +2604,7 @@ impl<'a> Builder<'a> {
                     display,
                     hide_in_outline,
                     opaque_return,
+                    is_constant: false,
                 };
                 let target_pkg = on_class.clone().or_else(|| self.current_package.clone());
 
@@ -3158,6 +3164,13 @@ impl<'a> Builder<'a> {
                 }
             }
 
+            // Regex literals → TOK_REGEXP. Record the whole literal span,
+            // then descend so interpolated variables inside still get refs.
+            "quoted_regexp" | "match_regexp" | "substitution_regexp" => {
+                self.regex_spans.push(node_to_span(node));
+                self.visit_children(node);
+            }
+
             // ERROR nodes: recover structural declarations (the file's skeleton)
             // but skip expressions/refs which are unreliable inside broken regions
             "ERROR" => self.recover_structural_from_error(node),
@@ -3298,6 +3311,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                 },
             );
         }
@@ -3587,7 +3601,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, doc, display: None, hide_in_outline: false, opaque_return: false },
+            SymbolDetail::Sub { params: params.clone(), is_method, doc, display: None, hide_in_outline: false, opaque_return: false, is_constant: false },
         );
 
         // Exporter::Extensible method-attribute export form: `sub foo :Export`.
@@ -3729,6 +3743,7 @@ impl<'a> Builder<'a> {
                 display: None,
                 hide_in_outline: true,
                 opaque_return: false,
+                is_constant: false,
             },
         );
         self.anon_sub_symbol_by_span.insert(span, sym_id);
@@ -4140,7 +4155,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         *var_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, doc: None, display: None, hide_in_outline: false, opaque_return: false },
+                        SymbolDetail::Sub { params: vec![], is_method: true, doc: None, display: None, hide_in_outline: false, opaque_return: false, is_constant: false },
                     );
                 }
                 if has_writer {
@@ -4162,6 +4177,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                         },
                     );
                 }
@@ -4410,6 +4426,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                 },
             );
             self.record_framework_accessor_witness(
@@ -4896,6 +4913,7 @@ impl<'a> Builder<'a> {
                 display: None,
                 hide_in_outline: false,
                 opaque_return: false,
+                is_constant: true,
             },
         );
     }
@@ -7238,6 +7256,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                 },
                 Namespace::Language,
                 target_pkg,
@@ -7776,6 +7795,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                         },
                     );
                     // Moo/Moose getter: arity 0 → isa-derived type
@@ -7816,6 +7836,7 @@ impl<'a> Builder<'a> {
                                 display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                             },
                         );
                         let writer_arm = return_type.clone().map(|t| {
@@ -7853,6 +7874,7 @@ impl<'a> Builder<'a> {
                                 display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                             },
                         );
                         let writer_arm = return_type.clone().map(|t| {
@@ -7926,6 +7948,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                         },
                     );
                     let getter_arm = getter_type.clone().map(|t| {
@@ -7959,6 +7982,7 @@ impl<'a> Builder<'a> {
                             display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                         },
                     );
                     // Mojo writer: arity ≥ 1 → fluent return
@@ -9236,6 +9260,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                 },
             );
         }
@@ -9281,6 +9306,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                 },
             );
         }
@@ -9392,6 +9418,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                 },
             );
             // DBIC relationship accessor — arity 0 (no arg form is
@@ -10312,6 +10339,7 @@ impl<'a> Builder<'a> {
                     display: None,
                     hide_in_outline: false,
                     opaque_return: false,
+                    is_constant: false,
                 },
             );
             synth_names.insert(name.to_string());

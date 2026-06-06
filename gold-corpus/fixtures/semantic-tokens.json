@@ -99,7 +99,7 @@
       "line": 14,
       "col": 13,
       "expect": {"all":["15:13 len=4 enumMember"],"none":["15:13 len=4 function"]},
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "st-tt-regex-literal-regexp",
@@ -108,8 +108,8 @@
       "file": "Type/Tiny.pm",
       "line": 1509,
       "col": 22,
-      "expect": {"all":["1510:22 len=66 regexp"],"none":[]},
-      "status": "xfail"
+      "expect": {"all":["1510:22 len=69 regexp"],"none":[]},
+      "status": "gold"
     }
   ]
 }

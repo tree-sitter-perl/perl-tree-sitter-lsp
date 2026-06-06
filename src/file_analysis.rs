@@ -291,6 +291,12 @@ pub enum SymbolDetail {
         /// no core heuristic on the type name.
         #[serde(default)]
         opaque_return: bool,
+        /// This Sub symbol is a `use constant` declaration, not an ordinary
+        /// sub. Set by `register_constant_symbol`. Consumers (semantic tokens)
+        /// ask the symbol whether it's a constant rather than re-deriving from
+        /// a name set (rule #10).
+        #[serde(default)]
+        is_constant: bool,
     },
     Class {
         parent: Option<String>,
@@ -1724,8 +1730,8 @@ pub const TOK_METHOD: u32 = 3;
 pub const TOK_MACRO: u32 = 4;
 pub const TOK_PROPERTY: u32 = 5;
 pub const TOK_NAMESPACE: u32 = 6;
-#[allow(dead_code)] pub const TOK_REGEXP: u32 = 7;
-#[allow(dead_code)] pub const TOK_ENUM_MEMBER: u32 = 8;
+pub const TOK_REGEXP: u32 = 7;
+pub const TOK_ENUM_MEMBER: u32 = 8;
 pub const TOK_KEYWORD: u32 = 9;
 
 pub const MOD_DECLARATION: u32 = 0;
@@ -1783,6 +1789,13 @@ pub struct FileAnalysis {
     /// (`package_at` falls back to the legacy scope walk in that case).
     #[serde(default)]
     pub package_ranges: Vec<PackageRange>,
+
+    /// Spans of regex literals (`qr//`, `m//`, `s///`) for semantic-token
+    /// coloring (`TOK_REGEXP`). Populated by the builder; `semantic_tokens()`
+    /// is the only consumer. `#[serde(default)]` so older cache blobs
+    /// deserialize as empty.
+    #[serde(default)]
+    pub regex_spans: Vec<Span>,
 
     /// Parent classes for each package in this file.
     /// Populated by the builder from use parent/base, @ISA, and class :isa.
@@ -1943,6 +1956,7 @@ impl FileAnalysis {
             call_bindings,
             method_call_bindings,
             package_ranges,
+            regex_spans: Vec::new(),
             package_parents,
             app_surface_consumers: Vec::new(),
             package_uses,
@@ -6193,9 +6207,11 @@ impl FileAnalysis {
                     });
                 }
                 SymKind::Sub => {
+                    let is_constant = matches!(sym.detail, SymbolDetail::Sub { is_constant: true, .. });
+                    let token_type = if is_constant { TOK_ENUM_MEMBER } else { TOK_FUNCTION };
                     tokens.push(PerlSemanticToken {
                         span: sym.selection_span,
-                        token_type: TOK_FUNCTION,
+                        token_type,
                         modifiers: 1 << MOD_DECLARATION,
                     });
                 }
@@ -6215,6 +6231,12 @@ impl FileAnalysis {
             .flat_map(|imp| imp.imported_symbols.iter().map(|s| s.local_name.as_str()))
             .collect();
 
+        // Local `use constant` names — usages color like the declaration.
+        let constant_names: std::collections::HashSet<&str> = self.symbols.iter()
+            .filter(|s| matches!(s.detail, SymbolDetail::Sub { is_constant: true, .. }))
+            .map(|s| s.name.as_str())
+            .collect();
+
         for r in &self.refs {
             // Skip declaration refs — the symbol loop already emits tokens for declarations
             if matches!(r.access, AccessKind::Declaration) {
@@ -6231,8 +6253,10 @@ impl FileAnalysis {
                     tokens.push(PerlSemanticToken { span: r.span, token_type, modifiers: mods });
                 }
                 RefKind::FunctionCall { .. } => {
-                    // Framework DSL keywords → macro, otherwise function
-                    let token_type = if self.framework_imports.contains(r.target_name.as_str()) {
+                    // Constant usages color like the decl; framework DSL keywords → macro.
+                    let token_type = if constant_names.contains(r.target_name.as_str()) {
+                        TOK_ENUM_MEMBER
+                    } else if self.framework_imports.contains(r.target_name.as_str()) {
                         TOK_MACRO
                     } else {
                         TOK_FUNCTION
@@ -6271,6 +6295,11 @@ impl FileAnalysis {
                     modifiers: 1 << MOD_DECLARATION,
                 });
             }
+        }
+
+        // ---- Regex literals → regexp tokens ----
+        for span in &self.regex_spans {
+            tokens.push(PerlSemanticToken { span: *span, token_type: TOK_REGEXP, modifiers: 0 });
         }
 
         tokens.sort_by_key(|t| (t.span.start.row, t.span.start.column));
