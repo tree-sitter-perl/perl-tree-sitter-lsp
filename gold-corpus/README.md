@@ -36,7 +36,7 @@ A process abort (the scanner-overflow class) is always a hard **CRASH** fail. Ou
 |------------|------|------|-------|-------------|---------|
 | outline (documentSymbol) | [outline.md](outline.md) | 8 | 0 | 2 | 1 |
 | definition (goto-def) | [definition.md](definition.md) | 15 | 1 | 0 | 0 |
-| references | [references.md](references.md) | 12 | 3 | 0 | 1 |
+| references | [references.md](references.md) | 13 | 2 | 0 | 1 |
 | hover | [hover.md](hover.md) | 12 | 0 | 4 | 1 |
 | type-at | [type-at.md](type-at.md) | 12 | 0 | 2 | 5 |
 | rename | [rename.md](rename.md) | 7 | 1 | 1 | 2 |
@@ -47,7 +47,7 @@ A process abort (the scanner-overflow class) is always a hard **CRASH** fail. Ou
 | semantic-tokens | [semantic-tokens.md](semantic-tokens.md) | 8 | 2 | 1 | 2 |
 | document-highlight | [document-highlight.md](document-highlight.md) | 7 | 0 | 1 | 2 |
 | linked-editing | [linked-editing.md](linked-editing.md) | 9 | 1 | 2 | 0 |
-| **total** | | **122** | **12** | **16** | **27** |
+| **total** | | **123** | **11** | **16** | **27** |
 
 The substrate is installed lib content only — it contains **no test files (`t/*.t`), `bin/`, or examples**. Rows whose original cursor lived in a test file, or whose module is not in the snapshot (e.g. JSON::PP, Time::HiRes), are listed in each capability's "Dropped" section. Rows that leaned on test-file call sites were re-authored to the surviving in-lib locations.
 
@@ -77,7 +77,6 @@ Confirmed gaps captured at xfail — the correct assertion does not currently ho
 - **def-16-codegen-type-function** (definition) — `Types::Standard::Any` has no literal `sub`; Type::Library codegen mints it at runtime, so goto-def degrades to the package decl (`Standard.pm:1:1`) instead of the `name => "Any"` declaration at `Standard.pm:215`.
 - **ref-uri-const-fq** (references) — use-constant value not exported; FQ `URI::HAS_RESERVED_SQUARE_BRACKETS` refs (`_server.pm:26`, `_generic.pm:13`) don't link to the def.
 - **ref-expt-tag_opts-lexical** (references) — lexical `%$tag_opts` hash-deref spelling at `:173` not emitted as a ref (9/10).
-- **ref-uri-escape_char-fq** (references) — `escape_char`'s FQ calls are inside `s///e` replacements (`:142/:284/:310`). `/e` makes the replacement Perl code, but the grammar emits it as a string node; the fix is ours: re-parse the `/e` replacement as Perl and walk it with a span offset (builder TODO, like the `__END__`/ISA re-parses). The plain FQ call at `:344` resolves fine, so FQ-non-exported resolution itself works.
 - **rename-09-base-constant** (rename) — use-constant rename drops `BASE` in `$w *= (BASE - $t)` at `:79` (10/11).
 - **diag-08** (diagnostics) — `bootstrap Net::SSLeay $VERSION` is a true unresolved-function, but the diagnostic is `info` severity and the harness binds `--severity warning`, so it is suppressed below threshold (not a regression).
 - **completion-datetime-hashkey** (completion) — `$self->{` offers only 2 of 13 mutated keys; keys assigned via `$self->{k}=...` in `_new` aren't harvested.

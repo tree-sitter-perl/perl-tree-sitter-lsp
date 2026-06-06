@@ -3171,8 +3171,27 @@ impl<'a> Builder<'a> {
 
             // Regex literals → TOK_REGEXP. Record the whole literal span,
             // then descend so interpolated variables inside still get refs.
-            "quoted_regexp" | "match_regexp" | "substitution_regexp" => {
+            "quoted_regexp" | "match_regexp" => {
                 self.regex_spans.push(node_to_span(node));
+                self.visit_children(node);
+            }
+            "substitution_regexp" => {
+                self.regex_spans.push(node_to_span(node));
+                // `s///e`: the replacement is Perl *code*, but the grammar
+                // emits it as a plain `replacement` node (not parsed as code).
+                // Re-parse it so calls/vars inside resolve (rule #7), mapping
+                // spans back to the file. Same idea as the __END__/ISA re-parses.
+                if self.subst_replacement_is_eval(node) {
+                    let mut repl = None;
+                    for i in 0..node.named_child_count() {
+                        if let Some(c) = node.named_child(i) {
+                            if c.kind() == "replacement" { repl = Some(c); break; }
+                        }
+                    }
+                    if let Some(repl) = repl {
+                        self.emit_refs_in_eval_replacement(repl);
+                    }
+                }
                 self.visit_children(node);
             }
 
@@ -6984,6 +7003,65 @@ impl<'a> Builder<'a> {
         for (i, pkg) in pins {
             if let RefKind::FunctionCall { resolved_package } = &mut self.refs[i].kind {
                 *resolved_package = Some(pkg);
+            }
+        }
+    }
+
+    /// Does this `substitution_regexp` carry the `/e` modifier (replacement is
+    /// evaluated as Perl code)?
+    fn subst_replacement_is_eval(&self, node: Node<'a>) -> bool {
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i) {
+                if c.kind() == "substitution_regexp_modifiers" {
+                    return c.utf8_text(self.source).map_or(false, |t| t.contains('e'));
+                }
+            }
+        }
+        false
+    }
+
+    /// Re-parse an `s///e` replacement as Perl and emit FunctionCall refs for
+    /// the calls inside it. The snippet is padded with the replacement's
+    /// leading rows/cols so the re-parsed nodes carry the *original* file
+    /// coordinates — no per-node offset math, spans drop straight in.
+    /// (`s///ee` double-eval is the documented edge; one level covers it.)
+    fn emit_refs_in_eval_replacement(&mut self, repl: Node<'a>) {
+        let Ok(text) = repl.utf8_text(self.source) else { return };
+        if text.trim().is_empty() {
+            return;
+        }
+        let start = repl.start_position();
+        let mut snippet = String::with_capacity(start.row + start.column + text.len());
+        for _ in 0..start.row { snippet.push('\n'); }
+        for _ in 0..start.column { snippet.push(' '); }
+        snippet.push_str(text);
+        let bytes = snippet.into_bytes();
+        let mut parser = crate::module_resolver::create_parser();
+        let Some(tree) = parser.parse(&bytes, None) else { return };
+        let scope = self.current_scope();
+        let mut stack = vec![tree.root_node()];
+        while let Some(n) = stack.pop() {
+            if matches!(n.kind(), "function_call_expression" | "ambiguous_function_call_expression") {
+                if let Some(func) = n.child_by_field_name("function") {
+                    if let Ok(name) = func.utf8_text(&bytes) {
+                        let name = name.to_string();
+                        let resolved_package = self.resolve_call_package(&name);
+                        self.refs.push(Ref {
+                            kind: RefKind::FunctionCall { resolved_package },
+                            span: node_to_span(func),
+                            scope,
+                            target_name: name,
+                            access: AccessKind::Read,
+                            resolves_to: None,
+                            resolved_method_target: None,
+                        });
+                    }
+                }
+            }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i) {
+                    stack.push(c);
+                }
             }
         }
     }

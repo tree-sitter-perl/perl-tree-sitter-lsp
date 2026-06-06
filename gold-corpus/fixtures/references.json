@@ -107,7 +107,7 @@
       "query": "",
       "newname": "",
       "expect": {"all":["\"file\":\"Escape.pm\",\"line\":\"234\"","\"file\":\"_query.pm\",\"line\":\"21\"","\"file\":\"_generic.pm\",\"line\":\"48\""],"none":[]},
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "ref-plack-toapp-component",
