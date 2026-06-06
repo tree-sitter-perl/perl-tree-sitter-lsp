@@ -47,3 +47,40 @@ jobs:
 
       - name: Run e2e tests
         run: ./run_e2e.sh
+
+  gold-corpus:
+    name: Gold corpus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # XS dists in the pinned substrate need system libraries to build.
+      - name: System libraries (XS build deps)
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libxml2-dev zlib1g-dev
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: "5.38"
+          install-modules-with: cpm
+
+      # Reproducible, version-pinned module tree. Cache keyed on the snapshot so
+      # a cold install (~30s) only runs when the pinned set changes.
+      - name: Cache corpus substrate
+        uses: actions/cache@v4
+        with:
+          path: gold-corpus/local
+          key: gold-corpus-${{ runner.os }}-perl5.38-${{ hashFiles('gold-corpus/cpanfile.snapshot') }}
+
+      - name: Install pinned substrate (cpm + snapshot)
+        working-directory: gold-corpus
+        run: cpm install -L local --resolver snapshot
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run gold-corpus harness
+        run: perl gold-corpus/run.pl
