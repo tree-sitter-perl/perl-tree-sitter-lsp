@@ -141,9 +141,11 @@ if (@ARGV && $ARGV[0] eq '--emit') {
     shift @ARGV;
     my ($cap, @rest) = @ARGV;
     my $spec = $CAP{$cap} or die "unknown capability: $cap\n";
+    # line/col arrive as ARGV strings; numify so encode_json emits JSON numbers
+    # (the binary's BatchReq line/col are usize and reject quoted strings).
     my $row = $spec->{check} ? {}
             : $spec->{qarg}  ? { query => $rest[0] }
-            :                  { file => $rest[0], line => $rest[1], col => $rest[2], newname => $rest[3] };
+            :                  { file => $rest[0], line => ($rest[1] // 0) + 0, col => ($rest[2] // 0) + 0, newname => $rest[3] };
     my $resp = run_batch([ batch_req($cap, $spec, $row, 'emit') ]);
     my $r = $resp->{emit};
     if    (!$r)        { print "<<CRASH: process aborted>>\n"; }

@@ -10,7 +10,7 @@
       "col": 4,
       "newname": "RENAMED",
       "expect": {"all":["Tiny.pm","\"line\":\"8\"","\"line\":\"429\"","\"line\":\"456\"","\"line\":\"69\"","\"line\":\"104\"","\"line\":\"167\""],"none":[]},
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "rename-02-mkopt-callsite",
@@ -21,7 +21,7 @@
       "col": 12,
       "newname": "RENAMED",
       "expect": {"all":["Tiny.pm","\"line\":\"69\"","\"line\":\"104\"","\"line\":\"167\"","\"line\":\"429\"","\"line\":\"8\"","\"line\":\"456\""],"none":[]},
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "rename-03-mkopt-hash",
@@ -65,7 +65,7 @@
       "col": 4,
       "newname": "RENAMED",
       "expect": {"all":["Exporter.pm","\"line\":\"703\"","\"line\":\"933\"","\"line\":\"934\"","\"line\":\"602\""],"none":[]},
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "rename-08-authority",

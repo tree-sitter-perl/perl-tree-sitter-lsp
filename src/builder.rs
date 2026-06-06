@@ -358,6 +358,11 @@ fn build_with_plugins_inner(
     // post-walk because subs are usually declared after the export list.
     b.emit_export_member_refs();
 
+    // Pin forward-reference calls (call above its `sub`) to the local def's
+    // package — order-independent, so goto-def/references/rename match them
+    // like backward calls (the walk-time pin only saw subs declared earlier).
+    b.pin_unresolved_call_packages();
+
     // Post-pass 2: resolve hash key owners from type constraints
     b.resolve_hash_key_owners();
 
@@ -6921,6 +6926,65 @@ impl<'a> Builder<'a> {
                 resolves_to: None,
                 resolved_method_target: None,
             });
+        }
+    }
+
+    /// Pin FunctionCall refs the walk left unresolved (`resolved_package:
+    /// None`) to a local sub of the same name in the call's enclosing package.
+    /// The walk-time `resolve_call_package` only sees subs declared *before*
+    /// the call (it scans `self.symbols` as-collected), so a forward reference
+    /// — a call above its `sub` — never pinned. That made goto-def /
+    /// references / rename silently miss every forward call, while diagnostics
+    /// (post-walk name lookup) did not — a resolution asymmetry. This
+    /// post-walk pass closes it so forward and backward calls resolve
+    /// identically; order-independent by construction (every sub + ref exists).
+    fn pin_unresolved_call_packages(&mut self) {
+        use std::collections::HashMap;
+        // Local sub/method name → the package(s) that define it.
+        let mut sub_pkgs: HashMap<&str, Vec<String>> = HashMap::new();
+        for s in &self.symbols {
+            if matches!(s.kind, SymKind::Sub | SymKind::Method) {
+                if let Some(pkg) = s.package.clone() {
+                    sub_pkgs.entry(s.name.as_str()).or_default().push(pkg);
+                }
+            }
+        }
+        if sub_pkgs.is_empty() {
+            return;
+        }
+        // Package decls in file order — the enclosing package of a position is
+        // the last one declared at or before it (Perl packages are
+        // file-sequential; block-scoped `{ package X; }` is the documented edge).
+        let mut marks: Vec<((usize, usize), String)> = self
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Package | SymKind::Class))
+            .map(|s| ((s.span.start.row, s.span.start.column), s.name.clone()))
+            .collect();
+        marks.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut pins: Vec<(usize, String)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            let RefKind::FunctionCall { resolved_package: None } = &r.kind else { continue };
+            if r.target_name.contains("::") {
+                continue; // qualified calls already pin at walk time (step 1)
+            }
+            let Some(pkgs) = sub_pkgs.get(r.target_name.as_str()) else { continue };
+            let pos = (r.span.start.row, r.span.start.column);
+            let encl = marks.iter().rev().find(|(p, _)| *p <= pos).map(|(_, n)| n.as_str());
+            // Prefer a sub in the call's enclosing package; else, if the name
+            // is defined in exactly one package, that's unambiguous.
+            let chosen = encl
+                .and_then(|e| pkgs.iter().find(|p| p.as_str() == e).cloned())
+                .or_else(|| if pkgs.len() == 1 { Some(pkgs[0].clone()) } else { None });
+            if let Some(pkg) = chosen {
+                pins.push((i, pkg));
+            }
+        }
+        for (i, pkg) in pins {
+            if let RefKind::FunctionCall { resolved_package } = &mut self.refs[i].kind {
+                *resolved_package = Some(pkg);
+            }
         }
     }
 

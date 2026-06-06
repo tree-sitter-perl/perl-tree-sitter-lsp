@@ -83,7 +83,7 @@
       "query": "",
       "newname": "",
       "expect": {"all":["\"file\":\"Tiny.pm\",\"line\":\"430\"","\"file\":\"Tiny.pm\",\"line\":\"9\"","\"file\":\"Tiny.pm\",\"line\":\"70\"","\"file\":\"Tiny.pm\",\"line\":\"105\"","\"file\":\"Tiny.pm\",\"line\":\"168\""],"none":[]},
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "ref-expt-tag_opts-lexical",
