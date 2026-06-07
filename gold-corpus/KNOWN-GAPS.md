@@ -159,6 +159,57 @@ assertion is "no diagnostic at this site."
 
 ---
 
+## 6. Big QA sweep (mined against the snapshot substrate)
+
+New gaps surfaced while mining gold from fresh CPAN modules. Each is pinned at
+xfail (expected-correct confirmed from source; tool genuinely wrong).
+
+### `hover-mojo-url-clone-via-new` / `ti-mojo-url-abs-clone-chain` — clone via `$self->new` types as HashRef
+`Mojo::URL::clone` does `my $clone = $self->new; %$clone = %$self; return $clone`.
+Expected return / `$abs = $self->clone` type: `Mojo::URL`. Actual: `HashRef`. The
+`$self->new` receiver resolves to the class, but the intermediate variable
+(`$clone`) reverts to its hashref rep before the return — the class identity isn't
+carried across `my $clone = $self->new; ...; return $clone`. (Contrast the direct
+`return $self` setters and the `bless …, ref $_[0]` clone, which both type fine.)
+**Subsystem:** chain typing across an intermediate `$x = $self->new`. **Difficulty:** medium.
+
+### `completion-inherited-http-message` / `completion-inherited-mojo-base-controller` — inherited methods absent from `$self->` completion
+`$self->` inside a method offers the package's OWN methods but NOT those inherited
+via `use parent 'HTTP::Message'` or `use Mojo::Base -base` (e.g. `content`/`header`,
+`tap`/`with_roles`). goto-def/hover already walk ancestors; completion candidate
+collection doesn't. **Subsystem:** completion ancestor walk. **Difficulty:** low–medium.
+
+### `ref-try-tiny-try-bareword-blockcalls` — bareword block-prototype calls not found as refs
+`references` on `sub try (&;@)` finds the `@EXPORT` entry, import-list spellings,
+and fully-qualified `Try::Tiny::try` calls — but NOT the `try { ... }` bareword call
+sites (the prototyped-block invocation form). **Subsystem:** ref graph for
+`(&;@)`-prototyped sub calls. **Difficulty:** medium.
+
+### `def-moo-role-goto-amp-fq-import` — `goto &Role::Tiny::import` doesn't resolve
+goto-def on the target of `goto &Role::Tiny::import` finds nothing. tree-sitter
+parses the `&`-call name as a single `varname` spanning `Role::Tiny::import`, so the
+builder emits no cross-file method ref. Correct target: Role/Tiny.pm `sub import`.
+(Contrast the non-`&` FQ call `Class::Method::Modifiers::install_modifier`, which
+resolves.) **Subsystem:** `&`-deref FQ call ref emission. **Difficulty:** low–medium.
+
+### `sig-mojo-controller-cookie-shift` — `(shift, shift)` params not parsed for sig-help
+`sub cookie { my ($self, $name) = (shift, shift); ... }` — signature-help shows an
+empty `cookie()` because params declared via a `(shift, shift)` list-assignment
+aren't extracted into labels (only `= @_` destructure and per-line `= shift` are).
+**Subsystem:** param extraction. **Difficulty:** low.
+
+### `diag-mojo-cookiejar-helper-fp` / `diag-mojo-daemon-callback-fp` — first-param-self over-reach in OO classes
+In an OO class, a plain helper (`sub _compare { my ($cookie,…)=@_ }`) or an
+anonymous callback (`on(request => sub { my $tx = shift; … })` ) has its first
+param typed as the enclosing class, so a method call on it (`$cookie->path`,
+`$tx->req`) fires a false `unresolved-method`. The `-strict` (non-OO module) case
+of this is now fixed; the in-OO-class helper/callback case is the harder residual —
+there's no clean static signal distinguishing a method from a helper in an OO
+class. **Subsystem:** first-param-self heuristic (`detect_first_param_type`).
+**Difficulty:** high (inherently ambiguous).
+
+---
+
 ## Triage summary
 
 | gap | subsystem | difficulty |
@@ -170,7 +221,13 @@ assertion is "no diagnostic at this site."
 | def-16-codegen-type-function | Type::Library synthesis | medium |
 | completion-datetime-hashkey | slot-write harvest (A4 tail) | medium–high |
 | ti-12 (`shift->SUPER::new`) | parser 1.1.0 regression | **open (root cause)** |
+| sig-mojo-controller-cookie-shift | `(shift,shift)` param extraction | **low** |
+| def-moo-role-goto-amp-fq-import | `&`-deref FQ call ref | low–medium |
+| completion-inherited-* | completion ancestor walk | low–medium |
+| ref-try-tiny-try-bareword-blockcalls | `(&;@)` block-call refs | medium |
+| hover/ti mojo-url clone-via-new | chain typing across `$x=$self->new` | medium |
+| diag-mojo-cookiejar/daemon first-param-self | invocant heuristic in OO class | **high** (ambiguous) |
 
 Quickest wins: the signature-help invocant gate, imported-names in completion,
-and the `bootstrap` loader recognition — all "the producer already has the
-signal, just consult it."
+the `bootstrap` loader recognition, and the `(shift, shift)` param extraction —
+all "the producer already has the signal, just consult it."

@@ -34,21 +34,23 @@ A process abort (the scanner-overflow class) is always a hard **CRASH** fail. Ou
 
 | capability | file | gold | xfail | provisional | dropped |
 |------------|------|------|-------|-------------|---------|
-| outline (documentSymbol) | [outline.md](outline.md) | 8 | 0 | 2 | 1 |
-| definition (goto-def) | [definition.md](definition.md) | 15 | 1 | 0 | 0 |
-| references | [references.md](references.md) | 15 | 0 | 0 | 1 |
-| hover | [hover.md](hover.md) | 12 | 0 | 4 | 1 |
-| type-at | [type-at.md](type-at.md) | 11 | 1 | 2 | 5 |
+| outline (documentSymbol) | [outline.md](outline.md) | 10 | 0 | 2 | 1 |
+| definition (goto-def) | [definition.md](definition.md) | 18 | 2 | 0 | 0 |
+| references | [references.md](references.md) | 20 | 1 | 0 | 1 |
+| hover | [hover.md](hover.md) | 18 | 1 | 4 | 1 |
+| type-at | [type-at.md](type-at.md) | 12 | 2 | 2 | 5 |
 | rename | [rename.md](rename.md) | 8 | 0 | 1 | 2 |
 | workspace-symbol | [workspace-symbol.md](workspace-symbol.md) | 14 | 0 | 0 | 1 |
-| diagnostics | [diagnostics.md](diagnostics.md) | 2 | 3 | 0 | 9 |
-| completion | [completion.md](completion.md) | 6 | 2 | 0 | 3 |
-| signature-help | [signature-help.md](signature-help.md) | 8 | 1 | 3 | 0 |
-| semantic-tokens | [semantic-tokens.md](semantic-tokens.md) | 10 | 0 | 1 | 2 |
-| document-highlight | [document-highlight.md](document-highlight.md) | 7 | 0 | 1 | 2 |
-| linked-editing | [linked-editing.md](linked-editing.md) | 10 | 0 | 2 | 0 |
+| diagnostics | [diagnostics.md](diagnostics.md) | 3 | 5 | 0 | 9 |
+| completion | [completion.md](completion.md) | 9 | 4 | 0 | 3 |
+| signature-help | [signature-help.md](signature-help.md) | 11 | 2 | 3 | 0 |
+| semantic-tokens | [semantic-tokens.md](semantic-tokens.md) | 13 | 0 | 1 | 2 |
+| document-highlight | [document-highlight.md](document-highlight.md) | 9 | 0 | 1 | 2 |
+| linked-editing | [linked-editing.md](linked-editing.md) | 12 | 0 | 2 | 0 |
 | re-export (definition) | [fixtures/reexport.json](fixtures/reexport.json) | 3 | 0 | 0 | 0 |
-| **total** | | **129** | **8** | **16** | **27** |
+| **total** | | **160** | **17** | **14** | **27** |
+
+> Counts are the source-of-truth `fixtures/*.json` row counts (run `gold-corpus/run.pl --list` to regenerate). The per-capability `*.md` human views may lag the JSON after a mining sweep; the JSON is authoritative.
 
 The substrate is installed lib content only — it contains **no test files (`t/*.t`), `bin/`, or examples**. Rows whose original cursor lived in a test file, or whose module is not in the snapshot (e.g. JSON::PP, Time::HiRes), are listed in each capability's "Dropped" section. Rows that leaned on test-file call sites were re-authored to the surviving in-lib locations.
 

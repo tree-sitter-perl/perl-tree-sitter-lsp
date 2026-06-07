@@ -10,7 +10,12 @@
       "col": 8,
       "query": "",
       "newname": "",
-      "expect": {"all":[],"none":["\"file\":\"SSLeay.pm\",\"line\":\"24\""]},
+      "expect": {
+        "all": [],
+        "none": [
+          "\"file\":\"SSLeay.pm\",\"line\":\"24\""
+        ]
+      },
       "status": "gold"
     },
     {
@@ -22,7 +27,12 @@
       "col": 1,
       "query": "",
       "newname": "",
-      "expect": {"all":[],"none":["\"file\":\"SSLeay.pm\",\"line\":\"1023\""]},
+      "expect": {
+        "all": [],
+        "none": [
+          "\"file\":\"SSLeay.pm\",\"line\":\"1023\""
+        ]
+      },
       "status": "xfail",
       "note": "XS-bootstrapped sub at SSLeay.pm:1023 is flagged unresolved-function ('bootstrap'); should be suppressed."
     },
@@ -35,7 +45,12 @@
       "col": 6,
       "query": "",
       "newname": "",
-      "expect": {"all":[],"none":["\"file\":\"Logger.pm\",\"line\":\"879\""]},
+      "expect": {
+        "all": [],
+        "none": [
+          "\"file\":\"Logger.pm\",\"line\":\"879\""
+        ]
+      },
       "status": "xfail",
       "note": "codegen'd accessor is_warn at Logger.pm:879 flagged unresolved-method; should be suppressed."
     },
@@ -48,7 +63,12 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":[],"none":["\"file\":\"Logger.pm\",\"line\":\"883\""]},
+      "expect": {
+        "all": [],
+        "none": [
+          "\"file\":\"Logger.pm\",\"line\":\"883\""
+        ]
+      },
       "status": "xfail",
       "note": "codegen'd method warn at Logger.pm:883 flagged unresolved-method; should be suppressed."
     },
@@ -61,8 +81,67 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":[],"none":["\"file\":\"CGI.pm\",\"line\":\"1205\""]},
+      "expect": {
+        "all": [],
+        "none": [
+          "\"file\":\"CGI.pm\",\"line\":\"1205\""
+        ]
+      },
       "status": "gold"
+    },
+    {
+      "id": "diag-mojo-websocket-strict-suppressed",
+      "difficulty": "tricky",
+      "semantic_area": "first-param-self",
+      "file": "Mojo/WebSocket.pm",
+      "line": 67,
+      "col": 16,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [],
+        "none": [
+          "\"file\":\"WebSocket.pm\""
+        ]
+      },
+      "status": "gold",
+      "note": "Mojo::WebSocket is `use Mojo::Base -strict` (non-OO); `my $tx = shift; $tx->res` must NOT flag unresolved-method — $tx is a Mojo::Transaction, not the package. Locks the -strict invocant gate."
+    },
+    {
+      "id": "diag-mojo-cookiejar-helper-fp",
+      "difficulty": "tricky",
+      "semantic_area": "first-param-self",
+      "file": "Mojo/UserAgent/CookieJar.pm",
+      "line": 169,
+      "col": 9,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [],
+        "none": [
+          "\"file\":\"CookieJar.pm\",\"line\":\"169\""
+        ]
+      },
+      "status": "xfail",
+      "note": "GAP: sub _compare { my ($cookie,...)=@_ } is a plain helper in an OO class; $cookie is a Mojo::Cookie, but first-param-self types it as the jar -> false unresolved-method on path/name/domain. The OO-class first-param-self over-reach (vs the -strict case) is unfixed."
+    },
+    {
+      "id": "diag-mojo-daemon-callback-fp",
+      "difficulty": "tricky",
+      "semantic_area": "first-param-self",
+      "file": "Mojo/Server/Daemon.pm",
+      "line": 92,
+      "col": 16,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [],
+        "none": [
+          "\"file\":\"Daemon.pm\",\"line\":\"92\""
+        ]
+      },
+      "status": "xfail",
+      "note": "GAP: `on(request => sub { my $tx = shift; $tx->req })` — $tx is a transaction, but first-param-self leaks into the anonymous callback and types it as the Daemon. Unfixed."
     }
   ]
 }
