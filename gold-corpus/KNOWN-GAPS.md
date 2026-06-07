@@ -164,14 +164,27 @@ assertion is "no diagnostic at this site."
 New gaps surfaced while mining gold from fresh CPAN modules. Each is pinned at
 xfail (expected-correct confirmed from source; tool genuinely wrong).
 
-### `hover-mojo-url-clone-via-new` / `ti-mojo-url-abs-clone-chain` — clone via `$self->new` types as HashRef
-`Mojo::URL::clone` does `my $clone = $self->new; %$clone = %$self; return $clone`.
-Expected return / `$abs = $self->clone` type: `Mojo::URL`. Actual: `HashRef`. The
-`$self->new` receiver resolves to the class, but the intermediate variable
-(`$clone`) reverts to its hashref rep before the return — the class identity isn't
-carried across `my $clone = $self->new; ...; return $clone`. (Contrast the direct
-`return $self` setters and the `bless …, ref $_[0]` clone, which both type fine.)
-**Subsystem:** chain typing across an intermediate `$x = $self->new`. **Difficulty:** medium.
+### `hover-mojo-url-clone-via-new` / `ti-mojo-url-abs-clone-chain` — clone via `$self->new` types as HashRef (same root as `ti-12`)
+`Mojo::URL::clone` does `my $clone = $self->new; …; return $clone` → expected
+`Mojo::URL`, actual `HashRef`. **Root cause (run down in the Big QA sweep): the
+receiver-polymorphic constructor idiom isn't typed cross-file.** `$self->new`
+calls `Mojo::URL::new` (= `shift->SUPER::new`), which inherits `Mojo::Base::new`:
+`bless @_ ? … : {}, ref $class || $class`. The bless class `ref $class || $class`
+means "bless into the *caller's* class" — i.e. `ReturnExpr::Receiver`. But:
+  1. `bless_class_of` doesn't recognize the `ref $x || $x` shape (only bare `ref
+     EXPR`), so `Mojo::Base::new` types as nothing → even `Mojo::URL->new` is
+     untyped (empty), not just the clone chain.
+  2. The general fix — emit `ReturnExpr::Receiver` for an invocant-blessed
+     constructor (`bless {}, $class` / `ref $self || $self`) — needs a paired
+     change: `Receiver` currently substitutes to `None` when there's no receiver
+     (a bare `sub_return_type_at_arity("new", None)` probe), which would regress
+     `test_return_bless_anon_hash_class` and every no-receiver constructor query.
+     So `Receiver` must fall back to the enclosing class when unsubstituted.
+This is the **same family as `ti-12`** (`shift->SUPER::new` not typing the
+enclosing class) — both are the cross-file receiver-polymorphic-constructor gap.
+Same-file constructors (`bless {}, shift`) work because the enclosing class
+happens to equal the receiver. **Subsystem:** bless-arm `Receiver` emission +
+`Receiver` no-receiver fallback. **Difficulty:** high (two load-bearing changes).
 
 ### `diag-mojo-cookiejar-helper-fp` / `diag-mojo-daemon-callback-fp` — first-param-self over-reach in OO classes
 In an OO class, a plain helper (`sub _compare { my ($cookie,…)=@_ }`) or an
@@ -195,8 +208,7 @@ class. **Subsystem:** first-param-self heuristic (`detect_first_param_type`).
 | diag-09 / diag-10 | typeglob-codegen synthesis | medium |
 | def-16-codegen-type-function | Type::Library synthesis | medium |
 | completion-datetime-hashkey | slot-write harvest (A4 tail) | medium–high |
-| ti-12 (`shift->SUPER::new`) | parser 1.1.0 regression | **open (root cause)** |
-| hover/ti mojo-url clone-via-new | chain typing across `$x=$self->new` | medium |
+| ti-12 + mojo-url clone-via-new | cross-file receiver-polymorphic ctor (`bless {}, ref $self \|\| $self`) → `Receiver` emission + no-receiver fallback | **high** |
 | diag-mojo-cookiejar/daemon first-param-self | invocant heuristic in OO class | **high** (ambiguous) |
 
 Quickest wins: the signature-help invocant gate, imported-names in completion,
