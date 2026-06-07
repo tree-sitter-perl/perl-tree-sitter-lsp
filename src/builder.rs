@@ -3949,6 +3949,39 @@ impl<'a> Builder<'a> {
                         }
                     }
 
+                    // Pattern: my ($a, $b, ...) = (shift, shift, ...) — Mojo's
+                    // `my ($self, $name) = (shift, shift)`. Each `shift` binds
+                    // the next @_ element, so the LHS vars are positional params
+                    // in order. Gate on every RHS element being a shift call so
+                    // a real list value (`my ($a,$b) = foo()`) isn't misread.
+                    // The RHS is the last named child, NOT `child_by_field_name
+                    // ("right")` — for a parenthesized RHS that field points at
+                    // the `(` token (the documented assignment-field gotcha).
+                    let rhs_list = assign
+                        .named_child(assign.named_child_count().saturating_sub(1))
+                        .filter(|n| n.kind() == "list_expression");
+                    let all_shifts = rhs_list.is_some_and(|list| {
+                        list.named_child_count() > 0
+                            && (0..list.named_child_count())
+                                .filter_map(|j| list.named_child(j))
+                                .all(|c| self.is_shift_call(c))
+                    });
+                    if all_shifts {
+                        if let Some(left) = assign.child_by_field_name("left") {
+                            let list_params: Vec<ParamInfo> = self.collect_vars_from_decl(left)
+                                .into_iter()
+                                .map(|(name, _)| {
+                                    let is_slurpy = name.starts_with('@') || name.starts_with('%');
+                                    ParamInfo { name, default: None, is_slurpy, is_invocant: false }
+                                })
+                                .collect();
+                            if !list_params.is_empty() {
+                                shift_params.extend(list_params);
+                                return shift_params;
+                            }
+                        }
+                    }
+
                     // Pattern: my $var = shift; or my $var = shift || default; or my $var = shift // default;
                     if let Some((var_name, default)) = self.extract_shift_param(assign, right) {
                         shift_params.push(ParamInfo {
@@ -6736,7 +6769,17 @@ impl<'a> Builder<'a> {
             return;
         }
         if let Some(func_node) = node.child_by_field_name("function") {
-            if let Ok(name) = func_node.utf8_text(self.source) {
+            if let Ok(raw) = func_node.utf8_text(self.source) {
+                // `goto &Foo::bar` / `&Foo::bar()` — the leading `&` is the
+                // code-ref sigil; the call targets sub `Foo::bar`. Strip it so
+                // FQ resolution and the ref's `target_name` see the real sub
+                // name (`&{...}` derefs and `&$var` are handled / skipped
+                // above — only a static `&name` reaches here). `raw` keeps the
+                // node-aligned text for span math.
+                let name = raw
+                    .strip_prefix('&')
+                    .filter(|n| n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':'))
+                    .unwrap_or(raw);
                 let resolved_package = self.resolve_call_package(name);
                 // Narrowest span (rule #7): for a qualified call
                 // (`Foo::Bar::baz()`) the renamable/highlightable token is
@@ -6744,7 +6787,7 @@ impl<'a> Builder<'a> {
                 // only `baz` and the qualifier survives. `target_name` keeps
                 // the full path (the hash-key binding + provenance rely on
                 // it); resolution sites read `unqualified_target_name()`.
-                let ref_span = fq_tail_span(func_node, name);
+                let ref_span = fq_tail_span(func_node, raw);
                 self.add_ref(
                     RefKind::FunctionCall { resolved_package: resolved_package.clone() },
                     ref_span,

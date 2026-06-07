@@ -173,19 +173,6 @@ carried across `my $clone = $self->new; ...; return $clone`. (Contrast the direc
 `return $self` setters and the `bless …, ref $_[0]` clone, which both type fine.)
 **Subsystem:** chain typing across an intermediate `$x = $self->new`. **Difficulty:** medium.
 
-### `def-moo-role-goto-amp-fq-import` — `goto &Role::Tiny::import` doesn't resolve
-goto-def on the target of `goto &Role::Tiny::import` finds nothing. tree-sitter
-parses the `&`-call name as a single `varname` spanning `Role::Tiny::import`, so the
-builder emits no cross-file method ref. Correct target: Role/Tiny.pm `sub import`.
-(Contrast the non-`&` FQ call `Class::Method::Modifiers::install_modifier`, which
-resolves.) **Subsystem:** `&`-deref FQ call ref emission. **Difficulty:** low–medium.
-
-### `sig-mojo-controller-cookie-shift` — `(shift, shift)` params not parsed for sig-help
-`sub cookie { my ($self, $name) = (shift, shift); ... }` — signature-help shows an
-empty `cookie()` because params declared via a `(shift, shift)` list-assignment
-aren't extracted into labels (only `= @_` destructure and per-line `= shift` are).
-**Subsystem:** param extraction. **Difficulty:** low.
-
 ### `diag-mojo-cookiejar-helper-fp` / `diag-mojo-daemon-callback-fp` — first-param-self over-reach in OO classes
 In an OO class, a plain helper (`sub _compare { my ($cookie,…)=@_ }`) or an
 anonymous callback (`on(request => sub { my $tx = shift; … })` ) has its first
@@ -209,8 +196,6 @@ class. **Subsystem:** first-param-self heuristic (`detect_first_param_type`).
 | def-16-codegen-type-function | Type::Library synthesis | medium |
 | completion-datetime-hashkey | slot-write harvest (A4 tail) | medium–high |
 | ti-12 (`shift->SUPER::new`) | parser 1.1.0 regression | **open (root cause)** |
-| sig-mojo-controller-cookie-shift | `(shift,shift)` param extraction | **low** |
-| def-moo-role-goto-amp-fq-import | `&`-deref FQ call ref | low–medium |
 | hover/ti mojo-url clone-via-new | chain typing across `$x=$self->new` | medium |
 | diag-mojo-cookiejar/daemon first-param-self | invocant heuristic in OO class | **high** (ambiguous) |
 

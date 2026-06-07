@@ -5020,6 +5020,32 @@ fn test_mojo_base_base_and_strict_still_oo() {
 }
 
 #[test]
+fn test_list_shift_pair_params_extracted() {
+    // Mojo idiom `my ($self, $name) = (shift, shift)` — each shift binds the
+    // next @_ element, so the LHS vars are positional params. $self is the
+    // invocant; $name is a real param.
+    let fa = build_fa("package P;\nsub cookie {\n  my ($self, $name) = (shift, shift);\n}\n");
+    let sub = fa.symbols.iter().find(|s| s.name == "cookie").expect("cookie sym");
+    let params: Vec<&str> = match &sub.detail {
+        SymbolDetail::Sub { params, .. } => params.iter().map(|p| p.name.as_str()).collect(),
+        _ => panic!("cookie not a Sub"),
+    };
+    assert!(params.contains(&"$self") && params.contains(&"$name"),
+        "expected $self + $name from (shift, shift), got {params:?}");
+}
+
+#[test]
+fn test_goto_amp_fq_sub_emits_call_ref() {
+    // `goto &Foo::bar` — the `&` code-ref sigil is stripped so the FQ call
+    // resolves; a FunctionCall ref to Foo::bar is emitted (resolved_package Foo).
+    let fa = build_fa("package Child;\nsub import { goto &Parent::Thing::setup; }\n");
+    let r = fa.refs.iter().find(|r|
+        matches!(r.kind, RefKind::FunctionCall { .. }) && r.target_name == "Parent::Thing::setup");
+    assert!(r.is_some(), "expected FunctionCall ref to Parent::Thing::setup (& stripped), got {:?}",
+        fa.refs.iter().filter(|r| matches!(r.kind, RefKind::FunctionCall{..})).map(|r| &r.target_name).collect::<Vec<_>>());
+}
+
+#[test]
 fn test_glob_assigned_sub_ternary_rhs_registers() {
     // Try::Tiny `*_subname = $su ? \&Sub::Util::set_subname : sub {...}` /
     // Path::Tiny `*_same = IS_WIN32() ? sub{} : sub{}`: the glob holds a coderef

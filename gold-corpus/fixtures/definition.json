@@ -296,16 +296,16 @@
       "difficulty": "tricky",
       "semantic_area": "role",
       "file": "Moo/Role.pm",
-      "line": 55,
+      "line": 54,
       "col": 20,
       "expect": {
         "all": [
-          "Tiny.pm:81:"
+          "Tiny.pm:81:1"
         ],
         "none": []
       },
-      "status": "xfail",
-      "note": "GAP: `goto &Role::Tiny::import` doesn't resolve; amp-call name parses as one varname so no cross-file ref. Correct target Role/Tiny.pm:81."
+      "status": "gold",
+      "note": "goto &Role::Tiny::import resolves to Role/Tiny.pm sub import — the `&` code-ref sigil is stripped so the FQ name resolves."
     }
   ]
 }

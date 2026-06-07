@@ -257,8 +257,8 @@
         ],
         "none": []
       },
-      "status": "xfail",
-      "note": "GAP: cookie() params declared via `my ($self,$name)=(shift,shift)` not parsed; sig shows empty."
+      "status": "gold",
+      "note": "cookie's params declared via `my ($self,$name)=(shift,shift)` are extracted; sig-help shows ($name)."
     }
   ]
 }
