@@ -8,7 +8,13 @@
       "file": "Type/Tiny.pm",
       "line": 962,
       "col": 23,
-      "expect": {"all":["_failed_check($name, $value, %attrs)","active param: 0 ($name)"],"none":[]},
+      "expect": {
+        "all": [
+          "_failed_check($name, $value, %attrs)",
+          "active param: 0 ($name)"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -18,7 +24,13 @@
       "file": "Type/Tiny.pm",
       "line": 962,
       "col": 32,
-      "expect": {"all":["_failed_check($name, $value, %attrs)","active param: 1 ($value)"],"none":[]},
+      "expect": {
+        "all": [
+          "_failed_check($name, $value, %attrs)",
+          "active param: 1 ($value)"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -28,7 +40,13 @@
       "file": "Email/Stuffer.pm",
       "line": 312,
       "col": 30,
-      "expect": {"all":["_assert_addr_list_ok($header, $allow_empty, $list)","active param: 0 ($header)"],"none":[]},
+      "expect": {
+        "all": [
+          "_assert_addr_list_ok($header, $allow_empty, $list)",
+          "active param: 0 ($header)"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -38,7 +56,13 @@
       "file": "Email/Stuffer.pm",
       "line": 312,
       "col": 41,
-      "expect": {"all":["_assert_addr_list_ok($header, $allow_empty, $list)","active param: 2 ($list)"],"none":[]},
+      "expect": {
+        "all": [
+          "_assert_addr_list_ok($header, $allow_empty, $list)",
+          "active param: 2 ($list)"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -48,7 +72,13 @@
       "file": "URI.pm",
       "line": 233,
       "col": 24,
-      "expect": {"all":["new($uri","active param: 0 ($uri"],"none":[]},
+      "expect": {
+        "all": [
+          "new($uri",
+          "active param: 0 ($uri"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -58,7 +88,13 @@
       "file": "URI.pm",
       "line": 89,
       "col": 29,
-      "expect": {"all":["new($uri","active param: 1 ($scheme)"],"none":[]},
+      "expect": {
+        "all": [
+          "new($uri",
+          "active param: 1 ($scheme)"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -68,7 +104,13 @@
       "file": "Email/Stuffer.pm",
       "line": 215,
       "col": 37,
-      "expect": {"all":["create(%args)","active param: 0 (%args)"],"none":[]},
+      "expect": {
+        "all": [
+          "create(%args)",
+          "active param: 0 (%args)"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -78,7 +120,13 @@
       "file": "Getopt/Long/Descriptive.pm",
       "line": 656,
       "col": 25,
-      "expect": {"all":["_norm_imply($what)","active param: 0 ($what)"],"none":[]},
+      "expect": {
+        "all": [
+          "_norm_imply($what)",
+          "active param: 0 ($what)"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -88,7 +136,13 @@
       "file": "URI/_generic.pm",
       "line": 58,
       "col": 13,
-      "expect": {"all":["_check_path($path, $pre)","active param: 0 ($path)"],"none":[]},
+      "expect": {
+        "all": [
+          "_check_path($path, $pre)",
+          "active param: 0 ($path)"
+        ],
+        "none": []
+      },
       "status": "xfail"
     },
     {
@@ -98,7 +152,13 @@
       "file": "Type/Tiny.pm",
       "line": 1246,
       "col": 27,
-      "expect": {"all":["new()","active param: 0 ()"],"none":[]},
+      "expect": {
+        "all": [
+          "new()",
+          "active param: 0 ()"
+        ],
+        "none": []
+      },
       "status": "provisional"
     },
     {
@@ -108,7 +168,13 @@
       "file": "Type/Tiny.pm",
       "line": 902,
       "col": 30,
-      "expect": {"all":["check()","active param: 0 ()"],"none":[]},
+      "expect": {
+        "all": [
+          "check()",
+          "active param: 0 ()"
+        ],
+        "none": []
+      },
       "status": "provisional"
     },
     {
@@ -118,8 +184,81 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 226,
       "col": 8,
-      "expect": {"all":["_normalize_nanoseconds()","active param: 0 ()"],"none":[]},
+      "expect": {
+        "all": [
+          "_normalize_nanoseconds()",
+          "active param: 0 ()"
+        ],
+        "none": []
+      },
       "status": "provisional"
+    },
+    {
+      "id": "sig-mojo-base-attr",
+      "difficulty": "simple",
+      "semantic_area": "oo",
+      "file": "Mojo/Base.pm",
+      "line": 110,
+      "col": 62,
+      "expect": {
+        "all": [
+          "attr($attrs, $value, %kv)",
+          "active param: 0 ($attrs)"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "attr(...) same-file sig with invocant dropped."
+    },
+    {
+      "id": "sig-mojo-controller-every-encrypted-cookie",
+      "difficulty": "simple",
+      "semantic_area": "oo",
+      "file": "Mojolicious/Controller.pm",
+      "line": 55,
+      "col": 33,
+      "expect": {
+        "all": [
+          "every_encrypted_cookie($name)",
+          "active param: 0 ($name)"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "method-call sig-help drops $self, shows $name."
+    },
+    {
+      "id": "sig-catalyst-parse-attr-active-param",
+      "difficulty": "tricky",
+      "semantic_area": "oo",
+      "file": "Catalyst/Controller.pm",
+      "line": 428,
+      "col": 65,
+      "expect": {
+        "all": [
+          "_parse_attr_key_value($c, $attr",
+          "active param: 1"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "cursor on 2nd arg advances active param to index 1."
+    },
+    {
+      "id": "sig-mojo-controller-cookie-shift",
+      "difficulty": "tricky",
+      "semantic_area": "oo",
+      "file": "Mojolicious/Controller.pm",
+      "line": 61,
+      "col": 22,
+      "expect": {
+        "all": [
+          "cookie($name)"
+        ],
+        "none": []
+      },
+      "status": "xfail",
+      "note": "GAP: cookie() params declared via `my ($self,$name)=(shift,shift)` not parsed; sig shows empty."
     }
   ]
 }

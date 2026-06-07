@@ -8,7 +8,14 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 542,
       "col": 4,
-      "expect": {"all":["sub now {","package DateTime","returns: DateTime"],"none":[]},
+      "expect": {
+        "all": [
+          "sub now {",
+          "package DateTime",
+          "returns: DateTime"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -18,7 +25,14 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 764,
       "col": 4,
-      "expect": {"all":["sub clone","package DateTime","returns: DateTime"],"none":[]},
+      "expect": {
+        "all": [
+          "sub clone",
+          "package DateTime",
+          "returns: DateTime"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -28,7 +42,14 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 87,
       "col": 4,
-      "expect": {"all":["sub duration_class () {'DateTime::Duration'}","package DateTime","returns: String"],"none":[]},
+      "expect": {
+        "all": [
+          "sub duration_class () {'DateTime::Duration'}",
+          "package DateTime",
+          "returns: String"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -38,7 +59,14 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 85,
       "col": 4,
-      "expect": {"all":["sub SECONDS_PER_DAY () {86400}","package DateTime","returns: Numeric"],"none":[]},
+      "expect": {
+        "all": [
+          "sub SECONDS_PER_DAY () {86400}",
+          "package DateTime",
+          "returns: Numeric"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -48,7 +76,14 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 568,
       "col": 4,
-      "expect": {"all":["sub today { shift->now(@_)->truncate( to => 'day' ) }","package DateTime","returns: DateTime"],"none":[]},
+      "expect": {
+        "all": [
+          "sub today { shift->now(@_)->truncate( to => 'day' ) }",
+          "package DateTime",
+          "returns: DateTime"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -58,7 +93,14 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 568,
       "col": 28,
-      "expect": {"all":["sub truncate {","class DateTime","returns: DateTime"],"none":[]},
+      "expect": {
+        "all": [
+          "sub truncate {",
+          "class DateTime",
+          "returns: DateTime"
+        ],
+        "none": []
+      },
       "status": "provisional"
     },
     {
@@ -68,7 +110,14 @@
       "file": "URI.pm",
       "line": 86,
       "col": 4,
-      "expect": {"all":["sub new_abs","package URI","Constructs a new absolute URI object"],"none":[]},
+      "expect": {
+        "all": [
+          "sub new_abs",
+          "package URI",
+          "Constructs a new absolute URI object"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -78,7 +127,15 @@
       "file": "URI/_punycode.pm",
       "line": 14,
       "col": 13,
-      "expect": {"all":["use constant BASE => 36;","package URI::_punycode"],"none":["returns: Numeric"]},
+      "expect": {
+        "all": [
+          "use constant BASE => 36;",
+          "package URI::_punycode"
+        ],
+        "none": [
+          "returns: Numeric"
+        ]
+      },
       "status": "provisional"
     },
     {
@@ -88,7 +145,14 @@
       "file": "URI/_server.pm",
       "line": 97,
       "col": 11,
-      "expect": {"all":["sub uri_unescape()","Returns a string with each %XX sequence replaced","imported from `URI::Escape`"],"none":[]},
+      "expect": {
+        "all": [
+          "sub uri_unescape()",
+          "Returns a string with each %XX sequence replaced",
+          "imported from `URI::Escape`"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -98,7 +162,15 @@
       "file": "Catalyst/Request.pm",
       "line": 47,
       "col": 4,
-      "expect": {"all":["has address => (is => 'rw');","package Catalyst::Request"],"none":["returns:"]},
+      "expect": {
+        "all": [
+          "has address => (is => 'rw');",
+          "package Catalyst::Request"
+        ],
+        "none": [
+          "returns:"
+        ]
+      },
       "status": "gold"
     },
     {
@@ -108,7 +180,16 @@
       "file": "Catalyst/Action.pm",
       "line": 34,
       "col": 4,
-      "expect": {"all":["has private_path => (","package Catalyst::Action","Returns absolute private path for this action"],"none":["returns: String"]},
+      "expect": {
+        "all": [
+          "has private_path => (",
+          "package Catalyst::Action",
+          "Returns absolute private path for this action"
+        ],
+        "none": [
+          "returns: String"
+        ]
+      },
       "status": "provisional"
     },
     {
@@ -118,7 +199,14 @@
       "file": "Minion.pm",
       "line": 145,
       "col": 4,
-      "expect": {"all":["sub worker {","package Minion","returns: Minion::Worker"],"none":[]},
+      "expect": {
+        "all": [
+          "sub worker {",
+          "package Minion",
+          "returns: Minion::Worker"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -128,7 +216,14 @@
       "file": "Minion.pm",
       "line": 16,
       "col": 4,
-      "expect": {"all":["has app => sub","package Minion","Application for job queue"],"none":[]},
+      "expect": {
+        "all": [
+          "has app => sub",
+          "package Minion",
+          "Application for job queue"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -138,7 +233,13 @@
       "file": "Minion.pm",
       "line": 151,
       "col": 6,
-      "expect": {"all":["my $worker = Minion::Worker->new(minion => $self);","type: Minion::Worker"],"none":[]},
+      "expect": {
+        "all": [
+          "my $worker = Minion::Worker->new(minion => $self);",
+          "type: Minion::Worker"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -148,7 +249,13 @@
       "file": "Minion.pm",
       "line": 94,
       "col": 7,
-      "expect": {"all":["my ($self, $id) = @_;","type: Minion"],"none":[]},
+      "expect": {
+        "all": [
+          "my ($self, $id) = @_;",
+          "type: Minion"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -158,8 +265,141 @@
       "file": "Minion.pm",
       "line": 152,
       "col": 9,
-      "expect": {"all":["sub emit()","class Minion (from Mojo::EventEmitter)","Emit event."],"none":[]},
+      "expect": {
+        "all": [
+          "sub emit()",
+          "class Minion (from Mojo::EventEmitter)",
+          "Emit event."
+        ],
+        "none": []
+      },
       "status": "provisional"
+    },
+    {
+      "id": "hover-mojo-url-path-fluent",
+      "difficulty": "tricky",
+      "semantic_area": "fluent",
+      "file": "Mojo/URL.pm",
+      "line": 70,
+      "col": 4,
+      "expect": {
+        "all": [
+          "sub path",
+          "package Mojo::URL",
+          "returns: Mojo::URL"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "fluent setter returns $self -> Mojo::URL."
+    },
+    {
+      "id": "hover-mojo-url-clone-via-new",
+      "difficulty": "tricky",
+      "semantic_area": "chain",
+      "file": "Mojo/URL.pm",
+      "line": 11,
+      "col": 4,
+      "expect": {
+        "all": [
+          "sub clone",
+          "package Mojo::URL",
+          "returns: Mojo::URL"
+        ],
+        "none": []
+      },
+      "status": "xfail",
+      "note": "GAP: clone does my $clone=$self->new;...;return $clone -> should be Mojo::URL but resolves HashRef."
+    },
+    {
+      "id": "hover-mojo-collection-each-self",
+      "difficulty": "tricky",
+      "semantic_area": "fluent",
+      "file": "Mojo/Collection.pm",
+      "line": 21,
+      "col": 4,
+      "expect": {
+        "all": [
+          "sub each",
+          "package Mojo::Collection",
+          "returns: Mojo::Collection"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "each() returns $self."
+    },
+    {
+      "id": "hover-mojo-collection-map-new",
+      "difficulty": "tricky",
+      "semantic_area": "chain",
+      "file": "Mojo/Collection.pm",
+      "line": 57,
+      "col": 4,
+      "expect": {
+        "all": [
+          "sub map",
+          "package Mojo::Collection",
+          "returns: Mojo::Collection"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "map() returns $self->new(...)."
+    },
+    {
+      "id": "hover-datetime-clone-bless-ref",
+      "difficulty": "tricky",
+      "semantic_area": "bless",
+      "file": "x86_64-linux/DateTime.pm",
+      "line": 764,
+      "col": 4,
+      "expect": {
+        "all": [
+          "sub clone",
+          "package DateTime",
+          "returns: DateTime"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "clone is `bless { %{ $_[0] } }, ref $_[0]` -> DateTime (bless-ref idiom)."
+    },
+    {
+      "id": "hover-datetime-now-from-epoch",
+      "difficulty": "tricky",
+      "semantic_area": "chain",
+      "file": "x86_64-linux/DateTime.pm",
+      "line": 542,
+      "col": 4,
+      "expect": {
+        "all": [
+          "sub now",
+          "package DateTime",
+          "returns: DateTime"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "now() returns $class->from_epoch(...) which blesses -> DateTime."
+    },
+    {
+      "id": "hover-path-tiny-path-pod",
+      "difficulty": "tricky",
+      "semantic_area": "oo",
+      "file": "Path/Tiny.pm",
+      "line": 221,
+      "col": 4,
+      "expect": {
+        "all": [
+          "sub path",
+          "package Path::Tiny",
+          "returns: Path::Tiny"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "path() tail-calls _pathify (bless [...], __PACKAGE__) -> Path::Tiny."
     }
   ]
 }

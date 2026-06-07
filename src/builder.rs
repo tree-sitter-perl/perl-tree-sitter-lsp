@@ -8480,7 +8480,9 @@ impl<'a> Builder<'a> {
                                 is_method: true,
                                 doc: None,
                                 display: None,
-                    hide_in_outline: false,
+                    // Same name+span as the getter — hide so the outline shows
+                    // one entry per `has` attribute, not a reader+writer pair.
+                    hide_in_outline: true,
                     opaque_return: false,
                     is_constant: false,
                             },
@@ -8626,7 +8628,9 @@ impl<'a> Builder<'a> {
                             is_method: true,
                             doc: None,
                             display: None,
-                    hide_in_outline: false,
+                    // Same name+span as the getter — hide so the outline shows
+                    // one entry per `has` attribute, not a reader+writer pair.
+                    hide_in_outline: true,
                     opaque_return: false,
                     is_constant: false,
                         },

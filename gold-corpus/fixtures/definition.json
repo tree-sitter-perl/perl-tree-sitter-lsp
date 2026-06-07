@@ -8,7 +8,12 @@
       "file": "Type/Registry.pm",
       "line": 13,
       "col": 23,
-      "expect": {"all":["Tiny.pm:430:"],"none":[]},
+      "expect": {
+        "all": [
+          "Tiny.pm:430:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -18,7 +23,12 @@
       "file": "Type/Registry.pm",
       "line": 74,
       "col": 12,
-      "expect": {"all":["Tiny.pm:430:"],"none":[]},
+      "expect": {
+        "all": [
+          "Tiny.pm:430:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -28,7 +38,12 @@
       "file": "Type/Tiny.pm",
       "line": 414,
       "col": 9,
-      "expect": {"all":["Tiny.pm:525:"],"none":[]},
+      "expect": {
+        "all": [
+          "Tiny.pm:525:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -38,7 +53,12 @@
       "file": "LWP/RobotUA.pm",
       "line": 64,
       "col": 23,
-      "expect": {"all":["MemberMixin.pm:5:"],"none":[]},
+      "expect": {
+        "all": [
+          "MemberMixin.pm:5:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -48,7 +68,12 @@
       "file": "LWP/RobotUA.pm",
       "line": 2,
       "col": 14,
-      "expect": {"all":["UserAgent.pm:1:"],"none":[]},
+      "expect": {
+        "all": [
+          "UserAgent.pm:1:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -58,7 +83,12 @@
       "file": "LWP/UserAgent.pm",
       "line": 711,
       "col": 36,
-      "expect": {"all":["MemberMixin.pm:5:"],"none":[]},
+      "expect": {
+        "all": [
+          "MemberMixin.pm:5:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -68,7 +98,12 @@
       "file": "LWP/Simple.pm",
       "line": 8,
       "col": 17,
-      "expect": {"all":["Simple.pm:32:"],"none":[]},
+      "expect": {
+        "all": [
+          "Simple.pm:32:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -78,7 +113,12 @@
       "file": "Dist/Zilla.pm",
       "line": 182,
       "col": 29,
-      "expect": {"all":["Zilla.pm:82:"],"none":[]},
+      "expect": {
+        "all": [
+          "Zilla.pm:82:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -88,7 +128,12 @@
       "file": "Dist/Zilla.pm",
       "line": 4,
       "col": 6,
-      "expect": {"all":["ConfigDumper.pm:1:"],"none":[]},
+      "expect": {
+        "all": [
+          "ConfigDumper.pm:1:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -98,7 +143,12 @@
       "file": "URI.pm",
       "line": 16,
       "col": 18,
-      "expect": {"all":["URI.pm:9:14"],"none":[]},
+      "expect": {
+        "all": [
+          "URI.pm:9:14"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -108,7 +158,12 @@
       "file": "URI/_query.pm",
       "line": 95,
       "col": 10,
-      "expect": {"all":["Escape.pm:216:"],"none":[]},
+      "expect": {
+        "all": [
+          "Escape.pm:216:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -118,7 +173,12 @@
       "file": "URI.pm",
       "line": 116,
       "col": 33,
-      "expect": {"all":["URI.pm:27:"],"none":[]},
+      "expect": {
+        "all": [
+          "URI.pm:27:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -128,7 +188,12 @@
       "file": "URI/otpauth.pm",
       "line": 47,
       "col": 39,
-      "expect": {"all":["Escape.pm:216:"],"none":[]},
+      "expect": {
+        "all": [
+          "Escape.pm:216:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -138,7 +203,12 @@
       "file": "LWP/MemberMixin.pm",
       "line": 9,
       "col": 11,
-      "expect": {"all":["MemberMixin.pm:8:8"],"none":[]},
+      "expect": {
+        "all": [
+          "MemberMixin.pm:8:8"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -148,7 +218,12 @@
       "file": "LWP/RobotUA.pm",
       "line": 46,
       "col": 31,
-      "expect": {"all":["UserAgent.pm:23:"],"none":[]},
+      "expect": {
+        "all": [
+          "UserAgent.pm:23:"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -158,8 +233,79 @@
       "file": "Type/Tiny.pm",
       "line": 414,
       "col": 56,
-      "expect": {"all":["Standard.pm:215:"],"none":["Standard.pm:1:1"]},
+      "expect": {
+        "all": [
+          "Standard.pm:215:"
+        ],
+        "none": [
+          "Standard.pm:1:1"
+        ]
+      },
       "status": "xfail"
+    },
+    {
+      "id": "def-role-tiny-install-modifier-fq",
+      "difficulty": "tricky",
+      "semantic_area": "method-modifier",
+      "file": "Role/Tiny.pm",
+      "line": 467,
+      "col": 28,
+      "expect": {
+        "all": [
+          "Modifiers.pm:29:1"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "FQ cross-file call Class::Method::Modifiers::install_modifier resolves to its def."
+    },
+    {
+      "id": "def-cmm-install-modifier-glob-alias",
+      "difficulty": "tricky",
+      "semantic_area": "oo",
+      "file": "Class/Method/Modifiers.pm",
+      "line": 153,
+      "col": 4,
+      "expect": {
+        "all": [
+          "Modifiers.pm:27:1"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "_install_modifier(...) resolves to the *_install_modifier = \\&install_modifier glob alias."
+    },
+    {
+      "id": "def-role-tiny-load-module-local",
+      "difficulty": "simple",
+      "semantic_area": "oo",
+      "file": "Role/Tiny.pm",
+      "line": 56,
+      "col": 2,
+      "expect": {
+        "all": [
+          "Tiny.pm:38:5"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "local _load_module(...) call resolves to sub _load_module."
+    },
+    {
+      "id": "def-moo-role-goto-amp-fq-import",
+      "difficulty": "tricky",
+      "semantic_area": "role",
+      "file": "Moo/Role.pm",
+      "line": 55,
+      "col": 20,
+      "expect": {
+        "all": [
+          "Tiny.pm:81:"
+        ],
+        "none": []
+      },
+      "status": "xfail",
+      "note": "GAP: `goto &Role::Tiny::import` doesn't resolve; amp-call name parses as one varname so no cross-file ref. Correct target Role/Tiny.pm:81."
     }
   ]
 }

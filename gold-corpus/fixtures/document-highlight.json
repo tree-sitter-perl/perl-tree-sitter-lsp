@@ -8,7 +8,16 @@
       "file": "URI.pm",
       "line": 64,
       "col": 8,
-      "expect": {"all":["URI.pm:65:8\tREAD","URI.pm:70:7\tWRITE","URI.pm:77:5\tWRITE","URI.pm:80:6\tWRITE","URI.pm:83:12\tREAD"],"none":[]},
+      "expect": {
+        "all": [
+          "URI.pm:65:8\tREAD",
+          "URI.pm:70:7\tWRITE",
+          "URI.pm:77:5\tWRITE",
+          "URI.pm:80:6\tWRITE",
+          "URI.pm:83:12\tREAD"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -18,7 +27,18 @@
       "file": "URI.pm",
       "line": 97,
       "col": 9,
-      "expect": {"all":["URI.pm:98:8\tREAD","URI.pm:100:5\tWRITE","URI.pm:100:33\tREAD","URI.pm:101:5\tWRITE","URI.pm:101:21\tREAD","URI.pm:101:34\tREAD","URI.pm:103:23\tREAD"],"none":[]},
+      "expect": {
+        "all": [
+          "URI.pm:98:8\tREAD",
+          "URI.pm:100:5\tWRITE",
+          "URI.pm:100:33\tREAD",
+          "URI.pm:101:5\tWRITE",
+          "URI.pm:101:21\tREAD",
+          "URI.pm:101:34\tREAD",
+          "URI.pm:103:23\tREAD"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -28,7 +48,24 @@
       "file": "URI.pm",
       "line": 55,
       "col": 21,
-      "expect": {"all":["URI.pm:56:22\tREAD","URI.pm:67:2\tWRITE","URI.pm:70:23\tREAD","URI.pm:71:6\tWRITE","URI.pm:71:16\tREAD","URI.pm:73:9\tREAD","URI.pm:73:20\tREAD","URI.pm:74:6\tWRITE","URI.pm:77:31\tREAD","URI.pm:83:35\tREAD"],"none":["URI.pm:8:","URI.pm:9:"]},
+      "expect": {
+        "all": [
+          "URI.pm:56:22\tREAD",
+          "URI.pm:67:2\tWRITE",
+          "URI.pm:70:23\tREAD",
+          "URI.pm:71:6\tWRITE",
+          "URI.pm:71:16\tREAD",
+          "URI.pm:73:9\tREAD",
+          "URI.pm:73:20\tREAD",
+          "URI.pm:74:6\tWRITE",
+          "URI.pm:77:31\tREAD",
+          "URI.pm:83:35\tREAD"
+        ],
+        "none": [
+          "URI.pm:8:",
+          "URI.pm:9:"
+        ]
+      },
       "status": "gold"
     },
     {
@@ -38,7 +75,21 @@
       "file": "URI.pm",
       "line": 55,
       "col": 17,
-      "expect": {"all":["URI.pm:56:16\tREAD","URI.pm:58:5\tWRITE","URI.pm:58:21\tREAD","URI.pm:58:30\tREAD","URI.pm:60:5\tREAD","URI.pm:61:5\tREAD","URI.pm:62:5\tREAD","URI.pm:63:5\tREAD","URI.pm:66:9\tREAD","URI.pm:83:29\tREAD"],"none":[]},
+      "expect": {
+        "all": [
+          "URI.pm:56:16\tREAD",
+          "URI.pm:58:5\tWRITE",
+          "URI.pm:58:21\tREAD",
+          "URI.pm:58:30\tREAD",
+          "URI.pm:60:5\tREAD",
+          "URI.pm:61:5\tREAD",
+          "URI.pm:62:5\tREAD",
+          "URI.pm:63:5\tREAD",
+          "URI.pm:66:9\tREAD",
+          "URI.pm:83:29\tREAD"
+        ],
+        "none": []
+      },
       "status": "provisional"
     },
     {
@@ -48,7 +99,18 @@
       "file": "URI.pm",
       "line": 12,
       "col": 3,
-      "expect": {"all":["URI.pm:13:4\tREAD","URI.pm:162:19\tREAD","URI.pm:164:9\tWRITE","URI.pm:168:14\tREAD","URI.pm:196:5\tWRITE"],"none":["URI.pm:435:"]},
+      "expect": {
+        "all": [
+          "URI.pm:13:4\tREAD",
+          "URI.pm:162:19\tREAD",
+          "URI.pm:164:9\tWRITE",
+          "URI.pm:168:14\tREAD",
+          "URI.pm:196:5\tWRITE"
+        ],
+        "none": [
+          "URI.pm:435:"
+        ]
+      },
       "status": "gold"
     },
     {
@@ -58,7 +120,15 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 394,
       "col": 8,
-      "expect": {"all":["DateTime.pm:343:24\tREAD","DateTime.pm:363:24\tREAD","DateTime.pm:395:5\tREAD","DateTime.pm:1925:16\tREAD"],"none":[]},
+      "expect": {
+        "all": [
+          "DateTime.pm:343:24\tREAD",
+          "DateTime.pm:363:24\tREAD",
+          "DateTime.pm:395:5\tREAD",
+          "DateTime.pm:1925:16\tREAD"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -68,7 +138,15 @@
       "file": "Moo.pm",
       "line": 37,
       "col": 5,
-      "expect": {"all":["Moo.pm:38:6\tREAD","Moo.pm:40:52\tREAD","Moo.pm:49:25\tREAD","Moo.pm:50:22\tREAD"],"none":[]},
+      "expect": {
+        "all": [
+          "Moo.pm:38:6\tREAD",
+          "Moo.pm:40:52\tREAD",
+          "Moo.pm:49:25\tREAD",
+          "Moo.pm:50:22\tREAD"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -78,8 +156,54 @@
       "file": "Plack/Request.pm",
       "line": 206,
       "col": 8,
-      "expect": {"all":["Request.pm:207:8\tREAD","Request.pm:209:16\tREAD","Request.pm:211:10\tREAD","Request.pm:211:33\tREAD","Request.pm:211:69\tREAD","Request.pm:212:10\tREAD"],"none":[]},
+      "expect": {
+        "all": [
+          "Request.pm:207:8\tREAD",
+          "Request.pm:209:16\tREAD",
+          "Request.pm:211:10\tREAD",
+          "Request.pm:211:33\tREAD",
+          "Request.pm:211:69\tREAD",
+          "Request.pm:212:10\tREAD"
+        ],
+        "none": []
+      },
       "status": "gold"
+    },
+    {
+      "id": "dh-throwable-inv-throw",
+      "difficulty": "simple",
+      "semantic_area": "lexical-var",
+      "file": "Throwable.pm",
+      "line": 66,
+      "col": 7,
+      "expect": {
+        "all": [
+          "Throwable.pm:67:7\tREAD",
+          "Throwable.pm:69:29\tREAD",
+          "Throwable.pm:71:9\tREAD",
+          "Throwable.pm:75:19\tREAD"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "$inv highlighted at all occurrences in sub throw."
+    },
+    {
+      "id": "dh-mojo-content-write-read",
+      "difficulty": "tricky",
+      "semantic_area": "lexical-var-rw",
+      "file": "Mojo/Message.pm",
+      "line": 23,
+      "col": 6,
+      "expect": {
+        "all": [
+          "Message.pm:28:3\tWRITE",
+          "Message.pm:29:3\tREAD"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "$content reassignment tagged WRITE, later read tagged READ."
     }
   ]
 }

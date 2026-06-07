@@ -4945,6 +4945,29 @@ sub setup {
 }
 
 #[test]
+fn test_mojo_has_accessor_writer_hidden_from_outline() {
+    // Mojo `has 'x'` synthesizes a getter + a same-named fluent writer (for
+    // arity-1 return typing). Only ONE should show in the outline; the writer
+    // carries hide_in_outline so it doesn't duplicate the getter.
+    let fa = build_fa("package Msg;\nuse Mojo::Base -base;\nhas 'content';\n");
+    let visible: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| s.name == "content" && s.kind == SymKind::Method)
+        .filter(|s| !matches!(&s.detail, SymbolDetail::Sub { hide_in_outline: true, .. }))
+        .collect();
+    assert_eq!(
+        visible.len(),
+        1,
+        "exactly one visible `content` accessor expected, got {}",
+        visible.len()
+    );
+    // Both symbols still exist (writer hidden, not deleted) for arity typing.
+    let total = fa.symbols.iter().filter(|s| s.name == "content" && s.kind == SymKind::Method).count();
+    assert_eq!(total, 2, "getter + (hidden) writer both retained");
+}
+
+#[test]
 fn test_strict_mojo_base_shift_not_invocant() {
     // `use Mojo::Base -strict` is a non-OO module: a bare `my $x = shift` is
     // arg[0], NOT the invocant, so it must not type as the package (doing so

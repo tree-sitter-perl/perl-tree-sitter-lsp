@@ -226,6 +226,40 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "id": "outline-ppi-use-constant-sub",
+      "difficulty": "tricky",
+      "semantic_area": "constants",
+      "file": "PPI/Document.pm",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"col\":\"13\",\"kind\":\"Sub\",\"line\":\"88\",\"name\":\"LOCATION_LINE\",\"package\":\"PPI::Document\""
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "use constant LOCATION_LINE outlined as Sub."
+    },
+    {
+      "id": "outline-mojo-has-accessor-single",
+      "difficulty": "tricky",
+      "semantic_area": "framework-accessor",
+      "file": "Mojo/Message.pm",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"name\":\"content\",\"package\":\"Mojo::Message\",\"return_type\":\"Mojo::Content::Single\""
+        ],
+        "none": [
+          "\"name\":\"content\",\"package\":\"Mojo::Message\",\"params\":[\"$val\"]"
+        ]
+      },
+      "status": "gold",
+      "note": "each Mojo `has` accessor appears ONCE in the outline (getter); the same-named fluent writer is hidden (hide_in_outline) but its arity-1 return witness survives."
     }
   ]
 }

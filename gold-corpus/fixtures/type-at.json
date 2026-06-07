@@ -10,7 +10,12 @@
       "col": 6,
       "query": "",
       "newname": "",
-      "expect": {"all":["Moo::Object"],"none":[]},
+      "expect": {
+        "all": [
+          "Moo::Object"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -22,7 +27,12 @@
       "col": 9,
       "query": "",
       "newname": "",
-      "expect": {"all":["URI"],"none":[]},
+      "expect": {
+        "all": [
+          "URI"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -34,7 +44,12 @@
       "col": 8,
       "query": "",
       "newname": "",
-      "expect": {"all":["URI"],"none":[]},
+      "expect": {
+        "all": [
+          "URI"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -46,7 +61,12 @@
       "col": 8,
       "query": "",
       "newname": "",
-      "expect": {"all":["DateTime"],"none":[]},
+      "expect": {
+        "all": [
+          "DateTime"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -58,7 +78,12 @@
       "col": 8,
       "query": "",
       "newname": "",
-      "expect": {"all":["DateTime"],"none":[]},
+      "expect": {
+        "all": [
+          "DateTime"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -70,7 +95,12 @@
       "col": 5,
       "query": "",
       "newname": "",
-      "expect": {"all":["Type::Tiny"],"none":[]},
+      "expect": {
+        "all": [
+          "Type::Tiny"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -82,7 +112,12 @@
       "col": 6,
       "query": "",
       "newname": "",
-      "expect": {"all":["Numeric"],"none":[]},
+      "expect": {
+        "all": [
+          "Numeric"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -94,7 +129,12 @@
       "col": 9,
       "query": "",
       "newname": "",
-      "expect": {"all":["Minion"],"none":[]},
+      "expect": {
+        "all": [
+          "Minion"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -106,7 +146,12 @@
       "col": 6,
       "query": "",
       "newname": "",
-      "expect": {"all":["Minion"],"none":[]},
+      "expect": {
+        "all": [
+          "Minion"
+        ],
+        "none": []
+      },
       "status": "xfail"
     },
     {
@@ -118,7 +163,12 @@
       "col": 6,
       "query": "",
       "newname": "",
-      "expect": {"all":["String"],"none":[]},
+      "expect": {
+        "all": [
+          "String"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -130,7 +180,12 @@
       "col": 5,
       "query": "",
       "newname": "",
-      "expect": {"all":["Minion::Worker"],"none":[]},
+      "expect": {
+        "all": [
+          "Minion::Worker"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -142,7 +197,12 @@
       "col": 7,
       "query": "",
       "newname": "",
-      "expect": {"all":["Dist::Zilla"],"none":[]},
+      "expect": {
+        "all": [
+          "Dist::Zilla"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -154,7 +214,14 @@
       "col": 5,
       "query": "",
       "newname": "",
-      "expect": {"all":[],"none":["Mojo::Collection","ARRAY","ArrayRef"]},
+      "expect": {
+        "all": [],
+        "none": [
+          "Mojo::Collection",
+          "ARRAY",
+          "ArrayRef"
+        ]
+      },
       "status": "provisional"
     },
     {
@@ -166,8 +233,47 @@
       "col": 5,
       "query": "",
       "newname": "",
-      "expect": {"all":[],"none":["Mojo::Loader","String","Str"]},
+      "expect": {
+        "all": [],
+        "none": [
+          "Mojo::Loader",
+          "String",
+          "Str"
+        ]
+      },
       "status": "provisional"
+    },
+    {
+      "id": "ti-datetime-new-bless-self",
+      "difficulty": "tricky",
+      "semantic_area": "bless",
+      "file": "x86_64-linux/DateTime.pm",
+      "line": 207,
+      "col": 4,
+      "expect": {
+        "all": [
+          "DateTime"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "my $self = bless {}, $class -> DateTime."
+    },
+    {
+      "id": "ti-mojo-url-abs-clone-chain",
+      "difficulty": "tricky",
+      "semantic_area": "chain",
+      "file": "Mojo/URL.pm",
+      "line": 123,
+      "col": 9,
+      "expect": {
+        "all": [
+          "Mojo::URL"
+        ],
+        "none": []
+      },
+      "status": "xfail",
+      "note": "GAP: my $abs=$self->clone -> should be Mojo::URL but clone mistyped HashRef propagates."
     }
   ]
 }

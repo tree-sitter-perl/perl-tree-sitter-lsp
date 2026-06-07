@@ -8,7 +8,19 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 207,
       "col": 11,
-      "expect": {"all":["new\tDateTime","now\tDateTime","today\tDateTime","clone\tDateTime","year\tDateTime","month\tDateTime","formatter\tDateTime","_set_locale\tDateTime"],"none":[]},
+      "expect": {
+        "all": [
+          "new\tDateTime",
+          "now\tDateTime",
+          "today\tDateTime",
+          "clone\tDateTime",
+          "year\tDateTime",
+          "month\tDateTime",
+          "formatter\tDateTime",
+          "_set_locale\tDateTime"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -18,7 +30,21 @@
       "file": "Catalyst/Action.pm",
       "line": 66,
       "col": 20,
-      "expect": {"all":["class\tCatalyst::Action","instance\tCatalyst::Action","has_instance\tCatalyst::Action","namespace\tCatalyst::Action","reverse\tCatalyst::Action","attributes\tCatalyst::Action","name\tCatalyst::Action","code\tCatalyst::Action","private_path\tCatalyst::Action","number_of_args\tCatalyst::Action"],"none":[]},
+      "expect": {
+        "all": [
+          "class\tCatalyst::Action",
+          "instance\tCatalyst::Action",
+          "has_instance\tCatalyst::Action",
+          "namespace\tCatalyst::Action",
+          "reverse\tCatalyst::Action",
+          "attributes\tCatalyst::Action",
+          "name\tCatalyst::Action",
+          "code\tCatalyst::Action",
+          "private_path\tCatalyst::Action",
+          "number_of_args\tCatalyst::Action"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -28,7 +54,20 @@
       "file": "URI/http.pm",
       "line": 14,
       "col": 23,
-      "expect": {"all":["default_port\tURI::http","canonical\tURI::http","host\tURI::http (from URI::_server)","port\tURI::http (from URI::_server)","userinfo\tURI::http (from URI::_server)","authority\tURI::http (from URI::_generic)","path\tURI::http (from URI::_generic)","scheme\tURI::http (from URI)","new\tURI::http (from URI)"],"none":[]},
+      "expect": {
+        "all": [
+          "default_port\tURI::http",
+          "canonical\tURI::http",
+          "host\tURI::http (from URI::_server)",
+          "port\tURI::http (from URI::_server)",
+          "userinfo\tURI::http (from URI::_server)",
+          "authority\tURI::http (from URI::_generic)",
+          "path\tURI::http (from URI::_generic)",
+          "scheme\tURI::http (from URI)",
+          "new\tURI::http (from URI)"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -38,7 +77,18 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 315,
       "col": 30,
-      "expect": {"all":["local_rd_days\tDateTime->{local_rd_days}","local_rd_secs\tDateTime->{local_rd_secs}","formatter\tDateTime->{formatter}","locale\tDateTime->{locale}","offset_modifier\tDateTime->{offset_modifier}","rd_nanosecs\tDateTime->{rd_nanosecs}","utc_year\tDateTime->{utc_year}"],"none":[]},
+      "expect": {
+        "all": [
+          "local_rd_days\tDateTime->{local_rd_days}",
+          "local_rd_secs\tDateTime->{local_rd_secs}",
+          "formatter\tDateTime->{formatter}",
+          "locale\tDateTime->{locale}",
+          "offset_modifier\tDateTime->{offset_modifier}",
+          "rd_nanosecs\tDateTime->{rd_nanosecs}",
+          "utc_year\tDateTime->{utc_year}"
+        ],
+        "none": []
+      },
       "status": "xfail"
     },
     {
@@ -48,7 +98,15 @@
       "file": "URI.pm",
       "line": 141,
       "col": 41,
-      "expect": {"all":["uri_escape\tURI::Escape","uri_unescape\tURI::Escape","uri_escape_utf8\tURI::Escape","escape_char\tURI::Escape"],"none":[]},
+      "expect": {
+        "all": [
+          "uri_escape\tURI::Escape",
+          "uri_unescape\tURI::Escape",
+          "uri_escape_utf8\tURI::Escape",
+          "escape_char\tURI::Escape"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -58,7 +116,13 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 318,
       "col": 36,
-      "expect": {"all":["offset\tDateTime","_offset_for_local_datetime\tDateTime"],"none":[]},
+      "expect": {
+        "all": [
+          "offset\tDateTime",
+          "_offset_for_local_datetime\tDateTime"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -68,7 +132,20 @@
       "file": "Dist/Zilla.pm",
       "line": 109,
       "col": 23,
-      "expect": {"all":["chrome\tDist::Zilla","name\tDist::Zilla","version\tDist::Zilla","abstract\tDist::Zilla","license\tDist::Zilla","authors\tDist::Zilla","plugins\tDist::Zilla","distmeta\tDist::Zilla","main_module\tDist::Zilla"],"none":[]},
+      "expect": {
+        "all": [
+          "chrome\tDist::Zilla",
+          "name\tDist::Zilla",
+          "version\tDist::Zilla",
+          "abstract\tDist::Zilla",
+          "license\tDist::Zilla",
+          "authors\tDist::Zilla",
+          "plugins\tDist::Zilla",
+          "distmeta\tDist::Zilla",
+          "main_module\tDist::Zilla"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -78,8 +155,101 @@
       "file": "Type/Tiny.pm",
       "line": 165,
       "col": 15,
-      "expect": {"all":["blessed\t"],"none":[]},
+      "expect": {
+        "all": [
+          "blessed\t"
+        ],
+        "none": []
+      },
       "status": "xfail"
+    },
+    {
+      "id": "completion-self-http-response",
+      "difficulty": "simple",
+      "semantic_area": "oo",
+      "file": "HTTP/Response.pm",
+      "line": 16,
+      "col": 11,
+      "expect": {
+        "all": [
+          "code\tHTTP::Response",
+          "message\tHTTP::Response",
+          "request\tHTTP::Response"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "$self-> offers the package's own accessors/methods."
+    },
+    {
+      "id": "completion-self-http-request",
+      "difficulty": "simple",
+      "semantic_area": "oo",
+      "file": "HTTP/Request.pm",
+      "line": 13,
+      "col": 10,
+      "expect": {
+        "all": [
+          "method\tHTTP::Request",
+          "uri\tHTTP::Request",
+          "as_string\tHTTP::Request"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "$self-> offers HTTP::Request's own methods."
+    },
+    {
+      "id": "completion-self-mojo-controller",
+      "difficulty": "simple",
+      "semantic_area": "oo",
+      "file": "Mojolicious/Controller.pm",
+      "line": 42,
+      "col": 10,
+      "expect": {
+        "all": [
+          "render\tMojolicious::Controller",
+          "stash\tMojolicious::Controller",
+          "param\tMojolicious::Controller"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "$self-> offers Controller methods + has-synthesized accessors."
+    },
+    {
+      "id": "completion-inherited-http-message",
+      "difficulty": "tricky",
+      "semantic_area": "inheritance",
+      "file": "HTTP/Response.pm",
+      "line": 16,
+      "col": 11,
+      "expect": {
+        "all": [
+          "content\t",
+          "header\t"
+        ],
+        "none": []
+      },
+      "status": "xfail",
+      "note": "GAP: $self-> omits methods inherited via `use parent HTTP::Message`."
+    },
+    {
+      "id": "completion-inherited-mojo-base-controller",
+      "difficulty": "tricky",
+      "semantic_area": "inheritance",
+      "file": "Mojolicious/Controller.pm",
+      "line": 42,
+      "col": 10,
+      "expect": {
+        "all": [
+          "tap\t",
+          "with_roles\t"
+        ],
+        "none": []
+      },
+      "status": "xfail",
+      "note": "GAP: $self-> omits methods inherited from Mojo::Base via `use Mojo::Base -base`."
     }
   ]
 }

@@ -10,7 +10,16 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"_server.pm\",\"line\":\"72\"","\"file\":\"_server.pm\",\"line\":\"104\"","\"file\":\"_server.pm\",\"line\":\"139\""],"none":["\"file\":\"file.pm\",\"line\":\"39\""]},
+      "expect": {
+        "all": [
+          "\"file\":\"_server.pm\",\"line\":\"72\"",
+          "\"file\":\"_server.pm\",\"line\":\"104\"",
+          "\"file\":\"_server.pm\",\"line\":\"139\""
+        ],
+        "none": [
+          "\"file\":\"file.pm\",\"line\":\"39\""
+        ]
+      },
       "status": "gold"
     },
     {
@@ -22,7 +31,15 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"Escape.pm\",\"line\":\"216\"","\"file\":\"Escape.pm\",\"line\":\"149\"","\"file\":\"ldapi.pm\",\"line\":\"14\"","\"file\":\"file.pm\",\"line\":\"39\""],"none":[]},
+      "expect": {
+        "all": [
+          "\"file\":\"Escape.pm\",\"line\":\"216\"",
+          "\"file\":\"Escape.pm\",\"line\":\"149\"",
+          "\"file\":\"ldapi.pm\",\"line\":\"14\"",
+          "\"file\":\"file.pm\",\"line\":\"39\""
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -34,7 +51,13 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"Moo.pm\",\"line\":\"54\"","\"file\":\"Moo.pm\",\"line\":\"50\""],"none":[]},
+      "expect": {
+        "all": [
+          "\"file\":\"Moo.pm\",\"line\":\"54\"",
+          "\"file\":\"Moo.pm\",\"line\":\"50\""
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -46,7 +69,16 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"DateTime.pm\",\"line\":\"767\"","\"file\":\"DateTime.pm\",\"line\":\"876\"","\"file\":\"DateTime.pm\",\"line\":\"1038\""],"none":["\"file\":\"Duration.pm\""]},
+      "expect": {
+        "all": [
+          "\"file\":\"DateTime.pm\",\"line\":\"767\"",
+          "\"file\":\"DateTime.pm\",\"line\":\"876\"",
+          "\"file\":\"DateTime.pm\",\"line\":\"1038\""
+        ],
+        "none": [
+          "\"file\":\"Duration.pm\""
+        ]
+      },
       "status": "gold"
     },
     {
@@ -58,7 +90,14 @@
       "col": 13,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"URI.pm\",\"line\":\"9\"","\"file\":\"_server.pm\",\"line\":\"26\"","\"file\":\"_generic.pm\",\"line\":\"13\""],"none":[]},
+      "expect": {
+        "all": [
+          "\"file\":\"URI.pm\",\"line\":\"9\"",
+          "\"file\":\"_server.pm\",\"line\":\"26\"",
+          "\"file\":\"_generic.pm\",\"line\":\"13\""
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -70,7 +109,15 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"http.pm\",\"line\":\"12\""],"none":["\"file\":\"_server.pm\",\"line\":\"150\"","\"file\":\"URI.pm\",\"line\":\"353\""]},
+      "expect": {
+        "all": [
+          "\"file\":\"http.pm\",\"line\":\"12\""
+        ],
+        "none": [
+          "\"file\":\"_server.pm\",\"line\":\"150\"",
+          "\"file\":\"URI.pm\",\"line\":\"353\""
+        ]
+      },
       "status": "gold"
     },
     {
@@ -82,7 +129,16 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"Tiny.pm\",\"line\":\"430\"","\"file\":\"Tiny.pm\",\"line\":\"9\"","\"file\":\"Tiny.pm\",\"line\":\"70\"","\"file\":\"Tiny.pm\",\"line\":\"105\"","\"file\":\"Tiny.pm\",\"line\":\"168\""],"none":[]},
+      "expect": {
+        "all": [
+          "\"file\":\"Tiny.pm\",\"line\":\"430\"",
+          "\"file\":\"Tiny.pm\",\"line\":\"9\"",
+          "\"file\":\"Tiny.pm\",\"line\":\"70\"",
+          "\"file\":\"Tiny.pm\",\"line\":\"105\"",
+          "\"file\":\"Tiny.pm\",\"line\":\"168\""
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -94,7 +150,14 @@
       "col": 6,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"Tiny.pm\",\"line\":\"162\"","\"file\":\"Tiny.pm\",\"line\":\"175\"","\"file\":\"Tiny.pm\",\"line\":\"173\""],"none":[]},
+      "expect": {
+        "all": [
+          "\"file\":\"Tiny.pm\",\"line\":\"162\"",
+          "\"file\":\"Tiny.pm\",\"line\":\"175\"",
+          "\"file\":\"Tiny.pm\",\"line\":\"173\""
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -106,7 +169,14 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"Escape.pm\",\"line\":\"234\"","\"file\":\"_query.pm\",\"line\":\"21\"","\"file\":\"_generic.pm\",\"line\":\"48\""],"none":[]},
+      "expect": {
+        "all": [
+          "\"file\":\"Escape.pm\",\"line\":\"234\"",
+          "\"file\":\"_query.pm\",\"line\":\"21\"",
+          "\"file\":\"_generic.pm\",\"line\":\"48\""
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -118,7 +188,19 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"Component.pm\",\"line\":\"47\"","\"file\":\"CGIBin.pm\",\"line\":\"49\"","\"file\":\"Middleware.pm\",\"line\":\"16\"","\"file\":\"Runner.pm\",\"line\":\"259\""],"none":["\"file\":\"Builder.pm\",\"line\":\"53\"","\"file\":\"Builder.pm\",\"line\":\"125\"","\"file\":\"Builder.pm\",\"line\":\"131\""]},
+      "expect": {
+        "all": [
+          "\"file\":\"Component.pm\",\"line\":\"47\"",
+          "\"file\":\"CGIBin.pm\",\"line\":\"49\"",
+          "\"file\":\"Middleware.pm\",\"line\":\"16\"",
+          "\"file\":\"Runner.pm\",\"line\":\"259\""
+        ],
+        "none": [
+          "\"file\":\"Builder.pm\",\"line\":\"53\"",
+          "\"file\":\"Builder.pm\",\"line\":\"125\"",
+          "\"file\":\"Builder.pm\",\"line\":\"131\""
+        ]
+      },
       "status": "gold"
     },
     {
@@ -130,7 +212,15 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"Builder.pm\",\"line\":\"53\"","\"file\":\"Builder.pm\",\"line\":\"131\""],"none":["\"file\":\"Component.pm\",\"line\":\"47\""]},
+      "expect": {
+        "all": [
+          "\"file\":\"Builder.pm\",\"line\":\"53\"",
+          "\"file\":\"Builder.pm\",\"line\":\"131\""
+        ],
+        "none": [
+          "\"file\":\"Component.pm\",\"line\":\"47\""
+        ]
+      },
       "status": "gold"
     },
     {
@@ -142,7 +232,14 @@
       "col": 5,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"Minion.pm\",\"line\":\"18\"","\"file\":\"Minion.pm\",\"line\":\"39\"","\"file\":\"Minion.pm\",\"line\":\"182\""],"none":[]},
+      "expect": {
+        "all": [
+          "\"file\":\"Minion.pm\",\"line\":\"18\"",
+          "\"file\":\"Minion.pm\",\"line\":\"39\"",
+          "\"file\":\"Minion.pm\",\"line\":\"182\""
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -154,7 +251,15 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"Minion.pm\",\"line\":\"57\""],"none":["\"file\":\"Backend.pm\",\"line\":\"18\"","\"file\":\"Pg.pm\",\"line\":\"75\""]},
+      "expect": {
+        "all": [
+          "\"file\":\"Minion.pm\",\"line\":\"57\""
+        ],
+        "none": [
+          "\"file\":\"Backend.pm\",\"line\":\"18\"",
+          "\"file\":\"Pg.pm\",\"line\":\"75\""
+        ]
+      },
       "status": "gold"
     },
     {
@@ -166,7 +271,17 @@
       "col": 8,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"DateTime.pm\",\"line\":\"191\"","\"file\":\"DateTime.pm\",\"line\":\"208\"","\"file\":\"DateTime.pm\",\"line\":\"256\""],"none":["\"file\":\"DateTime.pm\",\"line\":\"290\"","\"file\":\"DateTime.pm\",\"line\":\"488\""]},
+      "expect": {
+        "all": [
+          "\"file\":\"DateTime.pm\",\"line\":\"191\"",
+          "\"file\":\"DateTime.pm\",\"line\":\"208\"",
+          "\"file\":\"DateTime.pm\",\"line\":\"256\""
+        ],
+        "none": [
+          "\"file\":\"DateTime.pm\",\"line\":\"290\"",
+          "\"file\":\"DateTime.pm\",\"line\":\"488\""
+        ]
+      },
       "status": "gold"
     },
     {
@@ -178,8 +293,119 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "expect": {"all":["\"file\":\"DateTime.pm\",\"line\":\"780\"","\"file\":\"DateTime.pm\",\"line\":\"783\"","\"file\":\"DateTime.pm\",\"line\":\"790\""],"none":[]},
+      "expect": {
+        "all": [
+          "\"file\":\"DateTime.pm\",\"line\":\"780\"",
+          "\"file\":\"DateTime.pm\",\"line\":\"783\"",
+          "\"file\":\"DateTime.pm\",\"line\":\"790\""
+        ],
+        "none": []
+      },
       "status": "gold"
+    },
+    {
+      "id": "ref-try-tiny-try-callers",
+      "difficulty": "tricky",
+      "semantic_area": "exporter",
+      "file": "Try/Tiny.pm",
+      "line": 37,
+      "col": 4,
+      "expect": {
+        "all": [
+          "\"col\":\"5\",\"file\":\"Tiny.pm\",\"line\":\"38\"",
+          "\"col\":\"35\",\"file\":\"Tiny.pm\",\"line\":\"11\"",
+          "\"col\":\"16\",\"file\":\"Object.pm\",\"line\":\"96\""
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "refs from `sub try` find the @EXPORT entry + cross-file callers (import list + FQ Try::Tiny::try)."
+    },
+    {
+      "id": "ref-try-tiny-try-bareword-blockcalls",
+      "difficulty": "tricky",
+      "semantic_area": "exporter",
+      "file": "Try/Tiny.pm",
+      "line": 37,
+      "col": 4,
+      "expect": {
+        "all": [
+          "\"file\":\"Protocol.pm\",\"line\":\"70\""
+        ],
+        "none": []
+      },
+      "status": "xfail",
+      "note": "GAP: refs to `try` miss bareword block-prototype call sites (`try { ... }`). Only import-list + FQ calls indexed."
+    },
+    {
+      "id": "ref-try-tiny-catch-callers",
+      "difficulty": "tricky",
+      "semantic_area": "exporter",
+      "file": "Try/Tiny.pm",
+      "line": 136,
+      "col": 4,
+      "expect": {
+        "all": [
+          "\"col\":\"5\",\"file\":\"Tiny.pm\",\"line\":\"137\"",
+          "\"col\":\"39\",\"file\":\"Tiny.pm\",\"line\":\"11\"",
+          "\"col\":\"16\",\"file\":\"Object.pm\",\"line\":\"99\""
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "refs from `sub catch` find the @EXPORT entry + cross-file callers."
+    },
+    {
+      "id": "ref-cmm-install-modifier-crossfile",
+      "difficulty": "tricky",
+      "semantic_area": "exporter",
+      "file": "Class/Method/Modifiers.pm",
+      "line": 28,
+      "col": 4,
+      "expect": {
+        "all": [
+          "\"col\":\"5\",\"file\":\"Modifiers.pm\",\"line\":\"29\"",
+          "\"col\":\"29\",\"file\":\"_Utils.pm\",\"line\":\"86\"",
+          "\"col\":\"29\",\"file\":\"Tiny.pm\",\"line\":\"468\""
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "refs from sub install_modifier find @EXPORT_OK + the glob-alias + FQ cross-file callers (Moo/_Utils, Role/Tiny)."
+    },
+    {
+      "id": "ref-cmm-before-export-member",
+      "difficulty": "simple",
+      "semantic_area": "method-modifier",
+      "file": "Class/Method/Modifiers.pm",
+      "line": 11,
+      "col": 17,
+      "expect": {
+        "all": [
+          "\"col\":\"18\",\"file\":\"Modifiers.pm\",\"line\":\"12\"",
+          "\"col\":\"5\",\"file\":\"Modifiers.pm\",\"line\":\"153\""
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "refs from `before` @EXPORT member link the %EXPORT_TAGS occurrence and `sub before`."
+    },
+    {
+      "id": "ref-role-tiny-load-module-local",
+      "difficulty": "simple",
+      "semantic_area": "oo",
+      "file": "Role/Tiny.pm",
+      "line": 37,
+      "col": 4,
+      "expect": {
+        "all": [
+          "\"col\":\"5\",\"file\":\"Tiny.pm\",\"line\":\"38\"",
+          "\"col\":\"3\",\"file\":\"Tiny.pm\",\"line\":\"57\""
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "refs from sub _load_module find its in-file call site."
     }
   ]
 }

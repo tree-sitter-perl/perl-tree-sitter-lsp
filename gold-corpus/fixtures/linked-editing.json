@@ -8,7 +8,17 @@
       "file": "URI.pm",
       "line": 151,
       "col": 8,
-      "expect": {"all":["URI.pm:152:8","URI.pm:153:10","URI.pm:153:21","URI.pm:162:31","URI.pm:164:21","URI.pm:196:17"],"none":[]},
+      "expect": {
+        "all": [
+          "URI.pm:152:8",
+          "URI.pm:153:10",
+          "URI.pm:153:21",
+          "URI.pm:162:31",
+          "URI.pm:164:21",
+          "URI.pm:196:17"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -18,7 +28,18 @@
       "file": "URI.pm",
       "line": 12,
       "col": 3,
-      "expect": {"all":["URI.pm:13:4","URI.pm:162:19","URI.pm:164:9","URI.pm:168:14","URI.pm:196:5"],"none":["URI.pm:435"]},
+      "expect": {
+        "all": [
+          "URI.pm:13:4",
+          "URI.pm:162:19",
+          "URI.pm:164:9",
+          "URI.pm:168:14",
+          "URI.pm:196:5"
+        ],
+        "none": [
+          "URI.pm:435"
+        ]
+      },
       "status": "gold"
     },
     {
@@ -28,7 +49,16 @@
       "file": "URI.pm",
       "line": 23,
       "col": 5,
-      "expect": {"all":["URI.pm:24:5","URI.pm:66:21","URI.pm:126:29","URI.pm:153:35","URI.pm:273:18"],"none":[]},
+      "expect": {
+        "all": [
+          "URI.pm:24:5",
+          "URI.pm:66:21",
+          "URI.pm:126:29",
+          "URI.pm:153:35",
+          "URI.pm:273:18"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -38,7 +68,12 @@
       "file": "URI.pm",
       "line": 149,
       "col": 4,
-      "expect": {"all":[],"none":["URI.pm:"]},
+      "expect": {
+        "all": [],
+        "none": [
+          "URI.pm:"
+        ]
+      },
       "status": "provisional"
     },
     {
@@ -48,7 +83,16 @@
       "file": "Moo.pm",
       "line": 94,
       "col": 11,
-      "expect": {"all":["Moo.pm:95:12","Moo.pm:98:30","Moo.pm:104:41","Moo.pm:122:33","Moo.pm:131:29"],"none":[]},
+      "expect": {
+        "all": [
+          "Moo.pm:95:12",
+          "Moo.pm:98:30",
+          "Moo.pm:104:41",
+          "Moo.pm:122:33",
+          "Moo.pm:131:29"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -58,7 +102,20 @@
       "file": "Moo.pm",
       "line": 94,
       "col": 7,
-      "expect": {"all":["Moo.pm:95:7","Moo.pm:98:7","Moo.pm:99:7","Moo.pm:105:7","Moo.pm:119:9","Moo.pm:121:9","Moo.pm:123:9"],"none":["Moo.pm:104:7"]},
+      "expect": {
+        "all": [
+          "Moo.pm:95:7",
+          "Moo.pm:98:7",
+          "Moo.pm:99:7",
+          "Moo.pm:105:7",
+          "Moo.pm:119:9",
+          "Moo.pm:121:9",
+          "Moo.pm:123:9"
+        ],
+        "none": [
+          "Moo.pm:104:7"
+        ]
+      },
       "status": "gold"
     },
     {
@@ -68,7 +125,14 @@
       "file": "Moo.pm",
       "line": 81,
       "col": 11,
-      "expect": {"all":["Moo.pm:82:12","Moo.pm:83:18","Moo.pm:83:37"],"none":[]},
+      "expect": {
+        "all": [
+          "Moo.pm:82:12",
+          "Moo.pm:83:18",
+          "Moo.pm:83:37"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -78,7 +142,12 @@
       "file": "Moo.pm",
       "line": 81,
       "col": 7,
-      "expect": {"all":[],"none":["Moo.pm:"]},
+      "expect": {
+        "all": [],
+        "none": [
+          "Moo.pm:"
+        ]
+      },
       "status": "gold"
     },
     {
@@ -88,7 +157,19 @@
       "file": "Moo.pm",
       "line": 34,
       "col": 4,
-      "expect": {"all":["Moo.pm:35:5","Moo.pm:57:16","Moo.pm:83:10","Moo.pm:83:29","Moo.pm:268:16"],"none":["Moo.pm:211","Moo.pm:212"]},
+      "expect": {
+        "all": [
+          "Moo.pm:35:5",
+          "Moo.pm:57:16",
+          "Moo.pm:83:10",
+          "Moo.pm:83:29",
+          "Moo.pm:268:16"
+        ],
+        "none": [
+          "Moo.pm:211",
+          "Moo.pm:212"
+        ]
+      },
       "status": "gold"
     },
     {
@@ -98,7 +179,14 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 190,
       "col": 7,
-      "expect": {"all":["DateTime.pm:211:13","DateTime.pm:212:11","DateTime.pm:213:44"],"none":[]},
+      "expect": {
+        "all": [
+          "DateTime.pm:211:13",
+          "DateTime.pm:212:11",
+          "DateTime.pm:213:44"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -108,7 +196,16 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 189,
       "col": 7,
-      "expect": {"all":["DateTime.pm:190:8","DateTime.pm:194:16","DateTime.pm:204:22","DateTime.pm:216:30","DateTime.pm:219:11"],"none":[]},
+      "expect": {
+        "all": [
+          "DateTime.pm:190:8",
+          "DateTime.pm:194:16",
+          "DateTime.pm:204:22",
+          "DateTime.pm:216:30",
+          "DateTime.pm:219:11"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -118,8 +215,47 @@
       "file": "x86_64-linux/DateTime.pm",
       "line": 81,
       "col": 4,
-      "expect": {"all":[],"none":["DateTime.pm:"]},
+      "expect": {
+        "all": [],
+        "none": [
+          "DateTime.pm:"
+        ]
+      },
       "status": "provisional"
+    },
+    {
+      "id": "le-ppi-logical-file",
+      "difficulty": "simple",
+      "semantic_area": "lexical-var",
+      "file": "PPI/Document.pm",
+      "line": 694,
+      "col": 5,
+      "expect": {
+        "all": [
+          "Document.pm:695:5",
+          "Document.pm:696:23"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "$logical_file linked ranges in sub _default_location."
+    },
+    {
+      "id": "le-throwable-inv",
+      "difficulty": "simple",
+      "semantic_area": "lexical-var",
+      "file": "Throwable.pm",
+      "line": 66,
+      "col": 7,
+      "expect": {
+        "all": [
+          "Throwable.pm:67:7",
+          "Throwable.pm:75:19"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "$inv linked-editing exposes all occurrences in sub throw."
     }
   ]
 }
