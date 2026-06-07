@@ -124,9 +124,6 @@ $#foo;
 }
 
 #[test]
-#[ignore = "ts-parser-perl 1.1.0 regression: `my ${foo}` no longer parses as a \
-braced var-decl — it splits into `my $`, a `foo` bareword, and `{...}=1` anon-hash. \
-The `my ${name}` form is rare. Flagged for upstream in docs/parser-shortcomings.md."]
 fn braced_var_declaration_names_match_bare_form() {
     // `my ${foo}` is just `my $foo`. Before the varname refactor we
     // stored the declared name as the full node text `${foo}`, so a
@@ -922,6 +919,40 @@ fn test_return_bless_anon_hash_class() {
         "return bless should type the sub return, got {:?}",
         ty
     );
+}
+
+#[test]
+fn test_bless_into_ref_invocant_types_clone_return() {
+    // `bless { ... }, ref $_[0]` (the clone idiom) blesses into the invocant's
+    // class, so the implicit-return value types as the enclosing class.
+    let src = "package DateTime;\nsub clone { bless { %{ $_[0] } }, ref $_[0] }\n";
+    let fa = build_fa(src);
+    let ty = fa.sub_return_type_at_arity("clone", Some(1));
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("DateTime".into())),
+        "bless ..., ref $_[0] should type the clone return, got {:?}",
+        ty
+    );
+}
+
+#[test]
+fn test_forward_declaration_does_not_duplicate_symbol() {
+    // `sub foo;` is a forward declaration, not a definition: only the bodied
+    // `sub foo { ... }` should produce a symbol (no outline dup / goto-def shadow).
+    let fa = build_fa("package P;\nsub foo;\nsub foo { my ($self, $x) = @_; $x }\n");
+    let foos: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method) && s.name == "foo")
+        .collect();
+    assert_eq!(
+        foos.len(),
+        1,
+        "expected one `foo` symbol (the definition), got {:?}",
+        foos.iter().map(|s| s.span.start.row).collect::<Vec<_>>()
+    );
+    assert_eq!(foos[0].span.start.row, 2, "the symbol should be the bodied def on line 2");
 }
 
 #[test]

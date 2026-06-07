@@ -3660,6 +3660,16 @@ impl<'a> Builder<'a> {
             Err(_) => { self.visit_children(node); return; }
         };
 
+        // A bodyless `sub NAME;` / `method NAME;` is a forward declaration, not
+        // a definition (ts-parser-perl 1.1.1 parses these as real decl
+        // statements). Emitting a symbol would duplicate the real definition in
+        // the outline and shadow it in goto-def with a body-less target. Skip
+        // it — the navigable symbol is the actual definition (in this file,
+        // cross-file, or installed via AUTOLOAD/XS).
+        if node.child_by_field_name("body").is_none() {
+            return;
+        }
+
         // Extract params
         let mut params = self.extract_params(node);
 
@@ -10686,6 +10696,18 @@ impl<'a> Builder<'a> {
         // it to the enclosing package directly.
         if class_node.utf8_text(self.source).ok() == Some("__PACKAGE__") {
             return self.package_for_node(class_node);
+        }
+        // `bless $r, ref $x` (the clone idiom) blesses into `$x`'s class: the
+        // 2nd arg `ref EXPR` yields EXPR's class *name*, so the bless target is
+        // EXPR's resolved class. `ref EXPR` as a general value is a String, so
+        // this unwrap lives here (the class slot) rather than in the generic
+        // invocant resolver.
+        if class_node.kind() == "func1op_call_expression"
+            && class_node.child(0).and_then(|c| c.utf8_text(self.source).ok()) == Some("ref")
+        {
+            return class_node
+                .named_child(0)
+                .and_then(|operand| self.resolve_invocant_class_tree(operand));
         }
         if let Some(s) = self.literal_arg_string(class_node) {
             if !s.is_empty() {

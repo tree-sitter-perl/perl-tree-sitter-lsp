@@ -10,13 +10,22 @@ bleed or a whole-file ERROR wrap loses them entirely).
 For each: minimal repro, expected vs actual tree, downstream impact.
 Inspect any snippet with `perl-lsp --parse <file>` (or `--` for stdin).
 
-Parser version at time of writing: **ts-parser-perl 1.1.0**.
+Parser version at time of writing: **ts-parser-perl 1.1.1**.
 
 1.1.0 was a large fix release: the `not` prefix-operator gap
 (tree-sitter-perl#230), the `$#name`-in-string / empty-heredoc /
 bareword-filehandle / `-t FH` / `"${@}"` / v-string / bareword-`&&` /
 symbolic-code-deref families, and the `s{}{}` serialize-buffer abort all
-landed upstream. Only the items below remain.
+landed upstream.
+
+1.1.1 (no node-schema changes) added braced var declarations (`my ${foo}` —
+the **R1** regression below, now fixed), bare dotted versions (`use 5.14.0`),
+sub/method forward declarations (`sub NAME;`), glued `x`-repetition (`"ab"x3`),
+punctuation-var deref-casts, and arrow-chained subscripts in strings; it also
+fixed list-op `{…}` parsing as a hashref argument (`bless {@_}, $class`) — which
+flipped `bless {…}, ref $_[0]` from a mis-parsed indirect-object block to a
+correct two-arg call, so the builder now resolves the clone idiom's class from
+`ref EXPR` directly (`bless_class_of`). Only the items below remain.
 
 ---
 
@@ -63,42 +72,6 @@ as `main` (the `package` statement is inside the ERROR, detached from the
 body), 31+ subs vanish from the symbol table, goto-def / references /
 completion all dead for the file. This is the single highest-impact grammar
 gap found — one idiom loses one of perltidy's largest modules wholesale.
-
----
-
-## R1 — `my ${foo}` braced scalar-declaration no longer parses as a single decl (1.1.0 REGRESSION)
-
-The braced lexical-declaration form `my ${foo} = 1;` (equivalent to
-`my $foo = 1;`) parsed correctly in 1.0.3 as a single `variable_declaration`
-with canonical name `$foo`. In **1.1.0 it splits into three broken
-statements** — the `my $` decl with an EMPTY varname, a stray `foo` bareword,
-and a `{...}=1` anon-hash assignment:
-
-**Repro** (minimal):
-```perl
-my ${foo} = 1;
-$foo;
-```
-
-**Actual** (1.1.0):
-```
-(expression_statement (variable_declaration (scalar (varname))))   # `my $`  -- empty varname
-(expression_statement (bareword))                                  # `foo`
-(expression_statement (assignment_expression
-  left: (anonymous_hash_expression) right: (number)))              # `{...}=1`
-```
-No `$foo` symbol is produced, so a later `$foo` reference can't resolve to
-the declaration. No ERROR node, no contagion — but the declaration is lost.
-
-**Expected** — `my ${foo}` is `my $foo`: a single `variable_declaration`
-whose `scalar` varname is the canonical `foo` (the `${...}` braces are just
-the disambiguation form, identical to the bare sigil).
-
-**Downstream impact** — low: `my ${name}` (braced sigil on a *declaration*)
-is a rare spelling. The non-declaration deref `${$ref}` and the interpolation
-`"${name}"` forms are unaffected. The builder test
-`braced_var_declaration_names_match_bare_form` is `#[ignore]`d pending the
-upstream fix; the common `my $foo` form is correct.
 
 ---
 
