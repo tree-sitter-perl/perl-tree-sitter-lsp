@@ -195,6 +195,14 @@ pub enum ReturnExpr {
     /// query carries no receiver (build-time lookup, not a call site) —
     /// the reducer returns `None` rather than guessing.
     Receiver,
+    /// Receiver-polymorphic constructor return: the call-site invocant's
+    /// class, else the carried fallback when there is no receiver. This is
+    /// the `bless {}, $class` / `bless {}, ref $self || $self` idiom — an
+    /// inherited constructor returns whatever class it was *called on*
+    /// (`Child->new` → `Child`), so it must substitute the receiver; the
+    /// fallback (the enclosing class) keeps bare `sub_return_type` queries
+    /// answering instead of going `None`. Composes through `SUPER::new`.
+    ReceiverOr(InferredType),
     /// Apply a parametric operator with `ReturnExpr`-valued sub-positions.
     /// Substitution recurses, evaluates, and re-wraps as `ParametricType`
     /// so the value-side accessors (`class_name`, `hash_key_class`, …)
@@ -1088,6 +1096,9 @@ fn eval_return_expr(re: &ReturnExpr, q: &ReducerQuery) -> Option<InferredType> {
     match re {
         ReturnExpr::Concrete(t) => Some(t.clone()),
         ReturnExpr::Receiver => q.receiver.clone(),
+        ReturnExpr::ReceiverOr(fallback) => {
+            Some(q.receiver.clone().unwrap_or_else(|| fallback.clone()))
+        }
         ReturnExpr::Operator(op) => match op {
             ParametricOp::RowOf(inner) => {
                 // Project eagerly: `RowOf` only has meaning over a

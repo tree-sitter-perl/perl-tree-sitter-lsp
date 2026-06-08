@@ -6174,11 +6174,33 @@ impl<'a> Builder<'a> {
                 if self.is_bless_call(node) =>
             {
                 let args = self.extract_call_args(node);
-                let class = match args.get(1) {
-                    Some(c) => self.bless_class_of(*c),
-                    None => self.current_package.clone(),
-                };
-                class.map(|c| WitnessPayload::InferredType(InferredType::ClassName(c)))
+                match args.get(1) {
+                    // Receiver-polymorphic: `bless X, $class` / `bless X, ref
+                    // $self || $self` returns the class it was CALLED ON, so
+                    // inherited ctors and `SUPER::new` chains type to the actual
+                    // subclass. Fall back to the enclosing class for bare
+                    // (no-call-site) queries.
+                    Some(c) if self.bless_class_is_receiver(*c) => {
+                        let re = match self.current_package.clone() {
+                            Some(pkg) => crate::witnesses::ReturnExpr::ReceiverOr(
+                                InferredType::ClassName(pkg),
+                            ),
+                            None => crate::witnesses::ReturnExpr::Receiver,
+                        };
+                        Some(WitnessPayload::ReturnExpr(re))
+                    }
+                    // Fixed class: string / bareword / __PACKAGE__ / `ref` of a
+                    // non-invocant.
+                    Some(c) => self
+                        .bless_class_of(*c)
+                        .map(|c| WitnessPayload::InferredType(InferredType::ClassName(c))),
+                    // One-arg `bless {}` blesses into the CURRENT package (not the
+                    // receiver — Perl's one-arg bless uses __PACKAGE__).
+                    None => self
+                        .current_package
+                        .clone()
+                        .map(|c| WitnessPayload::InferredType(InferredType::ClassName(c))),
+                }
             }
 
             "function_call_expression"
@@ -10785,6 +10807,42 @@ impl<'a> Builder<'a> {
     /// literals read directly; everything else routes through the same
     /// invocant-class resolver used for method receivers (so `$class` from
     /// `shift`, `__PACKAGE__`, etc. resolve identically).
+    /// Does this `bless`-class argument denote the RECEIVER (the call-site
+    /// invocant) rather than a fixed class? Matches the receiver-polymorphic
+    /// constructor idiom: a bare invocant (`shift` / `$self` / `$class` /
+    /// `$_[0]`), `ref <invocant>`, or `<a> || <b>` / `<a> // <b>` where a side
+    /// denotes the receiver (`ref $class || $class`). A string / bareword /
+    /// `__PACKAGE__` is NOT the receiver — it blesses into a fixed class. When
+    /// true the bless returns `ReturnExpr::ReceiverOr`, so an inherited ctor /
+    /// `SUPER::new` chain types to whatever subclass it was called on.
+    fn bless_class_is_receiver(&self, node: Node<'a>) -> bool {
+        if self.is_shift_call(node) {
+            return true;
+        }
+        match node.kind() {
+            "scalar" => matches!(
+                node.utf8_text(self.source).ok(),
+                Some("$self") | Some("$class") | Some("$this") | Some("$proto")
+            ),
+            "array_element_expression" => self.is_positional_receiver(node),
+            // `ref <invocant>`
+            "func1op_call_expression" => {
+                node.child(0).and_then(|c| c.utf8_text(self.source).ok()) == Some("ref")
+                    && node
+                        .named_child(0)
+                        .map_or(false, |op| self.bless_class_is_receiver(op))
+            }
+            // `<a> || <b>` / `<a> // <b>` — receiver if either side is.
+            "binary_expression" => {
+                matches!(self.get_operator_text(node).as_deref(), Some("||") | Some("//"))
+                    && (0..node.named_child_count())
+                        .filter_map(|i| node.named_child(i))
+                        .any(|c| self.bless_class_is_receiver(c))
+            }
+            _ => false,
+        }
+    }
+
     fn bless_class_of(&self, class_node: Node<'a>) -> Option<String> {
         // `__PACKAGE__` parses as a func0op call here (not a bareword), so
         // `invocant_type_at_node`'s bareword arm doesn't catch it — resolve

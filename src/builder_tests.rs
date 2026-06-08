@@ -975,6 +975,26 @@ fn test_forward_declaration_does_not_duplicate_symbol() {
 }
 
 #[test]
+fn test_receiver_polymorphic_ctor_types_to_subclass() {
+    // An inherited `bless {}, ref $class || $class` constructor returns whatever
+    // class it was CALLED ON — Child->new is a Child, not a Base. The bless arm
+    // emits ReturnExpr::ReceiverOr; the call's receiver substitutes.
+    let fa = build_fa(
+        "package Base;\nsub new { my $class = shift; bless {}, ref $class || $class }\npackage Child;\nuse parent -norequire, 'Base';\n",
+    );
+    assert_eq!(
+        fa.find_method_return_type("Child", "new", None, Some(0)),
+        Some(InferredType::ClassName("Child".into())),
+        "Child->new (inherited ctor) must type as Child, not Base"
+    );
+    assert_eq!(
+        fa.find_method_return_type("Base", "new", None, Some(0)),
+        Some(InferredType::ClassName("Base".into())),
+        "Base->new still types as Base"
+    );
+}
+
+#[test]
 fn test_non_bless_hashref_stays_hashref() {
     // Regression: a hashref that's never blessed keeps its HashRef type.
     let src = "sub mk {\n  my $h = {};\n  return $h;\n}\n";
