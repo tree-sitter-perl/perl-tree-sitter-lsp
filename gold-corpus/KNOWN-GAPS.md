@@ -164,27 +164,30 @@ assertion is "no diagnostic at this site."
 New gaps surfaced while mining gold from fresh CPAN modules. Each is pinned at
 xfail (expected-correct confirmed from source; tool genuinely wrong).
 
-### `hover-mojo-url-clone-via-new` / `ti-mojo-url-abs-clone-chain` — clone via `$self->new` types as HashRef (same root as `ti-12`)
-`Mojo::URL::clone` does `my $clone = $self->new; …; return $clone` → expected
-`Mojo::URL`, actual `HashRef`. **Root cause (run down in the Big QA sweep): the
-receiver-polymorphic constructor idiom isn't typed cross-file.** `$self->new`
-calls `Mojo::URL::new` (= `shift->SUPER::new`), which inherits `Mojo::Base::new`:
-`bless @_ ? … : {}, ref $class || $class`. The bless class `ref $class || $class`
-means "bless into the *caller's* class" — i.e. `ReturnExpr::Receiver`. But:
-  1. `bless_class_of` doesn't recognize the `ref $x || $x` shape (only bare `ref
-     EXPR`), so `Mojo::Base::new` types as nothing → even `Mojo::URL->new` is
-     untyped (empty), not just the clone chain.
-  2. The general fix — emit `ReturnExpr::Receiver` for an invocant-blessed
-     constructor (`bless {}, $class` / `ref $self || $self`) — needs a paired
-     change: `Receiver` currently substitutes to `None` when there's no receiver
-     (a bare `sub_return_type_at_arity("new", None)` probe), which would regress
-     `test_return_bless_anon_hash_class` and every no-receiver constructor query.
-     So `Receiver` must fall back to the enclosing class when unsubstituted.
-This is the **same family as `ti-12`** (`shift->SUPER::new` not typing the
-enclosing class) — both are the cross-file receiver-polymorphic-constructor gap.
-Same-file constructors (`bless {}, shift`) work because the enclosing class
-happens to equal the receiver. **Subsystem:** bless-arm `Receiver` emission +
-`Receiver` no-receiver fallback. **Difficulty:** high (two load-bearing changes).
+### `hover-mojo-url-clone-via-new` / `ti-mojo-url-abs-clone-chain` — clone via `$self->new` types as HashRef
+`Mojo::URL::clone` does `my $clone = $self->new; @$clone{…}=…; return $clone` →
+expected `Mojo::URL`, actual `HashRef`.
+
+**PARTIALLY FIXED.** Receiver-polymorphic constructors now type correctly:
+`bless {}, $class` / `bless {}, ref $self || $self` emit `ReturnExpr::ReceiverOr`
+(the call-site receiver, else the enclosing class as fallback). So `Mojo::URL->new`
+→ `Mojo::URL`, `Child->new` (inherited ctor) → `Child`, and the `SUPER::new` chain
+composes — all at **query time**. The fold already lets a class dominate a hashref
+rep, verified: a *local*-ctor `my $x = $self->new; $x->{k}=…; return $x` returns the
+class, not HashRef.
+
+**Residual (the actual remaining break):** `$clone` never gets stamped with the
+class at the **assignment**, because resolving `$self->new` there requires the
+cross-file `SUPER::new` hop (Mojo::URL::new → Mojo::Base::new) at **build time**,
+where the module index is not warm (it is at query time — which is why
+`Mojo::URL->new` typed directly works, but `$clone = $self->new` inside the method
+does not). With no class witness on `$clone`, only the `@$clone{…}` deref-rep
+observations remain → HashRef. **Fix path:** make the build-time chain typer stamp
+the assignment via a query-time-chaseable edge (`Variable($clone) →
+Edge(Expression($self->new))`) so the cross-file SUPER chain resolves when the
+variable is folded, instead of relying on a build-time materialized class.
+**Subsystem:** build-time chain typer / assignment edge for cross-file method
+returns. **Difficulty:** high (build-time vs query-time cross-file resolution).
 
 ### `diag-mojo-cookiejar-helper-fp` / `diag-mojo-daemon-callback-fp` — first-param-self over-reach in OO classes
 In an OO class, a plain helper (`sub _compare { my ($cookie,…)=@_ }`) or an

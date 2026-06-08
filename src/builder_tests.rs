@@ -14178,3 +14178,4 @@ fn slot_type_keyed_by_owner_class() {
     let bar_h = slot_type(&fa, "Bar", "h").expect("SlotType{Bar,h} from $self write");
     assert_eq!(bar_h.class_name(), Some("Sidecar"), "got {bar_h:?}");
 }
+
