@@ -176,18 +176,32 @@ composes — all at **query time**. The fold already lets a class dominate a has
 rep, verified: a *local*-ctor `my $x = $self->new; $x->{k}=…; return $x` returns the
 class, not HashRef.
 
-**Residual (the actual remaining break):** `$clone` never gets stamped with the
-class at the **assignment**, because resolving `$self->new` there requires the
-cross-file `SUPER::new` hop (Mojo::URL::new → Mojo::Base::new) at **build time**,
-where the module index is not warm (it is at query time — which is why
-`Mojo::URL->new` typed directly works, but `$clone = $self->new` inside the method
-does not). With no class witness on `$clone`, only the `@$clone{…}` deref-rep
-observations remain → HashRef. **Fix path:** make the build-time chain typer stamp
-the assignment via a query-time-chaseable edge (`Variable($clone) →
-Edge(Expression($self->new))`) so the cross-file SUPER chain resolves when the
-variable is folded, instead of relying on a build-time materialized class.
-**Subsystem:** build-time chain typer / assignment edge for cross-file method
-returns. **Difficulty:** high (build-time vs query-time cross-file resolution).
+**Residual (root-caused — `SUPER::X` return resolution, not the assignment edge).**
+The chaseable edge already exists: `my $clone = $self->new` gives `Variable($clone)
+→ Edge(Expression($self->new))`, the fold materializes edges before reducing, and
+class-dominates-rep is in place (a *local*-ctor clone — incl. hash-slice deref —
+correctly returns the class). The actual break is one level deeper: `$self->new`
+resolves to `Mojo::URL::new`, whose body is `shift->SUPER::new`, and **`SUPER::X`
+return typing does not resolve — even same-file** (verified: `Child::new = $c->
+SUPER::new` → `None`). `emit_method_call_return_edges` emits `MethodOnClass{Child,
+"SUPER::new"}` (invocant class + literal `SUPER::new`), which never resolves.
+
+Two-part fix:
+  1. In `emit_method_call_return_edges`, when the method is `SUPER::X`, emit
+     `MethodOnClass{<parent of the enclosing package>, X}` (SUPER dispatches to the
+     *writing* package's parents, not the invocant's own class — and skips the
+     enclosing class to avoid `Child::new → Child::new` recursion).
+  2. Make the receiver preservation inheritance-aware: `materialize`'s
+     `fresh_dispatch_receiver(incoming, target_class)` resets the receiver to
+     `target_class` when `incoming != target_class`, which for SUPER drops `Child`
+     for `Base` and yields `Base`. A receiver that *is-a* the dispatch class should
+     be **preserved** (it is more specific and still valid), so the inherited
+     `ReturnExpr::ReceiverOr` substitutes the caller's class. Needs the inheritance
+     check via `q.context` (it carries `module_index` + `package_parents`).
+
+**Subsystem:** `SUPER::` dispatch in method-call-return edges + inheritance-aware
+receiver preservation. **Difficulty:** high — change (2) touches the receiver
+semantics of every dispatch, so it warrants its own PR + full regression pass.
 
 ### `diag-mojo-cookiejar-helper-fp` / `diag-mojo-daemon-callback-fp` — first-param-self over-reach in OO classes
 In an OO class, a plain helper (`sub _compare { my ($cookie,…)=@_ }`) or an
