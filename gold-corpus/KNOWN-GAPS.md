@@ -156,107 +156,21 @@ assertion is "no diagnostic at this site."
 New gaps surfaced while mining gold from fresh CPAN modules. Each is pinned at
 xfail (expected-correct confirmed from source; tool genuinely wrong).
 
-### `hover-mojo-url-clone-via-new` / `ti-mojo-url-abs-clone-chain` — clone via `$self->new` — **MOSTLY FIXED**
+### `hover-mojo-url-clone-via-new` / `ti-mojo-url-abs-clone-chain` — clone sub's stored *return type*
 `Mojo::URL::clone` does `my $clone = $self->new; @$clone{…}=…; return $clone`.
-The **variable** `$clone` now types `Mojo::URL` end-to-end — at the assignment,
-through the hash-slice mutation, and at `return $clone` (verified via `--hover`
-at every point). Two landed pieces:
-
-1. **Receiver-polymorphic constructors** (`bless {}, $class` /
-   `bless {}, ref $self || $self`) emit `ReturnExpr::ReceiverOr` — the call-site
-   receiver, else the enclosing class as fallback. So `Mojo::URL->new` →
-   `Mojo::URL`, `Child->new` (inherited ctor) → `Child`. The fold lets a class
-   dominate a hashref rep, so a hash-slice-mutated clone keeps the class.
-2. **`SUPER::X` return typing** via the `SuperCallReturn` witness:
-   `emit_method_call_return_edges` detects a `SUPER::`-prefixed method, looks `X`
-   up on the *enclosing package's parents* (not the invocant's own class), and
-   defaults the receiver to the invocant / enclosing class — preferring a dynamic
-   outer receiver only when it `is_subclass_of` the enclosing class. So
-   `Mojo::URL::new`'s body `shift->SUPER::new` resolves to `Mojo::Base::new` with
-   receiver `Mojo::URL`, whose `ReturnExpr::ReceiverOr` substitutes `Mojo::URL`.
-
-Locked in by the **gold** `hover-minion-super-new` and the unit test
-`test_super_new_types_to_calling_class`.
-
-**Residual — the SUB's stored *return type* (not the variable).** The fixture
-`hover-mojo-url-clone-via-new` cursors the `sub clone` declaration, which reports
-the sub's *declared* return type — still `HashRef`/null, NOT `Mojo::URL`. Root
-cause is **build-time vs query-time**: `clone`'s `return_types` entry is seeded
-in the fold (`seed_return_types_from_bag`) at build time, where the module index
-isn't consulted, so the cross-file `$self->new → SUPER::new → Mojo::Base::new`
-chain that the variable resolves *at query time* isn't visible to the build-time
-seed. Only locally-available evidence (the `@$clone{…}` hash-slice rep) survives
-into the stored return type. The variable hover recomputes with the module index
-and gets `Mojo::URL`; the sub-return seed does not. **This is the same class of
-gap as `ClassIsa`/`param_types` ancestry-gated *emission* deferred to the
-ReceiverGated seam** (a sub-return whose value depends on a cross-file chain must
-resolve on a query-time seam, not the build-time `return_types` map). Distinct
-from SUPER itself — kept xfail. **Subsystem:** build-time `return_types` seed vs
-query-time cross-file method-return composition. **Difficulty:** medium–high.
-
-**Note on the earlier "base-class corruption" red herring.** A first SUPER
-attempt appeared to make `find_method_return_type("Base", "new")` return `None`
-whenever a sibling SUPER-delegating `new` was present, which was blamed on a
-shared-`QueryState` memo / cycle-guard interaction. That was a **test artifact**,
-not a memo bug: the probe blessed via `bless {}, ref $c || $c`, but
-`bless_class_is_receiver` only recognises the canonical invocant names
-(`$self` / `$class` / `$this` / `$proto`) — `$c` is not one, so the ctor fell to
-`bless_class_of(||)` → `None`. Re-running with `$class`/`$self` shows same-file
-SUPER resolving with no cross-query contamination. The memo is per-top-level
-query (dropped on return) and keyed on `(bag, attachment, receiver, arity)`, so
-it never leaks across queries — the corruption never existed.
-
-### Fully-qualified method calls (`$obj->Foo::Bar::m`) — **supported across the LSP**
-Perl dispatches `$obj->Foo::Bar::m` from the *named* class `Foo::Bar` (its MRO),
-not the invocant's class. Now handled across every feature on two seams that
-mirror how FunctionCall already treats `Foo::Bar::baz()`:
-- **Return typing** — `emit_method_call_return_edges` peels the qualifier off
-  any `::`-bearing method token and emits `QualifiedCallReturn{MethodOnClass{
-  Foo::Bar, m}, …}`.
-- **Navigation** — `method_call_invocant_class` returns the qualifier as the
-  dispatch class; consumers resolve the method on the bare tail
-  (`unqualified_target_name()`), and `method_name_span` narrows to the tail
-  (`fq_tail_span`) so rename rewrites only `m`. This single class seam +
-  bare-name projection drives goto-def, references, rename/prepareRename, hover,
-  document-highlight, and signature-help.
-- **Completion** — both `Foo::Bar::` (bare) and `$obj->Foo::Bar::` (on a variable
-  invocant) complete the qualifier package's subs; the tree cursor-context detects
-  a `::`-bearing method token after `->` and routes to `QualifiedPath`.
-- **SUPER navigation** — `$self->SUPER::m` resolves to whichever ancestor
-  actually defines `m`, walking the **full parent MRO** (`resolve_super_method`
-  = the shared ancestor DFS with `skip_self`, so it searches every `@ISA` entry
-  and skips the current package). goto-def jumps to it, hover shows it, and
-  renaming the defining ancestor's method rewrites the SUPER call (a dangling
-  SUPER call would be a broken rename — see the updated
-  `rename-11-urn-canonical-precision`, which asserts the isbn SUPER call IS
-  renamed while the subclass override and unrelated `_generic.pm` are not).
-  references/rename resolve SUPER **lazily** in `refs_to` (the ref carries the
-  `SUPER::` marker + its enclosing scope, and `refs_to` runs with the module
-  index), so a SUPER call into a *cross-file* parent in a dependency file —
-  which the build-time stamp can't name — still resolves. `$self->SUPER::`
-  completion falls through to ordinary method completion (SUPER isn't a
-  package), so inherited methods still show.
-
-Proven by `test_fq_method_call_dispatches_from_named_class` (return typing),
-`test_fq_method_call_nav_dispatches_from_named_class` (goto-def / rename / class
-resolution / tail-span), `test_super_method_nav_resolves_to_parent` +
-`test_super_resolves_across_all_parents` (SUPER nav incl. multi-parent + skip-
-self), and `test_tree_context_fq_method_is_qualified_path` (completion context).
-
-### `return bless {BLOCK}, CLASS` class arg stranding — **FIXED**
-tree-sitter-perl parses `return bless {}, $class` as `return((bless {}), $class)`:
-the brace block greedily ends the parenless `bless`, stranding the class arg as a
-sibling of the `return_expression` in the enclosing `list_expression`. Perl parses
-`bless` as a list operator (the comma binds to bless), so that sibling IS the
-class. `bless_args` splices it back (gated to the parenless `ambiguous_function_
-call_expression` so an explicit `bless({}), $x` 2-element return isn't misread).
-This masked for non-inherited ctors (enclosing package == the class) but broke
-foreign-literal (`bless {}, 'Other'` → enclosing, not `Other`) and bare-`{}`
-receiver-poly ctors (`return bless {}, ref $class || $class` → enclosing, not
-`ReceiverOr`, so inherited/SUPER ctors lost the subclass). Locked in by
-`test_bless_return_strands_class_arg_recovered`,
-`test_bless_positional_self_is_receiver` (`$_[0]` is the positional invocant,
-already recognised via `is_positional_receiver`).
+The **variable** `$clone` types `Mojo::URL` correctly. The fixture cursors the
+`sub clone` declaration, which reports the sub's *declared* return type — still
+`HashRef`/null, NOT `Mojo::URL`. Root cause is **build-time vs query-time**:
+`clone`'s `return_types` entry is seeded in the fold
+(`seed_return_types_from_bag`) at build time, where the module index isn't
+consulted, so the cross-file `$self->new → SUPER::new → Mojo::Base::new` chain
+the variable resolves *at query time* isn't visible to the build-time seed —
+only the local `@$clone{…}` hash-slice rep survives. Same class of gap as
+`ClassIsa`/`param_types` ancestry-gated *emission* deferred to the ReceiverGated
+seam: a sub-return whose value depends on a cross-file chain must resolve on a
+query-time seam, not the build-time `return_types` map. **Subsystem:** build-time
+`return_types` seed vs query-time cross-file method-return composition.
+**Difficulty:** medium–high.
 
 ### `diag-mojo-cookiejar-helper-fp` / `diag-mojo-daemon-callback-fp` — first-param-self over-reach in OO classes
 In an OO class, a plain helper (`sub _compare { my ($cookie,…)=@_ }`) or an
