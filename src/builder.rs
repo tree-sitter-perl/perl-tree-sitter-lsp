@@ -2166,6 +2166,18 @@ impl<'a> Builder<'a> {
                 if text == "$self" {
                     return self.package_for_node(node).map(InferredType::ClassName);
                 }
+                // Const-folded class string: `my $c = 'Counter'; $c->bump`.
+                // In invocant position a known constant string IS the
+                // dispatch class — the same fold dynamic method names use
+                // on the other slot of the arrow. Single candidate only (a
+                // multi-valued fold can't pin one class); checked before
+                // the bag, whose honest answer for `$c` is the degenerate
+                // `String`.
+                let canonical = crate::cst::canonical_var_name(node, self.source);
+                let fold_key = canonical.as_deref().unwrap_or(text);
+                if let Some([class]) = self.resolve_constant_strings(fold_key, 0).as_deref() {
+                    return Some(InferredType::ClassName(class.clone()));
+                }
                 // The bag is canonical at every phase, walk-time
                 // included: `push_type_constraint` mirrors every TC
                 // into a Variable witness live during the walk, so
@@ -2786,7 +2798,9 @@ impl<'a> Builder<'a> {
                 let ref_idx = self.refs.len();
                 self.refs.push(Ref {
                     kind: RefKind::MethodCall {
-                        invocant,
+                        // The plugin asserts its receiver text (a literal
+                        // class like "Users", or a canonical `$self`).
+                        invocant: crate::conventions::InvocantName::assume_canonical(invocant),
                         invocant_span,
                         method_name_span: span,
                     },
@@ -7505,10 +7519,14 @@ impl<'a> Builder<'a> {
                             if name.chars().next().map_or(false, |c| c == '_' || c.is_alphabetic()) {
                                 self.refs.push(Ref {
                                     kind: RefKind::MethodCall {
-                                        invocant: invocant
-                                            .and_then(|i| i.utf8_text(&bytes).ok())
-                                            .unwrap_or("")
-                                            .to_string(),
+                                        invocant: crate::conventions::InvocantName::assume_canonical(
+                                            invocant
+                                                .and_then(|i| {
+                                                    crate::cst::canonical_var_name(i, &bytes)
+                                                        .or_else(|| i.utf8_text(&bytes).ok().map(String::from))
+                                                })
+                                                .unwrap_or_default(),
+                                        ),
                                         invocant_span: invocant.map(node_to_span),
                                         // A fully-qualified call (`$o->Foo::Bar::m`)
                                         // keeps the full path in `target_name` but
@@ -9535,15 +9553,23 @@ impl<'a> Builder<'a> {
             _ => node.span(),
         };
         let invocant_node = call.invocant();
-        let invocant_text = invocant_node
-            .and_then(|n| n.text(self.source))
-            .map(|s| s.to_string());
+        // Canonical sigiled name for variable invocants (`${sner}` records
+        // as `$sner`) so downstream bag lookups hit the variable's key; raw
+        // text for everything else.
+        let invocant_text = invocant_node.and_then(|n| {
+            crate::cst::canonical_var_name(n, self.source)
+                .or_else(|| n.text(self.source).map(|s| s.to_string()))
+        });
         let invocant = invocant_text.as_ref().map(|s| {
-            // Resolve __PACKAGE__ to enclosing package name
+            // Resolve __PACKAGE__ to enclosing package name. This is THE
+            // canonical producer for ref invocants — varname spelling
+            // normalized above, package token resolved here.
             if crate::conventions::is_current_package_token(s) {
-                self.current_package.clone().unwrap_or_else(|| s.to_string())
+                crate::conventions::InvocantName::assume_canonical(
+                    self.current_package.clone().unwrap_or_else(|| s.to_string()),
+                )
             } else {
-                s.to_string()
+                crate::conventions::InvocantName::assume_canonical(s)
             }
         });
         // Stored even when walk-time can't resolve the class — PostFold's
@@ -9553,7 +9579,8 @@ impl<'a> Builder<'a> {
         let invocant_span = invocant_node.map(|n| n.span());
 
         // Walk-time invocant_class: closed-under-syntax cases only
-        // (constructor chain `Sner->new->hi`, `__PACKAGE__->m`). Everything
+        // (constructor chain `Sner->new->hi`, `__PACKAGE__->m`, a scalar
+        // holding a const-folded class string). Everything
         // inference-dependent stays None for PostFold to fill from the bag.
         let invocant_class = invocant_node.and_then(|n| match n.kind() {
             "method_call_expression" => self.extract_constructor_class(n),

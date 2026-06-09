@@ -14280,3 +14280,70 @@ fn test_bless_positional_self_is_receiver() {
         "bless {{}}, ref $_[0] || $_[0] is receiver-polymorphic via the positional self"
     );
 }
+
+/// `${sner}->thing` is `$sner->thing` — the grammar's `varname` child
+/// excludes the braces, and the ref records the canonical sigiled name so
+/// invocant-class resolution hits the variable's bag key. A deref block
+/// (`${$ref}`) has no bare varname and must keep its raw text (no false
+/// canonicalization).
+#[test]
+fn braced_scalar_invocant_canonicalizes_and_resolves() {
+    let src = "\
+package main;
+my $sner = Foo->new;
+${sner}->thing;
+my $ref = \\$sner;
+${$ref}->other;
+";
+    let fa = build_fa(src);
+    let thing = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "thing")
+        .expect("MethodCall ref for thing");
+    let RefKind::MethodCall { ref invocant, .. } = thing.kind else {
+        panic!("expected MethodCall, got {:?}", thing.kind);
+    };
+    assert_eq!(invocant, "$sner");
+    assert_eq!(
+        fa.method_call_invocant_class(thing, None).as_deref(),
+        Some("Foo"),
+        "braced spelling resolves through the variable's type",
+    );
+
+    let other = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "other")
+        .expect("MethodCall ref for other");
+    let RefKind::MethodCall { ref invocant, .. } = other.kind else {
+        panic!("expected MethodCall, got {:?}", other.kind);
+    };
+    assert_eq!(invocant, "${$ref}", "deref block keeps raw text");
+}
+
+/// `my $c = 'Counter'; $c->bump` — a scalar invocant holding a const-folded
+/// string dispatches on that class (the same fold dynamic method names use,
+/// on the other slot of the arrow). Walk-time `invocant_class` pins it, so
+/// class-scoped refs/rename see the call without inference.
+#[test]
+fn const_folded_scalar_invocant_pins_class() {
+    let src = "\
+package Counter;
+sub bump { 1 }
+package main;
+my $c = 'Counter';
+$c->bump;
+";
+    let fa = build_fa(src);
+    let bump = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "bump" && matches!(r.kind, RefKind::MethodCall { .. }))
+        .expect("MethodCall ref for bump");
+    assert_eq!(
+        fa.method_call_invocant_class(bump, None).as_deref(),
+        Some("Counter"),
+        "const-folded invocant should dispatch on Counter",
+    );
+}

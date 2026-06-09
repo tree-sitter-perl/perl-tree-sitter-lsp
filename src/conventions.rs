@@ -35,6 +35,58 @@ pub fn is_current_package_token(text: &str) -> bool {
     text == "__PACKAGE__"
 }
 
+/// A method-call invocant in canonical spelling: variable invocants are
+/// sigil + bare varname (`${ sner }` stores as `$sner`, via the grammar's
+/// `varname` child), `__PACKAGE__` resolved to the enclosing package,
+/// anything else raw expression text. The newtype exists so a raw
+/// `node.utf8_text()` can't be slotted into an invocant field by
+/// accident — every producer either goes through the builder's
+/// canonicalizing path or owns the claim with [`assume_canonical`].
+///
+/// [`assume_canonical`]: InvocantName::assume_canonical
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct InvocantName(String);
+
+impl InvocantName {
+    /// The caller asserts the text is already canonical: plugin manifests
+    /// declaring a literal receiver class, synthesized refs spelled
+    /// `$self`, tests. Named so the assertion is grep-able — there is
+    /// deliberately no blanket `From<String>`.
+    pub fn assume_canonical(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn classify(&self) -> InvocantText<'_> {
+        InvocantText::parse(&self.0)
+    }
+}
+
+impl std::ops::Deref for InvocantName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for InvocantName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for InvocantName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::fmt::Display for InvocantName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// The text of a method-call invocant, classified once. Consumers match
 /// the variant instead of re-deriving the shape with sigil/keyword string
 /// checks at each site.
@@ -63,6 +115,10 @@ pub enum InvocantText<'a> {
 }
 
 impl<'a> InvocantText<'a> {
+    /// Classify invocant text. Callers with a node in hand canonicalize
+    /// FIRST (`cst::canonical_var_name` — the grammar's `varname` child
+    /// already strips `${...}` brace spellings); this never re-derives
+    /// node structure from text.
     pub fn parse(text: &'a str) -> Self {
         match text {
             t if is_current_package_token(t) => Self::CurrentPackage,

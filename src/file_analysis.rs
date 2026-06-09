@@ -550,7 +550,7 @@ pub enum RefKind {
     /// publishes Variable witnesses + chain-receiver `Expression`
     /// edge witnesses; the helper reads those at query time.
     MethodCall {
-        invocant: String,
+        invocant: crate::conventions::InvocantName,
         /// Span of the invocant node. Used by
         /// `method_call_invocant_class` to find an inner-receiver
         /// ref via `call_ref_by_start` (chain dispatch).
@@ -5271,7 +5271,7 @@ impl FileAnalysis {
         // enclosing-class identity here.
         use crate::conventions::InvocantText;
         if matches!(
-            InvocantText::parse(invocant),
+            invocant.classify(),
             InvocantText::PositionalReceiver | InvocantText::CurrentPackage
         ) {
             return self.enclosing_class_for_scope(r.scope);
@@ -5477,7 +5477,7 @@ impl FileAnalysis {
 
         // Positional receiver spellings and `__PACKAGE__` → enclosing class.
         if matches!(
-            crate::conventions::InvocantText::parse(invocant),
+            invocant.classify(),
             crate::conventions::InvocantText::PositionalReceiver
                 | crate::conventions::InvocantText::CurrentPackage
         ) {
@@ -5536,7 +5536,7 @@ impl FileAnalysis {
         if let Some(InferredType::ClassName(c)) = self.sub_return_type_at_arity(bare, Some(0)) {
             return Some(InferredType::ClassName(c));
         }
-        Some(InferredType::ClassName(invocant.clone()))
+        Some(InferredType::ClassName(invocant.to_string()))
     }
 
     /// Walk the scope chain to find the enclosing class or package.

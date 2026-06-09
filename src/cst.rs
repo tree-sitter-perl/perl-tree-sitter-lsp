@@ -214,6 +214,24 @@ pub(crate) fn varname_child<'a>(node: Node<'a>) -> Option<Node<'a>> {
     node.named().find(|c| c.kind() == "varname")
 }
 
+/// Canonical sigiled spelling of a variable node: `${ sner }` → `$sner`
+/// (the grammar's `varname` child already excludes the braces). `None`
+/// for deref spellings (`${$ref}` — the varname child wraps a `block`,
+/// not a bare identifier) and non-variable nodes.
+pub(crate) fn canonical_var_name<'a>(node: Node<'a>, src: &'a [u8]) -> Option<String> {
+    let sigil = match node.kind() {
+        "scalar" => '$',
+        "array" => '@',
+        "hash" => '%',
+        _ => return None,
+    };
+    let vn = varname_child(node)?;
+    if vn.named_child_count() > 0 {
+        return None;
+    }
+    Some(format!("{}{}", sigil, vn.text(src)?))
+}
+
 /// Canonical variable name for a container access: `$foo[0]` reads `@foo`,
 /// `$foo{k}` reads `%foo`, `@foo{...}` slices `%foo`. Resolves the access
 /// node + its parent's shape to the *declared* variable's sigil + bare name.
