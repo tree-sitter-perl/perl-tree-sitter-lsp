@@ -37,7 +37,7 @@ A process abort (the scanner-overflow class) is always a hard **CRASH** fail. Ou
 | outline (documentSymbol) | [outline.md](outline.md) | 10 | 0 | 2 | 1 |
 | definition (goto-def) | [definition.md](definition.md) | 18 | 2 | 0 | 0 |
 | references | [references.md](references.md) | 20 | 1 | 0 | 1 |
-| hover | [hover.md](hover.md) | 18 | 1 | 4 | 1 |
+| hover | [hover.md](hover.md) | 19 | 1 | 4 | 1 |
 | type-at | [type-at.md](type-at.md) | 12 | 2 | 2 | 5 |
 | rename | [rename.md](rename.md) | 8 | 0 | 1 | 2 |
 | workspace-symbol | [workspace-symbol.md](workspace-symbol.md) | 14 | 0 | 0 | 1 |

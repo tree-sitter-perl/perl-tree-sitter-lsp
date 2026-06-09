@@ -151,6 +151,19 @@ pub enum WitnessPayload {
     /// `MethodOnClass{class, method}` at the call's `count_call_args`);
     /// chased like `Edge` but overrides `q.arity_hint` with `arity`.
     CallReturn { target: WitnessAttachment, arity: u32 },
+    /// `$obj->SUPER::m(...)` dispatch: look `m` up on `method_lookup` (the
+    /// enclosing package's PARENT class) but default the receiver to
+    /// `receiver_class` (the invocant / enclosing class) — `SUPER::new`
+    /// blesses into the CALLER's class, not the parent, so a parent ctor
+    /// returning `ReturnExpr::ReceiverOr` must substitute the caller. The
+    /// dynamic outer receiver wins when it is a subclass of `receiver_class`.
+    /// (A plain `CallReturn` can't express this: its receiver defaults to the
+    /// dispatch class, which for SUPER is the parent — wrong.)
+    SuperCallReturn {
+        method_lookup: WitnessAttachment,
+        receiver_class: String,
+        arity: u32,
+    },
     /// **Symbol-declarative return type.** A receiver-relative /
     /// arity-relative expression that `ReturnExprReducer` substitutes at
     /// query time using `q.receiver` and `q.arity_hint`. Subsumes both
@@ -1228,13 +1241,49 @@ fn receiver_key(r: &Option<InferredType>) -> Option<String> {
 fn fresh_dispatch_receiver(
     incoming: &Option<InferredType>,
     class: &str,
+    ctx: Option<&BagContext>,
 ) -> Option<InferredType> {
     if let Some(t) = incoming {
-        if t.class_name() == Some(class) {
-            return Some(t.clone());
+        if let Some(cn) = t.class_name() {
+            // Preserve a receiver that IS the dispatch class — or a SUBCLASS of
+            // it (SUPER:: dispatch, inherited methods): more specific, still valid.
+            if cn == class || ctx.is_some_and(|c| is_subclass_of(cn, class, c)) {
+                return Some(t.clone());
+            }
         }
     }
     Some(InferredType::ClassName(class.to_string()))
+}
+
+/// Is `child` a (transitive) subclass of `ancestor`? Bounded BFS over `parents_of`.
+fn is_subclass_of(child: &str, ancestor: &str, ctx: &BagContext) -> bool {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<String> =
+        std::collections::VecDeque::from([child.to_string()]);
+    let mut steps = 0;
+    while let Some(c) = queue.pop_front() {
+        steps += 1;
+        if steps > 64 {
+            break;
+        }
+        if !seen.insert(c.clone()) {
+            continue;
+        }
+        for p in crate::file_analysis::parents_of(
+            &c,
+            ctx.package_parents,
+            ctx.module_index,
+            ctx.app_surface_consumers,
+        ) {
+            if p == ancestor {
+                return true;
+            }
+            if !seen.contains(&p) {
+                queue.push_back(p);
+            }
+        }
+    }
+    false
 }
 
 /// Depth backstop for `query_rec`. The `(bag, attachment)` visited set is
@@ -1572,7 +1621,7 @@ impl ReducerRegistry {
                                         WitnessAttachment::MethodOnClass { .. }
                                     ) =>
                                 {
-                                    fresh_dispatch_receiver(&q.receiver, class)
+                                    fresh_dispatch_receiver(&q.receiver, class, q.context)
                                 }
                                 _ => q.receiver.clone(),
                             };
@@ -1610,12 +1659,36 @@ impl ReducerRegistry {
                     // query's — that's the whole point of this variant.
                     let receiver = match target {
                         WitnessAttachment::MethodOnClass { class, .. } => {
-                            fresh_dispatch_receiver(&q.receiver, class)
+                            fresh_dispatch_receiver(&q.receiver, class, q.context)
                         }
                         _ => q.receiver.clone(),
                     };
                     let sub_q = ReducerQuery {
                         attachment: target,
+                        point: q.point,
+                        framework: q.framework,
+                        arity_hint: Some(*arity),
+                        receiver,
+                        context: q.context,
+                    };
+                    if let ReducedValue::Type(t) = &*self.query_rec(bag, &sub_q, state) {
+                        out.push(Witness {
+                            attachment: w.attachment.clone(),
+                            source: w.source.clone(),
+                            payload: WitnessPayload::InferredType(t.clone()),
+                            span: w.span,
+                        });
+                    }
+                }
+                WitnessPayload::SuperCallReturn { method_lookup, receiver_class, arity } => {
+                    // Look the method up on the parent, but the receiver is the
+                    // INVOCANT (enclosing) class — prefer a dynamic outer
+                    // receiver only when it's a subclass of it (same rule as a
+                    // fresh dispatch onto `receiver_class`).
+                    let receiver =
+                        fresh_dispatch_receiver(&q.receiver, receiver_class, q.context);
+                    let sub_q = ReducerQuery {
+                        attachment: method_lookup,
                         point: q.point,
                         framework: q.framework,
                         arity_hint: Some(*arity),

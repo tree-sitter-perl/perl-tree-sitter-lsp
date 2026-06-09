@@ -152,7 +152,8 @@
         ],
         "none": []
       },
-      "status": "xfail"
+      "status": "xfail",
+      "note": "type-at CLI is single-file (no module index), so SUPER::new can't reach Mojo::Base cross-file. The LSP path DOES resolve this — see hover-minion-super-new (gold)."
     },
     {
       "id": "ti-13",

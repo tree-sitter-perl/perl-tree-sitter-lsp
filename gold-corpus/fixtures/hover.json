@@ -259,6 +259,22 @@
       "status": "gold"
     },
     {
+      "id": "hover-minion-super-new",
+      "difficulty": "tricky",
+      "semantic_area": "oo-isa",
+      "file": "Minion.pm",
+      "line": 108,
+      "col": 6,
+      "expect": {
+        "all": [
+          "my $self = shift->SUPER::new;",
+          "type: Minion"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
       "id": "hover-minion-emit-inherited",
       "difficulty": "tricky",
       "semantic_area": "oo-isa",

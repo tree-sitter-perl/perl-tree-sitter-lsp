@@ -125,37 +125,26 @@ assertion is "no diagnostic at this site."
 
 ---
 
-## 5. Parser-version regression
+## 5. `--type-at` single-file CLI boundary
 
-### `ti-12` — `$self = shift->SUPER::new` no longer types (ts-parser-perl 1.1.0)
+### `ti-12` — `$self = shift->SUPER::new` types only via the cross-file path
 - **Cursor:** `Minion.pm:108:6` (the `$self` in `my $self = shift->SUPER::new;`)
 - **Expect:** `$self` typed `Minion` (the enclosing class).
-- **Actual:** `No type info` on **1.1.0**; returned `Minion` on **1.0.3**.
-- **Construct:** `my $self = shift->SUPER::new;` in a `Mojo::Base`-derived class.
-- **Root cause (narrowed; obvious causes ruled out):** A/B'd both parser versions.
-  Findings:
-  - **Cross-file only.** Single-file `--type-at` and `--dump-package` show `$self`
-    with NO type constraint (`vars_in_scope` = `$class`, `$e`) on **both** 1.0.3
-    and 1.1.0, and the minimal `my $self = shift->SUPER::new` is `None` on both.
-    Only the substrate/batch path (root + `PERL5LIB` + module index) yields
-    `Minion` on 1.0.3 / `None` on 1.1.0. So `$self`'s type is a *query-time*
-    bag-edge chase (`Variable $self → Edge(Expr(shift->SUPER::new))`), not a TC.
-  - **CST identical.** The `shift->SUPER::new` parse is byte-identical across
-    versions (invocant `func1op_call_expression` for bare `shift`, method token
-    `"SUPER::new"`) — verified, not assumed.
-  - **Not the local suspects.** `use Mojo::Base 'Mojo::EventEmitter'` parses
-    identically (base extraction intact); `Mojo::Base::new` returns `None` on
-    both (so the `Minion` did NOT come from the parent's `new` return) — it's a
-    constructor/invocant-class fallback (`shift`→Minion, `->…new` → invocant
-    class) resolved cross-file.
-  - **Conclusion:** 1.1.0 disrupted the cross-file `new`/SUPER chain-return
-    resolution via a parse change in *some other file the resolution walk
-    touches* (an ancestor in Minion's MRO, or the module-index method-return
-    path) — not Minion's own decl. Needs chain-typer instrumentation to pin the
-    exact hop.
-- **Reproduce:** `gold-corpus/run.pl --emit type-at Minion.pm 108 6` (→ `Minion`
-  on 1.0.3, `None` on 1.1.0). The minimal single-file repro does NOT reproduce.
-- **Difficulty:** unknown (exact broken hop open; obvious causes eliminated).
+- **Resolved in the LSP.** `SUPER::X` return typing now composes end-to-end:
+  `emit_method_call_return_edges` emits a `SuperCallReturn` witness (look `X` up
+  on the *enclosing package's parent*, default the receiver to the invocant /
+  enclosing class). `Mojo::Base::new` is receiver-polymorphic
+  (`bless …, ref $class || $class` → `ReturnExpr::ReceiverOr`), so the parent
+  ctor blesses into `Minion` and `$self` types `Minion`. Locked in by the **gold**
+  `hover-minion-super-new` (same cursor, full LSP startup) and the unit test
+  `test_super_new_types_to_calling_class`.
+- **Why this row stays xfail:** the `--type-at` CLI mode is *single-file*
+  (`cli_type_at` parses one file, no module index), so it cannot reach
+  `Mojo::Base` cross-file to resolve `SUPER::new`. This is an inherent boundary
+  of that debug CLI mode, not an LSP limitation — every cross-file query mode
+  (`--hover`, `--definition`, the LSP server) takes a `<root>` and resolves it.
+- **Reproduce:** `gold-corpus/run.pl hover` → `hover-minion-super-new` passes
+  (`Minion`); `--type-at Minion.pm 108 6` returns `No type info` (no root).
 
 ---
 
@@ -164,56 +153,55 @@ assertion is "no diagnostic at this site."
 New gaps surfaced while mining gold from fresh CPAN modules. Each is pinned at
 xfail (expected-correct confirmed from source; tool genuinely wrong).
 
-### `hover-mojo-url-clone-via-new` / `ti-mojo-url-abs-clone-chain` — clone via `$self->new` types as HashRef
-`Mojo::URL::clone` does `my $clone = $self->new; @$clone{…}=…; return $clone` →
-expected `Mojo::URL`, actual `HashRef`.
+### `hover-mojo-url-clone-via-new` / `ti-mojo-url-abs-clone-chain` — clone via `$self->new` — **MOSTLY FIXED**
+`Mojo::URL::clone` does `my $clone = $self->new; @$clone{…}=…; return $clone`.
+The **variable** `$clone` now types `Mojo::URL` end-to-end — at the assignment,
+through the hash-slice mutation, and at `return $clone` (verified via `--hover`
+at every point). Two landed pieces:
 
-**PARTIALLY FIXED.** Receiver-polymorphic constructors now type correctly:
-`bless {}, $class` / `bless {}, ref $self || $self` emit `ReturnExpr::ReceiverOr`
-(the call-site receiver, else the enclosing class as fallback). So `Mojo::URL->new`
-→ `Mojo::URL`, `Child->new` (inherited ctor) → `Child`, and the `SUPER::new` chain
-composes — all at **query time**. The fold already lets a class dominate a hashref
-rep, verified: a *local*-ctor `my $x = $self->new; $x->{k}=…; return $x` returns the
-class, not HashRef.
+1. **Receiver-polymorphic constructors** (`bless {}, $class` /
+   `bless {}, ref $self || $self`) emit `ReturnExpr::ReceiverOr` — the call-site
+   receiver, else the enclosing class as fallback. So `Mojo::URL->new` →
+   `Mojo::URL`, `Child->new` (inherited ctor) → `Child`. The fold lets a class
+   dominate a hashref rep, so a hash-slice-mutated clone keeps the class.
+2. **`SUPER::X` return typing** via the `SuperCallReturn` witness:
+   `emit_method_call_return_edges` detects a `SUPER::`-prefixed method, looks `X`
+   up on the *enclosing package's parents* (not the invocant's own class), and
+   defaults the receiver to the invocant / enclosing class — preferring a dynamic
+   outer receiver only when it `is_subclass_of` the enclosing class. So
+   `Mojo::URL::new`'s body `shift->SUPER::new` resolves to `Mojo::Base::new` with
+   receiver `Mojo::URL`, whose `ReturnExpr::ReceiverOr` substitutes `Mojo::URL`.
 
-**Residual (root-caused — `SUPER::X` return resolution, not the assignment edge).**
-The chaseable edge already exists: `my $clone = $self->new` gives `Variable($clone)
-→ Edge(Expression($self->new))`, the fold materializes edges before reducing, and
-class-dominates-rep is in place (a *local*-ctor clone — incl. hash-slice deref —
-correctly returns the class). The actual break is one level deeper: `$self->new`
-resolves to `Mojo::URL::new`, whose body is `shift->SUPER::new`, and **`SUPER::X`
-return typing does not resolve — even same-file** (verified: `Child::new = $c->
-SUPER::new` → `None`). `emit_method_call_return_edges` emits `MethodOnClass{Child,
-"SUPER::new"}` (invocant class + literal `SUPER::new`), which never resolves.
+Locked in by the **gold** `hover-minion-super-new` and the unit test
+`test_super_new_types_to_calling_class`.
 
-Two-part fix:
-  1. In `emit_method_call_return_edges`, when the method is `SUPER::X`, emit
-     `MethodOnClass{<parent of the enclosing package>, X}` (SUPER dispatches to the
-     *writing* package's parents, not the invocant's own class — and skips the
-     enclosing class to avoid `Child::new → Child::new` recursion).
-  2. Make the receiver preservation inheritance-aware: `materialize`'s
-     `fresh_dispatch_receiver(incoming, target_class)` resets the receiver to
-     `target_class` when `incoming != target_class`, which for SUPER drops `Child`
-     for `Base` and yields `Base`. A receiver that *is-a* the dispatch class should
-     be **preserved** (it is more specific and still valid), so the inherited
-     `ReturnExpr::ReceiverOr` substitutes the caller's class. Needs the inheritance
-     check via `q.context` (it carries `module_index` + `package_parents`).
+**Residual — the SUB's stored *return type* (not the variable).** The fixture
+`hover-mojo-url-clone-via-new` cursors the `sub clone` declaration, which reports
+the sub's *declared* return type — still `HashRef`/null, NOT `Mojo::URL`. Root
+cause is **build-time vs query-time**: `clone`'s `return_types` entry is seeded
+in the fold (`seed_return_types_from_bag`) at build time, where the module index
+isn't consulted, so the cross-file `$self->new → SUPER::new → Mojo::Base::new`
+chain that the variable resolves *at query time* isn't visible to the build-time
+seed. Only locally-available evidence (the `@$clone{…}` hash-slice rep) survives
+into the stored return type. The variable hover recomputes with the module index
+and gets `Mojo::URL`; the sub-return seed does not. **This is the same class of
+gap as `ClassIsa`/`param_types` ancestry-gated *emission* deferred to the
+ReceiverGated seam** (a sub-return whose value depends on a cross-file chain must
+resolve on a query-time seam, not the build-time `return_types` map). Distinct
+from SUPER itself — kept xfail. **Subsystem:** build-time `return_types` seed vs
+query-time cross-file method-return composition. **Difficulty:** medium–high.
 
-**Attempted (and backed out) — necessary but NOT sufficient.** Both parts were
-implemented and part (1) verified firing correctly (`SUPER::new` → emits
-`MethodOnClass{Base, new}`, `encl=Child`). But it surfaced a deeper blocker: with
-the SUPER edge present, even a *direct* `find_method_return_type("Base", "new")`
-on the same FA returns `None` — i.e. the presence of a sibling SUPER-delegating
-`new` **corrupts the base class's own resolution**. The CallReturn chase reaches
-`MethodOnClass{Base, new}` with `receiver=Child` but the nested `query_rec`
-returns `None` while the standalone query returns `Base`, which points at a
-shared-`QueryState` memo / cycle-guard interaction in the fold's write-back (the
-SUPER edge is processed at build time, feeding `seed_return_types_from_bag`).
-**So the real prerequisite is understanding that registry/fold interaction** — the
-two-part change alone regresses base resolution. **Subsystem:** `SUPER::` dispatch
-+ the shared-state memo/cycle behavior in `query_rec` during the fold.
-**Difficulty:** high — needs the memo/cycle interaction nailed before the
-two-part change is safe.
+**Note on the earlier "base-class corruption" red herring.** A first SUPER
+attempt appeared to make `find_method_return_type("Base", "new")` return `None`
+whenever a sibling SUPER-delegating `new` was present, which was blamed on a
+shared-`QueryState` memo / cycle-guard interaction. That was a **test artifact**,
+not a memo bug: the probe blessed via `bless {}, ref $c || $c`, but
+`bless_class_is_receiver` only recognises the canonical invocant names
+(`$self` / `$class` / `$this` / `$proto`) — `$c` is not one, so the ctor fell to
+`bless_class_of(||)` → `None`. Re-running with `$class`/`$self` shows same-file
+SUPER resolving with no cross-query contamination. The memo is per-top-level
+query (dropped on return) and keyed on `(bag, attachment, receiver, arity)`, so
+it never leaks across queries — the corruption never existed.
 
 ### `diag-mojo-cookiejar-helper-fp` / `diag-mojo-daemon-callback-fp` — first-param-self over-reach in OO classes
 In an OO class, a plain helper (`sub _compare { my ($cookie,…)=@_ }`) or an
@@ -237,7 +225,7 @@ class. **Subsystem:** first-param-self heuristic (`detect_first_param_type`).
 | diag-09 / diag-10 | typeglob-codegen synthesis | medium |
 | def-16-codegen-type-function | Type::Library synthesis | medium |
 | completion-datetime-hashkey | slot-write harvest (A4 tail) | medium–high |
-| ti-12 + mojo-url clone-via-new | cross-file receiver-polymorphic ctor (`bless {}, ref $self \|\| $self`) → `Receiver` emission + no-receiver fallback | **high** |
+| mojo-url clone *sub-return* (variable is fixed) | build-time `return_types` seed vs query-time cross-file method-return | medium–high |
 | diag-mojo-cookiejar/daemon first-param-self | invocant heuristic in OO class | **high** (ambiguous) |
 
 Quickest wins: the signature-help invocant gate, imported-names in completion,

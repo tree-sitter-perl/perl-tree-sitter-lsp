@@ -14202,3 +14202,25 @@ fn test_braced_invocant_bless_is_receiver_poly() {
         "a sigil-deref bless target must NOT be treated as the receiver"
     );
 }
+
+#[test]
+fn test_super_new_types_to_calling_class() {
+    // `$self->SUPER::new` looks `new` up on the parent (`Base`), but `Base::new`
+    // is receiver-polymorphic (`bless {}, ref $class || $class`), so it blesses
+    // into the SUBCLASS — `Child::new` must return `Child`, not `Base`. And a
+    // `clone` that calls `$self->new` composes through the SUPER hop back to
+    // `Child`.
+    let fa = build_fa(
+        "package Base;\nsub new { my $class = shift; bless {}, ref $class || $class }\nsub parse { $_[0] }\npackage Child;\nuse parent -norequire, 'Base';\nsub new { my $self = shift; @_ > 1 ? $self->SUPER::new->parse(@_) : $self->SUPER::new }\nsub clone { my $self = shift; my $c = $self->new; @$c{qw(a)} = (1); return $c }\n",
+    );
+    assert_eq!(
+        fa.find_method_return_type("Child", "new", None, Some(0)),
+        Some(InferredType::ClassName("Child".into())),
+        "SUPER::new on a receiver-polymorphic parent ctor blesses into the subclass"
+    );
+    assert_eq!(
+        fa.find_method_return_type("Child", "clone", None, Some(0)),
+        Some(InferredType::ClassName("Child".into())),
+        "clone's $self->new composes through the SUPER hop back to the subclass"
+    );
+}

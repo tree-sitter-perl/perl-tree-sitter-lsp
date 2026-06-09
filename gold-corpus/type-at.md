@@ -13,7 +13,7 @@ Positions are 0-based on input, 1-based on output. Run via `gold-corpus/run.pl t
 | ti-09 | tricky | oo-isa | `Type/Tiny.pm:397:5` | all: Type::Tiny | gold | Type::Tiny |
 | ti-10 | tricky | a4 | `Type/Tiny.pm:400:6` | all: Numeric | gold | Numeric |
 | ti-11 | simple | mojo | `Minion.pm:26:9` | all: Minion | gold | Minion |
-| ti-12 | tricky | oo-isa | `Minion.pm:108:6` | all: Minion | xfail | (1.1.0 regression: `$self = shift->SUPER::new` no longer types) |
+| ti-12 | tricky | oo-isa | `Minion.pm:108:6` | all: Minion | xfail | type-at CLI is single-file (no module index); SUPER::new can't reach Mojo::Base cross-file. LSP resolves it — see hover-minion-super-new (gold). |
 | ti-13 | simple | type-inference | `Minion.pm:110:6` | all: String | gold | String |
 | ti-14 | tricky | type-inference | `Minion.pm:151:5` | all: Minion::Worker | gold | Minion::Worker |
 | ti-15 | simple | moose | `Dist/Zilla.pm:90:7` | all: Dist::Zilla | gold | Dist::Zilla |

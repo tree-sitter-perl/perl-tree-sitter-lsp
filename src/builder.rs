@@ -12140,6 +12140,39 @@ impl<'a> Builder<'a> {
             if self.route_branded_refs.contains(&i) {
                 continue;
             }
+            // `$obj->SUPER::X` dispatches X on the parents of the package where
+            // the call is WRITTEN, skipping that package.
+            if let Some(method) = r.target_name.strip_prefix("SUPER::") {
+                let Some(encl) = self.package_at_pos(r.span.start) else { continue };
+                // SUPER blesses into the INVOCANT's class (the caller), not the
+                // parent — default the receiver to the call's invocant class,
+                // falling back to the enclosing package.
+                let receiver_class = self
+                    .method_call_invocant
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or_else(|| encl.to_string());
+                let parents = self.package_parents.get(encl).cloned().unwrap_or_default();
+                let arity = self.method_call_arity.get(&i).copied().unwrap_or(0);
+                for parent in parents {
+                    edges.push(Witness {
+                        attachment: WitnessAttachment::Expression(crate::witnesses::RefIdx(
+                            i as u32,
+                        )),
+                        source: WitnessSource::Builder("method_call_return".into()),
+                        payload: WitnessPayload::SuperCallReturn {
+                            method_lookup: WitnessAttachment::MethodOnClass {
+                                class: parent,
+                                name: method.to_string(),
+                            },
+                            receiver_class: receiver_class.clone(),
+                            arity,
+                        },
+                        span: r.span,
+                    });
+                }
+                continue;
+            }
             let Some(class) = self.method_call_invocant.get(&i) else {
                 continue;
             };

@@ -20,6 +20,7 @@ Positions are 0-based on input, 1-based on output. Run via `gold-corpus/run.pl h
 | hover-minion-has-app-mojo | simple | mojo | `Minion.pm:16:4` | all: has app => sub; package Minion; Application for job queue | gold | has app => sub {...} ... Application for job queue |
 | hover-minion-var-worker | simple | type-inference | `Minion.pm:151:6` | all: my $worker = Minion::Worker->new(minion => $self);; type: Minion::Worker | gold | my $worker = Minion::Worker->new(minion => $self); type: Minion::Worker |
 | hover-minion-self-shift-classic | simple | classic | `Minion.pm:94:7` | all: my ($self, $id) = @_;; type: Minion | gold | my ($self, $id) = @_; type: Minion |
+| hover-minion-super-new | tricky | oo-isa | `Minion.pm:108:6` | all: my $self = shift->SUPER::new;; type: Minion | gold | my $self = shift->SUPER::new; type: Minion |
 | hover-minion-emit-inherited | tricky | oo-isa | `Minion.pm:152:9` | all: sub emit(); class Minion (from Mojo::EventEmitter); Emit event. | provisional | sub emit() class Minion (from Mojo::EventEmitter) returns: HashRef ... Emit event. |
 
 ## Dropped (non-lib, absent from installed tree)
