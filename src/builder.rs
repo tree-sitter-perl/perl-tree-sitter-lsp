@@ -3,33 +3,14 @@
 //! One depth-first walk populates scopes, symbols, refs, type constraints,
 //! and fold ranges. Post-passes resolve hash key owners and variable refs.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use tree_sitter::{Node, Point, Tree};
 
 use crate::file_analysis::*;
 use crate::plugin::{self, PluginRegistry};
 
-/// Process-wide plugin registry, built once with the bundled Rhai plugins
-/// plus anything in `plugin_search_dirs()` (`$PERL_LSP_PLUGIN_DIR` and the
-/// nearest repo-local `.perl-lsp/`). All `build()` calls share it; tests
-/// that need isolation use `build_with_plugins()`.
-pub fn default_plugin_registry() -> Arc<PluginRegistry> {
-    static REG: OnceLock<Arc<PluginRegistry>> = OnceLock::new();
-    REG.get_or_init(|| {
-        let engine = Arc::new(plugin::rhai_host::make_engine());
-        let mut reg = PluginRegistry::new();
-        for p in plugin::rhai_host::load_bundled(engine.clone()) {
-            reg.register(p);
-        }
-        for dir in plugin::rhai_host::plugin_search_dirs() {
-            for p in plugin::rhai_host::load_plugin_dir(&dir, engine.clone()) {
-                reg.register(p);
-            }
-        }
-        Arc::new(reg)
-    }).clone()
-}
+pub use crate::plugin::default_plugin_registry;
 
 /// Single CST walk that powers the post-walk `ChainTypingReducer`.
 /// Indexes the node sets the reducer needs:

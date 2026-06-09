@@ -526,7 +526,7 @@ pub fn completion_items(
     // (e.g. Minion's arg-0 task-name completion: pure tasks, no
     // Minion instance-method firehose).
     if let Some(qctx) = cursor_context::build_plugin_query_context(analysis, tree, source.as_bytes(), point) {
-        let registry = crate::builder::default_plugin_registry();
+        let registry = crate::plugin::default_plugin_registry();
         let (uses, parents) = analysis.trigger_view_at(point);
         let query = crate::plugin::TriggerQuery {
             package_uses: &uses,
@@ -1706,7 +1706,7 @@ pub fn signature_help(
     // hash of a dispatcher — native would mis-show the task sig).
     let mut skip_string_dispatch = false;
     if let Some(qctx) = cursor_context::build_plugin_query_context(analysis, tree, text.as_bytes(), point) {
-        let registry = crate::builder::default_plugin_registry();
+        let registry = crate::plugin::default_plugin_registry();
         let (uses, parents) = analysis.trigger_view_at(point);
         let query = crate::plugin::TriggerQuery {
             package_uses: &uses,

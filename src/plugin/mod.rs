@@ -19,6 +19,29 @@ use crate::file_analysis::{
 pub mod cli;
 pub mod rhai_host;
 
+/// Process-wide plugin registry, built once with the bundled Rhai plugins
+/// plus anything in `plugin_search_dirs()` (`$PERL_LSP_PLUGIN_DIR` and the
+/// nearest repo-local `.perl-lsp/`). All `build()` calls share it; tests
+/// that need isolation use `build_with_plugins()`.
+pub fn default_plugin_registry() -> std::sync::Arc<PluginRegistry> {
+    use std::sync::{Arc, OnceLock};
+    static REG: OnceLock<Arc<PluginRegistry>> = OnceLock::new();
+    REG.get_or_init(|| {
+        let engine = Arc::new(rhai_host::make_engine());
+        let mut reg = PluginRegistry::new();
+        for p in rhai_host::load_bundled(engine.clone()) {
+            reg.register(p);
+        }
+        for dir in rhai_host::plugin_search_dirs() {
+            for p in rhai_host::load_plugin_dir(&dir, engine.clone()) {
+                reg.register(p);
+            }
+        }
+        Arc::new(reg)
+    })
+    .clone()
+}
+
 // ---- Context snapshots passed to plugins ----
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

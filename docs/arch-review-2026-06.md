@@ -84,7 +84,48 @@ The audit found 21. The serious ones:
   doesn't** — same question, different answer depending on entry point.
   Rename policy (which kinds rename cross-file) is implicit in each copy.
 
-## 4. What's actually fine (don't touch)
+## 4. Layering: directionally right, two knots, and the case for crates
+
+The measured intra-module dependency graph (who `use crate::`s whom) matches
+the documented four layers — data flows down, no adapter-level imports leak
+into the model. Two knots:
+
+- **`file_analysis ↔ module_index` is a genuine cycle.** 55 `FileAnalysis`
+  method signatures take `Option<&ModuleIndex>` (the query-time cross-file
+  seam) while `ModuleIndex` stores `Arc<FileAnalysis>`. Inside one crate
+  this is invisible; it's the thing that would block a crate split. The fix
+  is classic dependency inversion: the data-model crate defines the
+  capability trait (`trait CrossFileLookup { fn module(&self, name) ->
+  Option<Arc<FileAnalysis>>; ... }`), `ModuleIndex` implements it, and the
+  55 signatures take `Option<&dyn CrossFileLookup>`. Mechanical but wide.
+- **`symbols → builder`** exists only for `default_plugin_registry()` — a
+  constructor that belongs in `plugin`, not the builder. Trivial.
+
+**Should it be a workspace of crates? Eventually yes — because Cargo turns
+rules #1/#2 from doc-enforced into compiler-enforced.** A `model` crate that
+doesn't depend on the parser *cannot* grow a tree walk; reviewers stop
+needing to police it. Target DAG:
+
+```
+cst  ──────────►  tree-sitter + grammar     (typed view, src/cst.rs)
+model             file_analysis, witnesses, conventions  (no parser dep*)
+build ──► cst, model                        builder, plugin, pod, cpanfile
+index ──► model, build                      file_store, module_index/_resolver/_cache, resolve
+lsp   ──► all                               backend, symbols, cursor_context, main
+```
+
+*`Span` wraps `tree_sitter::Point` (already through a serde shim, `PointDef`)
+— the model either owns a two-field `Point` or keeps tree-sitter as a
+types-only dep (weaker guarantee).
+
+Prerequisites, in order: (1) evict the ~180 tree-walk lines from
+`file_analysis.rs` into `cursor_context.rs`/`cst.rs` (§3); (2) the
+`CrossFileLookup` inversion; (3) move `default_plugin_registry` to `plugin`.
+After those, the split is a mechanical move. Don't split before — you'd just
+relocate the violations. No other inversion is needed; the layer *order* is
+correct.
+
+## 5. What's actually fine (don't touch)
 
 - The witness bag + reducer registry. Monotone, edge-based, single query
   path. This is the best-designed part of the codebase.
