@@ -40,13 +40,13 @@ end)
 
 t.test("goto-def: $p->x jumps to field reader (via inserted line)", function()
   local N = "goto-def: $p->x jumps to field reader"
-  local insert_at = b.append(buf, { "$p->x;" })
+  local insert_at = b.append(buf, { "$p->xvalue;" })
   vim.wait(500)
 
-  local line, col = b.find_pos(buf, "$p->x;")
-  if not t.ok(N, line, "couldn't find inserted '$p->x;'") then return end
+  local line, col = b.find_pos(buf, "$p->xvalue;")
+  if not t.ok(N, line, "couldn't find inserted '$p->xvalue;'") then return end
   local def = lsp.def_line(buf, line, col + 4)
-  local expected = b.find_line(buf, "field $x :param :reader")
+  local expected = b.find_line(buf, "field $xvalue :param :reader")
 
   b.remove(buf, insert_at, insert_at + 1)
   vim.wait(200)
@@ -73,7 +73,7 @@ t.test("completion: $p-> returns Point methods", function()
   local labels = lsp.completion_labels(buf, line, col + 4)
   local ok = t.contains(N, labels, "magnitude", "completions")
   ok = t.contains(N, labels, "to_string", "completions") and ok
-  ok = t.contains(N, labels, "x", "completions") and ok
+  ok = t.contains(N, labels, "xvalue", "completions") and ok
   ok = t.contains(N, labels, "new", "completions") and ok
   if ok then t.pass(N) end
 end)
@@ -87,7 +87,7 @@ t.test("completion: $self-> inside method returns sibling methods", function()
   local labels = lsp.completion_labels(buf, line, col)
   local ok = t.contains(N, labels, "magnitude", "completions")
   ok = t.contains(N, labels, "to_string", "completions") and ok
-  ok = t.contains(N, labels, "x", "completions") and ok
+  ok = t.contains(N, labels, "xvalue", "completions") and ok
   if ok then t.pass(N) end
 end)
 
@@ -191,13 +191,13 @@ t.test("completion: $calc->get_self->get_config->{ offers hash keys", function()
   if ok then t.pass(N) end
 end)
 
-t.test("goto-def: x in Point->new(x => 3) jumps to field $x :param", function()
-  local N = "goto-def: x in Point->new(x => 3) jumps to field $x :param"
-  local line, col = b.find_pos(buf, "Point->new(x => 3")
-  if not t.ok(N, line, "couldn't find 'Point->new(x => 3'") then return end
-  -- cursor on "x": after "Point->new(" = 11 chars
+t.test("goto-def: xvalue in Point->new(xvalue => ...) jumps to field $xvalue :param", function()
+  local N = "goto-def: xvalue in Point->new(xvalue => ...) jumps to field $xvalue :param"
+  local line, col = b.find_pos(buf, "Point->new(xvalue => 9000")
+  if not t.ok(N, line, "couldn't find 'Point->new(xvalue => 9000'") then return end
+  -- cursor on "xvalue": after "Point->new(" = 11 chars
   local def = lsp.def_line(buf, line, col + 11)
-  local expected = b.find_line(buf, "field $x :param :reader")
+  local expected = b.find_line(buf, "field $xvalue :param :reader")
   if not t.ok(N, def, "no definition result") then return end
   if t.eq(N, expected, def, "definition line") then t.pass(N) end
 end)

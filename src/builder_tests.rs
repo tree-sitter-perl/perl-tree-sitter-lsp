@@ -14337,3 +14337,61 @@ $c->bump;
         "const-folded invocant should dispatch on Counter",
     );
 }
+
+/// `field $x :param :reader` is one renameable entity: the field variable,
+/// the constructor key, and the reader-method calls rewrite together,
+/// from WHICHEVER spelling the cursor is on — and the `$` sigil survives
+/// (edits cover only the bare name).
+#[test]
+fn corinna_field_group_rename_ties_all_spellings() {
+    let src = "\
+use v5.38;
+class Point {
+    field $x :param :reader;
+    field $y :param;
+    method magnitude () { return sqrt($x**2 + $y**2); }
+}
+my $p = Point->new(x => 3, y => 4);
+my $val = $p->x;
+";
+    let fa = build_fa(src);
+    let find = |row: usize, col: usize| {
+        fa.rename_at(Point::new(row, col), "coord")
+            .map(|mut v| {
+                v.sort_by_key(|(s, _)| (s.start.row, s.start.column));
+                v
+            })
+            .expect("rename produces edits")
+    };
+    // Expected spellings of `x`: field decl (2), body use (4), ctor key (6),
+    // reader call (7).
+    let from_decl = find(2, 11);
+    let rows: Vec<usize> = from_decl.iter().map(|(s, _)| s.start.row).collect();
+    assert_eq!(rows, vec![2, 4, 6, 7], "decl rename covers all spellings: {:?}", from_decl);
+    // Sigil survives: the decl edit starts AFTER the `$`.
+    assert_eq!(from_decl[0].0.start.column, 11);
+    assert!(from_decl.iter().all(|(_, t)| t == "coord"));
+
+    // Same union from the constructor key and from the body use.
+    assert_eq!(find(6, 19), from_decl, "ctor-key rename == decl rename");
+    assert_eq!(find(4, 39), from_decl, "body-use rename == decl rename");
+
+    // `$y` is untouched by `$x`'s group.
+    assert!(
+        !from_decl.iter().any(|(s, _)| s.start.row == 3),
+        "y's decl must not be in x's group"
+    );
+
+    // A `:param`-less field still renames as a plain group (no keys).
+    let src2 = "\
+use v5.38;
+class Q {
+    field $label = \"q\";
+    method tag () { return $label; }
+}
+my $q = Q->new();
+";
+    let fa2 = build_fa(src2);
+    let edits = fa2.rename_at(Point::new(2, 11), "name").expect("plain field renames");
+    assert_eq!(edits.len(), 2, "decl + body use only: {:?}", edits);
+}

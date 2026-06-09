@@ -78,20 +78,20 @@ print "Version: $version\n";
 use v5.38;
 
 class Point :isa(Base) :does(Printable) {
-    field $x :param :reader;
-    field $y :param;
+    field $xvalue :param :reader;
+    field $yvalue :param;
     field $label = "point";
 
     method magnitude () {
-        return sqrt($x**2 + $y**2);
+        return sqrt($xvalue**2 + $yvalue**2);
     }
 
     method to_string () {
         my $m = $self->magnitude();
-        return "$label: ($x, $y) mag=$m";
+        return "$label: ($xvalue, $yvalue) mag=$m";
     }
 }
 
-my $p = Point->new(x => 3, y => 4);
+my $p = Point->new(xvalue => 9000, yvalue => 9001);
 my $mag = $p->magnitude();
 print $p->to_string();

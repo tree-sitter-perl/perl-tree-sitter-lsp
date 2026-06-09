@@ -4289,16 +4289,28 @@ impl<'a> Builder<'a> {
                     has_writer = false;
                     has_param = false;
                 }
+                // Bare-name sub-span of the `$x` token: synthesized
+                // projections (ctor key, reader) select THIS, not the
+                // sigiled var span — a rename writing a bare replacement
+                // over a sigiled span would eat the `$`.
+                let bare_span = Span {
+                    start: Point {
+                        row: var_span.start.row,
+                        column: var_span.start.column + 1,
+                    },
+                    end: var_span.end,
+                };
                 // `:param` → constructor key: `Point->new(x => …)` connects
                 // to the field, mirroring Moo `has` / Class::Tiny synthesis.
-                // Selection span = the field decl, so goto-def from a
-                // constructor arg key lands on `field $x :param` (rule #9).
+                // Selection span = the field decl's bare name, so goto-def
+                // from a constructor arg key lands on `field $x :param`
+                // (rule #9).
                 if has_param {
                     self.add_symbol(
                         bare_name.to_string(),
                         SymKind::HashKeyDef,
                         node_to_span(node),
-                        *var_span,
+                        bare_span,
                         SymbolDetail::HashKeyDef {
                             owner: HashKeyOwner::Sub {
                                 package: self.current_package.clone(),
@@ -4313,7 +4325,7 @@ impl<'a> Builder<'a> {
                         bare_name.to_string(),
                         SymKind::Method,
                         node_to_span(node),
-                        *var_span,
+                        bare_span,
                         SymbolDetail::Sub { params: vec![], is_method: true, doc: None, display: None, hide_in_outline: false, opaque_return: false, is_constant: false },
                     );
                 }
@@ -4323,7 +4335,7 @@ impl<'a> Builder<'a> {
                         writer_name,
                         SymKind::Method,
                         node_to_span(node),
-                        *var_span,
+                        bare_span,
                         SymbolDetail::Sub {
                             params: vec![ParamInfo {
                                 name: format!("${}", bare_name),

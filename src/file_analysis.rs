@@ -2220,6 +2220,16 @@ pub struct FileAnalysisParts {
     pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
 }
 
+/// One Corinna field-group entity: the field symbol plus the facts the
+/// projection rename needs (class, bare name, which projections exist).
+struct FieldGroup {
+    field_sym: SymbolId,
+    class: String,
+    bare: String,
+    has_param: bool,
+    has_reader: bool,
+}
+
 impl FileAnalysis {
     /// Create a new FileAnalysis with indices built from the raw tables.
     /// `finalize_post_walk` runs on the builder path to seal baseline
@@ -4771,6 +4781,12 @@ impl FileAnalysis {
 
     /// Rename: return all spans + new text for renaming the symbol at cursor.
     pub fn rename_at(&self, point: Point, new_name: &str) -> Option<Vec<(Span, String)>> {
+        // A Corinna field and its projections (`:param` constructor key,
+        // `:reader` calls) are ONE renameable entity — rename from any
+        // spelling rewrites all of them.
+        if let Some(group) = self.field_group_at(point) {
+            return Some(self.rename_field_group(&group, new_name));
+        }
         let refs = self.find_references(point, None);
         if refs.is_empty() {
             return None;
@@ -4802,6 +4818,126 @@ impl FileAnalysis {
         };
 
         Some(edits)
+    }
+
+    /// The renameable entity behind a Corinna field: `field $x :param
+    /// :reader` is ONE name spelled three ways — the field variable, the
+    /// constructor key (`Point->new(x => …)`), and the reader method
+    /// (`$p->x`). The field is the source; the rest are projections
+    /// (rule #9), so rename rewrites them together.
+    fn field_group_at(&self, point: Point) -> Option<FieldGroup> {
+        // Cursor on the field decl, or on a field-variable use in a body.
+        let field_sym = self
+            .symbol_at(point)
+            .filter(|s| matches!(s.kind, SymKind::Field))
+            .or_else(|| {
+                self.ref_at(point).and_then(|r| {
+                    if !matches!(r.kind, RefKind::Variable) {
+                        return None;
+                    }
+                    r.resolves_to
+                        .map(|id| self.symbol(id))
+                        .filter(|s| matches!(s.kind, SymKind::Field))
+                })
+            });
+        if let Some(sym) = field_sym {
+            return self.field_group_of(sym);
+        }
+        // Cursor on a constructor key (access at a call site, or the
+        // synthesized def) owned by `Sub { class, new }`.
+        let (key, owner) = match self.ref_at(point).map(|r| (r, &r.kind)) {
+            Some((r, RefKind::HashKeyAccess { owner: Some(o), .. })) => {
+                (r.target_name.clone(), o.clone())
+            }
+            _ => match self.symbol_at(point) {
+                Some(s) if matches!(s.kind, SymKind::HashKeyDef) => match &s.detail {
+                    SymbolDetail::HashKeyDef { owner, .. } => (s.name.clone(), owner.clone()),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+        };
+        let HashKeyOwner::Sub { package: Some(class), name } = owner else {
+            return None;
+        };
+        if !crate::conventions::is_constructor_name(&name) {
+            return None;
+        }
+        let field_name = format!("${}", key);
+        let sym = self.symbols.iter().find(|s| {
+            matches!(s.kind, SymKind::Field)
+                && s.name == field_name
+                && s.package.as_deref() == Some(class.as_str())
+        })?;
+        self.field_group_of(sym)
+    }
+
+    fn field_group_of(&self, sym: &Symbol) -> Option<FieldGroup> {
+        let SymbolDetail::Field { ref attributes, .. } = sym.detail else {
+            return None;
+        };
+        if !sym.name.starts_with('$') {
+            return None;
+        }
+        Some(FieldGroup {
+            field_sym: sym.id,
+            class: sym.package.clone()?,
+            bare: sym.name[1..].to_string(),
+            has_param: attributes.iter().any(|a| a == "param"),
+            has_reader: attributes.iter().any(|a| a == "reader"),
+        })
+    }
+
+    /// Union of edits for every spelling in a field group, all written as
+    /// the bare name: variable occurrences contribute sigil-skipped spans
+    /// (the `$` survives), constructor keys and reader calls their own
+    /// bare-token spans.
+    fn rename_field_group(&self, g: &FieldGroup, new_name: &str) -> Vec<(Span, String)> {
+        let bare_new = new_name.trim_start_matches(['$', '@', '%']);
+        let mut edits: Vec<(Span, String)> = Vec::new();
+        // The field variable: decl + every body use.
+        for (span, _access) in self.collect_refs_for_target(g.field_sym, true, None) {
+            let name_span = Span {
+                start: Point::new(span.start.row, span.start.column + 1),
+                end: span.end,
+            };
+            edits.push((name_span, bare_new.to_string()));
+        }
+        // Constructor keys at call sites.
+        if g.has_param {
+            let owner = HashKeyOwner::Sub {
+                package: Some(g.class.clone()),
+                name: "new".to_string(),
+            };
+            for r in &self.refs {
+                if let RefKind::HashKeyAccess { owner: Some(o), .. } = &r.kind {
+                    if r.target_name == g.bare && o.found_by(&owner) {
+                        edits.push((r.span, bare_new.to_string()));
+                    }
+                }
+            }
+        }
+        // Reader calls (`$p->x`) dispatching to this class.
+        if g.has_reader {
+            for r in &self.refs {
+                if let RefKind::MethodCall { method_name_span, .. } = &r.kind {
+                    if r.unqualified_target_name() != g.bare {
+                        continue;
+                    }
+                    let cls = r
+                        .resolved_method_target
+                        .as_ref()
+                        .map(|t| t.invocant_class().to_string())
+                        .or_else(|| self.method_call_invocant_class(r, None));
+                    if cls.as_deref() == Some(g.class.as_str()) {
+                        edits.push((*method_name_span, bare_new.to_string()));
+                    }
+                }
+            }
+        }
+        edits.sort_by_key(|(s, _)| (s.start.row, s.start.column));
+        edits.dedup_by(|a, b| a.0 == b.0);
+        edits
     }
 
     /// Determine what kind of rename is appropriate for the cursor position.
