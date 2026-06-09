@@ -1018,14 +1018,7 @@ fn extract_delegated_call_name<'a>(return_node: Node<'a>, source: &'a [u8]) -> O
 /// returned node's kind (`varname` text is only meaningful for the
 /// identifier form).
 fn find_varname_child<'a>(node: Node<'a>) -> Option<Node<'a>> {
-    for i in 0..node.named_child_count() {
-        if let Some(child) = node.named_child(i) {
-            if child.kind() == "varname" {
-                return Some(child);
-            }
-        }
-    }
-    None
+    crate::cst::varname_child(node)
 }
 
 /// Find a directly-contained `code_deref_expression` in `node` (the grammar
@@ -1792,17 +1785,7 @@ impl<'a> Builder<'a> {
     /// nodes. Tree-sitter-perl wraps multi-arg lists in `list_expression`;
     /// single-arg calls present the arg directly.
     fn extract_call_args(&self, call_node: Node<'a>) -> Vec<Node<'a>> {
-        let args = match call_node.child_by_field_name("arguments") {
-            Some(a) => a,
-            None => return Vec::new(),
-        };
-        if args.kind() == "list_expression" || args.kind() == "parenthesized_expression" {
-            (0..args.named_child_count())
-                .filter_map(|i| args.named_child(i))
-                .collect()
-        } else {
-            vec![args]
-        }
+        crate::cst::call_args(call_node)
     }
 
     /// Build an `ArgInfo` for a plugin. Constant-folds literals, barewords,
@@ -3713,10 +3696,8 @@ impl<'a> Builder<'a> {
         // Framework-specific invocant markers (`as_invocant_params` from
         // a plugin) stack on top via EmittedParam → ParamInfo.
         if let Some(first) = params.first_mut() {
-            let name_says_invocant = matches!(
-                first.name.as_str(),
-                "$self" | "$class" | "$this" | "$proto"
-            );
+            let name_says_invocant =
+                crate::conventions::is_conventional_invocant_name(&first.name);
             let pkg_is_subclass = self.current_package
                 .as_ref()
                 .map_or(false, |p| self.package_parents.contains_key(p));
@@ -5026,19 +5007,12 @@ impl<'a> Builder<'a> {
     /// node, not its role), so names come from `extract_node_string` (bareword
     /// *or* quoted string), never from a `=>`-presence gate.
     fn accumulate_constant_block(&mut self, hash: Node<'a>) {
-        let list = (0..hash.named_child_count())
-            .filter_map(|i| hash.named_child(i))
-            .find(|c| c.kind() == "list_expression")
-            .unwrap_or(hash);
-        let mut flat: Vec<Node<'a>> = Vec::new();
-        Self::flatten_pair_list_children(list, &mut flat);
         let mut decls: Vec<(String, Node<'a>, Vec<String>)> = Vec::new();
-        self.for_each_pair_node_in_children(&flat, |name_node, val_node| {
+        for (name_node, val_node) in crate::cst::pair_nodes(hash) {
             if let Some(n) = self.extract_node_string(name_node) {
                 decls.push((n, name_node, self.extract_string_names(val_node)));
             }
-            true
-        });
+        }
         for (name, name_node, values) in decls {
             self.register_constant_symbol(&name, name_node);
             if !values.is_empty() {
@@ -5871,7 +5845,7 @@ impl<'a> Builder<'a> {
                                 invocant_node.utf8_text(self.source),
                             ) {
                                 // Skip constructors — already handled by extract_constructor_class
-                                if method != "new" {
+                                if !crate::conventions::is_constructor_name(method) {
                                     if let Some(vt) = self.get_var_text_from_lhs(left) {
                                         // Resolve dynamic method names via constant folding
                                         let method_names = if method.starts_with('$') {
@@ -9167,43 +9141,15 @@ impl<'a> Builder<'a> {
     /// barewords, autoquoted barewords (`-setup`), or strings; the inter-token
     /// commas / `=>` are skipped positionally. Stops early when `f` returns
     /// `false`.
-    fn for_each_pair_in_list<F>(&self, container: Node<'a>, f: F)
+    fn for_each_pair_in_list<F>(&self, container: Node<'a>, mut f: F)
     where
         F: FnMut(&str, Node<'a>) -> bool,
     {
-        let list = if container.kind() == "anonymous_hash_expression" {
-            (0..container.named_child_count())
-                .filter_map(|i| container.named_child(i))
-                .find(|c| c.kind() == "list_expression")
-                .unwrap_or(container)
-        } else {
-            container
-        };
-        let mut children: Vec<Node<'a>> = Vec::new();
-        Self::flatten_pair_list_children(list, &mut children);
-        self.for_each_pair_in_children(&children, f);
-    }
-
-    /// Flatten a pair-list container's children into one token stream,
-    /// descending tree-sitter-perl's right-associative nesting: `a => 1, b =>
-    /// 2` parses as `a, =>, 1, (b, =>, 2)` — the tail pairs hide inside a
-    /// nested `list_expression`. We splice that nested list's children inline
-    /// (in place of the wrapper node) so a single linear scan sees every pair.
-    /// A `list_expression` that is itself a *value* (e.g. `key => (a, b)`) only
-    /// nests when it's the last child, so descending the trailing wrapper is
-    /// safe — a non-trailing list is a genuine multi-element value and is kept
-    /// whole.
-    fn flatten_pair_list_children(list: Node<'a>, out: &mut Vec<Node<'a>>) {
-        let count = list.child_count();
-        for i in 0..count {
-            let Some(child) = list.child(i) else { continue };
-            // The trailing `list_expression` is the right-assoc continuation of
-            // the pair stream; everything else (including a non-trailing list
-            // that is a real value) stays as-is.
-            if child.kind() == "list_expression" && i + 1 == count {
-                Self::flatten_pair_list_children(child, out);
-            } else {
-                out.push(child);
+        for (k_node, val) in crate::cst::pair_nodes(container) {
+            if let Some(key) = self.extract_node_string(k_node) {
+                if !f(&key, val) {
+                    return;
+                }
             }
         }
     }
@@ -9227,33 +9173,17 @@ impl<'a> Builder<'a> {
         });
     }
 
-    /// Node-level pair walker: walk a flat sibling sequence as positional
-    /// `(key_node, value_node)` pairs, separator-agnostic (the `,` / `=>`
-    /// between tokens is skipped by position, never matched). The canonical
-    /// pairing primitive — `for_each_pair_in_children` is its string-key
-    /// projection, and span-needing callers (constant block, hash-key defs)
-    /// read the key node directly. Stops early when `f` returns `false`.
+    /// Node-level pair walker over a flat sibling sequence — see
+    /// `cst::pair_nodes_in` for the pairing rule. Stops early when `f`
+    /// returns `false`.
     fn for_each_pair_node_in_children<F>(&self, children: &[Node<'a>], mut f: F)
     where
         F: FnMut(Node<'a>, Node<'a>) -> bool,
     {
-        let count = children.len();
-        let mut i = 0;
-        while i < count {
-            let k_node = children[i];
-            i += 1;
-            if !k_node.is_named() { continue; }
-            // Skip the comma / fat comma to the next named node (the value).
-            let val = loop {
-                match children.get(i) {
-                    Some(c) if c.is_named() => break Some(*c),
-                    Some(_) => i += 1,
-                    None => break None,
-                }
-            };
-            let Some(val) = val else { break; };
-            i += 1; // step past the value so the next key isn't read off it
-            if !f(k_node, val) { return; }
+        for (k_node, val) in crate::cst::pair_nodes_in(children) {
+            if !f(k_node, val) {
+                return;
+            }
         }
     }
 
@@ -9615,20 +9545,23 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_method_call(&mut self, node: Node<'a>) {
-        let method_node = node.child_by_field_name("method");
+        use crate::cst::NodeExt;
+        let call = crate::cst::MethodCall::cast(node)
+            .expect("visit_node dispatches method_call_expression here");
+        let method_node = call.method();
         let method_name = method_node
-            .and_then(|n| n.utf8_text(self.source).ok())
+            .and_then(|n| n.text(self.source))
             .map(|s| s.to_string());
         // A fully-qualified call (`$o->Foo::Bar::m`) keeps the full path in
         // `target_name` but narrows the renamable span to the `m` tail (rule
         // #7), mirroring FunctionCall — so rename rewrites only the method.
         let method_name_span = match (method_node, method_name.as_deref()) {
             (Some(n), Some(name)) => crate::file_analysis::fq_tail_span(n, name),
-            _ => node_to_span(node),
+            _ => node.span(),
         };
-        let invocant_node = node.child_by_field_name("invocant");
+        let invocant_node = call.invocant();
         let invocant_text = invocant_node
-            .and_then(|n| n.utf8_text(self.source).ok())
+            .and_then(|n| n.text(self.source))
             .map(|s| s.to_string());
         let invocant = invocant_text.as_ref().map(|s| {
             // Resolve __PACKAGE__ to enclosing package name
@@ -9647,7 +9580,7 @@ impl<'a> Builder<'a> {
         // walk-time invocant_class was None would stay None
         // forever and class-scoped `refs_to` would silently match
         // too broadly.
-        let invocant_span = invocant_node.map(node_to_span);
+        let invocant_span = invocant_node.map(|n| n.span());
 
         // Walk-time invocant_class — closed-under-syntax cases only:
         //   - constructor pattern (`Sner->new->hi`)
@@ -10410,28 +10343,8 @@ impl<'a> Builder<'a> {
     /// name comes from the `varname` child so forms like `@{$ref}[0]`
     /// (ERROR/block-varname) don't produce garbage.
     fn canonicalize_container(&self, node: Node<'a>, text: &str) -> String {
-        let fallback = || text.to_string();
-        let parent = match node.parent() { Some(p) => p, None => return fallback() };
-        let bare = match find_varname_child(node).and_then(|v| v.utf8_text(self.source).ok()) {
-            Some(b) => b,
-            None => return fallback(),
-        };
-
-        let target_sigil: char = match parent.kind() {
-            "array_element_expression" => '@',
-            "hash_element_expression" => '%',
-            "slice_expression" | "keyval_expression" => {
-                if parent.child_by_field_name("array").map_or(false, |c| c == node) {
-                    '@'
-                } else if parent.child_by_field_name("hash").map_or(false, |c| c == node) {
-                    '%'
-                } else {
-                    return fallback();
-                }
-            }
-            _ => return fallback(),
-        };
-        format!("{}{}", target_sigil, bare)
+        crate::cst::canonical_container_name(node, self.source)
+            .unwrap_or_else(|| text.to_string())
     }
 
     /// Extract the function name from a call expression (function_call or ambiguous_function_call).
@@ -10474,7 +10387,11 @@ impl<'a> Builder<'a> {
     fn extract_constructor_class(&self, node: Node<'a>) -> Option<String> {
         if node.kind() == "method_call_expression" {
             let method = node.child_by_field_name("method")?;
-            if method.utf8_text(self.source).ok() == Some("new") {
+            if method
+                .utf8_text(self.source)
+                .ok()
+                .is_some_and(crate::conventions::is_constructor_name)
+            {
                 let invocant = node.child_by_field_name("invocant")?;
                 let inv_text = invocant.utf8_text(self.source).ok()?;
                 // Invocant must be a package name (not a variable)
@@ -10883,12 +10800,7 @@ impl<'a> Builder<'a> {
             return true;
         }
         match node.kind() {
-            // Compare the canonical varname (bare identifier), not the raw node
-            // text — so the braced spellings `${self}` / `${ class }` match too,
-            // and a deref (`${$ref}`, whose varname child is a `block`) does not.
-            "scalar" => find_varname_child(node)
-                .and_then(|v| v.utf8_text(self.source).ok())
-                .is_some_and(|n| matches!(n, "self" | "class" | "this" | "proto")),
+            "scalar" => crate::cst::is_conventional_invocant_scalar(node, self.source),
             "array_element_expression" => self.is_positional_receiver(node),
             // `ref <invocant>`
             "func1op_call_expression" => {
@@ -11050,22 +10962,8 @@ impl<'a> Builder<'a> {
     /// so the separator (`,` vs `=>`) is irrelevant; we pair positionally via
     /// the shared node-level walker and take each key node.
     fn collect_pair_keys(&mut self, node: Node<'a>, owner: &HashKeyOwner) {
-        // Unwrap the hash wrapper to its inner list, then flatten the
-        // right-associative pair nesting into one stream so positional pairing
-        // sees every key/value across the `(b, =>, 2)` continuation boundary —
-        // the value side is a real value, never re-scanned as a key.
-        let list = if node.kind() == "anonymous_hash_expression" {
-            (0..node.named_child_count())
-                .filter_map(|i| node.named_child(i))
-                .find(|c| c.kind() == "list_expression")
-                .unwrap_or(node)
-        } else {
-            node
-        };
-        let mut flat: Vec<Node<'a>> = Vec::new();
-        Self::flatten_pair_list_children(list, &mut flat);
         let mut defs: Vec<(String, Span)> = Vec::new();
-        self.for_each_pair_node_in_children(&flat, |k_node, _val| {
+        for (k_node, _val) in crate::cst::pair_nodes(node) {
             if matches!(
                 k_node.kind(),
                 "autoquoted_bareword" | "string_literal" | "interpolated_string_literal"
@@ -11076,8 +10974,7 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
-            true
-        });
+        }
         for (key, span) in defs {
             self.add_symbol(
                 key,

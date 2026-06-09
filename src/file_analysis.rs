@@ -3493,7 +3493,7 @@ impl FileAnalysis {
                 let method_name = node.child_by_field_name("method")?;
                 let method_text = method_name.utf8_text(source).ok()?;
                 // Constructor call returns Object(ClassName)
-                if method_text == "new" {
+                if crate::conventions::is_constructor_name(method_text) {
                     return Some(InferredType::ClassName(class_name.to_string()));
                 }
                 let arg_count = self.count_call_args(node);
@@ -5300,7 +5300,7 @@ impl FileAnalysis {
                             self.method_call_invocant_class(recv, module_index)
                         {
                             let recv_method = recv.unqualified_target_name();
-                            if recv_method == "new" {
+                            if crate::conventions::is_constructor_name(recv_method) {
                                 return Some(recv_class);
                             }
                             if let Some(cn) = self
@@ -7003,8 +7003,8 @@ impl FileAnalysis {
         used_keys: &HashSet<String>,
         module_index: Option<&ModuleIndex>,
     ) -> Vec<CompletionCandidate> {
-        // For `new` calls on a class, check for :param fields
-        if call_name == "new" {
+        // For constructor calls on a class, check for :param fields
+        if crate::conventions::is_constructor_name(call_name) {
             if let Some(inv) = invocant {
                 let class_name = if !inv.starts_with('$') {
                     Some(inv.to_string())

@@ -1,7 +1,9 @@
 mod backend;
 mod builder;
 mod builtins_pod;
+mod conventions;
 mod cpanfile;
+mod cst;
 mod cursor_context;
 mod document;
 mod file_analysis;

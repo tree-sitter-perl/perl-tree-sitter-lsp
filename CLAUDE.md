@@ -28,6 +28,8 @@ See `docs/ROADMAP.md` for the forward design corpus entry point. `docs/adr/file-
 
 1. **All tree-sitter CST traversal happens inside `build()`.** No other file walks tree-sitter nodes, calls `child_by_field_name`, or uses `TreeCursor`. To add CST-derived data: extend `visit_*` in `builder.rs`. Builder plugins (separate modules taking `&mut FileAnalysis` + `&Tree` + `&[u8]`) are fine — they preserve the single entry point. Multiple post-walk passes inside `build()` are allowed and named (see "Build pipeline phases") for cases needing resolved state.
 
+   **Within sanctioned tree consumers, speak `cst.rs`, not raw nodes.** `src/cst.rs` is the typed view over the CST (rust-analyzer style: zero-copy wrappers via `typed_node!` + `cast`, `NodeExt` for field-text/span/named-children, `pair_nodes` for separator-agnostic pair walking, `call_args` for flat call arguments, `varname_child`/`canonical_container_name` for variable identity, `is_conventional_invocant_scalar` for receiver detection). Each grammar trap is encoded there exactly once. New visitor code uses the typed accessors; re-spelling `child_by_field_name(..).utf8_text(..)` chains or a fresh `kind() == "..."` probe for a shape `cst.rs` already models is a bug. Name-level Perl conventions (`is_constructor_name`, `is_conventional_invocant_name`) live in `src/conventions.rs` — pure `&str`, importable by tree-free layers like `file_analysis.rs`.
+
 2. **`file_analysis.rs` is the single source of truth.** All analysis results live in `FileAnalysis`. Query methods belong here. No `tree_sitter` imports.
 
 3. **`symbols.rs` is a thin adapter** — `FileAnalysis` types → LSP types. No analysis, no tree walks, no Perl semantics decisions.
@@ -74,6 +76,8 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 - `file_store.rs` — unified store for open + workspace FileAnalyses, role-tagged, dedup'd by path.
 - `file_analysis.rs` — data model; serde-derived.
 - `builder.rs` — CST→FileAnalysis. ONLY tree-sitter consumer.
+- `cst.rs` — typed view over the CST (typed wrappers, `NodeExt`, pair walking, call args, varname canonicalization). The vocabulary every tree consumer uses.
+- `conventions.rs` — Perl-convention name predicates (constructor, conventional invocant). Pure `&str`; no tree-sitter.
 - `pod.rs` — POD→markdown via tree-sitter-pod.
 - `cursor_context.rs` — position-dependent context.
 - `symbols.rs` — LSP adapter.
