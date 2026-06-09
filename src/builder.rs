@@ -4273,17 +4273,40 @@ impl<'a> Builder<'a> {
                 // Re-read attrs from the symbol we just stored (avoid re-collecting)
                 let has_reader;
                 let has_writer;
+                let has_param;
                 if let Some(last_sym) = self.symbols.last() {
                     if let SymbolDetail::Field { ref attributes, .. } = last_sym.detail {
                         has_reader = attributes.iter().any(|a| a == "reader");
                         has_writer = attributes.iter().any(|a| a == "writer");
+                        has_param = attributes.iter().any(|a| a == "param");
                     } else {
                         has_reader = false;
                         has_writer = false;
+                        has_param = false;
                     }
                 } else {
                     has_reader = false;
                     has_writer = false;
+                    has_param = false;
+                }
+                // `:param` → constructor key: `Point->new(x => …)` connects
+                // to the field, mirroring Moo `has` / Class::Tiny synthesis.
+                // Selection span = the field decl, so goto-def from a
+                // constructor arg key lands on `field $x :param` (rule #9).
+                if has_param {
+                    self.add_symbol(
+                        bare_name.to_string(),
+                        SymKind::HashKeyDef,
+                        node_to_span(node),
+                        *var_span,
+                        SymbolDetail::HashKeyDef {
+                            owner: HashKeyOwner::Sub {
+                                package: self.current_package.clone(),
+                                name: "new".to_string(),
+                            },
+                            is_dynamic: false,
+                        },
+                    );
                 }
                 if has_reader {
                     self.add_symbol(

@@ -47,9 +47,22 @@ Decision still pending. Phases 6 and 7 block on this.
 
 ## Phase 5 — Eager `Ref.target`
 
-Today `Ref.resolves_to: Option<SymbolId>`. Some refs resolve at build, some
-lazily inside queries (which is why `collect_refs_for_target` needs tree +
-source — the lazy resolution path).
+**Lazy tree resolution is DEAD (June 2026).** An audit showed the entire
+lazy machinery (`resolve_hash_owner_from_tree`, `call_arg_key_at`, the
+tree+source params threaded through `find_definition` / `find_references` /
+`find_highlights` / `rename_at` / `collect_refs_for_target` /
+`resolve_target_at`) carried exactly one behavior: goto-def from a
+constructor named-arg key to a Corinna `:param` field. That's now eager —
+`field $x :param` synthesizes a constructor `HashKeyDef` at build (the Moo
+`has` / Class::Tiny precedent), so the key gets its own ref (rule #7). The
+walkers are deleted; `resolve_expression_type` (which cursor-time
+completion legitimately uses) moved to `cursor_context.rs`.
+`file_analysis.rs`'s only tree-sitter residue is `Point`. **The crate split
+is unblocked.**
+
+Still open from this phase: the eager-target *field* below — `resolves_to`
+is still `Option<SymbolId>` and not all ref kinds populate it. That's the
+phase 6 enabler (the unresolved bucket), not a split blocker.
 
 **Target shape:**
 

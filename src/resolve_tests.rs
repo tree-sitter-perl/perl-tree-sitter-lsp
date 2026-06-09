@@ -506,7 +506,7 @@ $x->m();
     // Cursor on `m` in `$x->m()`.
     let row = src.lines().position(|l| l.starts_with("$x->m")).unwrap();
     let col = "$x->".len();
-    let def = fa.find_definition(Point::new(row, col), Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(Point::new(row, col), None);
     assert_eq!(
         def, None,
         "untyped `$x->m` (where $x = external()) must be an honest miss, \
@@ -536,7 +536,7 @@ $x->frob;
     let fa = crate::builder::build(&tree, src.as_bytes());
     let row = src.lines().position(|l| l.starts_with("$x->frob")).unwrap();
     let col = "$x->".len();
-    let def = fa.find_definition(Point::new(row, col), Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(Point::new(row, col), None);
     assert_eq!(
         def, None,
         "untyped `$x->frob` with two unrelated `frob` definitions must \
@@ -762,7 +762,7 @@ $b->run;
 
     // ---- (2) goto-def — $f->run must jump to Foo::run (line 2), not Bar::run (line 6).
     let gd_f = fa
-        .find_definition(f_run_call, Some(&tree), Some(src.as_bytes()), None)
+        .find_definition(f_run_call, None)
         .expect("gd on $f->run resolves");
     assert_eq!(
         gd_f.start.row, 2,
@@ -771,7 +771,7 @@ $b->run;
     );
 
     let gd_b = fa
-        .find_definition(b_run_call, Some(&tree), Some(src.as_bytes()), None)
+        .find_definition(b_run_call, None)
         .expect("gd on $b->run resolves");
     assert_eq!(
         gd_b.start.row, 6,
@@ -931,7 +931,7 @@ hi();
 
     let kind = fa.rename_kind_at(hi_call, None);
     let hover = fa.hover_info(hi_call, src, None);
-    let gd = fa.find_definition(hi_call, Some(&tree), Some(src.as_bytes()), None);
+    let gd = fa.find_definition(hi_call, None);
 
     // Rename kind — for gr/rename construction.
     let target = match kind.as_ref() {
@@ -1104,7 +1104,7 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
         row: line_helper,
         column: helper_col + 2,
     };
-    let helper_highlights = fa.find_highlights(helper_pt, Some(&tree), Some(src.as_bytes()), None);
+    let helper_highlights = fa.find_highlights(helper_pt, None);
     let helper_rows: Vec<usize> = helper_highlights.iter().map(|(s, _)| s.start.row).collect();
     assert!(
         helper_rows.contains(&line_helper),
@@ -1124,7 +1124,7 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
         row: line_route,
         column: route_col + 2,
     };
-    let route_highlights = fa.find_highlights(route_pt, Some(&tree), Some(src.as_bytes()), None);
+    let route_highlights = fa.find_highlights(route_pt, None);
     let route_rows: Vec<usize> = route_highlights.iter().map(|(s, _)| s.start.row).collect();
     assert!(
         route_rows.contains(&line_route),
@@ -1659,10 +1659,7 @@ $b->touch();
     // Cursor on the first $b->touch() — column 4 lands on `t` of touch.
     let highlights = consumer_fa.find_highlights(
         tree_sitter::Point { row: 3, column: 4 },
-        None,
-        None,
-        Some(&idx),
-    );
+        Some(&idx));
 
     assert_eq!(
         highlights.len(),
@@ -1970,10 +1967,7 @@ $x->makeFoo()->ping();
     // Cursor on the first `->ping()` — column 18 lands on `p` of ping.
     let highlights = consumer_fa.find_highlights(
         tree_sitter::Point { row: 3, column: 18 },
-        None,
-        None,
-        Some(&idx),
-    );
+        Some(&idx));
 
     // Both call sites of `->ping()` share the same chain receiver
     // shape; they must highlight together once chain typing

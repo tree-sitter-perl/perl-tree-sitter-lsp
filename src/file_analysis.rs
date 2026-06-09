@@ -278,7 +278,7 @@ pub struct Span {
 /// Extract the function/method name from a call expression node.
 // Node-side utilities live in `cst.rs`; re-exported here while the lazy
 // tree-resolution paths (phase 5 retires them) still call them in-module.
-pub(crate) use crate::cst::{extract_call_name, find_ancestor, fq_tail_span, node_to_span};
+pub(crate) use crate::cst::{extract_call_name, fq_tail_span, node_to_span};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoldRange {
@@ -3644,194 +3644,6 @@ impl FileAnalysis {
         }
     }
 
-    /// Resolve the type of an arbitrary CST expression node.
-    ///
-    /// Recursive tree walk that composes existing atoms:
-    /// - `scalar` → `inferred_type(var_text, point)`
-    /// - bareword (class name) → `Object(ClassName)`
-    /// - `method_call_expression` → resolve invocant → find method → return type
-    /// - `function_call_expression` → `sub_return_type(name)`
-    /// - `hash_element_expression` → resolve base (for chaining)
-    ///
-    /// Used at query time (completion, goto-def, hover) — not during the build walk.
-    pub fn resolve_expression_type(
-        &self,
-        node: tree_sitter::Node,
-        source: &[u8],
-        module_index: Option<&dyn CrossFileLookup>,
-    ) -> Option<InferredType> {
-        // Tree-free first: the builder recorded the type of every
-        // meaningful expression at its span (`Expr(span)` + the
-        // `Expression(refidx)` call axis). Read it back by span — the
-        // same chase `method_call_invocant_class` uses. The node-kind
-        // walk below is the degradation path for the raw-cursor /
-        // incomplete-ERROR case completion hits where no witness was
-        // recorded (a node that never existed at build time).
-        let span = Span {
-            start: node.start_position(),
-            end: node.end_position(),
-        };
-        if let Some(t) = self.expr_type_at_span(span, module_index) {
-            return Some(t);
-        }
-        let point = node.start_position();
-        match node.kind() {
-            "scalar" => {
-                let text = node.utf8_text(source).ok()?;
-                // Route scalar-type resolution through the witness bag so
-                // framework / branch / arity rules refine the answer. Keep the
-                // index so a role-contract param (`$c`) resolves through
-                // cross-file ancestry, not just the local `package_parents`.
-                self.inferred_type_via_bag_ctx(text, point, module_index)
-            }
-            "package" | "bareword" => {
-                // Bareword = class name
-                let text = node.utf8_text(source).ok()?;
-                Some(InferredType::ClassName(text.to_string()))
-            }
-            "array_element_expression" => {
-                // `$arr[N]` — look up `@arr`'s Sequence shape via the
-                // bag, project the index. The bag answer is whatever
-                // the walker's last `push` / `my @arr = (...)`
-                // contribution left on `Variable{"@arr", scope}`.
-                let arr = node.child_by_field_name("array")?;
-                let name = arr
-                    .named_child(0)
-                    .and_then(|n| n.utf8_text(source).ok())?;
-                let idx_node = node.child_by_field_name("index")?;
-                let idx: i32 = idx_node.utf8_text(source).ok()?.parse().ok()?;
-                let arr_var = format!("@{}", name);
-                self.inferred_type_via_bag(&arr_var, point)
-                    .and_then(|t| t.element_at(idx).cloned())
-            }
-            "method_call_expression" => {
-                let invocant_node = node.child_by_field_name("invocant")?;
-                let invocant_type = self.resolve_expression_type(invocant_node, source, module_index)?;
-                let class_name = invocant_type.class_name()?;
-                let method_name = node.child_by_field_name("method")?;
-                let method_text = method_name.utf8_text(source).ok()?;
-                // Constructor call returns Object(ClassName)
-                if crate::conventions::is_constructor_name(method_text) {
-                    return Some(InferredType::ClassName(class_name.to_string()));
-                }
-                let arg_count = self.count_call_args(node);
-                self.find_method_return_type(class_name, method_text, module_index, Some(arg_count))
-            }
-            "function_call_expression" | "ambiguous_function_call_expression" => {
-                let func_node = node.child_by_field_name("function")?;
-                let name = func_node.utf8_text(source).ok()?;
-                // Route through the arity-aware helper so fluent
-                // arity dispatch (`return X unless @_`) can pick the
-                // right branch when the caller's arg count is known.
-                let arg_count = self.count_call_args(node) as u32;
-                self.sub_return_type_at_arity(name, Some(arg_count))
-                    .or_else(|| builtin_return_type(name))
-            }
-            "func1op_call_expression" | "func0op_call_expression" => {
-                let name = node.child(0)?.utf8_text(source).ok()?;
-                builtin_return_type(name)
-            }
-            "hash_element_expression" => {
-                // For chaining: resolve the base expression
-                let base = node.named_child(0)?;
-                self.resolve_expression_type(base, source, module_index)
-            }
-            _ => None,
-        }
-    }
-
-    /// Resolve the hash key owner from a tree node at a given point.
-    ///
-    /// Finds the enclosing `hash_element_expression`, resolves its base expression
-    /// type, and returns the appropriate `HashKeyOwner`. Used by goto-def,
-    /// references, completion, and highlights for chained hash access like
-    /// `$calc->get_self->get_config->{host}`.
-    pub fn resolve_hash_owner_from_tree(
-        &self,
-        tree: &tree_sitter::Tree,
-        source: &[u8],
-        point: Point,
-        module_index: Option<&dyn CrossFileLookup>,
-    ) -> Option<HashKeyOwner> {
-        let hash_elem = tree.root_node()
-            .descendant_for_point_range(point, point)
-            .and_then(|n| find_ancestor(n, "hash_element_expression"))?;
-        let base = hash_elem.named_child(0)?;
-        let ty = self.resolve_expression_type(base, source, module_index)?;
-
-        // Extract the function/method name for Sub owner
-        let sub_name = match base.kind() {
-            "method_call_expression" => base.child_by_field_name("method")
-                .and_then(|n| n.utf8_text(source).ok())
-                .map(|s| s.to_string()),
-            "function_call_expression" | "ambiguous_function_call_expression" =>
-                base.child_by_field_name("function")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .map(|s| s.to_string()),
-            _ => None,
-        };
-
-        if let Some(name) = sub_name {
-            // Try each package the sub might belong to. In practice, the sub
-            // is either defined locally (package comes from its Symbol) or
-            // imported (package = None, matching the enrichment synthetic def).
-            let mut candidate_owners: Vec<HashKeyOwner> = Vec::new();
-            for sym in &self.symbols {
-                if (sym.kind == SymKind::Sub || sym.kind == SymKind::Method) && sym.name == name {
-                    candidate_owners.push(HashKeyOwner::Sub {
-                        package: sym.package.clone(),
-                        name: name.clone(),
-                    });
-                }
-            }
-            // Fallback: None-package owner (matches imported synthetic defs).
-            candidate_owners.push(HashKeyOwner::Sub { package: None, name: name.clone() });
-            for sub_owner in candidate_owners {
-                if !self.hash_key_defs_for_owner(&sub_owner).is_empty() {
-                    return Some(sub_owner);
-                }
-            }
-        }
-
-        // Hash-key context: read `hash_key_class()` (= row-class
-        // for Parametric, dispatch class else) instead of bare
-        // `class_name()`. CLAUDE.md invariant #10 — never special-
-        // case for a particular shape; the type already carries
-        // the per-axis answer. For non-Parametric this is
-        // equivalent to `class_name()`; for Parametric it's the
-        // crucial narrowing to the type's row-class arg.
-        if let Some(cn) = ty.hash_key_class() {
-            return Some(HashKeyOwner::Class(cn.to_string()));
-        }
-
-        None
-    }
-
-    /// Check if cursor is on a bareword or string inside call arguments.
-    /// Returns the text if so (could be a named arg key).
-    fn call_arg_key_at(&self, tree: &tree_sitter::Tree, source: &[u8], point: Point) -> Option<String> {
-        let node = tree.root_node().descendant_for_point_range(point, point)?;
-        let key_node = match node.kind() {
-            "autoquoted_bareword" => node,
-            "string_literal" | "interpolated_string_literal" => node,
-            _ => {
-                let parent = node.parent()?;
-                if matches!(parent.kind(), "string_literal" | "interpolated_string_literal") {
-                    parent
-                } else {
-                    return None;
-                }
-            }
-        };
-        let text = key_node.utf8_text(source).ok()?;
-        if (text.starts_with('\'') || text.starts_with('"')) && text.len() >= 2 {
-            Some(text[1..text.len()-1].to_string())
-        } else if text.starts_with('\'') || text.starts_with('"') {
-            None
-        } else {
-            Some(text.to_string())
-        }
-    }
 
     /// Bag-routed query: "what does `Symbol(sym_id)` return at this
     /// arity?" Runs through the full reducer registry — Plugin
@@ -3953,29 +3765,6 @@ impl FileAnalysis {
         let reg = ReducerRegistry::with_defaults();
         if let ReducedValue::Type(t) = reg.query(&self.witnesses, &q) {
             return Some(t);
-        }
-        None
-    }
-
-    /// Count arguments in a method/function call expression (excluding invocant).
-    pub(crate) fn count_call_args(&self, node: tree_sitter::Node) -> usize {
-        crate::cst::call_args(node).len()
-    }
-
-    /// Find a `:param` field in a class by its bare name (without sigil).
-    fn find_param_field(&self, class_name: &str, key: &str) -> Option<Span> {
-        for sym in &self.symbols {
-            if matches!(sym.kind, SymKind::Field) {
-                if let SymbolDetail::Field { ref attributes, .. } = sym.detail {
-                    if attributes.contains(&"param".to_string())
-                        && self.symbol_in_class(sym.id, class_name)
-                    {
-                        if sym.bare_name() == key {
-                            return Some(sym.selection_span);
-                        }
-                    }
-                }
-            }
         }
         None
     }
@@ -4466,7 +4255,7 @@ impl FileAnalysis {
     // ---- High-level queries ----
 
     /// Go-to-definition: resolve the symbol at cursor to its definition span.
-    pub fn find_definition(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>, module_index: Option<&dyn CrossFileLookup>) -> Option<Span> {
+    pub fn find_definition(&self, point: Point, _module_index: Option<&dyn CrossFileLookup>) -> Option<Span> {
         // 1. Check if cursor is on a ref
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
@@ -4497,53 +4286,6 @@ impl FileAnalysis {
                     // the LSP adapter (symbols::find_definition).
                 }
                 RefKind::MethodCall { .. } => {
-                    // Single-source the invocant class off the build-time
-                    // frozen dispatch edge (NAV unification) — the same edge
-                    // refs_to / hover read, so all three agree. `None` edge
-                    // means the invocant didn't infer: honest miss.
-                    let class_name = r
-                        .resolved_method_target
-                        .as_ref()
-                        .map(|t| t.invocant_class().to_string());
-
-                    // Cursor on a named arg key (not the method name):
-                    // resolve to its hash-key def or :param field.
-                    //
-                    // The hash-key-arg owner is per-flavor + method-aware:
-                    // `ParametricType::method_arg_owner(method)` —
-                    // `Some(owner)` means the flavor claims these args
-                    // (DBIC ResultSet → row class for search/find/create;
-                    // None for count/exists). When unclaimed, fall back to
-                    // the receiver's class (constructor keys on
-                    // `bless {} 'Foo'`). Method dispatch still uses
-                    // `class_name()`, so `$rs->search` resolves against the
-                    // ResultSet base.
-                    if let (Some(t), Some(s)) = (tree, source_bytes) {
-                        if let Some(key_name) = self.call_arg_key_at(t, s, point) {
-                            let owner = self
-                                .method_call_invocant_type(r, module_index)
-                                .as_ref()
-                                .and_then(|ty| ty.as_parametric())
-                                .and_then(|p| p.method_arg_owner(r.unqualified_target_name()))
-                                .or_else(|| {
-                                    class_name
-                                        .as_ref()
-                                        .map(|c| HashKeyOwner::Class(c.clone()))
-                                });
-                            if let Some(owner) = owner {
-                                for def in self.hash_key_defs_for_owner(&owner) {
-                                    if def.name == key_name {
-                                        return Some(def.selection_span);
-                                    }
-                                }
-                                if let HashKeyOwner::Class(cn) = &owner {
-                                    if let Some(span) = self.find_param_field(cn, &key_name) {
-                                        return Some(span);
-                                    }
-                                }
-                            }
-                        }
-                    }
 
                     // Method dispatch is the frozen edge, full stop.
                     // `Local` lands on the local symbol; `CrossFile`
@@ -4572,12 +4314,7 @@ impl FileAnalysis {
                 }
                 RefKind::HashKeyAccess { ref owner, .. } => {
                     // Try the pre-resolved owner first
-                    let resolved_owner = owner.clone().or_else(|| {
-                        let tree = tree?;
-                        let source = source_bytes?;
-                        self.resolve_hash_owner_from_tree(tree, source, r.span.start, module_index)
-                    });
-                    if let Some(ref owner) = resolved_owner {
+                    if let Some(ref owner) = owner {
                         for def in self.hash_key_defs_for_owner(owner) {
                             if def.name == r.target_name {
                                 return Some(def.selection_span);
@@ -4627,12 +4364,10 @@ impl FileAnalysis {
     pub fn find_references(
         &self,
         point: Point,
-        tree: Option<&tree_sitter::Tree>,
-        source_bytes: Option<&[u8]>,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Vec<Span> {
-        if let Some((target_id, include_decl)) = self.resolve_target_at(point, tree, source_bytes, module_index) {
-            let mut results = self.collect_refs_for_target(target_id, include_decl, tree, source_bytes, module_index);
+        if let Some((target_id, include_decl)) = self.resolve_target_at(point, module_index) {
+            let mut results = self.collect_refs_for_target(target_id, include_decl, module_index);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
             results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
             results.into_iter().map(|(span, _)| span).collect()
@@ -4645,12 +4380,10 @@ impl FileAnalysis {
     pub fn find_highlights(
         &self,
         point: Point,
-        tree: Option<&tree_sitter::Tree>,
-        source_bytes: Option<&[u8]>,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Vec<(Span, AccessKind)> {
-        if let Some((target_id, _)) = self.resolve_target_at(point, tree, source_bytes, module_index) {
-            let mut results = self.collect_refs_for_target(target_id, true, tree, source_bytes, module_index);
+        if let Some((target_id, _)) = self.resolve_target_at(point, module_index) {
+            let mut results = self.collect_refs_for_target(target_id, true, module_index);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
             results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
             return results;
@@ -4712,8 +4445,6 @@ impl FileAnalysis {
         &self,
         target_id: SymbolId,
         include_decl: bool,
-        tree: Option<&tree_sitter::Tree>,
-        source_bytes: Option<&[u8]>,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Vec<(Span, AccessKind)> {
         let sym = self.symbol(target_id);
@@ -4788,15 +4519,8 @@ impl FileAnalysis {
                     }
                     let matches = match ro {
                         Some(ref ro) => owner.found_by(ro),
-                        None => {
-                            if let (Some(t), Some(s)) = (tree, source_bytes) {
-                                self.resolve_hash_owner_from_tree(t, s, r.span.start, None)
-                                    .as_ref()
-                                    .map_or(false, |resolved| owner.found_by(resolved))
-                            } else {
-                                false
-                            }
-                        }
+                        None => false,
+
                     };
                     if matches {
                         results.push((r.span, r.access));
@@ -5046,8 +4770,8 @@ impl FileAnalysis {
     }
 
     /// Rename: return all spans + new text for renaming the symbol at cursor.
-    pub fn rename_at(&self, point: Point, new_name: &str, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>) -> Option<Vec<(Span, String)>> {
-        let refs = self.find_references(point, tree, source_bytes, None);
+    pub fn rename_at(&self, point: Point, new_name: &str) -> Option<Vec<(Span, String)>> {
+        let refs = self.find_references(point, None);
         if refs.is_empty() {
             return None;
         }
@@ -5261,7 +4985,7 @@ impl FileAnalysis {
     // ---- Internal resolution helpers ----
 
     /// Find the target symbol for the thing at cursor. Returns (SymbolId, include_decl_in_refs).
-    fn resolve_target_at(&self, point: Point, tree: Option<&tree_sitter::Tree>, source_bytes: Option<&[u8]>, module_index: Option<&dyn CrossFileLookup>) -> Option<(SymbolId, bool)> {
+    fn resolve_target_at(&self, point: Point, module_index: Option<&dyn CrossFileLookup>) -> Option<(SymbolId, bool)> {
         // Check refs first
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
@@ -5350,12 +5074,7 @@ impl FileAnalysis {
                     }
                 }
                 RefKind::HashKeyAccess { ref owner, .. } => {
-                    let resolved_owner = owner.clone().or_else(|| {
-                        let tree = tree?;
-                        let source = source_bytes?;
-                        self.resolve_hash_owner_from_tree(tree, source, r.span.start, module_index)
-                    });
-                    if let Some(ref owner) = resolved_owner {
+                    if let Some(ref owner) = owner {
                         for def in self.hash_key_defs_for_owner(owner) {
                             if def.name == r.target_name {
                                 return Some((def.id, true));

@@ -172,8 +172,6 @@ pub fn find_definition(
     pos: Position,
     uri: &Url,
     module_index: &ModuleIndex,
-    tree: &Tree,
-    source: &str,
 ) -> Option<GotoDefinitionResponse> {
     let point = position_to_point(pos);
 
@@ -191,7 +189,7 @@ pub fn find_definition(
     }
 
     // Try local definition first
-    if let Some(span) = analysis.find_definition(point, Some(tree), Some(source.as_bytes()), Some(module_index)) {
+    if let Some(span) = analysis.find_definition(point, Some(module_index)) {
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
             range: span_to_range(span),
@@ -404,8 +402,8 @@ fn dispatch_handler_locations(
     })
 }
 
-pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url, tree: &Tree, source: &str, module_index: Option<&dyn CrossFileLookup>) -> Vec<Location> {
-    analysis.find_references(position_to_point(pos), Some(tree), Some(source.as_bytes()), module_index)
+pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url, module_index: Option<&dyn CrossFileLookup>) -> Vec<Location> {
+    analysis.find_references(position_to_point(pos), module_index)
         .into_iter()
         .map(|span| Location {
             uri: uri.clone(),
@@ -419,12 +417,8 @@ pub fn rename(
     pos: Position,
     uri: &Url,
     new_name: &str,
-    tree: Option<&tree_sitter::Tree>,
-    source: Option<&str>,
 ) -> Option<WorkspaceEdit> {
-    let edits = analysis.rename_at(
-        position_to_point(pos), new_name, tree, source.map(|s| s.as_bytes()),
-    )?;
+    let edits = analysis.rename_at(position_to_point(pos), new_name)?;
 
     let text_edits: Vec<TextEdit> = edits
         .into_iter()
@@ -1087,9 +1081,9 @@ pub fn hover_info(
     None
 }
 
-pub fn document_highlights(analysis: &FileAnalysis, pos: Position, tree: &tree_sitter::Tree, source: &str, module_index: Option<&dyn CrossFileLookup>) -> Vec<DocumentHighlight> {
+pub fn document_highlights(analysis: &FileAnalysis, pos: Position, module_index: Option<&dyn CrossFileLookup>) -> Vec<DocumentHighlight> {
     use crate::file_analysis::AccessKind;
-    analysis.find_highlights(position_to_point(pos), Some(tree), Some(source.as_bytes()), module_index)
+    analysis.find_highlights(position_to_point(pos), module_index)
         .into_iter()
         .map(|(span, access)| DocumentHighlight {
             range: span_to_range(span),
@@ -1111,7 +1105,7 @@ pub fn linked_editing_ranges(
     pos: Position,
     module_index: Option<&dyn CrossFileLookup>,
 ) -> Option<Vec<Range>> {
-    let refs = analysis.find_references(position_to_point(pos), None, None, module_index);
+    let refs = analysis.find_references(position_to_point(pos), module_index);
     if refs.len() < 2 {
         return None;
     }

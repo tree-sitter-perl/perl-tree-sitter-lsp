@@ -441,8 +441,6 @@ impl LanguageServer for Backend {
             pos,
             uri,
             &self.module_index,
-            &doc.tree,
-            &doc.text,
         ))
     }
 
@@ -462,7 +460,7 @@ impl LanguageServer for Backend {
             // Lexical / unowned — single-file references.
             Some(ResolvedTarget::Local) | None => {
                 let refs = symbols::find_references(
-                    &doc.analysis, pos, uri, &doc.tree, &doc.text, Some(&*self.module_index),
+                    &doc.analysis, pos, uri, Some(&*self.module_index),
                 );
                 return Ok(if refs.is_empty() { None } else { Some(refs) });
             }
@@ -525,7 +523,7 @@ impl LanguageServer for Backend {
             // Lexical variables, hash keys, handlers: single-file rename
             // (policy lives on `TargetRef::supports_cross_file_rename`).
             Some(_) => {
-                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
+                Ok(symbols::rename(&doc.analysis, pos, uri, new_name))
             }
             None => Ok(None),
         }
@@ -614,7 +612,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let highlights = symbols::document_highlights(&doc.analysis, pos, &doc.tree, &doc.text, Some(&*self.module_index));
+        let highlights = symbols::document_highlights(&doc.analysis, pos, Some(&*self.module_index));
         if highlights.is_empty() {
             Ok(None)
         } else {

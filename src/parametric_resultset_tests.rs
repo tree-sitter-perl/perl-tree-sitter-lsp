@@ -137,11 +137,11 @@ $schema->resultset('Schema::Result::Users')->search({{ name => 'X' }});
 ",
         USERS_RESULT,
     );
-    let (fa, tree) = parse_with_tree(&src);
+    let (fa, _tree) = parse_with_tree(&src);
     // Cursor on `name` in the search-arg hash. Pin column-def row
     // by name (hardcoded line numbers rot when fixtures shift).
     let pt = point_at(&src, "name => 'X'");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(NAME_COL_DEF_ROW),
@@ -164,9 +164,9 @@ $rs->search({{ email => 'x@y' }});
 ",
         USERS_RESULT,
     );
-    let (fa, tree) = parse_with_tree(&src);
+    let (fa, _tree) = parse_with_tree(&src);
     let pt = point_at(&src, "email => 'x@y'");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(EMAIL_COL_DEF_ROW),
@@ -189,9 +189,9 @@ $schema->resultset('Schema::Result::Users')->search({{ name => 'A' }})->search({
 ",
         USERS_RESULT,
     );
-    let (fa, tree) = parse_with_tree(&src);
+    let (fa, _tree) = parse_with_tree(&src);
     let pt = point_at(&src, "email => 'B'");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(EMAIL_COL_DEF_ROW),
@@ -213,9 +213,9 @@ $schema->resultset('Schema::Result::Users')->find({{ name => 'X' }});
 ",
         USERS_RESULT,
     );
-    let (fa, tree) = parse_with_tree(&src);
+    let (fa, _tree) = parse_with_tree(&src);
     let pt = point_at(&src, "name => 'X'");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(NAME_COL_DEF_ROW),
@@ -243,9 +243,9 @@ $schema->resultset('Schema::Result::Users')->all();
 ",
         USERS_RESULT,
     );
-    let (fa, tree) = parse_with_tree(&src);
+    let (fa, _tree) = parse_with_tree(&src);
     let pt = point_at(&src, "all()");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     // Either None (no DBIx::Class::ResultSet stub in fixture) or a
     // span pointing into a ResultSet class — but NEVER a span on
     // the Users row-class file. The negative pin is "doesn't
@@ -274,9 +274,9 @@ $schema->resultset('Schema::Result::Users')->search({{ definitely_not_a_column =
 ",
         USERS_RESULT,
     );
-    let (fa, tree) = parse_with_tree(&src);
+    let (fa, _tree) = parse_with_tree(&src);
     let pt = point_at(&src, "definitely_not_a_column");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert!(
         def.is_none(),
         "unknown column must not resolve to anything; got: {:?}",
@@ -371,11 +371,11 @@ my $name = $schema->resultset('Schema::Result::Users')->find(1)->name;
 ",
         USERS_RESULT,
     );
-    let (fa, tree) = parse_with_tree(&src);
+    let (fa, _tree) = parse_with_tree(&src);
     // Cursor on `name` in `->name` (the trailing method call).
     let pt = point_at(&src, "->name");
     let pt = Point::new(pt.row, pt.column + 2);
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(NAME_COL_DEF_ROW),
@@ -482,11 +482,11 @@ package main;
 my $schema;
 $schema->resultset('Schema::Result::Users')->admins;
 "#;
-    let (fa, tree) = parse_with_tree(src);
+    let (fa, _tree) = parse_with_tree(src);
     let pt = point_at(src, "->admins");
     // Cursor lands on `-` before `admins`; bump past `->` to `a`.
     let pt = Point::new(pt.row, pt.column + 2);
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     // The admins sub is in package Schema::ResultSet::Users,
     // declared on a single line. Goto-def should land on its
     // declaration row (the 8th line of the fixture, 0-indexed
@@ -517,9 +517,9 @@ $schema->frobnicate('Schema::Result::Users')->search({{ name => 'X' }});
 ",
         USERS_RESULT,
     );
-    let (fa, tree) = parse_with_tree(&src);
+    let (fa, _tree) = parse_with_tree(&src);
     let pt = point_at(&src, "name => 'X'");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     // `frobnicate` is not `resultset` — no parametric witness
     // emitted. The chain hop's invocant is therefore unknown,
     // hash-key resolution has no class to look up, def returns
@@ -560,9 +560,9 @@ my $schema;
 my $sner = 'Schema::Result::Sner';
 $schema->resultset($sner)->search({ name => 'foo' });
 ";
-    let (fa, tree) = parse_with_tree(src);
+    let (fa, _tree) = parse_with_tree(src);
     let pt = point_at(src, "name => 'foo'");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert!(
         def.is_some(),
         "const-folded `resultset($$sner)` must thread Parametric \
@@ -595,10 +595,10 @@ my $sner = 'Schema::Result::Sner';
 my $row = $schema->resultset($sner)->find(1);
 $row->name;
 ";
-    let (fa, tree) = parse_with_tree(src);
+    let (fa, _tree) = parse_with_tree(src);
     let pt = point_at(src, "->name");
     let pt = Point::new(pt.row, pt.column + 2);
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert!(
         def.is_some(),
         "const-fold + find→row composition must let `$$row->name` \
@@ -642,9 +642,9 @@ sub action {
 }
 1;
 ";
-    let (fa, tree) = parse_with_tree(src);
+    let (fa, _tree) = parse_with_tree(src);
     let pt = point_at(src, "name => 'foo'");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert!(
         def.is_some(),
         "in-file helper composition (helper synth + return_via_edge \
@@ -693,9 +693,9 @@ sub action {
 }
 1;
 ";
-    let (fa, tree) = parse_with_tree(src);
+    let (fa, _tree) = parse_with_tree(src);
     let pt = point_at(src, "name => 'foo'");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert!(
         def.is_some(),
         "rebound-coderef helper must compose the same as a literal \
@@ -966,9 +966,9 @@ sub action {
 }
 1;
 ";
-    let (fa, tree) = parse_with_tree(src);
+    let (fa, _tree) = parse_with_tree(src);
     let pt = point_at(src, "greet;");
-    let def = fa.find_definition(pt, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(pt, None);
     assert!(
         def.is_some(),
         "`$$c->thing->greet` must resolve to LocalThing::greet — the \

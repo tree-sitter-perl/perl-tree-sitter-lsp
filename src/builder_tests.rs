@@ -549,7 +549,7 @@ fn test_goto_def_method_after_package_main() {
     let source = "package main;\n1;\nuse v5.38;\nclass Point {\n    field $x :param :reader;\n    method magnitude () { }\n}\nmy $p = Point->new(x => 3);\n$p->magnitude();\n";
     let fa = build_fa(source);
     // cursor on `magnitude` in `$p->magnitude()` — line 8, col 5
-    let def = fa.find_definition(Point::new(8, 5), None, None, None);
+    let def = fa.find_definition(Point::new(8, 5), None);
     assert!(def.is_some(), "should find definition for magnitude");
     let span = def.unwrap();
     assert_eq!(
@@ -563,7 +563,7 @@ fn test_goto_def_method_after_package_main() {
 fn test_field_reader_goto_def() {
     // go-to-def on $p->x should find the reader method, which points to the field
     let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param :reader;\n    method mag() { }\n}\nmy $p = Point->new(x => 1);\n$p->x;");
-    let def = fa.find_definition(Point::new(6, 5), None, None, None); // cursor on `x` in `$p->x`
+    let def = fa.find_definition(Point::new(6, 5), None); // cursor on `x` in `$p->x`
     assert!(def.is_some(), "should find definition for reader method");
     // The reader method's selection_span points to the field declaration
     let span = def.unwrap();
@@ -580,7 +580,7 @@ fn test_goto_def_unknown_method_is_honest_miss_not_package_jump() {
     let source = "package Foo;\nsub new { bless { email => undef }, shift }\nsub to { my $self = shift; $self->{email}->totallyunknownmethod(1); }\n1;\n";
     let fa = build_fa(source);
     // `totallyunknownmethod` starts at row 2, col 43 (after the `->`).
-    let def = fa.find_definition(Point::new(2, 48), None, None, None);
+    let def = fa.find_definition(Point::new(2, 48), None);
     assert!(
         def.is_none(),
         "unknown method must return None (honest miss), not jump to package decl; got {:?}",
@@ -598,7 +598,7 @@ fn test_goto_def_typed_same_file_method_resolves() {
     let row = 3usize;
     let line = source.lines().nth(row).unwrap();
     let col = line.find("$w->frobnicate").unwrap() + "$w->".len() + 2;
-    let def = fa.find_definition(Point::new(row, col), None, None, None);
+    let def = fa.find_definition(Point::new(row, col), None);
     assert!(def.is_some(), "typed $w->frobnicate must resolve to the decl");
     assert_eq!(
         def.unwrap().start.row,
@@ -635,7 +635,7 @@ fn test_hash_element_extracted_to_scalar_is_not_container_class() {
     // goto-def on `$h->do_thing` must be an honest miss, never a jump
     // to a Foo sub.
     let do_thing_col = line.rfind("do_thing").unwrap();
-    let def = fa.find_definition(tree_sitter::Point::new(2, do_thing_col + 1), None, None, None);
+    let def = fa.find_definition(tree_sitter::Point::new(2, do_thing_col + 1), None);
     assert!(
         def.is_none(),
         "$h->do_thing must be an honest miss, not a confident jump to a Foo sub; got {:?}",
@@ -667,10 +667,7 @@ fn slot_type_write_then_extract_resolves_method() {
 
     let def = fa.find_definition(
         tree_sitter::Point::new(5, line.rfind("do_thing").unwrap() + 1),
-        None,
-        None,
-        None,
-    );
+        None);
     assert!(
         matches!(&def, Some(d) if d.start.row == 2),
         "$h->do_thing must resolve to Helper::do_thing on row 2; got {:?}",
@@ -1497,7 +1494,7 @@ fn test_resolve_expr_type_function_call() {
         "function_call_expression",
     )
     .expect("should find function_call_expression");
-    let ty = fa.resolve_expression_type(call_node, src.as_bytes(), None);
+    let ty = crate::cursor_context::resolve_expression_type(&fa, call_node, src.as_bytes(), None);
     assert_eq!(ty, Some(InferredType::HashRef));
 }
 
@@ -1522,7 +1519,7 @@ fn test_resolve_expr_type_scalar_variable() {
     // Find the scalar $x on line 1
     let scalar_node =
         find_node_at(tree.root_node(), Point::new(1, 0), "scalar").expect("should find scalar");
-    let ty = fa.resolve_expression_type(scalar_node, src.as_bytes(), None);
+    let ty = crate::cursor_context::resolve_expression_type(&fa, scalar_node, src.as_bytes(), None);
     assert_eq!(ty, Some(InferredType::HashRef));
 }
 
@@ -1550,7 +1547,7 @@ fn test_resolve_expr_type_chained_method() {
         };
     }
     assert_eq!(n.kind(), "method_call_expression");
-    let ty = fa.resolve_expression_type(n, src.as_bytes(), None);
+    let ty = crate::cursor_context::resolve_expression_type(&fa, n, src.as_bytes(), None);
     assert_eq!(ty, Some(InferredType::HashRef));
 }
 
@@ -1561,7 +1558,7 @@ fn test_resolve_expr_type_constructor() {
     let fa = build(&tree, src.as_bytes());
     let call = find_node_at(tree.root_node(), Point::new(3, 0), "method_call_expression")
         .expect("should find method_call_expression");
-    let ty = fa.resolve_expression_type(call, src.as_bytes(), None);
+    let ty = crate::cursor_context::resolve_expression_type(&fa, call, src.as_bytes(), None);
     assert_eq!(ty, Some(InferredType::ClassName("Foo".into())));
 }
 
@@ -1619,7 +1616,7 @@ $calc->get_self->get_config->{host};
     // The base of hash_element_expression is the method chain
     let base = n.named_child(0).expect("should have base");
     assert_eq!(base.kind(), "method_call_expression");
-    let ty = fa.resolve_expression_type(base, src.as_bytes(), None);
+    let ty = crate::cursor_context::resolve_expression_type(&fa, base, src.as_bytes(), None);
     assert_eq!(
         ty,
         Some(InferredType::HashRef),
@@ -1676,9 +1673,9 @@ $h{it}->kid();
             continue;
         }
         let via_ref = fa.method_call_invocant_class(r, None);
-        let via_node = fa
-            .resolve_expression_type(invocant_node, src.as_bytes(), None)
-            .and_then(|t| t.class_name().map(|s| s.to_string()));
+        let via_node =
+            crate::cursor_context::resolve_expression_type(&fa, invocant_node, src.as_bytes(), None)
+                .and_then(|t| t.class_name().map(|s| s.to_string()));
         assert_eq!(
             via_ref, via_node,
             "invocant-class (tree-free) vs resolve_expression_type disagree \
@@ -1816,7 +1813,7 @@ fn test_non_block_package_unaffected() {
 fn test_find_def_variable() {
     let fa = build_fa("my $x = 1;\nprint $x;");
     // Cursor on the usage of $x at line 1
-    let def = fa.find_definition(Point::new(1, 7), None, None, None);
+    let def = fa.find_definition(Point::new(1, 7), None);
     assert!(def.is_some(), "should find definition for $x");
     let span = def.unwrap();
     assert_eq!(span.start.row, 0, "definition should be on line 0");
@@ -1826,7 +1823,7 @@ fn test_find_def_variable() {
 fn test_find_def_sub() {
     let fa = build_fa("sub greet { }\ngreet();");
     // Cursor on the function call at line 1
-    let def = fa.find_definition(Point::new(1, 1), None, None, None);
+    let def = fa.find_definition(Point::new(1, 1), None);
     assert!(def.is_some(), "should find definition for greet");
     let span = def.unwrap();
     assert_eq!(span.start.row, 0, "definition should be on line 0");
@@ -1837,7 +1834,7 @@ fn test_find_def_method_in_class() {
     let src = "package Foo;\nsub new { bless {}, shift }\nsub hello { }\npackage main;\nmy $f = Foo->new();\n$f->hello();";
     let fa = build_fa(src);
     // Cursor on hello() call at line 5
-    let def = fa.find_definition(Point::new(5, 5), None, None, None);
+    let def = fa.find_definition(Point::new(5, 5), None);
     assert!(def.is_some(), "should find definition for hello method");
     let span = def.unwrap();
     assert_eq!(span.start.row, 2, "hello definition should be on line 2");
@@ -1848,7 +1845,7 @@ fn test_find_def_scoped_variable() {
     let src = "my $x = 'outer';\nsub foo {\n    my $x = 'inner';\n    print $x;\n}";
     let fa = build_fa(src);
     // Cursor on $x inside sub (line 3) should resolve to inner $x (line 2)
-    let def = fa.find_definition(Point::new(3, 11), None, None, None);
+    let def = fa.find_definition(Point::new(3, 11), None);
     assert!(def.is_some());
     let span = def.unwrap();
     assert_eq!(span.start.row, 2, "should resolve to inner $x on line 2");
@@ -1859,7 +1856,7 @@ fn test_find_references_variable() {
     let src = "my $x = 1;\nprint $x;\n$x = 2;";
     let fa = build_fa(src);
     // Cursor on the declaration of $x
-    let refs = fa.find_references(Point::new(0, 4), None, None, None);
+    let refs = fa.find_references(Point::new(0, 4), None);
     assert!(
         refs.len() >= 2,
         "should find at least declaration + usage, got {}",
@@ -1908,10 +1905,7 @@ fn test_hash_key_def_implicit_return_gets_sub_owner() {
     );
     let def = fa.find_definition(
         host_refs[0].span.start,
-        Some(&tree),
-        Some(src.as_bytes()),
-        None,
-    );
+        None);
     assert!(def.is_some(), "should find definition for host");
     assert_eq!(def.unwrap().start.row, 0, "host def should be on line 0");
 }
@@ -1921,7 +1915,7 @@ fn test_find_references_sub() {
     let src = "sub greet { }\ngreet();\ngreet();";
     let fa = build_fa(src);
     // Cursor on the sub name
-    let refs = fa.find_references(Point::new(0, 5), None, None, None);
+    let refs = fa.find_references(Point::new(0, 5), None);
     assert!(
         refs.len() >= 2,
         "should find definition + calls, got {}",
@@ -1944,7 +1938,7 @@ get_foo()->bar();
     let tree = parse(src);
     let fa = build(&tree, src.as_bytes());
     // Cursor on bar definition (line 2, col 4)
-    let refs = fa.find_references(Point::new(2, 5), Some(&tree), Some(src.as_bytes()), None);
+    let refs = fa.find_references(Point::new(2, 5), None);
     // Should find: $f->bar() + get_foo()->bar() (definition may or may not be included)
     let ref_lines: Vec<usize> = refs.iter().map(|s| s.start.row).collect();
     assert!(
@@ -2014,7 +2008,7 @@ fn test_hash_key_def_in_return_gets_sub_owner() {
 
     // Verify go-to-references from the def finds the usage
     let host_def_point = host_defs[0].selection_span.start;
-    let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()), None);
+    let refs = fa.find_references(host_def_point, None);
     // symbol_at returns include_decl=false, so only usages are returned
     assert!(
         refs.len() >= 1,
@@ -2024,7 +2018,7 @@ fn test_hash_key_def_in_return_gets_sub_owner() {
 
     // Verify go-to-references from the usage finds back to the def
     let host_ref_point = host_refs[0].span.start;
-    let refs_from_usage = fa.find_references(host_ref_point, Some(&tree), Some(src.as_bytes()), None);
+    let refs_from_usage = fa.find_references(host_ref_point, None);
     // ref resolves to def → include_decl=true, so def + usage
     assert!(
         refs_from_usage.len() >= 2,
@@ -2081,7 +2075,7 @@ $calc->get_self->get_config->{host};
 
     // find_references from the def finds the chained usage.
     let host_def_point = host_defs[0].selection_span.start;
-    let refs = fa.find_references(host_def_point, Some(&tree), Some(src.as_bytes()), None);
+    let refs = fa.find_references(host_def_point, None);
     assert!(
         refs.len() >= 1,
         "should find chained usage, got {} refs",
@@ -2093,7 +2087,7 @@ $calc->get_self->get_config->{host};
 fn test_highlights_read_write() {
     let src = "my $x = 1;\nprint $x;\n$x = 2;";
     let fa = build_fa(src);
-    let highlights = fa.find_highlights(Point::new(0, 4), None, None, None);
+    let highlights = fa.find_highlights(Point::new(0, 4), None);
     assert!(!highlights.is_empty(), "should have highlights");
     // Check that we have both read and write accesses
     let has_write = highlights
@@ -2205,7 +2199,7 @@ fn test_hover_shows_return_type() {
 fn test_rename_variable() {
     let src = "my $x = 1;\nprint $x;";
     let fa = build_fa(src);
-    let edits = fa.rename_at(Point::new(0, 4), "y", None, None);
+    let edits = fa.rename_at(Point::new(0, 4), "y");
     assert!(edits.is_some(), "should produce rename edits");
     let edits = edits.unwrap();
     assert!(
@@ -2386,7 +2380,7 @@ fn test_find_def_bareword_class() {
     let src = "package Point;\nsub new { bless {}, shift }\npackage main;\nPoint->new();";
     let fa = build_fa(src);
     // Cursor on "new" in Point->new()
-    let def = fa.find_definition(Point::new(3, 8), None, None, None);
+    let def = fa.find_definition(Point::new(3, 8), None);
     assert!(def.is_some(), "should find definition for new");
 }
 
@@ -2463,7 +2457,7 @@ fn test_deref_self_and_hash_key() {
     let fa = build_fa(src);
 
     // $self at line 12 (push @{$self->{history}}, ...)
-    let def_self = fa.find_definition(Point::new(12, 12), None, None, None);
+    let def_self = fa.find_definition(Point::new(12, 12), None);
     assert!(
         def_self.is_some(),
         "should find definition for $self in deref"
@@ -2475,7 +2469,7 @@ fn test_deref_self_and_hash_key() {
     );
 
     // history key at line 12
-    let def_history = fa.find_definition(Point::new(12, 20), None, None, None);
+    let def_history = fa.find_definition(Point::new(12, 20), None);
     assert!(
         def_history.is_some(),
         "should find definition for history hash key"
@@ -2587,7 +2581,7 @@ my $calc = Calculator->new(verbose => 1);
     // 0         1         2         3
     // 0123456789012345678901234567890123456789
     //                            ^27 = v of verbose
-    let def = fa.find_definition(Point::new(9, 27), Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(Point::new(9, 27), None);
     assert!(
         def.is_some(),
         "should find definition for verbose at call site"
@@ -2618,7 +2612,7 @@ my $p = Point->new(x => 3, y => 4);
     // 0123456789012345678901234
     //                    ^19 = x
 
-    let def = fa.find_definition(Point::new(6, 19), Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(Point::new(6, 19), None);
     assert!(def.is_some(), "should find definition for x at call site");
     // Should go to line 2: "field $x :param :reader;"
     assert_eq!(
@@ -7591,7 +7585,7 @@ sub run {
     let col = src.lines().nth(row).unwrap().find("do_thing").unwrap();
     let point = tree_sitter::Point::new(row, col + 1);
 
-    let hits = fa.find_highlights(point, None, None, None);
+    let hits = fa.find_highlights(point, None);
     assert!(!hits.is_empty(), "should highlight at least one occurrence");
 
     for (span, _access) in &hits {
@@ -7991,7 +7985,7 @@ fn mojo_demo_lines_70_71_all_tokens_intelligent() {
     parser
         .set_language(&ts_parser_perl::LANGUAGE.into())
         .unwrap();
-    let tree = parser.parse(&src, None).unwrap();
+    let _tree = parser.parse(&src, None).unwrap();
 
     // Stub the three Mojo modules the chain walks through so
     // cross-file resolution has something to reach. Shapes mirror
@@ -8097,7 +8091,7 @@ sub to { my $self = shift; return $self; }
     // Print detailed per-probe status so failures pinpoint the hop.
     let check = |label: &str, point: tree_sitter::Point| {
         let hover = fa.hover_info(point, &src, Some(&idx));
-        let def = fa.find_definition(point, Some(&tree), Some(src.as_bytes()), Some(&idx));
+        let def = fa.find_definition(point, Some(&idx));
         assert!(
             hover.is_some() || def.is_some(),
             "[{label}] @ ({},{}) is a dead token — NO hover AND NO gd. \
@@ -10680,8 +10674,7 @@ sub action {
     }
     let elem_node = find_array_element(tree.root_node())
         .expect("test source contains `$users[0]`");
-    let resolved = app_fa
-        .resolve_expression_type(elem_node, app_src.as_bytes(), Some(&idx))
+    let resolved = crate::cursor_context::resolve_expression_type(&app_fa, elem_node, app_src.as_bytes(), Some(&idx))
         .expect("$users[0] resolves to a type");
     assert_eq!(
         resolved.class_name(),
@@ -11489,10 +11482,7 @@ fn refgen_goto_def_lands_on_sub_definition() {
     // Cursor at the `h` of `\&handler` on line 1 (0-indexed row=1, col≈11)
     let def_span = fa.find_definition(
         Point::new(1, 11),
-        None,
-        None,
-        None,
-    );
+        None);
     assert_eq!(
         def_span,
         Some(sub_sym.selection_span),
@@ -11534,7 +11524,7 @@ fn fq_scalar_read_resolves_same_file() {
         Some(decl.id),
         "FQ scalar read should resolve to the Pkg::x declaration"
     );
-    let def = fa.find_definition(read.span.start, None, None, None);
+    let def = fa.find_definition(read.span.start, None);
     assert_eq!(def, Some(decl.selection_span));
 }
 
@@ -13675,7 +13665,7 @@ fn autoloader_data_section_subs_synthesized() {
     assert_eq!(want_read.package.as_deref(), Some("My::AL"));
 
     // Goto-def from the in-package caller reaches the data-section def.
-    let def = fa.find_definition(Point::new(2, 16), None, None, None);
+    let def = fa.find_definition(Point::new(2, 16), None);
     assert_eq!(
         def.map(|s| s.start.row),
         Some(5),
@@ -13775,7 +13765,7 @@ $obj->get_config->{host};
 
     // Goto-def from the `host` token reaches the bless'd key in Config::new.
     let key_ref = host_refs[0];
-    let def = fa.find_definition(key_ref.span.start, Some(&tree), Some(src.as_bytes()), None);
+    let def = fa.find_definition(key_ref.span.start, None);
     assert!(
         def.is_some(),
         "goto-def on chained `->{{host}}` should resolve to Config's key def"

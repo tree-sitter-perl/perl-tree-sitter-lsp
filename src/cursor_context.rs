@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use tree_sitter::{Node, Point, Tree};
 
-use crate::file_analysis::{extract_call_name, node_to_span, FileAnalysis, InferredType, Span};
+use crate::file_analysis::{extract_call_name, node_to_span, CrossFileLookup, FileAnalysis, InferredType, Span};
 
 // ---- Types ----
 
@@ -225,6 +225,102 @@ fn is_perl_package_name(s: &str) -> bool {
         }
     }
     true
+}
+
+/// Resolve the type of an arbitrary CST expression node.
+///
+/// Recursive tree walk that composes existing atoms:
+/// - `scalar` → `inferred_type(var_text, point)`
+/// - bareword (class name) → `Object(ClassName)`
+/// - `method_call_expression` → resolve invocant → find method → return type
+/// - `function_call_expression` → `sub_return_type(name)`
+/// - `hash_element_expression` → resolve base (for chaining)
+///
+/// Used at query time (completion, goto-def, hover) — not during the build walk.
+pub fn resolve_expression_type(
+analysis: &FileAnalysis,
+node: tree_sitter::Node,
+source: &[u8],
+module_index: Option<&dyn CrossFileLookup>,
+) -> Option<InferredType> {
+    // Tree-free first: the builder recorded the type of every
+    // meaningful expression at its span (`Expr(span)` + the
+    // `Expression(refidx)` call axis). Read it back by span — the
+    // same chase `method_call_invocant_class` uses. The node-kind
+    // walk below is the degradation path for the raw-cursor /
+    // incomplete-ERROR case completion hits where no witness was
+    // recorded (a node that never existed at build time).
+    let span = Span {
+        start: node.start_position(),
+        end: node.end_position(),
+    };
+    if let Some(t) = analysis.expr_type_at_span(span, module_index) {
+        return Some(t);
+    }
+    let point = node.start_position();
+    match node.kind() {
+        "scalar" => {
+            let text = node.utf8_text(source).ok()?;
+            // Route scalar-type resolution through the witness bag so
+            // framework / branch / arity rules refine the answer. Keep the
+            // index so a role-contract param (`$c`) resolves through
+            // cross-file ancestry, not just the local `package_parents`.
+            analysis.inferred_type_via_bag_ctx(text, point, module_index)
+        }
+        "package" | "bareword" => {
+            // Bareword = class name
+            let text = node.utf8_text(source).ok()?;
+            Some(InferredType::ClassName(text.to_string()))
+        }
+        "array_element_expression" => {
+            // `$arr[N]` — look up `@arr`'s Sequence shape via the
+            // bag, project the index. The bag answer is whatever
+            // the walker's last `push` / `my @arr = (...)`
+            // contribution left on `Variable{"@arr", scope}`.
+            let arr = node.child_by_field_name("array")?;
+            let name = arr
+                .named_child(0)
+                .and_then(|n| n.utf8_text(source).ok())?;
+            let idx_node = node.child_by_field_name("index")?;
+            let idx: i32 = idx_node.utf8_text(source).ok()?.parse().ok()?;
+            let arr_var = format!("@{}", name);
+            analysis.inferred_type_via_bag(&arr_var, point)
+                .and_then(|t| t.element_at(idx).cloned())
+        }
+        "method_call_expression" => {
+            let invocant_node = node.child_by_field_name("invocant")?;
+            let invocant_type = resolve_expression_type(analysis, invocant_node, source, module_index)?;
+            let class_name = invocant_type.class_name()?;
+            let method_name = node.child_by_field_name("method")?;
+            let method_text = method_name.utf8_text(source).ok()?;
+            // Constructor call returns Object(ClassName)
+            if crate::conventions::is_constructor_name(method_text) {
+                return Some(InferredType::ClassName(class_name.to_string()));
+            }
+            let arg_count = crate::cst::call_args(node).len();
+            analysis.find_method_return_type(class_name, method_text, module_index, Some(arg_count))
+        }
+        "function_call_expression" | "ambiguous_function_call_expression" => {
+            let func_node = node.child_by_field_name("function")?;
+            let name = func_node.utf8_text(source).ok()?;
+            // Route through the arity-aware helper so fluent
+            // arity dispatch (`return X unless @_`) can pick the
+            // right branch when the caller's arg count is known.
+            let arg_count = crate::cst::call_args(node).len() as u32;
+            analysis.sub_return_type_at_arity(name, Some(arg_count))
+                .or_else(|| crate::file_analysis::builtin_return_type(name))
+        }
+        "func1op_call_expression" | "func0op_call_expression" => {
+            let name = node.child(0)?.utf8_text(source).ok()?;
+            crate::file_analysis::builtin_return_type(name)
+        }
+        "hash_element_expression" => {
+            // For chaining: resolve the base expression
+            let base = node.named_child(0)?;
+            resolve_expression_type(analysis, base, source, module_index)
+        }
+        _ => None,
+    }
 }
 
 /// Resolve an invocant type from its text, using analysis when available.
@@ -509,7 +605,7 @@ fn resolve_node_type(
             let text = node.utf8_text(source).ok()?;
             Some(InferredType::ClassName(text.to_string()))
         }
-        _ => analysis.resolve_expression_type(node, source, module_index),
+        _ => resolve_expression_type(analysis, node, source, module_index),
     }
 }
 

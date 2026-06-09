@@ -2330,7 +2330,7 @@ fn test_route_pm_chain_decomposition() {
         src: &[u8],
     ) {
         let text = n.utf8_text(src).unwrap_or("").trim();
-        let ty = analysis.resolve_expression_type(n, src, None);
+        let ty = crate::cursor_context::resolve_expression_type(&analysis, n, src, None);
         eprintln!(
             "  [{label:>12}] `{text:.60}`\n                kind={} → ty={:?}",
             n.kind(),
@@ -2497,7 +2497,7 @@ fn test_demo_chain_empirical_truth_table() {
         find_getcall(tree.root_node(), demo_source.as_bytes()).expect("->get node")
     };
     let get_return_ty =
-        analysis.resolve_expression_type(mcall_node, demo_source.as_bytes(), Some(&idx));
+        crate::cursor_context::resolve_expression_type(&analysis, mcall_node, demo_source.as_bytes(), Some(&idx));
 
     // --- Link 4: ->to's invocant class (= ->get's return class) ---
     let to_ref = analysis.ref_at(pt(to_col)).expect("ref at ->to");
@@ -2723,7 +2723,7 @@ sub action ($c) {\n\
     let consumer = parse_analysis(consumer_src);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(consumer_src, None).unwrap();
+    let _tree = parser.parse(consumer_src, None).unwrap();
 
     // Cursor on the `widget` token in `$c->widget`.
     let byte = consumer_src.find("widget;").expect("call site present");
@@ -2734,7 +2734,7 @@ sub action ($c) {\n\
     };
 
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx, &tree, consumer_src);
+    let resp = find_definition(&consumer, pos, &uri, &idx);
 
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
@@ -2787,7 +2787,7 @@ sub day_of_week {\n\
     let consumer = parse_analysis(consumer_src);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(consumer_src, None).unwrap();
+    let _tree = parser.parse(consumer_src, None).unwrap();
 
     let byte = consumer_src.find("_ymd2rd( 2024").expect("call site present");
     let prefix = &consumer_src[..byte];
@@ -2797,7 +2797,7 @@ sub day_of_week {\n\
     };
 
     let uri = Url::parse("file:///datetime.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx, &tree, consumer_src);
+    let resp = find_definition(&consumer, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => v.remove(0),
@@ -2836,7 +2836,7 @@ my @s = @My::Vars::servers;\n\
     let consumer = parse_analysis(consumer_src);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(consumer_src, None).unwrap();
+    let _tree = parser.parse(consumer_src, None).unwrap();
 
     // Cursor on the `config` tail of `$My::Vars::config`.
     let byte = consumer_src.find("config;").expect("read site present");
@@ -2847,7 +2847,7 @@ my @s = @My::Vars::servers;\n\
     };
 
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx, &tree, consumer_src);
+    let resp = find_definition(&consumer, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         other => panic!("expected goto-def for FQ var, got {other:?}"),
@@ -2871,7 +2871,7 @@ fn fq_variable_read_unknown_package_is_honest_miss() {
     let consumer = parse_analysis(consumer_src);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(consumer_src, None).unwrap();
+    let _tree = parser.parse(consumer_src, None).unwrap();
     let byte = consumer_src.find("thing;").unwrap();
     let prefix = &consumer_src[..byte];
     let pos = Position {
@@ -2879,7 +2879,7 @@ fn fq_variable_read_unknown_package_is_honest_miss() {
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx, &tree, consumer_src);
+    let resp = find_definition(&consumer, pos, &uri, &idx);
     assert!(resp.is_none(), "unknown package must be an honest miss, got {resp:?}");
 }
 
@@ -3283,14 +3283,14 @@ sub startup {
     let uri = Url::parse("file:///app.pl").unwrap();
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(src, None).unwrap();
+    let _tree = parser.parse(src, None).unwrap();
     let list_at = src.find("'#list'").unwrap() + "'#".len();
     let pre = &src[..list_at];
     let pos = Position {
         line: pre.matches('\n').count() as u32,
         character: (list_at - pre.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
-    let resp = find_definition(&fa, pos, &uri, &idx, &tree, src);
+    let resp = find_definition(&fa, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => v.remove(0),
@@ -3797,7 +3797,7 @@ my $v = helper_fn(21);\n";
     let consumer = parse_analysis(consumer_src);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(consumer_src, None).unwrap();
+    let _tree = parser.parse(consumer_src, None).unwrap();
 
     // Cursor on the `helper_fn` token at the call site (line 1, not the use line).
     let byte = consumer_src.find("helper_fn(21)").expect("call site present");
@@ -3808,7 +3808,7 @@ my $v = helper_fn(21);\n";
     };
 
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx, &tree, consumer_src);
+    let resp = find_definition(&consumer, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         other => panic!("expected a single-hop Scalar to the module sub, got {other:?}"),
@@ -3839,7 +3839,7 @@ Foo->bar();\n";
     let analysis = parse_analysis(source);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(source, None).unwrap();
+    let _tree = parser.parse(source, None).unwrap();
     let idx = crate::module_index::ModuleIndex::new_for_test();
 
     // Cursor on the `Foo` invocant in `Foo->bar()`.
@@ -3850,7 +3850,7 @@ Foo->bar();\n";
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32 + 1,
     };
     let uri = Url::parse("file:///test.pl").unwrap();
-    let resp = find_definition(&analysis, pos, &uri, &idx, &tree, source);
+    let resp = find_definition(&analysis, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         other => panic!("expected goto-def on class invocant, got {other:?}"),
@@ -3873,7 +3873,7 @@ Foo->bar();\n";
     let analysis = parse_analysis(source);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(source, None).unwrap();
+    let _tree = parser.parse(source, None).unwrap();
     let idx = crate::module_index::ModuleIndex::new_for_test();
 
     // Cursor on the `bar` method token.
@@ -3884,7 +3884,7 @@ Foo->bar();\n";
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
     let uri = Url::parse("file:///test.pl").unwrap();
-    let resp = find_definition(&analysis, pos, &uri, &idx, &tree, source);
+    let resp = find_definition(&analysis, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         other => panic!("expected goto-def on method token, got {other:?}"),
@@ -3934,7 +3934,7 @@ fn gd_resolves(source: &str, name: &str, idx: &crate::module_index::ModuleIndex)
     let analysis = parse_analysis(source);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(source, None).unwrap();
+    let _tree = parser.parse(source, None).unwrap();
     let byte = source.rfind(&format!("{}(", name)).expect("call site present");
     let prefix = &source[..byte];
     let pos = Position {
@@ -3942,7 +3942,7 @@ fn gd_resolves(source: &str, name: &str, idx: &crate::module_index::ModuleIndex)
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let loc = match find_definition(&analysis, pos, &uri, idx, &tree, source) {
+    let loc = match find_definition(&analysis, pos, &uri, idx) {
         Some(GotoDefinitionResponse::Scalar(loc)) => Some(loc),
         Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => Some(v.remove(0)),
         _ => None,
@@ -4109,7 +4109,7 @@ fn gd_resolves_to(
     let analysis = parse_analysis(source);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(source, None).unwrap();
+    let _tree = parser.parse(source, None).unwrap();
     let byte = source.rfind(&format!("{}(", name)).expect("call site present");
     let prefix = &source[..byte];
     let pos = Position {
@@ -4117,7 +4117,7 @@ fn gd_resolves_to(
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let loc = match find_definition(&analysis, pos, &uri, idx, &tree, source) {
+    let loc = match find_definition(&analysis, pos, &uri, idx) {
         Some(GotoDefinitionResponse::Scalar(loc)) => Some(loc),
         Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => Some(v.remove(0)),
         _ => None,

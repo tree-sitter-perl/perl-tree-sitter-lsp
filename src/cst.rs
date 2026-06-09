@@ -92,18 +92,6 @@ pub(crate) fn fq_tail_span(node: Node, text: &str) -> Span {
     }
 }
 
-/// Walk up from a node to find an ancestor of the given kind.
-pub(crate) fn find_ancestor<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut current = node;
-    for _ in 0..20 {
-        if current.kind() == kind {
-            return Some(current);
-        }
-        current = current.parent()?;
-    }
-    None
-}
-
 pub(crate) struct NamedChildren<'a> {
     node: Node<'a>,
     idx: usize,

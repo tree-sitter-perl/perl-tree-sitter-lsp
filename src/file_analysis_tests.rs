@@ -286,13 +286,13 @@ fn test_qualified_call_local_goto_def_and_references() {
     // Cursor on `baz` in `Foo::baz()` (line 3 = 0-indexed; `baz` starts
     // at col 5 after `Foo::`).
     let def = fa
-        .find_definition(Point::new(3, 6), None, None, None)
+        .find_definition(Point::new(3, 6), None)
         .expect("goto-def on Foo::baz() should resolve to the local sub");
     // The def is `sub baz` on line 1.
     assert_eq!(def.start.row, 1, "should land on `sub baz`, got {:?}", def);
 
     // References anchored on the call site must include the call span.
-    let refs = fa.find_references(Point::new(3, 6), None, None, None);
+    let refs = fa.find_references(Point::new(3, 6), None);
     assert!(
         refs.iter().any(|s| s.start.row == 3),
         "references should include the Foo::baz() call site, got {:?}",
@@ -338,7 +338,7 @@ fn test_fq_method_call_nav_dispatches_from_named_class() {
 
     // goto-def on the `build` tail (line 4, col 22) lands on `sub build`.
     let def = fa
-        .find_definition(Point::new(4, 22), None, None, None)
+        .find_definition(Point::new(4, 22), None)
         .expect("FQ method goto-def resolves to the local sub");
     assert_eq!(def.start.row, 1, "should land on `sub build`, got {:?}", def);
 
@@ -403,7 +403,7 @@ fn test_super_method_nav_resolves_to_parent() {
     };
     // goto-def on the SUPER call lands on `Base::greet` (line 1).
     let def = fa
-        .find_definition(span.start, None, None, None)
+        .find_definition(span.start, None)
         .expect("SUPER goto-def resolves");
     assert_eq!(def.start.row, 1, "SUPER::greet resolves to Base::greet, got {:?}", def);
     // Renaming targets the parent method on `Base` (so the SUPER call tracks).
@@ -425,7 +425,7 @@ fn test_qualified_call_does_not_cross_package() {
 
     // Cursor on `baz` in `Bar::baz()` (line 5, col 5).
     let def = fa
-        .find_definition(Point::new(5, 6), None, None, None)
+        .find_definition(Point::new(5, 6), None)
         .expect("Bar::baz() should resolve");
     // Bar's `sub baz` is on line 3, not Foo's on line 1.
     assert_eq!(def.start.row, 3, "should land on Bar's sub baz, got {:?}", def);
@@ -743,7 +743,7 @@ fn test_phase5_find_references_on_hash_key_def_without_tree() {
     // *usages*, not the def itself. Previously this returned 0 without a
     // tree; phase 5 returns the access sites via refs_by_target.
     let point = def_host.selection_span.start;
-    let refs = fa.find_references(point, None, None, None);
+    let refs = fa.find_references(point, None);
     assert!(
         !refs.is_empty(),
         "expected at least one access for 'host' via refs_by_target (no tree), got empty",
@@ -1136,7 +1136,7 @@ $r->get('/x')->to('Y#z');
     };
 
     let invocant = to_node.child_by_field_name("invocant").expect("invocant");
-    let ty = fa.resolve_expression_type(invocant, source_bytes, None);
+    let ty = crate::cursor_context::resolve_expression_type(&fa, invocant, source_bytes, None);
     let class = ty.as_ref().and_then(|t| t.class_name());
     assert_eq!(
         class,
