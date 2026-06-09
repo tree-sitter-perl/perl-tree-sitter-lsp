@@ -4,10 +4,11 @@
 //! through this module so that each handler is a one-liner against a single
 //! role-masked function instead of reinventing the per-tier walk.
 //!
-//! As of phase 4, `refs_to` collects references to a named target across the
-//! callers-visible set of files. `resolve_symbol` is left as future work — the
-//! current handlers still use cursor-position tree resolution to identify the
-//! target, then call into `refs_to` for the cross-file collection.
+//! `resolve_symbol` is the inverse direction: cursor → target. Every handler
+//! that wants "what does this position refer to, cross-file" (LSP references,
+//! LSP rename, the CLI mirrors of both) calls it and then hands the
+//! `TargetRef` to `refs_to`. Handlers never re-derive the mapping inline —
+//! that's how the CLI and LSP used to disagree on hash-key references.
 
 use std::path::PathBuf;
 
@@ -77,6 +78,18 @@ impl TargetRef {
         TargetRef { name, kind, method_classes: Vec::new() }
     }
 
+    /// Rename policy, asked of the target rather than re-encoded per handler:
+    /// callables and packages rewrite everywhere; hash keys are in-file-only
+    /// by design (an unowned spelling elsewhere may be a different key);
+    /// handler cross-file rename isn't wired yet. References intentionally
+    /// ignores this — it walks every target kind cross-file.
+    pub fn supports_cross_file_rename(&self) -> bool {
+        matches!(
+            self.kind,
+            TargetKind::Sub { .. } | TargetKind::Method { .. } | TargetKind::Package
+        )
+    }
+
     /// Map a cursor-resolved `RenameKind` to the cross-file target, sharing
     /// the one mapping across both LSP handlers and both CLI modes so
     /// references and rename can't diverge on target identity (rule #5).
@@ -102,6 +115,46 @@ impl TargetRef {
             RenameKind::HashKey(_) | RenameKind::Variable => return None,
         })
     }
+}
+
+/// What the cursor position resolves to, for cross-file queries.
+#[derive(Debug, Clone)]
+pub enum ResolvedTarget {
+    /// A target `refs_to` can walk: callables, packages, handlers, and
+    /// hash keys whose owner resolved at build time.
+    Target(TargetRef),
+    /// Inherently file-local: lexical variables, and hash keys with no
+    /// resolvable owner. Callers keep their single-file path.
+    Local,
+}
+
+/// Cursor → cross-file target. The single entry point for "what does this
+/// position refer to" — both LSP handlers (references, rename) and their CLI
+/// mirrors route here, so target identity can never diverge between them.
+/// `None` = nothing resolvable at the cursor at all.
+pub fn resolve_symbol(
+    analysis: &FileAnalysis,
+    point: tree_sitter::Point,
+    module_index: Option<&ModuleIndex>,
+) -> Option<ResolvedTarget> {
+    use crate::file_analysis::{HashKeyOwner, RenameKind};
+    Some(match analysis.rename_kind_at(point, module_index)? {
+        RenameKind::Variable => ResolvedTarget::Local,
+        RenameKind::HashKey(name) => match analysis.hash_key_owner_at(point) {
+            Some(HashKeyOwner::Sub { package, name: sub_name }) => ResolvedTarget::Target(
+                TargetRef::new(name, TargetKind::HashKeyOfSub { package, name: sub_name }),
+            ),
+            Some(HashKeyOwner::Class(class)) => {
+                ResolvedTarget::Target(TargetRef::new(name, TargetKind::HashKeyOfClass(class)))
+            }
+            // Lexical-variable-owned or unresolved — scope-local by definition.
+            _ => ResolvedTarget::Local,
+        },
+        kind => ResolvedTarget::Target(
+            TargetRef::from_rename_kind(kind, analysis, module_index)
+                .expect("Function/Method/Package/Handler kinds map to a target"),
+        ),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

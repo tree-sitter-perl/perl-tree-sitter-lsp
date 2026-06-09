@@ -57,7 +57,7 @@ read-only). References uses `VISIBLE` (yes, search deps too). Diagnostics
 use `VISIBLE`. Forgetting a tier is now visible at the type level — you
 have to write the mask down.
 
-### Single `refs_to` (and a planned `resolve_symbol`)
+### Single `refs_to`, single `resolve_symbol`
 
 `src/resolve.rs` is the only place tier-walking lives. LSP handlers do not
 iterate `FileStore` directly. Adding a new cross-file query = picking a
@@ -67,11 +67,17 @@ The walk: start at the `from` namespace, DFS through `package_parents`
 (soon: `namespace_parents`), filter file entries by mask. `refs_to` reads
 each file's `refs_by_target` for O(1) per-file lookup.
 
-The inverse direction — `resolve_symbol` (cursor → target) — is **not yet
-landed** (deferred to phase 5, below). Handlers still identify the target
-via `FileAnalysis::rename_kind_at` + an inline `RenameKind → TargetRef` map
-(duplicated across `backend.rs` references/rename and `main.rs`), then call
-`refs_to`. Unifying that into `resolve_symbol` is mostly de-duplication.
+The inverse direction — `resolve_symbol` (cursor → target) — is the single
+entry point for "what does this position refer to, cross-file". It returns
+`ResolvedTarget::Target(TargetRef)` for walkable targets (callables,
+packages, handlers, owner-resolved hash keys) or `ResolvedTarget::Local`
+for inherently file-local ones (lexical variables, unowned hash keys).
+Both LSP handlers (references, rename) and their CLI mirrors route through
+it, so target identity cannot diverge by entry point — the bug class this
+killed was CLI references silently dropping owned hash keys to single-file
+while LSP walked them cross-file. Per-feature *policy* on a resolved
+target is asked of the value (`TargetRef::supports_cross_file_rename`),
+never re-encoded per handler.
 
 ### Lazy enrichment, idempotent
 

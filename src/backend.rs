@@ -454,88 +454,13 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        // Derive a cross-file target from the rename-kind machinery. If the
-        // target is inherently local (variables), fall back to single-file
-        // references — no cross-file walk to do.
-        use crate::file_analysis::RenameKind;
-        use crate::resolve::{refs_to, TargetKind, TargetRef};
+        use crate::resolve::{refs_to, resolve_symbol, ResolvedTarget};
 
         let point = symbols::position_to_point(pos);
-        let rk = doc.analysis.rename_kind_at(point, Some(&self.module_index));
-        let target = match rk {
-            Some(
-                kind @ (RenameKind::Function { .. }
-                | RenameKind::Method { .. }
-                | RenameKind::Package(_)
-                | RenameKind::Handler { .. }),
-            ) => {
-                // Single mapping shared with rename + CLI so references and
-                // rename agree on target identity, including the Method
-                // inheritance chain (rule #5).
-                TargetRef::from_rename_kind(kind, &doc.analysis, Some(&self.module_index))
-                    .expect("non-HashKey/Variable kinds map to a target")
-            }
-            Some(RenameKind::HashKey(name)) => {
-                // If the cursor is on a HashKeyDef or a HashKeyAccess
-                // whose owner was resolved at build time, do a cross-file walk
-                // keyed on (key name, owner). If we can't determine the owner,
-                // fall back to single-file.
-                use crate::file_analysis::{HashKeyOwner, RefKind, SymbolDetail};
-                let cursor_point = symbols::position_to_point(pos);
-                let owner_from_ref = doc.analysis.ref_at(cursor_point).and_then(|r| {
-                    if let RefKind::HashKeyAccess { owner: Some(o), .. } = &r.kind {
-                        Some(o.clone())
-                    } else {
-                        None
-                    }
-                });
-                let owner_from_sym = doc.analysis.symbol_at(cursor_point).and_then(|s| {
-                    if let SymbolDetail::HashKeyDef { owner, .. } = &s.detail {
-                        Some(owner.clone())
-                    } else {
-                        None
-                    }
-                });
-                let owner = owner_from_ref.or(owner_from_sym);
-
-                match owner {
-                    Some(HashKeyOwner::Sub { package, name: sub_name }) => {
-                        drop(doc);
-                        let t = TargetRef::new(
-                            name,
-                            TargetKind::HashKeyOfSub { package, name: sub_name },
-                        );
-                        let mask = crate::resolve::references_mask_for(
-                            &self.files, Some(&self.module_index), &t,
-                        );
-                        let results = crate::resolve::refs_to(
-                            &self.files, Some(&self.module_index), &t, mask,
-                        );
-                        return Ok(refs_to_locations(results));
-                    }
-                    Some(HashKeyOwner::Class(class_name)) => {
-                        drop(doc);
-                        let t = TargetRef::new(name, TargetKind::HashKeyOfClass(class_name));
-                        let mask = crate::resolve::references_mask_for(
-                            &self.files, Some(&self.module_index), &t,
-                        );
-                        let results = crate::resolve::refs_to(
-                            &self.files, Some(&self.module_index), &t, mask,
-                        );
-                        return Ok(refs_to_locations(results));
-                    }
-                    _ => {
-                        // Fall back to single-file (e.g. keys owned by a lexical
-                        // variable — scope-local by definition).
-                        let refs = symbols::find_references(
-                            &doc.analysis, pos, uri, &doc.tree, &doc.text, Some(&self.module_index),
-                        );
-                        return Ok(if refs.is_empty() { None } else { Some(refs) });
-                    }
-                }
-            }
-            Some(RenameKind::Variable) | None => {
-                // Variables are lexical — single-file only.
+        let target = match resolve_symbol(&doc.analysis, point, Some(&self.module_index)) {
+            Some(ResolvedTarget::Target(t)) => t,
+            // Lexical / unowned — single-file references.
+            Some(ResolvedTarget::Local) | None => {
                 let refs = symbols::find_references(
                     &doc.analysis, pos, uri, &doc.tree, &doc.text, Some(&self.module_index),
                 );
@@ -581,8 +506,7 @@ impl LanguageServer for Backend {
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        use crate::file_analysis::RenameKind;
-        use crate::resolve::TargetRef;
+        use crate::resolve::{resolve_symbol, ResolvedTarget};
 
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
@@ -593,31 +517,15 @@ impl LanguageServer for Backend {
         };
 
         let point = symbols::position_to_point(pos);
-        let rename_kind = doc.analysis.rename_kind_at(point, Some(&self.module_index));
-
-        match rename_kind {
-            Some(RenameKind::Variable) => {
-                // Single-file only — lexical scope doesn't cross files.
-                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
-            }
-            Some(RenameKind::Handler { .. }) => {
-                // Cross-file handler rename not yet wired — fall back to
-                // single-file for the moment.
-                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
-            }
-            Some(RenameKind::HashKey(_)) => {
-                // Hash keys: single-file for now.
-                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
-            }
-            Some(kind @ (RenameKind::Function { .. }
-            | RenameKind::Method { .. }
-            | RenameKind::Package(_))) => {
-                // Same mapping as references — the Method arm precomputes the
-                // inheritance chain so the parent `sub NAME` decl is collected.
-                let target = TargetRef::from_rename_kind(kind, &doc.analysis, Some(&self.module_index))
-                    .expect("Function/Method/Package map to a target");
+        match resolve_symbol(&doc.analysis, point, Some(&self.module_index)) {
+            Some(ResolvedTarget::Target(target)) if target.supports_cross_file_rename() => {
                 drop(doc);
                 Ok(rename_via_refs_to(&self.files, Some(&self.module_index), &target, new_name))
+            }
+            // Lexical variables, hash keys, handlers: single-file rename
+            // (policy lives on `TargetRef::supports_cross_file_rename`).
+            Some(_) => {
+                Ok(symbols::rename(&doc.analysis, pos, uri, new_name, Some(&doc.tree), Some(&doc.text)))
             }
             None => Ok(None),
         }

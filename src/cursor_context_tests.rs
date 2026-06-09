@@ -444,9 +444,7 @@ fn test_detect_qualified_path_with_unicode_segment() {
 /// the module index to resolve, confirming the invocant_type is now non-None.
 #[test]
 fn test_resolve_node_type_scalar_threads_module_index() {
-    use crate::file_analysis::InferredType;
     use crate::module_index::ModuleIndex;
-    use std::path::PathBuf;
     // Build a controller that has $c typed via a cross-file ReceiverGated TC.
     // We use the real builder (not a plugin) — instead, give $c an explicit
     // TypeConstraint via a known-type assignment so the test doesn't need a

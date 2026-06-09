@@ -4245,6 +4245,22 @@ impl FileAnalysis {
         self.symbols.iter().find(|s| contains_point(&s.selection_span, point))
     }
 
+    /// The build-time-resolved owner of the hash key under the cursor —
+    /// from the access ref (`$cfg->{key}`) or the key's def symbol (Moo
+    /// `has`, return-shape keys). `None` = the key is lexical/unowned and
+    /// cross-file queries have nothing to pin on.
+    pub fn hash_key_owner_at(&self, point: Point) -> Option<HashKeyOwner> {
+        if let Some(RefKind::HashKeyAccess { owner: Some(o), .. }) =
+            self.ref_at(point).map(|r| &r.kind)
+        {
+            return Some(o.clone());
+        }
+        match self.symbol_at(point).map(|s| &s.detail) {
+            Some(SymbolDetail::HashKeyDef { owner, .. }) => Some(owner.clone()),
+            _ => None,
+        }
+    }
+
     // ---- High-level queries ----
 
     /// Go-to-definition: resolve the symbol at cursor to its definition span.

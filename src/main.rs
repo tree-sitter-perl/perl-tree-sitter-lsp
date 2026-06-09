@@ -716,8 +716,10 @@ fn run_one(
             analysis.enrich_imported_types_with_keys(Some(idx));
             let file_path = std::path::Path::new(file).canonicalize()
                 .unwrap_or_else(|_| std::path::PathBuf::from(file));
-            let target = analysis.rename_kind_at(point, Some(idx))
-                .and_then(|k| resolve::TargetRef::from_rename_kind(k, &analysis, Some(idx)));
+            let target = match resolve::resolve_symbol(&analysis, point, Some(idx)) {
+                Some(resolve::ResolvedTarget::Target(t)) => Some(t),
+                Some(resolve::ResolvedTarget::Local) | None => None,
+            };
             let mut sources = SourceCache::new();
             let mut results = Vec::new();
             match target {
@@ -972,13 +974,14 @@ fn run_rename(
         .unwrap_or_else(|_| std::path::PathBuf::from(file));
     let (_s, _t, mut analysis) = parse_file(file);
     analysis.enrich_imported_types_with_keys(Some(idx));
-    let rename_kind = analysis.rename_kind_at(point, Some(idx))
+    let resolved = resolve::resolve_symbol(&analysis, point, Some(idx))
         .ok_or_else(|| format!("Nothing renameable at {}:{}", point.row, point.column))?;
     let mut all_edits: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-    match &rename_kind {
-        file_analysis::RenameKind::Variable
-        | file_analysis::RenameKind::HashKey(_)
-        | file_analysis::RenameKind::Handler { .. } => {
+    let target = match resolved {
+        resolve::ResolvedTarget::Target(t) if t.supports_cross_file_rename() => t,
+        // Lexical variables, hash keys, handlers: single-file rename — the
+        // same policy split the LSP rename handler reads off the target.
+        _ => {
             let source = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
             let mut parser = module_resolver::create_parser();
             let tree = parser.parse(&source, None).ok_or("parse failed")?;
@@ -989,10 +992,7 @@ fn run_rename(
             }
             return Ok(serde_json::to_string_pretty(&serde_json::json!(all_edits)).unwrap());
         }
-        _ => {}
-    }
-    let target = resolve::TargetRef::from_rename_kind(rename_kind, &analysis, Some(idx))
-        .ok_or("Function/Method/Package map to a target")?;
+    };
     let _staged = ScopedWorkspaceEntry::insert(ws, file_path, analysis);
     for loc in resolve::refs_to(ws, Some(idx), &target, resolve::RoleMask::EDITABLE) {
         let path = match &loc.key {

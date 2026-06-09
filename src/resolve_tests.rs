@@ -2648,3 +2648,84 @@ fn rename_from_child_call_site_includes_inherited_base_declaration() {
         locs,
     );
 }
+
+// ---- resolve_symbol: the single cursor→target entry point ----
+
+/// Every kind that maps to a cross-file target must come back as
+/// `Target`, lexical variables as `Local`, and blank space as `None` —
+/// the same answers regardless of which handler (LSP or CLI) asks.
+#[test]
+fn test_resolve_symbol_kinds() {
+    let src = "\
+package Counter;
+sub new { my ($class) = @_; return bless { count => 0 }, $class }
+sub bump { my ($self) = @_; $self->{count}++; my $local = 1; return $local }
+1;
+";
+    let fa = parse(src);
+    let at = |row, col| resolve_symbol(&fa, tree_sitter::Point { row, column: col }, None);
+
+    // `bump` decl → callable target scoped to the package ("same callable,
+    // two shapes": decls surface as Sub even when call sites are Method).
+    match at(2, 5) {
+        Some(ResolvedTarget::Target(t)) => {
+            assert_eq!(t.name, "bump");
+            assert!(
+                matches!(&t.kind, TargetKind::Sub { package: Some(p) } if p == "Counter"),
+                "expected Sub scoped to Counter, got {:?}",
+                t.kind,
+            );
+            assert!(t.supports_cross_file_rename());
+        }
+        other => panic!("expected callable target for bump decl, got {:?}", other),
+    }
+
+    // Package name → Package target.
+    match at(0, 9) {
+        Some(ResolvedTarget::Target(t)) => {
+            assert!(matches!(t.kind, TargetKind::Package));
+            assert!(t.supports_cross_file_rename());
+        }
+        other => panic!("expected Package target, got {:?}", other),
+    }
+
+    // `$local` → lexical, single-file.
+    let local_col = src.lines().nth(2).unwrap().find("$local").unwrap() + 1;
+    assert!(
+        matches!(at(2, local_col), Some(ResolvedTarget::Local)),
+        "expected Local for lexical $local, got {:?}",
+        at(2, local_col),
+    );
+}
+
+/// An owned hash key resolves to a cross-file HashKeyOfClass target —
+/// walkable by references — but reports itself non-renameable
+/// cross-file (hash-key rename is in-file-only by design). This is the
+/// divergence the CLI used to have: its references path dropped owned
+/// hash keys to single-file because the owner mapping lived only in the
+/// LSP handler.
+#[test]
+fn test_resolve_symbol_owned_hash_key() {
+    let src = "\
+package Widget;
+use Moo;
+has size => (is => 'ro');
+sub describe { my ($self) = @_; return $self->{size} }
+1;
+";
+    let fa = parse(src);
+    // Cursor on `size` inside `$self->{size}`.
+    let col = src.lines().nth(3).unwrap().find("{size}").unwrap() + 1;
+    match resolve_symbol(&fa, tree_sitter::Point { row: 3, column: col }, None) {
+        Some(ResolvedTarget::Target(t)) => {
+            assert_eq!(t.name, "size");
+            assert!(
+                matches!(&t.kind, TargetKind::HashKeyOfClass(c) if c == "Widget"),
+                "expected HashKeyOfClass(Widget), got {:?}",
+                t.kind,
+            );
+            assert!(!t.supports_cross_file_rename());
+        }
+        other => panic!("expected owned hash-key target, got {:?}", other),
+    }
+}
