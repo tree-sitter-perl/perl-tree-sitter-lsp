@@ -451,27 +451,16 @@ fn collect_from_analysis(
             }
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
              RefKind::MethodCall { .. }) => {
-                // Method-shaped call: prefer the build-time-frozen dispatch
-                // edge (`resolved_method_target`) — stamped once (PostFold /
-                // enrichment) by the bag-routed resolver, so a call that
-                // resolved at build time stays matched regardless of query-time
-                // inference flakiness. This is the NAV unification — references
-                // read a stored edge, the same discipline `Variable` refs use
-                // with `resolves_to`.
-                //
-                // Inheritance: the edge carries the frozen invocant class;
-                // `method_rename_chain` yields `[invocant_class, ...,
-                // defining_class]`, so `$child->m` matches a target on any class
-                // on that chain, and unrelated same-named methods stay out.
-                //
-                // When the edge is ABSENT, the build-time stamp couldn't name
-                // the dispatch class — which for a DEPENDENCY file means the
-                // invocant needed cross-file info the build-time pass lacks (a
-                // SUPER call into a cross-file parent, a chain receiver typed
-                // from another module; enrichment re-stamps OPEN docs only). We
-                // re-resolve lazily here — `refs_to` runs with the index —
-                // rather than silently excluding the site. `method_call_
-                // invocant_class` resolves SUPER via the full parent MRO too.
+                // Prefer the build-time-frozen dispatch edge
+                // (`resolved_method_target`) so a call that resolved at build
+                // time stays matched regardless of query-time inference. An
+                // absent edge means build-time lacked cross-file info (SUPER
+                // into a cross-file parent; enrichment re-stamps OPEN docs
+                // only) — re-resolve lazily here, where the index is in hand,
+                // rather than silently excluding the site. Either way the
+                // class then fans out over `method_rename_chain` so
+                // `$child->m` matches an ancestor-defined target while
+                // unrelated same-named methods stay out.
                 let scope = callable_scope_for_refs.as_ref().unwrap();
                 let method = r.unqualified_target_name();
                 {

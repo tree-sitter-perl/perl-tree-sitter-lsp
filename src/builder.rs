@@ -9552,30 +9552,15 @@ impl<'a> Builder<'a> {
                 s.to_string()
             }
         });
-        // Always store the invocant span so post-walk refinement
-        // (`apply_chain_typing_invocants`) can find the node and
-        // fill `invocant_class` for refs that walk-time couldn't
-        // resolve (variable invocants whose TC isn't yet seeded,
-        // call-chain invocants whose inner sub return type isn't
-        // resolved). Without this, a `$obj->method` ref whose
-        // walk-time invocant_class was None would stay None
-        // forever and class-scoped `refs_to` would silently match
+        // Stored even when walk-time can't resolve the class — PostFold's
+        // `apply_chain_typing_invocants` needs the span to find the node
+        // and fill `invocant_class`, else class-scoped `refs_to` matches
         // too broadly.
         let invocant_span = invocant_node.map(|n| n.span());
 
-        // Walk-time invocant_class — closed-under-syntax cases only:
-        //   - constructor pattern (`Sner->new->hi`)
-        //   - `__PACKAGE__->method(...)`
-        //
-        // Both are determined by syntax alone — no inference, no
-        // bag lookup. Everything else (variable invocants, bareword
-        // invocants whose canonical class only the bag knows like
-        // `app`, call-chain invocants whose return type is
-        // mid-fold) stays None and gets filled by PostFold's
-        // `apply_chain_typing_invocants` against the canonical bag.
-        // Now that `emit_method_call_arg_keys` runs post-walk, no
-        // walk-time consumer reads `invocant_class` — leaving it
-        // None at walk-time costs nothing.
+        // Walk-time invocant_class: closed-under-syntax cases only
+        // (constructor chain `Sner->new->hi`, `__PACKAGE__->m`). Everything
+        // inference-dependent stays None for PostFold to fill from the bag.
         let invocant_class = invocant_node.and_then(|n| match n.kind() {
             "method_call_expression" => self.extract_constructor_class(n),
             "bareword" | "package"
@@ -9644,19 +9629,11 @@ impl<'a> Builder<'a> {
                     }
                 }
 
-                // Part 5c — `recv->resultset('Foo')` is closed
-                // under syntax. Push the `Parametric` InferredType
-                // at the call's `Expression(refidx)` so chain
-                // receivers reading via
-                // `method_call_return_type_via_bag` see it, and
-                // mark the ref so `emit_method_call_return_edges`
-                // skips its standard `Edge(MethodOnClass)` (which
-                // would resolve to the receiver class's `resultset`
-                // plain return type and mask the row-class arg via
-                // `FrameworkAwareTypeFold`'s class-axis short-
-                // circuit). Variable-binding chain typing
-                // (`my $rs = $schema->resultset(…)`) reads the same
-                // attachment via the bag and seeds a TC for `$rs`.
+                // `recv->resultset('Foo')` is closed under syntax: push the
+                // `Parametric` type at the call's `Expression(refidx)`, and
+                // mark the ref so `emit_method_call_return_edges` skips its
+                // standard `Edge(MethodOnClass)` — that edge would resolve to
+                // plain `resultset` and mask the row-class arg.
                 if let Some(ty) = self.extract_resultset_parametric(node) {
                     self.parametric_emitted_refs.insert(idx);
                     let r_span = self.refs[idx].span;
@@ -9958,14 +9935,9 @@ impl<'a> Builder<'a> {
             );
         }
 
-        // Also synthesize HashKeyDef symbols owned by the row class
-        // so `$rs->search({ name => … })` and `$row->{name}` find
-        // their column def. Mirrors what Mojo `has` does for
-        // constructor args. The HashKeyAccess consumer at
-        // `find_definition`'s method-call-arg arm looks up
-        // `HashKeyOwner::Class(<class>)` — when threaded through
-        // Parametric ResultSet typing (Part 5c), `<class>` is the
-        // row class.
+        // Also synthesize HashKeyDef symbols owned by the row class so
+        // `$rs->search({ name => … })` and `$row->{name}` find their column
+        // def (same shape Mojo `has` emits for constructor args).
         if let Some(ref pkg) = self.current_package {
             let owner = HashKeyOwner::Class(pkg.clone());
             for (name, sel_span) in &col_names {
@@ -10333,11 +10305,9 @@ impl<'a> Builder<'a> {
         // Only match actual function calls, not method calls
         // (method calls are handled by MethodCallBinding).
         //
-        // We used to reject names containing `:` (qualified calls like
-        // `Pkg::Sub::foo()`), which silently dropped those from
-        // `call_bindings`. The fixup downstream strips the package prefix
-        // before looking the sub up in `return_types`, so qualifiers are
-        // fine to pass through here.
+        // Qualified names (`Pkg::Sub::foo()`) pass through whole — the
+        // downstream fixup strips the package prefix before the
+        // `return_types` lookup, so rejecting them here only loses bindings.
         //
         // Dynamic calls like `my $fn = 'get_config'; $fn->()` — the parser
         // yields a function_call_expression with function="$fn". Mirror the

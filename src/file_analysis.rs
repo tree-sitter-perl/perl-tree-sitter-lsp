@@ -829,8 +829,8 @@ impl InferredType {
     /// receiver value what controller is in force; it never inspects
     /// the chain shape. The build-time consumer reads the flattened
     /// `CallContext.receiver_route_defaults`; this is the query-time
-    /// surface for cursor-time stash lookups (hover/completion) — not
-    /// yet wired, hence `allow(dead_code)` for the spike.
+    /// surface for cursor-time stash lookups (hover/completion), which
+    /// aren't wired yet — hence `allow(dead_code)`.
     #[allow(dead_code)]
     pub fn route_default(&self, key: &str) -> Option<&str> {
         let InferredType::BrandedRoute { controller, stash, .. } = self else {
@@ -2572,8 +2572,7 @@ impl FileAnalysis {
     /// value is a cross-file method chain (`my $x = Foo->new->bar`) resolves —
     /// the chase keeps the index when it crosses the `Variable` edge instead of
     /// dead-ending. Pass the index from query-time callers (hover/completion);
-    /// the bare wrapper keeps `None` for build-time / single-file callers. Both
-    /// now carry `package_parents` (previously dropped to empty).
+    /// the bare wrapper keeps `None` for build-time / single-file callers.
     pub fn inferred_type_via_bag_ctx(
         &self,
         var_name: &str,
@@ -2603,10 +2602,9 @@ impl FileAnalysis {
     /// Resolve a `param_types()` role-contract TC for `var` at `point`: find a
     /// gated TC whose scope is on the chain and whose variable matches, then
     /// read its inner type ONLY if the enclosing package `isa` the rule's
-    /// gate (`in_role`), resolved cross-file via `resolve_for`. The gate makes
-    /// a controller whose `Catalyst::Controller` ancestry is established
-    /// through a cross-file base type its `$c` — the build-time local-only
-    /// ancestry check this replaces would have dropped it.
+    /// gate (`in_role`), resolved cross-file via `resolve_for` — so a
+    /// controller whose `Catalyst::Controller` ancestry runs through a
+    /// cross-file base still types its `$c`.
     fn gated_param_type_for(
         &self,
         var: &str,
@@ -3273,11 +3271,11 @@ impl FileAnalysis {
 
     /// Query-time handler call-sites in THIS file: every gated dispatch
     /// candidate whose receiver isa-resolves the gate, projected to the data
-    /// `refs_to` and goto-def need. This is the single seam that replaces
-    /// enrichment-eager promotion — both `resolve.rs` (handler references)
-    /// and dispatch goto-def call it, so they can't drift. Candidates ride
-    /// the cache; resolution is lazy, so non-open workspace/dependency files
-    /// surface exactly like open ones (`docs/adr/receiver-gated-dispatch.md`).
+    /// `refs_to` and goto-def need. The single seam for both — `resolve.rs`
+    /// (handler references) and dispatch goto-def call it, so they can't
+    /// drift. Candidates ride the cache; resolution is lazy, so non-open
+    /// workspace/dependency files surface exactly like open ones
+    /// (`docs/adr/receiver-gated-dispatch.md`).
     pub fn applicable_dispatches(
         &self,
         module_index: Option<&ModuleIndex>,

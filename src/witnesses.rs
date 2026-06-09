@@ -80,10 +80,9 @@ pub enum WitnessAttachment {
     /// `Edge(Expr(arm_span))` here; the ternary's own `Expr(span)`
     /// carries a single `Edge(BranchArm(span))` so consumers querying
     /// the expression materialize the agreed arm type. Distinct shape
-    /// (like `SymbolReturnArm`) so `BranchArmFold` claims by attachment,
-    /// which is why `ExprReturn` / `FrameworkAwareTypeFold` no longer
-    /// have to exclude branch-arm witnesses from the shared `Expr` /
-    /// `Variable` attachments.
+    /// (like `SymbolReturnArm`) so `BranchArmFold` claims by attachment
+    /// and the shared `Expr` / `Variable` reducers never see arm
+    /// witnesses.
     BranchArm(Span),
     /// Typed-slot collector: "what type does instance slot `key` hold on
     /// class `class`?" Seeded from typed hash-key WRITEs
@@ -1334,9 +1333,9 @@ impl ReducerRegistry {
         // so placement here is non-load-bearing — grouped with the other
         // arm-agreement folds for legibility.
         r.register(Box::new(SlotTypeFold));
-        // BranchArmFold claims the dedicated `BranchArm(_)` shape, so its
-        // order relative to the Variable/Expr folds below is no longer
-        // load-bearing — they no longer overlap.
+        // BranchArmFold claims the dedicated `BranchArm(_)` shape — no
+        // overlap with the Variable/Expr folds below, so order here is
+        // not load-bearing.
         r.register(Box::new(BranchArmFold));
         r.register(Box::new(FrameworkAwareTypeFold));
         r.register(Box::new(ExprReturn));
