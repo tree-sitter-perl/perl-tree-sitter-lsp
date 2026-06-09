@@ -2177,7 +2177,7 @@ impl<'a> Builder<'a> {
             }
             "bareword" | "package" => {
                 let text = node.utf8_text(self.source).ok()?;
-                if text == "__PACKAGE__" {
+                if crate::conventions::is_current_package_token(text) {
                     return self.package_for_node(node).map(InferredType::ClassName);
                 }
                 let bare = bare_name(text);
@@ -6858,11 +6858,10 @@ impl<'a> Builder<'a> {
                 // `Sub::Exporter::setup_exporter({ exports => [...] })`.
                 // Match on the unqualified tail so the package prefix
                 // (which the caller may have aliased) isn't load-bearing.
-                if let Some(tail) = name.rsplit("::").next() {
-                    if tail == "setup_exporter" {
-                        if let Some(args) = node.child_by_field_name("arguments") {
-                            self.detect_exporter_setup_call(tail, args);
-                        }
+                let tail = crate::file_analysis::split_qualified(name).1;
+                if tail == "setup_exporter" {
+                    if let Some(args) = node.child_by_field_name("arguments") {
+                        self.detect_exporter_setup_call(tail, args);
                     }
                 }
 
@@ -7401,7 +7400,7 @@ impl<'a> Builder<'a> {
         let mut pins: Vec<(usize, String)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
             let RefKind::FunctionCall { resolved_package: None } = &r.kind else { continue };
-            if r.target_name.contains("::") {
+            if crate::file_analysis::split_qualified(&r.target_name).0.is_some() {
                 continue; // qualified calls already pin at walk time (step 1)
             }
             let Some(pkgs) = sub_pkgs.get(r.target_name.as_str()) else { continue };
@@ -9541,7 +9540,7 @@ impl<'a> Builder<'a> {
             .map(|s| s.to_string());
         let invocant = invocant_text.as_ref().map(|s| {
             // Resolve __PACKAGE__ to enclosing package name
-            if s == "__PACKAGE__" {
+            if crate::conventions::is_current_package_token(s) {
                 self.current_package.clone().unwrap_or_else(|| s.to_string())
             } else {
                 s.to_string()
@@ -9559,7 +9558,7 @@ impl<'a> Builder<'a> {
         let invocant_class = invocant_node.and_then(|n| match n.kind() {
             "method_call_expression" => self.extract_constructor_class(n),
             "bareword" | "package"
-                if n.utf8_text(self.source).ok() == Some("__PACKAGE__") =>
+                if n.utf8_text(self.source).ok().is_some_and(crate::conventions::is_current_package_token) =>
             {
                 self.current_package.clone()
             }
@@ -9686,7 +9685,7 @@ impl<'a> Builder<'a> {
                             bw_text.to_string(),
                             AccessKind::Read,
                         );
-                    } else if bw_text != "__PACKAGE__" {
+                    } else if !crate::conventions::is_current_package_token(bw_text) {
                         // Class-name invocant (`Foo->bar`): the bareword is a
                         // package, not a local sub. Emit a narrower PackageRef
                         // at the invocant span so cursor-on-`Foo` resolves to
@@ -9708,7 +9707,7 @@ impl<'a> Builder<'a> {
         }
 
         // DBIC accessor synthesis: __PACKAGE__->add_columns(...), ->has_many(...), etc.
-        let is_pkg_call = invocant_text.as_deref() == Some("__PACKAGE__")
+        let is_pkg_call = invocant_text.as_deref().is_some_and(crate::conventions::is_current_package_token)
             || (invocant_node.map(|n| n.kind()) == Some("package")
                 && invocant_text.as_ref() == self.current_package.as_ref());
         if is_pkg_call {
@@ -10331,26 +10330,11 @@ impl<'a> Builder<'a> {
     }
 
     fn extract_constructor_class(&self, node: Node<'a>) -> Option<String> {
-        if node.kind() == "method_call_expression" {
-            let method = node.child_by_field_name("method")?;
-            if method
-                .utf8_text(self.source)
-                .ok()
-                .is_some_and(crate::conventions::is_constructor_name)
-            {
-                let invocant = node.child_by_field_name("invocant")?;
-                let inv_text = invocant.utf8_text(self.source).ok()?;
-                // Invocant must be a package name (not a variable)
-                if !inv_text.starts_with('$') && !inv_text.starts_with('@') && !inv_text.starts_with('%') {
-                    // Resolve __PACKAGE__ to enclosing package name
-                    if inv_text == "__PACKAGE__" {
-                        return self.current_package.clone();
-                    }
-                    return Some(inv_text.to_string());
-                }
-            }
+        let inv = crate::cst::constructor_invocant(node, self.source)?;
+        if crate::conventions::is_current_package_token(inv) {
+            return self.current_package.clone();
         }
-        None
+        Some(inv.to_string())
     }
 
     /// `recv->resultset('Foo')` → `Parametric(ResultSet { base,
@@ -10770,7 +10754,7 @@ impl<'a> Builder<'a> {
         // `__PACKAGE__` parses as a func0op call here (not a bareword), so
         // `invocant_type_at_node`'s bareword arm doesn't catch it — resolve
         // it to the enclosing package directly.
-        if class_node.utf8_text(self.source).ok() == Some("__PACKAGE__") {
+        if class_node.utf8_text(self.source).ok().is_some_and(crate::conventions::is_current_package_token) {
             return self.package_for_node(class_node);
         }
         // `bless $r, ref $x` (the clone idiom) blesses into `$x`'s class: the

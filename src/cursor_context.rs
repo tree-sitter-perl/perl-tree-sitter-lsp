@@ -229,17 +229,19 @@ fn is_perl_package_name(s: &str) -> bool {
 
 /// Resolve an invocant type from its text, using analysis when available.
 fn resolve_text_invocant(text: &str, point: Point, analysis: Option<&FileAnalysis>) -> Option<InferredType> {
-    if !text.starts_with('$') && !text.starts_with('@') && !text.starts_with('%') {
-        // Bareword — treat as class name
-        Some(InferredType::ClassName(text.to_string()))
-    } else if let Some(a) = analysis {
-        // Route through the witness-bag path so framework-aware
-        // resolution (Mojo `sub name`, blessed-hashref, branch arms,
-        // arity) refines the answer. Falls back to legacy
-        // `inferred_type` when the bag has nothing.
-        a.inferred_type_via_bag(text, point)
-    } else {
-        None
+    use crate::conventions::InvocantText;
+    match InvocantText::parse(text) {
+        InvocantText::Bareword(b) => Some(InferredType::ClassName(b.to_string())),
+        InvocantText::CurrentPackage | InvocantText::PositionalReceiver => analysis
+            .and_then(|a| a.package_at(point))
+            .map(|p| InferredType::ClassName(p.to_string())),
+        InvocantText::Variable(v) => {
+            // Route through the witness-bag path so framework-aware
+            // resolution (Mojo `sub name`, blessed-hashref, branch arms,
+            // arity) refines the answer. Falls back to legacy
+            // `inferred_type` when the bag has nothing.
+            analysis.and_then(|a| a.inferred_type_via_bag(v, point))
+        }
     }
 }
 

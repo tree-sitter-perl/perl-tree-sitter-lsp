@@ -238,6 +238,28 @@ pub(crate) fn canonical_container_name<'a>(node: Node<'a>, src: &'a [u8]) -> Opt
     Some(format!("{}{}", target_sigil, bare))
 }
 
+/// `Class->new(...)` — a constructor call with a class-shaped invocant.
+/// Returns the invocant text (`Foo::Bar` or `__PACKAGE__`); `None` for
+/// non-constructor methods and variable/positional invocants, whose class
+/// comes from inference. The caller resolves `__PACKAGE__` — the enclosing
+/// package is builder state this layer doesn't hold.
+pub(crate) fn constructor_invocant<'a>(node: Node<'a>, src: &'a [u8]) -> Option<&'a str> {
+    use crate::conventions::InvocantText;
+    let call = MethodCall::cast(node)?;
+    if !call
+        .method()?
+        .text(src)
+        .is_some_and(crate::conventions::is_constructor_name)
+    {
+        return None;
+    }
+    let inv = call.invocant()?.text(src)?;
+    match InvocantText::parse(inv) {
+        InvocantText::Bareword(_) | InvocantText::CurrentPackage => Some(inv),
+        InvocantText::Variable(_) | InvocantText::PositionalReceiver => None,
+    }
+}
+
 /// True when `node` is a `scalar` whose bare varname is a conventional
 /// invocant (`$self` / `$class` / `$this` / `$proto`), matching braced
 /// spellings (`${self}`) and rejecting derefs (`${$ref}`) by reading the

@@ -87,7 +87,7 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 - `file_analysis.rs` — data model; serde-derived.
 - `builder.rs` — CST→FileAnalysis. ONLY tree-sitter consumer.
 - `cst.rs` — typed view over the CST (typed wrappers, `NodeExt`, pair walking, call args, varname canonicalization). The vocabulary every tree consumer uses.
-- `conventions.rs` — Perl-convention name predicates (constructor, conventional invocant). Pure `&str`; no tree-sitter.
+- `conventions.rs` — Perl name semantics, parsed once: `MethodToken` (FQ/SUPER/main method-token qualifier), `InvocantText` (variable/bareword/`__PACKAGE__`/positional-receiver invocant shape), plus name predicates (constructor, conventional invocant, `__PACKAGE__`). Pure `&str`; no tree-sitter. Never re-derive these shapes with `rsplit_once("::")` / `starts_with('$')` string ops in a consumer.
 - `pod.rs` — POD→markdown via tree-sitter-pod.
 - `cursor_context.rs` — position-dependent context.
 - `symbols.rs` — LSP adapter.

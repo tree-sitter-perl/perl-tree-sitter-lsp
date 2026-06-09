@@ -30,6 +30,43 @@ pub fn is_constructor_name(name: &str) -> bool {
     name == "new"
 }
 
+/// `__PACKAGE__` — the compile-time token for the enclosing package.
+pub fn is_current_package_token(text: &str) -> bool {
+    text == "__PACKAGE__"
+}
+
+/// The text of a method-call invocant, classified once. Consumers match
+/// the variant instead of re-deriving the shape with sigil/keyword string
+/// checks at each site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvocantText<'a> {
+    /// `$obj` / `@list` / `%h` — a variable; its class comes from
+    /// inference, never from the spelling.
+    Variable(&'a str),
+    /// `__PACKAGE__` — the enclosing package.
+    CurrentPackage,
+    /// `shift` / `$_[0]` / `@_[0]` — the method's own receiver argument
+    /// read positionally (`my $self = shift`); resolves to the enclosing
+    /// class. Not real variables — the bag has no witness for them.
+    PositionalReceiver,
+    /// Anything else — a bareword: a class name, or a class-returning
+    /// zero-arg sub (`app->routes`).
+    Bareword(&'a str),
+}
+
+impl<'a> InvocantText<'a> {
+    pub fn parse(text: &'a str) -> Self {
+        match text {
+            t if is_current_package_token(t) => Self::CurrentPackage,
+            "shift" | "$_[0]" | "@_[0]" => Self::PositionalReceiver,
+            t if t.starts_with('$') || t.starts_with('@') || t.starts_with('%') => {
+                Self::Variable(t)
+            }
+            t => Self::Bareword(t),
+        }
+    }
+}
+
 /// A method-call name token (`$obj->Foo::Bar::m`, `$self->SUPER::m`,
 /// `->::m`, `->m`), parsed once. Consumers match the variant instead of
 /// re-deriving qualifier semantics with string ops — the qualifier's
@@ -85,7 +122,19 @@ impl<'a> MethodToken<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::MethodToken;
+    use super::{InvocantText, MethodToken};
+
+    #[test]
+    fn invocant_text_variants() {
+        assert_eq!(InvocantText::parse("$obj"), InvocantText::Variable("$obj"));
+        assert_eq!(InvocantText::parse("@list"), InvocantText::Variable("@list"));
+        assert_eq!(InvocantText::parse("%h"), InvocantText::Variable("%h"));
+        assert_eq!(InvocantText::parse("__PACKAGE__"), InvocantText::CurrentPackage);
+        assert_eq!(InvocantText::parse("shift"), InvocantText::PositionalReceiver);
+        assert_eq!(InvocantText::parse("$_[0]"), InvocantText::PositionalReceiver);
+        assert_eq!(InvocantText::parse("@_[0]"), InvocantText::PositionalReceiver);
+        assert_eq!(InvocantText::parse("Foo::Bar"), InvocantText::Bareword("Foo::Bar"));
+    }
 
     #[test]
     fn method_token_variants() {

@@ -2498,7 +2498,7 @@ pub fn collect_diagnostics(
         let name = &r.target_name;
 
         // Skip package-qualified calls like Foo::bar()
-        if name.contains("::") {
+        if crate::file_analysis::split_qualified(name).0.is_some() {
             continue;
         }
 
@@ -2633,19 +2633,18 @@ pub fn collect_diagnostics(
         // to find a method literally named "SUPER::foo" in the MRO always
         // fails. Caller-side package dispatch (`Class::method`) is intentional
         // and not our job to validate here.
-        if method_name.contains("::") {
+        use crate::conventions::{InvocantText, MethodToken};
+        if !matches!(MethodToken::parse(method_name), MethodToken::Bare(_)) {
             continue;
         }
 
-        // Resolve invocant to class name
-        let class_name = if !invocant.starts_with('$')
-            && !invocant.starts_with('@')
-            && !invocant.starts_with('%')
-        {
-            Some(invocant.clone())
-        } else {
-            analysis.inferred_type_via_bag(invocant, r.span.start)
-                .and_then(|ty| ty.class_name().map(|s| s.to_string()))
+        // Resolve invocant to class name. Diagnostics stays bag-only for
+        // non-barewords — no enclosing-class fallback, which would
+        // manufacture warnings on untyped invocants.
+        let class_name = match InvocantText::parse(invocant) {
+            InvocantText::Bareword(b) => Some(b.to_string()),
+            _ => analysis.inferred_type_via_bag(invocant, r.span.start)
+                .and_then(|ty| ty.class_name().map(|s| s.to_string())),
         };
         let class_name = match class_name {
             Some(cn) => cn,

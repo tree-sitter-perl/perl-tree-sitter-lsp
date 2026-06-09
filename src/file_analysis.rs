@@ -4174,11 +4174,15 @@ impl FileAnalysis {
     /// layer (rule #3). Callers in `symbols.rs` / `cursor_context.rs`
     /// compose this; they don't repeat the rules.
     pub fn invocant_text_to_class(&self, invocant: Option<&str>, point: Point) -> Option<String> {
+        use crate::conventions::InvocantText;
         let text = invocant?;
-        if crate::conventions::is_conventional_invocant_name(text) || text == "__PACKAGE__" {
+        if crate::conventions::is_conventional_invocant_name(text) {
             return self.package_at(point).map(|s| s.to_string());
         }
-        if text.starts_with('$') {
+        match InvocantText::parse(text) {
+            InvocantText::CurrentPackage | InvocantText::PositionalReceiver => {
+                self.package_at(point).map(|s| s.to_string())
+            }
             // Use `InferredType::class_name()` so BOTH `ClassName` and
             // `FirstParam` resolve to their class — without this, a
             // `my ($c) = @_` invocant in a controller method (typed
@@ -4187,13 +4191,12 @@ impl FileAnalysis {
             // Method completion on the same `$c` already uses this
             // accessor; routing through it here keeps the two paths in
             // sync. Rule #3.
-            return self.inferred_type_via_bag(text, point)
-                .and_then(|t| t.class_name().map(str::to_string));
+            InvocantText::Variable(v) if v.starts_with('$') => self
+                .inferred_type_via_bag(v, point)
+                .and_then(|t| t.class_name().map(str::to_string)),
+            InvocantText::Variable(_) => None,
+            InvocantText::Bareword(b) => Some(b.to_string()),
         }
-        if text.starts_with('@') || text.starts_with('%') {
-            return None;
-        }
-        Some(text.to_string())
     }
 
     /// Find all symbols with a given name.
@@ -5263,16 +5266,14 @@ impl FileAnalysis {
             return None;
         }
 
-        // Pseudo-invocants for "$self at the method's first arg":
-        // `shift` (no args; `sub m { my $self = shift; ... }`),
-        // `$_[0]` / `@_[0]` (positional), and raw `__PACKAGE__` on
-        // synthesized refs. None are real variables, so the bag has no
-        // witness for them — resolve to enclosing-class identity here.
-        if invocant == "shift"
-            || invocant == "$_[0]"
-            || invocant == "@_[0]"
-            || invocant == "__PACKAGE__"
-        {
+        // Positional receiver spellings and `__PACKAGE__` aren't real
+        // variables (the bag has no witness for them) — both resolve to
+        // enclosing-class identity here.
+        use crate::conventions::InvocantText;
+        if matches!(
+            InvocantText::parse(invocant),
+            InvocantText::PositionalReceiver | InvocantText::CurrentPackage
+        ) {
             return self.enclosing_class_for_scope(r.scope);
         }
 
@@ -5474,8 +5475,12 @@ impl FileAnalysis {
         }
         let point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
 
-        // Pseudo-invocants (`shift`, `$_[0]`, `__PACKAGE__`) → enclosing class.
-        if invocant == "shift" || invocant == "$_[0]" || invocant == "@_[0]" || invocant == "__PACKAGE__" {
+        // Positional receiver spellings and `__PACKAGE__` → enclosing class.
+        if matches!(
+            crate::conventions::InvocantText::parse(invocant),
+            crate::conventions::InvocantText::PositionalReceiver
+                | crate::conventions::InvocantText::CurrentPackage
+        ) {
             return self.enclosing_class_for_scope(r.scope).map(InferredType::ClassName);
         }
 
@@ -5565,52 +5570,57 @@ impl FileAnalysis {
     /// `method_call_invocant_class` is preferred everywhere a
     /// `&Ref` is available.
     fn resolve_invocant_class(&self, invocant: &str, scope: ScopeId, point: Point) -> Option<String> {
-        if invocant.starts_with('$') || invocant.starts_with('@') || invocant.starts_with('%') {
-            // Variable invocant → infer type via the witness bag so
-            // framework/branch/arity rules refine the answer (falls
-            // back to legacy `inferred_type` internally).
-            self.inferred_type_via_bag(invocant, point)
-                .and_then(|t| t.class_name().map(|s| s.to_string()))
-                .or_else(|| {
-                    // Enclosing-class fallback only applies to
-                    // `$self` — other variable invocants whose type
-                    // we don't know stay None, not poisoned with the
-                    // surrounding package. Otherwise `$r->to(...)`
-                    // with `$r` un-typed would pretend `to` is a
-                    // method on the enclosing package (MyApp), and
-                    // goto-def on the method name lands on
-                    // `package MyApp;`. The comment here described
-                    // this guard but the code didn't actually check.
-                    if !crate::conventions::is_conventional_invocant_name(invocant) {
-                        return None;
-                    }
-                    let chain = self.scope_chain(scope);
-                    for scope_id in &chain {
-                        let s = self.scope(*scope_id);
-                        if let ScopeKind::Class { ref name } = s.kind {
-                            return Some(name.clone());
-                        }
-                        if let Some(ref pkg) = s.package {
-                            return Some(pkg.clone());
-                        }
-                    }
-                    None
-                })
-        } else {
-            // Bareword invocant: ambiguous between class-name and
-            // zero-arg function call. If a sub by this name resolves
-            // (locally or via a cross-file import) to a ClassName
-            // return type when called with zero args, treat the
-            // bareword as the call and use that class. Mirrors the
-            // same rule in `receiver_type_for` and
-            // `resolve_invocant_class_tree`.
-            let bare = split_qualified(invocant).1;
-            if let Some(InferredType::ClassName(c)) =
-                self.sub_return_type_at_arity(bare, Some(0))
-            {
-                return Some(c);
+        use crate::conventions::InvocantText;
+        let enclosing = || {
+            for scope_id in &self.scope_chain(scope) {
+                let s = self.scope(*scope_id);
+                if let ScopeKind::Class { ref name } = s.kind {
+                    return Some(name.clone());
+                }
+                if let Some(ref pkg) = s.package {
+                    return Some(pkg.clone());
+                }
             }
-            Some(invocant.to_string())
+            None
+        };
+        match InvocantText::parse(invocant) {
+            InvocantText::CurrentPackage | InvocantText::PositionalReceiver => enclosing(),
+            InvocantText::Variable(_) => {
+                // Variable invocant → infer type via the witness bag so
+                // framework/branch/arity rules refine the answer.
+                self.inferred_type_via_bag(invocant, point)
+                    .and_then(|t| t.class_name().map(|s| s.to_string()))
+                    .or_else(|| {
+                        // Enclosing-class fallback only applies to
+                        // conventional invocants — other variable invocants
+                        // whose type we don't know stay None, not poisoned
+                        // with the surrounding package. Otherwise `$r->to(...)`
+                        // with `$r` un-typed would pretend `to` is a method on
+                        // the enclosing package (MyApp), and goto-def on the
+                        // method name lands on `package MyApp;`.
+                        if crate::conventions::is_conventional_invocant_name(invocant) {
+                            enclosing()
+                        } else {
+                            None
+                        }
+                    })
+            }
+            InvocantText::Bareword(_) => {
+                // Bareword invocant: ambiguous between class-name and
+                // zero-arg function call. If a sub by this name resolves
+                // (locally or via a cross-file import) to a ClassName
+                // return type when called with zero args, treat the
+                // bareword as the call and use that class. Mirrors the
+                // same rule in `receiver_type_for` and
+                // `resolve_invocant_class_tree`.
+                let bare = split_qualified(invocant).1;
+                if let Some(InferredType::ClassName(c)) =
+                    self.sub_return_type_at_arity(bare, Some(0))
+                {
+                    return Some(c);
+                }
+                Some(invocant.to_string())
+            }
         }
     }
 
@@ -6748,18 +6758,11 @@ impl FileAnalysis {
         point: Point,
         module_index: Option<&ModuleIndex>,
     ) -> Vec<CompletionCandidate> {
-        let class_name = if !invocant.starts_with('$')
-            && !invocant.starts_with('@')
-            && !invocant.starts_with('%')
-        {
-            Some(invocant.to_string())
-        } else {
-            self.resolve_invocant_class(
-                invocant,
-                self.scope_at(point).unwrap_or(ScopeId(0)),
-                point,
-            )
-        };
+        let class_name = self.resolve_invocant_class(
+            invocant,
+            self.scope_at(point).unwrap_or(ScopeId(0)),
+            point,
+        );
 
         if let Some(ref cn) = class_name {
             // Pass `module_index` so the ancestor walk reaches CROSS-FILE
@@ -7019,15 +7022,11 @@ impl FileAnalysis {
         // For constructor calls on a class, check for :param fields
         if crate::conventions::is_constructor_name(call_name) {
             if let Some(inv) = invocant {
-                let class_name = if !inv.starts_with('$') {
-                    Some(inv.to_string())
-                } else {
-                    self.resolve_invocant_class(
-                        inv,
-                        self.scope_at(point).unwrap_or(ScopeId(0)),
-                        point,
-                    )
-                };
+                let class_name = self.resolve_invocant_class(
+                    inv,
+                    self.scope_at(point).unwrap_or(ScopeId(0)),
+                    point,
+                );
                 if let Some(ref cn) = class_name {
                     let param_candidates = self.class_param_completions(cn, used_keys);
                     if !param_candidates.is_empty() {
@@ -7235,13 +7234,7 @@ impl FileAnalysis {
         let class_name = if fq_class.is_some() {
             fq_class
         } else if is_method {
-            invocant.and_then(|inv| {
-                if !inv.starts_with('$') && !inv.starts_with('@') && !inv.starts_with('%') {
-                    Some(inv.to_string())
-                } else {
-                    self.resolve_invocant_class(inv, scope, point)
-                }
-            })
+            invocant.and_then(|inv| self.resolve_invocant_class(inv, scope, point))
         } else {
             None
         };
