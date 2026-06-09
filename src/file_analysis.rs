@@ -52,46 +52,9 @@ pub struct Span {
 }
 
 /// Extract the function/method name from a call expression node.
-pub(crate) fn extract_call_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "method_call_expression" => node
-            .child_by_field_name("method")
-            .and_then(|n| n.utf8_text(source).ok())
-            .map(|s| s.to_string()),
-        "function_call_expression" | "ambiguous_function_call_expression" => node
-            .child_by_field_name("function")
-            .and_then(|n| n.utf8_text(source).ok())
-            .map(|s| s.to_string()),
-        _ => None,
-    }
-}
-
-pub(crate) fn node_to_span(node: tree_sitter::Node) -> Span {
-    Span {
-        start: node.start_position(),
-        end: node.end_position(),
-    }
-}
-
-/// Narrow `node`'s span to the bare tail after the last `::` in `text` (rule
-/// #7): for a qualified name (`Foo::Bar::baz`) the renamable / highlightable
-/// token is `baz`, not the whole path — so rename rewrites only the tail and
-/// the qualifier survives, while the ref's `target_name` keeps the full path. No
-/// `::` → the node's own span. FQ identifiers are single-line tokens, so the
-/// tail column is `start.column + byte_offset_of_tail`.
-pub(crate) fn fq_tail_span(node: tree_sitter::Node, text: &str) -> Span {
-    match text.rfind("::") {
-        Some(idx) => {
-            let s = node.start_position();
-            Span {
-                start: Point { row: s.row, column: s.column + idx + 2 },
-                end: node.end_position(),
-            }
-        }
-        None => node_to_span(node),
-    }
-}
-
+// Node-side utilities live in `cst.rs`; re-exported here while the lazy
+// tree-resolution paths (phase 5 retires them) still call them in-module.
+pub(crate) use crate::cst::{extract_call_name, find_ancestor, fq_tail_span, node_to_span};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoldRange {
@@ -3772,14 +3735,7 @@ impl FileAnalysis {
 
     /// Count arguments in a method/function call expression (excluding invocant).
     pub(crate) fn count_call_args(&self, node: tree_sitter::Node) -> usize {
-        let args = match node.child_by_field_name("arguments") {
-            Some(a) => a,
-            None => return 0,
-        };
-        match args.kind() {
-            "parenthesized_expression" | "list_expression" => args.named_child_count(),
-            _ => 1, // single argument
-        }
+        crate::cst::call_args(node).len()
     }
 
     /// Find a `:param` field in a class by its bare name (without sigil).
@@ -7583,18 +7539,6 @@ fn generate_cross_sigil_candidates(
 pub(crate) fn contains_point(span: &Span, point: Point) -> bool {
     (span.start.row < point.row || (span.start.row == point.row && span.start.column <= point.column))
         && (point.row < span.end.row || (point.row == span.end.row && point.column <= span.end.column))
-}
-
-/// Walk up from a node to find an ancestor of the given kind.
-fn find_ancestor<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
-    let mut current = node;
-    for _ in 0..20 {
-        if current.kind() == kind {
-            return Some(current);
-        }
-        current = current.parent()?;
-    }
-    None
 }
 
 fn span_size(span: &Span) -> usize {

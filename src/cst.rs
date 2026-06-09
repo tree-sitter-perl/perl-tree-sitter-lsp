@@ -47,11 +47,61 @@ impl<'a> NodeExt<'a> for Node<'a> {
         self.child_by_field_name(field).and_then(|n| n.text(src))
     }
     fn span(&self) -> Span {
-        crate::file_analysis::node_to_span(*self)
+        node_to_span(*self)
     }
     fn named(&self) -> NamedChildren<'a> {
         NamedChildren { node: *self, idx: 0 }
     }
+}
+
+pub(crate) fn node_to_span(node: Node) -> Span {
+    Span {
+        start: node.start_position(),
+        end: node.end_position(),
+    }
+}
+
+/// The called name of a call node: the `method` field of a method call,
+/// the `function` field of either function-call shape.
+pub(crate) fn extract_call_name(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "method_call_expression" => node.field_text("method", source).map(str::to_string),
+        "function_call_expression" | "ambiguous_function_call_expression" => {
+            node.field_text("function", source).map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
+/// Narrow `node`'s span to the bare tail after the last `::` in `text` (rule
+/// #7): for a qualified name (`Foo::Bar::baz`) the renamable / highlightable
+/// token is `baz`, not the whole path — so rename rewrites only the tail and
+/// the qualifier survives, while the ref's `target_name` keeps the full path.
+/// No `::` → the node's own span. FQ identifiers are single-line tokens, so
+/// the tail column is `start.column + byte_offset_of_tail`.
+pub(crate) fn fq_tail_span(node: Node, text: &str) -> Span {
+    match text.rfind("::") {
+        Some(idx) => {
+            let s = node.start_position();
+            Span {
+                start: tree_sitter::Point { row: s.row, column: s.column + idx + 2 },
+                end: node.end_position(),
+            }
+        }
+        None => node_to_span(node),
+    }
+}
+
+/// Walk up from a node to find an ancestor of the given kind.
+pub(crate) fn find_ancestor<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut current = node;
+    for _ in 0..20 {
+        if current.kind() == kind {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+    None
 }
 
 pub(crate) struct NamedChildren<'a> {
