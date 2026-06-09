@@ -5192,21 +5192,12 @@ impl FileAnalysis {
     /// another package resolve (e.g. `$r->get('/x')->to(...)`). Pass
     /// `None` only for CLI debug / isolated tests.
     ///
-    /// Resolve the dispatch class named by a method token's `::` qualifier
+    /// Resolve the dispatch class named by a *literal* `::` qualifier
     /// (`$obj->Foo::Bar::m` → `Foo::Bar`). A leading `::` (`->::m`) is `main`.
-    ///
-    /// `SUPER::m` dispatches to the enclosing package's parent — `$self->
-    /// SUPER::m` is a reference to that *specific* parent method (so goto-def
-    /// jumps to it, and renaming the parent method rewrites the SUPER call;
-    /// leaving it dangling would be a broken rename). First parent only: Perl's
-    /// SUPER walks the full parent MRO, but single inheritance is the common
-    /// case; multi-parent SUPER nav is a rare residual.
-    fn qualified_dispatch_class(&self, qualifier: &str, scope: ScopeId) -> Option<String> {
+    /// `SUPER` is not a literal class — it's resolved by `resolve_super_method`
+    /// (the enclosing package's parent MRO), not here.
+    fn qualified_dispatch_class(&self, qualifier: &str, _scope: ScopeId) -> Option<String> {
         match qualifier {
-            "SUPER" => {
-                let encl = self.enclosing_class_for_scope(scope)?;
-                self.package_parents.get(&encl).and_then(|ps| ps.first().cloned())
-            }
             "" => Some("main".to_string()),
             class => Some(class.to_string()),
         }
@@ -5225,6 +5216,19 @@ impl FileAnalysis {
         // The qualifier rides the method token (`target_name`), independent of
         // the invocant expression, so it wins ahead of invocant resolution.
         if let Some((qualifier, _)) = r.target_name.rsplit_once("::") {
+            if qualifier == "SUPER" {
+                // SUPER searches the enclosing package's parents' MRO; the
+                // dispatch class is whichever ancestor actually defines it
+                // (multi-parent safe). `None` when the index isn't available
+                // yet (build-time stamp of a dependency file, cross-file
+                // parent) — every query-time consumer re-resolves with the
+                // index: open docs via the enrichment re-stamp, goto-def via the
+                // cross-file path, references/rename via `refs_to`'s SUPER arm.
+                let encl = self.enclosing_class_for_scope(r.scope)?;
+                return self
+                    .resolve_super_method(&encl, r.unqualified_target_name(), module_index)
+                    .map(|res| res.class().to_string());
+            }
             return self.qualified_dispatch_class(qualifier, r.scope);
         }
         if invocant.is_empty() {
@@ -5503,7 +5507,7 @@ impl FileAnalysis {
     }
 
     /// Walk the scope chain to find the enclosing class or package.
-    fn enclosing_class_for_scope(&self, scope: ScopeId) -> Option<String> {
+    pub(crate) fn enclosing_class_for_scope(&self, scope: ScopeId) -> Option<String> {
         for sid in self.scope_chain(scope).iter() {
             let s = self.scope(*sid);
             if let ScopeKind::Class { ref name } = s.kind {
@@ -5624,6 +5628,21 @@ impl FileAnalysis {
         &self,
         class_name: &str,
         module_index: Option<&ModuleIndex>,
+        visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
+    ) {
+        self.for_each_ancestor_class_opt(class_name, module_index, false, visit)
+    }
+
+    /// MRO walk shared by every inheritance consumer. `skip_self`: when true,
+    /// the starting class is NOT visited but its parents' MRO still is — this
+    /// is exactly `SUPER::` semantics (search the enclosing package's parents,
+    /// skipping the package itself). The seen-set still records the start so a
+    /// diamond that loops back to it is skipped.
+    fn for_each_ancestor_class_opt(
+        &self,
+        class_name: &str,
+        module_index: Option<&ModuleIndex>,
+        skip_self: bool,
         mut visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
     ) {
         // Perl's default MRO is left-to-right depth-first: for
@@ -5638,11 +5657,15 @@ impl FileAnalysis {
         // `@ISA` order before the reverse-push.
         let mut seen: HashSet<String> = HashSet::new();
         let mut stack: Vec<String> = vec![class_name.to_string()];
+        let mut first = true;
         while let Some(cur) = stack.pop() {
             if !seen.insert(cur.clone()) { continue; }
             if seen.len() > 21 { break; } // matches the legacy depth guard
-            if let std::ops::ControlFlow::Break(()) = visit(&cur) {
-                return;
+            let is_root = std::mem::replace(&mut first, false);
+            if !(skip_self && is_root) {
+                if let std::ops::ControlFlow::Break(()) = visit(&cur) {
+                    return;
+                }
             }
             let parents = parents_of(
                 &cur,
@@ -5694,6 +5717,72 @@ impl FileAnalysis {
         chain
     }
 
+    /// Does `cls` ITSELF define/bridge `method_name`? The per-class check —
+    /// no ancestor walk — factored out of the MRO loop so normal dispatch and
+    /// `SUPER::` share one definition of "this class has the method". (a) local
+    /// symbols packaged under `cls`, (b) local plugin-namespace entities
+    /// bridged to `cls`, (c) cross-file: `cls`'s own module, cross-package
+    /// typeglob installs, and plugin bridges from other files.
+    fn method_resolution_on_class(
+        &self,
+        cls: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<MethodResolution> {
+        // (a) Local symbols in this file packaged under `cls`.
+        for &sid in self.symbols_named(method_name) {
+            let sym = self.symbol(sid);
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                && self.symbol_in_class(sid, cls)
+            {
+                return Some(MethodResolution::Local { class: cls.to_string(), sym_id: sid });
+            }
+        }
+        // (b) Local plugin-namespace entities bridged to `cls`.
+        for ns in &self.plugin_namespaces {
+            if !ns.bridges.iter().any(|b| matches!(b, Bridge::Class(c) if c == cls)) { continue; }
+            for sym_id in &ns.entities {
+                let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                if sym.name == method_name {
+                    return Some(MethodResolution::Local { class: cls.to_string(), sym_id: *sym_id });
+                }
+            }
+        }
+        // (c) Cross-file: the cached module for `cls` itself (real
+        // CPAN/user-defined methods) plus plugin-emitted methods registered via
+        // bridges from other workspace files (rule #8 — `for_each_entity_
+        // bridged_to`).
+        if let Some(idx) = module_index {
+            if let Some(cached) = idx.get_cached(cls) {
+                if cached.has_sub(method_name) {
+                    return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
+                }
+            }
+            // Cross-package typeglob install: the method is attributed to `cls`
+            // but lives in a differently-named module file (`*{'DateTime::'.
+            // $sub} = …` inside `package DateTime::PP`). Record the home module.
+            if let Some(home) = idx.module_declaring_method_in_package(method_name, cls) {
+                return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: Some(home) });
+            }
+            // Plugin-bridged method (a Mojo helper synthesized in another file,
+            // bridged to `cls`). Record the registration module so the def
+            // lookup hits the right file, not `cls`'s own module.
+            let mut bridged_module: Option<String> = None;
+            idx.for_each_entity_bridged_to(cls, |mod_name, _cached, sym| {
+                if bridged_module.is_some() { return; }
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
+                if sym.name == method_name {
+                    bridged_module = Some(mod_name.to_string());
+                }
+            });
+            if bridged_module.is_some() {
+                return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: bridged_module });
+            }
+        }
+        None
+    }
+
     /// Walk the inheritance chain to find a method (DFS, matches Perl's default MRO).
     pub fn resolve_method_in_ancestors(
         &self,
@@ -5703,80 +5792,31 @@ impl FileAnalysis {
     ) -> Option<MethodResolution> {
         let mut result: Option<MethodResolution> = None;
         self.for_each_ancestor_class(class_name, module_index, |cls| {
-            // (a) Local symbols in this file packaged under `cls`.
-            for &sid in self.symbols_named(method_name) {
-                let sym = self.symbol(sid);
-                if matches!(sym.kind, SymKind::Sub | SymKind::Method)
-                    && self.symbol_in_class(sid, cls)
-                {
-                    result = Some(MethodResolution::Local {
-                        class: cls.to_string(),
-                        sym_id: sid,
-                    });
-                    return std::ops::ControlFlow::Break(());
-                }
+            match self.method_resolution_on_class(cls, method_name, module_index) {
+                Some(r) => { result = Some(r); std::ops::ControlFlow::Break(()) }
+                None => std::ops::ControlFlow::Continue(()),
             }
-            // (b) Local plugin-namespace entities bridged to `cls`.
-            for ns in &self.plugin_namespaces {
-                if !ns.bridges.iter().any(|b| matches!(b, Bridge::Class(c) if c == cls)) { continue; }
-                for sym_id in &ns.entities {
-                    let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
-                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                    if sym.name == method_name {
-                        result = Some(MethodResolution::Local {
-                            class: cls.to_string(),
-                            sym_id: *sym_id,
-                        });
-                        return std::ops::ControlFlow::Break(());
-                    }
-                }
+        });
+        result
+    }
+
+    /// `$self->SUPER::m` dispatch: resolve `method_name` over `enclosing`'s
+    /// parents' MRO, skipping `enclosing` itself (Perl's SUPER searches the
+    /// current package's parents). Walks the FULL DFS MRO — every parent in
+    /// `@ISA`, not just the first — so a method defined on a later parent (or a
+    /// grandparent reached only through it) resolves exactly as Perl would.
+    pub fn resolve_super_method(
+        &self,
+        enclosing: &str,
+        method_name: &str,
+        module_index: Option<&ModuleIndex>,
+    ) -> Option<MethodResolution> {
+        let mut result: Option<MethodResolution> = None;
+        self.for_each_ancestor_class_opt(enclosing, module_index, true, |cls| {
+            match self.method_resolution_on_class(cls, method_name, module_index) {
+                Some(r) => { result = Some(r); std::ops::ControlFlow::Break(()) }
+                None => std::ops::ControlFlow::Continue(()),
             }
-            // (c) Cross-file: the cached module for `cls` itself
-            // (real CPAN/user-defined methods on the class) plus
-            // plugin-emitted methods registered via bridges from
-            // other workspace files. Per rule #8 the bridge index
-            // is the lookup — see `for_each_entity_bridged_to`.
-            if let Some(idx) = module_index {
-                if let Some(cached) = idx.get_cached(cls) {
-                    if cached.has_sub(method_name) {
-                        // Real method in `cls`'s own module.
-                        result = Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
-                        return std::ops::ControlFlow::Break(());
-                    }
-                }
-                // Cross-package typeglob install: the method is attributed
-                // to `cls` but lives in a differently-named module file
-                // (`*{'DateTime::'.$sub} = …` inside `package DateTime::PP`).
-                // The class's own module doesn't declare it; the symbol's
-                // package does. Record the actual home module so the def
-                // lookup hits the right file.
-                if let Some(home) = idx.module_declaring_method_in_package(method_name, cls) {
-                    result = Some(MethodResolution::CrossFile {
-                        class: cls.to_string(),
-                        def_module: Some(home),
-                    });
-                    return std::ops::ControlFlow::Break(());
-                }
-                // Plugin-bridged method (e.g. a Mojo helper synthesized in
-                // another file, bridged to `cls`). The SAME bridge walk
-                // completion uses — record which module the symbol actually
-                // lives in (its registration key, not a re-derived package
-                // name) so consumers don't re-look-it-up in `cls`'s module,
-                // where a bridged helper doesn't exist.
-                let mut bridged_module: Option<String> = None;
-                idx.for_each_entity_bridged_to(cls, |mod_name, _cached, sym| {
-                    if bridged_module.is_some() { return; }
-                    if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
-                    if sym.name == method_name {
-                        bridged_module = Some(mod_name.to_string());
-                    }
-                });
-                if bridged_module.is_some() {
-                    result = Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: bridged_module });
-                    return std::ops::ControlFlow::Break(());
-                }
-            }
-            std::ops::ControlFlow::Continue(())
         });
         result
     }
@@ -6543,6 +6583,15 @@ pub enum MethodResolution {
     CrossFile { class: String, def_module: Option<String> },
 }
 
+impl MethodResolution {
+    /// The class the method resolved on (both variants carry it).
+    pub fn class(&self) -> &str {
+        match self {
+            MethodResolution::Local { class, .. } | MethodResolution::CrossFile { class, .. } => class,
+        }
+    }
+}
+
 /// Result of resolving a sub/method call — local symbol or cross-file metadata.
 pub enum ResolvedSub<'a> {
     /// Found locally in this file's symbols.
@@ -7139,8 +7188,16 @@ impl FileAnalysis {
         // A fully-qualified / SUPER call token (`$o->Foo::Bar::m`, `SUPER::m`)
         // names its dispatch class explicitly — split it so lookups use the
         // bare tail scoped to the qualifier, overriding the invocant-derived
-        // class (Perl ignores the invocant's class for the lookup).
+        // class (Perl ignores the invocant's class for the lookup). SUPER
+        // resolves over the enclosing package's parent MRO.
         let (fq_class, name) = match name.rsplit_once("::") {
+            Some(("SUPER", tail)) => {
+                let c = self
+                    .enclosing_class_for_scope(scope)
+                    .and_then(|e| self.resolve_super_method(&e, tail, module_index))
+                    .map(|r| r.class().to_string());
+                (c, tail)
+            }
             Some((qual, tail)) => (self.qualified_dispatch_class(qual, scope), tail),
             None => (None, name),
         };

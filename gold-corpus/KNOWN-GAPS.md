@@ -222,21 +222,26 @@ mirror how FunctionCall already treats `Foo::Bar::baz()`:
 - **Completion** — both `Foo::Bar::` (bare) and `$obj->Foo::Bar::` (on a variable
   invocant) complete the qualifier package's subs; the tree cursor-context detects
   a `::`-bearing method token after `->` and routes to `QualifiedPath`.
-- **SUPER navigation** — `$self->SUPER::m` resolves to the enclosing package's
-  parent method: `qualified_dispatch_class` maps `SUPER` → first parent, so
-  goto-def jumps to the parent's `m`, hover shows it, and renaming the parent
-  method rewrites the SUPER call (a dangling SUPER call would be a broken rename —
-  see the updated `rename-11-urn-canonical-precision`, which now asserts the isbn
-  SUPER call IS renamed while the subclass override and unrelated `_generic.pm`
-  are not). `$self->SUPER::` completion falls through to ordinary method
-  completion (SUPER isn't a package), so inherited methods still show.
+- **SUPER navigation** — `$self->SUPER::m` resolves to whichever ancestor
+  actually defines `m`, walking the **full parent MRO** (`resolve_super_method`
+  = the shared ancestor DFS with `skip_self`, so it searches every `@ISA` entry
+  and skips the current package). goto-def jumps to it, hover shows it, and
+  renaming the defining ancestor's method rewrites the SUPER call (a dangling
+  SUPER call would be a broken rename — see the updated
+  `rename-11-urn-canonical-precision`, which asserts the isbn SUPER call IS
+  renamed while the subclass override and unrelated `_generic.pm` are not).
+  references/rename resolve SUPER **lazily** in `refs_to` (the ref carries the
+  `SUPER::` marker + its enclosing scope, and `refs_to` runs with the module
+  index), so a SUPER call into a *cross-file* parent in a dependency file —
+  which the build-time stamp can't name — still resolves. `$self->SUPER::`
+  completion falls through to ordinary method completion (SUPER isn't a
+  package), so inherited methods still show.
 
 Proven by `test_fq_method_call_dispatches_from_named_class` (return typing),
 `test_fq_method_call_nav_dispatches_from_named_class` (goto-def / rename / class
-resolution / tail-span), `test_super_method_nav_resolves_to_parent` (SUPER nav),
-and `test_tree_context_fq_method_is_qualified_path` (completion context).
-**Residual:** multi-parent `SUPER::m` nav resolves only the *first* parent (Perl
-walks the full parent MRO); single inheritance — the common case — is exact.
+resolution / tail-span), `test_super_method_nav_resolves_to_parent` +
+`test_super_resolves_across_all_parents` (SUPER nav incl. multi-parent + skip-
+self), and `test_tree_context_fq_method_is_qualified_path` (completion context).
 
 ### `return bless {BLOCK}, CLASS` class arg stranding — **FIXED**
 tree-sitter-perl parses `return bless {}, $class` as `return((bless {}), $class)`:
@@ -274,7 +279,6 @@ class. **Subsystem:** first-param-self heuristic (`detect_first_param_type`).
 | diag-08 (loader call) | XS loader recognition | **low** |
 | diag-09 / diag-10 | typeglob-codegen synthesis | medium |
 | def-16-codegen-type-function | Type::Library synthesis | medium |
-| multi-parent `SUPER::m` nav (single-inheritance is exact) | first-parent only vs full parent MRO | low |
 | completion-datetime-hashkey | slot-write harvest (A4 tail) | medium–high |
 | mojo-url clone *sub-return* (variable is fixed) | build-time `return_types` seed vs query-time cross-file method-return | medium–high |
 | diag-mojo-cookiejar/daemon first-param-self | invocant heuristic in OO class | **high** (ambiguous) |

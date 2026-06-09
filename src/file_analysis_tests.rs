@@ -380,6 +380,31 @@ fn test_fq_method_call_nav_dispatches_from_named_class() {
 /// `$self->SUPER::m` dispatches to the enclosing package's PARENT method —
 /// goto-def jumps to it and renaming the parent method rewrites the SUPER call
 /// (a dangling SUPER call would be a broken rename).
+/// SUPER walks the FULL parent MRO, not just the first parent: with
+/// `@ISA = (A, B)`, `$self->SUPER::m` finds `m` on B when only B defines it,
+/// and it skips the enclosing class itself (Perl's SUPER searches parents).
+#[test]
+fn test_super_resolves_across_all_parents() {
+    let src = "package A;\nsub a_only { 1 }\npackage B;\nsub b_only { 2 }\npackage Child;\nuse parent -norequire, 'A', 'B';\nsub go { my $self = shift; return $self->SUPER::b_only }\n";
+    let fa = build_fa_from_source(src);
+    // Method only on the SECOND parent — first-parent-only would miss it.
+    assert_eq!(
+        fa.resolve_super_method("Child", "b_only", None).map(|r| r.class().to_string()).as_deref(),
+        Some("B"),
+        "SUPER must search all parents, not just the first"
+    );
+    assert_eq!(
+        fa.resolve_super_method("Child", "a_only", None).map(|r| r.class().to_string()).as_deref(),
+        Some("A"),
+    );
+    // SUPER skips the enclosing class: Child defines `go`, but SUPER::go from
+    // Child must not resolve to Child::go.
+    assert!(
+        fa.resolve_super_method("Child", "go", None).is_none(),
+        "SUPER skips the current package"
+    );
+}
+
 #[test]
 fn test_super_method_nav_resolves_to_parent() {
     use crate::file_analysis::{RefKind, RenameKind};

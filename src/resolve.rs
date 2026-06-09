@@ -417,18 +417,36 @@ fn collect_from_analysis(
                 // unrelated same-named methods on other classes stay out
                 // (never on the chain).
                 let scope = callable_scope_for_refs.as_ref().unwrap();
-                match (r.resolved_method_target.as_ref(), scope) {
-                    (Some(edge), Some(pkg)) => {
-                        let cn = edge.invocant_class();
-                        cn == pkg || rename_chain_cache
-                            .entry(cn.to_string())
-                            .or_insert_with(|| {
-                                analysis.method_rename_chain(cn, r.unqualified_target_name(), module_index)
-                            })
-                            .iter()
-                            .any(|c| c == pkg)
+                let method = r.unqualified_target_name();
+                // SUPER calls resolve LAZILY here, not off the frozen edge: the
+                // build-time stamp can't name the dispatch class for a SUPER
+                // call into a CROSS-FILE parent (dependency files stamp without
+                // the index), and the answer needs the full parent MRO anyway.
+                // The ref already carries the SUPER marker (`target_name`) and
+                // its enclosing class (`scope`), and `refs_to` runs with the
+                // index — so resolve the defining ancestor on demand. It IS the
+                // referenced method, so a plain class equality is the match.
+                if r.target_name.starts_with("SUPER::") {
+                    match (analysis.enclosing_class_for_scope(r.scope), scope) {
+                        (Some(encl), Some(pkg)) => analysis
+                            .resolve_super_method(&encl, method, module_index)
+                            .is_some_and(|res| res.class() == pkg.as_str()),
+                        _ => false,
                     }
-                    _ => false,
+                } else {
+                    match (r.resolved_method_target.as_ref(), scope) {
+                        (Some(edge), Some(pkg)) => {
+                            let cn = edge.invocant_class();
+                            cn == pkg || rename_chain_cache
+                                .entry(cn.to_string())
+                                .or_insert_with(|| {
+                                    analysis.method_rename_chain(cn, method, module_index)
+                                })
+                                .iter()
+                                .any(|c| c == pkg)
+                        }
+                        _ => false,
+                    }
                 }
             }
             (TargetKind::Package, RefKind::PackageRef) => true,
