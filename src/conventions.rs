@@ -40,15 +40,23 @@ pub fn is_current_package_token(text: &str) -> bool {
 /// checks at each site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvocantText<'a> {
-    /// `$obj` / `@list` / `%h` — a variable; its class comes from
-    /// inference, never from the spelling.
-    Variable(&'a str),
+    /// `$obj` — a scalar variable, carried WITHOUT its sigil (only a
+    /// scalar can dispatch, so the `$` is content-free). Its class comes
+    /// from inference, never from the spelling — bag lookups key on the
+    /// original sigiled text the caller still holds.
+    Scalar(&'a str),
     /// `__PACKAGE__` — the enclosing package.
     CurrentPackage,
     /// `shift` / `$_[0]` / `@_[0]` — the method's own receiver argument
     /// read positionally (`my $self = shift`); resolves to the enclosing
     /// class. Not real variables — the bag has no witness for them.
     PositionalReceiver,
+    /// `@list` / `%h` — not a legal invocant (Perl methods dispatch on a
+    /// scalar or a class), but tree-sitter-perl's tolerant grammar still
+    /// parses `@list->m` as a method call, and mid-edit completion text
+    /// can spell anything. Unresolvable by construction; consumers
+    /// answer `None`, never a class.
+    NonScalar(&'a str),
     /// Anything else — a bareword: a class name, or a class-returning
     /// zero-arg sub (`app->routes`).
     Bareword(&'a str),
@@ -59,9 +67,8 @@ impl<'a> InvocantText<'a> {
         match text {
             t if is_current_package_token(t) => Self::CurrentPackage,
             "shift" | "$_[0]" | "@_[0]" => Self::PositionalReceiver,
-            t if t.starts_with('$') || t.starts_with('@') || t.starts_with('%') => {
-                Self::Variable(t)
-            }
+            t if t.starts_with('$') => Self::Scalar(&t[1..]),
+            t if t.starts_with('@') || t.starts_with('%') => Self::NonScalar(&t[1..]),
             t => Self::Bareword(t),
         }
     }
@@ -126,9 +133,11 @@ mod tests {
 
     #[test]
     fn invocant_text_variants() {
-        assert_eq!(InvocantText::parse("$obj"), InvocantText::Variable("$obj"));
-        assert_eq!(InvocantText::parse("@list"), InvocantText::Variable("@list"));
-        assert_eq!(InvocantText::parse("%h"), InvocantText::Variable("%h"));
+        // Scalar carries the bare name — the sigil is content-free since
+        // only a scalar can dispatch.
+        assert_eq!(InvocantText::parse("$obj"), InvocantText::Scalar("obj"));
+        assert_eq!(InvocantText::parse("@list"), InvocantText::NonScalar("list"));
+        assert_eq!(InvocantText::parse("%h"), InvocantText::NonScalar("h"));
         assert_eq!(InvocantText::parse("__PACKAGE__"), InvocantText::CurrentPackage);
         assert_eq!(InvocantText::parse("shift"), InvocantText::PositionalReceiver);
         assert_eq!(InvocantText::parse("$_[0]"), InvocantText::PositionalReceiver);

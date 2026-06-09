@@ -4191,10 +4191,10 @@ impl FileAnalysis {
             // Method completion on the same `$c` already uses this
             // accessor; routing through it here keeps the two paths in
             // sync. Rule #3.
-            InvocantText::Variable(v) if v.starts_with('$') => self
-                .inferred_type_via_bag(v, point)
+            InvocantText::Scalar(_) => self
+                .inferred_type_via_bag(text, point)
                 .and_then(|t| t.class_name().map(str::to_string)),
-            InvocantText::Variable(_) => None,
+            InvocantText::NonScalar(_) => None,
             InvocantText::Bareword(b) => Some(b.to_string()),
         }
     }
@@ -5585,8 +5585,9 @@ impl FileAnalysis {
         };
         match InvocantText::parse(invocant) {
             InvocantText::CurrentPackage | InvocantText::PositionalReceiver => enclosing(),
-            InvocantText::Variable(_) => {
-                // Variable invocant → infer type via the witness bag so
+            InvocantText::NonScalar(_) => None,
+            InvocantText::Scalar(_) => {
+                // Scalar invocant → infer type via the witness bag so
                 // framework/branch/arity rules refine the answer.
                 self.inferred_type_via_bag(invocant, point)
                     .and_then(|t| t.class_name().map(|s| s.to_string()))

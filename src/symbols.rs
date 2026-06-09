@@ -2639,12 +2639,13 @@ pub fn collect_diagnostics(
         }
 
         // Resolve invocant to class name. Diagnostics stays bag-only for
-        // non-barewords — no enclosing-class fallback, which would
-        // manufacture warnings on untyped invocants.
+        // scalars — no enclosing-class fallback, which would manufacture
+        // warnings on untyped invocants — and skips everything else.
         let class_name = match InvocantText::parse(invocant) {
             InvocantText::Bareword(b) => Some(b.to_string()),
-            _ => analysis.inferred_type_via_bag(invocant, r.span.start)
+            InvocantText::Scalar(_) => analysis.inferred_type_via_bag(invocant, r.span.start)
                 .and_then(|ty| ty.class_name().map(|s| s.to_string())),
+            _ => None,
         };
         let class_name = match class_name {
             Some(cn) => cn,

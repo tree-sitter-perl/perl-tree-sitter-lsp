@@ -256,7 +256,9 @@ pub(crate) fn constructor_invocant<'a>(node: Node<'a>, src: &'a [u8]) -> Option<
     let inv = call.invocant()?.text(src)?;
     match InvocantText::parse(inv) {
         InvocantText::Bareword(_) | InvocantText::CurrentPackage => Some(inv),
-        InvocantText::Variable(_) | InvocantText::PositionalReceiver => None,
+        InvocantText::Scalar(_)
+        | InvocantText::NonScalar(_)
+        | InvocantText::PositionalReceiver => None,
     }
 }
 
