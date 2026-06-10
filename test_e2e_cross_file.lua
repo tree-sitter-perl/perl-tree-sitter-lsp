@@ -69,9 +69,9 @@ t.test("hover: $cfg shows HashRef from imported get_config", function()
     "$cfg = get_config()", 0, "HashRef")
 end)
 
-t.test("hover: $items shows ArrayRef from imported make_items", function()
-  hover_has("hover: $items shows ArrayRef from imported make_items",
-    "$items = make_items()", 0, "ArrayRef")
+t.test("hover: $items shows the imported tuple type from make_items", function()
+  hover_has("hover: $items shows the imported tuple type from make_items",
+    "$items = make_items()", 0, "Sequence<")
 end)
 
 -- ── 2. Inlay hints show imported return types ────────────────────────
@@ -80,8 +80,8 @@ t.test("inlay hint: $cfg shows HashRef", function()
   hint_has("inlay hint: $cfg shows HashRef", "my %$cfg = get_config", "HashRef")
 end)
 
-t.test("inlay hint: $items shows ArrayRef", function()
-  hint_has("inlay hint: $items shows ArrayRef", "my %$items = make_items", "ArrayRef")
+t.test("inlay hint: $items shows the tuple type", function()
+  hint_has("inlay hint: $items shows the tuple type", "my %$items = make_items", "Sequence<")
 end)
 
 -- ── 3. Hash key completion from imported module ──────────────────────

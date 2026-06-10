@@ -1024,10 +1024,9 @@ fn test_extract_arrayref_literal() {
 
     let fa = build_fa("my $aref = [1, 2, 3];");
     let ty = fa.inferred_type_via_bag("$aref", Point::new(0, 21));
-    assert_eq!(
-        ty,
-        Some(InferredType::ArrayRef),
-        "populated array ref literal"
+    assert!(
+        ty.is_some_and(|t| t.is_array_shaped()),
+        "populated array ref literal",
     );
 }
 
@@ -1085,7 +1084,7 @@ fn test_arrow_hash_deref_infers_hashref() {
 fn test_arrow_array_deref_infers_arrayref() {
     let fa = build_fa("my $x;\n$x->[0];");
     let ty = fa.inferred_type_via_bag("$x", Point::new(1, 8));
-    assert_eq!(ty, Some(InferredType::ArrayRef));
+    assert!(ty.is_some_and(|t| t.is_array_shaped()), "array-shaped");
 }
 
 #[test]
@@ -1107,9 +1106,8 @@ fn test_coderef_call_propagates_return_type() {
     // body span resolves to ArrayRef without name lookup.
     let fa = build_fa("my $cb = sub { [1,2] };\nmy $r = $cb->();\nmy $z;");
     let ty = fa.inferred_type_via_bag("$r", Point::new(2, 0));
-    assert_eq!(
-        ty,
-        Some(InferredType::ArrayRef),
+    assert!(
+        ty.as_ref().is_some_and(|t| t.is_array_shaped()),
         "coderef call must inherit the callable's return type via return_edge: got {:?}",
         ty,
     );
@@ -1119,7 +1117,7 @@ fn test_coderef_call_propagates_return_type() {
 fn test_postfix_array_deref_infers_arrayref() {
     let fa = build_fa("my $x;\nmy @a = $x->@*;\nmy $z;");
     let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
-    assert_eq!(ty, Some(InferredType::ArrayRef));
+    assert!(ty.is_some_and(|t| t.is_array_shaped()), "array-shaped");
 }
 
 #[test]
@@ -1227,7 +1225,7 @@ fn test_preinc_infers_numeric() {
 fn test_block_array_deref_infers_arrayref() {
     let fa = build_fa("my $x;\nmy @items = @{$x};\nmy $z;");
     let ty = fa.inferred_type_via_bag("$x", Point::new(2, 0));
-    assert_eq!(ty, Some(InferredType::ArrayRef));
+    assert!(ty.is_some_and(|t| t.is_array_shaped()), "array-shaped");
 }
 
 #[test]
@@ -1259,10 +1257,9 @@ fn test_builtin_push_infers_arrayref() {
     // push @{$aref} triggers array_deref_expression which already infers ArrayRef
     let fa = build_fa("my $aref;\npush @{$aref}, 1;\nmy $z;");
     let ty = fa.inferred_type_via_bag("$aref", Point::new(2, 0));
-    assert_eq!(
-        ty,
-        Some(InferredType::ArrayRef),
-        "push deref should infer ArrayRef"
+    assert!(
+        ty.is_some_and(|t| t.is_array_shaped()),
+        "push deref should infer ArrayRef",
     );
 }
 
@@ -1331,9 +1328,9 @@ fn test_return_type_hashref() {
 #[test]
 fn test_return_type_arrayref() {
     let fa = build_fa("sub get_tags {\n    return [1, 2, 3];\n}");
-    assert_eq!(
-        fa.sub_return_type_at_arity("get_tags", None),
-        Some(InferredType::ArrayRef)
+    assert!(
+        fa.sub_return_type_at_arity("get_tags", None).is_some_and(|t| t.is_array_shaped()),
+        "array-shaped",
     );
 }
 
@@ -3437,7 +3434,6 @@ fn test_cross_file_method_override() {
 
 #[test]
 fn test_cross_file_return_type_through_inheritance() {
-    use crate::file_analysis::InferredType;
     use crate::module_index::ModuleIndex;
     use std::path::PathBuf;
 
@@ -4416,11 +4412,10 @@ has flavor => sub { [1, 2, 3] };
         "Sweet::flavor getter returns String (from 'caramel' default), \
          not Sour's ArrayRef"
     );
-    assert_eq!(
-        fa.find_method_return_type("Sour", "flavor", None, Some(0)),
-        Some(InferredType::ArrayRef),
+    assert!(
+        fa.find_method_return_type("Sour", "flavor", None, Some(0)).is_some_and(|t| t.is_array_shaped()),
         "Sour::flavor getter returns ArrayRef (from sub-returning-array \
-         default), not Sweet's String"
+         default), not Sweet's String",
     );
     assert_eq!(
         fa.find_method_return_type("Sweet", "flavor", None, Some(1)),
@@ -4507,10 +4502,9 @@ has items => sub { [] };
 ",
     );
     let rt = fa.find_method_return_type("App", "items", None, Some(0));
-    assert_eq!(
-        rt,
-        Some(InferredType::ArrayRef),
-        "sub {{ [] }} default → ArrayRef getter"
+    assert!(
+        rt.is_some_and(|t| t.is_array_shaped()),
+        "sub {{ [] }} default → ArrayRef getter",
     );
 }
 
@@ -14538,4 +14532,61 @@ my $h = cfg()->{host};
         .inferred_type_via_bag("$h", Point::new(2, 0))
         .expect("$h typed through cfg()->{host}");
     assert_eq!(h, InferredType::String);
+}
+
+// ---- Tier 3 nested-hashkey: array element narrowing + mixed drill ----
+
+/// `->[N]` projects array-literal element types (tuple semantics — the
+/// heterogeneous case answers per index, better than bailing), and the
+/// mixed drill `$obj->{users}->[0]->{name}` chains hash narrowing →
+/// element projection → hash narrowing end-to-end.
+#[test]
+fn array_element_narrowing_and_mixed_drill() {
+    let src = "\
+my $x = [1, 'a'];
+my $n = $x->[0];
+my $s = $x->[1];
+my $obj = { users => [ { name => 'A', id => 1 } ] };
+my $name = $obj->{users}->[0]->{name};
+my $id = $obj->{users}->[0]->{id};
+";
+    let fa = build_fa(src);
+    assert_eq!(
+        fa.inferred_type_via_bag("$n", Point::new(2, 0)),
+        Some(InferredType::Numeric),
+        "heterogeneous tuple projects per index",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$s", Point::new(2, 8)),
+        Some(InferredType::String),
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$name", Point::new(5, 0)),
+        Some(InferredType::String),
+        "mixed drill end-to-end",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$id", Point::new(5, 30)),
+        Some(InferredType::Numeric),
+    );
+}
+
+/// Out-of-range and unknown-element honesty: `->[7]` of a 2-tuple is
+/// None; a literal with an untypable element degrades to plain ArrayRef
+/// (no per-slot claims).
+#[test]
+fn array_element_narrowing_negative_space() {
+    let src = "\
+my $x = [1, 'a'];
+my $oob = $x->[7];
+my $mixed = [1, some_call()];
+";
+    let fa = build_fa(src);
+    assert_eq!(
+        fa.inferred_type_via_bag("$oob", Point::new(2, 0)),
+        None,
+        "out-of-range projection stays honest",
+    );
+    let m = fa.inferred_type_via_bag("$mixed", Point::new(2, 10));
+    assert_eq!(m, Some(InferredType::ArrayRef), "untypable element degrades whole literal");
 }

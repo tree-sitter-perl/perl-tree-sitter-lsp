@@ -1,13 +1,19 @@
 # Nested hash-key intelligence
 
-**Status:** Tier 1 partially landed in the parametric ResultSet
-PR — `add_columns` synthesizes `HashKeyDef` symbols on the row
-class, and `ParametricType::ResultSet`'s `hash_key_class()` /
-`method_arg_owner()` route hash-key access to the row class.
-What's NOT in Tier 1 yet: direct `$row->{name}` access on a
-typed row (DBIC's HRI shape; not currently supported anyway).
-Tiers 2/3 (structurally-typed hash literals, mixed array/hash
-drill) remain queued.
+**Status: ALL THREE TIERS LANDED (June 2026, `nested-hashkey`
+branch).** Tier 1: `$row->{name}` resolves to the column def via the
+post-fold variable-owner upgrade. Tier 2: `HashWithKeys` (per-key value
+types, `open` spread flag) with `->{key}` narrowing through assignment
+hops, double-drills, and sub-return literals; two lattice rules made it
+sound (all-hash-shaped return arms unify coarse; structure dominates
+rep in `subsumes_narrowing` + the plain-type fold). Tier 3: array
+literals type as per-index `Sequence` tuples (heterogeneous answers
+per index instead of bailing), `->[N]` projects, and the mixed drill
+`$obj->{users}->[0]->{name}` chains end-to-end. Displays stay coarse
+("HashRef") for hashes; sequences display `Sequence<…>` elided past 4
+elements. Still open below: the deferred items (mutation-induced
+widening, Type::Tiny recursive constraints) and the closed-shape-miss
+diagnostic (the `open` flag now carries everything it needs).
 
 Builds on the sealed-enum `ParametricType` shape landed in
 Part 5c (`docs/adr/parametric-types.md`). Each flavor carries

@@ -2235,7 +2235,15 @@ impl<'a> Builder<'a> {
                 self.package_for_node(node).map(InferredType::ClassName)
             }
             "array_element_expression" => {
-                let array = node.child_by_field_name("array")?;
+                // Arrow deref on an expression (`$x->[0]`,
+                // `$obj->{users}->[0]`) has no `array` field — the base is
+                // the first named child; its Sequence projects the element.
+                let Some(array) = node.child_by_field_name("array") else {
+                    let base = node.named_child(0)?;
+                    let idx_node = node.child_by_field_name("index")?;
+                    let idx: i32 = idx_node.utf8_text(self.source).ok()?.parse().ok()?;
+                    return self.invocant_type_at_node(base)?.element_at(idx).cloned();
+                };
                 let varname = array.named_child(0)?;
                 let index = node.child_by_field_name("index")?;
                 // `$_[0]` is the positional-receiver pseudo-invocant
@@ -6177,6 +6185,35 @@ impl<'a> Builder<'a> {
         InferredType::HashWithKeys { keys, open }
     }
 
+    /// Type an array literal positionally: `[1, 'x']` →
+    /// `Sequence([Numeric, String])`, so `->[N]` projects per index
+    /// (tuple semantics — the homogeneous case is just every slot
+    /// agreeing). Degrades to plain `ArrayRef` when any element's type
+    /// is unknown or the literal is huge (`Sequence` is a type-per-slot
+    /// tuple, not a summary).
+    fn array_literal_type(&mut self, node: Node<'a>) -> InferredType {
+        const MAX_TUPLE: usize = 64;
+        let list = node
+            .named_child(0)
+            .filter(|c| c.kind() == "list_expression")
+            .unwrap_or(node);
+        let mut flat: Vec<Node<'a>> = Vec::new();
+        crate::cst::flatten_list(list, &mut flat);
+        let elems: Vec<Node<'a>> = flat.into_iter().filter(|n| n.is_named()).collect();
+        if elems.is_empty() || elems.len() > MAX_TUPLE {
+            return InferredType::ArrayRef;
+        }
+        let mut types = Vec::with_capacity(elems.len());
+        for e in &elems {
+            self.emit_expr_witness(*e);
+            match self.bag_query_expr_span(node_to_span(*e)) {
+                Some(t) => types.push(t),
+                None => return InferredType::ArrayRef,
+            }
+        }
+        InferredType::Sequence(types)
+    }
+
     fn expr_payload(&mut self, node: Node<'a>) -> Option<crate::witnesses::WitnessPayload> {
         use crate::witnesses::{RefIdx, WitnessAttachment, WitnessPayload};
         match node.kind() {
@@ -6189,7 +6226,7 @@ impl<'a> Builder<'a> {
                 Some(WitnessPayload::InferredType(self.hash_literal_type(node)))
             }
             "anonymous_array_expression" => {
-                Some(WitnessPayload::InferredType(InferredType::ArrayRef))
+                Some(WitnessPayload::InferredType(self.array_literal_type(node)))
             }
             "quoted_regexp" => Some(WitnessPayload::InferredType(InferredType::Regexp)),
             "anonymous_subroutine_expression" | "refgen_expression" => {

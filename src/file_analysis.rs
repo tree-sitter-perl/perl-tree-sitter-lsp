@@ -1037,6 +1037,12 @@ impl InferredType {
         )
     }
 
+    /// Array-shaped rep, regardless of element knowledge — the
+    /// `is_hash_shaped` twin for `== ArrayRef` gates.
+    pub fn is_array_shaped(&self) -> bool {
+        matches!(self, InferredType::ArrayRef | InferredType::Sequence(_))
+    }
+
     pub fn key_value_type(&self, key: &str) -> Option<Option<&InferredType>> {
         match self {
             InferredType::HashWithKeys { keys, .. } => keys
@@ -1175,15 +1181,17 @@ impl InferredType {
                 InferredType::BrandedRoute { controller: hc, stash: hs, .. },
                 InferredType::BrandedRoute { controller: wc, stash: ws, .. },
             ) => (wc.is_none() || hc.is_some()) && ws.len() <= hs.len(),
-            // Structure dominates rep: a keyed hash is strictly more
-            // informative than the bare `HashRef` a deref-narrowing
-            // observation re-derives. Two keyed hashes only subsume on
-            // equality (a genuine reassignment with different keys must
-            // win as latest).
+            // Structure dominates rep: a keyed hash / positional tuple is
+            // strictly more informative than the bare ref a deref-
+            // narrowing observation re-derives. Structured-vs-structured
+            // only subsumes on equality (a genuine reassignment with a
+            // different shape must win as latest).
             (InferredType::HashWithKeys { .. }, InferredType::HashRef) => true,
             (a @ InferredType::HashWithKeys { .. }, b @ InferredType::HashWithKeys { .. }) => {
                 a == b
             }
+            (InferredType::Sequence(_), InferredType::ArrayRef) => true,
+            (a @ InferredType::Sequence(_), b @ InferredType::Sequence(_)) => a == b,
             // Unit-shape variants subsume themselves; mismatched
             // discriminants don't subsume.
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
@@ -1258,6 +1266,11 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
     // `{b=>2}`) → degrade to the coarse HashRef rather than Unknown.
     if return_types.iter().all(|t| t.is_hash_shaped()) {
         return Some(InferredType::HashRef);
+    }
+    // Same rule for arrays: structurally different tuples agree on the
+    // coarse ArrayRef.
+    if return_types.iter().all(|t| t.is_array_shaped()) {
+        return Some(InferredType::ArrayRef);
     }
     // Object subsumes HashRef: if some returns are Object(X) and others are
     // hash-shaped, the Object wins (overloaded hash access is common in Perl).
@@ -8293,7 +8306,13 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
             // bracketed text as link syntax and either swallow it
             // or render it as a broken link. Matches the
             // `Parametric<T1, T2>` style.
-            let parts: Vec<String> = elems.iter().map(format_inferred_type).collect();
+            // Elide long tuples — a 64-slot literal's hover shouldn't be
+            // a wall of element types.
+            let mut parts: Vec<String> =
+                elems.iter().take(4).map(format_inferred_type).collect();
+            if elems.len() > 4 {
+                parts.push("…".to_string());
+            }
             format!("Sequence<{}>", parts.join(", "))
         }
         InferredType::TypeConstraintOf(inner) => {

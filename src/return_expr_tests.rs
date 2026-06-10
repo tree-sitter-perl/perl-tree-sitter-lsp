@@ -257,11 +257,10 @@ my $sentinel;
     let fa = parse(src);
     let pt = point_at(src, "my $sentinel");
     let ty = fa.inferred_type_via_bag("$r", pt);
-    assert_eq!(
-        ty,
-        Some(InferredType::ArrayRef),
+    assert!(
+        ty.is_some_and(|t| t.is_array_shaped()),
         "dynamic-method call must chase $cb's CodeRef return_edge — \
          the closure returns an arrayref regardless of receiver, so \
-         the chase resolves through the Symbol's stored return"
+         the chase resolves through the Symbol's stored return",
     );
 }
