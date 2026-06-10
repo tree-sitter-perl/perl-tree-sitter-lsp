@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="52" ry="52" fill="#282c34"/>
+  <!-- AST: a root node with edges fanning down to the three Perl sigil leaves
+       ($ @ %), colored to match the extension's own semantic highlighting.
+       The syntax-tree motif nods to tree-sitter; the sigils read as Perl. -->
+  <g stroke="#5c6370" stroke-width="8" stroke-linecap="round">
+    <line x1="128" y1="56" x2="66" y2="120"/>
+    <line x1="128" y1="56" x2="128" y2="120"/>
+    <line x1="128" y1="56" x2="190" y2="120"/>
+  </g>
+  <circle cx="128" cy="50" r="15" fill="#56b6c2"/>
+  <g font-family="DejaVu Sans Mono, monospace" font-weight="bold" font-size="96"
+     text-anchor="middle" dominant-baseline="central">
+    <text x="66"  y="178" fill="#61afef">$</text>
+    <text x="128" y="178" fill="#c678dd">@</text>
+    <text x="190" y="178" fill="#e5c07b">%</text>
+  </g>
+</svg>

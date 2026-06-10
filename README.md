@@ -10,6 +10,12 @@ cargo install perl-lsp
 
 ## Editor Setup
 
+### VS Code
+
+Install **[Perl (perl-lsp)](https://marketplace.visualstudio.com/items?itemName=tree-sitter-perl.perl-lsp)** from the Marketplace (or search `perl-lsp` in the Extensions view). The extension fetches the matching `perl-lsp` binary automatically — no separate `cargo install` needed. To point it at your own build instead, set `perl-lsp.path` in settings.
+
+> The `cargo install` above is only needed for the other editors below, or if you prefer to manage the binary yourself.
+
 ### Neovim (0.11+)
 
 ```lua
@@ -143,7 +149,7 @@ PERL5LIB=./my-libs/perl5 nvim lib/MyApp.pm
 | **Signature help** | Parameter names with inferred types, cross-file parameter types |
 | **Semantic tokens** | 10 types (variable, parameter, `$self`, function, method, macro, property, namespace, regexp, constant), 9 modifiers |
 | **Inlay hints** | Variable type annotations, sub return types |
-| **Diagnostics** | Unresolved function/method warnings with framework awareness |
+| **Diagnostics** | Unresolved function/method hints with framework awareness (low-severity by design — dynamic Perl is common) |
 | **Code actions** | Auto-import for unresolved functions |
 | **Workspace symbol** | Search across all indexed project files |
 | **Document symbols** | Nested outline with packages, subs, classes, fields |

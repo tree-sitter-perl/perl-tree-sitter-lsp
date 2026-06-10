@@ -76,7 +76,10 @@ fn test_diagnostics_unresolved_function() {
     let module_index = crate::module_index::ModuleIndex::new_for_test();
     let diags = collect_diagnostics(&analysis, &module_index, Default::default());
     assert_eq!(diags.len(), 1);
-    assert_eq!(diags[0].severity, Some(DiagnosticSeverity::INFORMATION));
+    // Quietest visible severity — unresolved barewords are often genuinely
+    // dynamic (AUTOLOAD / runtime glob / uninstalled dep), so they shouldn't
+    // dominate the Problems panel.
+    assert_eq!(diags[0].severity, Some(DiagnosticSeverity::HINT));
     assert!(diags[0].message.contains("frobnicate"));
 }
 

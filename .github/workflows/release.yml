@@ -75,9 +75,39 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+  # Create the GitHub Release with hand-curated notes (the section for this tag
+  # from CHANGELOG.md), prepended to GitHub's auto-generated commit list. Runs
+  # before `build` so the release exists with its body before the matrix jobs
+  # append platform binaries (those upload steps don't touch the body).
+  release-notes:
+    name: Release notes
+    needs: publish-crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract CHANGELOG section for this tag
+        run: |
+          # Pull the block under `## <tag>` (e.g. `## v0.4.0`) up to the next `## `.
+          awk -v hdr="## ${GITHUB_REF_NAME}" '
+            $0 == hdr {f=1; next}
+            /^## / && f {exit}
+            f
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Release ${GITHUB_REF_NAME}." > RELEASE_NOTES.md
+            echo "::warning::No CHANGELOG.md section for ${GITHUB_REF_NAME}; using a stub body."
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
+
   build:
     name: Build ${{ matrix.target }}
-    needs: publish-crate
+    needs: release-notes
     strategy:
       matrix:
         include:

@@ -2611,9 +2611,14 @@ pub fn collect_diagnostics(
                         ..Default::default()
                     });
                 } else {
+                    // HINT (not INFORMATION): an unresolved bareword call is
+                    // often a genuinely-dynamic sub (AUTOLOAD, runtime glob
+                    // install, a not-installed dep) the static walker can't see.
+                    // Keep it the quietest visible severity so a Moose/AUTOLOAD-
+                    // heavy codebase doesn't light up the Problems panel.
                     diagnostics.push(Diagnostic {
                         range,
-                        severity: Some(DiagnosticSeverity::INFORMATION),
+                        severity: Some(DiagnosticSeverity::HINT),
                         code: Some(NumberOrString::String("unresolved-function".into())),
                         source: Some("perl-lsp".into()),
                         message: format!("'{}' is not defined in this file", name),
