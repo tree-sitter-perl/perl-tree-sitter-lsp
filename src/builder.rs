@@ -250,6 +250,7 @@ fn build_with_plugins_inner(
         gated_param_types: Vec::new(),
         method_call_invocant: std::collections::HashMap::new(),
         attr_projections: Vec::new(),
+        escaped_scalars: std::collections::HashSet::new(),
         method_call_arity: std::collections::HashMap::new(),
         parametric_emitted_refs: std::collections::HashSet::new(),
         method_call_ref_dedup: std::collections::HashSet::new(),
@@ -501,6 +502,7 @@ fn build_with_plugins_inner(
         provisional_dispatches: b.provisional_dispatches,
         attr_projections: b.attr_projections,
         gated_param_types: b.gated_param_types,
+        escaped_scalars: b.escaped_scalars,
     });
     // Finalize: run the legacy text-based MCB resolver as a fallback.
     // For every assignment the unified typer (run before
@@ -1450,6 +1452,14 @@ struct Builder<'a> {
     /// names derive from an attr (`predicate => has_x`). Flushed into
     /// `FileAnalysis.attr_accessors`.
     attr_projections: Vec<crate::file_analysis::AttrProjection>,
+
+    /// Scalars read in any position other than an element-access base
+    /// (`func($c)`, `my $z = $c`, `$c->method`, `%$c`) — the reference
+    /// escaped to code that may mutate the referent, so a closed literal
+    /// shape is no longer the variable's whole story. Flushed into
+    /// `FileAnalysis.escaped_scalars`; consumed by
+    /// `closed_shape_is_whole_story`.
+    escaped_scalars: std::collections::HashSet<String>,
 
     /// Per-MethodCall-ref arg count, keyed by ref index. Lets
     /// `emit_method_call_return_edges` pin the call site's arity onto its
@@ -6813,6 +6823,16 @@ impl<'a> Builder<'a> {
 
         if let Ok(text) = node.utf8_text(self.source) {
             let access = self.determine_access(node);
+            // A scalar READ anywhere but an element-access base hands the
+            // reference to code that may mutate the referent (call arg,
+            // alias, invocant, deref) — record the escape so closed-shape
+            // consumers know the literal isn't the whole story.
+            if access == AccessKind::Read
+                && text.starts_with('$')
+                && !crate::cst::is_element_access_base(node)
+            {
+                self.escaped_scalars.insert(text.to_string());
+            }
             // Fully-qualified read (`$Foo::Bar::x`): narrow the span to the
             // bare tail (rule #7) so rename rewrites only `x` and the
             // qualifier survives, mirroring the FQ-call narrowing. The full

@@ -4335,3 +4335,45 @@ class Point {
     );
     assert_eq!(loc.range.start.line, 2, "lands on the field decl line");
 }
+
+/// Closed-shape hash-key typo diagnostic: a READ of a key the closed
+/// literal doesn't define is hinted. Silent when the whole-story gate
+/// fails — a key write extends the shape, a reassignment replaces it,
+/// an escape (call arg / alias / invocant / sigil deref) hands the
+/// reference to code that may mutate it — and for open shapes and
+/// known keys.
+#[test]
+fn test_closed_shape_unknown_key_diagnostic() {
+    let src = "\
+my $config = { host => 'x', port => 1 };
+my $bad = $config->{typo};
+my $ok = $config->{host};
+my $mut = { host => 'x' };
+$mut->{added} = 1;
+my $r1 = $mut->{other};
+my $esc = { host => 'x' };
+process($esc);
+my $r2 = $esc->{anything};
+my $re = { host => 'x' };
+$re = fetch_config() if $ENV{X};
+my $r3 = $re->{whatever};
+my $base = { a => 1 };
+my $open = { %$base, extra => 1 };
+my $maybe = $open->{whatever};
+";
+    let analysis = parse_analysis(src);
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(
+        &analysis,
+        &idx,
+        DiagnosticOptions { unresolved_dispatch: false },
+    );
+    let keys: Vec<&str> = diags
+        .iter()
+        .filter(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "unknown-hash-key"))
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(keys.len(), 1, "exactly the typo is hinted: {:?}", keys);
+    assert!(keys[0].contains("'typo'"), "{:?}", keys);
+    assert!(keys[0].contains("host"), "message names the known keys: {:?}", keys);
+}

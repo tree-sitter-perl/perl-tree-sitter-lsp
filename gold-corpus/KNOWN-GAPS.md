@@ -182,6 +182,17 @@ there's no clean static signal distinguishing a method from a helper in an OO
 class. **Subsystem:** first-param-self heuristic (`detect_first_param_type`).
 **Difficulty:** high (inherently ambiguous).
 
+### `nested-closed-shape-typo-crossfile` — batch diagnostics lack enrichment parity
+The unknown-hash-key hint fires on `$config->{db_host}` in the editor, where
+`publish_diagnostics` enriches the open doc (`enrich_imported_types_with_keys`)
+before `collect_diagnostics`, so the `cfg()` import's `HashWithKeys` return
+types `$config`. `batch_diagnostics` (`--batch`/`--check`) walks raw workspace
+entries with no enrichment pass, so cross-file-typed shapes can't hint there.
+Closing it means an enriched diagnostics pass in batch — which will also shift
+the unresolved-method rows (more invocants resolve), so it wants its own
+calibration run. **Subsystem:** `main.rs::batch_diagnostics`.
+**Difficulty:** medium (mechanical, but re-baselines the diagnostics suite).
+
 ---
 
 ## Triage summary
@@ -196,6 +207,7 @@ class. **Subsystem:** first-param-self heuristic (`detect_first_param_type`).
 | completion-datetime-hashkey | slot-write harvest (A4 tail) | medium–high |
 | mojo-url clone *sub-return* (variable is fixed) | build-time `return_types` seed vs query-time cross-file method-return | medium–high |
 | diag-mojo-cookiejar/daemon first-param-self | invocant heuristic in OO class | **high** (ambiguous) |
+| nested-closed-shape-typo-crossfile | batch diagnostics enrichment parity | medium (re-baselines suite) |
 
 Quickest wins: the signature-help invocant gate, imported-names in completion,
 the `bootstrap` loader recognition, and the `(shift, shift)` param extraction —

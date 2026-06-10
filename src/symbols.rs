@@ -2757,6 +2757,54 @@ pub fn collect_diagnostics(
         }
     }
 
+    // Closed-shape hash-key typo: a READ of `$config->{typo}` where
+    // `$config`'s structural literal is CLOSED (no spread, no dynamic
+    // key) and doesn't define the key. Writes are skipped — assigning a
+    // new key extends the shape, it isn't a typo. Open shapes are
+    // skipped — the spread may carry the key. The whole-story gate
+    // skips vars that were mutated, reassigned, or escaped (the
+    // trust-gate stand-in for the unmodeled lattice widenings —
+    // docs/prompt-nested-hashkey.md). HINT severity, per the
+    // quiet-by-design diagnostics convention.
+    use crate::file_analysis::InferredType;
+    for r in &analysis.refs {
+        let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };
+        if !var_text.starts_with('$') {
+            continue;
+        }
+        if matches!(r.access, crate::file_analysis::AccessKind::Write) {
+            continue;
+        }
+        let Some(t) =
+            analysis.inferred_type_via_bag_ctx(var_text, r.span.start, Some(module_index))
+        else {
+            continue;
+        };
+        let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
+        if keys.iter().any(|(k, _)| k == &r.target_name) {
+            continue;
+        }
+        if !analysis.closed_shape_is_whole_story(var_text) {
+            continue;
+        }
+        let mut known: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).take(5).collect();
+        if keys.len() > 5 {
+            known.push("...");
+        }
+        diagnostics.push(Diagnostic {
+            range: span_to_range(r.span),
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unknown-hash-key".into())),
+            message: format!(
+                "key '{}' is not in {}'s literal shape (keys: {})",
+                r.target_name,
+                var_text,
+                known.join(", "),
+            ),
+            ..Default::default()
+        });
+    }
+
     diagnostics
 }
 

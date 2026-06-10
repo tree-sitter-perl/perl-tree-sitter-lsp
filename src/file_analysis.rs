@@ -2228,6 +2228,16 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub attr_projections: Vec<AttrProjection>,
 
+    /// Scalars whose reference escaped the file's view (read in a
+    /// non-element-access position: call argument, alias, invocant,
+    /// sigil deref). A closed literal shape on an escaped scalar is
+    /// not the whole story — the callee may have mutated it. See
+    /// `closed_shape_is_whole_story`. `#[serde(default)]` for blob
+    /// compat; the accompanying `EXTRACT_VERSION` bump re-extracts so
+    /// no blob actually carries an empty set for analyzed code.
+    #[serde(default)]
+    pub escaped_scalars: HashSet<String>,
+
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
@@ -2287,6 +2297,7 @@ pub struct FileAnalysisParts {
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
     pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
     pub attr_projections: Vec<AttrProjection>,
+    pub escaped_scalars: HashSet<String>,
 }
 
 /// One projection of a field/attr decl — the entity that encodes group
@@ -2409,6 +2420,7 @@ impl FileAnalysis {
             provisional_dispatches,
             gated_param_types,
             attr_projections,
+            escaped_scalars,
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
@@ -2439,6 +2451,7 @@ impl FileAnalysis {
             provisional_dispatches,
             gated_param_types,
             attr_projections,
+            escaped_scalars,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -3270,6 +3283,26 @@ impl FileAnalysis {
             }
         }
         out
+    }
+
+    /// True when a closed literal shape on `var_text` is the variable's
+    /// whole story in this file: the scalar is never written after its
+    /// declaration (no reassignment, no `$v->{k} = …` — both surface as
+    /// a `Variable` ref with `Write` access) and its reference never
+    /// escapes into a call / alias / invocant position. Each clause is
+    /// the trust-gate approximation of a lattice widening that isn't
+    /// modeled yet (mutation widening, conditional-reassignment
+    /// disagreement, escape widening — docs/prompt-nested-hashkey.md);
+    /// the unknown-hash-key diagnostic only fires behind it.
+    pub fn closed_shape_is_whole_story(&self, var_text: &str) -> bool {
+        if self.escaped_scalars.contains(var_text) {
+            return false;
+        }
+        !self.refs.iter().any(|r| {
+            matches!(r.kind, RefKind::Variable)
+                && r.access == AccessKind::Write
+                && r.target_name == var_text
+        })
     }
 
     /// Get the return type of a named sub/method (local definitions

@@ -1,0 +1,48 @@
+{
+  "capability": "diagnostics",
+  "rows": [
+    {
+      "id": "nested-closed-shape-typo",
+      "difficulty": "simple",
+      "semantic_area": "structural-shapes",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 31,
+      "col": 24,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [
+          "\"code\":\"unknown-hash-key\"",
+          "key 'retrys' is not in $local_cfg's literal shape"
+        ],
+        "none": [
+          "is not in $db's",
+          "is not in $obj's",
+          "is not in $row's"
+        ]
+      },
+      "status": "gold",
+      "note": "The deliberate local-literal typo; the whole-story gate keeps every other var silent (and the substrate at zero unknown-hash-key)."
+    },
+    {
+      "id": "nested-closed-shape-typo-crossfile",
+      "difficulty": "tricky",
+      "semantic_area": "structural-shapes",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 27,
+      "col": 21,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [
+          "key 'db_host' is not in $config's literal shape"
+        ],
+        "none": []
+      },
+      "status": "xfail",
+      "note": "GAP: $config's shape comes from the cfg() import; publish_diagnostics enriches open docs before collect_diagnostics, but batch_diagnostics walks raw workspace entries -- no enrichment parity, so cross-file-typed shapes can't hint in batch."
+    }
+  ]
+}

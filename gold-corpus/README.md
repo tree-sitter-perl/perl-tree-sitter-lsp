@@ -65,11 +65,12 @@ the numbers as JSON for run-over-run comparison.
 against the committed workspace at `nested-fixture/` (per-row `root`,
 same mechanism as re-export below) and exercise the structural typing
 tiers: the mixed drill `$obj->{users}->[0]->{name}` (type-at), imported
-array-literal tuples (`Sequence<…>` hover), and `$row->{name}` → column
-def (definition + references, cross-file). The two xfail rows pin the
-known gap: drill HOPS through an imported literal (`my $db =
-$config->{db}` where `cfg()` is imported) don't type yet — assignment
-chain typing runs at build, index-less.
+array-literal tuples (`Sequence<…>` hover), drill hops through an
+imported literal (`my $db = $config->{db}` hover — the `Projected`
+edge payload), `$row->{name}` → column def (definition + references,
+cross-file), and the closed-shape unknown-key hint (diagnostics: the
+local-literal typo is gold; the cross-file-typed typo is xfail — batch
+diagnostics have no enrichment parity, see KNOWN-GAPS.md).
 
 **Re-export fixture.** Three rows (`fixtures/reexport.json`, capability `definition` — folded under `definition` in `--list`) run against a small **committed, self-contained workspace** at `reexport-fixture/` instead of the snapshot substrate, via a per-row `root`. They flex the transitive export-surface feature: `goto-def` from a consumer of a re-exporter resolves to the *original* sub through both re-export forms — static splice (`our @EXPORT = (@RexBase::EXPORT)`) and loop-push (`push @EXPORT, @{"${m}::EXPORT"}`). The harness groups rows by `root` and runs one `--batch` per root.
 

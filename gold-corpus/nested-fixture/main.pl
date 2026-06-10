@@ -22,4 +22,13 @@ my $rs  = $schema->resultset('NestedRow');
 my $row = $rs->find(1);
 my $n   = $row->{name};
 
+# Closed-shape typo on a cross-file-typed var: fires in the editor
+# (enriched open doc); the batch diagnostics path has no enrichment
+# parity yet -- tracked xfail.
+my $oops = $config->{db_host};
+
+# Closed-shape typo on a local literal: the gold hint.
+my $local_cfg = { retries => 3, timeout => 10 };
+my $typo = $local_cfg->{retrys};
+
 print "$host $port $first $uname $uid $n\n";

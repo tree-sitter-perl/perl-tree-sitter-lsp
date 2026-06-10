@@ -294,6 +294,20 @@ pub(crate) fn canonical_container_name<'a>(node: Node<'a>, src: &'a [u8]) -> Opt
     Some(format!("{}{}", target_sigil, bare))
 }
 
+/// True when this node is the *container* of an element access —
+/// `$c` in `$c->{k}` / `$c->[0]` / `$foo{k}` / `$foo[0]`. The element
+/// expressions put the key/index in a named field; the container is the
+/// other (first) named child. Element-access bases keep the reference
+/// in hand; every other read position (call argument, RHS alias, list,
+/// invocant, sigil deref) lets it escape to code that may mutate it.
+pub(crate) fn is_element_access_base(node: Node) -> bool {
+    let Some(parent) = node.parent() else { return false };
+    matches!(
+        parent.kind(),
+        "hash_element_expression" | "array_element_expression"
+    ) && parent.named_child(0).is_some_and(|c| c == node)
+}
+
 /// `Class->new(...)` — a constructor call with a class-shaped invocant.
 /// Returns the invocant text (`Foo::Bar` or `__PACKAGE__`); `None` for
 /// non-constructor methods and variable/positional invocants, whose class
