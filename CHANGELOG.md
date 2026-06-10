@@ -4,52 +4,6 @@ All notable changes to perl-lsp are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the published
 crate / VS Code extension versions.
 
-## Unreleased
-
-### Structural hash shapes & nested drills
-
-- **Hash literals carry their keys in the type.** `{ host => 'x', port => 5432 }`
-  is a shape, not a bare HashRef: `->{key}` narrows to the per-key type through
-  assignment hops, double-drills (`$config->{db}{host}` → String), sub-return
-  literals, and imports (cross-file drill hops included). Array literals type as
-  per-index tuples — the mixed drill `$obj->{users}[0]{name}` chains end-to-end,
-  and hover shows `Sequence<…>`.
-- **`$row->{name}` on a typed row** (DBIC and friends) resolves to the column
-  def — goto-def, references, hover.
-- **Both spellings.** `my %h = (k => v)` types through the same shape builder
-  as the hashref literal; `$h{k}` reads check against `%h`'s shape. Spreads —
-  hash and array (`my %opts = (default => 1, @_)`) — mark the shape open.
-- **Mutation is modeled, not guessed.** An unconditional `$v->{k} = …` write
-  extends the shape (the read drills back typed); a conditional, dynamic-key,
-  closure, or slice write (every slice spelling: `@h{…}`, `%h{k}`, `@$h{…}`,
-  `$h->@{…}`, `$h->%{…}`) switches it open.
-- **New diagnostic: `unknown-hash-key`** (hint severity). A read of a key a
-  CLOSED literal shape doesn't define — the typo catcher — naming the known
-  keys. Covers variables in both spellings AND expression bases
-  (`cfg()->{kye}`, `$obj->get_config->{kye}`); calibrated to **zero false
-  positives across the 2,293-module substrate**. Design:
-  `docs/adr/structural-shapes.md`.
-- **Escapes widen temporally instead of suppressing.** Passing `$config` to a
-  call opens its shape AT that point — a typo read *before* the escape still
-  hints, instead of the whole variable going dark. Sequence tuples learn from
-  direct index writes too (slot retype, append at len).
-- **Batch/CI diagnostics match the editor.** `--check` and `--batch`
-  diagnostics now run the same cross-file enrichment as open buffers
-  (memoized per process), so imported shapes hint there too.
-
-### Gold corpus
-
-- **Cost report.** Every suite run ends with per-capability timing
-  (n/total/mean/max wall ms), per-root startup latency, child CPU, and peak
-  RSS — so feature work sees what it costs as it lands. `METRICS_OUT=<file>`
-  writes JSON for run-over-run comparison; `--emit --root <dir>` authors rows
-  against per-row-root fixtures.
-- New committed `nested-fixture/` workspace pinning the shape work (typo hints
-  in both spellings, mutation extension, drill type-at/hover/def/refs).
-- Harness fix: `normalize()` decoded character strings as bytes, so any
-  non-ASCII response character silently dropped a row to the text fallback
-  where `none` assertions vacuously pass.
-
 ## v0.4.0
 
 A large release: cross-file intelligence everywhere, framework and exporter
@@ -72,6 +26,10 @@ hangs).
   spellings — decl, accessor calls, constructor keys, `$self->{slot}` pokes,
   even derived names like `has_size` — rename and find-references as one
   entity, across files.
+- **Structural shapes.** Hash and array literals carry their keys/slots in the
+  type — drills narrow per key, mutation extends or opens the shape, and the
+  `unknown-hash-key` hint catches key typos at **zero false positives** across
+  the 2,293-module substrate.
 - **Bundled plugins + a plugin system.** Ships plugins for Catalyst, Dancer2,
   Mojolicious (helpers, events, Minion tasks), and DBIx::Class ResultDDL; you can
   drop your own `.rhai` plugins in a repo-local `.perl-lsp/`, or generate one from
@@ -127,6 +85,37 @@ hangs).
 - Parameters declared as `my ($self, $name) = (shift, shift)` are recognized for
   signature help
 
+### Structural hash & array shapes
+
+- **Hash literals carry their keys in the type.** `{ host => 'x', port => 5432 }`
+  is a shape, not a bare HashRef: `->{key}` narrows to the per-key type through
+  assignment hops, double-drills (`$config->{db}{host}` → String), sub-return
+  literals, and imports (cross-file drill hops included). Array literals type as
+  per-index tuples — the mixed drill `$obj->{users}[0]{name}` chains end-to-end,
+  and hover shows `Sequence<…>`.
+- **`$row->{name}` on a typed row** (DBIC and friends) resolves to the column
+  def — goto-def, references, hover.
+- **Both spellings.** `my %h = (k => v)` types through the same shape builder
+  as the hashref literal; `$h{k}` reads check against `%h`'s shape. Spreads —
+  hash and array (`my %opts = (default => 1, @_)`) — mark the shape open.
+- **Mutation is modeled, not guessed.** An unconditional `$v->{k} = …` write
+  extends the shape (the read drills back typed); a conditional, dynamic-key,
+  closure, or slice write (every slice spelling: `@h{…}`, `%h{k}`, `@$h{…}`,
+  `$h->@{…}`, `$h->%{…}`) switches it open.
+- **New diagnostic: `unknown-hash-key`** (hint severity). A read of a key a
+  CLOSED literal shape doesn't define — the typo catcher — naming the known
+  keys. Covers variables in both spellings AND expression bases
+  (`cfg()->{kye}`, `$obj->get_config->{kye}`); calibrated to **zero false
+  positives across the 2,293-module substrate**. Design:
+  `docs/adr/structural-shapes.md`.
+- **Escapes widen temporally instead of suppressing.** Passing `$config` to a
+  call opens its shape AT that point — a typo read *before* the escape still
+  hints, instead of the whole variable going dark. Sequence tuples learn from
+  direct index writes too (slot retype, append at len).
+- **Batch/CI diagnostics match the editor.** `--check` and `--batch`
+  diagnostics now run the same cross-file enrichment as open buffers
+  (memoized per process), so imported shapes hint there too.
+
 ### Exporters & imports
 
 - Models `Exporter`, `Exporter::Tiny`, `Sub::Exporter`, `Exporter::Extensible`,
@@ -154,13 +143,14 @@ hangs).
 
 ### Parser
 
-- Adopted **ts-parser-perl 1.1.0 → 1.1.1**: many more valid Perl constructs parse
+- Adopted **ts-parser-perl 1.1.0 → 1.1.2**: many more valid Perl constructs parse
   cleanly — braced variable declarations (`my ${foo}`), sub/method forward
   declarations (`sub NAME;`), bare dotted versions (`use 5.14.0`), glued
   `x`-repetition, the `not` operator, `\&subname` refgen, arrow-chained subscripts
   in interpolated strings, and correct hashref-vs-block disambiguation
   (`bless {@_}, $class`). Fixes the long-standing `s{}{}` external-scanner abort
-  on large modules.
+  on large modules; 1.1.2 parses `return bless {…}, CLASS` with both args under
+  the call, retiring the last bless workaround in the builder.
 
 ### Diagnostics
 
@@ -189,8 +179,14 @@ hangs).
 - Lazy tree resolution is gone: every query answers from build-time facts.
 - Cold-start and hot-path performance: memoized witness-bag edge chases, indexed
   fold loops, and a memoized per-pass export surface.
-- A CI-gated **gold corpus** — exact-assertion LSP checks (165 rows) against a
-  version-pinned CPAN substrate — guards every release.
+- The four-layer architecture is enforced by tests: imports flow down only,
+  the data model's tree-sitter surface is `Point`-only, and the grammar has a
+  single entry point (`builder::create_parser`).
+- A CI-gated **gold corpus** — exact-assertion LSP checks (179 gold rows + 12
+  pinned known gaps) against a version-pinned CPAN substrate — guards every
+  release, and every suite run ends with a **cost report** (per-capability
+  timing, startup latency, CPU, peak RSS; `METRICS_OUT=` for run-over-run
+  comparison) so feature work sees what it costs as it lands.
 
 ### Known gaps
 
