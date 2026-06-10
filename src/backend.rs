@@ -128,10 +128,19 @@ fn rename_via_refs_to(
 
     // Rename must not touch deps — EDITABLE stops at workspace/open files.
     let locations = refs_to(files, module_index, target, RoleMask::EDITABLE);
+    locations_to_workspace_edit(locations, new_name)
+}
+
+/// `RefLocation`s → one `WorkspaceEdit` writing `new_name` at every span.
+/// Callers guarantee every span covers exactly the renamable token
+/// (bare-name spans for groups, selection/name spans from `refs_to`).
+fn locations_to_workspace_edit(
+    locations: Vec<crate::resolve::RefLocation>,
+    new_name: &str,
+) -> Option<WorkspaceEdit> {
     if locations.is_empty() {
         return None;
     }
-
     let mut all_changes: std::collections::HashMap<Url, Vec<TextEdit>> =
         std::collections::HashMap::new();
     for loc in locations {
@@ -452,11 +461,24 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        use crate::resolve::{refs_to, resolve_symbol, ResolvedTarget};
+        use crate::resolve::{group_refs, refs_to, resolve_symbol, ResolvedTarget};
 
         let point = symbols::position_to_point(pos);
         let target = match resolve_symbol(&doc.analysis, point, Some(&*self.module_index)) {
             Some(ResolvedTarget::Target(t)) => t,
+            Some(ResolvedTarget::Group { local_spans, targets }) => {
+                let origin = FileKey::Url(uri.clone());
+                drop(doc);
+                let results = group_refs(
+                    &self.files,
+                    Some(&*self.module_index),
+                    &origin,
+                    &local_spans,
+                    &targets,
+                    None,
+                );
+                return Ok(refs_to_locations(results));
+            }
             // Lexical / unowned — single-file references.
             Some(ResolvedTarget::Local) | None => {
                 let refs = symbols::find_references(
@@ -519,6 +541,23 @@ impl LanguageServer for Backend {
             Some(ResolvedTarget::Target(target)) if target.supports_cross_file_rename() => {
                 drop(doc);
                 Ok(rename_via_refs_to(&self.files, Some(&*self.module_index), &target, new_name))
+            }
+            Some(ResolvedTarget::Group { local_spans, targets }) => {
+                // Every spelling of the group, everywhere editable. The
+                // group's spans all cover bare names, so one replacement
+                // text serves variables, keys, and reader calls alike.
+                let origin = FileKey::Url(uri.clone());
+                drop(doc);
+                let bare_new = new_name.trim_start_matches(['$', '@', '%']);
+                let locations = crate::resolve::group_refs(
+                    &self.files,
+                    Some(&*self.module_index),
+                    &origin,
+                    &local_spans,
+                    &targets,
+                    Some(crate::resolve::RoleMask::EDITABLE),
+                );
+                Ok(locations_to_workspace_edit(locations, bare_new))
             }
             // Lexical variables, hash keys, handlers: single-file rename
             // (policy lives on `TargetRef::supports_cross_file_rename`).

@@ -2220,6 +2220,17 @@ pub struct FileAnalysisParts {
     pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
 }
 
+/// Cross-file-facing facts of a field group — see
+/// `FileAnalysis::field_projections_at`.
+pub struct FieldProjections {
+    pub class: String,
+    pub bare: String,
+    pub has_param: bool,
+    pub has_reader: bool,
+    /// Origin-file variable spellings (decl + body uses), bare-adjusted.
+    pub variable_spans: Vec<Span>,
+}
+
 /// One Corinna field-group entity: the field symbol plus the facts the
 /// projection rename needs (class, bare name, which projections exist).
 struct FieldGroup {
@@ -4376,6 +4387,11 @@ impl FileAnalysis {
         point: Point,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Vec<Span> {
+        // A field group's spellings reference each other — from any of
+        // them, surface all of them (the same union rename rewrites).
+        if let Some(g) = self.field_group_at(point) {
+            return self.field_group_spans(&g);
+        }
         if let Some((target_id, include_decl)) = self.resolve_target_at(point, module_index) {
             let mut results = self.collect_refs_for_target(target_id, include_decl, module_index);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
@@ -4843,6 +4859,33 @@ impl FileAnalysis {
         if let Some(sym) = field_sym {
             return self.field_group_of(sym);
         }
+        // Cursor on a reader call: `$p->x` where the dispatch class has
+        // `field $x :reader` in THIS file.
+        if let Some(r) = self.ref_at(point) {
+            if matches!(r.kind, RefKind::MethodCall { .. }) {
+                let bare = r.unqualified_target_name();
+                let cls = r
+                    .resolved_method_target
+                    .as_ref()
+                    .map(|t| t.invocant_class().to_string())
+                    .or_else(|| self.method_call_invocant_class(r, None));
+                if let Some(class) = cls {
+                    let field_name = format!("${}", bare);
+                    if let Some(sym) = self.symbols.iter().find(|s| {
+                        matches!(s.kind, SymKind::Field)
+                            && s.name == field_name
+                            && s.package.as_deref() == Some(class.as_str())
+                    }) {
+                        if let Some(g) = self.field_group_of(sym) {
+                            if g.has_reader {
+                                return Some(g);
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
+        }
         // Cursor on a constructor key (access at a call site, or the
         // synthesized def) owned by `Sub { class, new }`.
         let (key, owner) = match self.ref_at(point).map(|r| (r, &r.kind)) {
@@ -4894,14 +4937,25 @@ impl FileAnalysis {
     /// bare-token spans.
     fn rename_field_group(&self, g: &FieldGroup, new_name: &str) -> Vec<(Span, String)> {
         let bare_new = new_name.trim_start_matches(['$', '@', '%']);
-        let mut edits: Vec<(Span, String)> = Vec::new();
+        self.field_group_spans(g)
+            .into_iter()
+            .map(|s| (s, bare_new.to_string()))
+            .collect()
+    }
+
+    /// Every in-file spelling of a field group as bare-name spans: the
+    /// field variable (decl + body uses, sigil skipped so the `$`
+    /// survives a bare-text rewrite), constructor keys at call sites,
+    /// reader calls. Sorted, deduped — the uniform currency for both
+    /// rename (write the new bare name at each) and references.
+    fn field_group_spans(&self, g: &FieldGroup) -> Vec<Span> {
+        let mut spans: Vec<Span> = Vec::new();
         // The field variable: decl + every body use.
         for (span, _access) in self.collect_refs_for_target(g.field_sym, true, None) {
-            let name_span = Span {
+            spans.push(Span {
                 start: Point::new(span.start.row, span.start.column + 1),
                 end: span.end,
-            };
-            edits.push((name_span, bare_new.to_string()));
+            });
         }
         // Constructor keys at call sites.
         if g.has_param {
@@ -4912,7 +4966,7 @@ impl FileAnalysis {
             for r in &self.refs {
                 if let RefKind::HashKeyAccess { owner: Some(o), .. } = &r.kind {
                     if r.target_name == g.bare && o.found_by(&owner) {
-                        edits.push((r.span, bare_new.to_string()));
+                        spans.push(r.span);
                     }
                 }
             }
@@ -4930,14 +4984,70 @@ impl FileAnalysis {
                         .map(|t| t.invocant_class().to_string())
                         .or_else(|| self.method_call_invocant_class(r, None));
                     if cls.as_deref() == Some(g.class.as_str()) {
-                        edits.push((*method_name_span, bare_new.to_string()));
+                        spans.push(*method_name_span);
                     }
                 }
             }
         }
-        edits.sort_by_key(|(s, _)| (s.start.row, s.start.column));
-        edits.dedup_by(|a, b| a.0 == b.0);
-        edits
+        spans.sort_by_key(|s| (s.start.row, s.start.column));
+        spans.dedup();
+        spans
+    }
+
+    /// Query-time owner for a deferred (`owner: None`) hash-key access:
+    /// find the enclosing call ref and derive `Sub { invocant class,
+    /// method }` with the index in hand. The build-time gate deferred
+    /// exactly because the class wasn't visible locally — this is the
+    /// other half of that bargain (the receiver-gated discipline: the
+    /// type is the gate, resolved at query time).
+    pub fn deferred_hash_key_owner(
+        &self,
+        key_ref: &Ref,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<HashKeyOwner> {
+        let enclosing = self
+            .refs
+            .iter()
+            .filter(|c| {
+                matches!(c.kind, RefKind::MethodCall { .. })
+                    && contains_point(&c.span, key_ref.span.start)
+                    && contains_point(&c.span, key_ref.span.end)
+            })
+            .min_by_key(|c| span_size(&c.span))?;
+        let class = enclosing
+            .resolved_method_target
+            .as_ref()
+            .map(|t| t.invocant_class().to_string())
+            .or_else(|| self.method_call_invocant_class(enclosing, module_index))?;
+        Some(HashKeyOwner::Sub {
+            package: Some(class),
+            name: enclosing.unqualified_target_name().to_string(),
+        })
+    }
+
+    /// The cross-file-facing view of the field group at `point`: the
+    /// class + bare name + which projections exist, plus the origin-file
+    /// variable spellings (fields are lexical to the class block, so the
+    /// variable side can ONLY live here — keys and reader calls in other
+    /// files are walked by `refs_to` against the projection targets the
+    /// caller mints from these facts).
+    pub fn field_projections_at(&self, point: Point) -> Option<FieldProjections> {
+        let g = self.field_group_at(point)?;
+        let variable_spans = self
+            .collect_refs_for_target(g.field_sym, true, None)
+            .into_iter()
+            .map(|(span, _)| Span {
+                start: Point::new(span.start.row, span.start.column + 1),
+                end: span.end,
+            })
+            .collect();
+        Some(FieldProjections {
+            class: g.class,
+            bare: g.bare,
+            has_param: g.has_param,
+            has_reader: g.has_reader,
+            variable_spans,
+        })
     }
 
     /// Determine what kind of rename is appropriate for the cursor position.

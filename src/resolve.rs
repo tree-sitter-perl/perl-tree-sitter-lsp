@@ -21,6 +21,7 @@ bitflags::bitflags! {
     /// Which file roles a query should search. Handlers pick the mask that
     /// fits their semantics: rename is EDITABLE (skip deps, they're read-only);
     /// references is VISIBLE (include deps, read-only reads are fine).
+    #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct RoleMask: u8 {
         const OPEN       = 1 << 0;
         const WORKSPACE  = 1 << 1;
@@ -122,6 +123,17 @@ pub enum ResolvedTarget {
     /// A target `refs_to` can walk: callables, packages, handlers, and
     /// hash keys whose owner resolved at build time.
     Target(TargetRef),
+    /// A projection group: one source decl spelled several ways (a
+    /// Corinna `field $x :param :reader` ↔ its constructor key ↔ its
+    /// reader calls). `targets` walk cross-file via `refs_to`;
+    /// `local_spans` are the origin-file-only spellings (the field
+    /// variable is lexical to the class block). Every span — local and
+    /// walked — covers a bare name token, so rename writes one
+    /// replacement text everywhere and references list them uniformly.
+    Group {
+        local_spans: Vec<Span>,
+        targets: Vec<TargetRef>,
+    },
     /// Inherently file-local: lexical variables, and hash keys with no
     /// resolvable owner. Callers keep their single-file path.
     Local,
@@ -137,6 +149,33 @@ pub fn resolve_symbol(
     module_index: Option<&dyn CrossFileLookup>,
 ) -> Option<ResolvedTarget> {
     use crate::file_analysis::{HashKeyOwner, RenameKind};
+    // Field projections claim first: from any spelling of a field group,
+    // the answer is the whole group (rename and references stay in
+    // lockstep with the in-file `rename_at`/`find_references` union).
+    if let Some(p) = analysis.field_projections_at(point) {
+        let mut targets = Vec::new();
+        if p.has_reader {
+            targets.push(TargetRef::method(
+                p.bare.clone(),
+                p.class.clone(),
+                analysis,
+                module_index,
+            ));
+        }
+        if p.has_param {
+            targets.push(TargetRef::new(
+                p.bare.clone(),
+                TargetKind::HashKeyOfSub {
+                    package: Some(p.class.clone()),
+                    name: "new".to_string(),
+                },
+            ));
+        }
+        return Some(ResolvedTarget::Group {
+            local_spans: p.variable_spans,
+            targets,
+        });
+    }
     Some(match analysis.rename_kind_at(point, module_index)? {
         RenameKind::Variable => ResolvedTarget::Local,
         RenameKind::HashKey(name) => match analysis.hash_key_owner_at(point) {
@@ -205,6 +244,44 @@ impl RefLocation {
             FileKey::Path(p) => Url::from_file_path(p).ok(),
         }
     }
+}
+
+/// Union of `refs_to` over a projection group's targets plus the group's
+/// origin-file spans. `mask_override` = `Some(EDITABLE)` for rename;
+/// `None` lets each target pick its references mask. Output is sorted +
+/// deduped like `refs_to`, and every span covers a bare name token, so a
+/// rename caller can write one replacement text at every location.
+pub fn group_refs(
+    files: &FileStore,
+    module_index: Option<&dyn CrossFileLookup>,
+    origin: &FileKey,
+    local_spans: &[Span],
+    targets: &[TargetRef],
+    mask_override: Option<RoleMask>,
+) -> Vec<RefLocation> {
+    let mut out: Vec<RefLocation> = local_spans
+        .iter()
+        .map(|span| RefLocation {
+            key: origin.clone(),
+            span: *span,
+            access: AccessKind::Read,
+        })
+        .collect();
+    for t in targets {
+        let mask = mask_override
+            .unwrap_or_else(|| references_mask_for(files, module_index, t));
+        out.extend(refs_to(files, module_index, t, mask));
+    }
+    out.sort_by(|a, b| {
+        key_for_sort(&a.key)
+            .cmp(&key_for_sort(&b.key))
+            .then_with(|| {
+                (a.span.start.row, a.span.start.column)
+                    .cmp(&(b.span.start.row, b.span.start.column))
+            })
+    });
+    out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
+    out
 }
 
 /// Collect every reference to `target` across the masked file set.
@@ -485,11 +562,24 @@ fn collect_from_analysis(
             (
                 TargetKind::HashKeyOfSub { package, name },
                 RefKind::HashKeyAccess { owner, .. },
-            ) => matches!(
-                owner,
-                Some(HashKeyOwner::Sub { package: op, name: on })
-                    if op == package && on == name
-            ),
+            ) => match owner {
+                Some(HashKeyOwner::Sub { package: op, name: on }) => {
+                    op == package && on == name
+                }
+                // Deferred (`owner: None`): the build-time gate couldn't see
+                // the class — re-derive the owner here, where the index is
+                // in hand (same lazy seam method dispatch uses above).
+                None => analysis
+                    .deferred_hash_key_owner(r, module_index)
+                    .is_some_and(|o| {
+                        matches!(
+                            o,
+                            HashKeyOwner::Sub { package: op, name: on }
+                                if op == *package && on == *name
+                        )
+                    }),
+                Some(_) => false,
+            },
             (TargetKind::HashKeyOfClass(wanted), RefKind::HashKeyAccess { owner, .. }) => {
                 // `Class(wanted)` is the canonical shape for "this
                 // class's keys"; a `Sub { package: wanted, .. }`-

@@ -1507,6 +1507,13 @@ struct Builder<'a> {
 ///     cross-file once `module_index` is available).
 enum Gate {
     Strict(HashKeyOwner),
+    /// Strict, but the owner's class is not defined in this file, so a
+    /// local def miss is NOT authoritative (the def may live with the
+    /// class, cross-file). Emits `owner: None` on miss; the query-time
+    /// class check in `refs_to`'s key arm decides — same discipline as
+    /// receiver-gated dispatch (the type is the gate, resolved with the
+    /// index in hand).
+    StrictOrDefer(HashKeyOwner),
     Open(HashKeyOwner),
     Deferred,
 }
@@ -10909,6 +10916,13 @@ impl<'a> Builder<'a> {
                     if !self.has_hash_key_def(&key, owner) { continue; }
                     Some(owner.clone())
                 }
+                Gate::StrictOrDefer(owner) => {
+                    if self.has_hash_key_def(&key, owner) {
+                        Some(owner.clone())
+                    } else {
+                        None
+                    }
+                }
                 Gate::Open(owner) => Some(owner.clone()),
                 Gate::Deferred => None,
             };
@@ -11809,6 +11823,7 @@ impl<'a> Builder<'a> {
         enum Path<'a> {
             Claimed(HashKeyOwner, Node<'a>),
             Strict(HashKeyOwner, Node<'a>),
+            StrictOrDefer(HashKeyOwner, Node<'a>),
             Deferred(Node<'a>),
         }
         let mut pending: Vec<Path<'a>> = Vec::new();
@@ -11840,13 +11855,22 @@ impl<'a> Builder<'a> {
                 continue;
             }
             if let Some(cls) = self.method_call_invocant.get(&i) {
-                pending.push(Path::Strict(
-                    HashKeyOwner::Sub {
-                        package: Some(cls.clone()),
-                        name: r.target_name.clone(),
-                    },
-                    args,
-                ));
+                // Definitions only — a `use Point` import symbol
+                // (SymKind::Module) does not make the class local.
+                let local_class = self.symbols.iter().any(|s| {
+                    matches!(s.kind, SymKind::Package | SymKind::Class) && s.name == *cls
+                });
+                let owner = HashKeyOwner::Sub {
+                    package: Some(cls.clone()),
+                    name: r.target_name.clone(),
+                };
+                pending.push(if local_class {
+                    Path::Strict(owner, args)
+                } else {
+                    // The class lives elsewhere — a local def miss can't
+                    // veto; defer the gate to query time.
+                    Path::StrictOrDefer(owner, args)
+                });
                 continue;
             }
             // Receiver type unresolvable at build. Only defer for
@@ -11869,6 +11893,9 @@ impl<'a> Builder<'a> {
                 }
                 Path::Strict(owner, args) => {
                     self.emit_call_arg_key_accesses(args, Gate::Strict(owner));
+                }
+                Path::StrictOrDefer(owner, args) => {
+                    self.emit_call_arg_key_accesses(args, Gate::StrictOrDefer(owner));
                 }
                 Path::Deferred(args) => {
                     self.emit_call_arg_key_accesses(args, Gate::Deferred);

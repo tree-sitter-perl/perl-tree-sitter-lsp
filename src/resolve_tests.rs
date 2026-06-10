@@ -2723,3 +2723,68 @@ sub describe { my ($self) = @_; return $self->{size} }
         other => panic!("expected owned hash-key target, got {:?}", other),
     }
 }
+
+// ---- field projection groups: cross-file union ----
+
+/// `field $x :param :reader` in Point.pm; a consumer constructs
+/// `Point->new(x => 1)` and reads `$p->x`. References/rename from the
+/// field decl must surface the consumer's ctor key and reader call;
+/// from the consumer's key, the field must surface back.
+#[test]
+fn test_field_group_unions_across_files() {
+    let store = FileStore::new();
+    let point_path = PathBuf::from("/tmp/fieldgroup_point.pm");
+    let user_path = PathBuf::from("/tmp/fieldgroup_user.pl");
+
+    let point_src = "\
+use v5.38;
+class Point {
+    field $x :param :reader;
+    method magnitude () { return $x * $x; }
+}
+1;
+";
+    let user_src = "\
+use Point;
+my $p = Point->new(x => 3);
+my $val = $p->x;
+";
+    let point_fa = parse(point_src);
+    let user_fa = parse(user_src);
+    store.insert_workspace(point_path.clone(), point_fa);
+    store.insert_workspace(user_path.clone(), user_fa);
+
+    let origin_fa = store.workspace_raw().get(&point_path).unwrap().value().clone();
+    // Cursor on `$x` in the field decl (row 2, col 11 = bare name).
+    let resolved = resolve_symbol(&origin_fa, tree_sitter::Point { row: 2, column: 11 }, None)
+        .expect("field decl resolves");
+    let ResolvedTarget::Group { local_spans, targets } = resolved else {
+        panic!("expected Group, got {:?}", resolved);
+    };
+    assert!(!local_spans.is_empty(), "field var spellings present");
+    assert_eq!(targets.len(), 2, "reader + ctor-key targets: {:?}", targets);
+
+    let locs = group_refs(
+        &store,
+        None,
+        &FileKey::Path(point_path.clone()),
+        &local_spans,
+        &targets,
+        None,
+    );
+    let in_user: Vec<_> = locs
+        .iter()
+        .filter(|l| matches!(&l.key, FileKey::Path(p) if p == &user_path))
+        .map(|l| (l.span.start.row, l.span.start.column))
+        .collect();
+    assert!(
+        in_user.contains(&(1, 19)),
+        "consumer ctor key `x` included; user-file hits: {:?}",
+        in_user,
+    );
+    assert!(
+        in_user.contains(&(2, 14)),
+        "consumer reader call `->x` included; user-file hits: {:?}",
+        in_user,
+    );
+}
