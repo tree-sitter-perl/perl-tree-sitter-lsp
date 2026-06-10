@@ -126,26 +126,31 @@ latest-wins, truncated away by the next enrichment cycle. `KeyWrite`s
 persist on `FileAnalysis` precisely so enrichment can re-run the pass
 once imported shapes land.
 
-### The whole-story gate is two clauses, each naming its modeled replacement
+### Escapes are open-switching writes (the gate clause came out)
 
-`FileAnalysis::closed_shape_is_whole_story(var)` =
-not escaped ∧ not reassigned. The unknown-hash-key diagnostic fires
-only behind it.
+An escape — a scalar READ in any non-element-access position: call
+argument, RHS alias, invocant, sigil deref — hands the reference to
+code that may write any key. That IS a dynamic-key write, so the walk
+records it as a `KeyWrite { key: None }` at the escape span (first
+site per var; one widening witness covers everything after it) and
+the mutation-extension pass opens the shape there. Temporal: reads
+BEFORE the first escape keep their closed shape and still diagnose —
+strictly better than the suppression set this replaced. Slice bases
+are excluded (a slice read copies values out). Hashes are sharper:
+bare `func(%h)` flattens to copies — the callee cannot add keys — so
+only `\%h` ref-taking escapes.
 
-- **Escape** (`escaped_scalars`, builder-recorded): a scalar READ in
-  any non-element-access position — call argument, RHS alias,
-  invocant, sigil deref — hands the reference to code that may mutate
-  the referent. Slice bases are excluded (a slice read copies values
-  out). Hashes are sharper: bare `func(%h)` flattens to copies — the
-  callee cannot add keys — so only `\%h` ref-taking escapes.
-- **Reassignment** (`reassigned_scalars`): a Write targeting the
-  variable itself (`$v = …`, `%h = …`). Element writes are NOT here —
-  they're mutations, modeled above.
+### The whole-story gate is one clause, naming its modeled replacement
 
-Each clause is the trust-gate stand-in for a lattice widening that
-isn't modeled yet (escape widening; conditional-reassignment
-disagreement — `$spec = {…} unless ref $spec`). When one gets
-modeled, its clause comes OUT of the gate, the way key writes did.
+`FileAnalysis::closed_shape_is_whole_story(var)` = not reassigned.
+**Reassignment** (`reassigned_scalars`): a Write targeting the
+variable itself (`$v = …`, `%h = …`); element writes are mutations,
+modeled above. The clause is the trust-gate stand-in for the
+unmodeled conditional-reassignment disagreement (`$spec = {…} unless
+ref $spec`) plus the unknown-RHS reassignment (`$h = fetch()` — the
+bag has no retraction, so a stale closed shape would survive
+latest-wins). When a disagreement fold lands, this clause comes OUT
+of the gate, the way key writes and escapes did.
 
 ### Calibration is part of done
 

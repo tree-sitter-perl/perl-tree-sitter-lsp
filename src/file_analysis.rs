@@ -1688,8 +1688,7 @@ pub struct CallBinding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyWrite {
     pub var_text: String,
-    /// `None` = dynamic key (`$v->{$k}`) — unknowable membership.
-    pub key: Option<String>,
+    pub key: WriteKey,
     pub scope: ScopeId,
     /// Key-node span — temporal anchor and per-var ordering.
     pub span: Span,
@@ -1699,6 +1698,20 @@ pub struct KeyWrite {
     /// loop/short-circuit). Scope-crossing writes (nested block or
     /// closure relative to the decl scope) are detected in the pass.
     pub conditional: bool,
+}
+
+/// What a `KeyWrite` lands on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WriteKey {
+    /// Static hash key — extends/retypes the named entry on a
+    /// `HashWithKeys` shape.
+    Hash(String),
+    /// Static array index (direct arrow write, `$v->[N] = …`) —
+    /// retypes the slot / appends at `len` on a `Sequence` tuple.
+    Index(i32),
+    /// Dynamic key, slice, or escape — membership unknowable;
+    /// switches a `HashWithKeys` shape open.
+    Unknown,
 }
 
 /// A method call binding: `$var = $invocant->method()`.
@@ -2252,16 +2265,6 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub attr_projections: Vec<AttrProjection>,
 
-    /// Scalars whose reference escaped the file's view (read in a
-    /// non-element-access position: call argument, alias, invocant,
-    /// sigil deref). A closed literal shape on an escaped scalar is
-    /// not the whole story — the callee may have mutated it. See
-    /// `closed_shape_is_whole_story`. `#[serde(default)]` for blob
-    /// compat; the accompanying `EXTRACT_VERSION` bump re-extracts so
-    /// no blob actually carries an empty set for analyzed code.
-    #[serde(default)]
-    pub escaped_scalars: HashSet<String>,
-
     /// Scalars reassigned after declaration (`$v = …` with the
     /// variable itself as assignment target — element writes are NOT
     /// reassignment, they're modeled as shape mutations). A closed
@@ -2336,7 +2339,6 @@ pub struct FileAnalysisParts {
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
     pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
     pub attr_projections: Vec<AttrProjection>,
-    pub escaped_scalars: HashSet<String>,
     pub reassigned_scalars: HashSet<String>,
     pub key_writes: Vec<KeyWrite>,
 }
@@ -2461,7 +2463,6 @@ impl FileAnalysis {
             provisional_dispatches,
             gated_param_types,
             attr_projections,
-            escaped_scalars,
             reassigned_scalars,
             key_writes,
         } = parts;
@@ -2494,7 +2495,6 @@ impl FileAnalysis {
             provisional_dispatches,
             gated_param_types,
             attr_projections,
-            escaped_scalars,
             reassigned_scalars,
             key_writes,
             scope_starts: Vec::new(),
@@ -3331,18 +3331,17 @@ impl FileAnalysis {
     }
 
     /// True when a closed literal shape on `var_text` is the variable's
-    /// whole story in this file: the scalar is never reassigned and its
-    /// reference never escapes into a call / alias / invocant position.
-    /// Key writes are NOT a gate clause — the mutation-extension pass
-    /// models them on the shape itself (unconditional writes extend a
-    /// closed shape; conditional/dynamic writes switch it open). The
-    /// two remaining clauses are trust-gate stand-ins for unmodeled
-    /// lattice widenings (conditional-reassignment disagreement, escape
-    /// widening — docs/adr/structural-shapes.md); the unknown-hash-key
-    /// diagnostic only fires behind them.
+    /// whole story in this file: the scalar is never reassigned. Key
+    /// writes AND escapes are not gate clauses — both are modeled on
+    /// the shape itself by the mutation-extension pass (writes extend
+    /// or open; an escape is an open-switching write at the escape
+    /// span, so reads before it keep their closed shape). The one
+    /// remaining clause is the trust-gate stand-in for the unmodeled
+    /// conditional-reassignment disagreement
+    /// (docs/adr/structural-shapes.md); the unknown-hash-key
+    /// diagnostic only fires behind it.
     pub fn closed_shape_is_whole_story(&self, var_text: &str) -> bool {
-        !self.escaped_scalars.contains(var_text)
-            && !self.reassigned_scalars.contains(var_text)
+        !self.reassigned_scalars.contains(var_text)
     }
 
     /// Get the return type of a named sub/method (local definitions

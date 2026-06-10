@@ -4339,9 +4339,10 @@ class Point {
 /// Closed-shape hash-key typo diagnostic: a READ of a key the closed
 /// literal doesn't define is hinted. An unconditional write EXTENDS
 /// the shape (the written key reads silently; other unknowns still
-/// hint); a conditional write opens it. Silent when the whole-story
-/// gate fails — reassignment, escape (call arg / alias / invocant /
-/// sigil deref) — and for open shapes and known keys.
+/// hint); a conditional write opens it; an escape (call arg / alias /
+/// invocant / sigil deref) opens it AT the escape span — reads before
+/// it still hint. Reassignment suppresses (the one remaining gate
+/// clause); open shapes and known keys stay silent.
 #[test]
 fn test_closed_shape_unknown_key_diagnostic() {
     let src = "\
@@ -4356,6 +4357,7 @@ my $cond = { host => 'x' };
 $cond->{maybe} = 1 if $ENV{X};
 my $rc = $cond->{anything};
 my $esc = { host => 'x' };
+my $pre = $esc->{typo_pre};
 process($esc);
 my $r2 = $esc->{anything};
 my $re = { host => 'x' };
@@ -4377,13 +4379,23 @@ my $maybe = $open->{whatever};
         .filter(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "unknown-hash-key"))
         .map(|d| d.message.as_str())
         .collect();
-    assert_eq!(keys.len(), 2, "the typo and the post-extension unknown: {:?}", keys);
+    assert_eq!(
+        keys.len(),
+        3,
+        "the typo, the post-extension unknown, and the pre-escape typo: {:?}",
+        keys,
+    );
     assert!(keys[0].contains("'typo'"), "{:?}", keys);
     assert!(keys[0].contains("host"), "message names the known keys: {:?}", keys);
     assert!(keys[1].contains("'other'"), "{:?}", keys);
     assert!(
         keys[1].contains("added"),
         "extended shape names the written key: {:?}",
+        keys,
+    );
+    assert!(
+        keys[2].contains("'typo_pre'"),
+        "read BEFORE the escape still hints: {:?}",
         keys,
     );
 }
@@ -4417,4 +4429,36 @@ my $silent = $taken{anything};
     assert_eq!(keys.len(), 1, "only the %config typo: {:?}", keys);
     assert!(keys[0].contains("'typo'"), "{:?}", keys);
     assert!(keys[0].contains("%config"), "names the hash variable: {:?}", keys);
+}
+
+/// Expression-base spelling: `cfg()->{kye}` hints off the producer's
+/// closed return shape — no variable in hand, the drill's Projected
+/// witness carries the (base, key) pair. Known keys stay silent, and
+/// bare-variable bases stay the gated ref loop's territory.
+#[test]
+fn test_expression_base_unknown_key_diagnostic() {
+    let src = "\
+sub cfg { return { host => 'x', port => 1 } }
+my $ok = cfg()->{host};
+my $bad = cfg()->{hsot};
+";
+    let analysis = parse_analysis(src);
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(
+        &analysis,
+        &idx,
+        DiagnosticOptions { unresolved_dispatch: false },
+    );
+    let keys: Vec<&str> = diags
+        .iter()
+        .filter(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "unknown-hash-key"))
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(keys.len(), 1, "only the call-base typo: {:?}", keys);
+    assert!(keys[0].contains("'hsot'"), "{:?}", keys);
+    assert!(
+        keys[0].contains("this expression's"),
+        "expression-base message form: {:?}",
+        keys,
+    );
 }

@@ -43,4 +43,8 @@ my %plain = (retries => 3);
 my $ph = $plain{retries};
 my $pt = $plain{retrys};
 
+# Expression-base spelling: the drill's own witness carries the pair.
+sub local_cfg { return { retries => 3, timeout => 10 } }
+my $et = local_cfg()->{retrys};
+
 print "$host $port $first $uname $uid $n\n";

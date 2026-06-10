@@ -2807,6 +2807,71 @@ pub fn collect_diagnostics(
         });
     }
 
+    // The expression-base spelling of the same typo: `cfg()->{kye}` /
+    // `$obj->get_config->{kye}` — no variable in hand, so the ref loop
+    // above can't see it. The drill's own Projected witness encodes
+    // exactly the (base, key) pair; materialize the base (the registry
+    // chases through call returns, cross-file included) and apply the
+    // same closed-shape check. No whole-story gate: the value is
+    // freshly produced, and the producer's own mutation/escape
+    // widening already rode along on its shape.
+    {
+        use crate::witnesses::{ProjectionStep, WitnessAttachment, WitnessPayload};
+        let mut seen: std::collections::HashSet<(Span, &str)> = std::collections::HashSet::new();
+        for w in analysis.witnesses.all() {
+            let WitnessPayload::Projected {
+                base: WitnessAttachment::Expr(base_span),
+                step: ProjectionStep::HashKey(ref key),
+            } = w.payload
+            else {
+                continue;
+            };
+            if !seen.insert((w.span, key.as_str())) {
+                continue;
+            }
+            // A base that is a bare variable read (its Expr attachment
+            // edges to a Variable) is the ref loop's territory — it
+            // carries the whole-story gate this loop deliberately
+            // doesn't. Materializing it here would bypass the gate
+            // (the Compiler.pm conditional-reassignment FP).
+            let base_is_variable = analysis
+                .witnesses
+                .for_attachment(&WitnessAttachment::Expr(base_span))
+                .iter()
+                .any(|bw| {
+                    matches!(
+                        bw.payload,
+                        WitnessPayload::Edge(WitnessAttachment::Variable { .. })
+                    )
+                });
+            if base_is_variable {
+                continue;
+            }
+            let Some(t) = analysis.expr_type_at_span(base_span, Some(module_index)) else {
+                continue;
+            };
+            let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
+            if keys.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            let mut known: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).take(5).collect();
+            if keys.len() > 5 {
+                known.push("...");
+            }
+            diagnostics.push(Diagnostic {
+                range: span_to_range(w.span),
+                severity: Some(DiagnosticSeverity::HINT),
+                code: Some(NumberOrString::String("unknown-hash-key".into())),
+                message: format!(
+                    "key '{}' is not in this expression's literal shape (keys: {})",
+                    key,
+                    known.join(", "),
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
     diagnostics
 }
 

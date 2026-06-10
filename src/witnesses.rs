@@ -2028,45 +2028,82 @@ pub(crate) fn emit_mutation_extension_witnesses(
             cur = ctx.scopes[sid.0 as usize].parent;
         }
         let Some((attach_sid, scope_crossed)) = attach else { continue };
-        let Some(InferredType::HashWithKeys { mut keys, open }) =
-            query_variable_type(bag, ctx, &w.var_text, w.scope, w.span.start)
+        let Some(base) = query_variable_type(bag, ctx, &w.var_text, w.scope, w.span.start)
         else {
             continue;
         };
-        let widen = w.key.is_none() || w.conditional || scope_crossed;
-        let shape = if widen {
-            if open {
-                continue; // already open — nothing to add
+        let rhs_type = |s: Span| {
+            let reg = ReducerRegistry::with_defaults();
+            let att = WitnessAttachment::Expr(s);
+            let q = ReducerQuery {
+                attachment: &att,
+                point: None,
+                framework: FrameworkFact::Plain,
+                arity_hint: None,
+                receiver: None,
+                context: Some(ctx),
+            };
+            match reg.query(bag, &q) {
+                ReducedValue::Type(t) => Some(t),
+                _ => None,
             }
-            InferredType::HashWithKeys { keys, open: true }
-        } else {
-            let k = w.key.as_deref().unwrap();
-            let vtype = w.rhs_span.and_then(|s| {
-                let reg = ReducerRegistry::with_defaults();
-                let att = WitnessAttachment::Expr(s);
-                let q = ReducerQuery {
-                    attachment: &att,
-                    point: None,
-                    framework: FrameworkFact::Plain,
-                    arity_hint: None,
-                    receiver: None,
-                    context: Some(ctx),
-                };
-                match reg.query(bag, &q) {
-                    ReducedValue::Type(t) => Some(t),
-                    _ => None,
+        };
+        let shape = match base {
+            InferredType::HashWithKeys { mut keys, open } => {
+                // An Index write on a hash-shaped var is contradictory
+                // evidence — widen like any unknowable write.
+                let widen = !matches!(w.key, crate::file_analysis::WriteKey::Hash(_))
+                    || w.conditional
+                    || scope_crossed;
+                if widen {
+                    if open {
+                        continue; // already open — nothing to add
+                    }
+                    InferredType::HashWithKeys { keys, open: true }
+                } else {
+                    let crate::file_analysis::WriteKey::Hash(ref k) = w.key else {
+                        unreachable!()
+                    };
+                    let vtype = w.rhs_span.and_then(rhs_type);
+                    match keys.iter_mut().find(|(name, _)| name == k) {
+                        Some(entry) => {
+                            if vtype.is_none() || entry.1.as_deref() == vtype.as_ref() {
+                                continue; // no new information
+                            }
+                            entry.1 = vtype.map(Box::new);
+                        }
+                        None => keys.push((k.to_string(), vtype.map(Box::new))),
+                    }
+                    InferredType::HashWithKeys { keys, open }
                 }
-            });
-            match keys.iter_mut().find(|(name, _)| name == k) {
-                Some(entry) => {
-                    if vtype.is_none() || entry.1.as_deref() == vtype.as_ref() {
+            }
+            // Sequence slot write: only the sound moves — retype an
+            // in-bounds slot, append at exactly len. Everything else
+            // (out-of-bounds, conditional, crossed, Unknown) is
+            // unmodeled: Sequence has no open flag to widen into, and
+            // a bare-ArrayRef downgrade loses to structure-dominates-
+            // rep subsumption. No array-index diagnostic exists, so
+            // `element_at`'s honest None covers the residual.
+            InferredType::Sequence(mut elems) => {
+                let crate::file_analysis::WriteKey::Index(i) = w.key else { continue };
+                if w.conditional || scope_crossed || i < 0 {
+                    continue;
+                }
+                let Some(vt) = w.rhs_span.and_then(rhs_type) else { continue };
+                let i = i as usize;
+                if i < elems.len() {
+                    if elems[i] == vt {
                         continue; // no new information
                     }
-                    entry.1 = vtype.map(Box::new);
+                    elems[i] = vt;
+                } else if i == elems.len() {
+                    elems.push(vt);
+                } else {
+                    continue;
                 }
-                None => keys.push((k.to_string(), vtype.map(Box::new))),
+                InferredType::Sequence(elems)
             }
-            InferredType::HashWithKeys { keys, open }
+            _ => continue,
         };
         bag.push(Witness {
             attachment: WitnessAttachment::Variable {

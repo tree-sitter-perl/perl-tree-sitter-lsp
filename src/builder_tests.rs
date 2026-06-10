@@ -14639,6 +14639,38 @@ my $s = { a => 1 };
     }
 }
 
+/// Sequence slot writes: a direct unconditional `$v->[N] = …` retypes
+/// the in-bounds slot from the RHS; a write at exactly `len` appends;
+/// a conditional write changes nothing (out-of-scope widening — no
+/// open flag on Sequence, no array-index diagnostic to protect).
+#[test]
+fn sequence_index_writes_retype_and_append() {
+    let src = "\
+my $t = [1, 'x'];
+$t->[0] = 'str';
+$t->[2] = 99;
+my $a = $t->[0];
+my $b = $t->[2];
+my $c = [1];
+$c->[0] = 'maybe' if $ENV{X};
+";
+    let fa = build_fa(src);
+    let t = fa.inferred_type_via_bag("$t", Point::new(3, 0)).expect("$t typed");
+    let InferredType::Sequence(elems) = &t else { panic!("{:?}", t) };
+    assert_eq!(
+        elems.as_slice(),
+        &[InferredType::String, InferredType::String, InferredType::Numeric],
+        "slot 0 retyped, slot 2 appended",
+    );
+    let a = fa.inferred_type_via_bag("$a", Point::new(4, 0)).expect("$a typed");
+    assert_eq!(a, InferredType::String);
+    let b = fa.inferred_type_via_bag("$b", Point::new(5, 0)).expect("$b typed");
+    assert_eq!(b, InferredType::Numeric);
+    let c = fa.inferred_type_via_bag("$c", Point::new(7, 0)).expect("$c typed");
+    let InferredType::Sequence(ce) = &c else { panic!("{:?}", c) };
+    assert_eq!(ce.as_slice(), &[InferredType::Numeric], "conditional write unmodeled");
+}
+
 /// Sub-return literals narrow at call sites: `cfg()->{host}` → String.
 #[test]
 fn hash_literal_narrows_through_sub_return() {

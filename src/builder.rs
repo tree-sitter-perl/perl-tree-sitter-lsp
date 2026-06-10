@@ -250,7 +250,7 @@ fn build_with_plugins_inner(
         gated_param_types: Vec::new(),
         method_call_invocant: std::collections::HashMap::new(),
         attr_projections: Vec::new(),
-        escaped_scalars: std::collections::HashSet::new(),
+        escape_recorded: std::collections::HashSet::new(),
         reassigned_scalars: std::collections::HashSet::new(),
         key_writes: Vec::new(),
         method_call_arity: std::collections::HashMap::new(),
@@ -504,7 +504,6 @@ fn build_with_plugins_inner(
         provisional_dispatches: b.provisional_dispatches,
         attr_projections: b.attr_projections,
         gated_param_types: b.gated_param_types,
-        escaped_scalars: b.escaped_scalars,
         reassigned_scalars: b.reassigned_scalars,
         key_writes: b.key_writes,
     });
@@ -1457,13 +1456,11 @@ struct Builder<'a> {
     /// `FileAnalysis.attr_accessors`.
     attr_projections: Vec<crate::file_analysis::AttrProjection>,
 
-    /// Scalars read in any position other than an element-access base
-    /// (`func($c)`, `my $z = $c`, `$c->method`, `%$c`) — the reference
-    /// escaped to code that may mutate the referent, so a closed literal
-    /// shape is no longer the variable's whole story. Flushed into
-    /// `FileAnalysis.escaped_scalars`; consumed by
-    /// `closed_shape_is_whole_story`.
-    escaped_scalars: std::collections::HashSet<String>,
+    /// Vars whose first escape site is already recorded as an
+    /// open-switching `KeyWrite` (walk-local dedup — one escape write
+    /// per var is enough: it widens the shape from that point on, and
+    /// the mutation-extension pass charges one bag query per record).
+    escape_recorded: std::collections::HashSet<String>,
 
     /// Scalars reassigned after declaration (`$v = …` targeting the
     /// variable itself; element writes go to `key_writes` instead).
@@ -6051,7 +6048,7 @@ impl<'a> Builder<'a> {
                             let span = node_to_span(left);
                             self.key_writes.push(crate::file_analysis::KeyWrite {
                                 var_text,
-                                key: None,
+                                key: crate::file_analysis::WriteKey::Unknown,
                                 scope: self
                                     .scope_stack
                                     .last()
@@ -6451,7 +6448,7 @@ impl<'a> Builder<'a> {
             "function_call_expression" | "ambiguous_function_call_expression"
                 if self.is_bless_call(node) =>
             {
-                let args = self.bless_args(node);
+                let args = self.extract_call_args(node);
                 match args.get(1) {
                     // Receiver-polymorphic: `bless X, $class` / `bless X, ref
                     // $self || $self` returns the class it was CALLED ON, so
@@ -6925,13 +6922,18 @@ impl<'a> Builder<'a> {
             let access = self.determine_access(node);
             // A scalar READ anywhere but an element-access base hands the
             // reference to code that may mutate the referent (call arg,
-            // alias, invocant, deref) — record the escape so closed-shape
-            // consumers know the literal isn't the whole story.
+            // alias, invocant, deref). An escape IS an unknown-key write:
+            // record it as an open-switching KeyWrite at the escape span,
+            // and the mutation-extension pass widens the shape from that
+            // point on — temporal, so reads BEFORE the first escape keep
+            // their closed shape. One site per var suffices.
             if access == AccessKind::Read
                 && text.starts_with('$')
                 && !crate::cst::is_element_access_base(node)
+                && !self.escape_recorded.contains(text)
             {
-                self.escaped_scalars.insert(text.to_string());
+                self.escape_recorded.insert(text.to_string());
+                self.record_escape_write(text.to_string(), node);
             }
             // Write with the variable itself as assignment target =
             // reassignment. An element write (`$v->{k} = …`, where this
@@ -6950,8 +6952,10 @@ impl<'a> Builder<'a> {
             // escape (unlike a scalar, whose value IS the shared ref).
             if text.starts_with('%')
                 && node.parent().is_some_and(|p| p.kind() == "refgen_expression")
+                && !self.escape_recorded.contains(text)
             {
-                self.escaped_scalars.insert(text.to_string());
+                self.escape_recorded.insert(text.to_string());
+                self.record_escape_write(text.to_string(), node);
             }
             // Fully-qualified read (`$Foo::Bar::x`): narrow the span to the
             // bare tail (rule #7) so rename rewrites only `x` and the
@@ -10641,6 +10645,26 @@ impl<'a> Builder<'a> {
     /// own shape (`$v->{a}{b} = …` adds `a`); only a direct single-hop
     /// write types the key's value from the RHS. Plain `%foo` elements
     /// (`$foo{k}`, no arrow) are a different variable — skipped.
+    /// Record an escape as an open-switching `KeyWrite` (`key: None`)
+    /// at the escape span — the modeled form of escape widening: once
+    /// the reference is out of our sight, any key may have been
+    /// written, which is exactly what a dynamic-key write claims.
+    fn record_escape_write(&mut self, var_text: String, node: Node<'a>) {
+        let span = node_to_span(node);
+        self.key_writes.push(crate::file_analysis::KeyWrite {
+            var_text,
+            key: crate::file_analysis::WriteKey::Unknown,
+            scope: self
+                .scope_stack
+                .last()
+                .copied()
+                .unwrap_or(crate::file_analysis::ScopeId(0)),
+            span,
+            rhs_span: None,
+            conditional: true,
+        });
+    }
+
     fn record_key_write(&mut self, left: Node<'a>, rhs: Option<Node<'a>>) {
         let mut innermost = left;
         loop {
@@ -10651,8 +10675,49 @@ impl<'a> Builder<'a> {
                 _ => return,
             }
         }
+        // Direct `$v->[N] = …` — a Sequence slot write. Only the
+        // direct, static-index, arrow-deref form is modeled (the pass
+        // retypes the slot / appends at len); container `$arr[N]` and
+        // nested array hops stay unmodeled — there's no open flag on
+        // Sequence to widen into, and no array-index diagnostic to
+        // protect.
+        if innermost.kind() == "array_element_expression" {
+            if innermost != left {
+                return;
+            }
+            if !crate::cst::element_arrow_deref(innermost, self.source) {
+                return;
+            }
+            let Some(container) = innermost.named_child(0) else { return };
+            if container.kind() != "scalar" {
+                return;
+            }
+            let Ok(t) = container.utf8_text(self.source) else { return };
+            if !t.starts_with('$') {
+                return;
+            }
+            let Some(idx_node) = innermost.child_by_field_name("index") else { return };
+            let Ok(Ok(idx)) = idx_node.utf8_text(self.source).map(|s| s.parse::<i32>())
+            else {
+                return;
+            };
+            let span = node_to_span(idx_node);
+            self.key_writes.push(crate::file_analysis::KeyWrite {
+                var_text: t.to_string(),
+                key: crate::file_analysis::WriteKey::Index(idx),
+                scope: self
+                    .scope_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(crate::file_analysis::ScopeId(0)),
+                span,
+                rhs_span: rhs.map(node_to_span),
+                conditional: crate::cst::is_conditionally_executed(left),
+            });
+            return;
+        }
         if innermost.kind() != "hash_element_expression" {
-            return; // array first hop — Sequence mutation, not modeled
+            return;
         }
         let Some(container) = innermost.named_child(0) else { return };
         // Container form `$h{k}` writes `%h` (canonical name); deref
@@ -10676,7 +10741,11 @@ impl<'a> Builder<'a> {
         let key_node = innermost.child_by_field_name("key");
         let key = key_node
             .and_then(|k| self.extract_key_text(k))
-            .and_then(|(t, dynamic)| (!dynamic).then_some(t));
+            .and_then(|(t, dynamic)| (!dynamic).then_some(t))
+            .map_or(
+                crate::file_analysis::WriteKey::Unknown,
+                crate::file_analysis::WriteKey::Hash,
+            );
         let direct = innermost == left;
         let span = key_node
             .map(node_to_span)
@@ -11093,62 +11162,8 @@ impl<'a> Builder<'a> {
     /// → current package; a string/bareword literal → its text; a missing
     /// 2nd arg (`bless {}`) → current package (Perl's one-arg bless blesses
     /// into the caller's package).
-    /// `bless`'s effective arguments, recovering the class arg that
-    /// tree-sitter-perl strands in `return bless {BLOCK}, CLASS`. The brace
-    /// block greedily ends the (parenless) call, so `CLASS` lands as a sibling
-    /// of the `return_expression` in the enclosing `list_expression`. Perl
-    /// parses `bless` as a list operator (the comma binds to bless, not
-    /// return), so that stranded sibling IS the class — splice it back. Only
-    /// the parenless `ambiguous_function_call_expression` strands; an explicit
-    /// `bless({}), $x` delimits its args, so its trailing list element is a
-    /// genuine second return value, not a dropped class.
-    ///
-    /// KLUDGE (tree-sitter-perl parser bug): the correct parse is `bless` as a
-    /// list operator grabbing the whole `{BLOCK}, CLASS` list. A fix is going
-    /// upstream; once a tree-sitter-perl release parses `return bless {}, X`
-    /// with both args under the call, DELETE `bless_args` + `bless_stranded_
-    /// class` and call `extract_call_args` directly at both bless sites. See
-    /// mem `tree-sitter-perl-parse-gotcha-return`.
-    fn bless_args(&self, node: Node<'a>) -> Vec<Node<'a>> {
-        let mut args = self.extract_call_args(node);
-        if node.kind() == "ambiguous_function_call_expression"
-            && args.len() == 1
-            && args[0].kind() == "anonymous_hash_expression"
-        {
-            if let Some(class) = self.bless_stranded_class(node) {
-                args.push(class);
-            }
-        }
-        args
-    }
-
-    /// The class arg stranded after `return bless {BLOCK}` — the head's next
-    /// named sibling in the `list_expression` that captured the tail (walking
-    /// past an optional `return_expression`). See `bless_args`.
-    fn bless_stranded_class(&self, node: Node<'a>) -> Option<Node<'a>> {
-        let head = match node.parent() {
-            Some(p) if p.kind() == "return_expression" => p,
-            _ => node,
-        };
-        let list = head.parent()?;
-        if list.kind() != "list_expression" {
-            return None;
-        }
-        let mut take_next = false;
-        for i in 0..list.named_child_count() {
-            let c = list.named_child(i)?;
-            if take_next {
-                return Some(c);
-            }
-            if c.id() == head.id() {
-                take_next = true;
-            }
-        }
-        None
-    }
-
     fn visit_bless_call(&mut self, node: Node<'a>) {
-        let args = self.bless_args(node);
+        let args = self.extract_call_args(node);
         let obj = match args.first() {
             Some(n) => *n,
             None => return,

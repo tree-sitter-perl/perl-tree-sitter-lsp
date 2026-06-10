@@ -429,10 +429,8 @@ fn cli_check(args: &[String]) {
 
     let mut all_diagnostics = Vec::new();
 
-    for entry in ws.workspace_raw().iter() {
-        let file = entry.key().display().to_string();
-        let diags = symbols::collect_diagnostics(entry.value(), &module_index, options);
-        for d in diags {
+    for (file, d) in enriched_tree_diagnostics(&ws, &module_index, options) {
+        {
             let sev = match d.severity {
                 Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::ERROR => "error",
                 Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::WARNING => "warning",
@@ -1036,31 +1034,61 @@ fn run_rename(
     Ok(serde_json::to_string_pretty(&serde_json::json!(all_edits)).unwrap())
 }
 
+/// Whole-tree diagnostics with enrichment parity: each workspace entry
+/// is deep-copied (bincode — `FileAnalysis` isn't `Clone`) and enriched
+/// with imported types before `collect_diagnostics` — the same pass
+/// `publish_diagnostics` runs on open docs, so cross-file-typed shapes
+/// hint here too. A file whose roundtrip fails degrades to its
+/// unenriched analysis rather than vanishing.
+fn enriched_tree_diagnostics(
+    ws: &file_store::FileStore,
+    idx: &module_index::ModuleIndex,
+    options: symbols::DiagnosticOptions,
+) -> Vec<(String, tower_lsp::lsp_types::Diagnostic)> {
+    let mut all = Vec::new();
+    for entry in ws.workspace_raw().iter() {
+        let file = entry.key().display().to_string();
+        let enriched = bincode::serialize(&**entry.value())
+            .ok()
+            .and_then(|bin| bincode::deserialize::<file_analysis::FileAnalysis>(&bin).ok())
+            .map(|mut fa| {
+                fa.after_deserialize();
+                fa.enrich_imported_types_with_keys(Some(idx));
+                fa
+            });
+        let diags = match &enriched {
+            Some(fa) => symbols::collect_diagnostics(fa, idx, options),
+            None => symbols::collect_diagnostics(entry.value(), idx, options),
+        };
+        for d in diags {
+            all.push((file.clone(), d));
+        }
+    }
+    all
+}
+
 /// Whole-tree diagnostics as the pretty-JSON array string (warning+; shared by
 /// `--batch` diagnostics requests). Mirrors `cli_check`'s JSON path.
 fn batch_diagnostics(ws: &file_store::FileStore, idx: &module_index::ModuleIndex) -> String {
     let options = symbols::DiagnosticOptions { unresolved_dispatch: false };
     let mut all = Vec::new();
-    for entry in ws.workspace_raw().iter() {
-        let file = entry.key().display().to_string();
-        for d in symbols::collect_diagnostics(entry.value(), idx, options) {
-            let sev = match d.severity {
-                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::ERROR => "error",
-                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::WARNING => "warning",
-                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION => "info",
-                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::HINT => "hint",
-                _ => "warning",
-            };
-            all.push(serde_json::json!({
-                "file": file, "line": d.range.start.line, "col": d.range.start.character,
-                "severity": sev,
-                "code": d.code.map(|c| match c {
-                    tower_lsp::lsp_types::NumberOrString::String(s) => s,
-                    tower_lsp::lsp_types::NumberOrString::Number(n) => n.to_string(),
-                }).unwrap_or_default(),
-                "message": d.message,
-            }));
-        }
+    for (file, d) in enriched_tree_diagnostics(ws, idx, options) {
+        let sev = match d.severity {
+            Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::ERROR => "error",
+            Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::WARNING => "warning",
+            Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION => "info",
+            Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::HINT => "hint",
+            _ => "warning",
+        };
+        all.push(serde_json::json!({
+            "file": file, "line": d.range.start.line, "col": d.range.start.character,
+            "severity": sev,
+            "code": d.code.map(|c| match c {
+                tower_lsp::lsp_types::NumberOrString::String(s) => s,
+                tower_lsp::lsp_types::NumberOrString::Number(n) => n.to_string(),
+            }).unwrap_or_default(),
+            "message": d.message,
+        }));
     }
     serde_json::to_string_pretty(&all).unwrap()
 }
@@ -1074,6 +1102,7 @@ fn cli_batch(root: &str) {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let mut diag_memo: Option<String> = None;
     for line in stdin.lock().lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
         if line.trim().is_empty() { continue; }
@@ -1084,7 +1113,17 @@ fn cli_batch(root: &str) {
                 continue;
             }
         };
-        let resp = match run_one(&ws, &idx, &req) {
+        // Whole-tree diagnostics are request-independent within one
+        // batch process (ScopedWorkspaceEntry restores any staging) —
+        // compute the enriched pass once, replay it for every row.
+        let result = if req.q == "diagnostics" {
+            Ok(diag_memo
+                .get_or_insert_with(|| batch_diagnostics(&ws, &idx))
+                .clone())
+        } else {
+            run_one(&ws, &idx, &req)
+        };
+        let resp = match result {
             Ok(s)  => serde_json::json!({"id": req.id, "ok": true,  "out": s}),
             Err(e) => serde_json::json!({"id": req.id, "ok": false, "err": e}),
         };
