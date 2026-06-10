@@ -31,4 +31,11 @@ my $oops = $config->{db_host};
 my $local_cfg = { retries => 3, timeout => 10 };
 my $typo = $local_cfg->{retrys};
 
+# Mutation extension: the unconditional write joins the shape -- the
+# read is silent and typed; unknowns on the mutated var still hint.
+my $branded = { path => '/api' };
+$branded->{name} = 'api_root';
+my $bn = $branded->{name};
+my $bt = $branded->{nmae};
+
 print "$host $port $first $uname $uid $n\n";

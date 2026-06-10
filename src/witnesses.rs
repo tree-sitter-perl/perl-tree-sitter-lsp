@@ -1958,6 +1958,111 @@ pub fn query_variable_type(
     reg.query_variable_with_visited(bag, ctx, var, scope, point, &mut state)
 }
 
+/// Fold `KeyWrite`s into variable shape witnesses — the mutation-
+/// extension pass. For each write on a variable whose shape at the
+/// write point is `HashWithKeys`:
+///
+/// - unconditional static-key write → push the EXTENDED shape (key
+///   joins the list, value typed from the RHS expression, `open`
+///   preserved). A write to an already-known key retypes its value.
+/// - dynamic key, syntactically conditional write, or a write whose
+///   scope chain crosses a boundary before reaching the attachment
+///   scope (nested block / closure — execution unknowable) → push the
+///   same keys with `open: true`.
+///
+/// Witnesses attach to the scope the variable's existing witnesses
+/// live on (so the read-side scope walk finds them) with a zero-width
+/// span at the write position — the same temporal contract as TC
+/// mirrors: invisible to reads before the write, latest-wins after
+/// (`HashWithKeys` subsumption is equality-only, so a different shape
+/// legitimately replaces the standing one).
+///
+/// Re-emittable: fold callers pass `clear = true` (clear-and-emit per
+/// iteration, tag `mutation_extension`). Enrichment passes `false` —
+/// post-finalize the bag is append-only (removal would shift the
+/// sealed `base_witness_count`); duplicate pushes are idempotent under
+/// latest-wins and truncated away by the next enrichment cycle.
+pub(crate) fn emit_mutation_extension_witnesses(
+    bag: &mut WitnessBag,
+    ctx: &BagContext,
+    key_writes: &[crate::file_analysis::KeyWrite],
+    clear: bool,
+) {
+    if clear {
+        bag.remove_by_source_tag("mutation_extension");
+    }
+    // Per-var doc order so later writes see earlier extensions.
+    let mut writes: Vec<&crate::file_analysis::KeyWrite> = key_writes.iter().collect();
+    writes.sort_by_key(|w| (&w.var_text, w.span.start));
+    for w in writes {
+        // Attach where the variable's existing witnesses live; note
+        // whether getting there crosses a scope boundary (nested block
+        // or closure — the write may not have executed by read time).
+        let mut attach: Option<(ScopeId, bool)> = None;
+        let mut cur = Some(w.scope);
+        let mut crossed = false;
+        while let Some(sid) = cur {
+            let att = WitnessAttachment::Variable { name: w.var_text.clone(), scope: sid };
+            if !bag.for_attachment(&att).is_empty() {
+                attach = Some((sid, crossed));
+                break;
+            }
+            crossed = true;
+            cur = ctx.scopes[sid.0 as usize].parent;
+        }
+        let Some((attach_sid, scope_crossed)) = attach else { continue };
+        let Some(InferredType::HashWithKeys { mut keys, open }) =
+            query_variable_type(bag, ctx, &w.var_text, w.scope, w.span.start)
+        else {
+            continue;
+        };
+        let widen = w.key.is_none() || w.conditional || scope_crossed;
+        let shape = if widen {
+            if open {
+                continue; // already open — nothing to add
+            }
+            InferredType::HashWithKeys { keys, open: true }
+        } else {
+            let k = w.key.as_deref().unwrap();
+            let vtype = w.rhs_span.and_then(|s| {
+                let reg = ReducerRegistry::with_defaults();
+                let att = WitnessAttachment::Expr(s);
+                let q = ReducerQuery {
+                    attachment: &att,
+                    point: None,
+                    framework: FrameworkFact::Plain,
+                    arity_hint: None,
+                    receiver: None,
+                    context: Some(ctx),
+                };
+                match reg.query(bag, &q) {
+                    ReducedValue::Type(t) => Some(t),
+                    _ => None,
+                }
+            });
+            match keys.iter_mut().find(|(name, _)| name == k) {
+                Some(entry) => {
+                    if vtype.is_none() || entry.1.as_deref() == vtype.as_ref() {
+                        continue; // no new information
+                    }
+                    entry.1 = vtype.map(Box::new);
+                }
+                None => keys.push((k.to_string(), vtype.map(Box::new))),
+            }
+            InferredType::HashWithKeys { keys, open }
+        };
+        bag.push(Witness {
+            attachment: WitnessAttachment::Variable {
+                name: w.var_text.clone(),
+                scope: attach_sid,
+            },
+            source: WitnessSource::Builder("mutation_extension".into()),
+            payload: WitnessPayload::InferredType(shape),
+            span: Span { start: w.span.start, end: w.span.start },
+        });
+    }
+}
+
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------

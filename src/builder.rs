@@ -251,6 +251,8 @@ fn build_with_plugins_inner(
         method_call_invocant: std::collections::HashMap::new(),
         attr_projections: Vec::new(),
         escaped_scalars: std::collections::HashSet::new(),
+        reassigned_scalars: std::collections::HashSet::new(),
+        key_writes: Vec::new(),
         method_call_arity: std::collections::HashMap::new(),
         parametric_emitted_refs: std::collections::HashSet::new(),
         method_call_ref_dedup: std::collections::HashSet::new(),
@@ -503,6 +505,8 @@ fn build_with_plugins_inner(
         attr_projections: b.attr_projections,
         gated_param_types: b.gated_param_types,
         escaped_scalars: b.escaped_scalars,
+        reassigned_scalars: b.reassigned_scalars,
+        key_writes: b.key_writes,
     });
     // Finalize: run the legacy text-based MCB resolver as a fallback.
     // For every assignment the unified typer (run before
@@ -1460,6 +1464,16 @@ struct Builder<'a> {
     /// `FileAnalysis.escaped_scalars`; consumed by
     /// `closed_shape_is_whole_story`.
     escaped_scalars: std::collections::HashSet<String>,
+
+    /// Scalars reassigned after declaration (`$v = …` targeting the
+    /// variable itself; element writes go to `key_writes` instead).
+    /// Flushed into `FileAnalysis.reassigned_scalars`.
+    reassigned_scalars: std::collections::HashSet<String>,
+
+    /// `$var->{key} = …` writes in walk order — input to the
+    /// mutation-extension pass (shape extension / open-widening).
+    /// Flushed into `FileAnalysis.key_writes`.
+    key_writes: Vec<crate::file_analysis::KeyWrite>,
 
     /// Per-MethodCall-ref arg count, keyed by ref index. Lets
     /// `emit_method_call_return_edges` pin the call site's arity onto its
@@ -5986,6 +6000,12 @@ impl<'a> Builder<'a> {
                             .insert(node_to_span(key_node), node_to_span(right));
                     }
                 }
+                if matches!(
+                    left.kind(),
+                    "hash_element_expression" | "array_element_expression"
+                ) {
+                    self.record_key_write(left, Some(right));
+                }
             }
             // Visit LHS children (except the variable_declaration we already handled)
             if left.kind() != "variable_declaration" {
@@ -6832,6 +6852,17 @@ impl<'a> Builder<'a> {
                 && !crate::cst::is_element_access_base(node)
             {
                 self.escaped_scalars.insert(text.to_string());
+            }
+            // Write with the variable itself as assignment target =
+            // reassignment. An element write (`$v->{k} = …`, where this
+            // scalar is the access base and the Write came from the
+            // grandparent rule) is a shape mutation instead — modeled by
+            // the mutation-extension pass, not a trust break.
+            if access == AccessKind::Write
+                && text.starts_with('$')
+                && !crate::cst::is_element_access_base(node)
+            {
+                self.reassigned_scalars.insert(text.to_string());
             }
             // Fully-qualified read (`$Foo::Bar::x`): narrow the span to the
             // bare tail (rule #7) so rename rewrites only `x` and the
@@ -10508,6 +10539,55 @@ impl<'a> Builder<'a> {
         None
     }
 
+    /// Record a `$var->{key} = …` write for the mutation-extension
+    /// pass. Walks subscript chains down to the scalar base: the FIRST
+    /// hop's key is the one the write autovivifies onto the variable's
+    /// own shape (`$v->{a}{b} = …` adds `a`); only a direct single-hop
+    /// write types the key's value from the RHS. Plain `%foo` elements
+    /// (`$foo{k}`, no arrow) are a different variable — skipped.
+    fn record_key_write(&mut self, left: Node<'a>, rhs: Option<Node<'a>>) {
+        let mut innermost = left;
+        loop {
+            let Some(c) = innermost.named_child(0) else { return };
+            match c.kind() {
+                "hash_element_expression" | "array_element_expression" => innermost = c,
+                "scalar" => break,
+                _ => return,
+            }
+        }
+        if innermost.kind() != "hash_element_expression" {
+            return; // array first hop — Sequence mutation, not modeled
+        }
+        if !crate::cst::element_arrow_deref(innermost, self.source) {
+            return;
+        }
+        let Some(container) = innermost.named_child(0) else { return };
+        let Ok(var_text) = container.utf8_text(self.source) else { return };
+        if !var_text.starts_with('$') {
+            return;
+        }
+        let key_node = innermost.child_by_field_name("key");
+        let key = key_node
+            .and_then(|k| self.extract_key_text(k))
+            .and_then(|(t, dynamic)| (!dynamic).then_some(t));
+        let direct = innermost == left;
+        let span = key_node
+            .map(node_to_span)
+            .unwrap_or_else(|| node_to_span(innermost));
+        self.key_writes.push(crate::file_analysis::KeyWrite {
+            var_text: var_text.to_string(),
+            key,
+            scope: self
+                .scope_stack
+                .last()
+                .copied()
+                .unwrap_or(crate::file_analysis::ScopeId(0)),
+            span,
+            rhs_span: if direct { rhs.map(node_to_span) } else { None },
+            conditional: crate::cst::is_conditionally_executed(left),
+        });
+    }
+
     fn determine_access(&self, node: Node<'a>) -> AccessKind {
         if let Some(parent) = node.parent() {
             match parent.kind() {
@@ -11663,6 +11743,24 @@ impl<'a> Builder<'a> {
             }
             self.run_chain_typing_reducer(idx, ChainPassMode::PreFold);
             self.resolve_return_types(idx, &reg, &ref_by_span, &method_sym_by_name);
+            // Mutation extension: fold key writes into variable shapes
+            // (re-emittable, clear-and-emit). After the return-type
+            // passes so call-binding-propagated shapes are visible.
+            {
+                let ctx = crate::witnesses::BagContext {
+                    scopes: &self.scopes,
+                    package_framework: &self.package_framework,
+                    module_index: None,
+                    package_parents: &self.package_parents,
+                    app_surface_consumers: &self.app_surface_consumers,
+                };
+                crate::witnesses::emit_mutation_extension_witnesses(
+                    &mut self.bag,
+                    &ctx,
+                    &self.key_writes,
+                    true,
+                );
+            }
             let cur = self.fold_state_snapshot(&reg);
             if cur == prev {
                 break;

@@ -1,6 +1,6 @@
 {
   "capability": "type-at",
-  "comment": "Nested hash-key intelligence (prompt-nested-hashkey.md): in-file structural typing. The mixed drill $obj->{users}->[0]->{name} chains HashWithKeys narrowing → Sequence element projection → HashWithKeys narrowing.",
+  "comment": "Nested hash-key intelligence (prompt-nested-hashkey.md): in-file structural typing. The mixed drill $obj->{users}->[0]->{name} chains HashWithKeys narrowing \u2192 Sequence element projection \u2192 HashWithKeys narrowing.",
   "rows": [
     {
       "id": "nested-mixed-drill-string",
@@ -9,7 +9,11 @@
       "line": 16,
       "col": 4,
       "status": "gold",
-      "expect": { "all": ["String"] }
+      "expect": {
+        "all": [
+          "String"
+        ]
+      }
     },
     {
       "id": "nested-mixed-drill-numeric",
@@ -18,7 +22,27 @@
       "line": 17,
       "col": 4,
       "status": "gold",
-      "expect": { "all": ["Numeric"] }
+      "expect": {
+        "all": [
+          "Numeric"
+        ]
+      }
+    },
+    {
+      "id": "nested-mutation-extended-value",
+      "difficulty": "simple",
+      "semantic_area": "structural-shapes",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 37,
+      "col": 4,
+      "status": "gold",
+      "expect": {
+        "all": [
+          "String"
+        ]
+      },
+      "note": "$branded->{name} read after the unconditional write -- the mutation-extension pass typed the added key from its RHS."
     }
   ]
 }

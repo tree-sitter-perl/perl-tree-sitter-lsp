@@ -1677,6 +1677,29 @@ pub struct CallBinding {
     pub span: Span,
 }
 
+/// One `$var->{key} = …` write observed at walk time. The mutation-
+/// extension pass (`witnesses::emit_mutation_extension_witnesses`)
+/// folds these into the variable's structural shape: an unconditional
+/// static-key write extends a closed `HashWithKeys` (the key joins the
+/// shape, its value typed from `rhs_span`); a dynamic key or a
+/// conditionally-executed write switches the shape open. Persisted so
+/// cross-file enrichment can re-run the pass once imported shapes land.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyWrite {
+    pub var_text: String,
+    /// `None` = dynamic key (`$v->{$k}`) — unknowable membership.
+    pub key: Option<String>,
+    pub scope: ScopeId,
+    /// Key-node span — temporal anchor and per-var ordering.
+    pub span: Span,
+    /// RHS expression span — types the extended key's value.
+    pub rhs_span: Option<Span>,
+    /// Syntactically conditional within its sub (if/postfix/ternary/
+    /// loop/short-circuit). Scope-crossing writes (nested block or
+    /// closure relative to the decl scope) are detected in the pass.
+    pub conditional: bool,
+}
+
 /// A method call binding: `$var = $invocant->method()`.
 /// Recorded during build, resolved in post-pass via `find_method_return_type`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2238,6 +2261,21 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub escaped_scalars: HashSet<String>,
 
+    /// Scalars reassigned after declaration (`$v = …` with the
+    /// variable itself as assignment target — element writes are NOT
+    /// reassignment, they're modeled as shape mutations). A closed
+    /// shape on a reassigned scalar isn't trustworthy: the other
+    /// assignment may carry a different (unknown) value. The
+    /// conditional-reassignment lattice disagreement is the modeled
+    /// fix; this set is its trust-gate stand-in.
+    #[serde(default)]
+    pub reassigned_scalars: HashSet<String>,
+
+    /// Hash-key writes, in walk order. Input to the mutation-extension
+    /// pass — see [`KeyWrite`].
+    #[serde(default)]
+    pub key_writes: Vec<KeyWrite>,
+
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
@@ -2298,6 +2336,8 @@ pub struct FileAnalysisParts {
     pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
     pub attr_projections: Vec<AttrProjection>,
     pub escaped_scalars: HashSet<String>,
+    pub reassigned_scalars: HashSet<String>,
+    pub key_writes: Vec<KeyWrite>,
 }
 
 /// One projection of a field/attr decl — the entity that encodes group
@@ -2421,6 +2461,8 @@ impl FileAnalysis {
             gated_param_types,
             attr_projections,
             escaped_scalars,
+            reassigned_scalars,
+            key_writes,
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
@@ -2452,6 +2494,8 @@ impl FileAnalysis {
             gated_param_types,
             attr_projections,
             escaped_scalars,
+            reassigned_scalars,
+            key_writes,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -3286,23 +3330,18 @@ impl FileAnalysis {
     }
 
     /// True when a closed literal shape on `var_text` is the variable's
-    /// whole story in this file: the scalar is never written after its
-    /// declaration (no reassignment, no `$v->{k} = …` — both surface as
-    /// a `Variable` ref with `Write` access) and its reference never
-    /// escapes into a call / alias / invocant position. Each clause is
-    /// the trust-gate approximation of a lattice widening that isn't
-    /// modeled yet (mutation widening, conditional-reassignment
-    /// disagreement, escape widening — docs/prompt-nested-hashkey.md);
-    /// the unknown-hash-key diagnostic only fires behind it.
+    /// whole story in this file: the scalar is never reassigned and its
+    /// reference never escapes into a call / alias / invocant position.
+    /// Key writes are NOT a gate clause — the mutation-extension pass
+    /// models them on the shape itself (unconditional writes extend a
+    /// closed shape; conditional/dynamic writes switch it open). The
+    /// two remaining clauses are trust-gate stand-ins for unmodeled
+    /// lattice widenings (conditional-reassignment disagreement, escape
+    /// widening — docs/prompt-nested-hashkey.md); the unknown-hash-key
+    /// diagnostic only fires behind them.
     pub fn closed_shape_is_whole_story(&self, var_text: &str) -> bool {
-        if self.escaped_scalars.contains(var_text) {
-            return false;
-        }
-        !self.refs.iter().any(|r| {
-            matches!(r.kind, RefKind::Variable)
-                && r.access == AccessKind::Write
-                && r.target_name == var_text
-        })
+        !self.escaped_scalars.contains(var_text)
+            && !self.reassigned_scalars.contains(var_text)
     }
 
     /// Get the return type of a named sub/method (local definitions
@@ -3557,6 +3596,30 @@ impl FileAnalysis {
                     }
                 }
             }
+        }
+
+        // Re-run the mutation-extension pass: imported shapes (a var
+        // typed by an imported sub's `HashWithKeys` return) only land
+        // with the TCs pushed above, so build-time extension found no
+        // shape to extend for them. Append-only (`clear = false`) —
+        // post-finalize removal would shift `base_witness_count`;
+        // duplicates are idempotent and truncated by the next cycle.
+        {
+            let key_writes = std::mem::take(&mut self.key_writes);
+            let ctx = crate::witnesses::BagContext {
+                scopes: &self.scopes,
+                package_framework: &self.package_framework,
+                module_index,
+                package_parents: &self.package_parents,
+                app_surface_consumers: &self.app_surface_consumers,
+            };
+            crate::witnesses::emit_mutation_extension_witnesses(
+                &mut self.witnesses,
+                &ctx,
+                &key_writes,
+                false,
+            );
+            self.key_writes = key_writes;
         }
 
         self.resolve_method_call_types(module_index);

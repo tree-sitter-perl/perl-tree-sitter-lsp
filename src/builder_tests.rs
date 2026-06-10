@@ -14520,6 +14520,60 @@ my $open = { %$config, extra => 'x' };
     );
 }
 
+/// Mutation extension: an unconditional `$v->{k} = …` write EXTENDS a
+/// closed shape (the key joins the list, value typed from the RHS,
+/// `open` preserved); a conditional or dynamic-key write switches the
+/// shape open. Reads before the write keep the original shape.
+#[test]
+fn mutation_extension_on_closed_shapes() {
+    let src = "\
+my $ext = { host => 'x' };
+my $before = $ext->{host};
+$ext->{added} = 42;
+my $after = $ext->{added};
+my $cond = { host => 'x' };
+$cond->{maybe} = 1 if $ENV{X};
+my $dyn = { host => 'x' };
+$dyn->{$ENV{K}} = 1;
+";
+    let fa = build_fa(src);
+
+    // Before the write: the literal's own closed single-key shape.
+    let t0 = fa.inferred_type_via_bag("$ext", Point::new(1, 0)).expect("$ext typed");
+    assert!(
+        matches!(&t0, InferredType::HashWithKeys { keys, open: false } if keys.len() == 1),
+        "pre-write shape: {:?}",
+        t0,
+    );
+
+    // After: extended, still closed, value typed from the RHS.
+    let t1 = fa.inferred_type_via_bag("$ext", Point::new(3, 0)).expect("$ext typed");
+    let InferredType::HashWithKeys { keys, open: false } = &t1 else {
+        panic!("post-write shape: {:?}", t1)
+    };
+    assert_eq!(keys.len(), 2, "{:?}", keys);
+    assert_eq!(keys[1].0, "added");
+    assert_eq!(keys[1].1.as_deref(), Some(&InferredType::Numeric));
+    let after = fa.inferred_type_via_bag("$after", Point::new(4, 0)).expect("$after typed");
+    assert_eq!(after, InferredType::Numeric, "read drills the extended key");
+
+    // Conditional write → open.
+    let tc = fa.inferred_type_via_bag("$cond", Point::new(6, 0)).expect("$cond typed");
+    assert!(
+        matches!(tc, InferredType::HashWithKeys { open: true, .. }),
+        "conditional write opens: {:?}",
+        tc,
+    );
+
+    // Dynamic key → open.
+    let td = fa.inferred_type_via_bag("$dyn", Point::new(8, 0)).expect("$dyn typed");
+    assert!(
+        matches!(td, InferredType::HashWithKeys { open: true, .. }),
+        "dynamic key opens: {:?}",
+        td,
+    );
+}
+
 /// Sub-return literals narrow at call sites: `cfg()->{host}` → String.
 #[test]
 fn hash_literal_narrows_through_sub_return() {

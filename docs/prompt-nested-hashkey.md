@@ -11,9 +11,13 @@ literals type as per-index `Sequence` tuples (heterogeneous answers
 per index instead of bailing), `->[N]` projects, and the mixed drill
 `$obj->{users}->[0]->{name}` chains end-to-end. Displays stay coarse
 ("HashRef") for hashes; sequences display `Sequence<…>` elided past 4
-elements. Still open below: the deferred items (mutation-induced
-widening, Type::Tiny recursive constraints) and the closed-shape-miss
-diagnostic (the `open` flag now carries everything it needs).
+elements. The closed-shape-miss diagnostic landed (whole-story
+gated), and mutation effects are modeled: the mutation-extension pass
+(`witnesses::emit_mutation_extension_witnesses`) folds `$v->{k} = …`
+writes into the shape — unconditional static-key writes EXTEND a
+closed shape (value typed from the RHS), conditional / dynamic /
+scope-crossing writes switch it open. Still open below: the remaining
+deferred items.
 
 Builds on the sealed-enum `ParametricType` shape landed in
 Part 5c (`docs/adr/parametric-types.md`). Each flavor carries
@@ -173,9 +177,14 @@ unknown for now, address with sum types (Part 5b) when motivated.
 - **JSON / YAML / TOML loaded data.** Could in principle be a Tier 2
   emission if we parse the schema, but that's a separate plugin
   domain.
-- **Mutation-induced widening.** `my $h = { a => 1 }; $h->{b} = 'x';
-  $h->{c}` — closed→open transition mid-flow. Touchable with the
-  invocant-mutation reducer (Part 1 residual). Defer.
+- **Mutation-induced widening.** LANDED — see the mutation-extension
+  pass note up top. Residual flavors still open: literal `%hash`
+  variables (`my %h = (a => 1); $h{b}` — no shape TC is minted for
+  hash-sigil variables, so neither extension nor the diagnostic apply;
+  the same model, second spelling), array index writes on `Sequence`
+  tuples, and conditional-reassignment disagreement (`$spec = {…}
+  unless ref $spec` — still a trust-gate suppression via
+  `reassigned_scalars`, not a lattice fold).
 - **Recursive type constraints from Type::Tiny / Moose.** `isa =>
   HashRef[ArrayRef[Str]]` ASTs. This is a separate plugin emission
   story (`use Types::Standard` plugin extends Moo synthesis to

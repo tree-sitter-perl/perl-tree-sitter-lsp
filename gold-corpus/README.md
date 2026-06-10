@@ -70,7 +70,10 @@ imported literal (`my $db = $config->{db}` hover — the `Projected`
 edge payload), `$row->{name}` → column def (definition + references,
 cross-file), and the closed-shape unknown-key hint (diagnostics: the
 local-literal typo is gold; the cross-file-typed typo is xfail — batch
-diagnostics have no enrichment parity, see KNOWN-GAPS.md).
+diagnostics have no enrichment parity, see KNOWN-GAPS.md; the
+mutation-extension rows pin that an unconditional write joins the
+shape — the written key reads back typed, the typo beside it still
+hints).
 
 **Re-export fixture.** Three rows (`fixtures/reexport.json`, capability `definition` — folded under `definition` in `--list`) run against a small **committed, self-contained workspace** at `reexport-fixture/` instead of the snapshot substrate, via a per-row `root`. They flex the transitive export-surface feature: `goto-def` from a consumer of a re-exporter resolves to the *original* sub through both re-export forms — static splice (`our @EXPORT = (@RexBase::EXPORT)`) and loop-push (`push @EXPORT, @{"${m}::EXPORT"}`). The harness groups rows by `root` and runs one `--batch` per root.
 
