@@ -22,7 +22,7 @@ backburner: ship when types + architecture are in a healthy place.
 | Doc | Axis | Status |
 |---|---|---|
 | `prompt-type-inference-residual.md` | **WHAT'S MISSING** — Parts 1–5 fact classes | each is a reducer+emitter pair |
-| `prompt-nested-hashkey.md` | hash-key intelligence on Parametric values + structural hashes + array-element narrowing | Tier 1 partially landed; Tiers 2/3 queued |
+| `prompt-nested-hashkey.md` | structural hash shapes + drills + the unknown-key diagnostic | LANDED (PR #50) — decisions in `adr/structural-shapes.md`; file keeps residuals |
 | `prompt-type-system-encoding.md` | **TYPE-SAFE AXIS DISPATCH** — make wrong-axis class-name reads unrepresentable | discussion; partially deferred to graph-walking |
 | `prompt-type-is-the-gate.md` | **GENERALIZE STRICT-EQ GATES** — `type_says()` answers replace local-symbol-table presence checks | two instances landed (Part 5c); general refactor open |
 | `prompt-dbic-as-plugin.md` | **MOVE DBIC OUT OF CORE** — port `visit_dbic_*` family + Parametric emission to a plugin | ReturnExpr gate cleared; still behind type-system-encoding |

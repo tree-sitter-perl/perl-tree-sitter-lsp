@@ -4,6 +4,45 @@ All notable changes to perl-lsp are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the published
 crate / VS Code extension versions.
 
+## Unreleased
+
+### Structural hash shapes & nested drills
+
+- **Hash literals carry their keys in the type.** `{ host => 'x', port => 5432 }`
+  is a shape, not a bare HashRef: `->{key}` narrows to the per-key type through
+  assignment hops, double-drills (`$config->{db}{host}` → String), sub-return
+  literals, and imports (cross-file drill hops included). Array literals type as
+  per-index tuples — the mixed drill `$obj->{users}[0]{name}` chains end-to-end,
+  and hover shows `Sequence<…>`.
+- **`$row->{name}` on a typed row** (DBIC and friends) resolves to the column
+  def — goto-def, references, hover.
+- **Both spellings.** `my %h = (k => v)` types through the same shape builder
+  as the hashref literal; `$h{k}` reads check against `%h`'s shape. Spreads —
+  hash and array (`my %opts = (default => 1, @_)`) — mark the shape open.
+- **Mutation is modeled, not guessed.** An unconditional `$v->{k} = …` write
+  extends the shape (the read drills back typed); a conditional, dynamic-key,
+  closure, or slice write (every slice spelling: `@h{…}`, `%h{k}`, `@$h{…}`,
+  `$h->@{…}`, `$h->%{…}`) switches it open.
+- **New diagnostic: `unknown-hash-key`** (hint severity). A read of a key a
+  CLOSED literal shape doesn't define — the typo catcher — naming the known
+  keys. Fires only when the shape is the variable's whole story (never
+  reassigned, never escaped into a call/alias/invocant); calibrated to **zero
+  false positives across the 2,293-module substrate**. Design:
+  `docs/adr/structural-shapes.md`.
+
+### Gold corpus
+
+- **Cost report.** Every suite run ends with per-capability timing
+  (n/total/mean/max wall ms), per-root startup latency, child CPU, and peak
+  RSS — so feature work sees what it costs as it lands. `METRICS_OUT=<file>`
+  writes JSON for run-over-run comparison; `--emit --root <dir>` authors rows
+  against per-row-root fixtures.
+- New committed `nested-fixture/` workspace pinning the shape work (typo hints
+  in both spellings, mutation extension, drill type-at/hover/def/refs).
+- Harness fix: `normalize()` decoded character strings as bytes, so any
+  non-ASCII response character silently dropped a row to the text fallback
+  where `none` assertions vacuously pass.
+
 ## v0.4.0
 
 A large release: cross-file intelligence everywhere, framework and exporter

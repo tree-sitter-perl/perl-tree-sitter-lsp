@@ -114,7 +114,7 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 
 ## Type inference (witness bag)
 
-**The bag is the only source of types.** Type production is `bag.push(...)`; type consumption is `bag_query_attachment(att)` through `ReducerRegistry::query`. There is no second source. `Builder::infer_expression_type` is gone; closed-syntax cases live in `expr_payload`'s match called by `emit_expr_witness`. `Builder.resolved_returns` is gone; walk-time synthesis pushes `Symbol(sid)` witnesses directly. See `docs/adr/bag-canonical.md` for the load-bearing decisions.
+**The bag is the only source of types.** Type production is `bag.push(...)`; type consumption is `bag_query_attachment(att)` through `ReducerRegistry::query`. There is no second source. `Builder::infer_expression_type` is gone; closed-syntax cases live in `expr_payload`'s match called by `emit_expr_witness`. `Builder.resolved_returns` is gone; walk-time synthesis pushes `Symbol(sid)` witnesses directly. See `docs/adr/bag-canonical.md` for the load-bearing decisions; `docs/adr/structural-shapes.md` for structural hash shapes (`HashWithKeys`, `Projected` drills, mutation extension, the whole-story trust gate).
 
 **Edges, not values.** If a registry query on attachment `A` already resolves through an edge chase, do NOT re-push the materialized `InferredType(t)` onto `A` as a "cache." The registry's chase IS the canonical flow; the materialization is a parallel store that drifts. Every published witness is either (a) a source value the walker uniquely knows (a literal's type, a plugin's declaration, a framework's `ReturnExpr`) or (b) an `Edge` to another attachment.
 

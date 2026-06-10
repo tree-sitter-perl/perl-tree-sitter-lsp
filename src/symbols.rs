@@ -2762,10 +2762,9 @@ pub fn collect_diagnostics(
     // key) and doesn't define the key. Writes are skipped — assigning a
     // new key extends the shape, it isn't a typo. Open shapes are
     // skipped — the spread may carry the key. The whole-story gate
-    // skips vars that were mutated, reassigned, or escaped (the
-    // trust-gate stand-in for the unmodeled lattice widenings —
-    // docs/prompt-nested-hashkey.md). HINT severity, per the
-    // quiet-by-design diagnostics convention.
+    // skips reassigned/escaped vars (the trust-gate stand-in for the
+    // unmodeled lattice widenings — docs/adr/structural-shapes.md).
+    // HINT severity, per the quiet-by-design diagnostics convention.
     use crate::file_analysis::InferredType;
     for r in &analysis.refs {
         let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };

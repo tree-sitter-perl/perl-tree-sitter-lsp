@@ -1682,8 +1682,9 @@ pub struct CallBinding {
 /// folds these into the variable's structural shape: an unconditional
 /// static-key write extends a closed `HashWithKeys` (the key joins the
 /// shape, its value typed from `rhs_span`); a dynamic key or a
-/// conditionally-executed write switches the shape open. Persisted so
-/// cross-file enrichment can re-run the pass once imported shapes land.
+/// conditionally-executed write switches the shape open
+/// (docs/adr/structural-shapes.md). Persisted so cross-file
+/// enrichment can re-run the pass once imported shapes land.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyWrite {
     pub var_text: String,
@@ -3337,7 +3338,7 @@ impl FileAnalysis {
     /// closed shape; conditional/dynamic writes switch it open). The
     /// two remaining clauses are trust-gate stand-ins for unmodeled
     /// lattice widenings (conditional-reassignment disagreement, escape
-    /// widening — docs/prompt-nested-hashkey.md); the unknown-hash-key
+    /// widening — docs/adr/structural-shapes.md); the unknown-hash-key
     /// diagnostic only fires behind them.
     pub fn closed_shape_is_whole_story(&self, var_text: &str) -> bool {
         !self.escaped_scalars.contains(var_text)
