@@ -1688,8 +1688,7 @@ pub struct CallBinding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyWrite {
     pub var_text: String,
-    /// `None` = dynamic key (`$v->{$k}`) — unknowable membership.
-    pub key: Option<String>,
+    pub key: WriteKey,
     pub scope: ScopeId,
     /// Key-node span — temporal anchor and per-var ordering.
     pub span: Span,
@@ -1699,6 +1698,20 @@ pub struct KeyWrite {
     /// loop/short-circuit). Scope-crossing writes (nested block or
     /// closure relative to the decl scope) are detected in the pass.
     pub conditional: bool,
+}
+
+/// What a `KeyWrite` lands on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WriteKey {
+    /// Static hash key — extends/retypes the named entry on a
+    /// `HashWithKeys` shape.
+    Hash(String),
+    /// Static array index (direct arrow write, `$v->[N] = …`) —
+    /// retypes the slot / appends at `len` on a `Sequence` tuple.
+    Index(i32),
+    /// Dynamic key, slice, or escape — membership unknowable;
+    /// switches a `HashWithKeys` shape open.
+    Unknown,
 }
 
 /// A method call binding: `$var = $invocant->method()`.

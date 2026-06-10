@@ -6048,7 +6048,7 @@ impl<'a> Builder<'a> {
                             let span = node_to_span(left);
                             self.key_writes.push(crate::file_analysis::KeyWrite {
                                 var_text,
-                                key: None,
+                                key: crate::file_analysis::WriteKey::Unknown,
                                 scope: self
                                     .scope_stack
                                     .last()
@@ -10653,7 +10653,7 @@ impl<'a> Builder<'a> {
         let span = node_to_span(node);
         self.key_writes.push(crate::file_analysis::KeyWrite {
             var_text,
-            key: None,
+            key: crate::file_analysis::WriteKey::Unknown,
             scope: self
                 .scope_stack
                 .last()
@@ -10675,8 +10675,49 @@ impl<'a> Builder<'a> {
                 _ => return,
             }
         }
+        // Direct `$v->[N] = …` — a Sequence slot write. Only the
+        // direct, static-index, arrow-deref form is modeled (the pass
+        // retypes the slot / appends at len); container `$arr[N]` and
+        // nested array hops stay unmodeled — there's no open flag on
+        // Sequence to widen into, and no array-index diagnostic to
+        // protect.
+        if innermost.kind() == "array_element_expression" {
+            if innermost != left {
+                return;
+            }
+            if !crate::cst::element_arrow_deref(innermost, self.source) {
+                return;
+            }
+            let Some(container) = innermost.named_child(0) else { return };
+            if container.kind() != "scalar" {
+                return;
+            }
+            let Ok(t) = container.utf8_text(self.source) else { return };
+            if !t.starts_with('$') {
+                return;
+            }
+            let Some(idx_node) = innermost.child_by_field_name("index") else { return };
+            let Ok(Ok(idx)) = idx_node.utf8_text(self.source).map(|s| s.parse::<i32>())
+            else {
+                return;
+            };
+            let span = node_to_span(idx_node);
+            self.key_writes.push(crate::file_analysis::KeyWrite {
+                var_text: t.to_string(),
+                key: crate::file_analysis::WriteKey::Index(idx),
+                scope: self
+                    .scope_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(crate::file_analysis::ScopeId(0)),
+                span,
+                rhs_span: rhs.map(node_to_span),
+                conditional: crate::cst::is_conditionally_executed(left),
+            });
+            return;
+        }
         if innermost.kind() != "hash_element_expression" {
-            return; // array first hop — Sequence mutation, not modeled
+            return;
         }
         let Some(container) = innermost.named_child(0) else { return };
         // Container form `$h{k}` writes `%h` (canonical name); deref
@@ -10700,7 +10741,11 @@ impl<'a> Builder<'a> {
         let key_node = innermost.child_by_field_name("key");
         let key = key_node
             .and_then(|k| self.extract_key_text(k))
-            .and_then(|(t, dynamic)| (!dynamic).then_some(t));
+            .and_then(|(t, dynamic)| (!dynamic).then_some(t))
+            .map_or(
+                crate::file_analysis::WriteKey::Unknown,
+                crate::file_analysis::WriteKey::Hash,
+            );
         let direct = innermost == left;
         let span = key_node
             .map(node_to_span)

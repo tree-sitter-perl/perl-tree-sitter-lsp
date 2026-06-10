@@ -22,10 +22,13 @@ side. This file keeps only what's still open.
   two assignment witnesses disagree-to-widen (BranchArmFold's shape,
   applied to conditional reassignment). When it lands, the
   reassignment clause comes out of the gate the way key writes did.
-- **Array index writes on `Sequence` tuples.** `$items->[3] = …` on a
-  closed tuple neither extends nor opens it today (`record_key_write`
-  skips array first hops). The hash-side machinery (KeyWrite +
-  extension pass) is the template.
+- **Sequence widening.** Direct in-bounds index writes retype/append
+  (landed); out-of-bounds, conditional, and dynamic index writes stay
+  unmodeled — `Sequence` has no open flag, and a bare-ArrayRef
+  downgrade loses to structure-dominates-rep subsumption. Harmless
+  while no array-index diagnostic exists (`element_at`'s None is an
+  honest miss); adding `open` to `Sequence` is the fix if one ever
+  lands.
 - **Batch diagnostics enrichment parity.** Cross-file-typed shapes
   can't hint under `--batch`/`--check` — `batch_diagnostics` walks
   raw workspace entries while `publish_diagnostics` enriches open
