@@ -1,0 +1,15 @@
+{
+  "capability": "definition",
+  "comment": "Tier 1: $row->{name} on a typed row resolves to the column def — cross-file, the class file carries the add_columns HashKeyDef.",
+  "rows": [
+    {
+      "id": "nested-row-key-to-column-def",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 22,
+      "col": 17,
+      "status": "gold",
+      "expect": { "all": ["NestedRow.pm:7:5"] }
+    }
+  ]
+}

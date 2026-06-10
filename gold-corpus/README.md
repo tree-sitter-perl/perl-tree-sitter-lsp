@@ -54,6 +54,23 @@ A process abort (the scanner-overflow class) is always a hard **CRASH** fail. Ou
 
 The substrate is installed lib content only — it contains **no test files (`t/*.t`), `bin/`, or examples**. Rows whose original cursor lived in a test file, or whose module is not in the snapshot (e.g. JSON::PP, Time::HiRes), are listed in each capability's "Dropped" section. Rows that leaned on test-file call sites were re-authored to the surviving in-lib locations.
 
+**Cost report.** Every suite run ends with a per-capability timing table
+(wall-time per query, attributed by row id), per-root startup latency
+(first-response time: workspace index + cache warm), child CPU
+(user/sys), and peak RSS (`/proc` VmHWM, Linux-only) — so feature work
+sees what it costs as it lands. Set `METRICS_OUT=<file>` to also write
+the numbers as JSON for run-over-run comparison.
+
+**Nested-hashkey fixture.** Rows under `fixtures/nested-*.json` run
+against the committed workspace at `nested-fixture/` (per-row `root`,
+same mechanism as re-export below) and exercise the structural typing
+tiers: the mixed drill `$obj->{users}->[0]->{name}` (type-at), imported
+array-literal tuples (`Sequence<…>` hover), and `$row->{name}` → column
+def (definition + references, cross-file). The two xfail rows pin the
+known gap: drill HOPS through an imported literal (`my $db =
+$config->{db}` where `cfg()` is imported) don't type yet — assignment
+chain typing runs at build, index-less.
+
 **Re-export fixture.** Three rows (`fixtures/reexport.json`, capability `definition` — folded under `definition` in `--list`) run against a small **committed, self-contained workspace** at `reexport-fixture/` instead of the snapshot substrate, via a per-row `root`. They flex the transitive export-surface feature: `goto-def` from a consumer of a re-exporter resolves to the *original* sub through both re-export forms — static splice (`our @EXPORT = (@RexBase::EXPORT)`) and loop-push (`push @EXPORT, @{"${m}::EXPORT"}`). The harness groups rows by `root` and runs one `--batch` per root.
 
 ## Already in corpus

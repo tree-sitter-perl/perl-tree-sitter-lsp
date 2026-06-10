@@ -1,0 +1,15 @@
+{
+  "capability": "references",
+  "comment": "Tier 1 references: the row-key access and the column def are one reference set, cross-file.",
+  "rows": [
+    {
+      "id": "nested-row-key-references",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 22,
+      "col": 17,
+      "status": "gold",
+      "expect": { "all": ["\"file\":\"NestedRow.pm\"", "\"file\":\"main.pl\""] }
+    }
+  ]
+}

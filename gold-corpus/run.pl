@@ -42,6 +42,7 @@ use File::Spec;
 use JSON::PP;
 use POSIX qw(WIFSIGNALED);
 use File::Temp qw(tempfile);
+use Time::HiRes qw(time);
 
 my $bin    = $ENV{BIN}    || File::Spec->rel2abs("$RealBin/../target/release/perl-lsp");
 my $corpus = $ENV{CORPUS} || "$RealBin/local/lib/perl5";
@@ -143,6 +144,8 @@ sub run_batch {
     # request delivery non-blocking, so we only ever read on the parent side.
     my ($tfh, $tpath) = tempfile('corpus-batch-XXXXXX', TMPDIR => 1, UNLINK => 1);
     print $tfh $jsonl; close $tfh;
+    my @cpu0 = times();           # children utime/stime baseline (slots 2,3)
+    my $t0 = time();
     my $pid = open(my $out, '-|');
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
@@ -151,19 +154,55 @@ sub run_batch {
         $ENV{PERL5LIB} = $p5lib if defined $p5lib;
         exec($bin, '--batch', $root) or exit 127;
     }
-    local $/; my $resp = <$out> // ''; close($out);
+    # Read line-by-line (the binary flushes per response): each arrival
+    # delta is that query's processing cost; the first arrival also
+    # carries startup (workspace index + cache warm). Peak RSS is
+    # sampled from /proc after each line — the last sample before the
+    # child exits is its high-water mark (Linux-only; silently absent
+    # elsewhere).
     my %by_id;
-    for my $line (split /\n/, $resp) {
+    my $met = { wall_s => 0, first_s => undef, per_id => {}, vm_hwm_kb => 0,
+                cpu_user_s => 0, cpu_sys_s => 0, root => $root };
+    my $prev = $t0;
+    while (my $line = <$out>) {
+        my $now = time();
         next unless $line =~ /\S/;
         my $r = eval { decode_json($line) } or next;
-        $by_id{$r->{id}} = $r if defined $r->{id};
+        next unless defined $r->{id};
+        $by_id{$r->{id}} = $r;
+        if (defined $met->{first_s}) {
+            $met->{per_id}{$r->{id}} = $now - $prev;
+        } else {
+            # The first arrival is dominated by startup (workspace index
+            # + cache warm) — report it as startup, not as the first
+            # row's capability cost.
+            $met->{first_s} = $now - $t0;
+        }
+        $prev = $now;
+        if (open(my $st, '<', "/proc/$pid/status")) {
+            while (my $l = <$st>) {
+                $met->{vm_hwm_kb} = $1 if $l =~ /^VmHWM:\s+(\d+)/;
+            }
+            close($st);
+        }
     }
-    return \%by_id;
+    close($out);
+    my @cpu1 = times();
+    $met->{wall_s}     = time() - $t0;
+    $met->{cpu_user_s} = $cpu1[2] - $cpu0[2];
+    $met->{cpu_sys_s}  = $cpu1[3] - $cpu0[3];
+    return wantarray ? (\%by_id, $met) : \%by_id;
 }
 
 # ---- --emit: canonical output for one ad-hoc query (fixture authoring) ----
 if (@ARGV && $ARGV[0] eq '--emit') {
     shift @ARGV;
+    my $emit_root;
+    if (@ARGV && $ARGV[0] eq '--root') {
+        shift @ARGV;
+        $emit_root = shift @ARGV;
+        $emit_root = File::Spec->rel2abs("$RealBin/../$emit_root") unless $emit_root =~ m{^/};
+    }
     my ($cap, @rest) = @ARGV;
     my $spec = $CAP{$cap} or die "unknown capability: $cap\n";
     # line/col arrive as ARGV strings; numify so encode_json emits JSON numbers
@@ -171,7 +210,8 @@ if (@ARGV && $ARGV[0] eq '--emit') {
     my $row = $spec->{check} ? {}
             : $spec->{qarg}  ? { query => $rest[0] }
             :                  { file => $rest[0], line => ($rest[1] // 0) + 0, col => ($rest[2] // 0) + 0, newname => $rest[3] };
-    my $resp = run_batch([ batch_req($cap, $spec, $row, 'emit') ]);
+    my $req = batch_req($cap, $spec, $row, 'emit', $emit_root);
+    my $resp = run_batch([ $req ], $emit_root, $emit_root ? p5lib_for($emit_root) : undef);
     my $r = $resp->{emit};
     if    (!$r)        { print "<<CRASH: process aborted>>\n"; }
     elsif (!$r->{ok})  { print "<<ERR: $r->{err}>>\n"; }
@@ -211,9 +251,11 @@ for my $r (@rows) {
     push @{ $groups{$root} }, batch_req($r->{capability}, $spec, $r, $key, $root);
 }
 my $resp = {};
+my @batch_metrics;
 for my $root (sort keys %groups) {
-    my $by = run_batch($groups{$root}, $root, p5lib_for($root));
+    my ($by, $met) = run_batch($groups{$root}, $root, p5lib_for($root));
     %$resp = (%$resp, %$by);
+    push @batch_metrics, $met;
 }
 
 my (@fail, @xpass, @crash, @skip, @prov); my ($pass, $xfail) = (0, 0);
@@ -250,4 +292,58 @@ print "\n** XPASS (known gap fixed — update fixture):\n", map { "  - $_\n" } @
 print "\nprovisional misses:\n",                         map { "  - $_\n" } @prov  if @prov;
 print "\nskipped:\n",                                    map { "  - $_\n" } @skip  if @skip;
 print "\n";
+
+# ---- cost report: what do features cost? ----
+# Per-capability wall time (each response's arrival delta attributed to
+# its row's capability), per-root startup (first-response latency,
+# dominated by workspace index + cache warm), child CPU, and peak RSS.
+# Written to $METRICS_OUT as JSON when set, for run-over-run comparison.
+{
+    my %by_cap;
+    for my $met (@batch_metrics) {
+        while (my ($id, $dt) = each %{ $met->{per_id} }) {
+            my ($cap) = $id =~ m{^([^/]+)/};
+            $cap //= $id;
+            push @{ $by_cap{$cap} }, $dt;
+        }
+    }
+    my ($cpu_u, $cpu_s, $hwm, $wall) = (0, 0, 0, 0);
+    for my $met (@batch_metrics) {
+        $cpu_u += $met->{cpu_user_s};
+        $cpu_s += $met->{cpu_sys_s};
+        $wall  += $met->{wall_s};
+        $hwm = $met->{vm_hwm_kb} if $met->{vm_hwm_kb} > $hwm;
+    }
+    print "Cost report\n";
+    printf "  %-20s %4s %9s %8s %8s\n", 'capability', 'n', 'total ms', 'mean ms', 'max ms';
+    for my $cap (sort { _sum($by_cap{$b}) <=> _sum($by_cap{$a}) } keys %by_cap) {
+        my @d = @{ $by_cap{$cap} };
+        my $tot = _sum(\@d);
+        my ($max) = sort { $b <=> $a } @d;
+        printf "  %-20s %4d %9.1f %8.1f %8.1f\n",
+            $cap, scalar @d, $tot * 1000, $tot * 1000 / @d, $max * 1000;
+    }
+    for my $met (@batch_metrics) {
+        printf "  startup %-46s %8.1f ms\n",
+            _bn($met->{root}), ($met->{first_s} // 0) * 1000;
+    }
+    printf "  wall %.2fs   cpu user %.2fs sys %.2fs   peak rss %.1f MB\n\n",
+        $wall, $cpu_u, $cpu_s, $hwm / 1024;
+    if (my $mo = $ENV{METRICS_OUT}) {
+        my %caps = map {
+            my @d = @{ $by_cap{$_} };
+            ($_ => { n => scalar @d, total_ms => _sum(\@d) * 1000 });
+        } keys %by_cap;
+        if (open(my $fh, '>', $mo)) {
+            print $fh JSON::PP->new->canonical->encode({
+                wall_s => $wall, cpu_user_s => $cpu_u, cpu_sys_s => $cpu_s,
+                peak_rss_kb => $hwm, capabilities => \%caps,
+                startup_ms => { map { _bn($_->{root}) => ($_->{first_s} // 0) * 1000 } @batch_metrics },
+            });
+            close($fh);
+        }
+    }
+}
+sub _sum { my $t = 0; $t += $_ for @{ $_[0] }; $t }
+
 exit((@fail || @crash || @xpass) ? 1 : 0);

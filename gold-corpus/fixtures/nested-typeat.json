@@ -1,0 +1,24 @@
+{
+  "capability": "type-at",
+  "comment": "Nested hash-key intelligence (prompt-nested-hashkey.md): in-file structural typing. The mixed drill $obj->{users}->[0]->{name} chains HashWithKeys narrowing → Sequence element projection → HashWithKeys narrowing.",
+  "rows": [
+    {
+      "id": "nested-mixed-drill-string",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 16,
+      "col": 4,
+      "status": "gold",
+      "expect": { "all": ["String"] }
+    },
+    {
+      "id": "nested-mixed-drill-numeric",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 17,
+      "col": 4,
+      "status": "gold",
+      "expect": { "all": ["Numeric"] }
+    }
+  ]
+}

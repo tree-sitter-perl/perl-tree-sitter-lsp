@@ -1,0 +1,33 @@
+{
+  "capability": "hover",
+  "comment": "Tier 3 array tuples travel cross-file ($items from an imported literal). The drill HOPS ($db = $config->{db} where cfg() is imported) do not type yet: assignment chain typing runs at build, index-less — xfail until enrichment re-runs the chain pass.",
+  "rows": [
+    {
+      "id": "nested-imported-sequence",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 13,
+      "col": 4,
+      "status": "gold",
+      "expect": { "all": ["Sequence<String"] }
+    },
+    {
+      "id": "nested-crossfile-drill-host",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 9,
+      "col": 4,
+      "status": "xfail",
+      "expect": { "all": ["String"] }
+    },
+    {
+      "id": "nested-crossfile-drill-port",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 10,
+      "col": 4,
+      "status": "xfail",
+      "expect": { "all": ["Numeric"] }
+    }
+  ]
+}
