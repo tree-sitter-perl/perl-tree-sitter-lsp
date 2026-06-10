@@ -16,28 +16,35 @@ ctor key ↔ internal `$self->{name}`.
   replacement can no longer eat the sigil.
 - `:reader` call sites are included in the group's edit set.
 
+## Landed (the union, June 2026 overnight session)
+
+1–4 of the original gaps are DONE: `ResolvedTarget::Group` rides
+`resolve_symbol` (reader-call cursors included), `resolve::group_refs`
+walks the group cross-file for both references and rename (backend +
+both CLI mirrors), in-file `find_references` unions (highlights /
+linked-editing inherit), and Moo `has` attrs join via the pair
+signature (accessor Method + ctor HashKeyDef sharing name, package,
+and selection span). Consumer files' ctor keys exist now too:
+`Gate::StrictOrDefer` emits `owner: None` candidates when the class
+isn't local, and `refs_to`'s key arm / goto-def re-derive the owner at
+query time (`FileAnalysis::deferred_hash_key_owner`) — the
+receiver-gated discipline applied to hash keys.
+
 ## Remaining gaps
 
-1. **Cursor ON a reader call** (`$p->x` → rename): resolves as
-   `RenameKind::Method` and takes the cross-file `refs_to` path, which
-   renames reader calls + the decl token (text-correct now) but misses
-   ctor keys and field body uses. Fix direction: `resolve_symbol` (or
-   `rename_kind_at`) should recognize the reader projection and answer
-   with the field group; needs a decision on how a group rides
-   `TargetRef` for the cross-file walk.
-2. **Cross-file ctor keys**: `Point->new(x => …)` in *another* file.
-   The group rename is the single-file primitive; cross-file fan-out
-   for field groups isn't wired (`TargetKind::HashKeyOfSub` walks exist
-   for references — rename policy currently says hash keys are
-   in-file-only, which is right for plain keys but wrong for
-   `:param`-derived ones).
-3. **Moo `has` has the same holes** (probed): decl rename misses the
-   ctor key; ctor-key rename renames only itself; internal
-   `$self->{name}` accesses aren't tied. The group concept extends —
-   Moo's group = accessor Method + ctor HashKeyDef + Class-owned hash
-   keys, no sigil variable — but its members differ enough that
-   `field_group_at` shouldn't be force-fit; add a Moo group constructor
-   feeding the same `rename_field_group`-style union.
-4. **References aren't unioned**: find-references on the ctor key lists
-   key accesses only, not field uses (and vice versa). Same group, read
-   side.
+1. **Internal `$self->{name}` keys aren't in the group** —
+   CONTENTIOUS, deliberately deferred: collecting them via
+   `HashKeyOwner::found_by` broadening would also admit *other subs'*
+   same-named arg keys (`$obj->search(name => …)`) into the attr's
+   rename. Needs a strict-Class-owner membership design first.
+2. **Consumer-side cursor, class elsewhere**: rename/references from a
+   ctor key or accessor call in a file that only `use`s the class falls
+   back to narrower behavior (the group is detected against the local
+   analysis only). Fix direction: in `resolve_symbol`, on a deferred
+   key / cross-file accessor, fetch the class's cached analysis via
+   `CrossFileLookup` and mint the group from THERE (its variable spans
+   become `RefLocation`s in the class file).
+3. **`:writer` (`set_x`) and Moo `predicate`/`clearer`/custom-named
+   accessors** aren't group members — their names differ from the attr;
+   tying them means a name-mapping on the group (plugin-owned for Moo
+   per the accessor-vocabulary split).
