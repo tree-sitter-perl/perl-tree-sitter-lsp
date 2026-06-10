@@ -283,6 +283,12 @@ pub enum TargetKind {
     HashKeyOfSub { package: Option<String>, name: String },
     /// A hash key owned by a class (Moo `has` slots, DBIC columns on a Result class).
     HashKeyOfClass(String),
+    /// An attr's internal hash slot (`$self->{attr}` — or any
+    /// `$obj->{attr}` poke; Perl culture is promiscuous about reaching
+    /// into the hashref). STRICT `HashKeyOwner::Class` matching, never
+    /// `found_by` — broadening would leak other subs' same-named arg
+    /// keys into the projection group this member serves.
+    InternalHashKey { class: String },
     /// A `Handler` symbol registered on a class (Mojo events, Dancer
     /// routes, etc.). Both the definition (`Handler` symbol) and call
     /// sites (`DispatchCall` refs) match; stacked registrations all
@@ -344,6 +350,15 @@ fn group_from_projections(
                     package: Some(p.class.clone()),
                     name: "new".to_string(),
                 },
+            ),
+            rename: MemberRename::Bare,
+        });
+    }
+    if p.has_internal {
+        members.push(GroupMember {
+            target: TargetRef::new(
+                p.bare.clone(),
+                TargetKind::InternalHashKey { class: p.class.clone() },
             ),
             rename: MemberRename::Bare,
         });
@@ -604,6 +619,10 @@ fn symbol_defines_target(sym: &crate::file_analysis::Symbol, target: &TargetRef)
             &sym.detail,
             SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(n), .. } if n == wanted
         ),
+        // The slot's def is the group decl (the Method/HashKeyDef pair
+        // already collect it) — internal-key members contribute access
+        // sites only, no decl matching here.
+        TargetKind::InternalHashKey { .. } => false,
         TargetKind::Handler { owner, name: hname } => {
             sym.name == *hname
                 && matches!(
@@ -788,6 +807,19 @@ fn collect_from_analysis(
                 // local find_definition agree on the set.
                 let target_owner = HashKeyOwner::Class(wanted.clone());
                 matches!(owner, Some(o) if o.found_by(&target_owner))
+            }
+            (TargetKind::InternalHashKey { class },
+             RefKind::HashKeyAccess { owner, .. }) => {
+                // STRICT Class-owner shape (see the kind's doc), widened
+                // only by ancestry: a subclass poking `$self->{attr}` owns
+                // the access as ITS class — `Gadget isa Widget` ties it to
+                // Widget's attr. Never `found_by` (Sub-owned arg keys stay
+                // out).
+                matches!(
+                    owner,
+                    Some(HashKeyOwner::Class(c))
+                        if c == class || analysis.class_isa(c, class, module_index)
+                )
             }
             (TargetKind::Handler { owner, name: hname },
              RefKind::DispatchCall { owner: ref_owner, .. }) => {

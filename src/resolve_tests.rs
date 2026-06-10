@@ -2898,3 +2898,51 @@ fn test_group_rename_rederives_mapped_members_cross_file() {
         user_edits,
     );
 }
+
+/// Internal slot pokes join the group cross-file: a subclass (or any
+/// promiscuous consumer) reaching into `$self->{size}` renames with the
+/// attr — under STRICT Class-owner matching, so another sub's
+/// `(size => 1)` arg keys in unrelated classes stay out.
+#[test]
+fn test_internal_slot_pokes_join_group_cross_file() {
+    let store = FileStore::new();
+    let class_path = PathBuf::from("/tmp/grp_slot_widget.pm");
+    let sub_path = PathBuf::from("/tmp/grp_slot_subclass.pm");
+    store.insert_workspace(
+        class_path.clone(),
+        parse("package Widget;\nuse Moo;\nhas size => (is => 'rw');\n1;\n"),
+    );
+    // Subclass pokes the parent's slot directly — classic promiscuous Perl.
+    store.insert_workspace(
+        sub_path.clone(),
+        parse("package Gadget;\nuse Moo;\nextends 'Widget';\nsub poke { my ($self) = @_; return $self->{size}; }\n1;\n"),
+    );
+
+    let class_fa = store.workspace_raw().get(&class_path).unwrap().value().clone();
+    let resolved = resolve_symbol(&class_fa, tree_sitter::Point { row: 2, column: 4 }, None)
+        .expect("attr decl resolves");
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+        panic!("expected Group, got {:?}", resolved);
+    };
+    assert!(
+        members.iter().any(|m| matches!(m.target.kind, TargetKind::InternalHashKey { .. })),
+        "internal-key member minted: {:?}",
+        members,
+    );
+    let edits = group_rename_edits(
+        &store,
+        None,
+        &FileKey::Path(class_path.clone()),
+        &local_spans,
+        &pinned_spans,
+        &members,
+        "extent",
+    );
+    assert!(
+        edits.iter().any(|(l, t)| {
+            matches!(&l.key, FileKey::Path(p) if p == &sub_path) && t == "extent"
+        }),
+        "subclass slot poke renamed; edits: {:?}",
+        edits,
+    );
+}

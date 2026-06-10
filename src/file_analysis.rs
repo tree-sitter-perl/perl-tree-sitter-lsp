@@ -2282,6 +2282,9 @@ pub struct FieldProjections {
     pub bare: String,
     pub has_param: bool,
     pub has_reader: bool,
+    /// An `InternalKey` projection was minted (hash-backed repr) —
+    /// `$obj->{attr}` slot pokes join the group, cross-file included.
+    pub has_internal: bool,
     /// Origin-file variable spellings (decl + body uses), bare-adjusted.
     pub variable_spans: Vec<Span>,
     /// Plugin-declared, name-mapped members (`predicate => has_size`).
@@ -5320,11 +5323,17 @@ impl FileAnalysis {
                 _ => None,
             })
             .collect();
+        let has_internal = self.attr_projections.iter().any(|a| {
+            a.class == g.class
+                && a.attr == g.bare
+                && matches!(a.kind, AttrProjectionKind::InternalKey)
+        });
         FieldProjections {
             class: g.class,
             bare: g.bare,
             has_param: g.has_param,
             has_reader: g.has_reader,
+            has_internal,
             variable_spans,
             mapped,
         }
@@ -6095,6 +6104,26 @@ impl FileAnalysis {
         visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
     ) {
         self.for_each_ancestor_class_opt(class_name, module_index, false, visit)
+    }
+
+    /// `child isa ancestor`? — the MRO walk (local ∪ cross-file parents)
+    /// as a predicate. `true` when `child == ancestor` too.
+    pub fn class_isa(
+        &self,
+        child: &str,
+        ancestor: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> bool {
+        let mut found = false;
+        self.for_each_ancestor_class(child, module_index, |c| {
+            if c == ancestor {
+                found = true;
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        found
     }
 
     /// MRO walk shared by every inheritance consumer. `skip_self`: when true,
