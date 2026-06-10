@@ -43,6 +43,7 @@ use JSON::PP;
 use POSIX qw(WIFSIGNALED);
 use File::Temp qw(tempfile);
 use Time::HiRes qw(time);
+binmode STDOUT, ':utf8';    # responses may carry non-ASCII once decoded
 
 my $bin    = $ENV{BIN}    || File::Spec->rel2abs("$RealBin/../target/release/perl-lsp");
 my $corpus = $ENV{CORPUS} || "$RealBin/local/lib/perl5";
@@ -87,7 +88,11 @@ sub _text_bn { my $s = shift; $s =~ s{/\S*?/([^/\s":]+\.(?:pm|pl|t|pod))}{$1}g; 
 sub normalize {
     my ($cap, $raw) = @_;
     if ($JSON_CAP{$cap}) {
-        my $data = eval { decode_json($raw) };
+        # $raw is already a decoded character string (the batch wrapper was
+        # byte-decoded once); decode_json would croak on any non-ASCII char
+        # and silently drop us to the text fallback — where the no-space
+        # canonical assertions vacuously pass. Character-mode decode only.
+        my $data = eval { JSON::PP->new->decode($raw) };
         return _text_bn($raw) unless defined $data;
         my $walk; $walk = sub {
             my $r = ref $_[0];
