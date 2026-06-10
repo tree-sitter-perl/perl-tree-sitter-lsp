@@ -465,6 +465,14 @@ fn build_with_plugins_inner(
     // owner class is the chain receiver's type, unknowable until then.
     b.emit_chained_hash_key_refs(&chain_idx);
 
+    // Post-pass: upgrade Variable-owned hash-key derefs whose variable's
+    // type settled to a class DURING the fold (`my $row = $rs->find(1);
+    // $row->{name}` — the RowOf projection lands mid-fold, after
+    // resolve_hash_key_owners ran). A Class owner routes the key to the
+    // class's defs (DBIC columns, Moo slots); variables without a class
+    // type keep their lexical grouping.
+    b.upgrade_variable_hash_key_owners();
+
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
     b.resolve_tail_pod_docs();
 
@@ -11962,6 +11970,39 @@ impl<'a> Builder<'a> {
     /// to either emits nothing, so a should-miss stays a miss rather
     /// than a wrong-owner latch.
     ///
+    /// Post-fold owner upgrade for variable derefs: `$row->{name}` where
+    /// `$row`'s class only settled during the worklist fold (RowOf
+    /// projections, chain assignments). `resolve_hash_key_owners` ran
+    /// pre-fold and could only stamp the lexical `Variable` owner; this
+    /// re-asks the canonical bag and promotes to `Class(C)` when the
+    /// variable's type yields a class. Untyped variables keep their
+    /// lexical grouping — plain `%config` hashes are untouched.
+    fn upgrade_variable_hash_key_owners(&mut self) {
+        let mut upgrades: Vec<(usize, HashKeyOwner)> = Vec::new();
+        for (i, r) in self.refs.iter().enumerate() {
+            let RefKind::HashKeyAccess {
+                ref var_text,
+                owner: Some(HashKeyOwner::Variable { .. }),
+            } = r.kind
+            else {
+                continue;
+            };
+            if !var_text.starts_with('$') {
+                continue;
+            }
+            let Some(t) = self.bag_query_variable(var_text, r.scope, r.span.start) else {
+                continue;
+            };
+            let Some(class) = t.class_name() else { continue };
+            upgrades.push((i, HashKeyOwner::Class(class.to_string())));
+        }
+        for (i, o) in upgrades {
+            if let RefKind::HashKeyAccess { ref mut owner, .. } = self.refs[i].kind {
+                *owner = Some(o);
+            }
+        }
+    }
+
     /// Runs post-fold (after `emit_method_call_arg_keys`) so
     /// `invocant_type_at_node` answers against the canonical bag.
     fn emit_chained_hash_key_refs(&mut self, idx: &ChainTypingIndex<'a>) {

@@ -979,3 +979,72 @@ sub action {
     // `greet` is declared on `sub greet` (row 4, 0-based).
     assert_eq!(def.unwrap().start.row, 4);
 }
+
+// ---- Tier 1 nested-hashkey: direct `$row->{col}` deref ----
+
+/// `$row->{name}` on a typed row (DBIC HRI shape): the deref's hash key
+/// resolves to the column def, same as `$row->name` does. The row's
+/// class comes from the RowOf projection (`$rs->find` →
+/// ClassName(Schema::Result::Users)); the key's owner must land on
+/// `Class(row)` so goto-def / references reach the add_columns def.
+#[test]
+fn row_hashref_deref_resolves_column() {
+    let src = format!(
+        "{}{}",
+        USERS_RESULT,
+        "package main;
+my $rs = $schema->resultset('Schema::Result::Users');
+my $row = $rs->find(1);
+my $n = $row->{name};
+"
+    );
+    let (fa, _tree) = parse_with_tree(&src);
+    let key = point_at(&src, "name};");
+    let def = fa.find_definition(key, None);
+    assert!(
+        def.is_some(),
+        "$row->{{name}} resolves to the column def; ref at cursor: {:?}",
+        fa.ref_at(key),
+    );
+    assert_eq!(def.unwrap().start.row, NAME_COL_DEF_ROW, "lands on the name column");
+}
+
+/// The negative space of tier 1: a key that isn't a column resolves to
+/// nothing (no wrong-owner latch), and an untyped variable's deref keeps
+/// its lexical grouping (plain `%config` hashes are untouched by the
+/// post-fold owner upgrade).
+#[test]
+fn row_hashref_deref_negative_space() {
+    let src = format!(
+        "{}{}",
+        USERS_RESULT,
+        "package main;
+my $rs = $schema->resultset('Schema::Result::Users');
+my $row = $rs->find(1);
+my $x = $row->{not_a_column};
+my $plain = { adhoc => 1 };
+my $y = $plain->{adhoc};
+"
+    );
+    let (fa, _tree) = parse_with_tree(&src);
+    let bad = point_at(&src, "not_a_column}");
+    assert!(
+        fa.find_definition(bad, None).is_none(),
+        "non-column key stays unresolved",
+    );
+    // The plain hashref's key still resolves through its own literal
+    // (Variable/Sub-owned path untouched by the upgrade).
+    let adhoc = point_at(&src, "adhoc};");
+    let r = fa.ref_at(adhoc).expect("adhoc key ref");
+    assert!(
+        !matches!(
+            r.kind,
+            crate::file_analysis::RefKind::HashKeyAccess {
+                owner: Some(crate::file_analysis::HashKeyOwner::Class(_)),
+                ..
+            }
+        ),
+        "untyped hashref deref not promoted to a class owner: {:?}",
+        r.kind,
+    );
+}
