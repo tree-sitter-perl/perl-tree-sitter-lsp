@@ -645,7 +645,18 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                         first_param_class = Some(package.clone())
                     }
                     b @ InferredType::BrandedRoute { .. } => branded = Some(b.clone()),
-                    other => plain_type = Some(other.clone()),
+                    // Latest wins UNLESS the standing answer subsumes the
+                    // newcomer — structure dominates rep (`HashWithKeys` is
+                    // not downgraded by a deref's re-derived `HashRef`),
+                    // mirroring the class-dominates-rep rule below.
+                    other => {
+                        if !plain_type
+                            .as_ref()
+                            .is_some_and(|have| have.subsumes_narrowing(other))
+                        {
+                            plain_type = Some(other.clone());
+                        }
+                    }
                 },
                 WitnessPayload::Observation(obs) => match obs {
                     TypeObservation::ClassAssertion(name) => {

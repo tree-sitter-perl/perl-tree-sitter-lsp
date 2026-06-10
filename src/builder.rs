@@ -2259,17 +2259,26 @@ impl<'a> Builder<'a> {
             }
             "hash_element_expression" => {
                 // A hash element's VALUE type is independent of the
-                // container's class — never `$self`'s class. If a typed
-                // write to this slot was recorded (`SlotType{class,key}`,
-                // seeded at the write site, agreed by `SlotTypeFold`),
-                // that is the honest answer; otherwise untyped.
+                // container's class — never `$self`'s class.
                 let base = node.named_child(0)?;
-                let class = self.invocant_type_at_node(base)?.class_name()?.to_string();
+                let base_ty = self.invocant_type_at_node(base)?;
                 let key_node = node.child_by_field_name("key")?;
                 let (key, is_dynamic) = self.extract_key_text(key_node)?;
                 if is_dynamic {
                     return None;
                 }
+                // Structurally-typed hash: the literal told us the per-key
+                // type — `$config->{db}` narrows to it, and nesting recurses
+                // for free (the inner literal's HashWithKeys rides in the
+                // value slot).
+                if let Some(v) = base_ty.key_value_type(&key) {
+                    return v.cloned();
+                }
+                // Class-typed base: a typed write to this slot
+                // (`SlotType{class,key}`, seeded at the write site, agreed
+                // by `SlotTypeFold`) is the honest answer; otherwise
+                // untyped.
+                let class = base_ty.class_name()?.to_string();
                 self.bag_query_attachment(&crate::witnesses::WitnessAttachment::SlotType {
                     class,
                     key,
@@ -6116,6 +6125,58 @@ impl<'a> Builder<'a> {
     ///   resolved type. Registry materialization chases at query
     ///   time. Ternaries Edge to their own `Expr(span)` since the
     ///   per-arm witnesses live there.
+    /// Type a hash literal structurally: literal keys carry their
+    /// values' types (`{ host => 'x' }` →
+    /// `HashWithKeys{[("host", String)], closed}`). A spread element
+    /// (`%$other`, `%other`) or a dynamic key flips `open` — the key
+    /// set is no longer exhaustive, so consumers can't treat unknown
+    /// keys as misses. No literal keys at all → plain `HashRef`
+    /// (back-compat: `{}` and fully-dynamic hashes keep today's type).
+    fn hash_literal_type(&mut self, node: Node<'a>) -> InferredType {
+        // A spread occupies ONE list slot but flattens to an even count
+        // at runtime, so pairing must skip it as a unit — `pair_nodes`'
+        // strict k/v alternation would mispair everything after it.
+        let list = node
+            .named_child(0)
+            .filter(|c| c.kind() == "list_expression")
+            .unwrap_or(node);
+        let mut flat: Vec<Node<'a>> = Vec::new();
+        crate::cst::flatten_list(list, &mut flat);
+        let named: Vec<Node<'a>> = flat.into_iter().filter(|n| n.is_named()).collect();
+
+        let mut keys: Vec<(String, Option<Box<InferredType>>)> = Vec::new();
+        let mut open = false;
+        let mut i = 0;
+        while i < named.len() {
+            let elem = named[i];
+            if matches!(elem.kind(), "hash" | "hash_deref_expression" | "container_variable") {
+                open = true;
+                i += 1;
+                continue;
+            }
+            let Some(v_node) = named.get(i + 1).copied() else {
+                open = true;
+                break;
+            };
+            i += 2;
+            let Some((key, is_dynamic)) = self.extract_key_text(elem) else {
+                open = true;
+                continue;
+            };
+            if is_dynamic {
+                open = true;
+                continue;
+            }
+            self.emit_expr_witness(v_node);
+            let vt = self.bag_query_expr_span(node_to_span(v_node));
+            keys.push((key, vt.map(Box::new)));
+        }
+        if keys.is_empty() && !open {
+            return InferredType::HashRef;
+        }
+        InferredType::HashWithKeys { keys, open }
+    }
+
     fn expr_payload(&mut self, node: Node<'a>) -> Option<crate::witnesses::WitnessPayload> {
         use crate::witnesses::{RefIdx, WitnessAttachment, WitnessPayload};
         match node.kind() {
@@ -6125,7 +6186,7 @@ impl<'a> Builder<'a> {
             }
             "number" => Some(WitnessPayload::InferredType(InferredType::Numeric)),
             "anonymous_hash_expression" => {
-                Some(WitnessPayload::InferredType(InferredType::HashRef))
+                Some(WitnessPayload::InferredType(self.hash_literal_type(node)))
             }
             "anonymous_array_expression" => {
                 Some(WitnessPayload::InferredType(InferredType::ArrayRef))
@@ -12927,7 +12988,7 @@ impl<'a> Builder<'a> {
             .filter(|b| {
                 return_types
                     .get(bare_name(&b.func_name))
-                    .map_or(false, |t| *t == InferredType::HashRef)
+                    .map_or(false, |t| t.is_hash_shaped())
             })
             .map(|b| (b.variable.as_str(), bare_name(&b.func_name).to_string()))
             .collect();

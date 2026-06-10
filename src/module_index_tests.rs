@@ -195,9 +195,9 @@ sub make_obj {
         Some(parse_source_to_cached(src, "Config::DB")),
     );
 
-    assert_eq!(
-        idx.get_return_type_cached("get_config"),
-        Some(InferredType::HashRef)
+    assert!(
+        idx.get_return_type_cached("get_config").is_some_and(|t| t.is_hash_shaped()),
+        "hash-shaped",
     );
     assert_eq!(
         idx.get_return_type_cached("make_obj"),

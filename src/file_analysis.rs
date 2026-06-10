@@ -874,6 +874,19 @@ pub enum InferredType {
         controller: Option<String>,
         stash: Vec<(String, String)>,
     },
+    /// `{ host => 'x', port => 5432 }` — a hash literal with literal
+    /// keys, each carrying its value's type when inferable (`None` =
+    /// key present, value type unknown). `open` = a spread (`%$other`)
+    /// or dynamic key makes the key set open-ended, so an unknown key
+    /// is not a claimable miss. `->{key}` narrows via
+    /// [`InferredType::key_value_type`]; nesting recurses naturally
+    /// (the value's own `HashWithKeys` rides in the box). Kept at the
+    /// END for bincode variant-index stability (bump
+    /// `EXTRACT_VERSION`).
+    HashWithKeys {
+        keys: Vec<(String, Option<Box<InferredType>>)>,
+        open: bool,
+    },
 }
 
 /// Concrete parametric flavors + type-level operators. Each
@@ -1008,6 +1021,32 @@ impl InferredType {
         }
     }
 
+    /// `->{key}` narrowing on a structurally-typed hash (rule #10: ask
+    /// the value). `Some(Some(t))` = key present with a known value
+    /// type; `Some(None)` = key present, value type unknown; `None` =
+    /// not a key of this value (or not a keyed hash at all). Closed
+    /// shapes answer `None` for unknown keys; open shapes (spread)
+    /// also answer `None` — the caller can't claim a miss either way,
+    /// the distinction is for future diagnostics.
+    /// Hash-shaped rep, regardless of key knowledge — the predicate
+    /// every "is this a hashref" gate asks instead of `== HashRef`.
+    pub fn is_hash_shaped(&self) -> bool {
+        matches!(
+            self,
+            InferredType::HashRef | InferredType::HashWithKeys { .. }
+        )
+    }
+
+    pub fn key_value_type(&self, key: &str) -> Option<Option<&InferredType>> {
+        match self {
+            InferredType::HashWithKeys { keys, .. } => keys
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, t)| t.as_deref()),
+            _ => None,
+        }
+    }
+
     /// Read the inherited route default for `key` from a branded
     /// route value, where `controller` is a distinguished key and
     /// everything else lives in the stash. `None` for non-route
@@ -1136,6 +1175,15 @@ impl InferredType {
                 InferredType::BrandedRoute { controller: hc, stash: hs, .. },
                 InferredType::BrandedRoute { controller: wc, stash: ws, .. },
             ) => (wc.is_none() || hc.is_some()) && ws.len() <= hs.len(),
+            // Structure dominates rep: a keyed hash is strictly more
+            // informative than the bare `HashRef` a deref-narrowing
+            // observation re-derives. Two keyed hashes only subsume on
+            // equality (a genuine reassignment with different keys must
+            // win as latest).
+            (InferredType::HashWithKeys { .. }, InferredType::HashRef) => true,
+            (a @ InferredType::HashWithKeys { .. }, b @ InferredType::HashWithKeys { .. }) => {
+                a == b
+            }
             // Unit-shape variants subsume themselves; mismatched
             // discriminants don't subsume.
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
@@ -1206,14 +1254,19 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
     if return_types.iter().all(|t| t == first) {
         return Some(first.clone());
     }
-    // Object subsumes HashRef: if some returns are Object(X) and others are HashRef,
-    // the Object wins (overloaded hash access is common in Perl).
+    // All arms hash-shaped but structurally different (`{a=>1}` vs
+    // `{b=>2}`) → degrade to the coarse HashRef rather than Unknown.
+    if return_types.iter().all(|t| t.is_hash_shaped()) {
+        return Some(InferredType::HashRef);
+    }
+    // Object subsumes HashRef: if some returns are Object(X) and others are
+    // hash-shaped, the Object wins (overloaded hash access is common in Perl).
     let mut object = None;
     for t in return_types {
         if t.is_object() {
             object = Some(t.clone());
-        } else if *t != InferredType::HashRef {
-            // Non-HashRef, non-Object disagreement → Unknown
+        } else if !t.is_hash_shaped() {
+            // Non-hash, non-Object disagreement → Unknown
             return None;
         }
     }
@@ -8170,6 +8223,9 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
         InferredType::ClassName(name) => format!("Object:{}", name),
         InferredType::FirstParam { package } => format!("Object:{}", package),
         InferredType::HashRef => "HashRef".to_string(),
+        // Structurally-typed hashes read as plain HashRef on the wire —
+        // the per-key detail drives narrowing, not display (yet).
+        InferredType::HashWithKeys { .. } => "HashRef".to_string(),
         InferredType::ArrayRef => "ArrayRef".to_string(),
         InferredType::CodeRef { .. } => "CodeRef".to_string(),
         InferredType::Regexp => "Regexp".to_string(),
@@ -8223,6 +8279,9 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
         InferredType::ClassName(name) => name.clone(),
         InferredType::FirstParam { package } => package.clone(),
         InferredType::HashRef => "HashRef".to_string(),
+        // Structurally-typed hashes read as plain HashRef on the wire —
+        // the per-key detail drives narrowing, not display (yet).
+        InferredType::HashWithKeys { .. } => "HashRef".to_string(),
         InferredType::ArrayRef => "ArrayRef".to_string(),
         InferredType::CodeRef { .. } => "CodeRef".to_string(),
         InferredType::Regexp => "Regexp".to_string(),

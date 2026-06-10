@@ -211,7 +211,7 @@ fn test_tree_context_method_on_function_call() {
     // Cursor at end of line 3 (after "->")
     let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), Point::new(3, 14), &fa);
     assert!(
-        matches!(ctx, Some(CursorContext::Method { ref invocant_type, .. }) if *invocant_type == Some(InferredType::HashRef)),
+        matches!(ctx, Some(CursorContext::Method { ref invocant_type, .. }) if invocant_type.as_ref().is_some_and(|t| t.is_hash_shaped())),
         "expected Method with HashRef type, got {:?}",
         ctx,
     );
@@ -282,7 +282,7 @@ $calc->get_self->get_config->{";
     let ctx = detect_cursor_context_tree(&tree, source.as_bytes(), cursor, &fa);
     assert!(
         matches!(ctx, Some(CursorContext::HashKey { ref owner_type, ref source_sub, .. })
-                if *owner_type == Some(InferredType::HashRef) && *source_sub == Some("get_config".to_string())),
+                if owner_type.as_ref().is_some_and(|t| t.is_hash_shaped()) && *source_sub == Some("get_config".to_string())),
         "expected HashKey with HashRef type and get_config source, got {:?}",
         ctx,
     );

@@ -1483,10 +1483,10 @@ my $host = $cfg->{host};
 
     let point = Point { row: 2, column: 20 };
     let t = fa.inferred_type_via_bag("$cfg", point);
-    assert_eq!(
+    assert!(
+        t.as_ref().is_some_and(|t| t.is_hash_shaped() && t.class_name().is_none()),
+        "without class evidence, $cfg is hash-shaped and classless: {:?}",
         t,
-        Some(InferredType::HashRef),
-        "without class evidence, $cfg is plain HashRef"
     );
 }
 
