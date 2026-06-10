@@ -25,10 +25,17 @@ crate / VS Code extension versions.
   `$h->@{…}`, `$h->%{…}`) switches it open.
 - **New diagnostic: `unknown-hash-key`** (hint severity). A read of a key a
   CLOSED literal shape doesn't define — the typo catcher — naming the known
-  keys. Fires only when the shape is the variable's whole story (never
-  reassigned, never escaped into a call/alias/invocant); calibrated to **zero
-  false positives across the 2,293-module substrate**. Design:
+  keys. Covers variables in both spellings AND expression bases
+  (`cfg()->{kye}`, `$obj->get_config->{kye}`); calibrated to **zero false
+  positives across the 2,293-module substrate**. Design:
   `docs/adr/structural-shapes.md`.
+- **Escapes widen temporally instead of suppressing.** Passing `$config` to a
+  call opens its shape AT that point — a typo read *before* the escape still
+  hints, instead of the whole variable going dark. Sequence tuples learn from
+  direct index writes too (slot retype, append at len).
+- **Batch/CI diagnostics match the editor.** `--check` and `--batch`
+  diagnostics now run the same cross-file enrichment as open buffers
+  (memoized per process), so imported shapes hint there too.
 
 ### Gold corpus
 
