@@ -51,7 +51,7 @@ marker, then the same fan-out). Cheap once children_index exists;
 the implementation-provider plumbing (capability, backend handler,
 CLI mirror, gold rows) is the bulk.
 
-### 2. Composer-mismatch diagnostic (docs/prompt-role-requires.md) — LANDED
+### 2. Composer-mismatch diagnostic — LANDED (`adr/role-contracts.md`)
 
 Same edge, opposite assertion: composer P of role R must provide
 every name in `R.role_requires`. Fully designed; blocked on nothing

@@ -2291,8 +2291,8 @@ pub struct FileAnalysis {
 
     /// Per-role `requires` lists: the method contracts a composing
     /// class must fulfill. The synthesized Method symbols carry the
-    /// in-role resolution; this record is the input for the future
-    /// composer-mismatch diagnostic (docs/prompt-role-requires.md).
+    /// in-role resolution; this record feeds the composer-mismatch
+    /// diagnostic (docs/adr/role-contracts.md).
     #[serde(default)]
     pub role_requires: HashMap<String, Vec<String>>,
 
@@ -6595,7 +6595,7 @@ impl FileAnalysis {
             .is_some_and(|uses| uses.iter().any(|u| ROLE_MAKERS.contains(&u.as_str())))
     }
 
-    /// The composer-mismatch check (docs/prompt-role-requires.md): for
+    /// The composer-mismatch check (docs/adr/role-contracts.md): for
     /// each local package with role parents, every name in each
     /// transitively-composed role's `role_requires` must be PROVIDED —
     /// a real def anywhere in the composer's MRO (local sub, inherited

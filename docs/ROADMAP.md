@@ -155,7 +155,7 @@ members:
    stays on the contract; references stay call-sites.
 2. **Composer-mismatch diagnostic** — LANDED. Flags composers that
    don't satisfy a role's `requires` set; decisions recorded in
-   `prompt-role-requires.md`.
+   `adr/role-contracts.md`.
 3. **Long-distance param typing** — call-site arg shapes type the
    callee's params (the Mojo plugin `$conf` case). Honesty gate:
    callers must be enumerable.

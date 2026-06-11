@@ -2747,7 +2747,7 @@ pub fn collect_diagnostics(
     }
 
     // 5f: role-requires-unfulfilled — the composer-mismatch contract
-    // check (docs/prompt-role-requires.md). WARNING, not HINT: Perl
+    // check (docs/adr/role-contracts.md). WARNING, not HINT: Perl
     // dies at composition time for this. Anchored to the `with 'Role'`
     // PackageRef inside the composing package; the package decl is the
     // fallback (e.g. the parent edge came from a raw `@ISA` push).
