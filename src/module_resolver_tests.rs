@@ -76,16 +76,15 @@ sub new {
     );
 
     let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
-    let reverse_index: DashMap<String, Vec<String>> = DashMap::new();
-    let bridges_index: DashMap<String, Vec<String>> = DashMap::new();
+    let edges = ModuleEdgeIndexes::new();
     let cached = Arc::new(CachedModule::new(PathBuf::from("/x/Demo/Has/Event.pm"), analysis));
 
     // Workspace-index style insert: a resolved module.
-    insert_into_cache(&cache, &reverse_index, &bridges_index, "Demo::Has::Event", Some(cached));
+    insert_into_cache(&cache, &edges, "Demo::Has::Event", Some(cached));
     assert!(cache.get("Demo::Has::Event").as_deref().unwrap().is_some());
 
     // On-demand resolver miss: `None`. Must NOT clobber the indexed copy.
-    insert_into_cache(&cache, &reverse_index, &bridges_index, "Demo::Has::Event", None);
+    insert_into_cache(&cache, &edges, "Demo::Has::Event", None);
     assert!(
         cache.get("Demo::Has::Event").as_deref().unwrap().is_some(),
         "a None on-demand miss clobbered an already-indexed module",
@@ -96,7 +95,7 @@ sub new {
     let tree2 = parser.parse(source, None).unwrap();
     let analysis2 = std::sync::Arc::new(crate::builder::build(&tree2, source.as_bytes()));
     let cached2 = Arc::new(CachedModule::new(PathBuf::from("/y/Demo/Has/Event.pm"), analysis2));
-    insert_into_cache(&cache, &reverse_index, &bridges_index, "Demo::Has::Event", Some(cached2));
+    insert_into_cache(&cache, &edges, "Demo::Has::Event", Some(cached2));
     assert_eq!(
         cache.get("Demo::Has::Event").as_deref().unwrap().as_ref().unwrap().path,
         PathBuf::from("/y/Demo/Has/Event.pm"),

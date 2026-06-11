@@ -107,8 +107,8 @@ fn test_find_exporters_uses_reverse_index() {
     let src = "package My::Mod;\nour @EXPORT = qw(foo);\nour @EXPORT_OK = qw(bar);\nsub foo {}\nsub bar {}\n1;";
     idx.insert_cache("My::Mod", Some(parse_source_to_cached(src, "My::Mod")));
 
-    assert!(idx.reverse_index.contains_key("foo"));
-    assert!(idx.reverse_index.contains_key("bar"));
+    assert!(!idx.modules_with_symbol("foo").is_empty());
+    assert!(!idx.modules_with_symbol("bar").is_empty());
     assert_eq!(idx.find_exporters("foo"), vec!["My::Mod"]);
     assert_eq!(idx.find_exporters("bar"), vec!["My::Mod"]);
 }
@@ -233,4 +233,68 @@ fn runtime_exporter_names_resolve_as_exporters() {
     assert_eq!(idx.find_exporters("sweeten"), vec!["Sugar::Sub"]);
     assert_eq!(idx.find_exporters("has_column"), vec!["Sugar::Moose"]);
     assert_eq!(idx.find_exporters("PositiveInt"), vec!["My::Types"]);
+}
+
+#[test]
+fn test_children_index_direct_and_transitive() {
+    let idx = ModuleIndex::new_for_test();
+
+    let role = "package My::Role;\nuse Moo::Role;\nrequires 'fetch';\n1;";
+    idx.insert_cache("My::Role", Some(parse_source_to_cached(role, "My::Role")));
+
+    // Direct composer.
+    let composer = "package My::Composer;\nuse Moo;\nwith 'My::Role';\nsub fetch { }\n1;";
+    idx.insert_cache("My::Composer", Some(parse_source_to_cached(composer, "My::Composer")));
+
+    // Role-composing-role, then a composer of THAT role — the
+    // transitive hop the descendant walk must reach.
+    let subrole = "package My::SubRole;\nuse Moo::Role;\nwith 'My::Role';\n1;";
+    idx.insert_cache("My::SubRole", Some(parse_source_to_cached(subrole, "My::SubRole")));
+    let deep = "package My::Deep;\nuse Moo;\nwith 'My::SubRole';\nsub fetch { }\n1;";
+    idx.insert_cache("My::Deep", Some(parse_source_to_cached(deep, "My::Deep")));
+
+    assert_eq!(
+        idx.modules_with_parent("My::Role"),
+        vec!["My::Composer", "My::SubRole"],
+        "direct children only",
+    );
+
+    let mut packages: Vec<String> = Vec::new();
+    idx.for_each_descendant_package("My::Role", |pkg, _cached| {
+        packages.push(pkg.to_string());
+        std::ops::ControlFlow::Continue(())
+    });
+    packages.sort();
+    assert_eq!(
+        packages,
+        vec!["My::Composer", "My::Deep", "My::SubRole"],
+        "descendant walk crosses the role-composing-role hop",
+    );
+}
+
+#[test]
+fn test_children_index_survives_warm_rebuild_and_purge() {
+    // B6: the children edge must be fed by the warm rebuild path, not
+    // just the insert path — and purged on re-registration.
+    let idx = ModuleIndex::new_for_test();
+    let child = "package Kid;\nuse parent 'Base::Class';\n1;";
+    let cached = parse_source_to_cached(child, "Kid");
+
+    // Simulate warm_cache: direct insert, indexes untouched.
+    idx.cache_raw().insert("Kid".to_string(), Some(cached));
+    assert!(idx.modules_with_parent("Base::Class").is_empty());
+
+    idx.rebuild_reverse_index_from_cache();
+    assert_eq!(idx.modules_with_parent("Base::Class"), vec!["Kid"]);
+
+    // Re-registration with the parent edge gone must drop the stale edge.
+    let orphaned = "package Kid;\nsub solo { }\n1;";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(orphaned, None).unwrap();
+    let analysis = Arc::new(crate::builder::build(&tree, orphaned.as_bytes()));
+    idx.register_workspace_module(PathBuf::from("/fake/Kid.pm"), analysis);
+    assert!(
+        idx.modules_with_parent("Base::Class").is_empty(),
+        "purge on re-registration must drop the stale parent edge",
+    );
 }
