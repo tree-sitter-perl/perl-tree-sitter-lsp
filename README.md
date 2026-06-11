@@ -12,7 +12,7 @@ cargo install perl-lsp
 
 ### VS Code
 
-Install **[Perl (perl-lsp)](https://marketplace.visualstudio.com/items?itemName=tree-sitter-perl.perl-lsp)** from the Marketplace (or search `perl-lsp` in the Extensions view). The extension fetches the matching `perl-lsp` binary automatically — no separate `cargo install` needed. To point it at your own build instead, set `perl-lsp.path` in settings.
+Install **[Perl (perl-lsp)](https://marketplace.visualstudio.com/items?itemName=tree-sitter-perl.vscode-perl-lsp)** from the Marketplace (or search `perl-lsp` in the Extensions view). The extension fetches the matching `perl-lsp` binary automatically — no separate `cargo install` needed. To point it at your own build instead, set `perl-lsp.path` in settings.
 
 > The `cargo install` above is only needed for the other editors below, or if you prefer to manage the binary yourself.
 
