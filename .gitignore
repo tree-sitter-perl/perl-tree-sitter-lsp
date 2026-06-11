@@ -2,6 +2,7 @@
 /.nvim-test
 editors/vscode/node_modules/
 editors/vscode/out/
+.node-version
 
 .claude/
 qa-workspace/
