@@ -179,17 +179,24 @@ jobs:
         with:
           node-version-file: editors/vscode/.node-version
 
-      - name: Validate versions match tag
+      # package.json must match the tag. extension.ts's VERSION names the
+      # server release whose binaries it downloads — it may lag the extension
+      # version (extension-only patches), but that release must exist.
+      - name: Validate versions
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG_VERSION=${GITHUB_REF_NAME#v}
           PKG_VERSION=$(node -p "require('./package.json').version")
           TS_VERSION=$(grep -oP 'const VERSION = "\K[^"]+' src/extension.ts)
-          for v in "$PKG_VERSION" "$TS_VERSION"; do
-            if [ "$v" != "$TAG_VERSION" ]; then
-              echo "ERROR: extension version ($PKG_VERSION pkg / $TS_VERSION ts) != tag ($TAG_VERSION)"
-              exit 1
-            fi
-          done
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: package.json version ($PKG_VERSION) != tag ($TAG_VERSION)"
+            exit 1
+          fi
+          if [ "$TS_VERSION" != "$TAG_VERSION" ]; then
+            gh release view "v$TS_VERSION" -R "$GITHUB_REPOSITORY" >/dev/null ||
+              { echo "ERROR: extension.ts VERSION ($TS_VERSION) has no GitHub release"; exit 1; }
+          fi
 
       - uses: azure/login@v2
         with:

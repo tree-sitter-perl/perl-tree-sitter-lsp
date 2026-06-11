@@ -2,7 +2,7 @@
   "name": "vscode-perl-lsp",
   "displayName": "Perl (perl-lsp)",
   "description": "Perl language support powered by tree-sitter-perl — type inference, cross-file navigation, framework intelligence",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "tree-sitter-perl",
   "license": "Artistic-2.0",
   "icon": "icon.png",
@@ -44,7 +44,9 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p ./",
+    "vscode:prepublish": "npm run compile",
+    "compile": "npm run typecheck && esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "typecheck": "tsc -p ./ --noEmit",
     "package": "vsce package",
     "publish": "vsce publish"
   },
@@ -52,6 +54,7 @@
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
+    "esbuild": "^0.25.0",
     "@types/vscode": "^1.75.0",
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0",
