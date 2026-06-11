@@ -686,3 +686,110 @@ fn r_cross_file_refs_and_workspace_rename() {
     assert!(files.contains(&"analysis.R".to_string()), "call found: {files:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn dbg_cmake_cst() {
+    let mut p = tree_sitter::Parser::new();
+    p.set_language(&tree_sitter_cmake::LANGUAGE.into()).unwrap();
+    let src = "set(MY_FLAG ON)\ninclude(util.cmake)\nadd_subdirectory(src)\nfunction(register_widget name)\n  message(STATUS \"${name} ${MY_FLAG}\")\nendfunction()\nadd_library(widgets STATIC a.c)\ntarget_link_libraries(widgets PRIVATE core)\nregister_widget(button)\n";
+    let tree = p.parse(src, None).unwrap();
+    println!("{}", tree.root_node().to_sexp());
+}
+
+// ---- spike 5: the CMake pack ----
+
+fn cmake_parser() -> tree_sitter::Parser {
+    let mut p = tree_sitter::Parser::new();
+    p.set_language(&tree_sitter_cmake::LANGUAGE.into()).unwrap();
+    p
+}
+
+fn cmake_skel(src: &str) -> SkeletonAnalysis {
+    let mut parser = cmake_parser();
+    let tree = parser.parse(src, None).unwrap();
+    extract(&tree, src.as_bytes(), &cmake_pack()).unwrap()
+}
+
+#[test]
+fn cmake_outline_targets_vars_and_interpolated_refs() {
+    let src = "set(MY_FLAG ON)\ninclude(util.cmake)\nadd_subdirectory(src)\n\
+               function(register_widget name)\n  message(STATUS \"${name} ${MY_FLAG}\")\nendfunction()\n\
+               add_library(widgets STATIC a.c)\ntarget_link_libraries(widgets PRIVATE core)\nregister_widget(button)\n";
+    let skel = cmake_skel(src);
+
+    let defs: Vec<(String, String)> = skel
+        .symbols
+        .iter()
+        .map(|s| (s.kind.clone(), s.name.clone()))
+        .collect();
+    assert!(defs.contains(&("var".into(), "MY_FLAG".into())), "{defs:?}");
+    assert!(defs.contains(&("sub".into(), "register_widget".into())), "{defs:?}");
+    assert!(defs.contains(&("sub".into(), "widgets".into())), "target def: {defs:?}");
+    assert!(defs.contains(&("var".into(), "name".into())), "param def: {defs:?}");
+    assert_eq!(skel.imports, vec!["util.cmake", "src"]);
+
+    // ${MY_FLAG} INSIDE a quoted string is a real var ref — Perl's
+    // regex-interpolation work, free.
+    assert!(
+        skel.refs.iter().any(|r| r.kind == "var" && r.name == "MY_FLAG"),
+        "interpolated var ref: {:?}",
+        skel.refs.iter().filter(|r| r.kind == "var").collect::<Vec<_>>(),
+    );
+    // target_link_libraries args reference targets; PRIVATE is a
+    // keyword and must not become a ref
+    assert!(skel.refs.iter().any(|r| r.kind == "call" && r.name == "widgets"));
+    assert!(skel.refs.iter().any(|r| r.kind == "call" && r.name == "core"));
+    assert!(!skel.refs.iter().any(|r| r.name == "PRIVATE"));
+}
+
+#[test]
+fn cmake_cross_file_function_rename_and_subdirectory_resolution() {
+    let dir = std::env::temp_dir().join(format!("qx-cmake-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let src_util = "function(register_widget name)\n  message(STATUS \"${name}\")\nendfunction()\n";
+    std::fs::write(dir.join("util.cmake"), src_util).unwrap();
+    std::fs::write(dir.join("src/CMakeLists.txt"), "add_library(inner STATIC b.c)\n").unwrap();
+    let src_root = "include(util.cmake)\nadd_subdirectory(src)\n\nregister_widget(button)\n";
+
+    let root_skel = cmake_skel(src_root);
+    let imports = root_skel.imports.clone();
+    let fa_root = root_skel.into_file_analysis();
+    let fa_util = cmake_skel(src_util).into_file_analysis();
+
+    // resolution: util.cmake verbatim, src → src/CMakeLists.txt
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    resolve_imports_with_pack(&imports, &dir, &cmake_pack(), &mut cmake_parser, &idx).unwrap();
+    assert!(idx.get_cached("util.cmake").is_some());
+    assert!(
+        idx.get_cached("src").is_some(),
+        "add_subdirectory(src) must resolve src/CMakeLists.txt",
+    );
+
+    // workspace rename of the function, cursor on the call site
+    let store = crate::file_store::FileStore::new();
+    let pr = std::path::PathBuf::from("/fake/cmake/CMakeLists.txt");
+    let pu = std::path::PathBuf::from("/fake/cmake/util.cmake");
+    store.insert_workspace(pr.clone(), fa_root);
+    store.insert_workspace(pu.clone(), fa_util);
+
+    let fa_view = store.workspace_raw().get(&pr).unwrap().clone();
+    let point = tree_sitter::Point { row: 3, column: 4 };
+    let target = match crate::resolve::resolve_symbol(&fa_view, point, None) {
+        Some(crate::resolve::ResolvedTarget::Target(t)) => t,
+        other => panic!("expected target, got {other:?}"),
+    };
+    assert_eq!(target.name, "register_widget");
+    let locs = crate::resolve::refs_to(&store, None, &target, crate::resolve::RoleMask::EDITABLE);
+    let files: Vec<String> = locs
+        .iter()
+        .map(|l| match &l.key {
+            crate::file_store::FileKey::Path(p) => {
+                p.file_name().unwrap().to_string_lossy().to_string()
+            }
+            _ => unreachable!(),
+        })
+        .collect();
+    assert!(files.contains(&"util.cmake".to_string()), "def: {files:?}");
+    assert!(files.contains(&"CMakeLists.txt".to_string()), "call: {files:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
