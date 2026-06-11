@@ -865,6 +865,14 @@ impl CrossFileLookup for ModuleIndex {
     ) {
         self.for_each_entity_bridged_to(class_name, f)
     }
+
+    fn for_each_descendant_package(
+        &self,
+        class: &str,
+        visit: &mut dyn FnMut(&str, &Arc<CachedModule>) -> std::ops::ControlFlow<()>,
+    ) {
+        self.for_each_descendant_package(class, visit)
+    }
 }
 
 // ---- Module-level helpers ----

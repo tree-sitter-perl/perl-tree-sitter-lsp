@@ -561,6 +561,61 @@ pub fn refs_to(
     out
 }
 
+/// `textDocument/implementation`: local defs of `name` in every
+/// transitive descendant package of the Method target's class. On a
+/// role's `requires` marker that's "every composer's def of the
+/// contract"; on a class method it's "every subclass override".
+/// Goto-def stays on the contract/def itself; call sites stay on
+/// references — this is the third verb, not a variant of either.
+///
+/// A descendant role's own re-`requires` marker is a contract
+/// re-declaration, not an implementation — `role_requires` is the
+/// recorded fact that identifies (and excludes) it.
+pub fn implementations_of(
+    module_index: Option<&dyn CrossFileLookup>,
+    target: &TargetRef,
+) -> Vec<RefLocation> {
+    let TargetKind::Method { class } = &target.kind else {
+        return Vec::new();
+    };
+    let Some(idx) = module_index else {
+        return Vec::new();
+    };
+    let mut out: Vec<RefLocation> = Vec::new();
+    idx.for_each_descendant_package(class, &mut |pkg, cached| {
+        let is_marker = cached
+            .analysis
+            .role_requires
+            .get(pkg)
+            .is_some_and(|reqs| reqs.iter().any(|r| r == &target.name));
+        if !is_marker {
+            for s in &cached.analysis.symbols {
+                if s.name == target.name
+                    && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                    && s.package.as_deref() == Some(pkg)
+                {
+                    out.push(RefLocation {
+                        key: FileKey::Path(cached.path.clone()),
+                        span: s.selection_span,
+                        access: AccessKind::Declaration,
+                    });
+                }
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    out.sort_by(|a, b| {
+        key_for_sort(&a.key)
+            .cmp(&key_for_sort(&b.key))
+            .then_with(|| {
+                (a.span.start.row, a.span.start.column)
+                    .cmp(&(b.span.start.row, b.span.start.column))
+            })
+    });
+    out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
+    out
+}
+
 fn key_for_sort(k: &FileKey) -> PathBuf {
     match k {
         FileKey::Path(p) => p.clone(),
