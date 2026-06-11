@@ -1140,6 +1140,7 @@ pub fn build_plugin_query_context(
             Some(s) => vec![crate::plugin::ArgInfo {
                 text: s.clone(),
                 string_value: Some(s.clone()),
+                string_values: vec![s.clone()],
                 span: crate::file_analysis::Span {
                     start: point,
                     end: point,

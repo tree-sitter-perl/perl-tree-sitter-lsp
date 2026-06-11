@@ -55,7 +55,16 @@ pub struct ArgInfo {
     pub text: String,
     /// Constant-folded string if the arg is a literal/bareword or resolves
     /// through `constant_strings`. `None` means "runtime/unknown".
+    /// Multi-valued folds (a loop variable over `qw(...)`, the postfix
+    /// `for` topic) surface their FIRST value here for back-compat;
+    /// `string_values` carries them all.
     pub string_value: Option<String>,
+    /// Every constant-folded candidate for this arg. Single-valued for
+    /// literals; the full list for loop-variable / `$_` folds — a
+    /// registration loop (`$app->helper($_ => …) for qw(a b c)`) is N
+    /// registrations, and plugins fan out over this.
+    #[serde(default)]
+    pub string_values: Vec<String>,
     pub span: Span,
     /// For string-literal args, the span of the INNER content only —
     /// excludes the quote delimiters, heredoc markers, or `q{}`/`qq!!`

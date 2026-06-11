@@ -49,15 +49,37 @@ fn app_surface_consumers() {
 // action. We emit on both entry points; the shared proxy prefix means
 // dotted helpers only pay the fan-out once per leaf.
 
+// Lite scripts register helpers with the bare DSL verb —
+// `helper(frontend_version => sub {…})` — no `$app->` in sight. Same
+// emissions as the method spelling, same fan-out.
+fn on_function_call(ctx) {
+    if ctx.function_name != "helper" { return []; }
+    helper_call_emissions(ctx)
+}
+
 fn on_method_call(ctx) {
+    if ctx.method_name != "helper" { return []; }
+    helper_call_emissions(ctx)
+}
+
+fn helper_call_emissions(ctx) {
     let out = [];
-    if ctx.method_name != "helper" { return out; }
 
     let args = ctx.args;
     if args.len() < 2 { return out; }
 
-    let name = args[0].string_value;
-    if name == () { return out; }
+    // Loop registrations expand: `$app->helper($name => …) for/foreach`
+    // folds the loop variable (or the postfix `$_` topic) over its
+    // literal list, and `string_values` carries every candidate — this
+    // is what discovers DefaultHelpers' own registrations from source,
+    // with no hardcoded helper list anywhere.
+    let names = args[0].string_values;
+    if names == () { names = []; }
+    if names.len() == 0 {
+        let single = args[0].string_value;
+        if single == () { return out; }
+        names = [single];
+    }
 
     // `$app->helper(NAME => sub { my ($c, @rest) = @_; ... })` — the
     // helper's first positional is the Mojolicious controller. Flag
@@ -96,6 +118,19 @@ fn on_method_call(ctx) {
         };
     }
 
+    for name in names {
+        // Unfolded dynamics (`$_` that didn't fold, interpolations)
+        // are honest misses, not helpers named "$_".
+        if name.contains("$") { continue; }
+        out += helper_emissions(ctx, name, params, name_span, args[1].callable_return_edge);
+    }
+    return out;
+}
+
+// Everything one registered helper NAME emits — split out so a loop
+// registration fans out N times over the same callback/spans.
+fn helper_emissions(ctx, name, params, name_span, ret_edge) {
+    let out = [];
     // Split on '.' — single-segment names are the common case and
     // produce exactly one Method. Dotted names chain.
     let segments = name.split(".");
@@ -147,7 +182,7 @@ fn on_method_call(ctx) {
                 params: params,
                 is_method: true,
                 return_type: (),
-                return_via_edge: args[1].callable_return_edge,
+                return_via_edge: ret_edge,
                 doc: (),
                 on_class: app_surface,
                 display: "Helper",

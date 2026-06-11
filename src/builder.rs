@@ -1855,6 +1855,7 @@ impl<'a> Builder<'a> {
     fn arg_info_for(&mut self, arg: Node<'a>) -> plugin::ArgInfo {
         let text = arg.utf8_text(self.source).unwrap_or("").to_string();
         let mut content_span: Option<Span> = None;
+        let mut string_values: Vec<String> = Vec::new();
         let string_value = match arg.kind() {
             "string_literal" | "interpolated_string_literal" => {
                 // Read the string_content child — quote-flavor-agnostic
@@ -1879,11 +1880,15 @@ impl<'a> Builder<'a> {
             // positional args) where the token text IS the string value.
             "autoquoted_bareword" | "bareword" => Some(text.clone()),
             "scalar" | "array" | "hash" => {
-                self.resolve_constant_strings(&text, 0)
-                    .and_then(|v| v.into_iter().next())
+                let folded = self.resolve_constant_strings(&text, 0).unwrap_or_default();
+                string_values = folded.clone();
+                folded.into_iter().next()
             }
             _ => None,
         };
+        if string_values.is_empty() {
+            string_values.extend(string_value.clone());
+        }
         self.emit_expr_witness(arg);
         let inferred_type = self.bag_query_expr_span(node_to_span(arg));
         let sub_params = if arg.kind() == "anonymous_subroutine_expression" {
@@ -1928,6 +1933,7 @@ impl<'a> Builder<'a> {
         plugin::ArgInfo {
             text,
             string_value,
+            string_values,
             span: node_to_span(arg),
             content_span,
             inferred_type,
@@ -4628,13 +4634,32 @@ impl<'a> Builder<'a> {
         // `... for (LIST)` form (the child_by_field_name paren gotcha), so the
         // list payload is read off the second named child instead — `[call,
         // list]`. `extract_string_list` folds qw / paren-list / constants.
+        let mut topic_values: Vec<String> = Vec::new();
         if let (Some(call), Some(list_node)) = (node.named_child(0), node.named_child(1)) {
             let names = self.extract_string_list(list_node);
             if !names.is_empty() && self.is_class_accessor_loop_body(call) {
                 self.emit_class_accessor_symbols(call, &names);
             }
+            topic_values = names.into_iter().map(|(n, _)| n).collect();
+        }
+        // The statement-modifier topic: `EXPR for qw(...)` runs EXPR once
+        // per element with `$_` bound — fold `$_` over the literal list
+        // for the body visit so registration loops expand
+        // (`$app->helper($_ => …) for qw(a b c)` is N registrations).
+        // Scoped: saved and restored around the children walk.
+        let saved = self.constant_strings.get("$_").cloned();
+        if !topic_values.is_empty() {
+            self.constant_strings.insert("$_".to_string(), topic_values);
         }
         self.visit_children(node);
+        match saved {
+            Some(v) => {
+                self.constant_strings.insert("$_".to_string(), v);
+            }
+            None => {
+                self.constant_strings.remove("$_");
+            }
+        }
     }
 
     /// Is `node` a `mk_classdata`/`mk_classaccessor` call whose single arg is the
