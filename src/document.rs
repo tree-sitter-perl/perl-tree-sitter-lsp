@@ -1,4 +1,4 @@
-use tree_sitter::{InputEdit, Parser, Point, Tree};
+use tree_sitter::{InputEdit, Point, Tree};
 
 use crate::builder;
 use crate::file_analysis::{FileAnalysis, SymKind};
