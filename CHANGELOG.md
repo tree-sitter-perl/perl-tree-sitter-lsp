@@ -28,6 +28,11 @@ crate / VS Code extension versions.
   name — now marks the package's ancestry incomplete, suppressing
   inheritance-dependent diagnostics on it (removed 41 false
   `unresolved-method` hints on the calibration codebase).
+- **Plugin-declared role engines** — new `role_makers()` plugin manifest
+  (array of module names whose `use` makes the consumer a role). Core
+  holds no engine list: the base four (Moo::Role, Moose::Role,
+  Mouse::Role, Role::Tiny) ride `frameworks/moo.rhai`'s manifest, and a
+  house role engine is one manifest line in a `.perl-lsp` plugin away.
 - **`children_index`** — new reverse edge in the module index (parent
   class/role → composing/inheriting modules), the shared primitive for the
   long-distance family. All reverse maps now live in one bundle fed
