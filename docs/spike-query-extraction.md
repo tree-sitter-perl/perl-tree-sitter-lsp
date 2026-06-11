@@ -250,6 +250,38 @@ order — BTreeMap fix); one R-shaped trap recorded for the future
 trap library: `f <- function` matches both the sub and the generic
 var pattern, handled by a generic specific-kind-wins def dedup.
 
+## Spike 5: the CMake pack — a command-dispatched language
+
+Picked for maximum forlornness-to-audience ratio: every C/C++
+developer is a captive CMake user, the incumbents are thin, and the
+language is small enough that FULL ring-1 coverage is reachable.
+`tree-sitter-cmake` 0.7. The pack: ~30 lines of .scm + ~35 lines of
+predicates.
+
+CMake's twist paid for one new generic vocabulary family —
+**command effects**. Defs aren't syntax-dispatched (`set`,
+`add_library`, and user functions are all `normal_command`), so
+`@cmd`/`@cmd.arg` deliver (name, ordered args) and the pack's
+`cmd_effects` predicate classifies: `Def{kind, name_arg}` (set→var,
+add_library→target), `RefArgsFrom{from}` (target_link_libraries args
+reference targets; ALL-CAPS keyword args skipped per CMake
+convention), `Import{arg}` (include / add_subdirectory). Any future
+command-dispatched language (Tcl, shells, build DSLs) reuses the
+family.
+
+Proven: outline (functions, params, variables, TARGETS — the entity
+nobody navigates today), `${VAR}` references **inside quoted
+strings** (the grammar parses interpolation, so what took Perl a
+dedicated walker fix is free), keyword-aware target references,
+`add_subdirectory(src)` resolving `src/CMakeLists.txt` through the
+`module_paths` predicate, and workspace rename of a user function
+across CMakeLists.txt and an included .cmake module — production
+paths, zero engine edits, again.
+
+Target rename (vs function rename) wants a real `SymKind::Target`
+rather than riding Sub — noted as the one engine nicety on the
+multi-language path (`prompt-multi-language.md`).
+
 ## Recommendation (revised after spike 2)
 
 Keep the branch as evidence; don't merge. The Perl path stays

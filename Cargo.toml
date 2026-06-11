@@ -45,3 +45,4 @@ rhai = { version = "1.23", features = ["sync", "serde"] }
 [dev-dependencies]
 tree-sitter-python = "0.25"
 tree-sitter-r = "1.2"
+tree-sitter-cmake = "0.7"

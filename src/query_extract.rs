@@ -155,6 +155,25 @@ pub struct LangPack {
     /// Languages where imports are CALLS, not statements (R's
     /// library()/source()): map (callee, argument) → imported module.
     pub import_call: fn(callee: &str, arg: &str) -> Option<String>,
+    /// Command-dispatched languages (CMake): what a command DOES with
+    /// its positional arguments. The @cmd/@cmd.arg captures deliver
+    /// (name, ordered args); this predicate classifies.
+    pub cmd_effects: fn(cmd: &str) -> Vec<CmdEffect>,
+}
+
+/// One effect of a command-dispatched statement.
+#[derive(Debug, Clone, Copy)]
+pub enum CmdEffect {
+    /// Argument `name_arg` declares an entity of `kind` ("var",
+    /// "sub", ...).
+    Def { kind: &'static str, name_arg: usize },
+    /// Arguments from `from` onward are name references (all-caps
+    /// keyword arguments like PRIVATE/STATIC are skipped — CMake's
+    /// keyword convention; a finer filter is a later predicate).
+    RefArgsFrom { from: usize },
+    /// Argument `arg` names an imported module (joins import_call's
+    /// role for command languages).
+    Import { arg: usize },
 }
 
 pub fn perl_pack() -> LangPack {
@@ -176,6 +195,7 @@ pub fn perl_pack() -> LangPack {
         module_paths: |m| vec![format!("{}.pm", m.replace("::", "/"))],
         shape_ctor: |_| false,
         import_call: |_, _| None,
+        cmd_effects: |_| vec![],
     }
 }
 
@@ -207,6 +227,7 @@ pub fn python_pack() -> LangPack {
         },
         shape_ctor: |_| false,
         import_call: |_, _| None,
+        cmd_effects: |_| vec![],
     }
 }
 
@@ -227,6 +248,42 @@ pub fn r_pack() -> LangPack {
         import_call: |callee, arg| match callee {
             "library" | "require" | "source" => Some(arg.to_string()),
             _ => None,
+        },
+        cmd_effects: |_| vec![],
+    }
+}
+
+pub fn cmake_pack() -> LangPack {
+    LangPack {
+        query_source: include_str!("../queries/cmake/skeleton.scm"),
+        shape_name: |_, raw| raw.to_string(),
+        default_name: |_| None,
+        annot_type: |_| None,
+        ctor_class: |_| None,
+        // include(util.cmake) is a literal path; add_subdirectory(src)
+        // means src/CMakeLists.txt. The whole resolution strategy.
+        module_paths: |m| {
+            if m.ends_with(".cmake") {
+                vec![m.to_string()]
+            } else {
+                vec![format!("{m}/CMakeLists.txt"), format!("{m}.cmake")]
+            }
+        },
+        shape_ctor: |_| false,
+        import_call: |_, _| None,
+        cmd_effects: |cmd| match cmd.to_ascii_lowercase().as_str() {
+            "set" | "option" => vec![CmdEffect::Def { kind: "var", name_arg: 0 }],
+            "add_library" | "add_executable" | "add_custom_target" => {
+                // Targets. SymKind::Target is the real future; "sub"
+                // rides the full rename/refs machinery today.
+                vec![CmdEffect::Def { kind: "sub", name_arg: 0 }]
+            }
+            "target_link_libraries" | "target_include_directories"
+            | "target_compile_definitions" | "target_sources" => vec![
+                CmdEffect::RefArgsFrom { from: 0 },
+            ],
+            "include" | "add_subdirectory" => vec![CmdEffect::Import { arg: 0 }],
+            _ => vec![],
         },
     }
 }
@@ -335,6 +392,11 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     let mut shape_spans: Vec<(usize, usize, Span)> = Vec::new();
     let mut shape_ctors: HashMap<(usize, usize), String> = HashMap::new();
     let mut shape_keys: Vec<(usize, usize, String)> = Vec::new();
+    // command-dispatch collection: per match, the command identifier
+    // and its ordered arguments
+    let mut cmd_names: std::collections::BTreeMap<usize, (String, Span, crate::file_analysis::ScopeId)> =
+        Default::default();
+    let mut cmd_args: std::collections::BTreeMap<usize, Vec<(String, Span)>> = Default::default();
     // import-call halves, joined per match (BTreeMap: match ids are
     // source-ordered, so imports come out deterministic)
     let mut import_fns: std::collections::BTreeMap<usize, String> = Default::default();
@@ -478,6 +540,18 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     shape_keys.push((range.0, range.1, e.text.clone()));
                 }
             }
+            "cmd" => {
+                cmd_names.insert(
+                    e.match_id,
+                    (e.text.clone(), Span { start: e.start, end: e.end }, cur_scope),
+                );
+            }
+            "cmd.arg" => {
+                cmd_args
+                    .entry(e.match_id)
+                    .or_default()
+                    .push((e.text.clone(), Span { start: e.start, end: e.end }));
+            }
             "import.fn" => {
                 import_fns.insert(e.match_id, e.text.clone());
             }
@@ -599,6 +673,61 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         }
         let mut it = keep.iter();
         out.symbols.retain(|_| *it.next().unwrap());
+    }
+
+    // ---- command dispatch: classify each command's effects ----
+    for (mid, (cmd, cmd_span, scope)) in &cmd_names {
+        let args = cmd_args.get(mid).cloned().unwrap_or_default();
+        // every invocation identifier is a call ref (user functions
+        // rename through it; builtin names match no defs, harmlessly)
+        out.refs.push(SkelRef {
+            kind: "call".into(),
+            name: cmd.clone(),
+            start: cmd_span.start,
+            end: cmd_span.end,
+            scope: *scope,
+        });
+        for effect in (pack.cmd_effects)(cmd) {
+            match effect {
+                CmdEffect::Def { kind, name_arg } => {
+                    if let Some((name, span)) = args.get(name_arg) {
+                        out.symbols.push(SkelSymbol {
+                            kind: kind.to_string(),
+                            name: name.clone(),
+                            start: cmd_span.start,
+                            end: span.end,
+                            name_start: span.start,
+                            name_end: span.end,
+                            package: None,
+                            scope_depth: 0,
+                            scope: *scope,
+                        });
+                    }
+                }
+                CmdEffect::RefArgsFrom { from } => {
+                    for (name, span) in args.iter().skip(from) {
+                        let is_keyword =
+                            !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_');
+                        if !is_keyword && !name.contains("${") {
+                            out.refs.push(SkelRef {
+                                kind: "call".into(),
+                                name: name.clone(),
+                                start: span.start,
+                                end: span.end,
+                                scope: *scope,
+                            });
+                        }
+                    }
+                }
+                CmdEffect::Import { arg } => {
+                    if let Some((name, _)) = args.get(arg) {
+                        if !out.imports.contains(name) {
+                            out.imports.push(name.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---- join flow captures into Variable witnesses ----
