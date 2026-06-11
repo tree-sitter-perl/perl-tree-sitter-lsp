@@ -11,13 +11,18 @@ The extension manages the [perl-lsp](https://github.com/tree-sitter-perl/perl-tr
 perl-lsp infers types from how your code uses values:
 
 ```perl
-my $ua = Mojo::UserAgent->new;        # $ua is Mojo::UserAgent
-my $res = $ua->get('/api')->result;   # chains resolve through return types
-$res->json->{items};                  # hash-key completion follows
+my $ua  = Mojo::UserAgent->new;       # $ua is Mojo::UserAgent
+my $res = $ua->get('/api')->result;   # chain resolves: Mojo::Message::Response
+$res->                                # ...so completion offers its methods
+
+sub config { return { host => 'localhost', port => 8080 } }
+my $c = $self->config;
+$c->{                                 # completes host/port — the keys config returns
 ```
 
 - `Foo->new()`, `bless`, `ref` checks, and literals all feed inference
 - Method chains propagate types — `$self->get_config()->{host}` resolves through return types
+- Hash keys flow from where a hash is built to where it's used, including across subs
 - Return types and parameter types flow across module boundaries
 
 ### Framework intelligence
