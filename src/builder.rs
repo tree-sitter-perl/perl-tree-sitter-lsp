@@ -202,6 +202,8 @@ fn build_with_plugins_inner(
     plugins: Arc<PluginRegistry>,
     extra_re_fold: bool,
 ) -> FileAnalysis {
+    let topic_dsls: Vec<plugin::TopicRouteDsl> =
+        plugins.all().filter_map(|pl| pl.topic_route_dsl()).collect();
     let mut b = Builder {
         source,
         scopes: Vec::new(),
@@ -265,6 +267,8 @@ fn build_with_plugins_inner(
         attr_projections: Vec::new(),
         escape_recorded: std::collections::HashSet::new(),
         role_requires: std::collections::HashMap::new(),
+        lite_brand: vec![None],
+        topic_dsls,
         reassigned_scalars: std::collections::HashSet::new(),
         key_writes: Vec::new(),
         method_call_arity: std::collections::HashMap::new(),
@@ -1491,6 +1495,17 @@ struct Builder<'a> {
     /// `FileAnalysis.role_requires`.
     role_requires: std::collections::HashMap<String, Vec<String>>,
 
+    /// Topic-route implicit base — the controller default the current
+    /// base-setter established, scoped by the DSL's group function
+    /// (push on entry, pop on exit). Topic-DSL routes have no variable
+    /// for the brand to ride; this stack IS the receiver for
+    /// `->to('#action')` partials on declared verb calls.
+    lite_brand: Vec<Option<String>>,
+
+    /// Topic-route DSL manifests collected from the plugin registry —
+    /// see `plugin::TopicRouteDsl`.
+    topic_dsls: Vec<plugin::TopicRouteDsl>,
+
     /// Per-MethodCall-ref arg count, keyed by ref index. Lets
     /// `emit_method_call_return_edges` pin the call site's arity onto its
     /// `Expression(refidx)` return edge (`CallReturn`), so a fluent
@@ -2524,6 +2539,32 @@ impl<'a> Builder<'a> {
     /// bareword arms query the local Symbol's return, method-call arms
     /// query Expression(refidx), shift / `$_[0]` / `__PACKAGE__` use
     /// current_package. One function, one dispatch.
+    /// The active topic-route DSL, when a plugin declared one whose
+    /// gating module is in scope. Core knows no names — the plugin
+    /// manifest carries the module, the verbs, and the scope function.
+    fn active_topic_dsl(&self) -> Option<&plugin::TopicRouteDsl> {
+        self.topic_dsls.iter().find(|d| {
+            self.package_uses
+                .values()
+                .any(|ms| ms.iter().any(|m| *m == d.module))
+        })
+    }
+
+    /// The called function's name when `inv` is a call — the generic
+    /// syntax fact `CallContext.receiver_call_name` carries to plugins.
+    fn invocant_call_name(&self, inv: Node<'a>) -> Option<String> {
+        if !matches!(
+            inv.kind(),
+            "function_call_expression" | "ambiguous_function_call_expression"
+        ) {
+            return None;
+        }
+        inv.child_by_field_name("function")?
+            .utf8_text(self.source)
+            .ok()
+            .map(str::to_string)
+    }
+
     fn receiver_type_for(&self, invocant_node: Option<Node<'a>>) -> Option<InferredType> {
         self.invocant_type_at_node(invocant_node?)
     }
@@ -2573,6 +2614,7 @@ impl<'a> Builder<'a> {
             function_name: None,
             method_name: None,
             receiver_text: None,
+            receiver_call_name: None,
             receiver_type: None,
             receiver_route_defaults: Vec::new(),
             args,
@@ -2704,6 +2746,14 @@ impl<'a> Builder<'a> {
     fn apply_emit_action(&mut self, plugin_id: String, action: plugin::EmitAction) {
         let ns = Namespace::framework(plugin_id.clone());
         match action {
+            // Topic-route base write: the plugin parsed its own
+            // `->to('ctrl#…')` on its declared base-setter verb; core
+            // just stores the result on the innermost open frame.
+            plugin::EmitAction::SetRouteBase { controller } => {
+                if let Some(frame) = self.lite_brand.last_mut() {
+                    *frame = Some(controller);
+                }
+            }
             plugin::EmitAction::Method {
                 name,
                 span,
@@ -7252,7 +7302,26 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        // A topic-route DSL's scope function (`group { … }` in lite)
+        // brackets the implicit base: push a copy of the current frame,
+        // restore after the block — a base set inside applies only
+        // within. The function's NAME comes from the plugin manifest.
+        let lite_group = self
+            .active_topic_dsl()
+            .map(|d| d.group_fn.clone())
+            .is_some_and(|g| {
+                node.child_by_field_name("function")
+                    .and_then(|f| f.utf8_text(self.source).ok())
+                    == Some(g.as_str())
+            });
+        if lite_group {
+            let cur = self.lite_brand.last().cloned().flatten();
+            self.lite_brand.push(cur);
+        }
         self.visit_children(node);
+        if lite_group {
+            self.lite_brand.pop();
+        }
         // If `modifier_invocant_pos` wasn't consumed by a nested `visit_anonymous_sub`
         // (malformed or modifier-without-sub-body code), clear it so it doesn't leak
         // to the next anonymous sub in the file.
@@ -10130,6 +10199,13 @@ impl<'a> Builder<'a> {
                 ctx.method_name = Some(name.clone());
                 ctx.receiver_text = invocant_text.clone();
                 ctx.receiver_type = self.receiver_type_for(invocant_node);
+                // The receiver's call name is a generic syntax fact —
+                // set unconditionally so plugins can match their own
+                // DSL verbs (mojo-routes' base-setter) whatever the
+                // receiver's type resolved to.
+                if let Some(inv) = invocant_node {
+                    ctx.receiver_call_name = self.invocant_call_name(inv);
+                }
                 if let Some(InferredType::BrandedRoute { controller, stash, .. }) =
                     &ctx.receiver_type
                 {
@@ -10138,6 +10214,27 @@ impl<'a> Builder<'a> {
                         defaults.push(("controller".to_string(), c.clone()));
                     }
                     ctx.receiver_route_defaults = defaults;
+                }
+                // Topic-route spelling: the receiver is a DSL verb CALL
+                // (`get('/x')->to('#action')`) — no variable, so the
+                // implicit base lives on the walk's stack. Fills the
+                // controller default only when the brand didn't carry
+                // one; which names count is the plugin manifest's call.
+                if ctx
+                    .receiver_route_defaults
+                    .iter()
+                    .all(|(k, _)| k != "controller")
+                {
+                    if let (Some(dsl), Some(callee)) =
+                        (self.active_topic_dsl(), ctx.receiver_call_name.as_deref())
+                    {
+                        if dsl.verbs.iter().any(|v| v == callee) {
+                            if let Some(c) = self.lite_brand.last().cloned().flatten() {
+                                ctx.receiver_route_defaults
+                                    .push(("controller".to_string(), c));
+                            }
+                        }
+                    }
                 }
                 self.record_provisional_dispatch(name, &ctx);
                 self.dispatch_method_call_plugins(ctx);

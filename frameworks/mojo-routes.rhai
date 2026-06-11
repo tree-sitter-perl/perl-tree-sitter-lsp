@@ -295,7 +295,14 @@ fn on_method_call(ctx) {
                 let action_start = lit_controller_len + 1;
                 let action_end   = action_start + action.len();
                 let action_span = subspan_cols(base, action_start, action_end);
-                return route_emissions(controller, action, action_span, ctx.current_package);
+                let ems = route_emissions(controller, action, action_span, ctx.current_package);
+                // Lite `under(...)->to('ctrl#…')` also WRITES the topic
+                // base following sibling routes inherit. The receiver's
+                // call name is a generic core fact; "under" is ours.
+                if ctx.receiver_call_name == "under" && controller != "" {
+                    ems += #{ "SetRouteBase": #{ "controller": controller } };
+                }
+                return ems;
             }
         }
     }

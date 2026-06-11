@@ -14793,3 +14793,47 @@ my $f = UNRESOLVED_BAREWORD_FH;
         "unresolvable barewords stay untouched",
     );
 }
+
+/// Mojolicious::Lite topic routes: `under(...)->to('ctrl#…')` sets the
+/// implicit base, `group { }` scopes it (an inner `under` applies only
+/// within, the outer base restores after), and `->to('#action')`
+/// partials on lite verb calls inherit the controller. Every name in
+/// the mechanism comes from the mojo-lite plugin's topic_route_dsl
+/// manifest; the base write is the plugin's SetRouteBase emission.
+#[test]
+fn lite_group_under_route_inheritance() {
+    let src = "\
+use Mojolicious::Lite;
+under('/auth')->to('login#check');
+group {
+  under('/n')->to('notifications#under');
+  get('/x')->to('#missing_fnsku');
+};
+get('/y')->to('#after_group');
+";
+    let fa = {
+        let mut parser = super::create_parser();
+        let tree = parser.parse(src, None).unwrap();
+        super::build_with_plugins(&tree, src.as_bytes(), super::default_plugin_registry())
+    };
+    let invocant_of = |action: &str| -> String {
+        fa.refs
+            .iter()
+            .find_map(|r| {
+                if r.target_name != action {
+                    return None;
+                }
+                let RefKind::MethodCall { ref invocant, .. } = r.kind else { return None };
+                Some(format!("{:?}", invocant))
+            })
+            .unwrap_or_else(|| panic!("no MethodCall ref for {action}"))
+    };
+    assert!(
+        invocant_of("missing_fnsku").contains("notifications"),
+        "in-group partial inherits the group's under",
+    );
+    assert!(
+        invocant_of("after_group").contains("login"),
+        "post-group partial inherits the OUTER under — the group frame popped",
+    );
+}

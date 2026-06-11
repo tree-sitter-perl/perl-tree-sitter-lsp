@@ -49,6 +49,20 @@ fn triggers() {
 //     diagnostic skips them regardless of whether the real source module
 //     is resolved cross-file yet.
 
+// The lite topic-route DSL: file-level verbs whose `->to('#action')`
+// partials inherit the controller the nearest `under(...)->to('ctrl#…')`
+// set, scoped by `group { }`. Core keeps the generic frame stack; every
+// NAME in the mechanism is declared right here. The SetRouteBase write
+// itself is emitted by mojo-routes (the plugin that parses to-specs).
+fn topic_route_dsl() {
+    #{
+        "module": "Mojolicious::Lite",
+        "verbs": ["get", "post", "put", "delete", "del", "patch", "options",
+                  "any", "websocket", "under"],
+        "group_fn": "group",
+    }
+}
+
 fn on_use(ctx) {
     if ctx.module_name != "Mojolicious::Lite" { return []; }
     let out = [];

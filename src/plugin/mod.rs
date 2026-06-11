@@ -119,6 +119,11 @@ pub struct CallContext {
     pub method_name: Option<String>,
     /// Raw text of receiver (`$self`, `__PACKAGE__`, etc.). Methods only.
     pub receiver_text: Option<String>,
+    /// When the receiver is itself a CALL (`get('/x')->to(...)`), the
+    /// called function's name — a generic syntax fact, so plugins can
+    /// match their own DSL verbs without core knowing any names.
+    #[serde(default)]
+    pub receiver_call_name: Option<String>,
     /// Resolved receiver type if inference succeeded.
     pub receiver_type: Option<InferredType>,
     /// Route defaults inherited by the receiver value, flattened to a
@@ -241,9 +246,30 @@ impl From<EmittedParam> for ParamInfo {
 /// body's scope doesn't exist yet when `VarType` is emitted), but they
 /// ARE the exceptions — prefer a data emission when you can express the
 /// same thing that way. New side-effect variants need explicit sign-off.
+/// See [`FrameworkPlugin::topic_route_dsl`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicRouteDsl {
+    /// The `use` that puts the DSL in scope (gates the stack).
+    pub module: String,
+    /// Route verbs whose CALL can stand as a `->to` receiver.
+    pub verbs: Vec<String>,
+    /// The block function that scopes the base (push on entry, pop on
+    /// exit).
+    pub group_fn: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EmitAction {
     // ==== Data emissions ====
+
+    /// Set the current topic-route base (the controller following
+    /// sibling routes inherit). Applied to the innermost open scope
+    /// frame of the walk's topic-route stack; the plugin that parses
+    /// `->to('ctrl#…')` emits it when the receiver is its declared
+    /// base-setter verb. Core never parses route specs.
+    SetRouteBase {
+        controller: String,
+    },
 
     /// Emit an accessor-style method. Shorthand for Symbol + SymKind::Method +
     /// SymbolDetail::Sub. The plugin's id becomes the symbol's Namespace tag.
@@ -779,6 +805,16 @@ pub trait FrameworkPlugin: Send + Sync {
     /// consumer set declared once. Default empty.
     fn app_surface_consumers(&self) -> &[String] {
         &[]
+    }
+
+    /// A topic-scoped route DSL this plugin owns (the
+    /// Mojolicious::Lite shape): file-level route verbs whose implicit
+    /// base a [`EmitAction::SetRouteBase`] emission sets and a scope
+    /// function brackets. Core provides only the generic stack — every
+    /// NAME in the mechanism (the gating module, the verb set, the
+    /// scope function) is declared here, never hardcoded in core.
+    fn topic_route_dsl(&self) -> Option<TopicRouteDsl> {
+        None
     }
 
     /// Fold a constraint constructor's extracted params into the
