@@ -4569,3 +4569,115 @@ sub public_fn { helper_fn() }
     assert!(names.contains(&"helper_fn"), "outline keeps the lexical sub: {:?}", names);
     assert!(names.contains(&"public_fn"), "{:?}", names);
 }
+
+// ---- role-requires-unfulfilled (composer-mismatch) ----
+
+fn role_requires_diags(source: &str) -> Vec<String> {
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    collect_diagnostics(&analysis, &module_index, Default::default())
+        .into_iter()
+        .filter(|d| {
+            matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                if c == "role-requires-unfulfilled")
+        })
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn test_role_requires_unfulfilled_fires_on_missing_def() {
+    let msgs = role_requires_diags(
+        "package My::Role;\nuse Moo::Role;\nrequires 'fetch';\n\
+         package My::Broken;\nuse Moo;\nwith 'My::Role';\nsub other { 1 }\n1;\n",
+    );
+    assert_eq!(
+        msgs,
+        vec!["role My::Role requires 'fetch'; My::Broken does not provide it"],
+    );
+}
+
+#[test]
+fn test_role_requires_satisfied_stays_quiet() {
+    // Local sub, has-accessor, and a sibling role's def all count as
+    // provided; the role itself is never diagnosed.
+    let msgs = role_requires_diags(
+        "package My::Role;\nuse Moo::Role;\nrequires 'fetch';\n\
+         package My::Provider;\nuse Moo::Role;\nsub fetch { 9 }\n\
+         package My::Ok;\nuse Moo;\nwith 'My::Role';\nsub fetch { 1 }\n\
+         package My::Attr;\nuse Moo;\nwith 'My::Role';\nhas fetch => (is => 'ro');\n\
+         package My::Sibling;\nuse Moo;\nwith 'My::Role', 'My::Provider';\n1;\n",
+    );
+    assert!(msgs.is_empty(), "expected no diagnostics, got: {:?}", msgs);
+}
+
+#[test]
+fn test_role_requires_transitive_and_marker_not_a_def() {
+    // SubRole composes Role and re-requires the contract: the marker
+    // must not satisfy Deep, but Deep's real def does — while Broken2
+    // composing SubRole is told about the (inherited) contract.
+    let msgs = role_requires_diags(
+        "package My::Role;\nuse Moo::Role;\nrequires 'fetch';\n\
+         package My::SubRole;\nuse Moo::Role;\nwith 'My::Role';\nrequires 'fetch';\n\
+         package My::Deep;\nuse Moo;\nwith 'My::SubRole';\nsub fetch { 7 }\n\
+         package My::Broken2;\nuse Moo;\nwith 'My::SubRole';\n1;\n",
+    );
+    assert_eq!(msgs.len(), 1, "only Broken2 should fire, got: {:?}", msgs);
+    assert!(msgs[0].contains("My::Broken2 does not provide it"), "got: {:?}", msgs);
+}
+
+#[test]
+fn test_role_requires_honest_silence() {
+    // AUTOLOAD anywhere in the MRO and unresolvable ancestors both
+    // suppress — the contract may be satisfied where we can't see.
+    let msgs = role_requires_diags(
+        "package My::Role;\nuse Moo::Role;\nrequires 'fetch';\n\
+         package My::Auto;\nuse Moo;\nwith 'My::Role';\nsub AUTOLOAD { }\n\
+         package My::Mystery;\nuse Moo;\nextends 'Vendor::Unknown';\nwith 'My::Role';\n1;\n",
+    );
+    assert!(msgs.is_empty(), "expected honest silence, got: {:?}", msgs);
+}
+
+#[test]
+fn test_role_requires_default_implementation_provides() {
+    // The Clove::Sheets pattern: the role both requires AND defines
+    // the name (requires as documentation, def as default). The real
+    // def must count as provision — only the marker is excluded.
+    let msgs = role_requires_diags(
+        "package My::Role;\nuse Moo::Role;\nrequires 'fetch';\nsub fetch { 'default' }\n\
+         package My::Composer;\nuse Moo;\nwith 'My::Role';\n1;\n",
+    );
+    assert!(msgs.is_empty(), "default impl in the role provides, got: {:?}", msgs);
+}
+
+#[test]
+fn test_role_requires_dynamic_parent_honest_silence() {
+    // `with ReportProxy(type => ...)` — a runtime-generated role we
+    // can't fold. The recorded parent list is incomplete, so neither
+    // the composer-mismatch warning nor the unresolved-method hint
+    // may fire on this package.
+    let analysis = parse_analysis(
+        "package My::Role;\nuse Moo::Role;\nrequires 'fetch';\n\
+         package My::Dynamic;\nuse Moo;\nwith RoleGen(type => 'x');\nwith 'My::Role';\n\
+         sub run { my $self = shift; $self->fetch }\n1;\n",
+    );
+    assert!(
+        analysis.dynamic_parent_packages.contains("My::Dynamic"),
+        "unfoldable with-arg must mark the package dynamic",
+    );
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    let role_or_method: Vec<&String> = diags
+        .iter()
+        .filter(|d| {
+            matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                if c == "role-requires-unfulfilled" || c == "unresolved-method")
+        })
+        .map(|d| &d.message)
+        .collect();
+    assert!(
+        role_or_method.is_empty(),
+        "dynamic parents must suppress, got: {:?}",
+        role_or_method,
+    );
+}

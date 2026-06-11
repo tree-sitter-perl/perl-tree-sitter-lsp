@@ -1,0 +1,45 @@
+{
+  "capability": "implementations",
+  "rows": [
+    {
+      "id": "role-requires-impl-from-atom",
+      "difficulty": "tricky",
+      "semantic_area": "roles",
+      "root": "gold-corpus/role-fixture",
+      "file": "lib/My/Role.pm",
+      "line": 3,
+      "col": 10,
+      "expect": {
+        "all": [
+          "{\"col\":\"5\",\"file\":\"Composer.pm\",\"line\":\"5\"}",
+          "{\"col\":\"5\",\"file\":\"Deep.pm\",\"line\":\"5\"}"
+        ],
+        "none": [
+          "SubRole.pm"
+        ]
+      },
+      "status": "gold",
+      "note": "goto-implementation on the requires 'fetch' atom fans out to every transitive composer's def \u2014 Composer directly, Deep through the SubRole hop. SubRole's own re-requires marker is a contract re-declaration, not an implementation, and must be excluded."
+    },
+    {
+      "id": "role-requires-impl-from-method-call",
+      "difficulty": "tricky",
+      "semantic_area": "roles",
+      "root": "gold-corpus/role-fixture",
+      "file": "lib/My/Role.pm",
+      "line": 7,
+      "col": 18,
+      "expect": {
+        "all": [
+          "{\"col\":\"5\",\"file\":\"Composer.pm\",\"line\":\"5\"}",
+          "{\"col\":\"5\",\"file\":\"Deep.pm\",\"line\":\"5\"}"
+        ],
+        "none": [
+          "SubRole.pm"
+        ]
+      },
+      "status": "gold",
+      "note": "Same fan-out from $self->fetch inside the role body: the call resolves to the requires marker, then the composer walk."
+    }
+  ]
+}

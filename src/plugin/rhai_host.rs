@@ -137,6 +137,7 @@ pub struct RhaiPlugin {
     param_types: Vec<ParamType>,
     type_constraint_names: Vec<String>,
     app_surface_consumers: Vec<String>,
+    role_makers: Vec<String>,
     topic_route_dsl: Option<crate::plugin::TopicRouteDsl>,
     engine: Arc<Engine>,
     ast: Arc<AST>,
@@ -283,6 +284,27 @@ impl RhaiPlugin {
             }
         }
 
+        // `role_makers()` — modules whose `use` makes the consuming
+        // package a role; same optional, fail-safe array-of-strings shape.
+        let mut role_makers: Vec<String> = Vec::new();
+        if signatures.iter().any(|n| n == "role_makers") {
+            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "role_makers", ()) {
+                Ok(arr) => {
+                    for d in arr {
+                        match from_dynamic::<String>(&d) {
+                            Ok(s) => role_makers.push(s),
+                            Err(e) => log::error!(
+                                "plugin `{}` role_makers() bad entry: {}",
+                                id,
+                                e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => log::error!("plugin `{}` role_makers() failed: {}", id, e),
+            }
+        }
+
         // `topic_route_dsl()` — optional manifest map; bad shapes log
         // and disable rather than fail the plugin.
         let mut topic_route_dsl: Option<crate::plugin::TopicRouteDsl> = None;
@@ -310,6 +332,7 @@ impl RhaiPlugin {
             param_types,
             type_constraint_names,
             app_surface_consumers,
+            role_makers,
             topic_route_dsl,
             engine,
             ast: Arc::new(ast),
@@ -399,6 +422,10 @@ impl FrameworkPlugin for RhaiPlugin {
 
     fn app_surface_consumers(&self) -> &[String] {
         &self.app_surface_consumers
+    }
+
+    fn role_makers(&self) -> &[String] {
+        &self.role_makers
     }
 
     fn topic_route_dsl(&self) -> Option<crate::plugin::TopicRouteDsl> {

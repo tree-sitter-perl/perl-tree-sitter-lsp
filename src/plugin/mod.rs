@@ -816,6 +816,17 @@ pub trait FrameworkPlugin: Send + Sync {
         &[]
     }
 
+    /// Modules whose `use` turns the consuming package into a ROLE
+    /// (the plugin-declared extension of core's base set: Moo::Role /
+    /// Moose::Role / Mouse::Role / Role::Tiny). For role engines that
+    /// aren't Moo-shaped — where emitting `SyntheticUse "Moo::Role"`
+    /// would be a lie about the keyword surface — a plugin declares the
+    /// engine module here and consumers are marked roles directly.
+    /// Default empty.
+    fn role_makers(&self) -> &[String] {
+        &[]
+    }
+
     /// A topic-scoped route DSL this plugin owns (the
     /// Mojolicious::Lite shape): file-level route verbs whose implicit
     /// base a [`EmitAction::SetRouteBase`] emission sets and a scope
@@ -1126,6 +1137,14 @@ impl PluginRegistry {
         self.plugins
             .iter()
             .flat_map(|p| p.app_surface_consumers().iter().map(|s| s.as_str()))
+    }
+
+    /// Union of role-maker modules across the registry — the open
+    /// extension of the builder's base role-engine set.
+    pub fn role_makers<'a>(&'a self) -> impl Iterator<Item = &'a str> + 'a {
+        self.plugins
+            .iter()
+            .flat_map(|p| p.role_makers().iter().map(|s| s.as_str()))
     }
 
     /// Fold a constraint constructor → its inner type, asking the plugin(s)

@@ -2946,3 +2946,56 @@ fn test_internal_slot_pokes_join_group_cross_file() {
         edits,
     );
 }
+
+#[test]
+fn test_implementations_of_role_requires_fans_out_to_composers() {
+    use crate::module_index::{CachedModule, ModuleIndex};
+    use std::sync::Arc;
+
+    let idx = ModuleIndex::new_for_test();
+    let mut insert = |name: &str, src: &str| {
+        let analysis = Arc::new(parse(src));
+        idx.insert_cache(
+            name,
+            Some(Arc::new(CachedModule::new(
+                PathBuf::from(format!("/fake/{}.pm", name.replace("::", "/"))),
+                analysis,
+            ))),
+        );
+    };
+    insert("My::Role", "package My::Role;\nuse Moo::Role;\nrequires 'fetch';\n1;\n");
+    insert(
+        "My::Composer",
+        "package My::Composer;\nuse Moo;\nwith 'My::Role';\nsub fetch { 42 }\n1;\n",
+    );
+    // Role-composing-role: re-requires the contract (a marker, not an
+    // implementation) and adds a transitive hop to reach My::Deep.
+    insert(
+        "My::SubRole",
+        "package My::SubRole;\nuse Moo::Role;\nwith 'My::Role';\nrequires 'fetch';\n1;\n",
+    );
+    insert("My::Deep", "package My::Deep;\nuse Moo;\nwith 'My::SubRole';\nsub fetch { 7 }\n1;\n");
+
+    let target = TargetRef {
+        name: "fetch".to_string(),
+        kind: TargetKind::Method { class: "My::Role".to_string() },
+        method_classes: Vec::new(),
+    };
+    let results = implementations_of(Some(&idx), &target);
+    let files: Vec<String> = results
+        .iter()
+        .map(|r| match &r.key {
+            FileKey::Path(p) => p.display().to_string(),
+            FileKey::Url(u) => u.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec!["/fake/My/Composer.pm", "/fake/My/Deep.pm"],
+        "direct + transitive composer defs, sorted; the SubRole re-requires marker excluded",
+    );
+
+    // Non-Method targets have no descendant-implementation semantics.
+    let pkg_target = TargetRef::new("My::Role".to_string(), TargetKind::Package);
+    assert!(implementations_of(Some(&idx), &pkg_target).is_empty());
+}

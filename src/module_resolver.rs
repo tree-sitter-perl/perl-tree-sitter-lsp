@@ -16,7 +16,7 @@ use tree_sitter::Parser;
 
 use crate::cpanfile;
 use crate::module_cache;
-use crate::module_index::{CachedModule, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
+use crate::module_index::{CachedModule, ModuleEdgeIndexes, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
 
 /// Callback invoked after each module is resolved. Used to trigger diagnostic refresh.
 pub type OnResolved = Box<dyn Fn() + Send + Sync>;
@@ -27,8 +27,7 @@ pub type OnResolved = Box<dyn Fn() + Send + Sync>;
 /// allowing the backend to re-publish diagnostics.
 pub fn spawn_resolver(
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
-    reverse_index: Arc<DashMap<String, Vec<String>>>,
-    bridges_index: Arc<DashMap<String, Vec<String>>>,
+    edges: Arc<ModuleEdgeIndexes>,
     stale_modules: Arc<DashMap<String, ()>>,
     available_modules: Arc<DashMap<String, PathBuf>>,
     builtins: Arc<DashMap<String, String>>,
@@ -90,7 +89,7 @@ pub fn spawn_resolver(
                     queue.condvar.notify_one();
                 }
                 // Build reverse index from warmed cache.
-                rebuild_reverse_index(&cache, &reverse_index, &bridges_index);
+                rebuild_reverse_index(&cache, &edges);
             }
 
             // Track which extract version each module was resolved at.
@@ -176,13 +175,7 @@ pub fn spawn_resolver(
                         ),
                         None => log::info!("No exports found for '{}'", module_name),
                     }
-                    insert_into_cache(
-                        &cache,
-                        &reverse_index,
-                        &bridges_index,
-                        &module_name,
-                        result.clone(),
-                    );
+                    insert_into_cache(&cache, &edges, &module_name, result.clone());
 
                     if let Some(ref conn) = db {
                         module_cache::save_to_db(conn, &module_name, &result, "import");
@@ -329,8 +322,7 @@ fn drain_next_batch(queue: &ResolveQueue) -> Vec<String> {
 #[doc(hidden)]
 pub fn spawn_test_resolver(
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
-    reverse_index: Arc<DashMap<String, Vec<String>>>,
-    bridges_index: Arc<DashMap<String, Vec<String>>>,
+    edges: Arc<ModuleEdgeIndexes>,
     stale_modules: Arc<DashMap<String, ()>>,
     available_modules: Arc<DashMap<String, PathBuf>>,
     queue: Arc<ResolveQueue>,
@@ -362,7 +354,7 @@ pub fn spawn_test_resolver(
                 for name in stale_names {
                     stale_modules.insert(name, ());
                 }
-                rebuild_reverse_index(&cache, &reverse_index, &bridges_index);
+                rebuild_reverse_index(&cache, &edges);
             }
 
             let mut seen: HashMap<String, i64> = HashMap::new();
@@ -382,7 +374,7 @@ pub fn spawn_test_resolver(
                     }
 
                     let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
-                    insert_into_cache(&cache, &reverse_index, &bridges_index, &module_name, result.clone());
+                    insert_into_cache(&cache, &edges, &module_name, result.clone());
                     if let Some(ref conn) = db {
                         module_cache::save_to_db(conn, &module_name, &result, "import");
                     }
@@ -415,46 +407,15 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
     guard.clone().flatten()
 }
 
-/// Names of every module-visible symbol in the analysis. Variables and
-/// fields are skipped — they're file-local and can't be queried across
-/// files. Deduplicated via a set first so a module with 10 subs named
-/// `foo` (unlikely but possible) contributes one entry, not ten.
-fn indexable_symbol_names(analysis: &crate::file_analysis::FileAnalysis) -> Vec<String> {
-    use crate::file_analysis::SymKind;
-    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for sym in &analysis.symbols {
-        if matches!(
-            sym.kind,
-            SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class
-                | SymKind::Module | SymKind::HashKeyDef | SymKind::Handler,
-        ) {
-            names.insert(sym.name.clone());
-        }
-    }
-    names.into_iter().collect()
-}
-
-/// Insert a resolved module into the cache and update the reverse index.
+/// Insert a resolved module into the cache and update the edge indexes.
 fn insert_into_cache(
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
-    reverse_index: &DashMap<String, Vec<String>>,
-    bridges_index: &DashMap<String, Vec<String>>,
+    edges: &ModuleEdgeIndexes,
     module_name: &str,
     result: Option<Arc<CachedModule>>,
 ) {
     if let Some(ref cached) = result {
-        for name in reverse_index_names(&cached.analysis) {
-            reverse_index
-                .entry(name)
-                .or_default()
-                .push(module_name.to_string());
-        }
-        for class in bridge_classes(&cached.analysis) {
-            bridges_index
-                .entry(class)
-                .or_default()
-                .push(module_name.to_string());
-        }
+        edges.feed(module_name, &cached.analysis);
     } else if matches!(cache.get(module_name).as_deref(), Some(Some(_))) {
         // On-demand @INC resolution missed this module (`None`), but the
         // workspace indexer already built it (e.g. a project module under a
@@ -467,56 +428,18 @@ fn insert_into_cache(
     cache.insert(module_name.to_string(), result);
 }
 
-/// Every name `find_exporters` might need to locate this module by: declared
-/// symbols plus the export/export_ok lists. XS exporters (e.g. Scalar::Util's
-/// `weaken`) name functions with no Perl body, so they live only in the export
-/// lists, never in `symbols` — indexing symbols alone leaves a warmed module
-/// invisible to export-attribution diagnostics (B6).
-pub fn reverse_index_names(analysis: &crate::file_analysis::FileAnalysis) -> Vec<String> {
-    let mut names: std::collections::HashSet<String> =
-        indexable_symbol_names(analysis).into_iter().collect();
-    names.extend(analysis.export.iter().cloned());
-    names.extend(analysis.export_ok.iter().cloned());
-    names.into_iter().collect()
-}
-
-/// The bridge classes an analysis' plugin namespaces declare — the
-/// feed for `bridges_index`, deduped. Shared by every cache-insert and
-/// warm-rebuild site so dependency modules and workspace modules
-/// register bridges identically.
-pub fn bridge_classes(analysis: &crate::file_analysis::FileAnalysis) -> Vec<String> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for ns in &analysis.plugin_namespaces {
-        for crate::file_analysis::Bridge::Class(c) in &ns.bridges {
-            seen.insert(c.clone());
-        }
-    }
-    seen.into_iter().collect()
-}
-
-/// Rebuild reverse index from existing cache (e.g. after warming from SQLite).
+/// Rebuild edge indexes from existing cache (e.g. after warming from
+/// SQLite). The warm path writes blobs straight into the cache without
+/// touching the indexes, so skipping this leaves every reverse lookup
+/// blind on warm starts (cold/warm attribution, the B6 class).
 fn rebuild_reverse_index(
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
-    reverse_index: &DashMap<String, Vec<String>>,
-    bridges_index: &DashMap<String, Vec<String>>,
+    edges: &ModuleEdgeIndexes,
 ) {
+    edges.clear();
     for entry in cache.iter() {
         if let Some(ref cached) = *entry.value() {
-            for name in reverse_index_names(&cached.analysis) {
-                reverse_index
-                    .entry(name)
-                    .or_default()
-                    .push(entry.key().clone());
-            }
-            // Bridges ride the same rebuild — the warm path that made
-            // dependency-registered helpers invisible on every start
-            // after the cold resolve (cold/warm attribution, B6 class).
-            for class in bridge_classes(&cached.analysis) {
-                bridges_index
-                    .entry(class)
-                    .or_default()
-                    .push(entry.key().clone());
-            }
+            edges.feed(entry.key(), &cached.analysis);
         }
     }
 }

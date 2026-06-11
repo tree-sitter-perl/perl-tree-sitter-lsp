@@ -14932,3 +14932,54 @@ sub run {
         "no junk ref for the outer interpolation scalar",
     );
 }
+
+#[test]
+fn test_plugin_declared_role_maker_marks_consumer_as_role() {
+    // The role-maker set is OPEN: core holds no list (the base engines
+    // live in frameworks/moo.rhai's manifest), and any plugin can
+    // declare another engine. A registry with ONLY this plugin proves
+    // the manifest alone carries the fact.
+    let plugin_src = r#"
+        fn id() { "house-role-kit" }
+        fn triggers() { [ #{ UsesModule: "My::CustomRole" } ] }
+        fn role_makers() { ["My::CustomRole"] }
+    "#;
+    let engine = std::sync::Arc::new(crate::plugin::rhai_host::make_engine());
+    let plugin = crate::plugin::rhai_host::RhaiPlugin::from_source(plugin_src, engine)
+        .expect("plugin compiles");
+    let mut reg = crate::plugin::PluginRegistry::new();
+    reg.register(Box::new(plugin));
+
+    let source = "package House::Role;\nuse My::CustomRole;\n1;\n";
+    let mut parser = create_parser();
+    let tree = parser.parse(source, None).unwrap();
+    let fa = build_with_plugins(&tree, source.as_bytes(), std::sync::Arc::new(reg));
+    assert!(
+        fa.is_role_package("House::Role"),
+        "plugin-declared role maker must mark the consumer as a role",
+    );
+    assert!(
+        !fa.is_role_package("My::CustomRole"),
+        "the maker module itself is not thereby a role",
+    );
+}
+
+#[test]
+fn test_bundled_moo_manifest_carries_base_role_engines() {
+    // Regression net for the core-list deletion: the four base engines
+    // ride frameworks/moo.rhai's role_makers() manifest through the
+    // default registry. If the manifest breaks (rhai parse error, a
+    // renamed fn), this is the test that says so directly.
+    let source = "package R1;\nuse Moo::Role;\npackage R2;\nuse Moose::Role;\n\
+                  package R3;\nuse Mouse::Role;\npackage R4;\nuse Role::Tiny;\n\
+                  package C1;\nuse Moo;\npackage C2;\nuse Role::Tiny::With;\n1;\n";
+    let mut parser = create_parser();
+    let tree = parser.parse(source, None).unwrap();
+    let fa = build(&tree, source.as_bytes());
+    for role in ["R1", "R2", "R3", "R4"] {
+        assert!(fa.is_role_package(role), "{role} should be a role");
+    }
+    for class in ["C1", "C2"] {
+        assert!(!fa.is_role_package(class), "{class} should NOT be a role");
+    }
+}

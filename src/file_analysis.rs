@@ -233,6 +233,13 @@ pub trait CrossFileLookup {
         class_name: &str,
         f: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>, &Symbol),
     );
+    /// Inverse inheritance/composition walk: every (package, module)
+    /// pair whose package transitively `isa`/composes `class`.
+    fn for_each_descendant_package(
+        &self,
+        class: &str,
+        visit: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>) -> std::ops::ControlFlow<()>,
+    );
 }
 
 // ---- Serde proxy for tree_sitter::Point ----
@@ -2284,10 +2291,32 @@ pub struct FileAnalysis {
 
     /// Per-role `requires` lists: the method contracts a composing
     /// class must fulfill. The synthesized Method symbols carry the
-    /// in-role resolution; this record is the input for the future
-    /// composer-mismatch diagnostic (docs/prompt-role-requires.md).
+    /// in-role resolution; this record feeds the composer-mismatch
+    /// diagnostic (docs/adr/role-contracts.md).
     #[serde(default)]
     pub role_requires: HashMap<String, Vec<String>>,
+
+    /// SymbolIds of `requires`-synthesized contract markers. A marker
+    /// resolves like a Method (in-role `$self->name` dispatch, hover,
+    /// goto-def land on the contract) but is NOT a provision — the
+    /// composer-mismatch check excludes these by id, so a role that
+    /// both requires AND defines a name (the default-implementation
+    /// pattern) still counts the real def.
+    #[serde(default)]
+    pub contract_symbols: HashSet<SymbolId>,
+
+    /// Packages whose recorded parent list is INCOMPLETE — at least
+    /// one `with`/`extends` argument didn't fold to a literal name
+    /// (runtime-generated roles: `with ReportProxy(type => ...)`).
+    /// `class_has_unresolved_ancestor` treats these as an unresolved
+    /// edge so inheritance-dependent diagnostics stay honest-silent.
+    #[serde(default)]
+    pub dynamic_parent_packages: HashSet<String>,
+
+    /// Packages that ARE roles — the baked verdict behind
+    /// `is_role_package`. Fed by the builder's open role-maker set.
+    #[serde(default)]
+    pub role_packages: HashSet<String>,
 
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
@@ -2351,6 +2380,9 @@ pub struct FileAnalysisParts {
     pub reassigned_scalars: HashSet<String>,
     pub key_writes: Vec<KeyWrite>,
     pub role_requires: HashMap<String, Vec<String>>,
+    pub contract_symbols: HashSet<SymbolId>,
+    pub dynamic_parent_packages: HashSet<String>,
+    pub role_packages: HashSet<String>,
 }
 
 /// One projection of a field/attr decl — the entity that encodes group
@@ -2476,6 +2508,9 @@ impl FileAnalysis {
             reassigned_scalars,
             key_writes,
             role_requires,
+            contract_symbols,
+            dynamic_parent_packages,
+            role_packages,
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
@@ -2509,6 +2544,9 @@ impl FileAnalysis {
             reassigned_scalars,
             key_writes,
             role_requires,
+            contract_symbols,
+            dynamic_parent_packages,
+            role_packages,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -6524,6 +6562,18 @@ impl FileAnalysis {
 
         let mut incomplete = false;
         self.for_each_ancestor_class(class_name, module_index, |cls| {
+            // A parent edge that never folded to a name (runtime-
+            // generated role: `with ReportProxy(type => ...)`) is as
+            // unresolved as a named parent we can't find — the
+            // recorded list isn't the whole ancestry.
+            let dynamic_here = self.dynamic_parent_packages.contains(cls)
+                || module_index
+                    .and_then(|idx| idx.get_cached(cls))
+                    .is_some_and(|c| c.analysis.dynamic_parent_packages.contains(cls));
+            if dynamic_here {
+                incomplete = true;
+                return std::ops::ControlFlow::Break(());
+            }
             let parents = parents_of(
                 cls,
                 &self.package_parents,
@@ -6539,6 +6589,204 @@ impl FileAnalysis {
             std::ops::ControlFlow::Continue(())
         });
         incomplete
+    }
+
+    /// Is `pkg` a role? Single source of the property — consumers ask
+    /// here, never re-derive from use lists. The verdict is baked at
+    /// build time from an OPEN maker set (builder `ROLE_MAKERS` base
+    /// engines ∪ plugin `role_makers()` manifests), so house role
+    /// engines join via plugin declaration with no core change.
+    pub fn is_role_package(&self, pkg: &str) -> bool {
+        self.role_packages.contains(pkg)
+    }
+
+    /// The composer-mismatch check (docs/adr/role-contracts.md): for
+    /// each local package with role parents, every name in each
+    /// transitively-composed role's `role_requires` must be PROVIDED —
+    /// a real def anywhere in the composer's MRO (local sub, inherited
+    /// method, `has` accessor, or a sibling role's def; a `requires`
+    /// marker is a contract re-declaration, never a provision).
+    ///
+    /// Stays honest-silent when it can't know: roles defer their
+    /// obligations to their eventual class composers, an unresolved
+    /// ancestor may provide anything, and an AUTOLOAD anywhere in the
+    /// MRO can satisfy any contract at runtime.
+    pub fn unfulfilled_role_requires(
+        &self,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<UnfulfilledRequire> {
+        use std::collections::VecDeque;
+
+        // Role facts for a class that may live in this file or in the
+        // index: (requires list, parents). `None` = not a role — the
+        // requires walk stops there (a base CLASS's composed roles were
+        // checked at its own composition site).
+        let role_facts = |c: &str| -> Option<(Vec<String>, Vec<String>)> {
+            let is_local = self
+                .symbols
+                .iter()
+                .any(|s| matches!(s.kind, SymKind::Package | SymKind::Class) && s.name == c);
+            if is_local {
+                if !self.is_role_package(c) {
+                    return None;
+                }
+                return Some((
+                    self.role_requires.get(c).cloned().unwrap_or_default(),
+                    self.package_parents.get(c).cloned().unwrap_or_default(),
+                ));
+            }
+            let cached = module_index?.get_cached(c)?;
+            if !cached.analysis.is_role_package(c) {
+                return None;
+            }
+            Some((
+                cached.analysis.role_requires.get(c).cloned().unwrap_or_default(),
+                cached.analysis.package_parents.get(c).cloned().unwrap_or_default(),
+            ))
+        };
+
+        let mut out: Vec<UnfulfilledRequire> = Vec::new();
+        let mut composers: Vec<&String> = self.package_parents.keys().collect();
+        composers.sort();
+        for pkg in composers {
+            if self.is_role_package(pkg) {
+                continue;
+            }
+            if self.class_has_unresolved_ancestor(pkg, module_index) {
+                continue;
+            }
+            if self
+                .resolve_method_in_ancestors(pkg, "AUTOLOAD", module_index)
+                .is_some()
+            {
+                continue;
+            }
+
+            // Gather (name, declaring role, direct parent) over the
+            // role-only reachable set from each direct parent.
+            let mut required: Vec<(String, String, String)> = Vec::new();
+            for direct in &self.package_parents[pkg] {
+                let mut queue: VecDeque<String> = VecDeque::from([direct.clone()]);
+                let mut seen: HashSet<String> = HashSet::new();
+                while let Some(c) = queue.pop_front() {
+                    if !seen.insert(c.clone()) || seen.len() > 21 {
+                        continue;
+                    }
+                    let Some((requires, parents)) = role_facts(&c) else { continue };
+                    for n in requires {
+                        required.push((n, c.clone(), direct.clone()));
+                    }
+                    queue.extend(parents);
+                }
+            }
+
+            let mut checked: HashSet<String> = HashSet::new();
+            for (name, role, via_parent) in required {
+                if !checked.insert(name.clone()) {
+                    continue;
+                }
+                let mut provided = false;
+                self.for_each_ancestor_class(pkg, module_index, |a| {
+                    let here = self.class_provides_method(a, &name)
+                        || module_index
+                            .and_then(|idx| idx.get_cached(a))
+                            .is_some_and(|c| c.analysis.provides_method_anywhere(&name))
+                        || module_index.is_some_and(|idx| {
+                            // Cross-package typeglob installs + plugin
+                            // bridges (mirrors `method_resolution_on_class`
+                            // arm c). The typeglob lookup rides the
+                            // names index, which the markers feed too —
+                            // re-check the home module package-attributed
+                            // and contract-excluded, or every requires
+                            // satisfies itself.
+                            idx.module_declaring_method_in_package(&name, a)
+                                .and_then(|home| idx.get_cached(&home))
+                                .is_some_and(|c| {
+                                    c.analysis.provides_method_in_package(&name, a)
+                                }) || {
+                                let mut hit = false;
+                                idx.for_each_entity_bridged_to(a, &mut |_m, _c, sym| {
+                                    if !hit
+                                        && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                                        && sym.name == name
+                                    {
+                                        hit = true;
+                                    }
+                                });
+                                hit
+                            }
+                        });
+                    if here {
+                        provided = true;
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                });
+                if !provided {
+                    out.push(UnfulfilledRequire {
+                        package: pkg.clone(),
+                        role,
+                        name,
+                        via_parent,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Does this file give class `cls` a REAL def of `name` — a local
+    /// Sub/Method symbol (incl. `has` accessors and plugin-namespace
+    /// entities bridged to `cls`) that is not a `requires` contract
+    /// marker? The provision predicate for the composer-mismatch check;
+    /// `method_resolution_on_class` stays marker-inclusive on purpose
+    /// (in-role `$self->name` dispatch lands on the contract).
+    fn class_provides_method(&self, cls: &str, name: &str) -> bool {
+        for &sid in self.symbols_named(name) {
+            let sym = self.symbol(sid);
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                && self.symbol_in_class(sid, cls)
+                && !self.contract_symbols.contains(&sid)
+            {
+                return true;
+            }
+        }
+        self.plugin_namespaces.iter().any(|ns| {
+            ns.bridges.iter().any(|b| matches!(b, Bridge::Class(c) if c == cls))
+                && ns.entities.iter().any(|sid| {
+                    self.symbols.get(sid.0 as usize).is_some_and(|s| {
+                        matches!(s.kind, SymKind::Sub | SymKind::Method) && s.name == name
+                    })
+                })
+        })
+    }
+
+    /// Any non-contract Sub/Method named `name` in this file,
+    /// regardless of package attribution — the cross-file flavor of
+    /// `class_provides_method`, matching `CachedModule::has_sub`'s
+    /// name-only looseness while excluding `requires` markers. The
+    /// distinction is load-bearing for the default-implementation
+    /// pattern: a role that both requires AND defines a name must
+    /// count as providing it.
+    pub fn provides_method_anywhere(&self, name: &str) -> bool {
+        self.symbols.iter().enumerate().any(|(i, s)| {
+            s.name == name
+                && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                && !self.contract_symbols.contains(&SymbolId(i as u32))
+        })
+    }
+
+    /// `provides_method_anywhere` narrowed to symbols attributed to
+    /// `package` — the contract-excluded sibling of
+    /// `has_sub_in_package`, for the typeglob-install provision arm.
+    pub fn provides_method_in_package(&self, name: &str, package: &str) -> bool {
+        self.symbols.iter().enumerate().any(|(i, s)| {
+            s.name == name
+                && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                && s.package.as_deref() == Some(package)
+                && !self.contract_symbols.contains(&SymbolId(i as u32))
+        })
     }
 
     /// Collect every Handler visible from `class_name` whose `dispatchers`
@@ -7234,6 +7482,18 @@ pub const PRIORITY_UNIMPORTED: u8 = 25;
 pub const PRIORITY_DYNAMIC: u8 = 50;
 
 // ---- Method resolution types ----
+
+/// One unmet role contract: `package` composes (transitively) `role`,
+/// which `requires 'name'`, and nothing in `package`'s MRO provides
+/// it. `via_parent` is the direct parent edge the role was reached
+/// through — the `with 'X'` ref the diagnostic anchors to.
+#[derive(Debug, Clone)]
+pub struct UnfulfilledRequire {
+    pub package: String,
+    pub role: String,
+    pub name: String,
+    pub via_parent: String,
+}
 
 /// Result of resolving a method through the inheritance chain.
 #[derive(Debug, Clone)]

@@ -57,33 +57,143 @@ pub(crate) struct WorkspaceRootChannel {
 
 /// Concurrent module cache with background resolution.
 ///
+/// The reverse-edge maps over the module cache, bundled so every feed
+/// site updates all of them in lockstep. Every map answers "which
+/// modules…" for a different edge:
+///
+/// - `names`: symbol/export name → modules declaring or exporting it.
+///   The single generic "find me modules with symbol X" primitive —
+///   hover, signature help, goto-def, auto-import, and the
+///   unimported-completion path all route through it instead of
+///   reinventing per-feature cache walks. Covers every module-visible
+///   symbol kind (Sub, Method, Package, Class, Module, HashKeyDef,
+///   Handler) plus the export/export_ok lists (XS exporters name
+///   functions with no Perl body). Callers wanting narrower semantics
+///   filter via per-module inspection.
+/// - `bridges`: class → modules declaring a `PluginNamespace` whose
+///   `bridges` list contains `Bridge::Class(class)`. The one reverse
+///   index for plugin-synthesized content; queried through
+///   `for_each_entity_bridged_to`.
+/// - `children`: parent class/role → modules containing a package
+///   that `isa`/composes it (inverse `package_parents`). The
+///   long-distance primitive: "who composes this role" /
+///   "who subclasses this class" in O(1).
+///
+/// The bundle exists because the feeds must never diverge across the
+/// resolve insert path, the SQLite warm rebuild, and workspace
+/// registration — a map fed on insert but not on rebuild serves cold
+/// sessions and starves warm ones (the twice-paid B6 lesson). One
+/// `feed()` per site makes a missed map unrepresentable.
+pub struct ModuleEdgeIndexes {
+    names: DashMap<String, Vec<String>>,
+    bridges: DashMap<String, Vec<String>>,
+    children: DashMap<String, Vec<String>>,
+}
+
+impl ModuleEdgeIndexes {
+    pub fn new() -> Self {
+        ModuleEdgeIndexes {
+            names: DashMap::new(),
+            bridges: DashMap::new(),
+            children: DashMap::new(),
+        }
+    }
+
+    /// Register every edge `analysis` contributes under `module_name`.
+    /// The ONLY write path besides `purge_module`/`clear` — new edge
+    /// maps get their extraction added here and nowhere else.
+    pub fn feed(&self, module_name: &str, analysis: &FileAnalysis) {
+        for name in Self::indexable_names(analysis) {
+            self.names
+                .entry(name)
+                .or_default()
+                .push(module_name.to_string());
+        }
+        for class in Self::bridge_classes(analysis) {
+            self.bridges
+                .entry(class)
+                .or_default()
+                .push(module_name.to_string());
+        }
+        for parent in Self::parent_classes(analysis) {
+            self.children
+                .entry(parent)
+                .or_default()
+                .push(module_name.to_string());
+        }
+    }
+
+    /// Remove `module_name` from every bucket of every map. Runs
+    /// before re-registration so stale edges from a prior version of
+    /// the same module don't accumulate (phantom-module lookups).
+    pub fn purge_module(&self, module_name: &str) {
+        for map in [&self.names, &self.bridges, &self.children] {
+            map.retain(|_key, mods| {
+                mods.retain(|m| m != module_name);
+                !mods.is_empty()
+            });
+        }
+    }
+
+    pub fn clear(&self) {
+        self.names.clear();
+        self.bridges.clear();
+        self.children.clear();
+    }
+
+    /// Every name `find_exporters` might need to locate a module by:
+    /// declared module-visible symbols plus the export/export_ok lists.
+    /// Variables and fields are skipped — file-local, not queryable
+    /// across files.
+    fn indexable_names(analysis: &FileAnalysis) -> Vec<String> {
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for sym in &analysis.symbols {
+            if matches!(
+                sym.kind,
+                SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class
+                    | SymKind::Module | SymKind::HashKeyDef | SymKind::Handler,
+            ) {
+                names.insert(sym.name.clone());
+            }
+        }
+        names.extend(analysis.export.iter().cloned());
+        names.extend(analysis.export_ok.iter().cloned());
+        names.into_iter().collect()
+    }
+
+    /// The bridge classes an analysis' plugin namespaces declare, deduped.
+    fn bridge_classes(analysis: &FileAnalysis) -> Vec<String> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ns in &analysis.plugin_namespaces {
+            for crate::file_analysis::Bridge::Class(c) in &ns.bridges {
+                seen.insert(c.clone());
+            }
+        }
+        seen.into_iter().collect()
+    }
+
+    /// Every parent class/role any package in the analysis records —
+    /// the values of `package_parents`, deduped. `use parent`/`use
+    /// base`/`@ISA`/`class :isa`/`:does`/`with` all land here, so the
+    /// `children` map covers inheritance and role composition alike.
+    fn parent_classes(analysis: &FileAnalysis) -> Vec<String> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for parents in analysis.package_parents.values() {
+            for p in parents {
+                seen.insert(p.clone());
+            }
+        }
+        seen.into_iter().collect()
+    }
+}
+
 /// Async LSP handlers read from `cache` (zero I/O). The background resolver
 /// thread populates the cache by parsing `.pm` files in-process.
 #[allow(dead_code)]
 pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
-    /// Reverse symbol index: name → list of module names whose
-    /// `FileAnalysis` contains at least one symbol with that name
-    /// (of any module-visible kind — Sub, Method, Package, Class,
-    /// Module, HashKeyDef, Handler). Populated at resolve + cache-
-    /// warm time. Queries that want narrower semantics (only exports,
-    /// only Handlers on a given class, only methods of a given kind,
-    /// etc.) filter the result themselves via per-module inspection.
-    ///
-    /// This is the single generic "find me modules with symbol X"
-    /// primitive — hover, signature help, goto-def, auto-import, and
-    /// the unimported-completion path all route through it instead
-    /// of reinventing per-feature cache walks. Different features
-    /// apply their own override / stacking rules on top.
-    reverse_index: Arc<DashMap<String, Vec<String>>>,
-    /// Class → modules declaring at least one `PluginNamespace`
-    /// whose `bridges` list contains `Bridge::Class(class)`. The
-    /// one reverse index for plugin-synthesized content — explicit
-    /// (plugin declares its bridges), supports multiple instances
-    /// (each app is its own namespace), and avoids the inferred
-    /// "any symbol with this package" variant that used to live
-    /// alongside this one. Queried through `for_each_entity_bridged_to`.
-    bridges_index: Arc<DashMap<String, Vec<String>>>,
+    /// See `ModuleEdgeIndexes` — names + bridges + children reverse maps.
+    edges: Arc<ModuleEdgeIndexes>,
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
     stale_modules: Arc<DashMap<String, ()>>,
@@ -104,7 +214,7 @@ pub struct ModuleIndex {
 impl ModuleIndex {
     pub fn new(client: Client, on_diagnostics_refresh: impl Fn() + Send + Sync + 'static) -> Self {
         let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
-        let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let edges = Arc::new(ModuleEdgeIndexes::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
         let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -122,14 +232,12 @@ impl ModuleIndex {
             condvar: Condvar::new(),
         });
 
-        let bridges_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
         let refresh = Arc::new(on_diagnostics_refresh);
         let refresh_clone = Arc::clone(&refresh);
 
         module_resolver::spawn_resolver(
             Arc::clone(&cache),
-            Arc::clone(&reverse_index),
-            Arc::clone(&bridges_index),
+            Arc::clone(&edges),
             Arc::clone(&stale_modules),
             Arc::clone(&available_modules),
             Arc::clone(&builtins),
@@ -142,8 +250,7 @@ impl ModuleIndex {
 
         ModuleIndex {
             cache,
-            reverse_index,
-            bridges_index,
+            edges,
             stale_modules,
             available_modules,
             builtins,
@@ -315,7 +422,7 @@ impl ModuleIndex {
     /// Look up the return type of an imported function. Zero I/O.
     #[cfg(test)]
     pub fn get_return_type_cached(&self, func_name: &str) -> Option<InferredType> {
-        let modules = self.reverse_index.get(func_name)?;
+        let modules = self.edges.names.get(func_name)?;
         for module_name in modules.value() {
             if let Some(cached) = self.get_cached(module_name) {
                 if let Some(ty) = cached.analysis.sub_return_type_local(func_name) {
@@ -351,7 +458,7 @@ impl ModuleIndex {
     /// own kind/detail filter + override/stacking semantics after
     /// picking which specific symbols matter to them.
     pub fn modules_with_symbol(&self, name: &str) -> Vec<String> {
-        match self.reverse_index.get(name) {
+        match self.edges.names.get(name) {
             Some(modules) => {
                 let mut result = modules.clone();
                 result.sort();
@@ -392,8 +499,7 @@ impl ModuleIndex {
         // gold harness. The thread blocks until `set_workspace_root`
         // fires in `cli_full_startup`.
         let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
-        let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
-        let bridges_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let edges = Arc::new(ModuleEdgeIndexes::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
         let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -413,8 +519,7 @@ impl ModuleIndex {
 
         module_resolver::spawn_test_resolver(
             Arc::clone(&cache),
-            Arc::clone(&reverse_index),
-            Arc::clone(&bridges_index),
+            Arc::clone(&edges),
             Arc::clone(&stale_modules),
             Arc::clone(&available_modules),
             Arc::clone(&queue),
@@ -424,8 +529,7 @@ impl ModuleIndex {
 
         ModuleIndex {
             cache,
-            reverse_index,
-            bridges_index,
+            edges,
             stale_modules,
             available_modules,
             builtins,
@@ -441,8 +545,7 @@ impl ModuleIndex {
     #[cfg(test)]
     pub fn new_for_test() -> Self {
         let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
-        let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
-        let bridges_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let edges = Arc::new(ModuleEdgeIndexes::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
         let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -462,8 +565,7 @@ impl ModuleIndex {
 
         module_resolver::spawn_test_resolver(
             Arc::clone(&cache),
-            Arc::clone(&reverse_index),
-            Arc::clone(&bridges_index),
+            Arc::clone(&edges),
             Arc::clone(&stale_modules),
             Arc::clone(&available_modules),
             Arc::clone(&queue),
@@ -473,8 +575,7 @@ impl ModuleIndex {
 
         ModuleIndex {
             cache,
-            reverse_index,
-            bridges_index,
+            edges,
             stale_modules,
             available_modules,
             builtins,
@@ -500,14 +601,8 @@ impl ModuleIndex {
 
     /// Insert a module directly into the cache (for CLI and testing).
     pub fn insert_cache(&self, module_name: &str, cached: Option<Arc<CachedModule>>) {
-        // Update reverse index.
         if let Some(ref m) = cached {
-            for func in m.analysis.export.iter().chain(m.analysis.export_ok.iter()) {
-                self.reverse_index
-                    .entry(func.clone())
-                    .or_default()
-                    .push(module_name.to_string());
-            }
+            self.edges.feed(module_name, &m.analysis);
         }
         self.cache.insert(module_name.to_string(), cached);
     }
@@ -529,41 +624,13 @@ impl ModuleIndex {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
 
-        // Re-registration happens on file-watcher save. Old edges in
-        // `reverse_index` and `bridges_index` still point at this module,
-        // so without a purge they accumulate forever — a name or bridge
-        // that a previous version declared lingers after it's removed,
-        // and cross-file lookups return phantom modules.
-        self.purge_module_edges(&module_name);
-
-        let mut name_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for sym in &analysis.symbols {
-            // Name-keyed reverse index (every module-visible symbol).
-            if matches!(
-                sym.kind,
-                SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class
-                    | SymKind::Module | SymKind::HashKeyDef | SymKind::Handler,
-            ) && name_seen.insert(sym.name.as_str()) {
-                self.reverse_index
-                    .entry(sym.name.clone())
-                    .or_default()
-                    .push(module_name.clone());
-            }
-        }
-        // Bridges index: any PluginNamespace whose Bridge::Class(c)
-        // matches means this module declares a namespace reachable
-        // from class `c`. One entry per class per module (dedup).
-        let mut bridge_classes_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for ns in &analysis.plugin_namespaces {
-            for crate::file_analysis::Bridge::Class(c) in &ns.bridges {
-                if bridge_classes_seen.insert(c.clone()) {
-                    self.bridges_index
-                        .entry(c.clone())
-                        .or_default()
-                        .push(module_name.clone());
-                }
-            }
-        }
+        // Re-registration happens on file-watcher save. Old edges still
+        // point at this module, so without a purge they accumulate
+        // forever — a name or bridge that a previous version declared
+        // lingers after it's removed, and cross-file lookups return
+        // phantom modules.
+        self.edges.purge_module(&module_name);
+        self.edges.feed(&module_name, &analysis);
         self.cache.insert(module_name, Some(cached));
     }
 
@@ -575,50 +642,12 @@ impl ModuleIndex {
     /// (the B6 cold/warm attribution regression). The resolver thread already
     /// calls the equivalent rebuild after its own warm.
     pub fn rebuild_reverse_index_from_cache(&self) {
-        self.reverse_index.clear();
-        self.bridges_index.clear();
+        self.edges.clear();
         for entry in self.cache.iter() {
             if let Some(ref cached) = *entry.value() {
-                for name in crate::module_resolver::reverse_index_names(&cached.analysis) {
-                    self.reverse_index
-                        .entry(name)
-                        .or_default()
-                        .push(entry.key().clone());
-                }
-                // Bridges too — same cold/warm-attribution class as the
-                // reverse index above: the warm path writes blobs straight
-                // into the cache, so a helper registered in a dependency
-                // (DefaultHelpers) was reachable on the cold run that
-                // resolved it and INVISIBLE on every warm start after.
-                let mut seen: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
-                for ns in &cached.analysis.plugin_namespaces {
-                    for crate::file_analysis::Bridge::Class(c) in &ns.bridges {
-                        if seen.insert(c.as_str()) {
-                            self.bridges_index
-                                .entry(c.clone())
-                                .or_default()
-                                .push(entry.key().clone());
-                        }
-                    }
-                }
+                self.edges.feed(entry.key(), &cached.analysis);
             }
         }
-    }
-
-    /// Remove `module_name` from every `reverse_index` and `bridges_index`
-    /// bucket it currently sits in. Called from
-    /// `register_workspace_module` before the re-insert so stale edges
-    /// from a prior version of the same module don't accumulate.
-    fn purge_module_edges(&self, module_name: &str) {
-        self.reverse_index.retain(|_name, mods| {
-            mods.retain(|m| m != module_name);
-            !mods.is_empty()
-        });
-        self.bridges_index.retain(|_class, mods| {
-            mods.retain(|m| m != module_name);
-            !mods.is_empty()
-        });
     }
 
     /// Every cached module that declares at least one `PluginNamespace`
@@ -627,7 +656,7 @@ impl ModuleIndex {
     /// `FileAnalysis` and iterate. Explicit bridges rather than
     /// symbol-package inference.
     pub fn modules_bridging_to(&self, class_name: &str) -> Vec<String> {
-        match self.bridges_index.get(class_name) {
+        match self.edges.bridges.get(class_name) {
             Some(mods) => {
                 let mut result = mods.clone();
                 result.sort();
@@ -635,6 +664,66 @@ impl ModuleIndex {
                 result
             }
             None => Vec::new(),
+        }
+    }
+
+    /// Every cached module containing a package that directly lists
+    /// `class_name` as a parent (`isa` or role composition — the
+    /// `children` edge map). Direct children only; transitive walks go
+    /// through `for_each_descendant_package`.
+    pub fn modules_with_parent(&self, class_name: &str) -> Vec<String> {
+        match self.edges.children.get(class_name) {
+            Some(mods) => {
+                let mut result = mods.clone();
+                result.sort();
+                result.dedup();
+                result
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Breadth-first walk over the inverse inheritance/composition
+    /// graph from `class`: visits every (package, module) pair whose
+    /// package transitively `isa`/composes `class`. The role-contracts
+    /// fan-out — "who implements this role's contract" is exactly the
+    /// transitive composer set. Bounded by a package seen-set (cycles,
+    /// diamonds) and a fan-out cap; never does I/O. `visit` returns
+    /// `ControlFlow::Break` to stop early.
+    pub fn for_each_descendant_package<F>(&self, class: &str, mut visit: F)
+    where
+        F: FnMut(&str, &Arc<CachedModule>) -> std::ops::ControlFlow<()>,
+    {
+        const MAX: usize = 512;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<String> =
+            std::collections::VecDeque::from([class.to_string()]);
+        let mut visited = 0usize;
+        while let Some(current) = queue.pop_front() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            visited += 1;
+            if visited > MAX {
+                break;
+            }
+            for module_name in self.modules_with_parent(&current) {
+                let Some(cached) = self.get_cached(&module_name) else { continue };
+                // A module can hold several packages; only the ones
+                // actually listing `current` as a parent are children.
+                for (pkg, parents) in &cached.analysis.package_parents {
+                    if !parents.iter().any(|p| p == &current) {
+                        continue;
+                    }
+                    if seen.contains(pkg) {
+                        continue;
+                    }
+                    if visit(pkg, &cached).is_break() {
+                        return;
+                    }
+                    queue.push_back(pkg.clone());
+                }
+            }
         }
     }
 
@@ -775,6 +864,14 @@ impl CrossFileLookup for ModuleIndex {
         f: &mut dyn FnMut(&str, &Arc<CachedModule>, &crate::file_analysis::Symbol),
     ) {
         self.for_each_entity_bridged_to(class_name, f)
+    }
+
+    fn for_each_descendant_package(
+        &self,
+        class: &str,
+        visit: &mut dyn FnMut(&str, &Arc<CachedModule>) -> std::ops::ControlFlow<()>,
+    ) {
+        self.for_each_descendant_package(class, visit)
     }
 }
 

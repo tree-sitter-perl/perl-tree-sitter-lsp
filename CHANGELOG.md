@@ -4,6 +4,41 @@ All notable changes to perl-lsp are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the published
 crate / VS Code extension versions.
 
+## Unreleased
+
+### Role contracts, part 2 — long-distance intelligence
+
+- **Go-to-implementation** (`textDocument/implementation`, new capability).
+  On a role's `requires 'name'` marker — or on `$self->name` inside the role
+  body — fans out to every transitive composer's definition of the contract.
+  Goto-def stays on the contract; references stay call sites. On a plain
+  class method it returns subclass overrides. CLI mirror:
+  `perl-lsp --implementations <root> <file> <line> <col>`.
+- **Composer-mismatch diagnostic** (`role-requires-unfulfilled`, WARNING).
+  A package composing a role must provide every `requires`d name — local
+  sub, inherited method, `has` accessor, or a sibling role's def. Anchored
+  on the `with 'Role'` ref. Honest-silent when it can't know: roles defer
+  obligations to their class composers, AUTOLOAD satisfies anything, an
+  unresolved ancestor may provide anything. A role that both requires AND
+  defines a name (the default-implementation pattern) counts as providing
+  it. Calibrated to zero false positives on the 2,293-module substrate and
+  on a large production codebase.
+- **Runtime-generated parents recorded as incomplete ancestry.** `with
+  ReportProxy(type => ...)` — a parent edge that doesn't fold to a literal
+  name — now marks the package's ancestry incomplete, suppressing
+  inheritance-dependent diagnostics on it (removed 41 false
+  `unresolved-method` hints on the calibration codebase).
+- **Plugin-declared role engines** — new `role_makers()` plugin manifest
+  (array of module names whose `use` makes the consumer a role). Core
+  holds no engine list: the base four (Moo::Role, Moose::Role,
+  Mouse::Role, Role::Tiny) ride `frameworks/moo.rhai`'s manifest, and a
+  house role engine is one manifest line in a `.perl-lsp` plugin away.
+- **`children_index`** — new reverse edge in the module index (parent
+  class/role → composing/inheriting modules), the shared primitive for the
+  long-distance family. All reverse maps now live in one bundle fed
+  atomically by every registration path (insert, warm rebuild, workspace
+  scan), making cold/warm index divergence unrepresentable.
+
 ## v0.4.0
 
 A large release: cross-file intelligence everywhere, framework and exporter

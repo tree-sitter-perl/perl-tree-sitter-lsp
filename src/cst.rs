@@ -410,23 +410,47 @@ pub(crate) fn string_list(
     src: &[u8],
     fold: &mut dyn FnMut(Node) -> Vec<(String, Span)>,
 ) -> Vec<(String, Span)> {
+    string_list_with_residue(node, src, fold).0
+}
+
+/// `string_list`, additionally reporting RESIDUE: `true` when at least
+/// one list item did not fold to literal strings — a runtime-generated
+/// element (`with ReportProxy(type => ...)`, an unresolvable bareword
+/// constant, a `map` whose template we can't fold). Callers recording
+/// structural facts (parent edges, export lists) use the flag to mark
+/// the record incomplete instead of silently dropping the item and
+/// presenting a partial list as the whole truth.
+pub(crate) fn string_list_with_residue(
+    node: Node,
+    src: &[u8],
+    fold: &mut dyn FnMut(Node) -> Vec<(String, Span)>,
+) -> (Vec<(String, Span)>, bool) {
     match node.kind() {
         "quoted_word_list" => {
             let mut results = Vec::new();
             qw_word_spans(node, src, &mut results);
-            return results;
+            return (results, false);
         }
         "string_literal" | "interpolated_string_literal" => {
             if let Some(text) = string_content_text(node, src) {
-                return vec![(text, string_content_span(node))];
+                return (vec![(text, string_content_span(node))], false);
             }
-            return vec![];
+            return (vec![], true);
         }
-        "bareword" | "autoquoted_bareword" | "array" => return fold(node),
-        "map_grep_expression" => return map_built_strings(node, src, fold),
+        "bareword" | "autoquoted_bareword" | "array" => {
+            let v = fold(node);
+            let residue = v.is_empty();
+            return (v, residue);
+        }
+        "map_grep_expression" => {
+            let v = map_built_strings(node, src, fold);
+            let residue = v.is_empty();
+            return (v, residue);
+        }
         _ => {}
     }
     let mut results = Vec::new();
+    let mut residue = false;
     for i in 0..node.child_count() {
         let Some(child) = node.child(i) else { continue };
         match child.kind() {
@@ -434,17 +458,35 @@ pub(crate) fn string_list(
             "string_literal" | "interpolated_string_literal" => {
                 if let Some(text) = string_content_text(child, src) {
                     results.push((text, string_content_span(child)));
+                } else {
+                    residue = true;
                 }
             }
             "parenthesized_expression" | "list_expression" | "anonymous_array_expression" => {
-                results.extend(string_list(child, src, fold));
+                let (v, r) = string_list_with_residue(child, src, fold);
+                results.extend(v);
+                residue |= r;
             }
-            "bareword" | "autoquoted_bareword" | "array" => results.extend(fold(child)),
-            "map_grep_expression" => results.extend(map_built_strings(child, src, fold)),
-            _ => {}
+            "bareword" | "autoquoted_bareword" | "array" => {
+                let v = fold(child);
+                residue |= v.is_empty();
+                results.extend(v);
+            }
+            "map_grep_expression" => {
+                let v = map_built_strings(child, src, fold);
+                residue |= v.is_empty();
+                results.extend(v);
+            }
+            // Separators and parens are anonymous; anything NAMED we
+            // didn't fold is a real list item we couldn't read.
+            _ => {
+                if child.is_named() && !matches!(child.kind(), "comment" | "pod") {
+                    residue = true;
+                }
+            }
         }
     }
-    results
+    (results, residue)
 }
 
 /// True when `node` sits in a conditionally-executed position within

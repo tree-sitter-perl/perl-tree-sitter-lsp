@@ -1,0 +1,25 @@
+{
+  "capability": "diagnostics",
+  "rows": [
+    {
+      "id": "role-requires-unfulfilled-broken-composer",
+      "difficulty": "tricky",
+      "semantic_area": "roles",
+      "root": "gold-corpus/role-fixture",
+      "file": "",
+      "expect": {
+        "all": [
+          "role-requires-unfulfilled",
+          "role My::Role requires 'fetch'; My::Broken does not provide it"
+        ],
+        "none": [
+          "My::Composer does not provide",
+          "My::Deep does not provide",
+          "My::Dynamic does not provide"
+        ]
+      },
+      "status": "gold",
+      "note": "Composer-mismatch contract check: Broken composes the role without providing fetch (WARNING — Perl dies at compose time). Composer/Deep provide real defs; Dynamic has a runtime-generated parent (with RoleGen(...)) so its ancestry is incomplete and it must stay honest-silent."
+    }
+  ]
+}

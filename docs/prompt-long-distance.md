@@ -1,6 +1,6 @@
 # Long-distance intelligence — the "look elsewhere" epic
 
-**Status: design corpus, nothing built.** Every item here shares one
+**Status: members 1–2 + the shared primitive LANDED (role-contracts-2); 3–4 open.** Every item here shares one
 inversion: the information a position needs lives in OTHER files that
 REFERENCE this one — composers of this role, callers of this sub,
 entrypoints loading this plugin. Normal resolution flows definition →
@@ -36,7 +36,7 @@ Plus one harder collector for the param-typing member:
 
 ## Members
 
-### 1. requires → implementations (task #27)
+### 1. requires → implementations (task #27) — LANDED
 
 In a role, `requires 'fetch'` declares a contract; the
 implementations live in composers. Protocol call: **goto-def stays on
@@ -51,7 +51,7 @@ marker, then the same fan-out). Cheap once children_index exists;
 the implementation-provider plumbing (capability, backend handler,
 CLI mirror, gold rows) is the bulk.
 
-### 2. Composer-mismatch diagnostic (docs/prompt-role-requires.md)
+### 2. Composer-mismatch diagnostic — LANDED (`adr/role-contracts.md`)
 
 Same edge, opposite assertion: composer P of role R must provide
 every name in `R.role_requires`. Fully designed; blocked on nothing

@@ -74,6 +74,10 @@ async fn main() {
             cli_references(&args[2], &args[3], &args[4], &args[5]);
             return;
         }
+        Some("--implementations") if args.len() >= 6 => {
+            cli_implementations(&args[2], &args[3], &args[4], &args[5]);
+            return;
+        }
         Some("--completion") if args.len() >= 6 => {
             cli_completion(&args[2], &args[3], &args[4], &args[5]);
             return;
@@ -160,6 +164,7 @@ fn print_usage() {
     eprintln!("  perl-lsp --hover [<root>] <file> <line> <col>         Type info and docs (root = cross-file)");
     eprintln!("  perl-lsp --type-at <file> <line> <col>                 Single type query");
     eprintln!("  perl-lsp --definition <root> <file> <line> <col>       Cross-file goto-def");
+    eprintln!("  perl-lsp --implementations <root> <file> <line> <col>  Descendant defs (role composers, overrides)");
     eprintln!("  perl-lsp --references <root> <file> <line> <col>       Cross-file find-refs");
     eprintln!("  perl-lsp --completion <root> <file> <line> <col>       Completion items at point");
     eprintln!("  perl-lsp --signature-help <root> <file> <line> <col>   Signature help at point");
@@ -581,6 +586,13 @@ fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
     print_run_one(&ws, &idx, &cursor_req("references", file, line_str, col_str));
 }
 
+/// --implementations <root> <file> <line> <col> — descendant defs of a
+/// method target (role-requires composers, subclass overrides).
+fn cli_implementations(root: &str, file: &str, line_str: &str, col_str: &str) {
+    let (ws, idx) = cli_full_startup(root);
+    print_run_one(&ws, &idx, &cursor_req("implementations", file, line_str, col_str));
+}
+
 /// --completion <root> <file> <line> <col> — completion items at point.
 fn cli_completion(root: &str, file: &str, line_str: &str, col_str: &str) {
     let (ws, idx) = cli_full_startup(root);
@@ -791,6 +803,27 @@ fn run_one(
                         let (line, col) = sources.display(&path, loc.span.start.row, loc.span.start.column);
                         results.push(serde_json::json!({"file": path, "line": line, "col": col}));
                     }
+                }
+            }
+            Ok(serde_json::to_string_pretty(&results).unwrap())
+        }
+        "implementations" => {
+            let (_s, _t, mut analysis) = parse_file(file);
+            resolve_imports_blocking(idx, &analysis);
+            analysis.enrich_imported_types_with_keys(Some(idx));
+            let mut sources = SourceCache::new();
+            let mut results = Vec::new();
+            if let Some(resolve::ResolvedTarget::Target(t)) =
+                resolve::resolve_symbol(&analysis, point, Some(idx))
+            {
+                for loc in resolve::implementations_of(Some(idx), &t) {
+                    let path = match &loc.key {
+                        file_store::FileKey::Path(p) => p.display().to_string(),
+                        file_store::FileKey::Url(u) => u.to_file_path()
+                            .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
+                    };
+                    let (line, col) = sources.display(&path, loc.span.start.row, loc.span.start.column);
+                    results.push(serde_json::json!({"file": path, "line": line, "col": col}));
                 }
             }
             Ok(serde_json::to_string_pretty(&results).unwrap())

@@ -2746,6 +2746,45 @@ pub fn collect_diagnostics(
         });
     }
 
+    // 5f: role-requires-unfulfilled — the composer-mismatch contract
+    // check (docs/adr/role-contracts.md). WARNING, not HINT: Perl
+    // dies at composition time for this. Anchored to the `with 'Role'`
+    // PackageRef inside the composing package; the package decl is the
+    // fallback (e.g. the parent edge came from a raw `@ISA` push).
+    for u in analysis.unfulfilled_role_requires(Some(module_index)) {
+        let span = analysis
+            .refs
+            .iter()
+            .find(|r| {
+                matches!(r.kind, RefKind::PackageRef)
+                    && r.target_name == u.via_parent
+                    && analysis.package_at(r.span.start) == Some(u.package.as_str())
+            })
+            .map(|r| r.span)
+            .or_else(|| {
+                analysis
+                    .symbols
+                    .iter()
+                    .find(|s| {
+                        matches!(s.kind, FaSymKind::Package | FaSymKind::Class)
+                            && s.name == u.package
+                    })
+                    .map(|s| s.selection_span)
+            });
+        let Some(span) = span else { continue };
+        diagnostics.push(Diagnostic {
+            range: span_to_range(span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("role-requires-unfulfilled".into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "role {} requires '{}'; {} does not provide it",
+                u.role, u.name, u.package,
+            ),
+            ..Default::default()
+        });
+    }
+
     // Opt-in `unresolved-dispatch`: a known dispatch verb whose receiver
     // couldn't be typed, so we can't tell if the dispatch applies. Fires ONLY
     // on `ReceiverUntyped` (a real typing gap), never on `DoesNotApply` — the

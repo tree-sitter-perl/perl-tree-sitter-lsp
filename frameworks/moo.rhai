@@ -24,6 +24,18 @@
 
 fn id() { "moo" }
 
+// The base role engines this family ships: `use`-ing one makes the
+// consuming package a ROLE (is_role_package; the composer-mismatch
+// diagnostic skips roles — their requires obligations transfer to the
+// eventual class composer). Core holds NO list of its own — this
+// manifest and any third-party plugin's are the whole set. House kits
+// that re-export one of these can instead emit SyntheticUse (see
+// adr/role-contracts.md). Role::Tiny::With is deliberately absent: it
+// grants `with` to plain classes.
+fn role_makers() {
+    ["Moo::Role", "Moose::Role", "Mouse::Role", "Role::Tiny"]
+}
+
 fn triggers() {
     [
         #{ UsesModule: "Moo" },

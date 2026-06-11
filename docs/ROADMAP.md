@@ -146,17 +146,16 @@ runtime export generators) live in `docs/open-problems.md`.
 
 Detailed in `prompt-long-distance.md` — the "look elsewhere for the
 facts about here" family. Part 1 of role contracts (the `requires`
-declaration itself: `role_requires`, definedness suppression, role
-method references) landed in PR #55. One shared primitive —
-`children_index`, the inverse of `package_parents` — feeds the four
+declaration itself) landed in PR #55; part 2 (the shared
+`children_index` primitive + members 1–2 below) is landed. The four
 members:
 
-1. **requires → implementations** — `textDocument/implementation` on a
-   `requires 'name'` fans out to every composer's def. Goto-def stays
-   on the contract; references stay call-sites.
-2. **Composer-mismatch diagnostic** — flags composers that don't
-   satisfy a role's `requires` set. Designed in
-   `prompt-role-requires.md`.
+1. **requires → implementations** — LANDED. `textDocument/implementation`
+   on a `requires 'name'` fans out to every composer's def. Goto-def
+   stays on the contract; references stay call-sites.
+2. **Composer-mismatch diagnostic** — LANDED. Flags composers that
+   don't satisfy a role's `requires` set; decisions recorded in
+   `adr/role-contracts.md`.
 3. **Long-distance param typing** — call-site arg shapes type the
    callee's params (the Mojo plugin `$conf` case). Honesty gate:
    callers must be enumerable.
@@ -164,8 +163,9 @@ members:
    phase 2: flag helpers whose providing plugin is never loaded from
    any entrypoint.
 
-Sequencing: 1 → 2 as one PR ("role contracts, part 2" — both consume
-`children_index` fresh), then the lint, then param typing last.
+Remaining sequencing: the entrypoint lint next, then param typing
+last (its honesty gate — caller enumerability — wants its own design
+round).
 
 This arc is also the strangler-fig on-ramp for graph walking below:
 `children_index` is the first reverse edge that wants to be a typed

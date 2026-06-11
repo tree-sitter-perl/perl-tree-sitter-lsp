@@ -261,6 +261,7 @@ impl LanguageServer for Backend {
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
@@ -475,6 +476,30 @@ impl LanguageServer for Backend {
             uri,
             &self.module_index,
         ))
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: request::GotoImplementationParams,
+    ) -> Result<Option<request::GotoImplementationResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        use crate::resolve::{implementations_of, resolve_symbol, ResolvedTarget};
+        let point = symbols::position_to_point(pos);
+        let target = match resolve_symbol(&doc.analysis, point, Some(&*self.module_index)) {
+            Some(ResolvedTarget::Target(t)) => t,
+            // Groups (field projections) and lexicals have no
+            // descendant-implementation semantics.
+            _ => return Ok(None),
+        };
+        drop(doc); // release the DashMap read lock before the cross-file walk
+        let results = implementations_of(Some(&*self.module_index), &target);
+        Ok(refs_to_locations(results).map(GotoDefinitionResponse::Array))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
