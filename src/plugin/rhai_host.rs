@@ -832,6 +832,7 @@ mod tests {
                 ArgInfo {
                     text: "'connect'".into(),
                     string_value: Some("connect".into()),
+                    string_values: Vec::new(),
                     span: evt_span,
                     content_span: None,
                     inferred_type: Some(InferredType::String), sub_params: vec![], callable_return_edge: None, ref_sub_name: None,
@@ -839,6 +840,7 @@ mod tests {
                 ArgInfo {
                     text: "sub { ... }".into(),
                     string_value: None,
+                    string_values: Vec::new(),
                     span: cb_span,
                     content_span: None,
                     inferred_type: Some(InferredType::CodeRef { return_edge: None }), sub_params: vec![], callable_return_edge: None, ref_sub_name: None,
@@ -905,6 +907,7 @@ mod tests {
                 args: vec![ArgInfo {
                     text: accessor.into(),
                     string_value: Some(accessor.into()),
+                    string_values: Vec::new(),
                     span: name_span,
                     content_span: None,
                     inferred_type: Some(InferredType::String),
@@ -949,6 +952,7 @@ mod tests {
             args: vec![ArgInfo {
                 text: "x".into(),
                 string_value,
+                string_values: Vec::new(),
                 span: sp(1, 4, 1, 8),
                 content_span: None,
                 inferred_type: None,
@@ -996,6 +1000,7 @@ mod tests {
                 ArgInfo {
                     text: "$name".into(),
                     string_value: None,
+                    string_values: Vec::new(),
                     span: sp(0, 0, 0, 5),
                     content_span: None,
                     inferred_type: None, sub_params: vec![], callable_return_edge: None, ref_sub_name: None,
@@ -1003,6 +1008,7 @@ mod tests {
                 ArgInfo {
                     text: "sub {}".into(),
                     string_value: None,
+                    string_values: Vec::new(),
                     span: sp(0, 6, 0, 12),
                     content_span: None,
                     inferred_type: Some(InferredType::CodeRef { return_edge: None }), sub_params: vec![], callable_return_edge: None, ref_sub_name: None,
@@ -1139,6 +1145,7 @@ mod tests {
                 ArgInfo {
                     text: "'Foo'".into(),
                     string_value: Some("Foo".into()),
+                    string_values: Vec::new(),
                     span: name_span,
                     content_span: Some(name_span),
                     inferred_type: Some(InferredType::String),
@@ -1189,6 +1196,7 @@ mod tests {
                 ArgInfo {
                     text: "'/Root/index'".into(),
                     string_value: Some("/Root/index".into()),
+                    string_values: Vec::new(),
                     span: path_span,
                     content_span: Some(path_span),
                     inferred_type: Some(InferredType::String),
@@ -1239,6 +1247,7 @@ mod tests {
                 ArgInfo {
                     text: "'Foo'".into(),
                     string_value: Some("Foo".into()),
+                    string_values: Vec::new(),
                     span: sp(0, 0, 0, 5),
                     content_span: None,
                     inferred_type: Some(InferredType::String),
