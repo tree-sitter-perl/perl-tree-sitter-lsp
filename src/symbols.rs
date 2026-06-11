@@ -156,8 +156,13 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
     }
     // The detail's hide_in_outline covers the workspace list too —
     // anon subs and plugin DSL imports are resolvable, not browsable.
-    if let crate::file_analysis::SymbolDetail::Sub { hide_in_outline: true, .. } = &sym.detail {
-        return None;
+    // Lexical subs likewise: document symbols show them (in-file
+    // structure), workspace search does not (not addressable outside
+    // their block).
+    match &sym.detail {
+        crate::file_analysis::SymbolDetail::Sub { hide_in_outline: true, .. }
+        | crate::file_analysis::SymbolDetail::Sub { lexical: true, .. } => return None,
+        _ => {}
     }
     Some(SymbolInformation {
         name: sym.name.clone(),

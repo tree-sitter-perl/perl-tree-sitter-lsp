@@ -4544,3 +4544,28 @@ sub real_sub { 1 }
         names,
     );
 }
+
+/// `my sub helper { … }` — document symbols keep it (real in-file
+/// structure); workspace-symbol search drops it (not addressable
+/// outside its block). Plain subs surface in both.
+#[test]
+fn test_lexical_subs_outline_only() {
+    let src = "\
+my sub helper_fn { 42 }
+sub public_fn { helper_fn() }
+";
+    let analysis = parse_analysis(src);
+    let uri = tower_lsp::lsp_types::Url::parse("file:///t.pl").unwrap();
+    let ws: Vec<String> = analysis
+        .symbols
+        .iter()
+        .filter_map(|s| symbol_to_workspace_info(s, uri.clone()))
+        .map(|i| i.name)
+        .collect();
+    assert!(ws.iter().any(|n| n == "public_fn"), "{:?}", ws);
+    assert!(!ws.iter().any(|n| n == "helper_fn"), "lexical stays out of workspace: {:?}", ws);
+    let outline = analysis.document_symbols();
+    let names: Vec<&str> = outline.iter().map(|d| d.name.as_str()).collect();
+    assert!(names.contains(&"helper_fn"), "outline keeps the lexical sub: {:?}", names);
+    assert!(names.contains(&"public_fn"), "{:?}", names);
+}

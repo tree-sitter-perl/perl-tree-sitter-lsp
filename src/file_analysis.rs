@@ -499,6 +499,12 @@ pub enum SymbolDetail {
         /// a name set (rule #10).
         #[serde(default)]
         is_constant: bool,
+        /// `my sub helper { … }` — scoped to its enclosing block, not
+        /// callable by name from anywhere else. Document symbols show
+        /// it (it's real in-file structure); workspace-symbol search
+        /// does not (it's not a workspace-addressable entity).
+        #[serde(default)]
+        lexical: bool,
     },
     Class {
         parent: Option<String>,

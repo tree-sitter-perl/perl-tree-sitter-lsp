@@ -2785,6 +2785,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline,
                     opaque_return,
                     is_constant: false,
+                    lexical: false,
                 };
                 let target_pkg = on_class.clone().or_else(|| self.current_package.clone());
                 // Projection-group enrollment: the plugin declared which
@@ -3556,6 +3557,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                 },
             );
         }
@@ -3848,12 +3850,17 @@ impl<'a> Builder<'a> {
         // Extract preceding POD/comment documentation
         let doc = self.extract_preceding_doc(node, &name);
 
+        // `my sub helper { … }` — the grammar's `lexical` field marks a
+        // block-scoped sub: real in-file structure (document symbols
+        // keep it) but not a workspace-addressable entity (workspace
+        // search drops it).
+        let lexical = node.child_by_field_name("lexical").is_some();
         self.add_symbol(
             name.clone(),
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, doc, display: None, hide_in_outline: false, opaque_return: false, is_constant: false },
+            SymbolDetail::Sub { params: params.clone(), is_method, doc, display: None, hide_in_outline: false, opaque_return: false, is_constant: false, lexical },
         );
 
         // Exporter::Extensible method-attribute export form: `sub foo :Export`.
@@ -3996,6 +4003,7 @@ impl<'a> Builder<'a> {
                 hide_in_outline: true,
                 opaque_return: false,
                 is_constant: false,
+                lexical: false,
             },
         );
         self.anon_sub_symbol_by_span.insert(span, sym_id);
@@ -4481,7 +4489,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         bare_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, doc: None, display: None, hide_in_outline: false, opaque_return: false, is_constant: false },
+                        SymbolDetail::Sub { params: vec![], is_method: true, doc: None, display: None, hide_in_outline: false, opaque_return: false, is_constant: false, lexical: false },
                     );
                 }
                 if has_writer {
@@ -4504,6 +4512,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                         },
                     );
                 }
@@ -4790,6 +4799,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                 },
             );
             self.record_framework_accessor_witness(
@@ -5342,6 +5352,7 @@ impl<'a> Builder<'a> {
                 hide_in_outline: false,
                 opaque_return: false,
                 is_constant: true,
+                lexical: false,
             },
         );
     }
@@ -8325,6 +8336,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                 },
                 Namespace::Language,
                 target_pkg,
@@ -8624,6 +8636,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                 },
             );
         }
@@ -8934,6 +8947,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                         },
                     );
                     // Moo/Moose getter: arity 0 → isa-derived type
@@ -8977,6 +8991,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: true,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                             },
                         );
                         let writer_arm = return_type.clone().map(|t| {
@@ -9015,6 +9030,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                             },
                         );
                         let writer_arm = return_type.clone().map(|t| {
@@ -9089,6 +9105,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                         },
                     );
                     let getter_arm = getter_type.clone().map(|t| {
@@ -9125,6 +9142,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: true,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                         },
                     );
                     // Mojo writer: arity ≥ 1 → fluent return
@@ -10390,6 +10408,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                 },
             );
         }
@@ -10436,6 +10455,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                 },
             );
         }
@@ -10543,6 +10563,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                 },
             );
             // DBIC relationship accessor — arity 0 (no arg form is
@@ -11610,6 +11631,7 @@ impl<'a> Builder<'a> {
                     hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
+                    lexical: false,
                 },
             );
             synth_names.insert(name.to_string());

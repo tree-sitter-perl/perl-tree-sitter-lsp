@@ -151,6 +151,7 @@ fn test_resolve_sub_return_type() {
                 hide_in_outline: false,
                 opaque_return: false,
                 is_constant: false,
+                lexical: false,
             },
             namespace: Namespace::Language,
             outline_label: None,
