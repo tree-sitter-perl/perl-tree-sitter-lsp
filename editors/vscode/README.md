@@ -43,7 +43,7 @@ my $method = "get_$field";
 $self->$method();          # go-to-definition works — resolves through the constant
 ```
 
-perl-lsp folds `use constant`, package-scope variables, string interpolation, and loop variables to resolve dynamic method calls.
+perl-lsp folds `use constant`, package-scope variables, string interpolation, and loop/map variables to resolve dynamic method calls.
 
 ### Cross-file intelligence
 
