@@ -1,5 +1,14 @@
 # WASM Build + VS Code Web Extension
 
+> **Status note (June 2026):** the crate split this doc assumes was
+> executed and deliberately REJECTED for layering purposes (PR #52;
+> `src/layering_tests.rs` enforces the DAG instead). Branch
+> `workspace-split` is the executed playbook if wasm ever forces the
+> split as a build necessity. The multi-language engine design
+> (`prompt-multi-language.md` on branch
+> `worktree-query-extraction-spike`) supersedes parts of the
+> core/shell sketch below.
+
 > Goal: run perl-lsp in vscode.dev (browser). Single-file intelligence
 > only — no @INC resolve, no SQLite, no perltidy. Same limitation
 > PerlNavigator's web mode has, but our single-file feature set is

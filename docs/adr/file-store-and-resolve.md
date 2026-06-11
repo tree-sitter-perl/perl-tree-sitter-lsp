@@ -89,7 +89,7 @@ back to baseline before re-deriving. The `enriched: bool` flag on
 
 ## Where this is going
 
-Forward residual lives in `prompt-unification-residual.md`:
+Forward residual lives in `prompt-graph-walking.md` (absorbed residuals section):
 
 - Phase 1: `Namespace` enum (deferred — pluggability question gates phases
   6+7).

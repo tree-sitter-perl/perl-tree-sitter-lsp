@@ -2653,7 +2653,7 @@ pub fn collect_diagnostics(
     // Rule-#10 debt: the framework entries below (DBIC/Moose) belong to the
     // frameworks, not core diagnostics — they move out when plugins can
     // register meta-methods (docs/prompt-dbic-as-plugin.md) or the Openness
-    // rule lands (docs/prompt-unification-residual.md phase 6).
+    // rule lands (docs/prompt-graph-walking.md, Openness).
     let universal_methods = [
         "new", "AUTOLOAD", "DESTROY", "can", "isa", "DOES",
         // Moose adds lowercase `does` alongside UNIVERSAL's uppercase DOES.

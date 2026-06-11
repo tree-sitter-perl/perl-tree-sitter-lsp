@@ -29,7 +29,7 @@ types at the boundary (the `param_types()` manifest in
 role/callback contract, not arbitrary hashref params) or cross-procedure
 value-flow that propagates a type *into* a param from its call sites. The route doc enumerates the option
 space and explicitly chose to leave boundary #4 (param/hashref) out;
-see `docs/prompt-route-default-inheritance.md` option #4. Deferred until
+see `adr/route-branding.md` (the unbranded-root boundary). Deferred until
 a value-flow story exists; the in-`register` local case is the dominant
 idiom and resolves without it.
 
@@ -44,7 +44,7 @@ honest fix resolves the qualified target against the same ancestor /
 package graph method dispatch already walks, rather than special-casing
 the `SUPER::`/`::` token shape (a rule-#10 smell). Hint-level today, so
 low blast radius; revisit alongside the Openness diagnostic rework
-(`docs/prompt-unification-residual.md` Phase 6), which owns the
+(`docs/prompt-graph-walking.md`, Openness), which owns the
 "when is an unresolved call real?" question.
 
 ## Static analysis can't run runtime export generators

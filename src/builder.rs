@@ -4377,7 +4377,7 @@ impl<'a> Builder<'a> {
         out: &mut Vec<(String, String, String)>,
     ) {
         // Catalyst dispatches these private actions by name; over-inclusion of
-        // non-action-attributed subs is a documented follow-up (qa-findings P1.3).
+        // non-action-attributed subs is a documented follow-up.
         const CATALYST_PRIVATE_ACTIONS: &[&str] =
             &["begin", "end", "auto", "default", "index"];
         let is_private_action = CATALYST_PRIVATE_ACTIONS.contains(&sub_name);

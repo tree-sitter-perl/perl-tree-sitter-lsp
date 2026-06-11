@@ -211,7 +211,7 @@ impl<'a> SubInfo<'a> {
 /// What query-time cross-file resolution needs from the dependency
 /// index. `ModuleIndex` implements this; `file_analysis`/`witnesses`
 /// depend on the capability, not the index — the inversion that breaks
-/// the FA ↔ index cycle (docs/arch-review-2026-06.md §4).
+/// the FA ↔ index cycle (dependency inversion; the index implements it).
 ///
 /// Object-safe by design: a `&dyn CrossFileLookup` rides
 /// `witnesses::BagContext`, hence the `&mut dyn FnMut` callback params.

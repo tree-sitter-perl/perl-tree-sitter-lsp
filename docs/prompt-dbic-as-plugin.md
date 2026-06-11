@@ -1,8 +1,31 @@
 # DBIC support as a plugin
 
-**Status:** open. Schedules around the user's plan to extract DBIC
-out of core. Open-ended on purpose — iterate on the boundaries
-before committing.
+**Status: open — and UNGATED (June 2026).** This was queued behind
+type-system-encoding "so the plugin owns its semantics from day one";
+that gate is stale. Since it was set, the plugin system grew the
+muscles the migration needs: decision-ready `CallContext` shapes (the
+`extract_has_options` pattern), the manifest families (`overrides`,
+`param_types`, `dispatch_verbs`, `role_makers`), `return_via_edge`,
+and the moo.rhai seam as the executed playbook for moving native
+synthesis out. Only phase 3 below still touches the axis question.
+
+## Phase ladder
+
+1. **Accessor/relationship synthesis → `frameworks/dbic.rhai`.** Move
+   the `visit_dbic_add_columns` / `visit_dbic_relationship` family the
+   way moo.rhai took the accessor-option vocabulary: core walks the
+   call into decision-ready context (rule #1), the plugin owns
+   keyword → method-name + typed-return rules. `load_components`
+   parent registration stays core (it's generic parent machinery).
+2. **Meta-method suppression → manifest.** The DBIC entries in
+   `symbols.rs`' `universal_methods` (comment-flagged debt) become a
+   plugin manifest field; core's diagnostic consults the registry.
+3. **Parametric emission + per-method projection** (the tables below)
+   — the one genuinely axis-shaped piece. A `parametric_returns`
+   manifest field may sidestep full type-system-encoding; decide at
+   the boundary, not before.
+
+End state: core is plugin-free except generic dispatch.
 
 ## Why move DBIC out
 

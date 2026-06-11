@@ -3,7 +3,7 @@
 Hash literals carry their keys in the type: `{ host => 'x' }` is not a
 bare `HashRef`, it's a shape — and `->{key}` narrows through it, across
 assignment hops, double-drills, sub returns, and imports. This ADR is
-the data model + lattice + trust contract; `prompt-nested-hashkey.md`
+the data model + lattice + trust contract; `ROADMAP.md`
 keeps the residual phases. Landed across the `nested-hashkey` branch
 (PR #50). Arrays got the same treatment earlier — see
 `sequence-types.md`; the two variants share every rule below that
