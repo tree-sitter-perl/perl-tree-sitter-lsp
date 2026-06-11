@@ -14898,3 +14898,37 @@ sub register {
         "register's $app is the application",
     );
 }
+
+/// Interpolation deref `${ EXPR }` — `scalar > block` with no varname
+/// wrapper — carries real code in strings AND regex patterns:
+/// `s/_to_${\ $self->filetype }$//` holds a method call that must get
+/// refs (the crm Clove::Converter idiom). The outer scalar emits
+/// nothing (its text is not a variable name).
+#[test]
+fn interpolation_deref_code_gets_refs() {
+    let src = "\
+package T;
+sub filetype { 'csv' }
+sub run {
+  my $self = shift;
+  my @m;
+  grep {s/_to_${\\$self->filetype}$//} @m;
+  my $y = \"x_${\\$self->filetype}_z\";
+  return $y;
+}
+1;
+";
+    let fa = build_fa(src);
+    let calls = fa
+        .refs
+        .iter()
+        .filter(|r| {
+            r.target_name == "filetype" && matches!(r.kind, RefKind::MethodCall { .. })
+        })
+        .count();
+    assert_eq!(calls, 2, "regex-pattern and string interpolations both ref");
+    assert!(
+        !fa.refs.iter().any(|r| r.target_name.contains("${")),
+        "no junk ref for the outer interpolation scalar",
+    );
+}

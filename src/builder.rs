@@ -6926,6 +6926,21 @@ impl<'a> Builder<'a> {
             return;
         }
 
+        // Interpolation deref: `${ EXPR }` inside a string or regex
+        // parses as `scalar > block` directly — no varname wrapper, so
+        // `is_block_deref` doesn't claim it. The block holds real code
+        // (`"_${\ $self->filetype }_"` carries a method call); visit it
+        // so its refs land, and emit nothing for the outer node — its
+        // text isn't a variable name.
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.kind() == "block" {
+                    self.visit_children(child);
+                    return;
+                }
+            }
+        }
+
         // Sigil-deref of a scalar: `%$x` / `@$x` / `$$x` parses as the outer
         // sigil node (hash/array/scalar) whose varname child wraps an inner
         // `scalar` node naming the dereferenced variable. The inner scalar is
