@@ -30,6 +30,9 @@ hangs).
   type — drills narrow per key, mutation extends or opens the shape, and the
   `unknown-hash-key` hint catches key typos at **zero false positives** across
   the 2,293-module substrate.
+- **Role contracts.** `requires` declares what a role demands: calls on those
+  methods resolve inside the role, and a method a role uses WITHOUT declaring
+  it gets a hint — surfacing years-old undeclared contracts in real codebases.
 - **Bundled plugins + a plugin system.** Ships plugins for Catalyst, Dancer2,
   Mojolicious (helpers, events, Minion tasks), and DBIx::Class ResultDDL; you can
   drop your own `.rhai` plugins in a repo-local `.perl-lsp/`, or generate one from
@@ -52,6 +55,20 @@ hangs).
 - Refs reach into more places: chained hash-ref keys at any depth, `use constant`
   usages, `s///e` replacement code, forward-reference calls (call above its sub),
   and sigil-deref spellings.
+- **Roles connect both ways**: references from a role method find every
+  composing class's call sites, and map-built role lists
+  (`with map "My::Roles::$_", qw/CSV DB/`) fold statically — goto-def lands on
+  each role from its own qw word.
+- **Barewords naming an in-scope sub are calls** (Perl's own reading): hover,
+  goto-def, references, rename, and semantic tokens all work on
+  `my $x = get_config;` and the `get_config->{host}` base — and `sub INFINITY ()`
+  prototype constants link their usages.
+- Interpolated code is code: `${\ $self->filetype }` inside a string OR a
+  regex pattern carries real refs — rename and references reach into
+  `s/_to_${\ $self->filetype }$//`.
+- **Mojolicious plugin names** goto-def: `plugin 'Thing'` lands on the plugin
+  class's `register`, whatever namespace it lives in (`Mojolicious::Plugin::*`
+  and app-specific trees both work).
 
 ### Field & attribute projection groups
 
@@ -84,6 +101,24 @@ hangs).
 - `$self` / `$c` controller typing for Mojolicious and Catalyst actions.
 - Parameters declared as `my ($self, $name) = (shift, shift)` are recognized for
   signature help
+- **Framework-assigned Mojo attrs type**: `$c->app`, `$c->tx`, `$c->ua`,
+  `$c->req`/`res` (and the `$tx->req`/`res` delegations) chain without an
+  indexed Mojo tree, and a plugin's `register($self, $app, $conf)` knows
+  `$app` is the application.
+
+### Mojolicious routing & helpers
+
+- **Lite apps inherit route targets**: `under('/notifications')->to('notifications#under')`
+  sets the controller the following `get(...)->to('#action')` partials use,
+  `group { }` scopes it — goto-def works on nested route groups, and the
+  base restores after the group.
+- **Default helpers are discovered from source** — no hardcoded list:
+  DefaultHelpers/TagHelpers' own registration loops
+  (`$app->helper($_ => …) for qw(...)`) expand, so all ~50 built-in helpers
+  resolve, including dotted chains (`$c->proxy->get_p`). Framework-loaded
+  plugins resolve unconditionally; `plugin 'X'` pulls X in — "you loaded it".
+- Helpers registered the lite way (`helper name => sub {…}`, no `$app->`)
+  resolve like the method spelling.
 
 ### Structural hash & array shapes
 
@@ -160,6 +195,9 @@ hangs).
   severity, since dynamic Perl (AUTOLOAD, runtime glob installs, uninstalled
   deps) is common and shouldn't flood the Problems panel. This is frequently
   solvable by using a custom plugin.
+- **Role-contract hints**: a role calling `$self->fetch_raw` without
+  `requires 'fetch_raw'` keeps its hint — the diagnostic teaches the contract
+  the role should declare (declared requirements resolve silently).
 
 ### Editors & CLI
 
@@ -168,6 +206,10 @@ hangs).
 - New CLI query modes for scripting/CI: `--batch` (one startup, many queries on
   stdin), plus `--completion`, `--signature-help`, `--semantic-tokens`,
   `--document-highlight`, `--linked-editing`, and `--timings`.
+- **One-shot CLI sessions resolve @INC modules themselves** (headless
+  resolver: same scan, project-local libs, and SQLite cache as the editor) —
+  CLI answers match the editor instead of depending on what an editor session
+  happened to cache. Workspace-symbol search no longer lists anonymous subs.
 
 ### Under the hood
 
