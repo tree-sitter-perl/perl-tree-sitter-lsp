@@ -115,6 +115,42 @@ language-agnostic — it shells the binary), and the zero-false-positive
 sweep for any diagnostic before it exists. "Best in class" is this
 harness, not the feature list. Budget it as half the work.
 
+## Shipping shape: the engine as a product
+
+Three pieces, phased so no crate is cut before shipping demands it
+(consistent with the rejected workspace split — crates when a second
+consumer exists, tests for layering until then):
+
+**The core crate (`lsp-engine`).** `layering_tests::layer_map()` IS
+the manifest: model (file_analysis, witnesses), the generic driver
+(query_extract + capture vocabulary), cross-file (file_store, resolve,
+module_index, module_cache), the rhai host, and the GENERIC half of
+the LSP adapter. The honest cost: `symbols.rs` must split — the verbs
+(documentSymbol/references/rename/workspace-symbol) are pure
+FileAnalysis reads and belong to core; the intelligence (diagnostics,
+import classification, hover rendering, cursor_context) is
+language-flavored and moves driver-side. That disentanglement is the
+biggest single line item, bigger than the routing work above.
+
+**The middle: language packs as runtime artifacts (eventually).**
+Every pack predicate written in the spikes (ctor_class, module_paths,
+cmd_effects, annot_type, shape_ctor, import_call) is trivially rhai —
+and the rhai host with fingerprinted cache invalidation already
+ships. End state: a pack is a directory `{grammar, skeleton.scm,
+predicates.rhai, pack.toml}`, installable like `.perl-lsp/` plugins.
+The grammar is the only hard part: compiled-in (crate dep) first;
+dynamically loaded (.so / wasm, the Helix/Zed model) later.
+
+**The binary: one multiplexing server.** The registry serves N
+languages from one process (LSP document selectors handle this).
+perl-lsp doesn't die — it becomes the Perl-configured distribution of
+that binary, name and install base intact.
+
+Open design round carried from the spikes: keying framework-plugin
+hooks on CAPTURE EVENTS the way rhai hooks key on CallContext today —
+that is what gives pack languages a framework tier (tidyverse, CMake
+module conventions). Everything else on this page is enumerable work.
+
 ## Sequencing
 
 1. **Registry + PerlDriver** — pure refactor, behavior-identical,
@@ -128,3 +164,9 @@ harness, not the feature list. Budget it as half the work.
 Steps 1–2 are days and de-risk everything; step 3 is the demo; step 4
 is the product. The spike branch carries the working driver, packs,
 and tests to lift from.
+
+Then, and only then, the crate cut (shipping shape above): step 5 is
+`lsp-engine` split along the layer-test seam with the
+`workspace-split` branch as the mechanical playbook; step 6 is
+runtime packs. Neither starts before a pack language has shipped
+in-editor from the single crate.
