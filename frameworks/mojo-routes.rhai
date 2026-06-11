@@ -86,7 +86,48 @@ fn overrides() {
         "Mojolicious app `routes` accessor returns the top-level router");
     out += route_method_override("Mojolicious::Controller", "routes", "Mojolicious::Routes",
         "Mojolicious controller `routes` accessor returns the top-level router");
+    // Framework-assigned attrs: `has [qw(app tx)]` and friends are
+    // declared with NO default/isa (the framework assigns them at
+    // dispatch), so the synthesized accessors carry no return type and
+    // chains die at the first hop. Declared here as overrides — the
+    // same trick as the route verbs above — so `$c->app->…`,
+    // `$c->tx->…`, `$plugin_app->…` type with or without an indexed
+    // Mojo source tree.
+    let assigned = [
+        ["Mojolicious::Controller", "app", "Mojolicious"],
+        ["Mojolicious::Controller", "tx", "Mojo::Transaction::HTTP"],
+        ["Mojolicious::Plugin", "app", "Mojolicious"],
+        ["Mojo::Server", "app", "Mojolicious"],
+        ["Mojolicious", "ua", "Mojo::UserAgent"],
+        ["Mojolicious::Controller", "ua", "Mojo::UserAgent"],
+        ["Mojo::UserAgent", "transactor", "Mojo::UserAgent::Transactor"],
+        // req/res delegate through $tx in real source (`sub req {
+        // shift->tx->req }`); declared on BOTH the controller and the
+        // transaction (route-verbs pattern) so the chain types without
+        // an indexed Mojo tree, and `$tx->req->…` works wherever a
+        // transaction shows up (ua callbacks, hooks, proxies).
+        ["Mojolicious::Controller", "req", "Mojo::Message::Request"],
+        ["Mojolicious::Controller", "res", "Mojo::Message::Response"],
+        ["Mojo::Transaction", "req", "Mojo::Message::Request"],
+        ["Mojo::Transaction", "res", "Mojo::Message::Response"],
+        ["Mojo::Transaction::HTTP", "req", "Mojo::Message::Request"],
+        ["Mojo::Transaction::HTTP", "res", "Mojo::Message::Response"],
+    ];
+    for a in assigned {
+        out += route_method_override(a[0], a[1], a[2],
+            "framework-assigned attr (has with no default; set at dispatch)");
+    }
     out
+}
+
+// `register($self, $app, $conf)` — the contract method every
+// Mojolicious plugin implements; the framework passes the app. $conf's
+// call-site shape is future work (long-distance param typing).
+fn param_types() {
+    [
+        #{ method: "register", in_role: "Mojolicious::Plugin", param: 1,
+           type_class: "Mojolicious" },
+    ]
 }
 
 // A route is a first-class thing — it has identity (the `Controller#action`

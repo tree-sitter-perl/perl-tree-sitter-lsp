@@ -14868,3 +14868,33 @@ plugin 'Foo::BarBaz';
     assert!(invocants[0].contains("was_loaded"), "{:?}", invocants);
     assert!(invocants[1].contains("foo-bar_baz"), "{:?}", invocants);
 }
+
+/// Framework-assigned Mojo attrs (`has [qw(app tx)]` with no default —
+/// the framework sets them at dispatch) type via plugin overrides, and
+/// a plugin's `register($self, $app, $conf)` gets `$app: Mojolicious`
+/// via the param_types manifest — with or without an indexed Mojo
+/// source tree.
+#[test]
+fn mojo_framework_assigned_attrs_type() {
+    let src = "\
+package My::App::Plugin::Demo;
+use Mojo::Base 'Mojolicious::Plugin';
+sub register {
+  my ($self, $app, $conf) = @_;
+  return $app;
+}
+1;
+";
+    let fa = {
+        let mut parser = super::create_parser();
+        let tree = parser.parse(src, None).unwrap();
+        super::build_with_plugins(&tree, src.as_bytes(), super::default_plugin_registry())
+    };
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let t = fa.inferred_type_via_bag_ctx("$app", Point::new(4, 10), Some(&idx));
+    assert_eq!(
+        t,
+        Some(InferredType::ClassName("Mojolicious".into())),
+        "register's $app is the application",
+    );
+}
