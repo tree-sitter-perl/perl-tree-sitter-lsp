@@ -34,6 +34,7 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("pod", Build),
         ("cpanfile", Build),
         ("query_cache", Build),
+        ("query_extract", Build),
         ("module_index", Index),
         ("module_resolver", Index),
         ("module_cache", Index),
