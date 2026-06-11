@@ -1,0 +1,17 @@
+{
+  "capability": "hover",
+  "rows": [
+    {
+      "id": "a4v2-cross-file-slot-read",
+      "difficulty": "tricky",
+      "semantic_area": "long-distance",
+      "root": "gold-corpus/longdist-fixture",
+      "file": "lib/My/Child.pm",
+      "line": 6,
+      "col": 8,
+      "expect": { "all": ["My::Conn"], "none": [] },
+      "status": "gold",
+      "note": "my $x = $self->{conn} where the typed slot write lives in the PARENT class's file — the SlotType cross-file + ancestor recursion (A4 v2)."
+    }
+  ]
+}

@@ -1595,6 +1595,66 @@ impl ReducerRegistry {
             }
         }
 
+        // `SlotType{C, k}` the local bag couldn't answer: the typed
+        // slot WRITE may live in C's own file (cross-file primary) or
+        // anywhere up C's ancestry (a base class's BUILD populating
+        // `$self->{conn}`). Hops (1) and (2) of the `MethodOnClass`
+        // fallback above, same shared visited set; no bridge hop —
+        // slot writes are real code, not plugin entities.
+        if let WitnessAttachment::SlotType { class, key } = q.attachment {
+            if let Some(ctx) = q.context {
+                if let Some(idx) = ctx.module_index {
+                    if let Some(cached) = idx.get_cached(class) {
+                        if !std::ptr::eq(bag, &cached.analysis.witnesses) {
+                            let cached_ctx = BagContext {
+                                scopes: &cached.analysis.scopes,
+                                package_framework: &cached.analysis.package_framework,
+                                module_index: Some(idx),
+                                package_parents: &cached.analysis.package_parents,
+                                app_surface_consumers: &cached.analysis.app_surface_consumers,
+                            };
+                            let sub_q = ReducerQuery {
+                                attachment: q.attachment,
+                                point: q.point,
+                                framework: q.framework,
+                                arity_hint: None,
+                                receiver: q.receiver.clone(),
+                                context: Some(&cached_ctx),
+                            };
+                            let v = self.query_rec(&cached.analysis.witnesses, &sub_q, state);
+                            if *v != ReducedValue::None {
+                                return (*v).clone();
+                            }
+                        }
+                    }
+                }
+                let parents = crate::file_analysis::parents_of(
+                    class,
+                    ctx.package_parents,
+                    ctx.module_index,
+                    ctx.app_surface_consumers,
+                );
+                for p in parents {
+                    let parent_att = WitnessAttachment::SlotType {
+                        class: p,
+                        key: key.clone(),
+                    };
+                    let sub_q = ReducerQuery {
+                        attachment: &parent_att,
+                        point: q.point,
+                        framework: q.framework,
+                        arity_hint: None,
+                        receiver: q.receiver.clone(),
+                        context: q.context,
+                    };
+                    let v = self.query_rec(bag, &sub_q, state);
+                    if *v != ReducedValue::None {
+                        return (*v).clone();
+                    }
+                }
+            }
+        }
+
         ReducedValue::None
     }
 
@@ -1739,7 +1799,33 @@ impl ReducerRegistry {
                     if let Some(t) = base_t {
                         let projected = match step {
                             ProjectionStep::HashKey(k) => {
-                                t.key_value_type(k).flatten().cloned()
+                                t.key_value_type(k).flatten().cloned().or_else(|| {
+                                    // Class-typed base: the structural
+                                    // literal can't answer, but a typed
+                                    // slot WRITE can — `SlotType{class,
+                                    // key}`, local or (via the arm in
+                                    // query_rec_body) cross-file and up
+                                    // the ancestry. The read drills
+                                    // through the registry, never a
+                                    // baked value.
+                                    let class = t.class_name()?.to_string();
+                                    let att = WitnessAttachment::SlotType {
+                                        class,
+                                        key: k.clone(),
+                                    };
+                                    let sub_q = ReducerQuery {
+                                        attachment: &att,
+                                        point: q.point,
+                                        framework: q.framework,
+                                        arity_hint: None,
+                                        receiver: q.receiver.clone(),
+                                        context: q.context,
+                                    };
+                                    match &*self.query_rec(bag, &sub_q, state) {
+                                        ReducedValue::Type(t) => Some(t.clone()),
+                                        _ => None,
+                                    }
+                                })
                             }
                             ProjectionStep::ArrayIndex(i) => t.element_at(*i).cloned(),
                         };

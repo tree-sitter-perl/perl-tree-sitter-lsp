@@ -4681,3 +4681,87 @@ fn test_role_requires_dynamic_parent_honest_silence() {
         role_or_method,
     );
 }
+
+// ---- helper-not-loaded (entrypoint-scan lint) ----
+
+fn helper_lint_setup() -> (crate::module_index::ModuleIndex, String) {
+    // A workspace Mojolicious plugin registering a helper. The bundled
+    // mojo plugins synthesize the helper entity bridged to the
+    // controller surface.
+    let plugin_src = "package My::Plugin::WasLoaded;\nuse Mojo::Base 'Mojolicious::Plugin';\n\
+        sub register {\n    my ($self, $app, $conf) = @_;\n    $app->helper(was_loaded => sub { 1 });\n}\n1;\n";
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(plugin_src, None).unwrap();
+    let fa = crate::builder::build(&tree, plugin_src.as_bytes());
+    idx.register_workspace_module(
+        std::path::PathBuf::from("/fake/lint/My/Plugin/WasLoaded.pm"),
+        std::sync::Arc::new(fa),
+    );
+    let consumer_src = "package MyApp::C;\nuse Mojo::Base 'Mojolicious::Controller';\n\
+        sub act {\n    my $self = shift;\n    $self->was_loaded;\n}\n1;\n"
+        .to_string();
+    (idx, consumer_src)
+}
+
+fn lint_messages(idx: &crate::module_index::ModuleIndex, src: &str) -> Vec<String> {
+    let analysis = parse_analysis(src);
+    collect_diagnostics(&analysis, idx, Default::default())
+        .into_iter()
+        .filter(|d| {
+            matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                if c == "helper-not-loaded")
+        })
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn test_helper_not_loaded_fires_for_unloaded_workspace_plugin() {
+    let (idx, consumer) = helper_lint_setup();
+    let msgs = lint_messages(&idx, &consumer);
+    assert_eq!(
+        msgs,
+        vec!["'was_loaded' is provided by My::Plugin::WasLoaded, which no workspace entrypoint loads"],
+    );
+}
+
+#[test]
+fn test_helper_not_loaded_suppressed_when_an_entrypoint_loads_it() {
+    let (idx, consumer) = helper_lint_setup();
+    // A packageless entrypoint script loading the plugin — exactly the
+    // file shape (lite app) that never enters the module cache; the
+    // loaded-set feed must run before the packageless early-return.
+    let entry_src = "use My::Plugin::WasLoaded;\nprint 1;\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(entry_src, None).unwrap();
+    let fa = crate::builder::build(&tree, entry_src.as_bytes());
+    idx.register_workspace_module(
+        std::path::PathBuf::from("/fake/lint/app.pl"),
+        std::sync::Arc::new(fa),
+    );
+    assert!(lint_messages(&idx, &consumer).is_empty());
+}
+
+#[test]
+fn test_helper_not_loaded_exempts_installed_plugins() {
+    // Same plugin arriving via insert_cache (the @INC path, not
+    // workspace registration): the "downloaded = intended" policy —
+    // no lint.
+    let plugin_src = "package My::Plugin::WasLoaded;\nuse Mojo::Base 'Mojolicious::Plugin';\n\
+        sub register {\n    my ($self, $app, $conf) = @_;\n    $app->helper(was_loaded => sub { 1 });\n}\n1;\n";
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(plugin_src, None).unwrap();
+    let fa = crate::builder::build(&tree, plugin_src.as_bytes());
+    idx.insert_cache(
+        "My::Plugin::WasLoaded",
+        Some(std::sync::Arc::new(crate::file_analysis::CachedModule::new(
+            std::path::PathBuf::from("/inc/My/Plugin/WasLoaded.pm"),
+            std::sync::Arc::new(fa),
+        ))),
+    );
+    let consumer = "package MyApp::C;\nuse Mojo::Base 'Mojolicious::Controller';\n\
+        sub act {\n    my $self = shift;\n    $self->was_loaded;\n}\n1;\n";
+    assert!(lint_messages(&idx, consumer).is_empty());
+}

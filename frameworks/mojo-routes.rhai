@@ -127,6 +127,12 @@ fn param_types() {
     [
         #{ method: "register", in_role: "Mojolicious::Plugin", param: 1,
            type_class: "Mojolicious" },
+        // $conf: typed from whatever the loader call passed
+        // (`plugin 'X', {...}` — the PluginLoad fact carries the arg
+        // span). HashRef is the no-caller static fallback;
+        // structure-dominates-rep prefers the gathered shape.
+        #{ method: "register", in_role: "Mojolicious::Plugin", param: 2,
+           type_class: "HashRef", from_loader_config: true },
     ]
 }
 
@@ -323,6 +329,22 @@ fn on_method_call(ctx) {
                         invocant_span: (),
                     }
                 };
+                // "You loaded it" — same as the lite arm: record the
+                // load so the resolver pulls the plugin AND the
+                // entrypoint-scan lint sees the load fact. Default
+                // namespace guess for short names; the lint
+                // tail-matches, so app-custom namespaces
+                // (Clove::App::Plugin::*) count as loaded too.
+                if !name.contains("::") {
+                    out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::" + name, "args": [], "imports": [], "span": span }};
+                } else {
+                    out += #{ "SyntheticUse": #{ "module": name, "args": [], "imports": [], "span": span }};
+                }
+                // the loader fact: which module, and where its config
+                // value sits — the caller half of $conf typing
+                let cfg = ();
+                if args.len() >= 2 { cfg = args[1].span; }
+                out += #{ "PluginLoad": #{ "name": name, "config_span": cfg }};
             }
         }
         return out;

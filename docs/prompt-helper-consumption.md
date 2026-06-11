@@ -10,7 +10,7 @@ from that round:
   intend to use it" — resolve generously; PRECISION is the
   diagnostic's job, not the resolver's.
 
-## Phase 2 — entrypoint-scan diagnostic (in flight: long-distance PR)
+## Phase 2 — entrypoint-scan diagnostic (LANDED: long-distance-remainder)
 
 At the USAGE site: "`$c->was_loaded` is provided by
 Clove::App::Plugin::WasLoaded, which no entrypoint loads

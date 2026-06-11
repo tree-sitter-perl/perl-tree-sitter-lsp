@@ -11023,6 +11023,7 @@ mod param_types_manifest {
                     param: 1,
                     type_class: "Mojolicious".into(),
                     requires_action_attr: false,
+                    from_loader_config: false,
                 }]
             })
         }
@@ -11180,6 +11181,7 @@ mod param_types_manifest {
                     // Mirror the real catalyst.rhai: only attribute-carrying
                     // actions get $c, not plain helper subs.
                     requires_action_attr: true,
+                    from_loader_config: false,
                 }]
             })
         }

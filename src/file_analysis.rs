@@ -240,6 +240,11 @@ pub trait CrossFileLookup {
         class: &str,
         visit: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>) -> std::ops::ControlFlow<()>,
     );
+    /// Registration-time loader-config shapes: every (load_name, shape)
+    /// projected from `PluginLoad` facts across the workspace —
+    /// INCLUDING packageless entrypoint scripts, which never enter the
+    /// module cache.
+    fn for_each_loader_shape(&self, f: &mut dyn FnMut(&str, &InferredType));
 }
 
 // ---- Serde proxy for tree_sitter::Point ----
@@ -2318,6 +2323,16 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub role_packages: HashSet<String>,
 
+    /// Caller-side loader facts: this file loads plugin `name` and
+    /// passes the value at `config_span`. Joined at enrichment with
+    /// the loaded module's `loader_config_params` markers.
+    #[serde(default)]
+    pub plugin_loads: Vec<PluginLoadFact>,
+    /// Callee-side markers: params whose type arrives from loader
+    /// config (the `from_loader_config` ParamType flavor).
+    #[serde(default)]
+    pub loader_config_params: Vec<LoaderConfigParam>,
+
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
@@ -2383,6 +2398,26 @@ pub struct FileAnalysisParts {
     pub contract_symbols: HashSet<SymbolId>,
     pub dynamic_parent_packages: HashSet<String>,
     pub role_packages: HashSet<String>,
+    pub plugin_loads: Vec<PluginLoadFact>,
+    pub loader_config_params: Vec<LoaderConfigParam>,
+}
+
+/// "This file loads plugin `name`, passing the config value at
+/// `config_span`" — the caller half of loader-config param typing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginLoadFact {
+    pub name: String,
+    pub config_span: Option<Span>,
+}
+
+/// "This param's type arrives from whoever loads me" — the callee
+/// half. `in_role` re-gates at enrichment (the package must still
+/// isa the declaring role/class).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoaderConfigParam {
+    pub variable: String,
+    pub scope: ScopeId,
+    pub in_role: String,
 }
 
 /// One projection of a field/attr decl — the entity that encodes group
@@ -2511,6 +2546,8 @@ impl FileAnalysis {
             contract_symbols,
             dynamic_parent_packages,
             role_packages,
+            plugin_loads,
+            loader_config_params,
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
@@ -2547,6 +2584,8 @@ impl FileAnalysis {
             contract_symbols,
             dynamic_parent_packages,
             role_packages,
+            plugin_loads,
+            loader_config_params,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -3437,6 +3476,102 @@ impl FileAnalysis {
     /// hash-key set, reaching cross-file `Symbol(_)` witnesses through
     /// `BagContext.module_index` directly. Call after building, when the
     /// module index is available.
+    /// The enrichment half of loader-config param typing
+    /// (`prompt-long-distance.md`): for each `from_loader_config`
+    /// marker, gather the config-arg shapes from every caller's
+    /// `PluginLoad` facts and push the agreed type as a TC. Honesty
+    /// gate: callers here are ENUMERABLE BY CONSTRUCTION (the loader
+    /// facts name this module); shapes that disagree fold to an OPEN
+    /// key union rather than a guess; zero matching callers pushes
+    /// nothing (the static `type_class` fallback already rode the
+    /// gated path at build).
+    fn apply_loader_config_params(&mut self, module_index: Option<&dyn CrossFileLookup>) {
+        if self.loader_config_params.is_empty() {
+            return;
+        }
+        let Some(idx) = module_index else { return };
+        // every package name this file declares, for FQ + tail matching
+        let my_packages: Vec<String> = self
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Package | SymKind::Class))
+            .map(|s| s.name.clone())
+            .collect();
+        let matches_me = |load_name: &str| -> bool {
+            my_packages.iter().any(|p| {
+                p == load_name || p.rsplit("::").next() == Some(load_name)
+            })
+        };
+
+        let markers = self.loader_config_params.clone();
+        for m in &markers {
+            // re-gate: the marker's package must still isa the
+            // declaring role/class (same condition the static gated
+            // path checks at query time)
+            let pkg = self.scopes.get(m.scope.0 as usize).and_then(|sc| sc.package.clone());
+            let Some(pkg) = pkg else { continue };
+            if !self.class_isa(&pkg, &m.in_role, module_index) {
+                continue;
+            }
+            let mut shapes: Vec<InferredType> = Vec::new();
+            idx.for_each_loader_shape(&mut |load_name, t| {
+                if matches_me(load_name) {
+                    shapes.push(t.clone());
+                }
+            });
+            if shapes.is_empty() {
+                continue;
+            }
+            let agreed = if shapes.windows(2).all(|w| w[0] == w[1]) {
+                shapes.pop().unwrap()
+            } else {
+                // disagree → widen: union of keys when every shape is
+                // keyed, OPEN (a key any caller passes may arrive);
+                // anything else declines.
+                let mut keys: Vec<(String, Option<Box<InferredType>>)> = Vec::new();
+                let mut all_keyed = true;
+                for sh in &shapes {
+                    match sh {
+                        InferredType::HashWithKeys { keys: ks, .. } => {
+                            for (k, v) in ks {
+                                match keys.iter_mut().find(|(ek, _)| ek == k) {
+                                    None => keys.push((k.clone(), v.clone())),
+                                    Some((_, ev)) => {
+                                        if *ev != *v {
+                                            *ev = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            all_keyed = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_keyed {
+                    continue;
+                }
+                InferredType::HashWithKeys { keys, open: true }
+            };
+            let span = self
+                .scopes
+                .get(m.scope.0 as usize)
+                .map(|sc| Span { start: sc.span.start, end: sc.span.start })
+                .unwrap_or(Span {
+                    start: Point { row: 0, column: 0 },
+                    end: Point { row: 0, column: 0 },
+                });
+            self.push_type_constraint(TypeConstraint {
+                variable: m.variable.clone(),
+                scope: m.scope,
+                constraint_span: span,
+                inferred_type: agreed,
+            });
+        }
+    }
+
     pub fn enrich_imported_types_with_keys(
         &mut self,
         module_index: Option<&dyn CrossFileLookup>,
@@ -3453,6 +3588,10 @@ impl FileAnalysis {
         // query time (`applicable_dispatches`), so a `$minion->enqueue('T')`
         // surfaces by the receiver's type whether or not its file is open.
         // See `docs/adr/receiver-gated-dispatch.md`.
+
+        // Loader-config param typing: join my `loader_config_params`
+        // markers with caller-side `PluginLoad` facts across the index.
+        self.apply_loader_config_params(module_index);
 
         // Build the import → exported-name map inline from
         // `self.imports` + `module_index`. `imported_hash_keys` is
@@ -6589,6 +6728,39 @@ impl FileAnalysis {
             std::ops::ControlFlow::Continue(())
         });
         incomplete
+    }
+
+    /// The plugin module whose BRIDGE is what resolves `class`->`name`
+    /// — the helper's provider. `None` when a real def resolves first
+    /// (local sub, inherited method, typeglob install) or when nothing
+    /// resolves at all. The entrypoint-scan lint asks this to find
+    /// helpers whose providing plugin no entrypoint loads.
+    pub fn bridged_helper_provider(
+        &self,
+        class: &str,
+        name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<String> {
+        let res = self.resolve_method_in_ancestors(class, name, module_index)?;
+        let MethodResolution::CrossFile { class: on_class, def_module: Some(module) } = res
+        else {
+            return None;
+        };
+        // CrossFile{def_module: Some} covers typeglob installs too —
+        // bridge-classify by the providing module's own declaration.
+        let idx = module_index?;
+        let cached = idx.get_cached(&module)?;
+        let is_bridge = cached.analysis.plugin_namespaces.iter().any(|ns| {
+            ns.bridges
+                .iter()
+                .any(|b| matches!(b, Bridge::Class(c) if c == &on_class))
+                && ns.entities.iter().any(|sid| {
+                    cached.analysis.symbols.get(sid.0 as usize).is_some_and(|s| {
+                        matches!(s.kind, SymKind::Sub | SymKind::Method) && s.name == name
+                    })
+                })
+        });
+        is_bridge.then_some(module)
     }
 
     /// Is `pkg` a role? Single source of the property — consumers ask
