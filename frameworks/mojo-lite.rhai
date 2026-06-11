@@ -219,6 +219,9 @@ fn on_function_call(ctx) {
                 if !name.contains("::") {
                     out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::" + name, "args": [], "imports": [], "span": span }};
                 }
+                let cfg = ();
+                if args.len() >= 2 { cfg = args[1].span; }
+                out += #{ "PluginLoad": #{ "name": name, "config_span": cfg }};
             }
         }
         return out;

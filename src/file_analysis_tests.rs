@@ -1991,3 +1991,61 @@ fn cross_file_slot_write_types_the_read() {
     assert_eq!(t2, Some(InferredType::ClassName("My::Conn".into())));
 }
 
+
+#[test]
+fn loader_config_types_register_conf_cross_file() {
+    // #25, framework-mediated: `plugin 'CloveApp', {...}` in the app
+    // types `$conf` inside the plugin's register — callers enumerable
+    // by construction (the PluginLoad facts name this module).
+    use std::sync::Arc;
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let app_src = "use Mojolicious::Lite;\nplugin 'CloveApp', { minion => 1, redis => 'r' };\napp->start;\n";
+    {
+        let mut parser = crate::builder::create_parser();
+        let tree = parser.parse(app_src, None).unwrap();
+        let fa = crate::builder::build(&tree, app_src.as_bytes());
+        assert!(
+            fa.plugin_loads.iter().any(|f| f.name == "CloveApp" && f.config_span.is_some()),
+            "the lite plugin arm should record the loader fact: {:?}",
+            fa.plugin_loads,
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/fake/conf/app.pl.pm-shim"),
+            Arc::new(fa),
+        );
+    }
+    // packageless shim doesn't register; use insert_cache instead
+    let app_src2 = "package MyApp::Boot;\nuse Mojolicious::Lite;\nplugin 'CloveApp', { minion => 1, redis => 'r' };\n1;\n";
+    {
+        let mut parser = crate::builder::create_parser();
+        let tree = parser.parse(app_src2, None).unwrap();
+        let fa = crate::builder::build(&tree, app_src2.as_bytes());
+        idx.insert_cache(
+            "MyApp::Boot",
+            Some(Arc::new(crate::file_analysis::CachedModule::new(
+                std::path::PathBuf::from("/fake/conf/Boot.pm"),
+                Arc::new(fa),
+            ))),
+        );
+    }
+
+    let plugin_src = "package Mojolicious::Plugin::CloveApp;\nuse Mojo::Base 'Mojolicious::Plugin';\n\nsub register {\n    my ($self, $app, $conf) = @_;\n}\n1;\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(plugin_src, None).unwrap();
+    let mut fa = crate::builder::build(&tree, plugin_src.as_bytes());
+    assert!(
+        !fa.loader_config_params.is_empty(),
+        "the param_types from_loader_config rule should mint a marker",
+    );
+    fa.enrich_imported_types_with_keys(Some(&idx));
+
+    let t = fa.inferred_type_via_bag("$conf", Point { row: 5, column: 0 });
+    match t {
+        Some(InferredType::HashWithKeys { keys, .. }) => {
+            let mut names: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).collect();
+            names.sort();
+            assert_eq!(names, vec!["minion", "redis"]);
+        }
+        other => panic!("expected the gathered config shape, got {other:?}"),
+    }
+}

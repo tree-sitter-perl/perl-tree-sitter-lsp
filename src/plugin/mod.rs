@@ -442,6 +442,16 @@ pub enum EmitAction {
     /// generic MethodCall ref; from that point on goto-def, references,
     /// rename, and hover work via the standard method-resolution path
     /// (with inheritance walk + workspace index).
+    /// "This call LOADS module `name` and passes it a config value."
+    /// The caller-side half of loader-config param typing: the fact
+    /// rides the calling file's FileAnalysis; enrichment of the LOADED
+    /// module joins it with a `from_loader_config` param marker and
+    /// types the param from the value at `config_span`.
+    PluginLoad {
+        name: String,
+        #[serde(default)]
+        config_span: Option<Span>,
+    },
     MethodCallRef {
         /// The method name (e.g. `"list"` from `"Users#list"`).
         method_name: String,
@@ -754,6 +764,15 @@ pub struct ParamType {
     /// *named* rules that don't set this.
     #[serde(default)]
     pub requires_action_attr: bool,
+    /// The param's REAL type is whatever value the loader call passed
+    /// (`plugin 'X', {...}` → register's `$conf`): enrichment joins
+    /// the callee-side marker this mints with caller-side
+    /// `PluginLoad` facts and pushes the gathered shape. `type_class`
+    /// stays as the static fallback (HashRef for Mojo's `$conf`) —
+    /// the bag's structure-dominates-rep subsumption prefers the
+    /// gathered shape when both land.
+    #[serde(default)]
+    pub from_loader_config: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

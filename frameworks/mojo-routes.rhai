@@ -127,6 +127,12 @@ fn param_types() {
     [
         #{ method: "register", in_role: "Mojolicious::Plugin", param: 1,
            type_class: "Mojolicious" },
+        // $conf: typed from whatever the loader call passed
+        // (`plugin 'X', {...}` — the PluginLoad fact carries the arg
+        // span). HashRef is the no-caller static fallback;
+        // structure-dominates-rep prefers the gathered shape.
+        #{ method: "register", in_role: "Mojolicious::Plugin", param: 2,
+           type_class: "HashRef", from_loader_config: true },
     ]
 }
 
@@ -334,6 +340,11 @@ fn on_method_call(ctx) {
                 } else {
                     out += #{ "SyntheticUse": #{ "module": name, "args": [], "imports": [], "span": span }};
                 }
+                // the loader fact: which module, and where its config
+                // value sits — the caller half of $conf typing
+                let cfg = ();
+                if args.len() >= 2 { cfg = args[1].span; }
+                out += #{ "PluginLoad": #{ "name": name, "config_span": cfg }};
             }
         }
         return out;

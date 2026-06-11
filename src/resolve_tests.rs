@@ -2953,7 +2953,7 @@ fn test_implementations_of_role_requires_fans_out_to_composers() {
     use std::sync::Arc;
 
     let idx = ModuleIndex::new_for_test();
-    let mut insert = |name: &str, src: &str| {
+    let insert = |name: &str, src: &str| {
         let analysis = Arc::new(parse(src));
         idx.insert_cache(
             name,
