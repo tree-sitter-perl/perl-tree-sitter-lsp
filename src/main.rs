@@ -254,6 +254,9 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     // Indexing without the index (bridge-less) is what forced callers to
     // hand-roll their own `index_workspace_with_index`, and they drifted.
     let module_index = module_index::ModuleIndex::new_for_cli();
+    // Wake the headless resolver: it blocks on this channel for the
+    // @INC scan + SQLite warm.
+    module_index.set_workspace_root(Some(root_uri.as_str()));
     let ws = file_store::FileStore::new();
     let indexed = module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index));
     eprintln!("Indexed {} files", indexed);
@@ -674,6 +677,36 @@ impl Drop for ScopedWorkspaceEntry<'_> {
     }
 }
 
+/// Resolve the query file's direct imports before answering. The LSP
+/// backend does this on didOpen (request_resolve per import); a CLI
+/// query is one-shot, so it requests AND waits, bounded per module.
+/// Without it, modules nothing in the workspace literally `use`s —
+/// framework-implied SyntheticUses like Mojolicious::Plugin::
+/// DefaultHelpers — resolve in the editor but stay invisible to CLI
+/// probes and the gold harness.
+fn resolve_imports_blocking(
+    idx: &module_index::ModuleIndex,
+    analysis: &file_analysis::FileAnalysis,
+) {
+    for imp in &analysis.imports {
+        idx.request_resolve(&imp.module_name);
+    }
+    // Global budget, not per-import: a cold cache resolving a
+    // framework's whole dependency tree must not stall the CLI for
+    // minutes. Each resolved module persists to the SQLite cache, so
+    // repeated runs converge to fully warm; within one run we answer
+    // with whatever resolved in time (the editor is eventually-
+    // consistent here too — it refreshes when resolution lands).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    for imp in &analysis.imports {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let _ = idx.wait_resolved(&imp.module_name, left);
+    }
+}
+
 fn run_one(
     ws: &file_store::FileStore,
     idx: &module_index::ModuleIndex,
@@ -693,6 +726,7 @@ fn run_one(
     match req.q.as_str() {
         "definition" => {
             let (_source, _tree, mut analysis) = parse_file(file);
+            resolve_imports_blocking(idx, &analysis);
             analysis.enrich_imported_types_with_keys(Some(idx));
             let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
             let uri = tower_lsp::lsp_types::Url::from_file_path(&abs)
@@ -718,6 +752,7 @@ fn run_one(
         }
         "references" => {
             let (_s, _t, mut analysis) = parse_file(file);
+            resolve_imports_blocking(idx, &analysis);
             analysis.enrich_imported_types_with_keys(Some(idx));
             let file_path = std::path::Path::new(file).canonicalize()
                 .unwrap_or_else(|_| std::path::PathBuf::from(file));
@@ -762,12 +797,14 @@ fn run_one(
         }
         "hover" => {
             let (source, _t, mut analysis) = parse_file(file);
+            resolve_imports_blocking(idx, &analysis);
             analysis.enrich_imported_types_with_keys(Some(idx));
             analysis.hover_info(point, &source, Some(idx))
                 .ok_or_else(|| format!("No hover info at {}:{}", req.line, req.col))
         }
         "type-at" => {
             let (_s, _t, analysis) = parse_file(file);
+            resolve_imports_blocking(idx, &analysis);
             if let Some(r) = analysis.ref_at(point) {
                 if let Some(ty) = analysis.inferred_type_via_bag(&r.target_name, point) {
                     return Ok(file_analysis::format_inferred_type(&ty));
@@ -872,6 +909,7 @@ fn run_one(
         }
         "outline" => {
             let (_s, _t, analysis) = parse_file(file);
+            resolve_imports_blocking(idx, &analysis);
             Ok(outline_json(&analysis))
         }
         "workspace-symbol" => {

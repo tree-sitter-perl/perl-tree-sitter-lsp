@@ -28,6 +28,7 @@ pub type OnResolved = Box<dyn Fn() + Send + Sync>;
 pub fn spawn_resolver(
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     reverse_index: Arc<DashMap<String, Vec<String>>>,
+    bridges_index: Arc<DashMap<String, Vec<String>>>,
     stale_modules: Arc<DashMap<String, ()>>,
     available_modules: Arc<DashMap<String, PathBuf>>,
     builtins: Arc<DashMap<String, String>>,
@@ -89,7 +90,7 @@ pub fn spawn_resolver(
                     queue.condvar.notify_one();
                 }
                 // Build reverse index from warmed cache.
-                rebuild_reverse_index(&cache, &reverse_index);
+                rebuild_reverse_index(&cache, &reverse_index, &bridges_index);
             }
 
             // Track which extract version each module was resolved at.
@@ -178,6 +179,7 @@ pub fn spawn_resolver(
                     insert_into_cache(
                         &cache,
                         &reverse_index,
+                        &bridges_index,
                         &module_name,
                         result.clone(),
                     );
@@ -319,11 +321,16 @@ fn drain_next_batch(queue: &ResolveQueue) -> Vec<String> {
     }
 }
 
-/// Simplified resolver for tests — no Client, no progress, no cpanfile.
-#[cfg(test)]
+/// Headless resolver — no Client, no LSP progress. Same @INC scan,
+/// project-local lib discovery, SQLite warm/persist, and index feeds
+/// as the full resolver. Serves tests AND one-shot CLI sessions
+/// (`ModuleIndex::new_for_cli`), which previously had NO resolver at
+/// all and could only read what editor sessions had cached.
+#[doc(hidden)]
 pub fn spawn_test_resolver(
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     reverse_index: Arc<DashMap<String, Vec<String>>>,
+    bridges_index: Arc<DashMap<String, Vec<String>>>,
     stale_modules: Arc<DashMap<String, ()>>,
     available_modules: Arc<DashMap<String, PathBuf>>,
     queue: Arc<ResolveQueue>,
@@ -355,7 +362,7 @@ pub fn spawn_test_resolver(
                 for name in stale_names {
                     stale_modules.insert(name, ());
                 }
-                rebuild_reverse_index(&cache, &reverse_index);
+                rebuild_reverse_index(&cache, &reverse_index, &bridges_index);
             }
 
             let mut seen: HashMap<String, i64> = HashMap::new();
@@ -375,7 +382,7 @@ pub fn spawn_test_resolver(
                     }
 
                     let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
-                    insert_into_cache(&cache, &reverse_index, &module_name, result.clone());
+                    insert_into_cache(&cache, &reverse_index, &bridges_index, &module_name, result.clone());
                     if let Some(ref conn) = db {
                         module_cache::save_to_db(conn, &module_name, &result, "import");
                     }
@@ -431,6 +438,7 @@ fn indexable_symbol_names(analysis: &crate::file_analysis::FileAnalysis) -> Vec<
 fn insert_into_cache(
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
     reverse_index: &DashMap<String, Vec<String>>,
+    bridges_index: &DashMap<String, Vec<String>>,
     module_name: &str,
     result: Option<Arc<CachedModule>>,
 ) {
@@ -438,6 +446,12 @@ fn insert_into_cache(
         for name in reverse_index_names(&cached.analysis) {
             reverse_index
                 .entry(name)
+                .or_default()
+                .push(module_name.to_string());
+        }
+        for class in bridge_classes(&cached.analysis) {
+            bridges_index
+                .entry(class)
                 .or_default()
                 .push(module_name.to_string());
         }
@@ -466,16 +480,40 @@ pub fn reverse_index_names(analysis: &crate::file_analysis::FileAnalysis) -> Vec
     names.into_iter().collect()
 }
 
+/// The bridge classes an analysis' plugin namespaces declare — the
+/// feed for `bridges_index`, deduped. Shared by every cache-insert and
+/// warm-rebuild site so dependency modules and workspace modules
+/// register bridges identically.
+pub fn bridge_classes(analysis: &crate::file_analysis::FileAnalysis) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ns in &analysis.plugin_namespaces {
+        for crate::file_analysis::Bridge::Class(c) in &ns.bridges {
+            seen.insert(c.clone());
+        }
+    }
+    seen.into_iter().collect()
+}
+
 /// Rebuild reverse index from existing cache (e.g. after warming from SQLite).
 fn rebuild_reverse_index(
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
     reverse_index: &DashMap<String, Vec<String>>,
+    bridges_index: &DashMap<String, Vec<String>>,
 ) {
     for entry in cache.iter() {
         if let Some(ref cached) = *entry.value() {
             for name in reverse_index_names(&cached.analysis) {
                 reverse_index
                     .entry(name)
+                    .or_default()
+                    .push(entry.key().clone());
+            }
+            // Bridges ride the same rebuild — the warm path that made
+            // dependency-registered helpers invisible on every start
+            // after the cold resolve (cold/warm attribution, B6 class).
+            for class in bridge_classes(&cached.analysis) {
+                bridges_index
+                    .entry(class)
                     .or_default()
                     .push(entry.key().clone());
             }

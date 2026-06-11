@@ -122,12 +122,14 @@ impl ModuleIndex {
             condvar: Condvar::new(),
         });
 
+        let bridges_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
         let refresh = Arc::new(on_diagnostics_refresh);
         let refresh_clone = Arc::clone(&refresh);
 
         module_resolver::spawn_resolver(
             Arc::clone(&cache),
             Arc::clone(&reverse_index),
+            Arc::clone(&bridges_index),
             Arc::clone(&stale_modules),
             Arc::clone(&available_modules),
             Arc::clone(&builtins),
@@ -140,7 +142,8 @@ impl ModuleIndex {
 
         ModuleIndex {
             cache,
-            reverse_index,            bridges_index: Arc::new(DashMap::new()),
+            reverse_index,
+            bridges_index,
             stale_modules,
             available_modules,
             builtins,
@@ -382,35 +385,15 @@ impl ModuleIndex {
 
     /// Create a minimal ModuleIndex for CLI mode (no resolver thread, no @INC scan).
     pub fn new_for_cli() -> Self {
-        ModuleIndex {
-            cache: Arc::new(DashMap::new()),
-            reverse_index: Arc::new(DashMap::new()),            bridges_index: Arc::new(DashMap::new()),
-            stale_modules: Arc::new(DashMap::new()),
-            available_modules: Arc::new(DashMap::new()),
-            builtins: Arc::new(DashMap::new()),
-            queue: Arc::new(ResolveQueue {
-                priority: Mutex::new(Vec::new()),
-                pending: Mutex::new(Vec::new()),
-                condvar: Condvar::new(),
-            }),
-            resolved: Arc::new(ResolveNotify {
-                mu: Mutex::new(()),
-                cv: Condvar::new(),
-            }),
-            workspace_root: Arc::new(WorkspaceRootChannel {
-                root: Mutex::new(None),
-                condvar: Condvar::new(),
-            }),
-            refresh_diagnostics: Arc::new(|| {}),
-        }
-    }
-
-    // ---- Test-only methods ----
-
-    #[cfg(test)]
-    pub fn new_for_test() -> Self {
+        // A real (headless) resolver thread: one-shot CLI sessions used
+        // to carry NO resolver, so they could never resolve a module the
+        // editor hadn't already cached — framework-implied imports
+        // (DefaultHelpers) stayed invisible to every CLI probe and the
+        // gold harness. The thread blocks until `set_workspace_root`
+        // fires in `cli_full_startup`.
         let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
         let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let bridges_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
         let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
         let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
         let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -431,6 +414,7 @@ impl ModuleIndex {
         module_resolver::spawn_test_resolver(
             Arc::clone(&cache),
             Arc::clone(&reverse_index),
+            Arc::clone(&bridges_index),
             Arc::clone(&stale_modules),
             Arc::clone(&available_modules),
             Arc::clone(&queue),
@@ -440,7 +424,57 @@ impl ModuleIndex {
 
         ModuleIndex {
             cache,
-            reverse_index,            bridges_index: Arc::new(DashMap::new()),
+            reverse_index,
+            bridges_index,
+            stale_modules,
+            available_modules,
+            builtins,
+            queue,
+            resolved,
+            workspace_root,
+            refresh_diagnostics: Arc::new(|| {}),
+        }
+    }
+
+    // ---- Test-only methods ----
+
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
+        let reverse_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let bridges_index: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
+        let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
+        let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
+        let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let queue = Arc::new(ResolveQueue {
+            priority: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+            condvar: Condvar::new(),
+        });
+        let resolved = Arc::new(ResolveNotify {
+            mu: Mutex::new(()),
+            cv: Condvar::new(),
+        });
+        let workspace_root = Arc::new(WorkspaceRootChannel {
+            root: Mutex::new(None),
+            condvar: Condvar::new(),
+        });
+
+        module_resolver::spawn_test_resolver(
+            Arc::clone(&cache),
+            Arc::clone(&reverse_index),
+            Arc::clone(&bridges_index),
+            Arc::clone(&stale_modules),
+            Arc::clone(&available_modules),
+            Arc::clone(&queue),
+            Arc::clone(&resolved),
+            Arc::clone(&workspace_root),
+        );
+
+        ModuleIndex {
+            cache,
+            reverse_index,
+            bridges_index,
             stale_modules,
             available_modules,
             builtins,
@@ -542,6 +576,7 @@ impl ModuleIndex {
     /// calls the equivalent rebuild after its own warm.
     pub fn rebuild_reverse_index_from_cache(&self) {
         self.reverse_index.clear();
+        self.bridges_index.clear();
         for entry in self.cache.iter() {
             if let Some(ref cached) = *entry.value() {
                 for name in crate::module_resolver::reverse_index_names(&cached.analysis) {
@@ -549,6 +584,23 @@ impl ModuleIndex {
                         .entry(name)
                         .or_default()
                         .push(entry.key().clone());
+                }
+                // Bridges too — same cold/warm-attribution class as the
+                // reverse index above: the warm path writes blobs straight
+                // into the cache, so a helper registered in a dependency
+                // (DefaultHelpers) was reachable on the cold run that
+                // resolved it and INVISIBLE on every warm start after.
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for ns in &cached.analysis.plugin_namespaces {
+                    for crate::file_analysis::Bridge::Class(c) in &ns.bridges {
+                        if seen.insert(c.as_str()) {
+                            self.bridges_index
+                                .entry(c.clone())
+                                .or_default()
+                                .push(entry.key().clone());
+                        }
+                    }
                 }
             }
         }
@@ -630,7 +682,8 @@ impl ModuleIndex {
     }
 
     /// Block until `module_name` appears in the cache, or timeout.
-    #[cfg(test)]
+    /// (Used by tests and the one-shot CLI import resolution.)
+    #[doc(hidden)]
     pub fn wait_resolved(&self, module_name: &str, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let mut guard = self.resolved.mu.lock().unwrap();

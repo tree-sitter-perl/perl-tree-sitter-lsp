@@ -93,6 +93,14 @@ fn decamelize(name) {
 fn on_use(ctx) {
     if ctx.module_name != "Mojolicious::Lite" { return []; }
     let out = [];
+    // The framework loads these unconditionally at startup — no `use`
+    // ever names them, so the import-driven resolver would never pull
+    // them in and their helper registrations would stay invisible.
+    // Declaring the implication here (rule #8: the plugin owns
+    // framework behavior) routes them through the normal import →
+    // resolve → bridge pipeline.
+    out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::DefaultHelpers", "args": [], "imports": [], "span": ctx.span }};
+    out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::TagHelpers", "args": [], "imports": [], "span": ctx.span }};
 
     // `app` — no real sub to link to; monkey-patched `sub { $app }`.
     // Typed Sub is the one acknowledged stub; downstream chain flow
@@ -204,6 +212,13 @@ fn on_function_call(ctx) {
                         invocant_span: (),
                     }
                 };
+                // "You loaded it" — make the resolver pull the plugin in
+                // so its helpers register. Default namespace guess only;
+                // app-custom namespaces (Clove::App::Plugin::*) are
+                // workspace modules and already indexed.
+                if !name.contains("::") {
+                    out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::" + name, "args": [], "imports": [], "span": span }};
+                }
             }
         }
         return out;
