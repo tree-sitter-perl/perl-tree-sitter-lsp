@@ -37,6 +37,7 @@ pub struct SkelSymbol {
     pub start: Point,
     pub end: Point,
     pub name_start: Point,
+    pub name_end: Point,
     /// Sticky `@context.package` value in force at the def site.
     pub package: Option<String>,
     /// Innermost `@scope` nesting depth (0 = file).
@@ -91,7 +92,7 @@ impl SkeletonAnalysis {
                     _ => SymKind::Variable,
                 },
                 span: Span { start: s.start, end: s.end },
-                selection_span: Span { start: s.name_start, end: s.name_start },
+                selection_span: Span { start: s.name_start, end: s.name_end },
                 scope: s.scope,
                 package: s.package.clone(),
                 detail: SymbolDetail::None,
@@ -266,10 +267,11 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
 
     // ---- join def name-captures to their def event ----
     use std::collections::HashMap;
-    let mut names_by_match: HashMap<(usize, String), (String, Point)> = HashMap::new();
+    let mut names_by_match: HashMap<(usize, String), (String, Point, Point)> = HashMap::new();
     for e in &events {
         if let Some(prefix) = e.cap.strip_suffix(".name") {
-            names_by_match.insert((e.match_id, prefix.to_string()), (e.text.clone(), e.start));
+            names_by_match
+                .insert((e.match_id, prefix.to_string()), (e.text.clone(), e.start, e.end));
         }
     }
 
@@ -339,11 +341,13 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             }
             cap if cap.starts_with("def.") && !cap.ends_with(".name") => {
                 let kind = cap.strip_prefix("def.").unwrap().to_string();
-                let (name, name_start) = names_by_match
+                let (name, name_start, name_end) = names_by_match
                     .get(&(e.match_id, e.cap.clone()))
                     .cloned()
-                    .or_else(|| (pack.default_name)(&kind).map(|n| (n.to_string(), e.start)))
-                    .unwrap_or((e.text.clone(), e.start));
+                    .or_else(|| {
+                        (pack.default_name)(&kind).map(|n| (n.to_string(), e.start, e.start))
+                    })
+                    .unwrap_or((e.text.clone(), e.start, e.end));
                 def_name_spans.push((e.start_byte, e.end_byte));
                 out.symbols.push(SkelSymbol {
                     name: (pack.shape_name)(&format!("def.{kind}"), &name),
@@ -351,6 +355,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     start: e.start,
                     end: e.end,
                     name_start,
+                    name_end,
                     package: package.clone(),
                     scope_depth: scope_stack.len(),
                     scope: cur_scope,

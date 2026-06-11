@@ -514,3 +514,51 @@ fn operator_evidence_types_through_usage() {
     assert_eq!(fa.inferred_type_via_bag("$x", end), Some(InferredType::Numeric));
     assert_eq!(fa.inferred_type_via_bag("$s", end), Some(InferredType::String));
 }
+
+#[test]
+fn python_workspace_rename_for_free() {
+    // The exact LSP rename path — resolve_symbol at the cursor, then
+    // refs_to, then text edits — over two pack-built Python files.
+    let src_a = "def helper(x):\n    return x\n";
+    let src_b = "from a import helper\n\nz = helper(1)\n";
+    let (fa_a, _) = python_fa(src_a);
+    let (fa_b, _) = python_fa(src_b);
+
+    let store = crate::file_store::FileStore::new();
+    let pa = std::path::PathBuf::from("/fake/py/a.py");
+    let pb = std::path::PathBuf::from("/fake/py/b.py");
+    store.insert_workspace(pa.clone(), fa_a);
+    store.insert_workspace(pb.clone(), fa_b);
+
+    // Cursor on the CALL in b.py (line 2, inside "helper").
+    let fa_b_view = store.workspace_raw().get(&pb).unwrap().clone();
+    let point = tree_sitter::Point { row: 2, column: 6 };
+    let resolved = crate::resolve::resolve_symbol(&fa_b_view, point, None);
+    let target = match resolved {
+        Some(crate::resolve::ResolvedTarget::Target(t)) => t,
+        other => panic!("expected a walkable target at the call, got {other:?}"),
+    };
+    assert_eq!(target.name, "helper");
+
+    let locs = crate::resolve::refs_to(&store, None, &target, crate::resolve::RoleMask::EDITABLE);
+    assert_eq!(locs.len(), 3, "decl + import spelling + call, got {locs:?}");
+
+    // Apply the edits the way backend::rename does: replace each span
+    // with the new name, per file, right-to-left.
+    let mut texts: std::collections::HashMap<std::path::PathBuf, String> =
+        [(pa.clone(), src_a.to_string()), (pb.clone(), src_b.to_string())].into();
+    for loc in &locs {
+        let crate::file_store::FileKey::Path(p) = &loc.key else { panic!() };
+        let text = texts.get_mut(p).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let line = lines[loc.span.start.row];
+        let mut new_line = line.to_string();
+        new_line.replace_range(loc.span.start.column..loc.span.end.column, "fetch_all");
+        let mut new_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        new_lines[loc.span.start.row] = new_line;
+        *text = new_lines.join("\n") + "\n";
+    }
+    assert_eq!(texts[&pa], "def fetch_all(x):\n    return x\n");
+    assert_eq!(texts[&pb], "from a import fetch_all\n\nz = fetch_all(1)\n");
+}
+

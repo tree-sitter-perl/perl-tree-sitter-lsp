@@ -204,6 +204,16 @@ annotations exist where it matters (typeshed covers the stdlib and
 maintained libraries), so the pack's `annot_type` predicate carries
 the load, with constructor and literal evidence filling locals.
 
+**Workspace rename, for free.** The question answered itself once
+refs worked: rename in this architecture IS `resolve_symbol` →
+`refs_to` → text edits, and all three are engine. The test
+(`python_workspace_rename_for_free`) puts the cursor on the call in
+b.py and renames `helper` → `fetch_all` across the def, the call,
+AND the `from a import helper` spelling — the import line cost
+exactly one .scm pattern (imported names are refs). Two fixes were
+needed, both in the driver/pack, neither in the engine: name-token
+selection spans (were zero-width) and the import-name capture.
+
 ## Recommendation (revised after spike 2)
 
 Keep the branch as evidence; don't merge. The Perl path stays

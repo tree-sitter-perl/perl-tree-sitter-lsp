@@ -18,6 +18,11 @@
 (import_from_statement
   module_name: (dotted_name) @import.name) @import
 
+; Imported names are references to the remote def — this single
+; pattern is what makes cross-file RENAME rewrite the import line too.
+(import_from_statement
+  name: (dotted_name (identifier) @ref.call))
+
 ; Assignment IS declaration in Python — the same identifier is both
 ; the def and the flow target.
 (assignment
