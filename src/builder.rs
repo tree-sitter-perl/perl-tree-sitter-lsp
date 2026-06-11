@@ -6590,6 +6590,18 @@ impl<'a> Builder<'a> {
             });
             return;
         }
+        // Idempotent per span: the walk reaches many expressions twice
+        // (child visit first, then the enclosing assignment/invocant
+        // emitter). One "expression"-source witness per Expr(span) is
+        // the contract; identical duplicates only bloat the bag.
+        let already = self
+            .bag
+            .for_attachment(&WitnessAttachment::Expr(span))
+            .iter()
+            .any(|w| matches!(&w.source, WitnessSource::Builder(t) if t == "expression"));
+        if already {
+            return;
+        }
         if let Some(payload) = self.expr_payload(node) {
             self.bag.push(Witness {
                 attachment: WitnessAttachment::Expr(span),
@@ -10516,6 +10528,16 @@ impl<'a> Builder<'a> {
         // the LHS of an assignment, so the grandparent check returns
         // Write. Needed for invocant mutations.
         let element_access = self.determine_access(node);
+
+        // READ drills get their Projected witness here, not only when
+        // an enclosing assignment/invocant emitter happens to reach
+        // them — a bare-statement `cfg()->{k};` is still a drill the
+        // expression-base diagnostic must see. Writes stay
+        // witness-less: a write extends the producer's shape, it isn't
+        // a typo to hint on.
+        if element_access != AccessKind::Write {
+            self.emit_expr_witness(node);
+        }
 
         // A method-call container (`$obj->get_config->{host}`) has no
         // variable identity to anchor the key on — its owner is the

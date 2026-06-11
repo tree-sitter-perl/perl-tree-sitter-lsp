@@ -356,7 +356,31 @@ end)
 
 -- ── diagnostics ──────────────────────────────────────────────────────
 
-lsp.assert_no_diagnostics(t, buf)
+-- The deliberate shape typos in sample.pl ($sner->{pot} + the two
+-- call-base ->{prot} drills, bare-statement included): pinned
+-- positively here, then allowed through the no-unexpected sweep.
+t.test("unknown-hash-key hints on the deliberate typos", function()
+  local N = "unknown-hash-key hints on the deliberate typos"
+  local found = 0
+  for _ = 1, 20 do
+    found = 0
+    for _, d in ipairs(vim.diagnostic.get(buf)) do
+      if d.message:find("literal shape", 1, true) then found = found + 1 end
+    end
+    if found >= 3 then break end
+    vim.wait(250)
+  end
+  if found == 3 then
+    t.pass(N)
+  else
+    t.fail(N, "expected 3 unknown-hash-key hints, saw " .. found)
+  end
+end)
+
+lsp.assert_no_diagnostics(t, buf, {
+  "key 'pot' is not in $sner's literal shape",
+  "key 'prot' is not in this expression's literal shape",
+})
 
 -- ── done ─────────────────────────────────────────────────────────────
 

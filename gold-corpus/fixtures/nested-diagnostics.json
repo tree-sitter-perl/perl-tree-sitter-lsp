@@ -106,6 +106,25 @@
       },
       "status": "gold",
       "note": "Call-base drill (local_cfg()->{retrys}) hints off the producer's closed return shape via the Projected witness; no variable in hand."
+    },
+    {
+      "id": "nested-bare-statement-drill-typo",
+      "difficulty": "simple",
+      "semantic_area": "structural-shapes",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 48,
+      "col": 13,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [
+          "key 'tiemout' is not in this expression's literal shape"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "Bare-statement drill (local_cfg()->{tiemout};) \u2014 read elements get their Projected witness in visit_hash_element, not only under an assignment emitter."
     }
   ]
 }

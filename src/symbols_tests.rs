@@ -4441,6 +4441,7 @@ fn test_expression_base_unknown_key_diagnostic() {
 sub cfg { return { host => 'x', port => 1 } }
 my $ok = cfg()->{host};
 my $bad = cfg()->{hsot};
+cfg()->{hsot2};
 ";
     let analysis = parse_analysis(src);
     let idx = crate::module_index::ModuleIndex::new_for_test();
@@ -4454,11 +4455,21 @@ my $bad = cfg()->{hsot};
         .filter(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "unknown-hash-key"))
         .map(|d| d.message.as_str())
         .collect();
-    assert_eq!(keys.len(), 1, "only the call-base typo: {:?}", keys);
+    assert_eq!(
+        keys.len(),
+        2,
+        "assignment-position and bare-statement call-base typos: {:?}",
+        keys,
+    );
     assert!(keys[0].contains("'hsot'"), "{:?}", keys);
     assert!(
         keys[0].contains("this expression's"),
         "expression-base message form: {:?}",
+        keys,
+    );
+    assert!(
+        keys[1].contains("'hsot2'"),
+        "bare-statement drill is witnessed too: {:?}",
         keys,
     );
 }

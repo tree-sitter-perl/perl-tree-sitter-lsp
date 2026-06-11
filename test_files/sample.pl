@@ -53,6 +53,11 @@ sub get_self {
     return $self;
 }
 
+my $sner = get_config();
+get_config()->{prot};
+get_config->{prot};
+$sner->{pot};
+
 package main;
 
 my $calc = Calculator->new(verbose => 1);
