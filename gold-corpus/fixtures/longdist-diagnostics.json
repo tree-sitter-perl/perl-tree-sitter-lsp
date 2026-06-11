@@ -1,0 +1,38 @@
+{
+  "capability": "diagnostics",
+  "rows": [
+    {
+      "id": "helper-not-loaded-workspace-plugin",
+      "difficulty": "tricky",
+      "semantic_area": "long-distance",
+      "root": "gold-corpus/longdist-fixture",
+      "file": "",
+      "expect": {
+        "all": [
+          "helper-not-loaded",
+          "'widget_count' is provided by My::Plugin::Widgets, which no workspace entrypoint loads"
+        ],
+        "none": [
+          "'confy_thing'"
+        ]
+      },
+      "status": "gold",
+      "note": "Widgets is a workspace plugin nothing loads — the lint fires at the usage site. Confy IS loaded (app.pl `plugin 'Confy'`), so its helper stays silent: both directions of the entrypoint scan in one sweep."
+    },
+    {
+      "id": "loader-config-conf-shape-closed",
+      "difficulty": "tricky",
+      "semantic_area": "long-distance",
+      "root": "gold-corpus/longdist-fixture",
+      "file": "",
+      "expect": {
+        "all": [
+          "key 'alpa' is not in $conf's literal shape (keys: alpha, beta)"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "The $conf typo hint proves the whole loader-config chain: the PluginLoad fact from a PACKAGELESS lite entrypoint, the registration-time shape projection, the enrichment join, and the resulting CLOSED HashWithKeys{alpha, beta} feeding the unknown-hash-key diagnostic."
+    }
+  ]
+}

@@ -2049,3 +2049,4 @@ fn loader_config_types_register_conf_cross_file() {
         other => panic!("expected the gathered config shape, got {other:?}"),
     }
 }
+

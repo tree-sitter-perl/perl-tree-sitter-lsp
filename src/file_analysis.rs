@@ -240,6 +240,11 @@ pub trait CrossFileLookup {
         class: &str,
         visit: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>) -> std::ops::ControlFlow<()>,
     );
+    /// Registration-time loader-config shapes: every (load_name, shape)
+    /// projected from `PluginLoad` facts across the workspace —
+    /// INCLUDING packageless entrypoint scripts, which never enter the
+    /// module cache.
+    fn for_each_loader_shape(&self, f: &mut dyn FnMut(&str, &InferredType));
 }
 
 // ---- Serde proxy for tree_sitter::Point ----
@@ -3509,15 +3514,9 @@ impl FileAnalysis {
                 continue;
             }
             let mut shapes: Vec<InferredType> = Vec::new();
-            idx.for_each_cached(&mut |_name, cached| {
-                for f in &cached.analysis.plugin_loads {
-                    let Some(span) = f.config_span else { continue };
-                    if !matches_me(&f.name) {
-                        continue;
-                    }
-                    if let Some(t) = cached.analysis.expr_type_at_span(span, Some(idx)) {
-                        shapes.push(t);
-                    }
+            idx.for_each_loader_shape(&mut |load_name, t| {
+                if matches_me(load_name) {
+                    shapes.push(t.clone());
                 }
             });
             if shapes.is_empty() {
