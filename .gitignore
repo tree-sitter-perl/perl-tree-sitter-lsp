@@ -9,3 +9,4 @@ qa-workspace/
 gold-corpus/local/
 gold-corpus/.carton/
 gold-corpus/local
+*.vsix
