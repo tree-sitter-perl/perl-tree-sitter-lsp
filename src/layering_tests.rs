@@ -3,7 +3,7 @@
 //! suite makes a violation a red `cargo test` instead of a review
 //! catch. (The alternative — a crate-per-layer workspace — buys the
 //! same guarantee from the compiler at the price of five published
-//! crates; see `docs/arch-review-2026-06.md` §4 for the trade-off.)
+//! crates; the executed-and-rejected split lives on branch `workspace-split`.)
 
 use std::collections::HashMap;
 use std::fs;

@@ -1,14 +1,19 @@
 # Graph Walking: One Typed-Edge Graph, One Walker
 
-> **Scheduled after the type-inference triplet ships.** Type intelligence
-> is the priority — the lights-off problem in real Perl projects. Graph
-> rework is the next architectural pillar; type inference benefits from
-> a cleaner graph but doesn't block on it.
+> **Scheduled NOW (June 2026).** The type-inference arc's remaining
+> items are all explicitly deferred-by-design; meanwhile six bespoke
+> walk mechanisms have accumulated (`parents_of`, `ModuleEdgeIndexes`'
+> three maps, `for_each_descendant_package`, `ReceiverGated`, RoleMask
+> tiers) — each with its own B6-style feed discipline. The strangler-
+> fig consumers exist; this is the next pillar.
 >
 > Cross-refs: `adr/file-store-and-resolve.md` (today's `RoleMask` model
 > that this retires); `adr/plugin-system.md` (today's `PluginNamespace`
-> + `Bridge` that becomes typed edges); `prompt-unification-residual.md`
-> (Phase 6 Openness + Phase 7 home_namespace move depend on this).
+> + `Bridge` that becomes typed edges); `adr/role-contracts.md`
+> (children_index — the inverse edge this graph makes first-class).
+> This doc also absorbed the unification residuals (Openness,
+> `home_namespace`, the eager `Ref.target` field) — see the final
+> section.
 
 ## The problem
 
@@ -267,13 +272,13 @@ graph-walk version is a drop-in replacement when ready.
 
 ## What this unblocks
 
-- **Phase 6 Openness diagnostic** (from `prompt-unification-residual.md`).
+- **Openness diagnostic** (absorbed residuals, below).
   Walking the namespace chain to ask "does this terminate Closed?"
   becomes one `walk` call with an `inherits | imports | bridges` mask.
 - **Multi-app Mojo support** (from `prompt-mojo-todo.md`). Two
   Mojolicious::Lite apps in one workspace stop colliding once branded
   edges work.
-- **Phase 7 `home_namespace` move** (from `prompt-unification-residual.md`).
+- **`home_namespace` move** (absorbed residuals, below).
   Once nodes are typed, `Symbol.package: Option<String>` becomes
   `Symbol.home_scope: NodeId`.
 - **Cleaner type-inference scope queries.** `query_variable_type`'s
@@ -346,3 +351,40 @@ extends naturally.
 - Effect tracking on edges (which edges mutate state, throw, etc.).
 - Runtime-dynamic graph mutation (e.g. `*Foo::bar = sub { ... }`
   installing a method at runtime). Static-only.
+
+## Absorbed residuals (from the retired unification doc)
+
+**Openness classification (was phase 6).** Unresolved-* diagnostics
+either over-fire (roles, plugins, abstract bases) or under-fire
+(framework-imported names). One derived-never-stored rule:
+`enum Openness { Closed, Open }` per namespace —
+`use Moo::Role`/`Role::Tiny` → Open; plugin-shaped `Mojo::Base
+'Mojolicious::Plugin'` → Open; an app with `sub startup` → Closed;
+controllers with routes targeting them → Closed; referenced-as-parent
+but never instantiated → Open; scripts → Closed; default Closed.
+Diagnostic rule: walk upward from the ref's namespace via `inherits |
+imports | bridges`; unresolved at a Closed termination → warn; an Open
+node on the way → suppress. Replaces the bespoke `framework_imports`
+suppression and covers unresolved function/method/stash-key/route-
+target/helper uniformly.
+
+**`Symbol.home_namespace` (was phase 7).** Once nodes are typed,
+`Symbol.package: Option<String>` becomes `Symbol.home_scope: NodeId`,
+and `Bridge::Class(...)` becomes a bridge to a framework node directly
+(no more routing app surfaces through a controller class name).
+
+**Eager `Ref.target` (was phase 5, mostly dissolved).** Lazy TREE
+resolution is dead (the one behavior it carried — ctor-key → Corinna
+field — became eager `HashKeyDef` synthesis); MethodCalls carry
+`resolved_method_target`, FunctionCalls `resolved_package`, variables
+`resolves_to`. What remains is the field SHAPE: `resolves_to:
+Option<SymbolId>` → non-optional `target` with an `UNRESOLVED`
+sentinel, which is what the Openness rule's "unresolved bucket" reads.
+Do it as part of this rework — a ref's target is the walk's output.
+
+**The pluggability question (was phase 1's blocker) is this graph's
+node-identity question.** Enum-only nodes (exhaustive, recompile per
+framework) vs `Custom { kind, name }` (open, loses exhaustiveness) vs
+hybrid. The plugin-system's trajectory (manifests over enums —
+`role_makers`, `app_surface_consumers`) argues hybrid with the open
+arm as the default for plugin-declared scopes.

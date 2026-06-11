@@ -17,7 +17,10 @@
 | Helper completion + goto-def | `mojo-helpers.rhai` |
 | Minion task registration + enqueue sig help | `minion.rhai` |
 | EventEmitter `on`/`emit`/`once` | `mojo-events.rhai` |
-| Mojolicious::Lite DSL imports + routes | `mojo-lite.rhai` |
+| Mojolicious::Lite DSL imports + routes (incl. under/group nesting) | `mojo-lite.rhai` |
+| Plugin-name goto-def (`plugin 'Thing'` → register) | `mojo-lite.rhai` / `mojo-routes.rhai` |
+| Framework-assigned attr typing (`$app`, `$tx`, `$c->req/res`) | `mojo-routes.rhai` |
+| DefaultHelpers/TagHelpers discovery (framework-implied SyntheticUse) | core `process_use` + plugins |
 | Data::Printer use-line completion | `data-printer.rhai` |
 
 ## What's missing
@@ -50,6 +53,11 @@ Need: stash-key registry per controller / action. Completion inside
 `$c->stash('…')` and `$c->stash->{…}`. Detection covers `stash(k=>v)`,
 fat-comma pairs in `render(k=>v)` after known render options, fat-comma
 pairs in `->to('c#a', k=>v)` route defaults.
+
+`BrandedRoute` already carries an arbitrary `stash: Vec<(String,
+String)>` through `under`/`->to` chains (`adr/route-branding.md`) — a
+hover/completion surfacing the in-force inherited stash keys at a
+descendant route is the read side waiting for a consumer.
 
 Plugin shape: emit `HashKeyDef` with `HashKeyOwner::Class` tagged to the
 controller (or eventually `MojoAction` namespace once phase 1 of the
@@ -84,14 +92,11 @@ known set, plus `on_signature_help` for the handler-sub argument shape.
 calls `$app->helper(...)` — those helpers should appear in the host's
 controllers.
 
-Today: short-name resolution (`'Authentication'` → `'Mojolicious::Plugin::Authentication'`)
-isn't even done. Goto-def on the plugin name string would be the first
-win. Transitive helper discovery is the second — needs the plugin's
-`register()` body parsed and its `helper()` calls collected against the
-host app's namespace.
-
-Phase order: short-name + goto-def first (small); transitive helper
-discovery later (needs cross-file plumbing).
+Short-name resolution + goto-def LANDED (crm QA sweep), and `plugin
+'X'` SyntheticUses the plugin module so its register-time helpers
+resolve. What's left is TRANSITIVE chains: plugin A's register loading
+plugin B — B's helpers should reach the host. Needs the chain followed
+one more hop at resolve time.
 
 ### Config completion (stretch)
 
@@ -108,6 +113,6 @@ machinery; the new bit is the `.conf` parser.
 Two `Mojolicious::Lite` apps in one workspace today fold into one set of
 helpers/routes (helpers attach to `Mojolicious::Controller`, routes to
 the literal package). The right shape is `PluginNamespace` with bridges
-— see `prompt-plugin-namespace.md`. Not blocking for any single feature
+— see `adr/plugin-system.md`. Not blocking for any single feature
 above; a quality bar to revisit once two-app cases come up in real
 usage.

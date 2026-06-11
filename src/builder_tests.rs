@@ -3898,7 +3898,7 @@ has 'name';
     }
 }
 
-/// Regression test for QA finding B1 (refer to qa-workspace/qa-findings.md):
+/// Regression test for QA finding B1 (export-attribution; the sweep history):
 /// Mojo::Base writer accessors lost their fluent invocant return type
 /// when queried through the bag at arity=1. The QA dump for
 /// `Mojo::Log::level` showed:

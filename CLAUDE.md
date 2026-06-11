@@ -35,7 +35,7 @@ Builder          builder.rs                   → produces FileAnalysis
 Data model       file_analysis.rs             → FileAnalysis (serde, bincode-cacheable)
 ```
 
-See `docs/ROADMAP.md` for the forward design corpus entry point. `docs/adr/file-store-and-resolve.md` covers the landed cross-file unification: single role-tagged FileStore + RoleMask + `refs_to`, plus `resolve_symbol` (cursor→`ResolvedTarget`) — the one entry point both LSP handlers (references/rename) and their CLI mirrors use to identify the target before calling `refs_to`. Never map `RenameKind`→`TargetRef` inline in a handler; per-feature policy on a target is a method on `TargetRef` (e.g. `supports_cross_file_rename`). Residual forward work in `docs/prompt-unification-residual.md`; the next architectural pillar (graph walking) in `docs/prompt-graph-walking.md`.
+See `docs/ROADMAP.md` for the forward design corpus entry point. `docs/adr/file-store-and-resolve.md` covers the landed cross-file unification: single role-tagged FileStore + RoleMask + `refs_to`, plus `resolve_symbol` (cursor→`ResolvedTarget`) — the one entry point both LSP handlers (references/rename) and their CLI mirrors use to identify the target before calling `refs_to`. Never map `RenameKind`→`TargetRef` inline in a handler; per-feature policy on a target is a method on `TargetRef` (e.g. `supports_cross_file_rename`). The next architectural pillar (graph walking, which absorbed the unification residuals) is `docs/prompt-graph-walking.md`.
 
 ### Rules (read before writing code)
 

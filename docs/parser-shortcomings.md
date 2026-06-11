@@ -107,5 +107,5 @@ to let a bare `block` be a logical-expression operand the same way
 
 A one-line cross-ref lives in `docs/ROADMAP.md` under the upstream-parser
 section. When G2 is fixed upstream, the matching QA-findings entry
-(`docs/qa-findings.md` §G) can be closed and the structural-recovery load
+(tracked per-row in `gold-corpus/KNOWN-GAPS.md`) can be closed and the structural-recovery load
 it imposes (`docs/adr/error-recovery.md`) shrinks.
