@@ -12,8 +12,14 @@ rename, semantic tokens, sig help, inlay hints, etc.). The next round of
 user-visible wins comes from making them **smarter**, not adding more —
 which is downstream of a better-typed engine and a cleaner core.
 
-User-facing features (Mojo polish, CLI diagnostics, distribution) are
-backburner: ship when types + architecture are in a healthy place.
+The newest axis is **long-distance intelligence** — facts about *here*
+recovered from *elsewhere* (role composers, call sites, app
+entrypoints). See the active arc below.
+
+Distribution shipped: v0.4.0 is tagged and released (crates.io +
+platform binaries via `release.yml`, gold corpus gating the pipeline).
+Mojo polish substantially landed in the crm QA sweep (PR #55). Still
+backburner: the CLI diagnostics framework and the web extension.
 
 ---
 
@@ -127,6 +133,40 @@ runtime export generators) live in `docs/open-problems.md`.
 
 ---
 
+## Active arc: long-distance intelligence
+
+Detailed in `prompt-long-distance.md` — the "look elsewhere for the
+facts about here" family. Part 1 of role contracts (the `requires`
+declaration itself: `role_requires`, definedness suppression, role
+method references) landed in PR #55. One shared primitive —
+`children_index`, the inverse of `package_parents` — feeds the four
+members:
+
+1. **requires → implementations** — `textDocument/implementation` on a
+   `requires 'name'` fans out to every composer's def. Goto-def stays
+   on the contract; references stay call-sites.
+2. **Composer-mismatch diagnostic** — flags composers that don't
+   satisfy a role's `requires` set. Designed in
+   `prompt-role-requires.md`.
+3. **Long-distance param typing** — call-site arg shapes type the
+   callee's params (the Mojo plugin `$conf` case). Honesty gate:
+   callers must be enumerable.
+4. **Entrypoint-scan helper lint** — `prompt-helper-consumption.md`
+   phase 2: flag helpers whose providing plugin is never loaded from
+   any entrypoint.
+
+Sequencing: 1 → 2 as one PR ("role contracts, part 2" — both consume
+`children_index` fresh), then the lint, then param typing last.
+
+This arc is also the strangler-fig on-ramp for graph walking below:
+`children_index` is the first reverse edge that wants to be a typed
+graph edge rather than another bespoke map. The B6 both-paths
+discipline in the epic doc exists precisely because the graph isn't
+there yet — when `walk` lands, `children_index` consumers are the
+first queries to port.
+
+---
+
 ## Next architectural pillar (after types)
 
 ### Graph walking — typed-edge graph with one walker
@@ -147,7 +187,10 @@ different masks. Lives as an isolated module that consumes
 
 **Scheduled after the type-inference quad.** Type intelligence is the
 priority; graph rework is the next pillar. Migration is strangler fig —
-port one query at a time.
+port one query at a time. The long-distance arc supplies the first
+concrete edges (`children_index` is `inherits` walked backward) and
+the first consumers to port; per-app Mojo surfaces (helper-consumption
+phase 3) are explicitly gated on branded edges from this rework.
 
 ### Eager Ref targets
 
@@ -161,8 +204,9 @@ already exists; just the eager-target invariant is missing.
 The bag is canonical at every phase: no cached projections, no parallel
 paths. New type intelligence is purely additive — emit a witness, write
 a reducer, no parallel path to keep in sync. Graph rework is what
-unblocks Phase 6 (Openness diagnostic), multi-app Mojo support, and the
-eventual `Symbol.home_scope` move. All follow the same pattern: collapse
+unblocks Phase 6 (Openness diagnostic), multi-app Mojo support, the
+long-distance arc's reverse edges, and the eventual `Symbol.home_scope`
+move. All follow the same pattern: collapse
 ad-hoc code paths doing morally-similar work into one canonical
 mechanism; enforce the invariant by construction.
 
@@ -174,10 +218,10 @@ Wired today; smarter is downstream of the engine work above.
 
 | Doc | What |
 |---|---|
-| `prompt-mojo-todo.md` | Stash keys, hook completion, route naming + url_for, plugin chain transitive helpers, config completion |
+| `prompt-mojo-todo.md` | Stash keys, hook completion, route naming + url_for, config completion, transitive plugin-chain helpers. (Helper discovery, lite/group route goto-def, plugin-name goto-def, `$app`/`$tx` attr typing landed in the crm QA sweep, PR #55.) |
 | `prompt-cli-tools.md` | Diagnostic framework (PL001–PL010, `.perl-lsp.json`, suppression directives, SARIF), `--migrate`, remaining analysis subcommands |
 | `prompt-ref-provenance.md` | Constant-fold `folded_from`, framework-attribute unified rename, package→file rename, inheritance override scoping |
-| `prompt-wasm-web-extension.md` | Cargo workspace split + browser extension; orthogonal to everything else |
+| `prompt-wasm-web-extension.md` | Browser extension (vscode.dev). The doc's crate-split prerequisite was executed and deliberately **rejected** for layering purposes (PR #52 closed; `src/layering_tests.rs` enforces the DAG instead) — branch `workspace-split` is the playbook if WASM ever forces the split as a build necessity. |
 
 These are ship-when-ready, not blocked. Several are worth slotting between
 type-inference phases when an engine refactor needs cooling time.
