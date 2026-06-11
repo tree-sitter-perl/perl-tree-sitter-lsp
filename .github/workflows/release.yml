@@ -156,3 +156,58 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: perl-lsp-${{ matrix.target }}.${{ matrix.archive }}
+
+  # Publish the VS Code extension to both marketplaces. Runs after `build` so
+  # the release assets the extension downloads on activation already exist.
+  # MS side is secret-free: the `release` environment's OIDC token federates
+  # into a managed identity that is a Contributor member of the publisher.
+  # Open VSX has no Entra equivalent — token secret, step skips when unset.
+  publish-extension:
+    name: Publish VS Code extension
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: editors/vscode/.node-version
+
+      - name: Validate versions match tag
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TS_VERSION=$(grep -oP 'const VERSION = "\K[^"]+' src/extension.ts)
+          for v in "$PKG_VERSION" "$TS_VERSION"; do
+            if [ "$v" != "$TAG_VERSION" ]; then
+              echo "ERROR: extension version ($PKG_VERSION pkg / $TS_VERSION ts) != tag ($TAG_VERSION)"
+              exit 1
+            fi
+          done
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          allow-no-subscriptions: true
+
+      - name: Build and package
+        run: |
+          npm ci
+          npm run compile
+          npx vsce package -o perl-lsp.vsix
+
+      - name: Publish to VS Marketplace
+        run: npx vsce publish --packagePath perl-lsp.vsix --azure-credential
+
+      # Same .vsix to both stores — byte-identical artifacts by construction.
+      - name: Publish to Open VSX
+        if: env.OVSX_PAT != ''
+        run: npx --yes ovsx publish perl-lsp.vsix -p "$OVSX_PAT"
