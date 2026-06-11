@@ -14837,3 +14837,34 @@ get('/y')->to('#after_group');
         "post-group partial inherits the OUTER under — the group frame popped",
     );
 }
+
+/// `plugin 'Thing'` emits a register-anchored MethodCall ref with the
+/// DECAMELIZED token ("WasLoaded" → "was_loaded"), so goto-def rides
+/// the same camelize+tail+ownership search as go-to-controller —
+/// namespace-agnostic (Mojolicious::Plugin::* and app-specific
+/// namespaces both land).
+#[test]
+fn lite_plugin_name_emits_register_ref() {
+    let src = "\
+use Mojolicious::Lite;
+plugin 'WasLoaded';
+plugin 'Foo::BarBaz';
+";
+    let fa = {
+        let mut parser = super::create_parser();
+        let tree = parser.parse(src, None).unwrap();
+        super::build_with_plugins(&tree, src.as_bytes(), super::default_plugin_registry())
+    };
+    let invocants: Vec<String> = fa
+        .refs
+        .iter()
+        .filter(|r| r.target_name == "register")
+        .filter_map(|r| {
+            let RefKind::MethodCall { ref invocant, .. } = r.kind else { return None };
+            Some(format!("{:?}", invocant))
+        })
+        .collect();
+    assert_eq!(invocants.len(), 2, "{:?}", invocants);
+    assert!(invocants[0].contains("was_loaded"), "{:?}", invocants);
+    assert!(invocants[1].contains("foo-bar_baz"), "{:?}", invocants);
+}

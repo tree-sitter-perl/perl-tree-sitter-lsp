@@ -63,6 +63,33 @@ fn topic_route_dsl() {
     }
 }
 
+
+// Mojo::Util decamelize: "FooBar" -> "foo_bar", "Foo::Bar" -> "foo-bar".
+// Plugin names arrive camelized; the core's controller-token search is
+// gated on lowercase-leading tokens (mirroring camelize's /^[A-Z]/
+// early-return), so emitting the decamelized form round-trips through
+// the exact same machinery Mojo's loader uses.
+fn decamelize(name) {
+    let out = "";
+    let parts = name.split("::");
+    let first_part = true;
+    for part in parts {
+        if !first_part { out += "-"; }
+        first_part = false;
+        let first = true;
+        for ch in part {
+            if ch >= 'A' && ch <= 'Z' {
+                if !first { out += "_"; }
+                out += ch.to_lower();
+            } else {
+                out += ch;
+            }
+            first = false;
+        }
+    }
+    out
+}
+
 fn on_use(ctx) {
     if ctx.module_name != "Mojolicious::Lite" { return []; }
     let out = [];
@@ -154,6 +181,33 @@ fn on_use(ctx) {
 
 fn on_function_call(ctx) {
     let out = [];
+
+    // `plugin 'Thing'` — goto-def on the name lands on the plugin
+    // class's `register`. Same machinery as go-to-controller: the
+    // MethodCallRef's invocant token camelizes and tail-matches
+    // workspace modules, with ownership of the action (`register` —
+    // every Mojolicious plugin has one) as the disambiguator.
+    // Namespace-agnostic, so app-specific plugin namespaces
+    // (Clove::App::Plugin::*) resolve the same as Mojolicious::Plugin::*.
+    if ctx.function_name == "plugin" {
+        let args = ctx.args;
+        if args.len() >= 1 {
+            let name = args[0].string_value;
+            if name != () && name != "" {
+                let span = args[0].content_span;
+                if span == () { span = args[0].span; }
+                out += #{
+                    MethodCallRef: #{
+                        method_name: "register",
+                        invocant: decamelize(name),
+                        span: span,
+                        invocant_span: (),
+                    }
+                };
+            }
+        }
+        return out;
+    }
 
     // Route-declaration verbs. `under` is a middleware-ish route
     // wrapper; `websocket` registers a WS handler. Both behave like

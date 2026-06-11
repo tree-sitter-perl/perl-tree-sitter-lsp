@@ -235,8 +235,57 @@ fn inherited_controller(ctx) {
     ()
 }
 
+
+// Mojo::Util decamelize: "FooBar" -> "foo_bar", "Foo::Bar" -> "foo-bar".
+// Plugin names arrive camelized; the core's controller-token search is
+// gated on lowercase-leading tokens (mirroring camelize's /^[A-Z]/
+// early-return), so emitting the decamelized form round-trips through
+// the exact same machinery Mojo's loader uses.
+fn decamelize(name) {
+    let out = "";
+    let parts = name.split("::");
+    let first_part = true;
+    for part in parts {
+        if !first_part { out += "-"; }
+        first_part = false;
+        let first = true;
+        for ch in part {
+            if ch >= 'A' && ch <= 'Z' {
+                if !first { out += "_"; }
+                out += ch.to_lower();
+            } else {
+                out += ch;
+            }
+            first = false;
+        }
+    }
+    out
+}
+
 fn on_method_call(ctx) {
     let out = [];
+
+    // `$app->plugin('Thing')` — the OO spelling of the lite `plugin`
+    // verb; same register-anchored resolution (see mojo-lite).
+    if ctx.method_name == "plugin" {
+        let args = ctx.args;
+        if args.len() >= 1 {
+            let name = args[0].string_value;
+            if name != () && name != "" {
+                let span = args[0].content_span;
+                if span == () { span = args[0].span; }
+                out += #{
+                    MethodCallRef: #{
+                        method_name: "register",
+                        invocant: decamelize(name),
+                        span: span,
+                        invocant_span: (),
+                    }
+                };
+            }
+        }
+        return out;
+    }
 
     if ctx.method_name == "name" {
         let args = ctx.args;
