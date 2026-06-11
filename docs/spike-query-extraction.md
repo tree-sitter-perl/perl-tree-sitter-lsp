@@ -147,6 +147,63 @@ the Python pack doesn't do yet), and any of ring 2 at production
 fidelity. The gradient from here is real work, but it is *additive*
 pack work against a fixed engine — not engine surgery.
 
+## Spike 3: cross-file, and the Any-land question
+
+**Cross-file works, with per-language resolution as one predicate.**
+Two new pack hooks: `module_paths(module) → candidate relative paths`
+(the entire per-language resolution strategy — Python's is two
+format! lines) and `ctor_class(callee)` (PEP8 capitalization → class
+instantiation; the pack's conventions.rs). With those:
+
+- `python_cross_file_function_refs_through_refs_to`: two pack-built
+  FileAnalyses in the production FileStore; production `refs_to`
+  returns the def in a.py and the call in b.py.
+- `python_cross_file_method_dispatch_through_mro_walk`: a generic
+  ~20-line import loop registers a.py in the production ModuleIndex
+  via `insert_cache` (which feeds `ModuleEdgeIndexes` — names index,
+  children index — for free); b.py's `g = Greeter()` types via the
+  ctor predicate; `resolve_method_in_ancestors("Greeter", "greet")`
+  resolves CROSS-FILE through the production index arms
+  (`module_declaring_method_in_package` / `has_sub_in_package`),
+  untouched.
+
+A bonus architectural datapoint: the layering test REJECTED the
+import-resolver from the Build layer (Build importing Index) — the
+resolver is Index-shaped, exactly where module_resolver sits for
+Perl. The enforced DAG held against the spike's first sloppy
+placement; the language-pack world inherits the same architecture
+discipline for free.
+
+**The Any-land question (operator orientation).** Perl's inference
+ceiling is high because its syntax LEAKS types at usage sites:
+mono-typed operators (`+` numeric, `.`/`eq` string), sigils, deref
+shapes. Unannotated Python leaks almost nothing at usage sites — `+`
+is polymorphic — so its unannotated ceiling is genuinely lower.
+Spike 3b makes the asymmetry concrete in both directions:
+
+- Perl's leakiness IS capture vocabulary: `@obs.numeric` /
+  `@obs.string` arms on operator patterns emit the production
+  `TypeObservation` payloads, and `operator_evidence_types_through_
+  usage` proves a variable with an unknowable initializer types from
+  `$x + 1` alone — usage-site evidence through the production
+  FrameworkAwareTypeFold.
+- A Python pack has almost no such arms to write. That is a fact
+  about Python, not about the design: the witness bag is an
+  *evidence* framework, and each pack harvests whatever its language
+  leaks — sigils + operators (Perl, unusually rich), annotations +
+  constructors + literals (Python), less (Ruby). Where evidence runs
+  out, the bag's honesty discipline degrades features to navigation
+  instead of guessing — no witness, no claim, no lie.
+
+So "how far can language X get" decomposes: ring-1 navigation is
+free for every language; the typed ceiling is proportional to
+syntax leakiness × ecosystem annotation density. Perl sits at one
+extreme by both measures (operators leak, frameworks declare). For
+real-world Python the working answer is the same one pyright found:
+annotations exist where it matters (typeshed covers the stdlib and
+maintained libraries), so the pack's `annot_type` predicate carries
+the load, with constructor and literal evidence filling locals.
+
 ## Recommendation (revised after spike 2)
 
 Keep the branch as evidence; don't merge. The Perl path stays

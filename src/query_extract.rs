@@ -49,6 +49,8 @@ pub struct SkelRef {
     pub kind: String,
     pub name: String,
     pub start: Point,
+    pub end: Point,
+    pub scope: crate::file_analysis::ScopeId,
 }
 
 #[derive(Debug, Default)]
@@ -97,9 +99,24 @@ impl SkeletonAnalysis {
                 outline_label: None,
             })
             .collect();
+        let refs: Vec<crate::file_analysis::Ref> = self
+            .refs
+            .iter()
+            .filter(|r| r.kind == "call")
+            .map(|r| crate::file_analysis::Ref {
+                kind: crate::file_analysis::RefKind::FunctionCall { resolved_package: None },
+                span: Span { start: r.start, end: r.end },
+                scope: r.scope,
+                target_name: r.name.clone(),
+                access: crate::file_analysis::AccessKind::Read,
+                resolves_to: None,
+                resolved_method_target: None,
+            })
+            .collect();
         FileAnalysis::new(FileAnalysisParts {
             scopes: self.scopes,
             symbols,
+            refs,
             witnesses: bag,
             ..Default::default()
         })
@@ -121,6 +138,16 @@ pub struct LangPack {
     /// Map a `@type.annot` token's text to a type — the pack predicate
     /// for languages whose ring 3 is partly in the tree (`x: int`).
     pub annot_type: fn(text: &str) -> Option<InferredType>,
+    /// Is a bare call to `name` a CONSTRUCTOR in this language's
+    /// conventions? (Python: PEP8 capitalization; Perl: ->new, handled
+    /// by the walker.) Returns the instantiated class name. This is a
+    /// pack predicate for the same reason conventions.rs exists: name
+    /// conventions are language facts, not engine facts.
+    pub ctor_class: fn(callee: &str) -> Option<String>,
+    /// Module-name → workspace-relative candidate paths — the entire
+    /// per-language cross-file resolution strategy ("the one executable
+    /// line"). Python: `pkg.mod` → pkg/mod.py | pkg/mod/__init__.py.
+    pub module_paths: fn(module: &str) -> Vec<String>,
 }
 
 pub fn perl_pack() -> LangPack {
@@ -138,6 +165,8 @@ pub fn perl_pack() -> LangPack {
             _ => None,
         },
         annot_type: |_| None,
+        ctor_class: |_| None,
+        module_paths: |m| vec![format!("{}.pm", m.replace("::", "/"))],
     }
 }
 
@@ -155,6 +184,17 @@ pub fn python_pack() -> LangPack {
                 Some(InferredType::ClassName(t.to_string()))
             }
             _ => None,
+        },
+        ctor_class: |callee| {
+            callee
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_uppercase())
+                .then(|| callee.to_string())
+        },
+        module_paths: |m| {
+            let base = m.replace('.', "/");
+            vec![format!("{base}.py"), format!("{base}/__init__.py")]
         },
     }
 }
@@ -238,7 +278,10 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // (end_byte, ScopeId) — real Scope rows are minted as we go so the
     // resulting FileAnalysis carries a genuine lexical tree.
     let mut scope_stack: Vec<(usize, crate::file_analysis::ScopeId)> = Vec::new();
-    let mut package: Option<String> = None;
+    // (registered_at_depth, value) — a context set inside a scope pops
+    // with it (Python class blocks); one set at file depth is sticky
+    // (Perl's flat `package Foo;`).
+    let mut context_stack: Vec<(usize, String)> = Vec::new();
     let mut def_name_spans: Vec<(usize, usize)> = Vec::new();
 
     use crate::file_analysis::{Scope, ScopeId, ScopeKind};
@@ -264,8 +307,12 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             && scope_stack.last().is_some_and(|&(end, _)| e.start_byte >= end)
         {
             scope_stack.pop();
+            while context_stack.last().is_some_and(|&(d, _)| d > scope_stack.len()) {
+                context_stack.pop();
+            }
         }
         let cur_scope = scope_stack.last().unwrap().1;
+        let package: Option<String> = context_stack.last().map(|(_, p)| p.clone());
         match e.cap.as_str() {
             "scope" => {
                 let id = ScopeId(out.scopes.len() as u32);
@@ -280,9 +327,15 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 out.scope_count += 1;
             }
             cap if cap.starts_with("context.") => {
-                // Sticky linear context: in force from here until the
-                // next assignment. (Perl's flat `package Foo;`.)
-                package = Some(e.text.clone());
+                // Replace any context at the same depth; deeper ones
+                // were already popped with their scopes.
+                while context_stack
+                    .last()
+                    .is_some_and(|&(d, _)| d >= scope_stack.len())
+                {
+                    context_stack.pop();
+                }
+                context_stack.push((scope_stack.len(), e.text.clone()));
             }
             cap if cap.starts_with("def.") && !cap.ends_with(".name") => {
                 let kind = cap.strip_prefix("def.").unwrap().to_string();
@@ -318,6 +371,8 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                         kind: e.cap.strip_prefix("ref.").unwrap().to_string(),
                         name: (pack.shape_name)(&e.cap, &e.text),
                         start: e.start,
+                        end: e.end,
+                        scope: cur_scope,
                     });
                 }
             }
@@ -363,6 +418,51 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             }
             "type.annot" => {
                 annots.insert(e.match_id, e.text.clone());
+            }
+            cap if cap.starts_with("obs.") => {
+                // Usage-site evidence: a mono-typed operator observes
+                // its operand. Same Observation payloads the Perl
+                // walker emits; the fold is the production one.
+                let obs = match cap.strip_prefix("obs.").unwrap() {
+                    "numeric" => Some(crate::witnesses::TypeObservation::NumericUse),
+                    "string" => Some(crate::witnesses::TypeObservation::StringUse),
+                    _ => None,
+                };
+                if let Some(o) = obs {
+                    let span = Span { start: e.start, end: e.end };
+                    out.witnesses.push(crate::witnesses::Witness {
+                        attachment: crate::witnesses::WitnessAttachment::Variable {
+                            name: (pack.shape_name)("ref.var", &e.text),
+                            scope: cur_scope,
+                        },
+                        source: crate::witnesses::WitnessSource::Builder("skeleton-obs".into()),
+                        payload: crate::witnesses::WitnessPayload::Observation(o),
+                        span,
+                    });
+                }
+            }
+            "expr.call" => {
+                // Constructor convention: when the pack says this
+                // callee instantiates a class, the call expression IS
+                // a value of that class — a direct witness, same as a
+                // literal. Otherwise no claim (return typing is a
+                // later pack layer).
+                let callee = events
+                    .iter()
+                    .find(|x| x.match_id == e.match_id && x.cap == "ref.call")
+                    .map(|x| x.text.clone());
+                if let Some(class) = callee.and_then(|c| (pack.ctor_class)(&c)) {
+                    let span = Span { start: e.start, end: e.end };
+                    lit_spans.push((e.start_byte, e.end_byte, span));
+                    out.witnesses.push(crate::witnesses::Witness {
+                        attachment: crate::witnesses::WitnessAttachment::Expr(span),
+                        source: crate::witnesses::WitnessSource::Builder("skeleton-ctor".into()),
+                        payload: crate::witnesses::WitnessPayload::InferredType(
+                            InferredType::ClassName(class),
+                        ),
+                        span,
+                    });
+                }
             }
             _ => {}
         }

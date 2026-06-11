@@ -104,3 +104,24 @@
 (assignment_expression
   left: (scalar) @flow.target
   right: (_) @flow.source) @flow.assign
+
+; ---- spike 3b: operator evidence ----
+; Perl's edge over other dynamic languages is operator orientation:
+; mono-typed operators leak operand types at USAGE sites. That
+; leakiness is itself capture vocabulary — `@obs.<t>` arms feed
+; TypeObservation witnesses that the production FrameworkAwareTypeFold
+; folds, so a variable with an unknowable initializer still types from
+; how it's USED. (A Python pack has no such arms to write — that
+; asymmetry is a fact about the languages, not about the design.)
+(binary_expression
+  left: (scalar) @obs.numeric
+  ["+" "-" "*" "/" "%" "**" "==" "!=" "<=>"])
+(binary_expression
+  ["+" "-" "*" "/" "%" "**" "==" "!=" "<=>"]
+  right: (scalar) @obs.numeric)
+(binary_expression
+  left: (scalar) @obs.string
+  ["." "eq" "ne" "cmp" "lt" "gt"])
+(binary_expression
+  ["." "eq" "ne" "cmp" "lt" "gt"]
+  right: (scalar) @obs.string)

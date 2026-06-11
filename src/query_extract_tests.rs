@@ -336,3 +336,181 @@ y = x
     let inside = tree_sitter::Point { row: 5, column: 8 };
     assert_eq!(fa.inferred_type_via_bag("msg", inside), Some(InferredType::String));
 }
+
+// ---- spike 3: cross-file through the production engine ----
+//
+// `resolve_imports_with_pack` lives HERE because the layering test
+// (correctly) rejected it from query_extract.rs: import resolution is
+// Index-layer work — in a real implementation it sits beside
+// module_resolver (Index imports Build, never the reverse). The spike
+// keeps it in the test suite, which is exempt by design.
+
+/// Resolve a file's imports into a `ModuleIndex` — the GENERIC
+/// cross-file loop. The only per-language inputs are the pack's
+/// `module_paths` predicate and a parser factory; registration rides
+/// `insert_cache`, which feeds the production reverse indexes
+/// (`ModuleEdgeIndexes`), so `modules_with_symbol` /
+/// `module_declaring_method_in_package` / the MRO walk all work
+/// unchanged on pack-built modules.
+fn resolve_imports_with_pack(
+    imports: &[String],
+    root: &std::path::Path,
+    pack: &LangPack,
+    mk_parser: &mut dyn FnMut() -> tree_sitter::Parser,
+    idx: &crate::module_index::ModuleIndex,
+) -> Result<(), String> {
+    for module in imports {
+        for rel in (pack.module_paths)(module) {
+            let path = root.join(&rel);
+            let Ok(source) = std::fs::read_to_string(&path) else { continue };
+            let mut parser = mk_parser();
+            let Some(tree) = parser.parse(&source, None) else { continue };
+            let fa = extract(&tree, source.as_bytes(), pack)?.into_file_analysis();
+            idx.insert_cache(
+                module,
+                Some(std::sync::Arc::new(crate::module_index::CachedModule::new(
+                    path,
+                    std::sync::Arc::new(fa),
+                ))),
+            );
+            break;
+        }
+    }
+    Ok(())
+}
+
+
+
+fn python_parser() -> tree_sitter::Parser {
+    let mut p = tree_sitter::Parser::new();
+    p.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+    p
+}
+
+fn python_fa(src: &str) -> (crate::file_analysis::FileAnalysis, Vec<String>) {
+    let mut parser = python_parser();
+    let tree = parser.parse(src, None).unwrap();
+    let skel = extract(&tree, src.as_bytes(), &python_pack()).unwrap();
+    let imports = skel.imports.clone();
+    (skel.into_file_analysis(), imports)
+}
+
+#[test]
+fn python_cross_file_function_refs_through_refs_to() {
+    // Two pack-built FileAnalyses in the production FileStore; the
+    // production refs_to walks them — declaration in a.py, call in
+    // b.py — with zero Perl and zero engine edits.
+    let (fa_a, _) = python_fa("def helper(x):\n    return x\n");
+    let (fa_b, _) = python_fa("from a import helper\n\nz = helper(1)\n");
+
+    let store = crate::file_store::FileStore::new();
+    let pa = std::path::PathBuf::from("/fake/py/a.py");
+    let pb = std::path::PathBuf::from("/fake/py/b.py");
+    store.insert_workspace(pa.clone(), fa_a);
+    store.insert_workspace(pb.clone(), fa_b);
+
+    let target = crate::resolve::TargetRef::new(
+        "helper".into(),
+        crate::resolve::TargetKind::Sub { package: None },
+    );
+    let locs = crate::resolve::refs_to(&store, None, &target, crate::resolve::RoleMask::EDITABLE);
+    let by_file: Vec<(String, crate::file_analysis::AccessKind)> = locs
+        .iter()
+        .map(|l| {
+            let f = match &l.key {
+                crate::file_store::FileKey::Path(p) => {
+                    p.file_name().unwrap().to_string_lossy().to_string()
+                }
+                crate::file_store::FileKey::Url(u) => u.to_string(),
+            };
+            (f, l.access)
+        })
+        .collect();
+    assert!(
+        by_file.contains(&("a.py".into(), crate::file_analysis::AccessKind::Declaration)),
+        "expected the def in a.py, got {by_file:?}",
+    );
+    assert!(
+        by_file.contains(&("b.py".into(), crate::file_analysis::AccessKind::Read)),
+        "expected the call in b.py, got {by_file:?}",
+    );
+}
+
+#[test]
+fn python_cross_file_method_dispatch_through_mro_walk() {
+    // The full chain: pack resolver (module_paths predicate) registers
+    // a.py in the production ModuleIndex; b's bag types `g` via the
+    // PEP8 constructor predicate; resolve_method_in_ancestors finds
+    // greet on Greeter CROSS-FILE through the production index arms.
+    let dir = std::env::temp_dir().join(format!("qx-spike-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("a.py"),
+        "class Greeter:\n    def greet(self, name):\n        return name\n",
+    )
+    .unwrap();
+
+    let src_b = "from a import Greeter\n\ng = Greeter()\nr = g.greet(\"x\")\n";
+    let (fa_b, imports_b) = python_fa(src_b);
+
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    resolve_imports_with_pack(&imports_b, &dir, &python_pack(), &mut python_parser, &idx)
+        .unwrap();
+
+    use crate::file_analysis::InferredType;
+    let end = tree_sitter::Point { row: 4, column: 0 };
+    assert_eq!(
+        fa_b.inferred_type_via_bag("g", end),
+        Some(InferredType::ClassName("Greeter".into())),
+        "constructor convention types the instance",
+    );
+    match fa_b.resolve_method_in_ancestors("Greeter", "greet", Some(&idx)) {
+        Some(crate::file_analysis::MethodResolution::CrossFile { class, def_module }) => {
+            assert_eq!(class, "Greeter");
+            assert_eq!(def_module.as_deref(), Some("a"));
+        }
+        other => panic!("expected cross-file resolution of greet, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dbg_operator_patterns() {
+    use tree_sitter::{Query, QueryCursor, StreamingIterator};
+    let src = "my $y = $x + 1;\nmy $s = $a . \"b\";\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(src, None).unwrap();
+    for pat in [
+        r#"(binary_expression left: (scalar) @v "+")"#,
+        r#"(binary_expression left: (scalar) @v operator: "+")"#,
+        r#"(binary_expression left: (scalar) @v ".")"#,
+    ] {
+        match Query::new(&tree.language(), pat) {
+            Ok(q) => {
+                let mut c = QueryCursor::new();
+                let mut ms = c.matches(&q, tree.root_node(), src.as_bytes());
+                let mut n = 0;
+                while let Some(m) = ms.next() { n += m.captures.len(); }
+                println!("PAT {pat} -> {n}");
+            }
+            Err(e) => println!("PAT {pat} -> ERR {e}"),
+        }
+    }
+}
+
+#[test]
+fn operator_evidence_types_through_usage() {
+    // The operator-orientation answer: $x's initializer is unknowable,
+    // but `$x + 1` observes it numeric and `$s . "!"` observes $s
+    // stringy — usage-site evidence through the production fold.
+    let src = "my $x = f();\nmy $s = g();\nmy $y = $x + 1;\nmy $t = $s . \"!\";\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(src, None).unwrap();
+    let fa = extract(&tree, src.as_bytes(), &perl_pack())
+        .unwrap()
+        .into_file_analysis();
+    let end = tree_sitter::Point { row: 4, column: 0 };
+    use crate::file_analysis::InferredType;
+    assert_eq!(fa.inferred_type_via_bag("$x", end), Some(InferredType::Numeric));
+    assert_eq!(fa.inferred_type_via_bag("$s", end), Some(InferredType::String));
+}

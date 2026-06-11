@@ -32,7 +32,7 @@
   type: (type) @type.annot)
 
 (call
-  function: (identifier) @ref.call)
+  function: (identifier) @ref.call) @expr.call
 (call
   function: (attribute attribute: (identifier) @ref.method))
 (identifier) @expr.read.var
