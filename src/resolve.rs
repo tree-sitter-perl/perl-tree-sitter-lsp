@@ -572,6 +572,7 @@ pub fn refs_to(
 /// re-declaration, not an implementation — `role_requires` is the
 /// recorded fact that identifies (and excludes) it.
 pub fn implementations_of(
+    origin: &FileAnalysis,
     module_index: Option<&dyn CrossFileLookup>,
     target: &TargetRef,
 ) -> Vec<RefLocation> {
@@ -581,18 +582,54 @@ pub fn implementations_of(
     let Some(idx) = module_index else {
         return Vec::new();
     };
+    // The composer fan-out is a graph walk: INHERITS_INV from the
+    // contract's class — the first strangler-fig consumer ported onto
+    // the one walker (docs/prompt-graph-walking.md).
+    let mut descendants: Vec<String> = Vec::new();
+    let probe = crate::graph::GraphView::new(origin, Some(idx));
+    probe.walk(
+        crate::graph::Node::Class(class.clone()),
+        crate::graph::EdgeKindMask::INHERITS_INV,
+        &mut |n| {
+            if let crate::graph::Node::Class(c) = n {
+                descendants.push(c.clone());
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    );
     let mut out: Vec<RefLocation> = Vec::new();
-    idx.for_each_descendant_package(class, &mut |pkg, cached| {
-        let is_marker = cached
-            .analysis
-            .role_requires
-            .get(pkg)
-            .is_some_and(|reqs| reqs.iter().any(|r| r == &target.name));
-        if !is_marker {
+    for pkg in &descendants {
+        // class → home module(s): exact cache key for the common
+        // single-package file; the names index covers cross-named and
+        // multi-package homes.
+        let mut homes: Vec<std::sync::Arc<crate::file_analysis::CachedModule>> = Vec::new();
+        if let Some(c) = idx.get_cached(pkg) {
+            homes.push(c);
+        } else {
+            for m in idx.modules_with_symbol(pkg) {
+                if let Some(c) = idx.get_cached(&m) {
+                    let declares = c.analysis.symbols.iter().any(|s| {
+                        matches!(s.kind, SymKind::Package | SymKind::Class) && &s.name == pkg
+                    });
+                    if declares {
+                        homes.push(c);
+                    }
+                }
+            }
+        }
+        for cached in homes {
+            let is_marker = cached
+                .analysis
+                .role_requires
+                .get(pkg.as_str())
+                .is_some_and(|reqs| reqs.iter().any(|r| r == &target.name));
+            if is_marker {
+                continue;
+            }
             for s in &cached.analysis.symbols {
                 if s.name == target.name
                     && matches!(s.kind, SymKind::Sub | SymKind::Method)
-                    && s.package.as_deref() == Some(pkg)
+                    && s.package.as_deref() == Some(pkg.as_str())
                 {
                     out.push(RefLocation {
                         key: FileKey::Path(cached.path.clone()),
@@ -602,8 +639,7 @@ pub fn implementations_of(
                 }
             }
         }
-        std::ops::ControlFlow::Continue(())
-    });
+    }
     out.sort_by(|a, b| {
         key_for_sort(&a.key)
             .cmp(&key_for_sort(&b.key))

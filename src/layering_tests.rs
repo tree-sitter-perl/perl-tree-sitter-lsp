@@ -39,6 +39,7 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("module_cache", Index),
         ("file_store", Index),
         ("resolve", Index),
+        ("graph", Index),
         ("document", Index),
         ("timings", Index),
         ("builtins_pod", Index),

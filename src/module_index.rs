@@ -972,6 +972,21 @@ impl CrossFileLookup for ModuleIndex {
         self.for_each_descendant_package(class, visit)
     }
 
+    fn direct_children_of(&self, class: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for module in self.modules_with_parent(class) {
+            let Some(cached) = self.get_cached(&module) else { continue };
+            for (pkg, parents) in &cached.analysis.package_parents {
+                if parents.iter().any(|p| p == class) {
+                    out.push((pkg.clone(), module.clone()));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn for_each_loader_shape(&self, f: &mut dyn FnMut(&str, &crate::file_analysis::InferredType)) {
         for entry in self.loader_config_shapes.iter() {
             for (_contributor, t) in entry.value() {
