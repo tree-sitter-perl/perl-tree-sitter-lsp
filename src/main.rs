@@ -8,6 +8,7 @@ mod cursor_context;
 mod document;
 mod file_analysis;
 mod file_store;
+mod graph;
 mod module_cache;
 mod module_index;
 mod module_resolver;
@@ -816,7 +817,7 @@ fn run_one(
             if let Some(resolve::ResolvedTarget::Target(t)) =
                 resolve::resolve_symbol(&analysis, point, Some(idx))
             {
-                for loc in resolve::implementations_of(Some(idx), &t) {
+                for loc in resolve::implementations_of(&analysis, Some(idx), &t) {
                     let path = match &loc.key {
                         file_store::FileKey::Path(p) => p.display().to_string(),
                         file_store::FileKey::Url(u) => u.to_file_path()
