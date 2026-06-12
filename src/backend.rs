@@ -497,8 +497,8 @@ impl LanguageServer for Backend {
             // descendant-implementation semantics.
             _ => return Ok(None),
         };
-        drop(doc); // release the DashMap read lock before the cross-file walk
-        let results = implementations_of(Some(&*self.module_index), &target);
+        let results = implementations_of(&doc.analysis, Some(&*self.module_index), &target);
+        drop(doc);
         Ok(refs_to_locations(results).map(GotoDefinitionResponse::Array))
     }
 

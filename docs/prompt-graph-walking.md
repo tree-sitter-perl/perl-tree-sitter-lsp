@@ -241,8 +241,20 @@ different masks:
 
 Strangler fig, lasts a while. Phases:
 
-1. **Stand up `Graph` as a parallel structure.** Populated alongside
-   today's data; not yet queried.
+1. **Stand up `Graph` as a parallel structure.** ~~Populated alongside
+   today's data; not yet queried.~~ **LANDED (graph-walking-1)** as a
+   DERIVED view, not parallel storage: `src/graph.rs` `GraphView` +
+   `walk(origin, EdgeKindMask, visit)` — visit-at-pop DFS preserving
+   @ISA order, seen-set, the legacy depth cap. Edge derivation is one
+   function (`edges_from`): INHERITS via `parents_of` (the shared
+   injection site, so graph and legacy walkers cannot disagree),
+   INHERITS_INV via the children index (`direct_children_of`, depth 1
+   — the walker supplies transitivity), BRIDGES via
+   `for_each_entity_bridged_to` (terminal Module nodes; composes with
+   INHERITS through the synthetic app-surface edge, replacing the
+   ancestor+bridge two-step). First ported consumer:
+   `resolve.rs::implementations_of` (the requires→composers fan-out)
+   — its gold rows are the parity net.
 2. **Port one query at a time**, retiring old data structures as their
    last consumer moves over:
    - `resolve_method_in_ancestors` first (simplest, smallest blast

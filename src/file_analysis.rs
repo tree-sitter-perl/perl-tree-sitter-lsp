@@ -240,6 +240,10 @@ pub trait CrossFileLookup {
         class: &str,
         visit: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>) -> std::ops::ControlFlow<()>,
     );
+    /// Direct children/composers of `class` as (package, module) pairs
+    /// — the `children_index` inverse, depth 1 (the graph walker
+    /// supplies transitivity).
+    fn direct_children_of(&self, class: &str) -> Vec<(String, String)>;
     /// Registration-time loader-config shapes: every (load_name, shape)
     /// projected from `PluginLoad` facts across the workspace —
     /// INCLUDING packageless entrypoint scripts, which never enter the

@@ -2981,7 +2981,8 @@ fn test_implementations_of_role_requires_fans_out_to_composers() {
         kind: TargetKind::Method { class: "My::Role".to_string() },
         method_classes: Vec::new(),
     };
-    let results = implementations_of(Some(&idx), &target);
+    let origin = parse("package Probe;\n1;\n");
+    let results = implementations_of(&origin, Some(&idx), &target);
     let files: Vec<String> = results
         .iter()
         .map(|r| match &r.key {
@@ -2997,5 +2998,5 @@ fn test_implementations_of_role_requires_fans_out_to_composers() {
 
     // Non-Method targets have no descendant-implementation semantics.
     let pkg_target = TargetRef::new("My::Role".to_string(), TargetKind::Package);
-    assert!(implementations_of(Some(&idx), &pkg_target).is_empty());
+    assert!(implementations_of(&origin, Some(&idx), &pkg_target).is_empty());
 }
