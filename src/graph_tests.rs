@@ -158,3 +158,25 @@ fn edge_kind_all_covers_every_mask_bit() {
         EdgeKind::ALL.iter().map(|k| k.flag().bits()).collect::<std::collections::HashSet<_>>().len(),
     );
 }
+
+#[test]
+fn ancestor_funnel_includes_self_then_mro_order() {
+    // The include-self funnel (for_each_ancestor_class) must visit the
+    // origin FIRST, then proper ancestors in Perl's left-to-right DFS
+    // MRO — the contract the ~7 method/dispatch/rename consumers rely
+    // on. `A isa (Left, Right)`, each isa Base.
+    let fa = parse(
+        "package Base;\n1;\n\
+         package Left;\nuse parent -norequire, 'Base';\n1;\n\
+         package Right;\nuse parent -norequire, 'Base';\n1;\n\
+         package A;\nuse parent -norequire, 'Left', 'Right';\n1;\n",
+    );
+    let mut order: Vec<String> = Vec::new();
+    fa.for_each_ancestor_class_test("A", None, |c| {
+        order.push(c.to_string());
+        std::ops::ControlFlow::Continue(())
+    });
+    // self first; then Left and its ancestors (Base) before Right —
+    // DFS, not BFS — and Base seen-once despite the diamond.
+    assert_eq!(order, vec!["A", "Left", "Base", "Right"]);
+}

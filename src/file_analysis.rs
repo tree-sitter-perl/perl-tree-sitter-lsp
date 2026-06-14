@@ -6452,13 +6452,33 @@ impl FileAnalysis {
     /// through here so the two code paths can never drift on MRO
     /// rules. New ancestor-aware queries should reuse it too rather
     /// than reroll the walk.
+    /// The include-self MRO walk: visit `class_name` itself, then every
+    /// proper ancestor in Perl's left-to-right DFS order. The ONE place
+    /// self-handling lives for the ~7 "method on this class or up the
+    /// chain" consumers — running their own closure on self (consumer-
+    /// specific, so it can't move into `walk`, which has no closure for
+    /// the origin). Proper-ancestor traversal IS `walk(class, INHERITS)`
+    /// — same `parents_of` seam, so it cannot diverge from the legacy
+    /// hand-rolled DFS this replaced. The `skip_self=true` variant is
+    /// gone: `SUPER::` is the bare `walk` (see `resolve_super_method`).
     fn for_each_ancestor_class(
         &self,
         class_name: &str,
         module_index: Option<&dyn CrossFileLookup>,
-        visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
+        mut visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
     ) {
-        self.for_each_ancestor_class_opt(class_name, module_index, false, visit)
+        if visit(class_name).is_break() {
+            return;
+        }
+        let graph = crate::graph::GraphView::new(self, module_index);
+        graph.walk(
+            crate::graph::Node::Class(class_name.to_string()),
+            crate::graph::EdgeKindMask::INHERITS,
+            &mut |n| match n {
+                crate::graph::Node::Class(c) => visit(c),
+                _ => std::ops::ControlFlow::Continue(()),
+            },
+        );
     }
 
     /// Test-only access to the legacy ancestor walk, for graph-walk
@@ -6505,52 +6525,6 @@ impl FileAnalysis {
             },
         );
         found
-    }
-
-    /// MRO walk shared by every inheritance consumer. `skip_self`: when true,
-    /// the starting class is NOT visited but its parents' MRO still is — this
-    /// is exactly `SUPER::` semantics (search the enclosing package's parents,
-    /// skipping the package itself). The seen-set still records the start so a
-    /// diamond that loops back to it is skipped.
-    fn for_each_ancestor_class_opt(
-        &self,
-        class_name: &str,
-        module_index: Option<&dyn CrossFileLookup>,
-        skip_self: bool,
-        mut visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
-    ) {
-        // Perl's default MRO is left-to-right depth-first: for
-        // `@ISA = (A, B)`, walk A and all A's ancestors before
-        // visiting B. A stack-based DFS achieves this by pushing
-        // parents in REVERSE order so LIFO pops them in `@ISA`
-        // order. The previous implementation pushed left-to-right
-        // and visited parents in reverse `@ISA` — wrong for
-        // method-resolution semantics, surfaced as same-name
-        // overrides on a later parent silently winning over an
-        // earlier one. Local + cross-file parents concatenate in
-        // `@ISA` order before the reverse-push.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut stack: Vec<String> = vec![class_name.to_string()];
-        let mut first = true;
-        while let Some(cur) = stack.pop() {
-            if !seen.insert(cur.clone()) { continue; }
-            if seen.len() > 21 { break; } // matches the legacy depth guard
-            let is_root = std::mem::replace(&mut first, false);
-            if !(skip_self && is_root) {
-                if let std::ops::ControlFlow::Break(()) = visit(&cur) {
-                    return;
-                }
-            }
-            let parents = parents_of(
-                &cur,
-                &self.package_parents,
-                module_index,
-                &self.app_surface_consumers,
-            );
-            for p in parents.into_iter().rev() {
-                stack.push(p);
-            }
-        }
     }
 
     /// Inheritance chain for a method rename: `[class, ..., defining_class]`.
@@ -6685,13 +6659,24 @@ impl FileAnalysis {
         method_name: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<MethodResolution> {
+        // SUPER:: searches the PARENTS, never the enclosing class — so
+        // it is the bare `walk` (origin-excluded by construction). The
+        // old `skip_self=true` variant is exactly this; no flag needed.
         let mut result: Option<MethodResolution> = None;
-        self.for_each_ancestor_class_opt(enclosing, module_index, true, |cls| {
-            match self.method_resolution_on_class(cls, method_name, module_index) {
-                Some(r) => { result = Some(r); std::ops::ControlFlow::Break(()) }
-                None => std::ops::ControlFlow::Continue(()),
-            }
-        });
+        let graph = crate::graph::GraphView::new(self, module_index);
+        graph.walk(
+            crate::graph::Node::Class(enclosing.to_string()),
+            crate::graph::EdgeKindMask::INHERITS,
+            &mut |n| {
+                let crate::graph::Node::Class(cls) = n else {
+                    return std::ops::ControlFlow::Continue(());
+                };
+                match self.method_resolution_on_class(cls, method_name, module_index) {
+                    Some(r) => { result = Some(r); std::ops::ControlFlow::Break(()) }
+                    None => std::ops::ControlFlow::Continue(()),
+                }
+            },
+        );
         result
     }
 
