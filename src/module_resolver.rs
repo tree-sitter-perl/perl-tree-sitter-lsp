@@ -562,9 +562,10 @@ fn resolve_and_parse_inner(
     }
 
     // Brand self-contained Lite apps by file so co-resident apps don't
-    // merge plugin content (no-op for ordinary deps). See
-    // `docs/adr/branded-edges.md`.
-    analysis.apply_home_brand(&path.to_string_lossy());
+    // merge plugin content (no-op for ordinary deps). Canonicalize so
+    // the brand matches the open-document brand for the same file.
+    // See `docs/adr/branded-edges.md`.
+    analysis.apply_home_brand(&crate::file_analysis::canonical_brand(&path));
     let symbols = analysis.symbols.len();
     let result = Arc::new(CachedModule::new(path, Arc::new(analysis)));
     if let Some(start) = bench_start {
@@ -714,7 +715,8 @@ pub fn index_workspace_with_index(
             let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
             // Brand self-contained Lite apps by file (no-op otherwise) so
             // two apps in one workspace keep distinct plugin content.
-            analysis.apply_home_brand(&path.to_string_lossy());
+            // Canonicalize to match the open-document brand for the file.
+            analysis.apply_home_brand(&crate::file_analysis::canonical_brand(path));
             if timing {
                 crate::timings::record_built(
                     path.strip_prefix(root).unwrap_or(path).display().to_string(),

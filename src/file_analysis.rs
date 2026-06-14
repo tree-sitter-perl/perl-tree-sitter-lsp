@@ -1520,6 +1520,24 @@ pub fn scope_chain_of(scopes: &[Scope], start: ScopeId) -> Vec<ScopeId> {
     chain
 }
 
+/// Canonical brand id for a file path — the value handed to
+/// [`FileAnalysis::apply_home_brand`] and matched by
+/// [`PluginNamespace::visible_under`]. Canonicalizes so the
+/// open-document brand (derived from a URI) and the workspace-index
+/// brand (derived from a walked path) agree byte-for-byte for the same
+/// file — the comparison is plain string equality, so a symlinked /
+/// relative / case-variant path would otherwise split one file's
+/// identity in two. Falls back to the lexical path when the file isn't
+/// on disk (tests, unsaved buffers). Matches the canonicalization
+/// `ModuleIndex::register_workspace_module` already applies to the
+/// cached path. See `docs/adr/branded-edges.md`.
+pub fn canonical_brand(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn parents_of(
     class: &str,
     package_parents: &HashMap<String, Vec<String>>,
@@ -3185,6 +3203,12 @@ impl FileAnalysis {
     /// The registry-query context over this analysis. Every bag query
     /// threads the same field set; build it here so adding a field is one
     /// edit, not one per call site.
+    /// Build the witness-bag query context for THIS file as the query
+    /// origin. `home_brand` is reconstructed from `self.query_brand()`
+    /// every call (BagContext isn't serialized) — and cross-file
+    /// recursion carries this origin brand forward (`home_brand:
+    /// ctx.home_brand`), never the visited file's, so a branded query
+    /// stays scoped across file boundaries. See `docs/adr/branded-edges.md`.
     pub(crate) fn bag_context<'a>(
         &'a self,
         module_index: Option<&'a dyn CrossFileLookup>,

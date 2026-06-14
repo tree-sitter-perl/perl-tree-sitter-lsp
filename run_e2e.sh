@@ -28,6 +28,7 @@ suites=(
   test_e2e_mojo_events.lua
   test_e2e_dbic_parametric.lua
   test_e2e_roles.lua
+  test_e2e_branded_apps.lua
 )
 
 total_passed=0

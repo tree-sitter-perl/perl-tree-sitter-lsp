@@ -122,15 +122,16 @@ impl Backend {
 ///
 /// Rename shares the same resolution path as references — both go through
 /// `refs_to(EDITABLE)`. This is the single place that decides which spans get
-/// The brand for an open file = its canonical filesystem path. Stable
-/// per file and unique across co-resident apps, so two Mojo::Lite apps
-/// in one workspace get distinct brands. `None` for non-`file:` URIs
-/// (apply_home_brand then leaves the analysis agnostic). See
-/// `docs/adr/branded-edges.md`.
+/// The brand for an open file = its canonical filesystem path (so the
+/// open-document brand matches the workspace-index brand for the same
+/// file — see `canonical_brand`). Stable per file and unique across
+/// co-resident apps, so two Mojo::Lite apps in one workspace get
+/// distinct brands. `None` for non-`file:` URIs (apply_home_brand then
+/// leaves the analysis agnostic). See `docs/adr/branded-edges.md`.
 fn brand_id_for_uri(uri: &Url) -> Option<String> {
     uri.to_file_path()
         .ok()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| crate::file_analysis::canonical_brand(&p))
 }
 
 /// edited, so rename and references can't diverge on which call sites qualify.
