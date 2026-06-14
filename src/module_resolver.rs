@@ -609,6 +609,54 @@ pub fn add_project_lib_paths(inc_paths: &mut Vec<PathBuf>, workspace_root: &std:
 /// resolve. Without this, `->to('Users#list')` couldn't find
 /// `test_files/lib/Users.pm` because nothing ever triggers a
 /// module_index populate for workspace files.
+/// Does this extensionless file start with a Perl shebang
+/// (`#!...perl`)? The entrypoint-script test — `jobs`, `login`,
+/// Mojo::Lite apps. Peeks 64 bytes; never called on extensioned files.
+fn has_perl_shebang(path: &std::path::Path) -> bool {
+    if path.extension().is_some() {
+        return false;
+    }
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut buf = [0u8; 64];
+    let Ok(n) = f.read(&mut buf) else { return false };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let first = head.lines().next().unwrap_or("");
+    first.starts_with("#!") && first.contains("perl")
+}
+
+/// Extensionless Perl entrypoint scripts, found by a SHALLOW (depth-1)
+/// shebang scan over the conventional dirs — repo root, `bin/`,
+/// `script/` — plus any `extra` dirs (relative to `root`). Shallow +
+/// dir-scoped on purpose: entrypoints are direct files in known
+/// places, so this never walks a source tree.
+///
+/// `extra` is the SEAM for a future workspace-config `entrypoint_dirs`
+/// knob: today every caller passes `&[]`; wiring config is one line at
+/// the call site, no change here. (The config-file reader itself is
+/// deliberately deferred until there's a real config story to design.)
+fn scan_entrypoint_scripts(root: &std::path::Path, extra: &[String]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> =
+        vec![root.to_path_buf(), root.join("bin"), root.join("script")];
+    dirs.extend(extra.iter().map(|d| root.join(d)));
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            if std::fs::metadata(&p).map(|m| m.len() < 1_000_000).unwrap_or(false)
+                && has_perl_shebang(&p)
+            {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 pub fn index_workspace_with_index(
     root: &std::path::Path,
     files: &crate::file_store::FileStore,
@@ -619,6 +667,8 @@ pub fn index_workspace_with_index(
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // Extensioned Perl (`*.pm/*.pl/*.t`) — type-pruned at the walk
+    // level (cheap; never descends into a JS tree's files).
     let mut types_builder = TypesBuilder::new();
     types_builder.add("perl", "*.pm").unwrap();
     types_builder.add("perl", "*.pl").unwrap();
@@ -626,7 +676,7 @@ pub fn index_workspace_with_index(
     types_builder.select("perl");
     let types = types_builder.build().unwrap();
 
-    let paths: Vec<PathBuf> = WalkBuilder::new(root)
+    let mut paths: Vec<PathBuf> = WalkBuilder::new(root)
         .types(types)
         .build()
         .filter_map(|e| e.ok())
@@ -634,6 +684,16 @@ pub fn index_workspace_with_index(
         .filter(|e| e.metadata().map(|m| m.len() < 1_000_000).unwrap_or(false))
         .map(|e| e.into_path())
         .collect();
+
+    // Extensionless entrypoint SCRIPTS (`#!/usr/bin/env perl` — crm's
+    // `jobs`/`login`/… Mojo::Lite apps) carry no glob, so a SHALLOW
+    // shebang scan over the conventional entrypoint dirs catches them
+    // without enumerating the whole tree. These scripts are exactly
+    // where `plugin 'X'` loads live; skipping them blinded the
+    // entrypoint-scan lint and goto-def into entrypoint-defined symbols.
+    // `&[]` today; the seam for a future workspace-config
+    // `entrypoint_dirs` (additive to the built-in root/bin/script).
+    paths.extend(scan_entrypoint_scripts(root, &[]));
 
     let count = AtomicUsize::new(0);
 

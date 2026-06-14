@@ -10,14 +10,15 @@
       "expect": {
         "all": [
           "helper-not-loaded",
-          "'widget_count' is provided by My::Plugin::Widgets, which no workspace entrypoint loads"
+          "'orphan_h' is provided by My::Plugin::Orphan, which no workspace entrypoint loads"
         ],
         "none": [
+          "'widget_count'",
           "'confy_thing'"
         ]
       },
       "status": "gold",
-      "note": "Widgets is a workspace plugin nothing loads — the lint fires at the usage site. Confy IS loaded (app.pl `plugin 'Confy'`), so its helper stays silent: both directions of the entrypoint scan in one sweep."
+      "note": "Orphan is a workspace plugin nothing loads \u2014 the lint fires. widget_count stays silent because the EXTENSIONLESS `jobs` entrypoint (`#!.../perl`, `plugin Widgets => {...}` bareword form) is indexed by shebang and records the load; confy_thing likewise. Pins entrypoint-script indexing + the bareword load form in one sweep."
     },
     {
       "id": "loader-config-conf-shape-closed",

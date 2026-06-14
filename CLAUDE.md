@@ -216,7 +216,7 @@ Inspect any snippet's CST with `perl-lsp --parse <file>` (or `echo '...' | perl-
 
 ## Workspace indexing
 
-- `workspace_index` indexed at startup (Rayon `par_iter`, `.gitignore`-aware via `ignore` crate, 1MB cap, `catch_unwind` per file).
+- `workspace_index` indexed at startup (Rayon `par_iter`, `.gitignore`-aware via `ignore` crate, 1MB cap, `catch_unwind` per file). Standard extensions (`*.pm`/`*.pl`/`*.t`) are type-pruned at the walk; extensionless ENTRYPOINT scripts (`#!/usr/bin/env perl` — Mojo::Lite apps where `plugin 'X'` loads live) are found by a SHALLOW shebang scan over root + `bin/` + `script/` (`scan_entrypoint_scripts`; its `extra: &[String]` param is the seam for a future workspace-config `entrypoint_dirs` — callers pass `&[]` today). Don't broaden the entrypoint scan to a recursive walk — it would enumerate non-Perl source trees.
 - File watcher via `workspace/didChangeWatchedFiles` for incremental updates (`spawn_blocking`).
 - Query priority: `documents` (open, freshest) → `workspace_index` (all project files) → `module_index` (external @INC).
 

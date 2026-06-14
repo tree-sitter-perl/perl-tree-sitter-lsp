@@ -110,3 +110,38 @@ fn test_uri_to_path() {
     );
     assert_eq!(uri_to_path("http://example.com"), None);
 }
+
+#[test]
+fn entrypoint_scan_finds_shebang_scripts_in_conventional_dirs() {
+    let dir = std::env::temp_dir().join(format!("qx-entry-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("script")).unwrap();
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    // root-level Perl entrypoint (no extension) — found
+    std::fs::write(dir.join("jobs"), "#!/usr/bin/env perl\nuse Mojolicious::Lite;\n").unwrap();
+    // bin/ + script/ entrypoints — found
+    std::fs::write(dir.join("bin/login"), "#! /usr/bin/perl\n").unwrap();
+    std::fs::write(dir.join("script/cron"), "#!/usr/bin/env perl\n").unwrap();
+    // non-Perl shebang — not found
+    std::fs::write(dir.join("deploy"), "#!/bin/bash\n").unwrap();
+    // extensionless script buried in lib/ — NOT scanned by default
+    std::fs::write(dir.join("lib/buried"), "#!/usr/bin/env perl\n").unwrap();
+
+    let mut found: Vec<String> = scan_entrypoint_scripts(&dir, &[])
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    found.sort();
+    assert_eq!(found, vec!["cron", "jobs", "login"]);
+
+    // the config seam: an `extra` dir brings its entrypoints in.
+    std::fs::create_dir_all(dir.join("daemons")).unwrap();
+    std::fs::write(dir.join("daemons/worker"), "#!/usr/bin/env perl\n").unwrap();
+    let mut with_extra: Vec<String> = scan_entrypoint_scripts(&dir, &["daemons".into()])
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    with_extra.sort();
+    assert_eq!(with_extra, vec!["cron", "jobs", "login", "worker"]);
+    std::fs::remove_dir_all(&dir).ok();
+}

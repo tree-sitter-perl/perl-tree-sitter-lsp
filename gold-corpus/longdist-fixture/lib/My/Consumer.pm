@@ -7,3 +7,8 @@ sub act {
 }
 
 1;
+
+package My::Consumer2;
+use Mojo::Base 'Mojolicious::Controller';
+sub act2 { my $self = shift; return $self->orphan_h; }
+1;
