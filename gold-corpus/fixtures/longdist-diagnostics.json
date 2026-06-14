@@ -1,0 +1,39 @@
+{
+  "capability": "diagnostics",
+  "rows": [
+    {
+      "id": "helper-not-loaded-workspace-plugin",
+      "difficulty": "tricky",
+      "semantic_area": "long-distance",
+      "root": "gold-corpus/longdist-fixture",
+      "file": "",
+      "expect": {
+        "all": [
+          "helper-not-loaded",
+          "'orphan_h' is provided by My::Plugin::Orphan, which no workspace entrypoint loads"
+        ],
+        "none": [
+          "'widget_count'",
+          "'confy_thing'"
+        ]
+      },
+      "status": "gold",
+      "note": "Orphan is a workspace plugin nothing loads \u2014 the lint fires. widget_count stays silent because the EXTENSIONLESS `jobs` entrypoint (`#!.../perl`, `plugin Widgets => {...}` bareword form) is indexed by shebang and records the load; confy_thing likewise. Pins entrypoint-script indexing + the bareword load form in one sweep."
+    },
+    {
+      "id": "loader-config-conf-shape-closed",
+      "difficulty": "tricky",
+      "semantic_area": "long-distance",
+      "root": "gold-corpus/longdist-fixture",
+      "file": "",
+      "expect": {
+        "all": [
+          "key 'alpa' is not in $conf's literal shape (keys: alpha, beta)"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "The $conf typo hint proves the whole loader-config chain: the PluginLoad fact from a PACKAGELESS lite entrypoint, the registration-time shape projection, the enrichment join, and the resulting CLOSED HashWithKeys{alpha, beta} feeding the unknown-hash-key diagnostic."
+    }
+  ]
+}

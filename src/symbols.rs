@@ -2785,6 +2785,62 @@ pub fn collect_diagnostics(
         });
     }
 
+    // 5h: helper-not-loaded — the entrypoint-scan lint
+    // (docs/prompt-helper-consumption.md phase 2). A method call whose
+    // ONLY resolution is a plugin bridge from a WORKSPACE module that
+    // no workspace file loads (imports literally or via the SyntheticUse
+    // a `plugin 'X'` line emits). Installed CPAN plugins are exempt —
+    // the "downloaded = intended" policy keeps resolution generous and
+    // makes precision this lint's job. HINT severity.
+    {
+        use crate::conventions::{InvocantText, MethodToken};
+        let mut seen: std::collections::HashSet<(String, String)> = Default::default();
+        for r in &analysis.refs {
+            let RefKind::MethodCall { invocant, .. } = &r.kind else { continue };
+            let method_name = &r.target_name;
+            if !matches!(MethodToken::parse(method_name), MethodToken::Bare(_)) {
+                continue;
+            }
+            let class_name = match invocant.classify() {
+                InvocantText::Bareword(b) => Some(b.to_string()),
+                InvocantText::Scalar(_) => analysis
+                    .inferred_type_via_bag(invocant, r.span.start)
+                    .and_then(|ty| ty.class_name().map(|s| s.to_string())),
+                _ => None,
+            };
+            let Some(class_name) = class_name else { continue };
+            if !seen.insert((class_name.clone(), method_name.clone())) {
+                // one hint per (class, helper) per file — the fix is
+                // one `plugin` line, not one per call site
+                continue;
+            }
+            let Some(provider) =
+                analysis.bridged_helper_provider(&class_name, method_name, Some(module_index))
+            else {
+                continue;
+            };
+            if !module_index.is_workspace_module(&provider) {
+                continue;
+            }
+            if analysis.imports.iter().any(|i| i.module_name == provider)
+                || module_index.is_module_loaded(&provider)
+            {
+                continue;
+            }
+            diagnostics.push(Diagnostic {
+                range: span_to_range(r.span),
+                severity: Some(DiagnosticSeverity::HINT),
+                code: Some(NumberOrString::String("helper-not-loaded".into())),
+                source: Some("perl-lsp".into()),
+                message: format!(
+                    "'{}' is provided by {}, which no workspace entrypoint loads",
+                    method_name, provider,
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
     // Opt-in `unresolved-dispatch`: a known dispatch verb whose receiver
     // couldn't be typed, so we can't tell if the dispatch applies. Fires ONLY
     // on `ReceiverUntyped` (a real typing gap), never on `DoesNotApply` — the

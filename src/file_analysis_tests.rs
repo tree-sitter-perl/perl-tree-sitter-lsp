@@ -1934,3 +1934,119 @@ fn name_in_no_export_or_tag_is_not_exported() {
     assert!(fa.exports_name("foo"));
     assert!(!fa.exports_name("private_helper"), "non-exported sub must stay unexported");
 }
+
+#[test]
+fn cross_file_slot_write_types_the_read() {
+    // A4 v2: the typed slot write lives in the PARENT class's file;
+    // the read in the child file narrows through the registry's
+    // SlotType cross-file + ancestor arm at query time.
+    use std::sync::Arc;
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let parent_src = "package Parent;\nsub init {\n    my ($self) = @_;\n    $self->{conn} = My::Conn->new;\n}\n1;\n";
+    {
+        let mut parser = crate::builder::create_parser();
+        let tree = parser.parse(parent_src, None).unwrap();
+        let fa = crate::builder::build(&tree, parent_src.as_bytes());
+        idx.insert_cache(
+            "Parent",
+            Some(Arc::new(crate::file_analysis::CachedModule::new(
+                std::path::PathBuf::from("/fake/Parent.pm"),
+                Arc::new(fa),
+            ))),
+        );
+    }
+    let child_src = "package Child;\nuse Moo;\nextends 'Parent';\nsub go {\n    my ($self) = @_;\n    my $x = $self->{conn};\n}\n1;\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(child_src, None).unwrap();
+    let fa = crate::builder::build(&tree, child_src.as_bytes());
+
+    // the read expression `$self->{conn}` on line 5 (0-based)
+    let read_span = fa
+        .refs
+        .iter()
+        .find(|r| {
+            matches!(r.kind, RefKind::HashKeyAccess { .. })
+                && r.target_name == "conn"
+                && r.span.start.row == 5
+        })
+        .map(|r| r.span)
+        .expect("read-site hash key ref");
+    // the Expr witness covers the whole `$self->{conn}` element; ask at
+    // the element span — expr_type_at_span finds the narrowest cover.
+    let t = fa.expr_type_at_span(
+        Span { start: Point { row: 5, column: 12 }, end: Point { row: 5, column: 25 } },
+        Some(&idx),
+    );
+    assert_eq!(
+        t,
+        Some(InferredType::ClassName("My::Conn".into())),
+        "read at {read_span:?} should narrow via the parent file's slot write",
+    );
+    // and the variable that received it — `$x` rides Edge(Expr(read))
+    let t2 = fa.inferred_type_via_bag_ctx(
+        "$x",
+        Point { row: 6, column: 0 },
+        Some(&idx),
+    );
+    assert_eq!(t2, Some(InferredType::ClassName("My::Conn".into())));
+}
+
+
+#[test]
+fn loader_config_types_register_conf_cross_file() {
+    // #25, framework-mediated: `plugin 'CloveApp', {...}` in the app
+    // types `$conf` inside the plugin's register — callers enumerable
+    // by construction (the PluginLoad facts name this module).
+    use std::sync::Arc;
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let app_src = "use Mojolicious::Lite;\nplugin 'CloveApp', { minion => 1, redis => 'r' };\napp->start;\n";
+    {
+        let mut parser = crate::builder::create_parser();
+        let tree = parser.parse(app_src, None).unwrap();
+        let fa = crate::builder::build(&tree, app_src.as_bytes());
+        assert!(
+            fa.plugin_loads.iter().any(|f| f.name == "CloveApp" && f.config_span.is_some()),
+            "the lite plugin arm should record the loader fact: {:?}",
+            fa.plugin_loads,
+        );
+        idx.register_workspace_module(
+            std::path::PathBuf::from("/fake/conf/app.pl.pm-shim"),
+            Arc::new(fa),
+        );
+    }
+    // packageless shim doesn't register; use insert_cache instead
+    let app_src2 = "package MyApp::Boot;\nuse Mojolicious::Lite;\nplugin 'CloveApp', { minion => 1, redis => 'r' };\n1;\n";
+    {
+        let mut parser = crate::builder::create_parser();
+        let tree = parser.parse(app_src2, None).unwrap();
+        let fa = crate::builder::build(&tree, app_src2.as_bytes());
+        idx.insert_cache(
+            "MyApp::Boot",
+            Some(Arc::new(crate::file_analysis::CachedModule::new(
+                std::path::PathBuf::from("/fake/conf/Boot.pm"),
+                Arc::new(fa),
+            ))),
+        );
+    }
+
+    let plugin_src = "package Mojolicious::Plugin::CloveApp;\nuse Mojo::Base 'Mojolicious::Plugin';\n\nsub register {\n    my ($self, $app, $conf) = @_;\n}\n1;\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(plugin_src, None).unwrap();
+    let mut fa = crate::builder::build(&tree, plugin_src.as_bytes());
+    assert!(
+        !fa.loader_config_params.is_empty(),
+        "the param_types from_loader_config rule should mint a marker",
+    );
+    fa.enrich_imported_types_with_keys(Some(&idx));
+
+    let t = fa.inferred_type_via_bag("$conf", Point { row: 5, column: 0 });
+    match t {
+        Some(InferredType::HashWithKeys { keys, .. }) => {
+            let mut names: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).collect();
+            names.sort();
+            assert_eq!(names, vec!["minion", "redis"]);
+        }
+        other => panic!("expected the gathered config shape, got {other:?}"),
+    }
+}
+

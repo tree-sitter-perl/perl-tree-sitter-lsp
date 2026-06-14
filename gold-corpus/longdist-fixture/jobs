@@ -1,0 +1,7 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+
+plugin 'Confy', { alpha => 1, beta => 'x' };
+plugin Widgets => { opt => 1 };
+
+app->start;

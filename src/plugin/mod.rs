@@ -442,6 +442,16 @@ pub enum EmitAction {
     /// generic MethodCall ref; from that point on goto-def, references,
     /// rename, and hover work via the standard method-resolution path
     /// (with inheritance walk + workspace index).
+    /// "This call LOADS module `name` and passes it a config value."
+    /// The caller-side half of loader-config param typing: the fact
+    /// rides the calling file's FileAnalysis; enrichment of the LOADED
+    /// module joins it with a `from_loader_config` param marker and
+    /// types the param from the value at `config_span`.
+    PluginLoad {
+        name: String,
+        #[serde(default)]
+        config_span: Option<Span>,
+    },
     MethodCallRef {
         /// The method name (e.g. `"list"` from `"Users#list"`).
         method_name: String,
@@ -703,6 +713,24 @@ pub struct DispatchVerb {
     pub name_arg_index: usize,
 }
 
+/// A method that LOADS a module, naming it in a positional string
+/// argument — `$app->plugin('X')`, `$app->plugin($_) for qw/A B/`.
+/// Recognized TRIGGER-INDEPENDENTLY (like `DispatchVerb`): the load
+/// happens on the receiver app regardless of the enclosing file's
+/// class — a `Mojolicious::Plugin` subclass, never an app, for the
+/// whole nested-plugin cascade. `receiver_class` is the honest intent
+/// (the app type); the load FACT is a suppression signal for the
+/// entrypoint lint, so recording errs toward silence rather than
+/// gating on a receiver type that only resolves at query time (see
+/// `record_plugin_loads`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadVerb {
+    pub verb: String,
+    pub receiver_class: String,
+    #[serde(default)]
+    pub name_arg_index: usize,
+}
+
 /// One extracted parameter of a parametric type-constraint constructor
 /// (`InstanceOf['Foo']` → one param with `string: "Foo"`). The builder
 /// fills exactly one of the two fields per param (rule #1 — it walked the
@@ -754,6 +782,15 @@ pub struct ParamType {
     /// *named* rules that don't set this.
     #[serde(default)]
     pub requires_action_attr: bool,
+    /// The param's REAL type is whatever value the loader call passed
+    /// (`plugin 'X', {...}` → register's `$conf`): enrichment joins
+    /// the callee-side marker this mints with caller-side
+    /// `PluginLoad` facts and pushes the gathered shape. `type_class`
+    /// stays as the static fallback (HashRef for Mojo's `$conf`) —
+    /// the bag's structure-dominates-rep subsumption prefers the
+    /// gathered shape when both land.
+    #[serde(default)]
+    pub from_loader_config: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -786,6 +823,11 @@ pub trait FrameworkPlugin: Send + Sync {
     /// in the enrichment pass (cross-file receiver isa resolution) — see
     /// `DispatchVerb`. Default empty; only dispatch-style plugins declare.
     fn dispatch_verbs(&self) -> &[DispatchVerb] {
+        &[]
+    }
+
+    /// Module-loading verbs — see `LoadVerb`. Default empty.
+    fn load_verbs(&self) -> &[LoadVerb] {
         &[]
     }
 
@@ -1114,6 +1156,10 @@ impl PluginRegistry {
     /// Trigger-independent, same rationale as `overrides`.
     pub fn dispatch_verbs<'a>(&'a self) -> impl Iterator<Item = &'a DispatchVerb> + 'a {
         self.plugins.iter().flat_map(|p| p.dispatch_verbs().iter())
+    }
+
+    pub fn load_verbs<'a>(&'a self) -> impl Iterator<Item = &'a LoadVerb> + 'a {
+        self.plugins.iter().flat_map(|p| p.load_verbs().iter())
     }
 
     /// Yield every role-contract parameter-type rule across the registry.

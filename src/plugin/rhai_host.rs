@@ -134,6 +134,7 @@ pub struct RhaiPlugin {
     triggers: Vec<Trigger>,
     overrides: Vec<TypeOverride>,
     dispatch_verbs: Vec<DispatchVerb>,
+    load_verbs: Vec<crate::plugin::LoadVerb>,
     param_types: Vec<ParamType>,
     type_constraint_names: Vec<String>,
     app_surface_consumers: Vec<String>,
@@ -220,6 +221,26 @@ impl RhaiPlugin {
                     }
                 }
                 Err(e) => log::error!("plugin `{}` dispatch_verbs() failed: {}", id, e),
+            }
+        }
+
+        // `load_verbs()` — same optional, fail-safe contract.
+        let mut load_verbs: Vec<crate::plugin::LoadVerb> = Vec::new();
+        if signatures.iter().any(|n| n == "load_verbs") {
+            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "load_verbs", ()) {
+                Ok(arr) => {
+                    for d in arr {
+                        match from_dynamic::<crate::plugin::LoadVerb>(&d) {
+                            Ok(v) => load_verbs.push(v),
+                            Err(e) => log::error!(
+                                "plugin `{}` load_verbs() bad entry: {}",
+                                id,
+                                e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => log::error!("plugin `{}` load_verbs() failed: {}", id, e),
             }
         }
 
@@ -329,6 +350,7 @@ impl RhaiPlugin {
             triggers,
             overrides,
             dispatch_verbs,
+            load_verbs,
             param_types,
             type_constraint_names,
             app_surface_consumers,
@@ -410,6 +432,10 @@ impl FrameworkPlugin for RhaiPlugin {
 
     fn dispatch_verbs(&self) -> &[DispatchVerb] {
         &self.dispatch_verbs
+    }
+
+    fn load_verbs(&self) -> &[crate::plugin::LoadVerb] {
+        &self.load_verbs
     }
 
     fn param_types(&self) -> &[ParamType] {

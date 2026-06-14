@@ -123,10 +123,24 @@ fn overrides() {
 // `register($self, $app, $conf)` — the contract method every
 // Mojolicious plugin implements; the framework passes the app. $conf's
 // call-site shape is future work (long-distance param typing).
+// `$app->plugin('X')` LOADS X — recognized core-side, trigger-
+// independently (the cascade is in Mojolicious::Plugin files no Mojo
+// trigger matches). receiver_class is the honest app type; the load
+// fact is a lint-suppression signal, recorded liberally.
+fn load_verbs() {
+    [ #{ verb: "plugin", receiver_class: "Mojolicious", name_arg_index: 0 } ]
+}
+
 fn param_types() {
     [
         #{ method: "register", in_role: "Mojolicious::Plugin", param: 1,
            type_class: "Mojolicious" },
+        // $conf: typed from whatever the loader call passed
+        // (`plugin 'X', {...}` — the PluginLoad fact carries the arg
+        // span). HashRef is the no-caller static fallback;
+        // structure-dominates-rep prefers the gathered shape.
+        #{ method: "register", in_role: "Mojolicious::Plugin", param: 2,
+           type_class: "HashRef", from_loader_config: true },
     ]
 }
 
@@ -323,6 +337,21 @@ fn on_method_call(ctx) {
                         invocant_span: (),
                     }
                 };
+                // "You loaded it" — same as the lite arm: record the
+                // load so the resolver pulls the plugin AND the
+                // entrypoint-scan lint sees the load fact. Default
+                // namespace guess for short names; the lint
+                // tail-matches, so app-custom namespaces
+                // (Clove::App::Plugin::*) count as loaded too.
+                if !name.contains("::") {
+                    out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::" + name, "args": [], "imports": [], "span": span }};
+                } else {
+                    out += #{ "SyntheticUse": #{ "module": name, "args": [], "imports": [], "span": span }};
+                }
+                // The load FACT (PluginLoad) is recorded core-side,
+                // trigger-independently: the nested-plugin cascade runs
+                // in Mojolicious::Plugin files this hook never sees. See
+                // `load_verbs()` + `Builder::record_plugin_loads`.
             }
         }
         return out;

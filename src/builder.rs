@@ -256,10 +256,13 @@ fn build_with_plugins_inner(
         open_statement_package: None,
         plugins,
         dispatch_manifest: std::collections::HashMap::new(),
+        load_manifest: std::collections::HashMap::new(),
         type_constraint_names: std::collections::HashSet::new(),
         app_surface_consumers: Vec::new(),
         param_type_manifest: std::collections::HashMap::new(),
         param_type_wildcards: Vec::new(),
+        plugin_loads: Vec::new(),
+        loader_config_params: Vec::new(),
         any_requires_action_attr: false,
         provisional_dispatches: Vec::new(),
         gated_param_types: Vec::new(),
@@ -285,6 +288,11 @@ fn build_with_plugins_inner(
     b.dispatch_manifest = b
         .plugins
         .dispatch_verbs()
+        .map(|d| (d.verb.clone(), d.clone()))
+        .collect();
+    b.load_manifest = b
+        .plugins
+        .load_verbs()
         .map(|d| (d.verb.clone(), d.clone()))
         .collect();
     b.type_constraint_names = b
@@ -534,6 +542,8 @@ fn build_with_plugins_inner(
         contract_symbols: b.contract_symbols,
         dynamic_parent_packages: b.dynamic_parent_packages,
         role_packages: b.role_packages,
+        plugin_loads: b.plugin_loads,
+        loader_config_params: b.loader_config_params,
     });
     // Finalize: run the legacy text-based MCB resolver as a fallback.
     // For every assignment the unified typer (run before
@@ -1436,6 +1446,7 @@ struct Builder<'a> {
     /// construction (trigger-independent, like overrides). Drives provisional
     /// dispatch collection in the method-call walk.
     dispatch_manifest: std::collections::HashMap<String, plugin::DispatchVerb>,
+    load_manifest: std::collections::HashMap<String, plugin::LoadVerb>,
     /// Constraint-constructor name gate from plugin `type_constraint_names()`
     /// (`InstanceOf`, …), flattened once. A call to one of these is typed as
     /// `TypeConstraintOf` via the plugin's fold rather than its callee return.
@@ -1448,6 +1459,14 @@ struct Builder<'a> {
     /// Plugin `param_types()` manifest, grouped by method name. At a matching
     /// sub declaration in a role-doer, the named param gets a typed TC.
     param_type_manifest: std::collections::HashMap<String, Vec<plugin::ParamType>>,
+
+    /// Caller-side loader facts (`plugin 'X', {...}`) — flushed into
+    /// `FileAnalysis.plugin_loads`.
+    plugin_loads: Vec<crate::file_analysis::PluginLoadFact>,
+    /// Callee-side markers: params whose type arrives from loader
+    /// config at enrichment. Flushed into
+    /// `FileAnalysis.loader_config_params`.
+    loader_config_params: Vec<crate::file_analysis::LoaderConfigParam>,
     /// Rules from `param_types()` with `method: None` — applied to every sub
     /// declaration in a matching class, regardless of method name. The
     /// "every action in a controller" case (Catalyst `$c`).
@@ -1903,11 +1922,22 @@ impl<'a> Builder<'a> {
                 }
                 Some(self.extract_string_content(arg).unwrap_or_default())
             }
-            // `autoquoted_bareword` is what the LHS of fat-comma parses
-            // as (`key => value`) — `bareword` never appears there. The
-            // `bareword` branch catches the other contexts (e.g. unquoted
-            // positional args) where the token text IS the string value.
-            "autoquoted_bareword" | "bareword" => Some(text.clone()),
+            // `autoquoted_bareword` is a fat-comma key (`key => value`)
+            // — its text IS the value, never const-folded (a key that
+            // happens to match a constant name is still that key).
+            "autoquoted_bareword" => Some(text.clone()),
+            // A positional `bareword` arg may be a constant — fold it
+            // through the constant table (`$app->plugin(EXTRA)` where
+            // `use constant EXTRA => 'Gizmos'`). Falls back to the raw
+            // token when it names no constant.
+            "bareword" => {
+                if let Some(folded) = self.resolve_constant_strings(&text, 0) {
+                    string_values = folded.clone();
+                    folded.into_iter().next()
+                } else {
+                    Some(text.clone())
+                }
+            }
             "scalar" | "array" | "hash" => {
                 let folded = self.resolve_constant_strings(&text, 0).unwrap_or_default();
                 string_values = folded.clone();
@@ -2775,6 +2805,81 @@ impl<'a> Builder<'a> {
         ));
     }
 
+    /// Record `PluginLoadFact`s for a method-form load verb
+    /// (`$app->plugin(...)`), TRIGGER-INDEPENDENTLY — the nested-plugin
+    /// cascade runs inside `Mojolicious::Plugin` files that no Mojo
+    /// trigger matches, so gating on the file class loses every load
+    /// past the entrypoint (the receiver-gated dispatch lesson,
+    /// `docs/adr/receiver-gated-dispatch.md`).
+    ///
+    /// Multi-value by construction: `ctx.args[i].string_values` carries
+    /// the full constant-fold — a `qw(...)` loop topic, a `$_` postfix
+    /// fold, OR a folded scalar constant — so `$app->plugin($_) for
+    /// qw/A B C/` records A, B, AND C, and `$app->plugin(SOME_CONST)`
+    /// records the folded name. The load fact is a SUPPRESSION signal
+    /// for the entrypoint lint, so an untyped receiver records (honest-
+    /// silent); the verb-name specificity + workspace-only + tail-match
+    /// bound any false suppression. config_span (arg i+1) rides through
+    /// for loader-config `$conf` typing.
+    fn record_plugin_loads(&mut self, method: &str, ctx: &plugin::CallContext) {
+        let Some(spec) = self.load_manifest.get(method) else { return };
+        let Some(arg) = ctx.args.get(spec.name_arg_index) else { return };
+        let names = arg.string_values.clone();
+        if names.is_empty() {
+            return;
+        }
+        // Skip a load on a receiver KNOWN to be a different concrete
+        // class — the only confident negative we have at walk time
+        // (the app receiver is param-typed, hence None here).
+        if let Some(InferredType::ClassName(c)) = &ctx.receiver_type {
+            if c != &spec.receiver_class
+                && !self.package_isa_local(c, &spec.receiver_class)
+            {
+                // an untyped/None receiver still records; a confirmed
+                // foreign class does not. cross-file isa isn't available
+                // at build, so this only fires on a locally-known class.
+                if self.package_parents.contains_key(c) {
+                    return;
+                }
+            }
+        }
+        let config_span = ctx.args.get(spec.name_arg_index + 1).map(|a| a.span);
+        for n in names {
+            if n.is_empty() {
+                continue;
+            }
+            self.plugin_loads.push(crate::file_analysis::PluginLoadFact {
+                name: n,
+                config_span,
+            });
+        }
+    }
+
+    /// Local-only isa: does `child` reach `ancestor` through this
+    /// file's `package_parents`? (No index at build — `parents_of`'s
+    /// cross-file arm needs one.)
+    fn package_isa_local(&self, child: &str, ancestor: &str) -> bool {
+        if child == ancestor {
+            return true;
+        }
+        let mut stack = vec![child.to_string()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            if let Some(ps) = self.package_parents.get(&c) {
+                for p in ps {
+                    if p == ancestor {
+                        return true;
+                    }
+                    stack.push(p.clone());
+                }
+            }
+        }
+        false
+    }
+
     /// Convert a plugin-produced `EmitAction` into real builder state. All
     /// emitted symbols carry a `Namespace::Framework { id }` tag so downstream
     /// queries can distinguish plugin-synthesized entities from native ones.
@@ -2948,6 +3053,12 @@ impl<'a> Builder<'a> {
                         s.outline_label = outline_label;
                     }
                 }
+            }
+            plugin::EmitAction::PluginLoad { name, config_span } => {
+                self.plugin_loads.push(crate::file_analysis::PluginLoadFact {
+                    name,
+                    config_span,
+                });
             }
             plugin::EmitAction::MethodCallRef { method_name, invocant, span, invocant_span } => {
                 // Standard MethodCall ref — gd/gr/hover/rename route to
@@ -4335,9 +4446,10 @@ impl<'a> Builder<'a> {
                 .child_by_field_name("attributes")
                 .map_or(false, |a| a.named_child_count() > 0);
 
-        // Collect (variable, gate-class, type-class) before mutating self —
-        // can't hold the manifest borrow while pushing into `gated_param_types`.
-        let mut to_gate: Vec<(String, String, String)> = Vec::new();
+        // Collect (variable, gate-class, type-class, from_loader) before
+        // mutating self — can't hold the manifest borrow while pushing
+        // into `gated_param_types`.
+        let mut to_gate: Vec<(String, String, String, bool)> = Vec::new();
 
         // Named rules: only those keyed to exactly this method name.
         if let Some(rules) = self.param_type_manifest.get(method) {
@@ -4351,7 +4463,19 @@ impl<'a> Builder<'a> {
 
         let scope = self.current_scope();
         let span = node_to_span(node);
-        for (variable, in_role, class) in to_gate {
+        for (variable, in_role, class, from_loader) in to_gate {
+            if from_loader {
+                // Callee-side marker: the real type arrives at
+                // enrichment from caller PluginLoad facts. The static
+                // `type_class` still rides the gated path below as the
+                // no-caller fallback — structure-dominates-rep picks
+                // the gathered shape when both land.
+                self.loader_config_params.push(crate::file_analysis::LoaderConfigParam {
+                    variable: variable.clone(),
+                    scope,
+                    in_role: in_role.clone(),
+                });
+            }
             self.gated_param_types.push(crate::file_analysis::ReceiverGated::new(
                 in_role,
                 TypeConstraint {
@@ -4374,7 +4498,7 @@ impl<'a> Builder<'a> {
         params: &[ParamInfo],
         has_action_attr: bool,
         sub_name: &str,
-        out: &mut Vec<(String, String, String)>,
+        out: &mut Vec<(String, String, String, bool)>,
     ) {
         // Catalyst dispatches these private actions by name; over-inclusion of
         // non-action-attributed subs is a documented follow-up.
@@ -4387,7 +4511,12 @@ impl<'a> Builder<'a> {
             }
             if let Some(p) = params.get(r.param) {
                 if p.name.starts_with('$') {
-                    out.push((p.name.clone(), r.in_role.clone(), r.type_class.clone()));
+                    out.push((
+                        p.name.clone(),
+                        r.in_role.clone(),
+                        r.type_class.clone(),
+                        r.from_loader_config,
+                    ));
                 }
             }
         }
@@ -10344,6 +10473,7 @@ impl<'a> Builder<'a> {
                     }
                 }
                 self.record_provisional_dispatch(name, &ctx);
+                self.record_plugin_loads(name, &ctx);
                 self.dispatch_method_call_plugins(ctx);
             }
         }

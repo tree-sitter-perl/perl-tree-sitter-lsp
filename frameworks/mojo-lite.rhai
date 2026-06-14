@@ -219,6 +219,14 @@ fn on_function_call(ctx) {
                 if !name.contains("::") {
                     out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::" + name, "args": [], "imports": [], "span": span }};
                 }
+                // Multi-value: a lite `plugin($_) for qw/A B/` and a
+                // folded constant both surface in `string_values`
+                // (the const-folding machinery), so record every name.
+                let cfg = ();
+                if args.len() >= 2 { cfg = args[1].span; }
+                for nm in args[0].string_values {
+                    out += #{ "PluginLoad": #{ "name": nm, "config_span": cfg }};
+                }
             }
         }
         return out;

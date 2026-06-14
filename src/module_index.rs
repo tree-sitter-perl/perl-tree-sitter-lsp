@@ -32,6 +32,8 @@ use crate::module_resolver;
 // index consumers keep one import site.
 pub use crate::file_analysis::{CachedModule, SubInfo};
 
+type InferredTypeOwned = crate::file_analysis::InferredType;
+
 // ---- Internal sync primitives (pub(crate) for resolver thread) ----
 
 /// Thread-safe queue: Mutex<Vec> + Condvar.
@@ -194,6 +196,25 @@ pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     /// See `ModuleEdgeIndexes` — names + bridges + children reverse maps.
     edges: Arc<ModuleEdgeIndexes>,
+    /// Modules imported (literally or via SyntheticUse) by ANY
+    /// workspace file, entrypoint scripts included. Powers the
+    /// entrypoint-scan helper lint's "does anything load M" question.
+    /// Fed by `register_workspace_module` only — the workspace scan
+    /// re-runs every startup, so no warm-rebuild feed is needed.
+    loaded_modules: Arc<DashMap<String, ()>>,
+    /// Primary package names of workspace-registered files. The lint
+    /// fires only for WORKSPACE plugin modules (in-project plugins you
+    /// forgot to load); installed CPAN plugins keep the generous
+    /// "downloaded = intended" resolution.
+    workspace_modules: Arc<DashMap<String, ()>>,
+    /// Loader-config shapes projected at registration: load-name →
+    /// (contributor, shape) pairs from each file's `PluginLoad` facts.
+    /// Projected HERE because lite entrypoints are PACKAGELESS — they
+    /// never enter the cache, so enrichment can't reach their bags;
+    /// the config value is a literal, so its shape is final at the
+    /// contributor's own build. Fed by register_workspace_module
+    /// (before the packageless early-return) AND insert_cache.
+    loader_config_shapes: Arc<DashMap<String, Vec<(String, InferredTypeOwned)>>>,
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
     stale_modules: Arc<DashMap<String, ()>>,
@@ -251,6 +272,9 @@ impl ModuleIndex {
         ModuleIndex {
             cache,
             edges,
+            loaded_modules: Arc::new(DashMap::new()),
+            workspace_modules: Arc::new(DashMap::new()),
+            loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             builtins,
@@ -530,6 +554,9 @@ impl ModuleIndex {
         ModuleIndex {
             cache,
             edges,
+            loaded_modules: Arc::new(DashMap::new()),
+            workspace_modules: Arc::new(DashMap::new()),
+            loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             builtins,
@@ -576,6 +603,9 @@ impl ModuleIndex {
         ModuleIndex {
             cache,
             edges,
+            loaded_modules: Arc::new(DashMap::new()),
+            workspace_modules: Arc::new(DashMap::new()),
+            loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
             available_modules,
             builtins,
@@ -603,8 +633,32 @@ impl ModuleIndex {
     pub fn insert_cache(&self, module_name: &str, cached: Option<Arc<CachedModule>>) {
         if let Some(ref m) = cached {
             self.edges.feed(module_name, &m.analysis);
+            self.record_loader_shapes(module_name, &m.analysis);
         }
         self.cache.insert(module_name.to_string(), cached);
+    }
+
+    /// Project each `PluginLoad` fact's config value into a stored
+    /// shape under its load-name. The value is a literal in the
+    /// contributor's file, so `expr_type_at_span` with no index is
+    /// already final — this is a registration-time projection of
+    /// local facts (the same tier as export names), not a cached
+    /// cross-file resolution.
+    fn record_loader_shapes(&self, contributor: &str, analysis: &FileAnalysis) {
+        // re-registration: drop this contributor's old entries
+        self.loader_config_shapes.retain(|_n, v| {
+            v.retain(|(c, _)| c != contributor);
+            !v.is_empty()
+        });
+        for f in &analysis.plugin_loads {
+            let Some(span) = f.config_span else { continue };
+            if let Some(t) = analysis.expr_type_at_span(span, None) {
+                self.loader_config_shapes
+                    .entry(f.name.clone())
+                    .or_default()
+                    .push((contributor.to_string(), t));
+            }
+        }
     }
 
     /// Register a workspace-indexed file under its primary package name
@@ -616,7 +670,26 @@ impl ModuleIndex {
     ///
     /// No-op for files without a `package` declaration (top-level scripts).
     pub fn register_workspace_module(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
+        // Loaded-module tracking feeds the entrypoint-scan lint and must
+        // run BEFORE the packageless early-return: Mojolicious::Lite
+        // scripts (no `package` decl) are exactly the entrypoints whose
+        // `plugin 'X'` loads (via SyntheticUse imports) the lint needs
+        // to see. Workspace scan re-runs every startup, so this set
+        // needs no warm-rebuild feed.
+        for imp in &analysis.imports {
+            self.loaded_modules.insert(imp.module_name.clone(), ());
+        }
+        // Method-form loads (`$app->plugin('X')`, the nested cascade)
+        // are recorded as `plugin_loads` by the trigger-independent
+        // builder recognizer — feed them too. Names are short
+        // (`FeatureFlags`); `is_module_loaded` tail-matches them to FQ
+        // providers (`Clove::App::Plugin::FeatureFlags`).
+        for f in &analysis.plugin_loads {
+            self.loaded_modules.insert(f.name.clone(), ());
+        }
+        self.record_loader_shapes(&path.display().to_string(), &analysis);
         let Some(module_name) = first_package_name(&analysis) else { return };
+        self.workspace_modules.insert(module_name.clone(), ());
         // Canonicalize the path — `Url::from_file_path` in symbols.rs
         // requires absolute paths, so relative workspace paths (e.g.
         // "./test_files/lib/Users.pm" from CLI `.` root) would silently
@@ -655,6 +728,31 @@ impl ModuleIndex {
     /// Callers then pull the namespace's entities from the module's
     /// `FileAnalysis` and iterate. Explicit bridges rather than
     /// symbol-package inference.
+    /// Is `module` imported by any workspace file (entrypoint scripts
+    /// included)? `false` is honest only after the workspace scan has
+    /// run — callers on the diagnostics path are post-startup.
+    ///
+    /// Matching is exact OR last-segment tail: a `plugin 'DataLog'`
+    /// load records the default-namespace guess
+    /// (`Mojolicious::Plugin::DataLog`) while the resolved provider
+    /// may live in an app-custom tree (`Clove::App::Plugin::DataLog`).
+    /// The looseness only SUPPRESSES the lint — the honest-quiet
+    /// direction.
+    pub fn is_module_loaded(&self, module: &str) -> bool {
+        if self.loaded_modules.contains_key(module) {
+            return true;
+        }
+        let tail = module.rsplit("::").next().unwrap_or(module);
+        self.loaded_modules
+            .iter()
+            .any(|e| e.key().rsplit("::").next() == Some(tail))
+    }
+
+    /// Was `module` registered from the workspace tree (vs @INC)?
+    pub fn is_workspace_module(&self, module: &str) -> bool {
+        self.workspace_modules.contains_key(module)
+    }
+
     pub fn modules_bridging_to(&self, class_name: &str) -> Vec<String> {
         match self.edges.bridges.get(class_name) {
             Some(mods) => {
@@ -872,6 +970,14 @@ impl CrossFileLookup for ModuleIndex {
         visit: &mut dyn FnMut(&str, &Arc<CachedModule>) -> std::ops::ControlFlow<()>,
     ) {
         self.for_each_descendant_package(class, visit)
+    }
+
+    fn for_each_loader_shape(&self, f: &mut dyn FnMut(&str, &crate::file_analysis::InferredType)) {
+        for entry in self.loader_config_shapes.iter() {
+            for (_contributor, t) in entry.value() {
+                f(entry.key(), t);
+            }
+        }
     }
 }
 
