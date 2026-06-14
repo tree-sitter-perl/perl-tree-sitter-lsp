@@ -768,7 +768,8 @@ impl ModuleIndex {
     /// Every cached module containing a package that directly lists
     /// `class_name` as a parent (`isa` or role composition — the
     /// `children` edge map). Direct children only; transitive walks go
-    /// through `for_each_descendant_package`.
+    /// through the graph walk (`walk(INHERITS_INV)`) — this is the
+    /// depth-1 edge it composes.
     pub fn modules_with_parent(&self, class_name: &str) -> Vec<String> {
         match self.edges.children.get(class_name) {
             Some(mods) => {
@@ -782,12 +783,15 @@ impl ModuleIndex {
     }
 
     /// Breadth-first walk over the inverse inheritance/composition
-    /// graph from `class`: visits every (package, module) pair whose
-    /// package transitively `isa`/composes `class`. The role-contracts
-    /// fan-out — "who implements this role's contract" is exactly the
-    /// transitive composer set. Bounded by a package seen-set (cycles,
-    /// diamonds) and a fan-out cap; never does I/O. `visit` returns
-    /// `ControlFlow::Break` to stop early.
+    /// graph from `class`: every (package, module) pair whose package
+    /// transitively `isa`/composes `class`. Bounded by a package
+    /// seen-set (cycles, diamonds) and a fan-out cap; never does I/O.
+    ///
+    /// The independent BFS oracle the graph-walk descendant test
+    /// cross-checks `walk(INHERITS_INV)` against. Production reachability
+    /// goes through the graph walk; this stays test-only so the two
+    /// implementations can disagree loudly.
+    #[cfg(test)]
     pub fn for_each_descendant_package<F>(&self, class: &str, mut visit: F)
     where
         F: FnMut(&str, &Arc<CachedModule>) -> std::ops::ControlFlow<()>,
@@ -962,14 +966,6 @@ impl CrossFileLookup for ModuleIndex {
         f: &mut dyn FnMut(&str, &Arc<CachedModule>, &crate::file_analysis::Symbol),
     ) {
         self.for_each_entity_bridged_to(class_name, f)
-    }
-
-    fn for_each_descendant_package(
-        &self,
-        class: &str,
-        visit: &mut dyn FnMut(&str, &Arc<CachedModule>) -> std::ops::ControlFlow<()>,
-    ) {
-        self.for_each_descendant_package(class, visit)
     }
 
     fn direct_children_of(&self, class: &str) -> Vec<(String, String)> {

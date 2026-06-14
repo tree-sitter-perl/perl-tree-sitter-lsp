@@ -233,13 +233,6 @@ pub trait CrossFileLookup {
         class_name: &str,
         f: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>, &Symbol),
     );
-    /// Inverse inheritance/composition walk: every (package, module)
-    /// pair whose package transitively `isa`/composes `class`.
-    fn for_each_descendant_package(
-        &self,
-        class: &str,
-        visit: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>) -> std::ops::ControlFlow<()>,
-    );
     /// Direct children/composers of `class` as (package, module) pairs
     /// — the `children_index` inverse, depth 1 (the graph walker
     /// supplies transitivity).

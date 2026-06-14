@@ -62,7 +62,6 @@ fn walk_descendants_matches_index_fan_out() {
     // different implementation than the graph walk, so this is a real
     // cross-check, not a tautology.
     let mut index_bfs: Vec<String> = Vec::new();
-    use crate::file_analysis::CrossFileLookup;
     idx.for_each_descendant_package("My::Role", &mut |pkg: &str, _cached: &Arc<crate::file_analysis::CachedModule>| {
         index_bfs.push(pkg.to_string());
         std::ops::ControlFlow::Continue(())
