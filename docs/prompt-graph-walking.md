@@ -98,14 +98,28 @@ mandatory. This is a single path; no second mechanism for `our`.
 - **`bridges_file`** — plugin_namespace → file. Used for per-file
   singletons (the Mojolicious::Lite app case).
 
-#### File attribution (replaces `RoleMask` as an edge concept)
-- **`file_role`** — file edges tagged: `open` | `workspace` |
-  `dependency` | `builtin`.
+#### File attribution — `RoleMask` STAYS (the unification thesis's boundary)
+**Correction (graph-walking-1, after porting the inheritance axis):**
+this was an overreach. `refs_to`/`references_mask_for`/`group_refs`
+ENUMERATE file tiers (open → workspace → dependency), collecting
+matching refs from *every* file — a brute-force scan partitioned by
+role. There is no origin and no edge to follow, so it is not a
+`walk(origin, mask)`: forcing it needs a synthetic "root" node with a
+`file_role` edge to every file, which still enumerates everything,
+dressed as a graph. Zero benefit.
 
-The "files are special" abstraction goes away. `RoleMask::EDITABLE`
-becomes "edge-kind mask: don't traverse `dependency`-tagged file edges."
-Same walker, kind-mask varies. The `RoleMask` type can survive as a
-convenience constructor.
+The only real graph version is an import-reachability OPTIMIZATION
+(scan only files that transitively import the target via reverse
+`uses_module` edges) — but that trades the completeness `refs_to`
+exists for (re-exports, framework DSL, dynamic dispatch produce refs
+with no clean import edge) for speed. Not a parity strangle.
+
+So `RoleMask` is a PARTITION, not a traversal model, and stays as the
+right abstraction. `walk` unifies the three edge-following models
+(`package_parents`→INHERITS, `bridges`→BRIDGES, the lexical scope
+tree→PARENT); file-role is orthogonal and out of scope. If the three
+tier-iteration sites ever want DRYing, that's a shared
+`for_each_file_in_mask` helper in resolve/file_store — not the graph.
 
 ### Branded edges (first-class)
 
@@ -497,16 +511,17 @@ available as an independent later cleanup if the model gets fat.
 
 ### Remaining strangles after the funnel
 
-- **file-role tier** (`refs_to`/`resolve_symbol` open/workspace/dep
-  walk) — needs a `file_role` edge kind + File nodes. New taxonomy,
-  not a model gate.
 - **lexical scope chains** (`cursor_context`) — needs Scope nodes +
-  `PARENT`/`BINDS_*` edges. New taxonomy.
+  `PARENT`/`BINDS_*` edges. New taxonomy. This IS a genuine
+  walk-from-origin (cursor scope → enclosing scopes until a binding),
+  so it fits `walk`; the cost is adding the node/edge kinds.
 - **branded bridges** (`$minion`/`$app` instance identity) — branded
   edges, the design-heavy finale.
+- ~~file-role tier~~ — REMOVED: enumeration, not a walk (see "File
+  attribution" above). `RoleMask` stays.
 
 Each grows the node/edge set additively. The migration ends when
-`package_parents`, `RoleMask`-as-a-concept, and `PluginNamespace.
-bridges` have no direct consumers — every visibility question is a
-`walk` with a mask. Openness diagnostic + multi-app Mojo fall out
-then.
+`package_parents` and `PluginNamespace.bridges` have no direct
+consumers — every *reachability* question is a `walk` with a mask.
+(`RoleMask` is not in that set; it partitions files, it doesn't
+traverse.) Openness diagnostic + multi-app Mojo fall out then.
