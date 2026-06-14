@@ -1456,6 +1456,26 @@ pub const APP_SURFACE_CLASS: &str = "Mojolicious::_AppSurface";
 /// appended last so same-name overrides on a real parent win. The
 /// surface has no parents of its own, so the walk's seen-set + depth cap
 /// bound it like any edge.
+/// The lexical scope chain `[start, parent, …, file]` over a bare
+/// `&[Scope]` slice — the single source of the parent-climb. A free
+/// function (not a `FileAnalysis` method) so the witness-bag query path,
+/// which holds `BagContext.scopes: &[Scope]` and never a `&FileAnalysis`,
+/// shares it instead of re-rolling the `while let Some(p) = …parent`
+/// loop (it had two copies). `FileAnalysis::scope_chain` is the thin
+/// wrapper. The tree has one parent per node and no cycles, so this is a
+/// linked-list climb, not a graph walk — `GraphView` (which needs a
+/// `&FileAnalysis`) deliberately does NOT own it; see
+/// `docs/prompt-graph-walking.md` on why lexical isn't a strangle.
+pub fn scope_chain_of(scopes: &[Scope], start: ScopeId) -> Vec<ScopeId> {
+    let mut chain = Vec::new();
+    let mut current = Some(start);
+    while let Some(id) = current {
+        chain.push(id);
+        current = scopes[id.0 as usize].parent;
+    }
+    chain
+}
+
 pub fn parents_of(
     class: &str,
     package_parents: &HashMap<String, Vec<String>>,
@@ -2995,13 +3015,7 @@ impl FileAnalysis {
 
     /// Walk the scope chain from a scope upward to file root.
     pub fn scope_chain(&self, start: ScopeId) -> Vec<ScopeId> {
-        let mut chain = Vec::new();
-        let mut current = Some(start);
-        while let Some(id) = current {
-            chain.push(id);
-            current = self.scopes[id.0 as usize].parent;
-        }
-        chain
+        scope_chain_of(&self.scopes, start)
     }
 
     /// Get the scope struct by ID.
@@ -7289,13 +7303,14 @@ impl FileAnalysis {
     /// "structural"; a `Sub`/`Method` reached first means "working state".
     /// Both the outline tree builder and the `--outline` CLI ask this.
     pub fn scope_within_sub_body(&self, scope: ScopeId) -> bool {
-        let mut cur = Some(scope);
-        while let Some(id) = cur {
-            let Some(s) = self.scopes.iter().find(|s| s.id == id) else { return false };
-            match s.kind {
+        // Climb the shared chain (indexed lookup, not the old O(n)
+        // `.find(|s| s.id == id)` per level); a Sub/Method boundary
+        // before any Class/File answers true.
+        for id in self.scope_chain(scope) {
+            match self.scopes[id.0 as usize].kind {
                 ScopeKind::Sub { .. } | ScopeKind::Method { .. } => return true,
                 ScopeKind::Class { .. } | ScopeKind::File => return false,
-                ScopeKind::Block | ScopeKind::ForLoop { .. } => cur = s.parent,
+                ScopeKind::Block | ScopeKind::ForLoop { .. } => {}
             }
         }
         false

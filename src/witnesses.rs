@@ -1883,12 +1883,7 @@ impl ReducerRegistry {
         point: Point,
         state: &mut QueryState,
     ) -> Option<InferredType> {
-        let mut chain: Vec<ScopeId> = Vec::new();
-        let mut cur = Some(scope);
-        while let Some(sid) = cur {
-            chain.push(sid);
-            cur = ctx.scopes[sid.0 as usize].parent;
-        }
+        let chain = crate::file_analysis::scope_chain_of(ctx.scopes, scope);
         let framework = chain
             .iter()
             .find_map(|sid| ctx.scopes[sid.0 as usize].package.as_ref())
@@ -2101,17 +2096,19 @@ pub(crate) fn emit_mutation_extension_witnesses(
         // Attach where the variable's existing witnesses live; note
         // whether getting there crosses a scope boundary (nested block
         // or closure — the write may not have executed by read time).
+        // First scope up the shared chain whose Variable attachment has
+        // witnesses; `crossed` = we climbed past the start scope (index
+        // > 0) to find it.
         let mut attach: Option<(ScopeId, bool)> = None;
-        let mut cur = Some(w.scope);
-        let mut crossed = false;
-        while let Some(sid) = cur {
+        for (i, &sid) in crate::file_analysis::scope_chain_of(ctx.scopes, w.scope)
+            .iter()
+            .enumerate()
+        {
             let att = WitnessAttachment::Variable { name: w.var_text.clone(), scope: sid };
             if !bag.for_attachment(&att).is_empty() {
-                attach = Some((sid, crossed));
+                attach = Some((sid, i > 0));
                 break;
             }
-            crossed = true;
-            cur = ctx.scopes[sid.0 as usize].parent;
         }
         let Some((attach_sid, scope_crossed)) = attach else { continue };
         let Some(base) = query_variable_type(bag, ctx, &w.var_text, w.scope, w.span.start)
