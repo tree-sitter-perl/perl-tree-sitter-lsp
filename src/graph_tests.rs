@@ -40,7 +40,7 @@ fn walk_inherits_preserves_isa_order_and_caps_cycles() {
 }
 
 #[test]
-fn walk_descendants_matches_the_legacy_fan_out() {
+fn walk_descendants_matches_index_fan_out() {
     let idx = crate::module_index::ModuleIndex::new_for_test();
     cache(&idx, "My::Role", "package My::Role;\nuse Moo::Role;\nrequires 'fetch';\n1;\n");
     cache(&idx, "My::Composer", "package My::Composer;\nuse Moo;\nwith 'My::Role';\nsub fetch {1}\n1;\n");
@@ -58,14 +58,17 @@ fn walk_descendants_matches_the_legacy_fan_out() {
     });
     got.sort();
 
-    let mut legacy: Vec<String> = Vec::new();
+    // `for_each_descendant_package` is the ModuleIndex BFS — a
+    // different implementation than the graph walk, so this is a real
+    // cross-check, not a tautology.
+    let mut index_bfs: Vec<String> = Vec::new();
     use crate::file_analysis::CrossFileLookup;
     idx.for_each_descendant_package("My::Role", &mut |pkg: &str, _cached: &Arc<crate::file_analysis::CachedModule>| {
-        legacy.push(pkg.to_string());
+        index_bfs.push(pkg.to_string());
         std::ops::ControlFlow::Continue(())
     });
-    legacy.sort();
-    assert_eq!(got, legacy, "graph fan-out must match the legacy walker");
+    index_bfs.sort();
+    assert_eq!(got, index_bfs, "graph fan-out must match the index BFS");
     assert_eq!(got, vec!["My::Composer", "My::Deep", "My::SubRole"]);
 }
 
@@ -82,7 +85,7 @@ fn walk_bridges_reaches_plugin_modules_terminally() {
     let g = GraphView::new(&fa, Some(&idx));
     // bridges target the synthetic app surface; Controller reaches it
     // through the INHERITS synthetic edge — the masks compose the way
-    // the legacy ancestor+bridge walks did, in ONE walker.
+    // the separate ancestor + bridge walks once did, in ONE walker.
     let mut mods: Vec<String> = Vec::new();
     g.walk(
         Node::Class("Mojolicious::Controller".into()),
@@ -99,9 +102,10 @@ fn walk_bridges_reaches_plugin_modules_terminally() {
 
 
 #[test]
-fn class_isa_matches_legacy_ancestor_walk() {
-    // Parity pin: the ported class_isa (walk INHERITS) must agree with
-    // the legacy for_each_ancestor_class on every shape — reflexive,
+fn class_isa_agrees_with_ancestor_walk() {
+    // class_isa (reflexive check + walk) and for_each_ancestor_class
+    // (self-visit + walk) compose the same INHERITS traversal two
+    // ways; they must answer identically on every shape — reflexive,
     // direct, transitive, role, diamond, and negative.
     let fa = parse(
         "package Base;\n1;\n\
@@ -121,9 +125,9 @@ fn class_isa_matches_legacy_ancestor_walk() {
         ("Base", "Leaf", false),    // wrong direction
     ];
     for (child, ancestor, want) in cases {
-        // ported (walk) answer
+        // class_isa's answer
         let got = fa.class_isa(child, ancestor, None);
-        // independent legacy walk over the same data
+        // the include-self walk over the same data
         let mut legacy = child == ancestor;
         fa.for_each_ancestor_class_test(child, None, |c| {
             if c == ancestor {
@@ -132,7 +136,7 @@ fn class_isa_matches_legacy_ancestor_walk() {
             std::ops::ControlFlow::Continue(())
         });
         assert_eq!(got, want, "class_isa({child}, {ancestor})");
-        assert_eq!(got, legacy, "walk vs legacy disagree on ({child}, {ancestor})");
+        assert_eq!(got, legacy, "class_isa vs ancestor walk disagree on ({child}, {ancestor})");
     }
 }
 

@@ -5,16 +5,12 @@ This file is only what's NEXT, in order.
 
 ## Now (in order)
 
-1. **Long-distance remainder** — entrypoint-scan helper lint +
-   param typing's framework-mediated case. PR in flight
-   (`long-distance-remainder`). Docs: `prompt-long-distance.md`,
-   `prompt-helper-consumption.md`.
-2. **Graph walking** — the architectural pillar: one typed-edge graph,
-   one walker, replacing six bespoke walk mechanisms. Absorbs the
-   Openness diagnostic, `home_namespace`, the eager `Ref.target`
-   field shape, and per-app Mojo surfaces. Doc:
-   `prompt-graph-walking.md`.
-3. **DBIC out of core** — ungated; phase ladder in
+1. **Graph walking** — the walker + the whole inheritance axis landed
+   (`adr/graph-walking.md`). Next: **branded edges** (`$minion`/`$app`
+   instance identity → multi-app Mojo), then the deferred Scope-node
+   taxonomy (Openness diagnostic, `home_namespace`) when those are
+   built. Forward work: `prompt-graph-walking.md`.
+2. **DBIC out of core** — ungated; phase ladder in
    `prompt-dbic-as-plugin.md`. Ends with core plugin-free except
    generic dispatch.
 

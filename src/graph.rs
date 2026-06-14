@@ -1,22 +1,21 @@
 //! The typed-edge graph — one walker over what is morally one graph.
 //!
-//! Phase 1 of `docs/prompt-graph-walking.md`: a DERIVED view, no new
-//! storage. Edges materialize on demand from the stores that already
-//! exist (`package_parents` ∪ `parents_of`'s synthetic edges, the
-//! ModuleEdgeIndexes children map, plugin-namespace bridges); `walk`
-//! is the single traversal — seen-set, depth cap, edge-kind mask —
-//! that the bespoke walkers collapse into one consumer at a time
-//! (strangler fig).
+//! A DERIVED view, no stored graph. Edges materialize on demand from
+//! the stores that already exist (`package_parents` ∪ `parents_of`'s
+//! synthetic app-surface edge, the `ModuleEdgeIndexes` children map,
+//! plugin-namespace bridges); `walk` is the single traversal — seen-
+//! set, depth cap, edge-kind mask — that the ancestry/bridge/descendant
+//! queries route through. Design: `docs/adr/graph-walking.md`.
 //!
-//! The builder does NOT build this. It consumes `&FileAnalysis` +
-//! the `CrossFileLookup` trait and answers queries; `FileAnalysis`
-//! stays the canonical model (rule #2).
+//! `GraphView` consumes `&FileAnalysis` + the `CrossFileLookup` trait
+//! and answers queries; `FileAnalysis` stays the canonical model (rule
+//! #2), and the builder never touches this.
 //!
-//! MODEL layer: this is a derived view over `&FileAnalysis` and the
-//! model-defined `CrossFileLookup` trait — zero Index-layer deps — so
+//! Model layer: a derived view over `&FileAnalysis` and the model-
+//! defined `CrossFileLookup` trait, with zero Index-layer deps — so the
 //! model-internal walkers (`for_each_ancestor_class` and the dispatch/
-//! method/bridge resolution that funnels through it) can route through
-//! `walk` without an up-layer import. Phase 1 misfiled it at Index.
+//! method/bridge resolution that funnels through it) call `walk`
+//! directly, no up-layer import.
 
 use crate::file_analysis::{CrossFileLookup, FileAnalysis};
 
@@ -29,9 +28,9 @@ use crate::file_analysis::{CrossFileLookup, FileAnalysis};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     /// class → parent class/role (`use parent`/`@ISA`/`with`/…, plus
-    /// the synthetic app-surface edge — `parents_of` is the single
-    /// injection site, shared with the legacy walkers so the two
-    /// cannot disagree during the migration).
+    /// the synthetic app-surface edge). `parents_of` is the single
+    /// injection site for this edge — the inheritance consumers share
+    /// it, so they can't disagree on the MRO.
     Inherits,
     /// parent → direct child/composer (the `children_index` inverse;
     /// `walk` supplies the transitivity).
@@ -68,9 +67,8 @@ bitflags::bitflags! {
     }
 }
 
-/// A graph node. Phase 1 carries the class axis (+ terminal Module
-/// nodes for bridges); Scope/Symbol/File nodes join as their walkers
-/// port — see the migration table in the design doc.
+/// A graph node. The class axis + terminal Module nodes for bridges;
+/// Scope/Symbol/File nodes are future taxonomy (`adr/graph-walking.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Node {
     Class(String),
@@ -92,9 +90,9 @@ impl<'a> GraphView<'a> {
 
     /// THE walker. DFS from `origin` over edges in `mask`, depth-capped
     /// and cycle-safe; `visit` sees every reached node (origin
-    /// excluded) in traversal order and may stop early. Perl's
-    /// left-to-right DFS order is preserved on INHERITS so method
-    /// resolution semantics survive the port.
+    /// excluded) in traversal order and may stop early. On INHERITS the
+    /// order is Perl's left-to-right DFS MRO, so method resolution sees
+    /// ancestors in the order dispatch demands.
     pub fn walk(
         &self,
         origin: Node,
@@ -104,7 +102,7 @@ impl<'a> GraphView<'a> {
         let mut seen: std::collections::HashSet<Node> = std::collections::HashSet::new();
         seen.insert(origin.clone());
         let mut stack: Vec<(Node, usize)> = vec![(origin, 0)];
-        const MAX_DEPTH: usize = 21; // matches the legacy ancestry guard
+        const MAX_DEPTH: usize = 21; // ancestry-depth backstop (seen-set already breaks cycles)
         while let Some((node, depth)) = stack.pop() {
             // visit at POP — depth-first order, so a left parent's whole
             // ancestry precedes the right parent (the @ISA contract).

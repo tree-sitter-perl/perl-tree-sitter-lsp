@@ -1459,13 +1459,11 @@ pub const APP_SURFACE_CLASS: &str = "Mojolicious::_AppSurface";
 /// The lexical scope chain `[start, parent, …, file]` over a bare
 /// `&[Scope]` slice — the single source of the parent-climb. A free
 /// function (not a `FileAnalysis` method) so the witness-bag query path,
-/// which holds `BagContext.scopes: &[Scope]` and never a `&FileAnalysis`,
-/// shares it instead of re-rolling the `while let Some(p) = …parent`
-/// loop (it had two copies). `FileAnalysis::scope_chain` is the thin
-/// wrapper. The tree has one parent per node and no cycles, so this is a
-/// linked-list climb, not a graph walk — `GraphView` (which needs a
-/// `&FileAnalysis`) deliberately does NOT own it; see
-/// `docs/prompt-graph-walking.md` on why lexical isn't a strangle.
+/// which holds `BagContext.scopes: &[Scope]` and never a
+/// `&FileAnalysis`, shares it. `FileAnalysis::scope_chain` is the thin
+/// wrapper. A scope has one parent and no cycles, so this is a linked-
+/// list climb, not a graph walk — the graph deliberately does not model
+/// it (`docs/adr/graph-walking.md`).
 pub fn scope_chain_of(scopes: &[Scope], start: ScopeId) -> Vec<ScopeId> {
     let mut chain = Vec::new();
     let mut current = Some(start);
@@ -6467,14 +6465,13 @@ impl FileAnalysis {
     /// rules. New ancestor-aware queries should reuse it too rather
     /// than reroll the walk.
     /// The include-self MRO walk: visit `class_name` itself, then every
-    /// proper ancestor in Perl's left-to-right DFS order. The ONE place
-    /// self-handling lives for the ~7 "method on this class or up the
-    /// chain" consumers — running their own closure on self (consumer-
-    /// specific, so it can't move into `walk`, which has no closure for
-    /// the origin). Proper-ancestor traversal IS `walk(class, INHERITS)`
-    /// — same `parents_of` seam, so it cannot diverge from the legacy
-    /// hand-rolled DFS this replaced. The `skip_self=true` variant is
-    /// gone: `SUPER::` is the bare `walk` (see `resolve_super_method`).
+    /// proper ancestor in Perl's left-to-right DFS order. The one place
+    /// self-handling lives for the "method on this class or up the
+    /// chain" consumers — it runs their own closure on self, which is
+    /// consumer-specific (so it can't live in `walk`, which has no
+    /// closure for the origin). Proper-ancestor traversal is
+    /// `walk(class, INHERITS)`. `SUPER::` — parents only, never self —
+    /// is the bare `walk` (see `resolve_super_method`).
     fn for_each_ancestor_class(
         &self,
         class_name: &str,
@@ -6495,8 +6492,7 @@ impl FileAnalysis {
         );
     }
 
-    /// Test-only access to the legacy ancestor walk, for graph-walk
-    /// parity assertions during the strangler migration.
+    /// Test-only access to the include-self ancestor walk.
     #[cfg(test)]
     pub fn for_each_ancestor_class_test(
         &self,
@@ -6515,12 +6511,8 @@ impl FileAnalysis {
         ancestor: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> bool {
-        // First ancestry consumer ported onto the one walker
-        // (`docs/prompt-graph-walking.md`). `walk` excludes the origin,
-        // so the reflexive `X isa X` is a direct check; the rest is an
-        // INHERITS traversal — same `parents_of` seam, same seen-set
-        // and depth cap as the legacy `for_each_ancestor_class`, so the
-        // two cannot disagree during the migration.
+        // `walk` yields reached nodes only, so the reflexive `X isa X`
+        // is a direct check; the rest is an INHERITS traversal.
         if child == ancestor {
             return true;
         }
@@ -6674,8 +6666,7 @@ impl FileAnalysis {
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<MethodResolution> {
         // SUPER:: searches the PARENTS, never the enclosing class — so
-        // it is the bare `walk` (origin-excluded by construction). The
-        // old `skip_self=true` variant is exactly this; no flag needed.
+        // it is the bare `walk`, origin-excluded by construction.
         let mut result: Option<MethodResolution> = None;
         let graph = crate::graph::GraphView::new(self, module_index);
         graph.walk(
@@ -7303,9 +7294,8 @@ impl FileAnalysis {
     /// "structural"; a `Sub`/`Method` reached first means "working state".
     /// Both the outline tree builder and the `--outline` CLI ask this.
     pub fn scope_within_sub_body(&self, scope: ScopeId) -> bool {
-        // Climb the shared chain (indexed lookup, not the old O(n)
-        // `.find(|s| s.id == id)` per level); a Sub/Method boundary
-        // before any Class/File answers true.
+        // Climb the scope chain; a Sub/Method boundary reached before
+        // any Class/File answers true.
         for id in self.scope_chain(scope) {
             match self.scopes[id.0 as usize].kind {
                 ScopeKind::Sub { .. } | ScopeKind::Method { .. } => return true,
