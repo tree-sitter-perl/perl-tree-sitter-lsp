@@ -351,7 +351,7 @@ fn symbol_to_snapshot(s: &Symbol) -> Value {
                 "opaque_return": opaque_return,
             });
         }
-        SymbolDetail::Handler { owner, dispatchers, params, display, hide_in_outline } => {
+        SymbolDetail::Handler { owner, dispatchers, params, display, hide_in_outline, instance_brand } => {
             entry["detail"] = json!({
                 "kind": "Handler",
                 "owner": format!("{:?}", owner),
@@ -363,6 +363,7 @@ fn symbol_to_snapshot(s: &Symbol) -> Value {
                 })).collect::<Vec<_>>(),
                 "display": format!("{:?}", display),
                 "hide_in_outline": hide_in_outline,
+                "instance_brand": instance_brand,
             });
         }
         SymbolDetail::HashKeyDef { owner, is_dynamic } => {

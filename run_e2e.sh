@@ -29,6 +29,7 @@ suites=(
   test_e2e_dbic_parametric.lua
   test_e2e_roles.lua
   test_e2e_branded_apps.lua
+  test_e2e_branded_minion.lua
 )
 
 total_passed=0

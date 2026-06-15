@@ -416,6 +416,15 @@ pub enum EmitAction {
         /// appends non-invocant params.
         #[serde(default)]
         outline_label: Option<String>,
+        /// The raw receiver text the handler was registered on (e.g.
+        /// `"$minion"`). Lets core brand the handler per INSTANCE: it
+        /// resolves this variable to its declaration post-walk and
+        /// stamps `SymbolDetail::Handler.instance_brand`, so a task on
+        /// `$a` and one on `$b` don't cross-dispatch. `None` (the
+        /// default) leaves the handler global. See
+        /// `docs/adr/branded-edges.md`.
+        #[serde(default)]
+        receiver_text: Option<String>,
     },
     /// Emit a call-site reference for a Handler — e.g. the cursor is on
     /// `'ready'` in `$x->emit('ready', ...)`. `dispatcher` is the

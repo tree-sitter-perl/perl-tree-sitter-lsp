@@ -202,6 +202,12 @@ fn on_method_call(ctx) {
                 params: params,
                 span: task.name_span,
                 selection_span: task.name_span,
+                // The receiver instance (`$minion`) this task was added
+                // on — core resolves it to a per-instance brand so
+                // `$a->enqueue` won't reach a task registered on `$b`
+                // (docs/adr/branded-edges.md). () for a non-variable
+                // receiver leaves the task global.
+                receiver_text: if ctx.receiver_text == () { () } else { ctx.receiver_text },
                 // Tasks render as Function, not Event — you don't
                 // subscribe to them, you enqueue calls. Matches how
                 // mojo-routes chose Function over Event.

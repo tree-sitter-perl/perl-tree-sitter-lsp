@@ -570,6 +570,16 @@ pub enum SymbolDetail {
         /// them via the symbol table.
         #[serde(default)]
         hide_in_outline: bool,
+        /// Per-INSTANCE brand (`docs/adr/branded-edges.md`). `Some(b)`
+        /// when this handler was registered on a specific lexical
+        /// receiver instance — e.g. a Minion task added via
+        /// `$a->add_task(...)` is branded by `$a`'s declaration, so
+        /// `$b->enqueue(...)` (a different instance) won't dispatch to
+        /// it. `None` = global (registered on a class/`$self`/untyped
+        /// receiver), the pre-brand behavior. Filtered via `brand_visible`
+        /// at the dispatch sites against the receiver's `instance_brand_at`.
+        #[serde(default)]
+        instance_brand: Option<String>,
     },
     /// Package, Module, or other kinds needing no extra data.
     None,
@@ -1455,11 +1465,27 @@ impl PluginNamespace {
     /// invariant — a second decision with the wrong context silently
     /// drops branded content). See `docs/adr/branded-edges.md`.
     pub fn visible_under(&self, query_brand: Option<&str>) -> bool {
-        match (self.brand.as_deref(), query_brand) {
-            (None, _) => true,           // global namespace: always visible
-            (Some(_), None) => true,     // agnostic query: sees everything
-            (Some(b), Some(q)) => b == q, // scoped query: exact match
-        }
+        brand_visible(self.brand.as_deref(), query_brand)
+    }
+}
+
+/// The additive-brand rule, shared by every branded visibility unit
+/// (plugin namespaces via [`PluginNamespace::visible_under`], task
+/// Handlers via the dispatch filter). `item` is the thing's brand,
+/// `query` the asking context's brand:
+///
+/// - unbranded item (`None`) is GLOBAL — visible to every query;
+/// - a branded item is visible to the agnostic query (`None`, the
+///   pre-brand "see everything" caller) or a brand-matching one.
+///
+/// Brands are therefore additive: turning one on never hides a global,
+/// and an agnostic caller is never restricted. See
+/// `docs/adr/branded-edges.md`.
+pub fn brand_visible(item: Option<&str>, query: Option<&str>) -> bool {
+    match (item, query) {
+        (None, _) => true,
+        (Some(_), None) => true,
+        (Some(i), Some(q)) => i == q,
     }
 }
 
@@ -2905,21 +2931,37 @@ impl FileAnalysis {
         // to the *first* def found so `resolves_to` has a single target,
         // and rely on `refs_to_symbol` walking all stacked defs separately
         // for features like references/rename.
-        let handler_defs: HashMap<(&str, &HandlerOwner), SymbolId> = self.symbols.iter()
-            .filter_map(|sym| {
-                if let SymbolDetail::Handler { owner, .. } = &sym.detail {
-                    Some(((sym.name.as_str(), owner), sym.id))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Multimap: (name, owner) → all stacked handler defs with their
+        // instance brand. A DispatchCall pairs to the brand-VISIBLE one
+        // for its receiver (`brand_visible`), preferring an exact
+        // instance match over a global handler — so `$a->enqueue('tb')`
+        // (tb registered on $b) finds NO visible target and stays
+        // unresolved, while a global/`$self` task still pairs as before.
+        let mut handler_defs: HashMap<(&str, &HandlerOwner), Vec<(SymbolId, Option<&str>)>> =
+            HashMap::new();
+        for sym in &self.symbols {
+            if let SymbolDetail::Handler { owner, instance_brand, .. } = &sym.detail {
+                handler_defs
+                    .entry((sym.name.as_str(), owner))
+                    .or_default()
+                    .push((sym.id, instance_brand.as_deref()));
+            }
+        }
         let mut handler_resolutions: Vec<(usize, SymbolId)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
             if r.resolves_to.is_some() { continue; }
             if let RefKind::DispatchCall { owner: Some(owner), .. } = &r.kind {
-                if let Some(&sid) = handler_defs.get(&(r.target_name.as_str(), owner)) {
-                    handler_resolutions.push((i, sid));
+                if let Some(cands) = handler_defs.get(&(r.target_name.as_str(), owner)) {
+                    let recv = self.dispatch_ref_receiver_brand(r);
+                    let pick = cands
+                        .iter()
+                        .filter(|(_, b)| brand_visible(*b, recv.as_deref()))
+                        // exact instance match (key 0) beats a global (key 1)
+                        .min_by_key(|(_, b)| usize::from(*b != recv.as_deref()))
+                        .map(|(sid, _)| *sid);
+                    if let Some(sid) = pick {
+                        handler_resolutions.push((i, sid));
+                    }
                 }
             }
         }
@@ -6559,6 +6601,88 @@ impl FileAnalysis {
     /// `docs/adr/branded-edges.md`.
     pub(crate) fn query_brand(&self) -> Option<&str> {
         self.home_brand.as_deref()
+    }
+
+    /// The instance brand of a receiver expression — for per-VARIABLE
+    /// branding (`my $a = Minion->new; $a->add_task(...)`). Brands ONLY a
+    /// simple scalar variable that resolves to a lexical declaration: the
+    /// brand keys on that declaration's location, so the SAME `$a`
+    /// resolves to the SAME brand at its `add_task` and its `enqueue`
+    /// sites, while a different `$b` (or `$b` in another scope) gets a
+    /// distinct one. Returns `None` for non-variable / unresolved
+    /// receivers (`$self`, `$app->minion`, an undeclared name) — they
+    /// stay agnostic, so dispatch keeps its pre-brand behavior. Computed
+    /// identically at emission (branding the task Handler) and at query
+    /// (scoping the dispatch). See `docs/adr/branded-edges.md`.
+    pub(crate) fn instance_brand_at(&self, receiver: &str, point: Point) -> Option<String> {
+        use crate::conventions::InvocantText;
+        // Only a plain lexical scalar is an "instance" we can key on.
+        let InvocantText::Scalar(_) = InvocantText::parse(receiver) else {
+            return None;
+        };
+        if crate::conventions::is_conventional_invocant_name(receiver) {
+            return None; // $self / $class — the package, not an instance
+        }
+        let decl = self.resolve_variable(receiver, point)?;
+        Some(format!(
+            "inst:{}@{}:{}",
+            receiver, decl.span.start.row, decl.span.start.column
+        ))
+    }
+
+    /// The instance brand of the receiver of the method call enclosing
+    /// `point` — for query-time dispatch filtering (completion / sig-help
+    /// at `$a->enqueue('|')`). Resolves the innermost enclosing method
+    /// call's invocant via `instance_brand_at`. `None` for non-instance
+    /// receivers. See `docs/adr/branded-edges.md`.
+    pub(crate) fn receiver_brand_at(&self, point: Point) -> Option<String> {
+        let le = |a: Point, b: Point| (a.row, a.column) <= (b.row, b.column);
+        let mc = self
+            .refs
+            .iter()
+            .filter(|r| {
+                matches!(r.kind, RefKind::MethodCall { .. })
+                    && le(r.span.start, point)
+                    && le(point, r.span.end)
+            })
+            .max_by_key(|r| (r.span.start.row, r.span.start.column))?;
+        let RefKind::MethodCall { invocant, invocant_span, .. } = &mc.kind else {
+            return None;
+        };
+        let p = invocant_span.map(|s| s.start).unwrap_or(mc.span.start);
+        self.instance_brand_at(invocant, p)
+    }
+
+    /// The instance brand of a `DispatchCall` ref's receiver — the
+    /// query-side counterpart of the handler's `instance_brand`. Finds
+    /// the enclosing method call (same dispatcher verb, whose span
+    /// contains the name-arg ref), then resolves its invocant variable
+    /// via `instance_brand_at`. `None` for class / `$self` / chain /
+    /// untyped receivers — they dispatch agnostically (pre-brand
+    /// behavior). See `docs/adr/branded-edges.md`.
+    fn dispatch_ref_receiver_brand(&self, dref: &Ref) -> Option<String> {
+        let RefKind::DispatchCall { dispatcher, .. } = &dref.kind else {
+            return None;
+        };
+        let le = |a: Point, b: Point| (a.row, a.column) <= (b.row, b.column);
+        // Tightest enclosing call: the one whose span contains the ref
+        // and starts latest (innermost) — guards against a nested call
+        // reusing the same verb.
+        let mc = self
+            .refs
+            .iter()
+            .filter(|r| {
+                matches!(r.kind, RefKind::MethodCall { .. })
+                    && r.target_name == *dispatcher
+                    && le(r.span.start, dref.span.start)
+                    && le(dref.span.end, r.span.end)
+            })
+            .max_by_key(|r| (r.span.start.row, r.span.start.column))?;
+        let RefKind::MethodCall { invocant, invocant_span, .. } = &mc.kind else {
+            return None;
+        };
+        let point = invocant_span.map(|s| s.start).unwrap_or(mc.span.start);
+        self.instance_brand_at(invocant, point)
     }
 
     /// Find a method definition within a class/package.

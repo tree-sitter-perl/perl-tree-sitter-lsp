@@ -71,13 +71,37 @@ threads through the query API. Cross-file recursion in the witness bag
 carries the *origin's* brand (`BagContext.home_brand`), not the visited
 file's.
 
+## Per-variable instances (landed for owner-keyed dispatch)
+
+`my $a = Minion->new; $a->add_task(ta); my $b = Minion->new;
+$b->add_task(tb); $a->enqueue('tb')` — `tb` (registered on `$b`) must
+NOT dispatch on `$a`. Minion tasks resolve via owner-keyed Handlers
+(`handlers_for_owner`), not namespaces, so the brand lives on the
+**Handler** (`SymbolDetail::Handler.instance_brand`) and shares the rule
+via the free `brand_visible(item, query)` (which `visible_under` also
+delegates to).
+
+The brand source is the **receiver variable's declaration identity** —
+`instance_brand_at(receiver, point)` resolves a plain lexical scalar to
+its `my` decl and keys on the decl's location (`inst:$a@row:col`). It is
+computed identically at:
+
+- **emission** (build time, `Builder::assign_task_instance_brands`, after
+  `resolve_variable_refs` so the decl is reachable) — the plugin threads
+  the raw receiver text on `EmitAction::Handler.receiver_text`, core
+  resolves it and stamps the handler;
+- **query** — the brand-aware DispatchCall→Handler pairing
+  (`dispatch_ref_receiver_brand`, goto-def + references) and the
+  completion filter (`receiver_brand_at`, `dispatch_target_items_for`).
+
+`$self` / `__PACKAGE__` / a chain / an undeclared name resolve to `None`
+→ the task stays global and dispatch keeps its pre-brand behavior. The
+brand key is same-FILE (a lexical decl's location), so cross-file
+handlers are left unfiltered — instance identity doesn't cross the file
+boundary, and same-file row:col keys would otherwise risk a collision.
+
 ## Boundaries — what this does NOT do yet
 
-- **Per-variable instances** (`my $a = Minion->new; my $b = Minion->new`)
-  share a file, so a per-file brand can't separate them. The mechanism
-  is ready (the same-file sites already gate on `visible_under`); it
-  needs per-decl-site brand emission + an instance-brand resolver out of
-  `method_call_invocant_class`. Forward work in `prompt-graph-walking.md`.
 - **Accessor chains** (`$app->minion`) need the brand derived from what
   the accessor returns — lazy-at-query-time from the resolved invocant,
   NOT a cross-file enrichment post-pass (enrichment is open-documents-

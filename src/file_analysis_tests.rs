@@ -2105,6 +2105,54 @@ fn multi_app_lite_helpers_do_not_leak_across_apps() {
     );
 }
 
+/// Per-VARIABLE instance brands: two Minion instances in one file own
+/// distinct task sets. `$a->enqueue('task_b')` must NOT resolve to the
+/// task `$b` registered — they're different instances. See
+/// `docs/adr/branded-edges.md`.
+#[test]
+fn minion_tasks_are_scoped_per_instance() {
+    let src = "use Minion;\n\
+        my $a = Minion->new;\n\
+        $a->add_task(task_a => sub { 1 });\n\
+        my $b = Minion->new;\n\
+        $b->add_task(task_b => sub { 2 });\n\
+        $a->enqueue('task_a');\n\
+        $a->enqueue('task_b');\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(src, None).unwrap();
+    let fa = crate::builder::build(&tree, src.as_bytes());
+
+    // helper: the resolves_to target name for an enqueue DispatchCall ref.
+    let enqueue_target = |task: &str| -> Option<String> {
+        let r = fa.refs.iter().find(|r| {
+            matches!(&r.kind, crate::file_analysis::RefKind::DispatchCall { dispatcher, .. } if dispatcher == "enqueue")
+                && r.target_name == task
+        })?;
+        r.resolves_to.map(|sid| fa.symbols[sid.0 as usize].name.clone())
+    };
+
+    // sanity: both task handlers exist and are branded by distinct instances.
+    let brand_of = |task: &str| -> Option<String> {
+        fa.symbols.iter().find(|s| s.name == task
+            && matches!(s.detail, crate::file_analysis::SymbolDetail::Handler { .. }))
+            .and_then(|s| match &s.detail {
+                crate::file_analysis::SymbolDetail::Handler { instance_brand, .. } => instance_brand.clone(),
+                _ => None,
+            })
+    };
+    let ba = brand_of("task_a");
+    let bb = brand_of("task_b");
+    assert!(ba.is_some() && bb.is_some(), "both tasks must be instance-branded: {ba:?} {bb:?}");
+    assert_ne!(ba, bb, "tasks on $a and $b must carry distinct brands");
+
+    // $a->enqueue('task_a') resolves to $a's own task.
+    assert_eq!(enqueue_target("task_a").as_deref(), Some("task_a"),
+        "$a->enqueue('task_a') should resolve to $a's task");
+    // $a->enqueue('task_b') must NOT resolve — task_b belongs to $b.
+    assert_eq!(enqueue_target("task_b"), None,
+        "$a->enqueue('task_b') must NOT reach $b's task (the leak)");
+}
+
 /// The same two apps, but app-one is left UNBRANDED (home_brand None) —
 /// the pre-feature state. It is brand-agnostic, so it sees everything,
 /// proving the consumer brand is what filters (and that branding is
@@ -2144,4 +2192,3 @@ fn unbranded_app_still_sees_everything_no_regression() {
         "an unbranded (agnostic) app must see every helper, no regression; got {labels:?}",
     );
 }
-

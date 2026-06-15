@@ -590,8 +590,10 @@ pub fn completion_items(
                 // their names as items. Saves each plugin from
                 // reimplementing the symbol-table scan.
                 if let Some(req) = answer.dispatch_targets_for {
+                    let recv_brand = analysis.receiver_brand_at(position_to_point(pos));
                     plugin_items.extend(dispatch_target_items_for(
                         analysis, module_index, &req.owner_class, &req.dispatcher_names,
+                        recv_brand.as_deref(),
                     ));
                 }
             }
@@ -1501,8 +1503,15 @@ fn dispatch_target_items_for(
     module_index: &ModuleIndex,
     owner_class: &str,
     dispatcher_names: &[String],
+    // The receiver's per-instance brand at the cursor — local handlers
+    // are filtered to those visible to this instance, so completing
+    // `$a->enqueue('|')` offers only `$a`'s tasks, not `$b`'s. `None`
+    // (non-instance receiver) keeps the pre-brand behavior. Cross-file
+    // handlers stay unfiltered: instance brands key on a same-file
+    // declaration, so they don't carry across the file boundary.
+    receiver_brand: Option<&str>,
 ) -> Vec<CompletionItem> {
-    use crate::file_analysis::SymbolDetail;
+    use crate::file_analysis::{brand_visible, SymbolDetail};
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<CompletionItem> = Vec::new();
     let mut emit = |sym: &crate::file_analysis::Symbol| {
@@ -1520,6 +1529,11 @@ fn dispatch_target_items_for(
         });
     };
     for sym in analysis.handlers_for_owner(owner_class, dispatcher_names) {
+        if let SymbolDetail::Handler { instance_brand, .. } = &sym.detail {
+            if !brand_visible(instance_brand.as_deref(), receiver_brand) {
+                continue;
+            }
+        }
         emit(sym);
     }
     module_index.for_each_cached(|_, cached| {

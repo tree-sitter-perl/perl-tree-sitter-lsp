@@ -107,6 +107,11 @@ enum ChainPassMode {
 /// reducer cares about. Pure: reads only tree-sitter structural data,
 /// no Builder state. Same recursion shape (depth-first via
 /// `named_child(i)`) the three former independent walks all used.
+/// Lexical `<=` on positions ((row, column) order).
+fn le_point(a: Point, b: Point) -> bool {
+    (a.row, a.column) <= (b.row, b.column)
+}
+
 fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
     let mut idx = ChainTypingIndex {
         assignment_nodes: Vec::new(),
@@ -235,6 +240,7 @@ fn build_with_plugins_inner(
         export_tags: std::collections::HashMap::new(),
         reexport_modules: Vec::new(),
         plugin_namespaces: Vec::new(),
+        task_handler_receivers: Vec::new(),
         type_provenance: std::collections::HashMap::new(),
         bag: crate::witnesses::WitnessBag::new(),
         unresolved_expr_nodes: Vec::new(),
@@ -371,6 +377,12 @@ fn build_with_plugins_inner(
 
     // Post-pass 1: resolve variable refs -> resolves_to
     b.resolve_variable_refs();
+
+    // Per-instance handler brands: resolve each receiver-bound task
+    // handler's receiver variable to its declaration and stamp a brand,
+    // BEFORE FileAnalysis::new's build_indices pairs DispatchCall refs to
+    // handlers (that pairing is brand-aware). See branded-edges ADR.
+    b.assign_task_instance_brands();
 
     // Export-list member refs: a `@EXPORT` / `@EXPORT_OK` / `%EXPORT_TAGS`
     // member naming a local sub gets a FunctionCall ref back to it. Runs
@@ -1375,6 +1387,11 @@ struct Builder<'a> {
     /// `EmitAction::PluginNamespace`. Flushed into the final
     /// `FileAnalysis.plugin_namespaces`.
     plugin_namespaces: Vec<crate::file_analysis::PluginNamespace>,
+    /// `(handler symbol, raw receiver text)` for handlers a plugin
+    /// registered on a specific receiver (`$minion->add_task(...)`).
+    /// Resolved to per-instance brands post-construction once the
+    /// scope/symbol tables settle (`FileAnalysis::assign_instance_brands`).
+    task_handler_receivers: Vec<(crate::file_analysis::SymbolId, String)>,
     /// Per-symbol provenance for return types. Populated by plugin
     /// `overrides()` (PluginOverride) and by reducer-driven folds
     /// (ReducerFold). Empty entry == `TypeProvenance::Inferred`.
@@ -3026,7 +3043,7 @@ impl<'a> Builder<'a> {
             }
             plugin::EmitAction::Handler {
                 name, owner, dispatchers, params, span, selection_span, display,
-                hide_in_outline, outline_label,
+                hide_in_outline, outline_label, receiver_text,
             } => {
                 // Dedup: the partial-route re-dispatch re-runs `->to`
                 // plugins post-fold, so the same Handler (same name +
@@ -3046,12 +3063,20 @@ impl<'a> Builder<'a> {
                     params: params.into_iter().map(Into::into).collect(),
                     display,
                     hide_in_outline,
+                    // Resolved post-walk (variable identity needs the
+                    // settled scope/symbol tables): the receiver text is
+                    // queued and turned into an instance brand once refs
+                    // resolve. See `FileAnalysis::assign_instance_brands`.
+                    instance_brand: None,
                 };
                 let sid = self.add_symbol_ns(name, SymKind::Handler, span, selection_span, detail, ns);
                 if outline_label.is_some() {
                     if let Some(s) = self.symbols.iter_mut().find(|s| s.id == sid) {
                         s.outline_label = outline_label;
                     }
+                }
+                if let Some(rx) = receiver_text {
+                    self.task_handler_receivers.push((sid, rx));
                 }
             }
             plugin::EmitAction::PluginLoad { name, config_span } => {
@@ -11992,6 +12017,69 @@ impl<'a> Builder<'a> {
     }
 
     // ---- Post-passes ----
+
+    /// Stamp `instance_brand` on each task handler the plugin registered
+    /// on a lexical receiver (`$minion->add_task(...)`): resolve that
+    /// receiver variable to its declaration and key the brand on the
+    /// decl's location, identical to the query-side
+    /// `FileAnalysis::instance_brand_at`. So a task on `$a` and one on
+    /// `$b` get distinct brands and `$a->enqueue` won't reach `$b`'s
+    /// task. Skips `$self` / non-variable receivers (they stay global).
+    /// See `docs/adr/branded-edges.md`.
+    fn assign_task_instance_brands(&mut self) {
+        if self.task_handler_receivers.is_empty() {
+            return;
+        }
+        // scope -> declared scalars/fields (name, decl point), the same
+        // shape `resolve_variable_refs` walks.
+        let mut scope_vars: std::collections::HashMap<ScopeId, Vec<(String, Point)>> =
+            std::collections::HashMap::new();
+        for sym in &self.symbols {
+            if matches!(sym.kind, SymKind::Variable | SymKind::Field) {
+                scope_vars
+                    .entry(sym.scope)
+                    .or_default()
+                    .push((sym.name.clone(), sym.span.start));
+            }
+        }
+        let receivers = std::mem::take(&mut self.task_handler_receivers);
+        let mut assignments: Vec<(crate::file_analysis::SymbolId, String)> = Vec::new();
+        for (hsid, receiver) in &receivers {
+            // Only a plain lexical scalar is an instance we can key on —
+            // not `$self`/`$class` (the package), not a chain/bareword.
+            if !receiver.starts_with('$')
+                || crate::conventions::is_conventional_invocant_name(receiver)
+            {
+                continue;
+            }
+            let Some(handler) = self.symbols.get(hsid.0 as usize) else { continue };
+            let before = handler.span.start;
+            let mut current = Some(handler.scope);
+            while let Some(scope_id) = current {
+                if let Some(vars) = scope_vars.get(&scope_id) {
+                    if let Some((_, decl_point)) = vars
+                        .iter()
+                        .filter(|(n, p)| n == receiver && le_point(*p, before))
+                        .last()
+                    {
+                        assignments.push((
+                            *hsid,
+                            format!("inst:{}@{}:{}", receiver, decl_point.row, decl_point.column),
+                        ));
+                        break;
+                    }
+                }
+                current = self.scopes[scope_id.0 as usize].parent;
+            }
+        }
+        for (hsid, brand) in assignments {
+            if let Some(sym) = self.symbols.get_mut(hsid.0 as usize) {
+                if let SymbolDetail::Handler { instance_brand, .. } = &mut sym.detail {
+                    *instance_brand = Some(brand);
+                }
+            }
+        }
+    }
 
     fn resolve_variable_refs(&mut self) {
         // Build a temporary scope-to-symbols map for efficient lookup.
