@@ -6636,18 +6636,21 @@ impl FileAnalysis {
     /// (scoping the dispatch). See `docs/adr/branded-edges.md`.
     pub(crate) fn instance_brand_at(&self, receiver: &str, point: Point) -> Option<String> {
         use crate::conventions::InvocantText;
-        // Only a plain lexical scalar is an "instance" we can key on.
+        // Accessor chain (`$app->minion`) — brand on the accessor identity
+        // (singleton-accessor semantics); base-independent, so `$c->minion`
+        // matches `$app->minion`. Pure text, identical at build and query.
+        if let Some(brand) = crate::conventions::accessor_chain_brand(receiver) {
+            return Some(brand);
+        }
+        // Otherwise only a plain lexical scalar is an instance we can key on.
         let InvocantText::Scalar(_) = InvocantText::parse(receiver) else {
             return None;
         };
         if crate::conventions::is_conventional_invocant_name(receiver) {
             return None; // $self / $class — the package, not an instance
         }
-        // A chain (`$app->minion`) or qualified name (`$pkg::var`) is not
-        // a plain lexical scalar we can key an instance on — reject it
-        // up front rather than leaning on a failed symbol lookup. (The
-        // accessor-chain brand is the deferred tier — branded-edges ADR.)
-        if receiver.contains("->") || receiver.contains("::") {
+        // A qualified name (`$pkg::var`) isn't a plain lexical scalar.
+        if receiver.contains("::") {
             return None;
         }
         // Key on the LATEST decl before `point` (Perl shadowing), the

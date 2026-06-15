@@ -100,12 +100,30 @@ brand key is same-FILE (a lexical decl's location), so cross-file
 handlers are left unfiltered — instance identity doesn't cross the file
 boundary, and same-file row:col keys would otherwise risk a collision.
 
+## Accessor chains (landed) — keyed on the accessor identity
+
+`$app->minion->add_task(t); $app->minion->enqueue(t)` scopes by accessor,
+and `$app->other_minion` is a distinct instance. The brand keys on the
+**leaf accessor** (`conventions::accessor_chain_brand` → `acc:minion`),
+NOT the base expression — a singleton accessor returns ONE instance, so
+`$app->minion` (registered in a plugin) and `$c->minion` (enqueued in a
+controller) name the same minion and MUST share a brand. Keying on the
+base variable would break that extremely common registers-here /
+enqueues-there split — the receiver expressions differ while the instance
+is one.
+
+The brand is **pure text** (the accessor name), so build
+(`assign_task_instance_brands`) and query (`instance_brand_at`) compute it
+identically with no inference — the lazy-at-query-time resolution the
+bake-off called for, without an enrichment pass (which, being
+open-documents-only, would have re-merged on workspace/dependency files).
+Only a bare-identifier leaf qualifies; `$app->minion('x')` / deref shapes
+stay global. Known coarseness: two *different* apps' `->minion` in one
+workspace share `acc:minion` (a home-brand prefix would separate them — a
+further tier).
+
 ## Boundaries — what this does NOT do yet
 
-- **Accessor chains** (`$app->minion`) need the brand derived from what
-  the accessor returns — lazy-at-query-time from the resolved invocant,
-  NOT a cross-file enrichment post-pass (enrichment is open-documents-
-  only and would re-merge on workspace/dependency files).
 - **Full Mojo multi-app** (helpers on an app class, consumed by separate
   controller files) stays merged — the consumer file can't carry the
   app's brand. Documented degradation, not a regression.

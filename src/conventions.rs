@@ -30,6 +30,34 @@ pub fn is_constructor_name(name: &str) -> bool {
     name == "new"
 }
 
+/// The per-INSTANCE brand for an accessor-chain receiver
+/// (`$app->minion`), or `None` if `receiver` isn't a clean chain.
+///
+/// The brand keys on the LEAF accessor — the method that produces the
+/// receiver — NOT the base expression, because a singleton accessor
+/// returns one instance: `$app->minion` (in a plugin) and `$c->minion`
+/// (in a controller) name the SAME minion and must share a brand, while
+/// `$app->other_minion` is a different instance. Computed identically at
+/// the `add_task` and `enqueue` sites (it's pure text), so build and
+/// query never disagree. Used for the accessor-chain tier of
+/// `instance_brand_at`. See `docs/adr/branded-edges.md`.
+///
+/// Only a bare-identifier leaf qualifies (`$app->minion`), not a call
+/// with args or a sigil — `$app->minion('x')` / deref shapes stay global
+/// (`None`), the conservative default.
+pub fn accessor_chain_brand(receiver: &str) -> Option<String> {
+    let leaf = receiver.rsplit("->").next()?.trim();
+    // a chain at all? (`rsplit` always yields the whole string when there
+    // is no `->`, so require the separator was actually present)
+    if leaf == receiver {
+        return None;
+    }
+    let is_ident = !leaf.is_empty()
+        && leaf.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !leaf.chars().next().unwrap().is_ascii_digit();
+    is_ident.then(|| format!("acc:{leaf}"))
+}
+
 /// `__PACKAGE__` — the compile-time token for the enclosing package.
 pub fn is_current_package_token(text: &str) -> bool {
     text == "__PACKAGE__"
@@ -185,7 +213,23 @@ impl<'a> MethodToken<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InvocantText, MethodToken};
+    use super::{accessor_chain_brand, InvocantText, MethodToken};
+
+    #[test]
+    fn accessor_chain_brand_keys_on_leaf() {
+        // base-independent: same accessor → same brand.
+        assert_eq!(accessor_chain_brand("$app->minion").as_deref(), Some("acc:minion"));
+        assert_eq!(accessor_chain_brand("$c->minion").as_deref(), Some("acc:minion"));
+        assert_eq!(accessor_chain_brand("$self->minion").as_deref(), Some("acc:minion"));
+        // different accessor → different brand.
+        assert_eq!(accessor_chain_brand("$app->other_minion").as_deref(), Some("acc:other_minion"));
+        // deeper chain keys on the leaf.
+        assert_eq!(accessor_chain_brand("$app->svc->minion").as_deref(), Some("acc:minion"));
+        // not a chain, or not a clean identifier leaf → None (stays global).
+        assert_eq!(accessor_chain_brand("$minion"), None);
+        assert_eq!(accessor_chain_brand("$app->minion('x')"), None);
+        assert_eq!(accessor_chain_brand("$Foo::bar"), None);
+    }
 
     #[test]
     fn invocant_text_variants() {

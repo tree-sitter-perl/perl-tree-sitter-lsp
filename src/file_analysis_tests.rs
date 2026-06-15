@@ -2153,6 +2153,40 @@ fn minion_tasks_are_scoped_per_instance() {
         "$a->enqueue('task_b') must NOT reach $b's task (the leak)");
 }
 
+/// Accessor-chain instance brands (`$app->minion`): the brand keys on the
+/// LEAF ACCESSOR (singleton-accessor semantics), not the base expression.
+/// So `$app->minion` and `$c->minion` (same accessor, different base —
+/// the common plugin-registers / controller-enqueues split) share an
+/// instance, while `$app->other_minion` is a distinct one. See
+/// `docs/adr/branded-edges.md`.
+#[test]
+fn accessor_chain_tasks_scoped_by_accessor() {
+    let src = "use Minion;\n\
+        $app->minion->add_task(only_minion => sub { 1 });\n\
+        $app->other_minion->add_task(only_other => sub { 2 });\n\
+        $app->minion->enqueue('only_minion');\n\
+        $app->minion->enqueue('only_other');\n\
+        $c->minion->enqueue('only_minion');\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(src, None).unwrap();
+    let fa = crate::builder::build(&tree, src.as_bytes());
+    let resolved_at = |row: usize, task: &str| -> bool {
+        fa.refs.iter().any(|r| {
+            matches!(&r.kind, crate::file_analysis::RefKind::DispatchCall { dispatcher, .. } if dispatcher == "enqueue")
+                && r.target_name == task
+                && r.span.start.row == row
+                && r.resolves_to.is_some()
+        })
+    };
+    // $app->minion->enqueue('only_minion') resolves (same accessor).
+    assert!(resolved_at(3, "only_minion"), "own accessor's task must resolve");
+    // $app->minion->enqueue('only_other') must NOT — other_minion's task.
+    assert!(!resolved_at(4, "only_other"), "a different accessor's task must NOT resolve (the leak)");
+    // $c->minion->enqueue('only_minion') resolves — different base, SAME
+    // accessor is the same singleton instance (must not regress).
+    assert!(resolved_at(5, "only_minion"), "same accessor on a different base must still resolve");
+}
+
 /// F1 regression: a re-`my` of the receiver (Perl shadowing) must brand
 /// build-side and resolve query-side on the SAME (latest) declaration —
 /// otherwise the brands disagree and the own task silently fails to

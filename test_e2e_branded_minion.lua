@@ -42,4 +42,27 @@ t.test("branded edges: $a->enqueue does NOT offer $b's task", function()
   end
 end)
 
+-- Accessor-chain: cursor between the quotes of `$app->minion->enqueue('')`.
+local function accessor_completions()
+  local line, col = b.find_pos(buf, "$app->minion->enqueue('')")
+  if not line then return {} end
+  return lsp.completion_labels(buf, line, col + 23) -- inside the ''
+end
+
+t.test("branded edges: $app->minion->enqueue offers its accessor's task", function()
+  local N = "branded edges: $app->minion->enqueue offers its accessor's task"
+  if t.contains(N, accessor_completions(), "acc_minion_task", "accessor tasks") then
+    t.pass(N)
+  end
+end)
+
+t.test("branded edges: $app->minion does NOT offer $app->other_minion's task", function()
+  local N = "branded edges: $app->minion does NOT offer $app->other_minion's task"
+  local labels = accessor_completions()
+  if t.ok(N, not has(labels, "acc_other_task"),
+      "other_minion's task must NOT leak onto ->minion; got: [" .. table.concat(labels, ", ") .. "]") then
+    t.pass(N)
+  end
+end)
+
 t.finish()

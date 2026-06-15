@@ -12045,8 +12045,15 @@ impl<'a> Builder<'a> {
         let receivers = std::mem::take(&mut self.task_handler_receivers);
         let mut assignments: Vec<(crate::file_analysis::SymbolId, String)> = Vec::new();
         for (hsid, receiver) in &receivers {
-            // Only a plain lexical scalar is an instance we can key on —
-            // not `$self`/`$class` (the package), not a chain/bareword.
+            // Accessor chain (`$app->minion`) — brand on the accessor
+            // identity, base-independent, pure text (so it matches the
+            // query side exactly). Handled before the lexical-scalar path.
+            if let Some(brand) = crate::conventions::accessor_chain_brand(receiver) {
+                assignments.push((*hsid, brand));
+                continue;
+            }
+            // Otherwise only a plain lexical scalar is an instance we can
+            // key on — not `$self`/`$class` (the package), not a bareword.
             if !receiver.starts_with('$')
                 || crate::conventions::is_conventional_invocant_name(receiver)
             {
