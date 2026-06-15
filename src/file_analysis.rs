@@ -6643,6 +6643,13 @@ impl FileAnalysis {
         if crate::conventions::is_conventional_invocant_name(receiver) {
             return None; // $self / $class — the package, not an instance
         }
+        // A chain (`$app->minion`) or qualified name (`$pkg::var`) is not
+        // a plain lexical scalar we can key an instance on — reject it
+        // up front rather than leaning on a failed symbol lookup. (The
+        // accessor-chain brand is the deferred tier — branded-edges ADR.)
+        if receiver.contains("->") || receiver.contains("::") {
+            return None;
+        }
         // Key on the LATEST decl before `point` (Perl shadowing), the
         // identical selection `Builder::assign_task_instance_brands` makes
         // at build time — `resolve_variable` returns the FIRST in-scope
