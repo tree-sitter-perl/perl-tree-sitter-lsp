@@ -15,7 +15,7 @@ Positions are 0-based on input, 1-based on output. Run via `gold-corpus/run.pl s
 | st-tt-hashkey-property | simple | type-inference | `Type/Tiny.pm:96:15` | all: 97:15 len=17 property | gold | 97:10 len=4 variable; 97:15 len=17 property; 97:40 len=4 variable; 97:45 len=17 property |
 | st-tt-foreach-loopvar-parameter | tricky | type-inference | `Type/Tiny.pm:693:8` | all: 694:8 len=11 parameter | provisional | 694:8 len=11 parameter; 694:22 len=4 variable |
 | st-uri-constant-name-enummember | tricky | constants | `URI/_punycode.pm:14:13` | all: 15:13 len=4 enumMember / none: 15:13 len=4 function | gold | 15:4 len=8 namespace; 15:13 len=4 enumMember |
-| st-tt-regex-literal-regexp | tricky | type-inference | `Type/Tiny.pm:1509:22` | all: 1510:22 len=69 regexp | gold | 1510:3 len=16 variable; 1510:22 len=69 regexp |
+| st-tt-regex-literal-no-regexp-token | tricky | type-inference | `Type/Tiny.pm:1509:22` | all: 1510:3 len=16 variable; none: regexp | gold | 1510:3 len=16 variable |
 
 ## Dropped (non-lib, absent from installed tree)
 

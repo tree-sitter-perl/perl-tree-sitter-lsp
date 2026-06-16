@@ -76,15 +76,23 @@ function M.reference_lines(buf, line, col)
 end
 
 --- Get document symbols as a list of names.
+-- Flattened list of every symbol name in the document outline. The outline
+-- is a nested DocumentSymbol tree (subs under their `package`, events under
+-- the sub that registers them, …), so we walk `children` recursively — the
+-- substring assertions don't care which level a name lives at.
 function M.symbol_names(buf)
   local result = M.request(buf, "textDocument/documentSymbol", {
     textDocument = { uri = vim.uri_from_bufnr(buf) },
   })
   if not result then return {} end
   local names = {}
-  for _, sym in ipairs(result) do
-    table.insert(names, sym.name)
+  local function walk(syms)
+    for _, sym in ipairs(syms) do
+      table.insert(names, sym.name)
+      if sym.children then walk(sym.children) end
+    end
   end
+  walk(result)
   return names
 end
 

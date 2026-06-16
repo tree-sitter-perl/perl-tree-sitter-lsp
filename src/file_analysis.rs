@@ -2111,9 +2111,9 @@ pub const TOK_METHOD: u32 = 3;
 pub const TOK_MACRO: u32 = 4;
 pub const TOK_PROPERTY: u32 = 5;
 pub const TOK_NAMESPACE: u32 = 6;
-pub const TOK_REGEXP: u32 = 7;
-pub const TOK_ENUM_MEMBER: u32 = 8;
-pub const TOK_KEYWORD: u32 = 9;
+// No TOK_REGEXP: regex literals deliberately emit no semantic token (#63).
+pub const TOK_ENUM_MEMBER: u32 = 7;
+pub const TOK_KEYWORD: u32 = 8;
 
 pub const MOD_DECLARATION: u32 = 0;
 pub const MOD_READONLY: u32 = 1;
@@ -2170,13 +2170,6 @@ pub struct FileAnalysis {
     /// (`package_at` falls back to the legacy scope walk in that case).
     #[serde(default)]
     pub package_ranges: Vec<PackageRange>,
-
-    /// Spans of regex literals (`qr//`, `m//`, `s///`) for semantic-token
-    /// coloring (`TOK_REGEXP`). Populated by the builder; `semantic_tokens()`
-    /// is the only consumer. `#[serde(default)]` so older cache blobs
-    /// deserialize as empty.
-    #[serde(default)]
-    pub regex_spans: Vec<Span>,
 
     /// Parent classes for each package in this file.
     /// Populated by the builder from use parent/base, @ISA, and class :isa.
@@ -2400,7 +2393,6 @@ pub struct FileAnalysisParts {
     pub package_uses: HashMap<String, Vec<String>>,
     pub type_provenance: HashMap<SymbolId, TypeProvenance>,
     pub package_ranges: Vec<PackageRange>,
-    pub regex_spans: Vec<Span>,
     pub app_surface_consumers: Vec<String>,
     pub witnesses: crate::witnesses::WitnessBag,
     pub package_framework: HashMap<String, crate::witnesses::FrameworkFact>,
@@ -2548,7 +2540,6 @@ impl FileAnalysis {
             package_uses,
             type_provenance,
             package_ranges,
-            regex_spans,
             app_surface_consumers,
             mut witnesses,
             package_framework,
@@ -2574,7 +2565,6 @@ impl FileAnalysis {
             call_bindings,
             method_call_bindings,
             package_ranges,
-            regex_spans,
             package_parents,
             app_surface_consumers,
             package_uses,
@@ -7268,15 +7258,79 @@ impl FileAnalysis {
         // `package X;`, `my`/`our` decls, `use` imports, …) attach
         // to the file scope directly. Statement-form `package X;`
         // is package context, not a lexical boundary, so it doesn't
-        // create an intermediate scope. Children come out in
-        // declaration order from the symbols vector.
+        // create an intermediate scope — `nest_under_packages` folds
+        // those siblings under their owning package for the outline
+        // tree (#62).
         //
         // Plugin namespaces are NOT surfaced. They exist for
         // cross-file bridge lookups (`for_each_entity_bridged_to`),
         // not as navigation targets — users look for the
         // helpers/routes/tasks themselves, which already render flat
         // with their `<word>` kind prefix.
-        self.outline_children_of(ScopeId(0))
+        let flat = self.outline_children_of(ScopeId(0));
+        self.nest_under_packages(flat)
+    }
+
+    /// Fold file-scope siblings into the package/class they belong to so the
+    /// outline (and the editor sticky-scroll / breadcrumb built on it) renders
+    /// nested instead of flat (#62).
+    ///
+    /// A statement-form `package Foo;` is a namespace pin, not a lexical scope,
+    /// so its subs/vars live at file scope tagged via `package_ranges`; we
+    /// attach each non-container sibling to the most recent preceding container
+    /// whose range governs it (`package_at`). Block-form classes already nest
+    /// through their lexical body scope and arrive with their children intact;
+    /// they just stay containers here. Files with no `package`/`class` at all
+    /// (a plain script, or a Mojo::Lite app whose structure is plugin
+    /// namespaces) keep the flat list.
+    fn nest_under_packages(&self, flat: Vec<OutlineSymbol>) -> Vec<OutlineSymbol> {
+        let is_container =
+            |k: SymKind| matches!(k, SymKind::Package | SymKind::Class);
+        if !flat.iter().any(|s| is_container(s.kind)) {
+            return flat;
+        }
+
+        let mut result: Vec<OutlineSymbol> = Vec::new();
+        for sym in flat {
+            if is_container(sym.kind) {
+                result.push(sym);
+                continue;
+            }
+            // `package_at` answers "which namespace governs this point",
+            // honouring both statement ranges and block spans (innermost wins).
+            if let Some(owner) = self.package_at(sym.span.start) {
+                if let Some(container) = result
+                    .iter_mut()
+                    .rev()
+                    .find(|c| is_container(c.kind) && c.name == owner)
+                {
+                    container.children.push(sym);
+                    continue;
+                }
+            }
+            result.push(sym);
+        }
+
+        // LSP requires a parent symbol's `range` to enclose its children's
+        // ranges (sticky scroll, breadcrumb, "symbol at cursor" all rely on
+        // containment). A statement-form package's span is just its one-line
+        // declaration, so widen each container to cover what we nested under it.
+        for c in &mut result {
+            if !is_container(c.kind) {
+                continue;
+            }
+            if let Some(end) = c
+                .children
+                .iter()
+                .map(|ch| ch.span.end)
+                .max_by_key(|p| (p.row, p.column))
+            {
+                if (end.row, end.column) > (c.span.end.row, c.span.end.column) {
+                    c.span.end = end;
+                }
+            }
+        }
+        result
     }
 
     /// Whether a scope sits inside a sub/method body (directly or via nested
@@ -7632,10 +7686,10 @@ impl FileAnalysis {
             }
         }
 
-        // ---- Regex literals → regexp tokens ----
-        for span in &self.regex_spans {
-            tokens.push(PerlSemanticToken { span: *span, token_type: TOK_REGEXP, modifiers: 0 });
-        }
+        // Regex literals deliberately get NO semantic token: the editor's
+        // TextMate grammar already scopes them as `string.regexp` *with*
+        // embedded escape-sequence highlighting, which a flat `regexp`
+        // semantic token would override (and recolor mid-typing). See #63.
 
         tokens.sort_by_key(|t| (t.span.start.row, t.span.start.column));
         // Dedup by position — if two tokens start at the same (row, col), keep the first

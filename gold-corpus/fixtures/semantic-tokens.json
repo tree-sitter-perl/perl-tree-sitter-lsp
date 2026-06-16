@@ -155,7 +155,7 @@
       "status": "gold"
     },
     {
-      "id": "st-tt-regex-literal-regexp",
+      "id": "st-tt-regex-literal-no-regexp-token",
       "difficulty": "tricky",
       "semantic_area": "type-inference",
       "file": "Type/Tiny.pm",
@@ -163,9 +163,11 @@
       "col": 22,
       "expect": {
         "all": [
-          "1510:22 len=69 regexp"
+          "1510:3 len=16 variable"
         ],
-        "none": []
+        "none": [
+          "regexp"
+        ]
       },
       "status": "gold"
     },

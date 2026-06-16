@@ -252,7 +252,6 @@ fn build_with_plugins_inner(
         next_scope_id: 0,
         next_symbol_id: 0,
         package_ranges: Vec::new(),
-        regex_spans: Vec::new(),
         open_statement_package: None,
         plugins,
         dispatch_manifest: std::collections::HashMap::new(),
@@ -529,7 +528,6 @@ fn build_with_plugins_inner(
         package_uses: b.package_uses,
         type_provenance: b.type_provenance,
         package_ranges: b.package_ranges,
-        regex_spans: b.regex_spans,
         app_surface_consumers: b.app_surface_consumers,
         witnesses: b.bag,
         package_framework: b.package_framework,
@@ -1430,9 +1428,6 @@ struct Builder<'a> {
     /// the file end and gets trimmed when a same-level successor
     /// appears.
     package_ranges: Vec<crate::file_analysis::PackageRange>,
-    /// Spans of regex literals (`qr//`, `m//`, `s///`), collected during the
-    /// walk and copied onto `FileAnalysis.regex_spans` for `TOK_REGEXP`.
-    regex_spans: Vec<Span>,
     /// Index in `package_ranges` of the currently-open statement-form
     /// declaration (the one a successor `package X;` / `class X;`
     /// would supplant), if any.
@@ -3523,10 +3518,10 @@ impl<'a> Builder<'a> {
                 }
             }
 
-            // Regex literals → TOK_REGEXP. Record the whole literal span,
-            // then descend so interpolated variables inside still get refs.
+            // Descend so interpolated variables inside the pattern still get
+            // refs. No semantic token is emitted for the literal itself — see
+            // `FileAnalysis::semantic_tokens` (#63).
             "quoted_regexp" | "match_regexp" => {
-                self.regex_spans.push(node_to_span(node));
                 self.visit_children(node);
             }
             "substitution_regexp" => {
@@ -3540,18 +3535,7 @@ impl<'a> Builder<'a> {
                         .find(|c| c.kind() == "replacement")
                 }).flatten();
                 if let Some(repl) = repl {
-                    // Color only the pattern region as a regex literal, stopping
-                    // where the code replacement begins — the replacement's own
-                    // refs color the code, and overlapping semantic tokens are
-                    // invalid LSP. (Non-/e keeps the whole-literal span: the
-                    // replacement there is a plain string, not code.)
-                    self.regex_spans.push(Span {
-                        start: node_to_span(node).start,
-                        end: node_to_span(repl).start,
-                    });
                     self.emit_refs_in_eval_replacement(repl);
-                } else {
-                    self.regex_spans.push(node_to_span(node));
                 }
                 self.visit_children(node);
             }
@@ -5106,6 +5090,24 @@ impl<'a> Builder<'a> {
             SymbolDetail::None,
             module_ns,
         );
+
+        // The module name is a package reference: goto-def on `File::Copy` in
+        // `use File::Copy;` should reach the external `.pm`, not self-reference
+        // (rule #7 — every meaningful token gets a ref; `find_definition` first
+        // looks for a ref at the cursor, else falls back to `symbol_at`, which
+        // would return this very Module symbol's own span). The cross-file
+        // PackageRef resolver (symbols.rs) maps the name to its file; an
+        // in-file package resolves locally via `find_package_or_class`; a
+        // pragma that resolves to neither is an honest no-jump. Only for real
+        // source — a synthetic `use` has no name span to anchor on.
+        if node.is_some() {
+            self.add_ref(
+                RefKind::PackageRef,
+                module_name_span,
+                module_name.clone(),
+                AccessKind::Read,
+            );
+        }
 
         // Track uses per-package so `Trigger::UsesModule` matches.
         // Populated before any plugin-dispatch site reads it.

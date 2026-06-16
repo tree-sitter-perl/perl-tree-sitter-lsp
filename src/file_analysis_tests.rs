@@ -786,31 +786,34 @@ fn plugin_mojo_demo_outline_pinned() {
     let rendered = render_outline(&fa.document_symbols());
     let expected = "\
 [NAMESPACE] MyApp @L34
-[VARIABLE] $app @L44
-[FUNCTION] <helper> current_user ($fallback) @L45
-[FUNCTION] <helper> users.create ($name, $email) @L52
-[FUNCTION] <helper> users.delete ($id) @L56
-[FUNCTION] <helper> admin.users.purge ($force) @L62
-[VARIABLE] $r @L70
-[FUNCTION] <action> Users#list @L71
-[FUNCTION] <action> Users#create @L72
-[FUNCTION] <action> Admin::Dashboard#index @L73
-[FUNCTION] <route> GET /users/profile @L79
-[FUNCTION] <route> POST /users/profile ($form_data) @L84
-[FUNCTION] <route> ANY /fallback @L90
-[VARIABLE] $minion @L105
-[FUNCTION] <task> send_email ($to, $subject, $body) @L107
-[FUNCTION] <task> resize_image ($path, $width, $height) @L113
+  [VARIABLE] $app @L44
+  [FUNCTION] <helper> current_user ($fallback) @L45
+  [FUNCTION] <helper> users.create ($name, $email) @L52
+  [FUNCTION] <helper> users.delete ($id) @L56
+  [FUNCTION] <helper> admin.users.purge ($force) @L62
+  [VARIABLE] $r @L70
+  [FUNCTION] <action> Users#list @L71
+  [FUNCTION] <action> Users#create @L72
+  [FUNCTION] <action> Admin::Dashboard#index @L73
+  [FUNCTION] <route> GET /users/profile @L79
+  [FUNCTION] <route> POST /users/profile ($form_data) @L84
+  [FUNCTION] <route> ANY /fallback @L90
+  [VARIABLE] $minion @L105
+  [FUNCTION] <task> send_email ($to, $subject, $body) @L107
+  [FUNCTION] <task> resize_image ($path, $width, $height) @L113
 [NAMESPACE] MyApp::Progress @L131
-[FUNCTION] new @L134
-  [EVENT] <event> ready ($ctx) @L137
-  [EVENT] <event> step ($n, $total) @L138
-  [EVENT] <event> done ($result) @L139
-[FUNCTION] tick @L143
+  [FUNCTION] new @L134
+    [EVENT] <event> ready ($ctx) @L137
+    [EVENT] <event> step ($n, $total) @L138
+    [EVENT] <event> done ($result) @L139
+  [FUNCTION] tick @L143
 ";
-    // `use` lines absent: outlines show structure, not imports. File-scope
-    // `my` vars ($app, $r, $minion) survive; sub-body lexicals ($class/$self
-    // in new, $self/$n in tick) are dropped as working state.
+    // Subs/vars nest under their owning `package` (#62): everything declared
+    // under `package MyApp;` lands beneath it, the `MyApp::Progress` methods
+    // beneath that, and `new`'s events stay one level deeper still. `use`
+    // lines absent: outlines show structure, not imports. File-scope `my`
+    // vars ($app, $r, $minion) survive; sub-body lexicals ($class/$self in
+    // new, $self/$n in tick) are dropped as working state.
     assert_eq!(
         rendered, expected,
         "\n---- ACTUAL ----\n{}\n---- EXPECTED ----\n{}",
@@ -864,6 +867,70 @@ fn lsp_kind_name(k: tower_lsp::lsp_types::SymbolKind) -> &'static str {
         K::KEY => "KEY",
         _ => "OTHER",
     }
+}
+
+/// #62: statement-form `package Foo;` is a namespace pin, not a lexical
+/// scope, yet the outline must nest its subs/vars beneath it (sticky scroll /
+/// breadcrumb depend on the tree). Code in `main` before any package stays at
+/// the top level; a later package becomes a sibling container, not a child.
+#[test]
+fn outline_nests_subs_under_their_package() {
+    let src = "\
+sub top_level {}
+
+package Alpha;
+sub one {}
+sub two {}
+
+package Beta;
+sub three {}
+";
+    let fa = build_fa_from_source(src);
+    let rendered = render_outline(&fa.document_symbols());
+    let expected = "\
+[FUNCTION] top_level @L1
+[NAMESPACE] Alpha @L3
+  [FUNCTION] one @L4
+  [FUNCTION] two @L5
+[NAMESPACE] Beta @L7
+  [FUNCTION] three @L8
+";
+    assert_eq!(
+        rendered, expected,
+        "\n---- ACTUAL ----\n{}\n---- EXPECTED ----\n{}",
+        rendered, expected,
+    );
+
+    // The container's range must enclose its children (LSP requirement for
+    // sticky scroll): `Alpha`'s one-line decl span widens past `two` (L5).
+    let alpha = fa
+        .document_symbols()
+        .into_iter()
+        .find(|s| s.name == "Alpha")
+        .expect("Alpha package in outline");
+    assert!(
+        alpha.span.end.row >= 4,
+        "package span should widen to cover nested subs, got end {:?}",
+        alpha.span.end,
+    );
+}
+
+/// #61: goto-def on the module name in `use Foo::Bar;` must resolve as a
+/// package reference (→ external `.pm`), not fall back to the use statement's
+/// own Module symbol (the self-reference bug). The builder emits a PackageRef
+/// on the name span, and same-file `find_definition` returns None for an
+/// out-of-file package so cross-file resolution takes over.
+#[test]
+fn use_module_name_emits_package_ref() {
+    use crate::file_analysis::RefKind;
+    let fa = build_fa_from_source("use File::Copy;\n");
+    let r = fa
+        .ref_at(Point::new(0, 6))
+        .expect("a ref on the module name 'File::Copy'");
+    assert!(matches!(r.kind, RefKind::PackageRef), "got {:?}", r.kind);
+    assert_eq!(r.target_name, "File::Copy");
+    // No local package `File::Copy` ⇒ honest None, not a self-reference.
+    assert_eq!(fa.find_definition(Point::new(0, 6), None), None);
 }
 
 #[test]

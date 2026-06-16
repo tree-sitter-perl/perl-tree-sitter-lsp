@@ -1938,9 +1938,10 @@ pub fn semantic_token_types() -> Vec<SemanticTokenType> {
         SemanticTokenType::MACRO,          // 4: framework DSL keywords
         SemanticTokenType::PROPERTY,       // 5: hash keys
         SemanticTokenType::NAMESPACE,      // 6: package/class names
-        SemanticTokenType::REGEXP,         // 7: regex literals
-        SemanticTokenType::ENUM_MEMBER,    // 8: constants
-        SemanticTokenType::KEYWORD,        // 9: $self/$class
+        // No REGEXP: the TextMate `string.regexp` scope (with escape-sequence
+        // highlighting) is left to shine through — see #63.
+        SemanticTokenType::ENUM_MEMBER,    // 7: constants
+        SemanticTokenType::KEYWORD,        // 8: $self/$class
     ]
 }
 
