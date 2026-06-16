@@ -7,51 +7,88 @@ through it; `children_index`'s descendant fan-out and plugin bridges
 too. Landed design + rationale: `docs/adr/graph-walking.md`. This doc
 is what's left.
 
-## Next: branded edges
+## PARKED: instance brands (behind the long-distance value-provenance tier)
 
-A branded edge fires only when the walker's *context* matches a brand —
-the instance-identity cases the plain class/bridge edges can't express.
+The motivation: scope plugin-synthesized dispatch to the right
+*instance* so the LSP doesn't merge across co-resident objects —
+`$a->enqueue('tb')` shouldn't reach `$b`'s task; `$app->minion` and
+`$app->other_minion` are different queues; two Mojo::Lite apps in one
+workspace shouldn't see each other's helpers.
 
-```rust
-enum Brand {
-    Variable { file: FileId, scope: ScopeId, name: String },
-    File(FileId),
-    Custom { kind: String, payload: serde_json::Value },  // plugins
-}
-```
+**A spike was built and then closed (PRs #65/#66, branches
+`branded-edges` / `branded-edges-accessor`, kept for reference).** It is
+parked, not abandoned — but it must NOT be rebuilt the way it was. The
+spike keyed an accessor receiver on its *syntactic name* (`$app->minion`
+→ `acc:minion`). That is the rule-#10 mistake in disguise: it regressed
+the moment a variable aliased the accessor (`my $m = $app->minion;
+$m->enqueue` — different key, no resolve), and it can never be made
+right by adding more string cases.
 
-Concrete cases:
+### Why it's parked, and on what
 
-- **`my $minion = Minion->new(...)`** — entities of `$minion`'s plugin
-  namespace bridge to `Brand::Variable { … "$minion" }`. A second
-  Minion instance in the same workspace doesn't collide.
-- **`my $app = Mojolicious::Lite->new`** — the app's namespace bridges
-  to `Brand::File(file_id)` (the multi-app Mojo case).
+"Which instance is this receiver" is a *runtime* fact. Recovering it
+statically is **value provenance**: trace a receiver to the site where
+its instance was *born*. And that is the exact same engine as the
+high-value implicit-contract features we want anyway — "what types can
+this hash key hold", "what type is the n-th arg of this callback",
+value-indexed returns. Those live in `prompt-type-inference-residual.md`
+(Parts 1–5) and are **not yet built**. Instance brands are one
+downstream *consumer* of that engine, so they wait for it. Building a
+bespoke half-chase now (the spike) is strictly the wrong move — it
+reproduces the type system's provenance badly and rots.
 
-The goal is for brands to fit `walk` cleanly — a brand is walk
-*context* that gates branded edges, not a bolt-on. `walk` already
-carries the origin; brand context rides alongside, and `edges_from`
-consults it for branded edge kinds.
+### The rule, for when the foundation exists
 
-**The one real decision is brand-resolution timing.** The hard case
-isn't `my $minion = Minion->new` (static, visible at the decl) — it's
-`$app->minion` vs `$app->other_minion`, where the brand depends on what
-the accessor returns (type inference, possibly cross-file). Three
-options:
+Brand = the **birth-site of the instance**, one uniform rule, no
+fallback and no special case:
 
-1. **Static at emission** — covers `my $x = Class->new` and per-file
-   singletons; misses accessor-returned brands.
-2. **Cross-file enrichment post-pass** — after inference settles, walk
-   method-call refs whose receiver resolves to a branded namespace and
-   materialise the branded edges. Same machinery as
-   `enrich_imported_types_with_keys`.
-3. **Lazy at query time** — branded edges carry a compute-brand
-   closure. Reintroduces the query-time logic the unification is
-   trying to remove; avoid.
+- `my $x = Class->new` → `$x`'s decl.
+- `$obj->accessor` → resolve the accessor → the instance its body
+  *returns* (the captured lexical / `state` var) → recurse.
+- `Class->new` inline (anonymous) → the `->new` call-site span.
 
-Plan: **(1) for the cheap cases, (2) for accessor chains.** Land (1)
-first; the accessor-chain case shouldn't block it. Decide the timing
-deliberately when this is picked up — don't defer it into the code.
+The accessor case **rides the existing return-edge chase** — the same
+`Symbol(sid) → Edge(Expr(last_expr_span))` the return-*type* chase walks
+(`adr/return-expr.md`), projected to the tail expr's `resolves_to` decl
+instead of its `InferredType`. Verified against the real substrate: the
+Minion helper is `$app->helper(minion => sub {$minion})` (lexical
+capture, in `gold-corpus/local/.../Mojolicious/Plugin/Minion.pm` — the
+LSP already indexes it), so `$app->minion`, `$c->minion`, and a direct
+`$minion->add_task` all chase to the same `my $minion` decl → one brand.
+This collapses the per-variable, accessor, and alias cases into a single
+"trace to the birth site" — none are separate tiers.
+
+### What must stay OUT of core
+
+The "home app" notion (which app instance owns this minion) is a
+*plugin* concept and must never enter core. Core ships only:
+
+- generic value-provenance birth-site resolution (framework-free), and
+- bounded direct keys (a *file* identity, a *same-file lexical* decl).
+
+The Mojo-specific per-app overlay — needed ONLY to disambiguate multiple
+apps loading the same plugin (one static `my $minion` decl, N runtime
+instances) — is a plugin-supplied qualifier composed as an opaque
+`(birth-site, Option<home>)` tuple with additive component-wise matching
+(`None` home = shared, visible to all). Single-app needs zero home
+concept. Core treats the brand as an opaque string; the plugin/entrypoint
+layer supplies the qualifier. The irreducible gap (a shared controller
+serving multiple apps with an app-specific task — statically
+unattributable, same wall as full-Mojo multi-app helpers) is documented,
+not solved.
+
+### The line
+
+- **Direct keys** (file identity, same-file lexical decl) need no chase
+  and could stand alone if the DX is ever judged worth it on its own.
+- **Flow keys** (accessor-return instance, constructor injection,
+  fields, the "class that takes a minion") need the value-provenance
+  tier — and that is the gate this whole feature waits behind.
+
+Prerequisite to un-park: the value-provenance layer of
+`prompt-type-inference-residual.md` (esp. Part 2 hash-key unions,
+Part 5a value-indexed returns, and constructor/field value flow). When
+that lands, build the birth-site rule as one of its consumers.
 
 ## Deferred: Scope nodes (the future taxonomy)
 
