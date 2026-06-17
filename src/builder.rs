@@ -5540,31 +5540,27 @@ impl<'a> Builder<'a> {
     }
 
     /// Flatten a DSL call's args to `(name, span)` for a plugin's
-    /// `CallContext::arg_names`. Shares `cst::string_list` (qw / string /
-    /// nested-list / fat-comma handling) but with a DSL-arg fold: a
-    /// bareword is its own LITERAL text. Fat-comma autoquoting means a
-    /// key/name bareword is that name, never a constant lookup. `@array`
-    /// elements still fold through the constant table.
-    ///
-    /// KLUDGE (tree-sitter-perl grammar): a fat-comma key is *normally*
-    /// lexed as `autoquoted_bareword` (a grammar-certified literal), but on
-    /// continuation lines of a multi-line list certain words (`name`,
-    /// `status`) come through as plain `bareword`. Treating every bareword
-    /// as literal text here papers over that until the grammar is fixed
-    /// upstream; once it is, this can defer to the autoquoted classification
-    /// (and constant barewords could route back through the fold).
+    /// `CallContext::arg_names`. Shares `cst::string_list` but with a
+    /// DSL-arg fold: an `autoquoted_bareword` is a grammar-certified
+    /// fat-comma key — its value IS its text, never a constant lookup. A
+    /// plain `bareword` / `@array` is a genuine value and routes through
+    /// the constant table. (`cst::string_list` hands both kinds to the
+    /// fold, so the distinction is drawn here rather than in the shared
+    /// helper — keeping its const-folding contract intact for the
+    /// use-import / export-list callers.)
     fn extract_arg_name_list(&self, node: Node<'a>) -> Vec<(String, Span)> {
         crate::cst::string_list(node, self.source, &mut |n| {
-            if n.kind() == "array" {
-                let Ok(text) = n.utf8_text(self.source) else { return vec![] };
-                let Some(values) = self.resolve_constant_strings(text, 0) else { return vec![] };
-                let span = node_to_span(n);
-                return values.into_iter().map(|v| (v, span)).collect();
+            if n.kind() == "autoquoted_bareword" {
+                return match n.utf8_text(self.source) {
+                    Ok(text) => vec![(text.to_string(), node_to_span(n))],
+                    Err(_) => vec![],
+                };
             }
-            match n.utf8_text(self.source) {
-                Ok(text) => vec![(text.to_string(), node_to_span(n))],
-                Err(_) => vec![],
-            }
+            // plain bareword / @array: a genuine value — fold via constants.
+            let Ok(text) = n.utf8_text(self.source) else { return vec![] };
+            let Some(values) = self.resolve_constant_strings(text, 0) else { return vec![] };
+            let span = node_to_span(n);
+            values.into_iter().map(|v| (v, span)).collect()
         })
     }
 
