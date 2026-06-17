@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "perl-lsp",
+  "displayName": "Perl (perl-lsp)",
+  "version": "0.1.0",
+  "description": "Perl language intelligence for Claude Code: type inference without annotations, cross-file navigation, and framework awareness for Moo/Moose, Mojolicious, and DBIx::Class. Requires the perl-lsp binary on PATH (cargo install perl-lsp).",
+  "author": {
+    "name": "tree-sitter-perl",
+    "url": "https://github.com/tree-sitter-perl"
+  },
+  "homepage": "https://github.com/tree-sitter-perl/perl-tree-sitter-lsp",
+  "repository": "https://github.com/tree-sitter-perl/perl-tree-sitter-lsp",
+  "license": "Artistic-2.0",
+  "keywords": ["perl", "lsp", "language-server", "type-inference", "mojolicious", "moo", "moose", "dbix-class"]
+}
