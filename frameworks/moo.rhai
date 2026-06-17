@@ -36,6 +36,15 @@ fn role_makers() {
     ["Moo::Role", "Moose::Role", "Mouse::Role", "Role::Tiny"]
 }
 
+// The verbs whose args core flattens into `ctx.arg_names` — and, since
+// these are Moo's accessor declarators, the gate behind which core also
+// builds the richer `has_options` (classified shorthand/handles options a
+// flat name list can't carry). Declaring them here is what keeps core from
+// hardcoding `has`/`option`; the vocabulary lives with the plugin.
+fn arg_name_verbs() {
+    ["has", "option"]
+}
+
 fn triggers() {
     [
         #{ UsesModule: "Moo" },

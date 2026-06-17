@@ -1536,48 +1536,6 @@ pub fn class_isa(
     false
 }
 
-/// Walk `class`'s full MRO (local `package_parents` ∪ cross-file graph) and
-/// return `true` as soon as any class in the chain (including `class` itself)
-/// satisfies `pred`. The predicate-variant of [`class_isa`] — for "does any
-/// ancestor look like a DBIC base class" where the target isn't a single
-/// fixed name. Same cycle-guard + budget as `class_isa`.
-pub fn any_ancestor<F>(
-    class: &str,
-    package_parents: &HashMap<String, Vec<String>>,
-    module_index: Option<&dyn CrossFileLookup>,
-    mut pred: F,
-) -> bool
-where
-    F: FnMut(&str) -> bool,
-{
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = vec![class.to_string()];
-    let mut budget = 0;
-    while let Some(cur) = stack.pop() {
-        if budget > 200 {
-            break;
-        }
-        budget += 1;
-        if !seen.insert(cur.clone()) {
-            continue;
-        }
-        if pred(&cur) {
-            return true;
-        }
-        if let Some(parents) = package_parents.get(&cur) {
-            for p in parents {
-                stack.push(p.clone());
-            }
-        }
-        if let Some(idx) = module_index {
-            for p in idx.parents_cached(&cur) {
-                stack.push(p);
-            }
-        }
-    }
-    false
-}
-
 /// Three-way outcome of resolving a [`ReceiverGated`] value against a
 /// concrete receiver class. Splitting "doesn't apply" from "can't tell"
 /// is load-bearing: `DoesNotApply` is a settled negative (the receiver

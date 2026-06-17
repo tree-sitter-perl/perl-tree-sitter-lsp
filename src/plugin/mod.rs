@@ -160,6 +160,19 @@ pub struct CallContext {
     /// `frameworks/moo.rhai`. `None` for every other call.
     #[serde(default)]
     pub has_options: Option<HasOptions>,
+    /// The call's positional args read as a flat string list — every
+    /// string-ish token (string-literal content, barewords, autoquoted
+    /// fat-comma keys, `qw(...)` words, foldable constants), each with
+    /// its tight selection span, in source order, separator-agnostic
+    /// (the fat-comma gotcha: never gate on `=>`). Non-string args
+    /// (hashrefs, coderefs) carry no name and are dropped. Produced by
+    /// `cst::string_list` (rule #1) so a list-DSL plugin reads its
+    /// accessor / column / export names without touching the tree.
+    /// Populated ONLY for calls whose verb a plugin registered via
+    /// [`FrameworkPlugin::arg_name_verbs`]; empty otherwise. See
+    /// `frameworks/dbic.rhai`.
+    #[serde(default)]
+    pub arg_names: Vec<(String, Span)>,
 }
 
 /// Decision-ready snapshot of a Moo/Moose `has` declaration's accessor
@@ -831,6 +844,18 @@ pub trait FrameworkPlugin: Send + Sync {
         &[]
     }
 
+    /// Call verbs (method or function names) for which this plugin wants
+    /// the args pre-flattened into `CallContext::arg_names` — the shared
+    /// `cst::string_list` extraction, run by core only when an APPLICABLE
+    /// plugin registered the verb. Keeps tree access in the builder
+    /// (rule #1) while leaving the "which calls, which names" vocabulary
+    /// with the plugin (rule #8/#10): core hardcodes no DSL verb. Default
+    /// empty; list-DSL plugins (DBIC columns/relationships, exporters)
+    /// declare theirs. See `frameworks/dbic.rhai`.
+    fn arg_name_verbs(&self) -> &[String] {
+        &[]
+    }
+
     /// Static role-contract parameter-type manifest — see `ParamType`.
     /// Applied at the sub-declaration walk. Default empty.
     fn param_types(&self) -> &[ParamType] {
@@ -1207,6 +1232,16 @@ impl PluginRegistry {
                 None
             }
         })
+    }
+
+    /// Does an APPLICABLE plugin want `verb`'s args pre-flattened into
+    /// `CallContext::arg_names`? Gates the builder's shared
+    /// `cst::string_list` extraction so it runs only for registered
+    /// verbs in packages where the declaring plugin actually fires —
+    /// no DSL verb is hardcoded in core.
+    pub fn wants_arg_names(&self, query: &TriggerQuery<'_>, verb: &str) -> bool {
+        self.applicable(query)
+            .any(|p| p.arg_name_verbs().iter().any(|v| v == verb))
     }
 
     /// Return plugins whose triggers match the current package context.
