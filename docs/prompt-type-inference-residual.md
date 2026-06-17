@@ -9,6 +9,14 @@
 > Cross-refs: `adr/bag-canonical.md` (the bag is the only source of types —
 > the foundation each fact class below builds on); `prompt-sequence-types.md`
 > (positional containers).
+>
+> **Downstream consumer (gated on this work):** instance brands (scoping
+> plugin dispatch to the right object — `$a` vs `$b`, `$app->minion` vs
+> `$app->other_minion`) are value-provenance, the same engine as the
+> implicit-contract facts here. Parked behind this tier; the birth-site
+> design is in `prompt-graph-walking.md`. Build it as a consumer once the
+> value-flow parts below (esp. Part 2 + Part 5a + constructor/field flow)
+> land — not as a bespoke chase.
 
 ## Part 1 — Invocant mutations
 

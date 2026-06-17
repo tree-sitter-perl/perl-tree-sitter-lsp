@@ -6,10 +6,13 @@ This file is only what's NEXT, in order.
 ## Now (in order)
 
 1. **Graph walking** — the walker + the whole inheritance axis landed
-   (`adr/graph-walking.md`). Next: **branded edges** (`$minion`/`$app`
-   instance identity → multi-app Mojo), then the deferred Scope-node
-   taxonomy (Openness diagnostic, `home_namespace`) when those are
-   built. Forward work: `prompt-graph-walking.md`.
+   (`adr/graph-walking.md`). The deferred Scope-node taxonomy (Openness
+   diagnostic, `home_namespace`) is forward work in
+   `prompt-graph-walking.md`. **Instance brands** (`$minion`/`$app`
+   instance identity, multi-app Mojo) were spiked and PARKED — they're a
+   consumer of the long-distance value-provenance tier (see Queued), not
+   a standalone feature; rationale + the birth-site design in
+   `prompt-graph-walking.md`.
 2. **DBIC out of core** — ungated; phase ladder in
    `prompt-dbic-as-plugin.md`. Ends with core plugin-free except
    generic dispatch.
