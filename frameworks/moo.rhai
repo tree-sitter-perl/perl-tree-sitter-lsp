@@ -12,15 +12,13 @@
 //                       a class, the delegated method's return edges to the
 //                       remote method on that class
 //
-// The core walks the `has` CST and hands this plugin EVERY fat-comma option
-// key→value as a value-shape-classified `ctx.has_options` entry (rule #1 —
-// only the builder touches tree-sitter; no keyword allowlist in core, so a
-// new keyword needs no core edit). What lives HERE is the vocabulary: which
-// keyword maps to which name pattern and return behavior; arms below ignore
-// keywords/shapes they don't act on. New Moo accessor behavior is a new arm
-// in this file, not a branch in the builder. The default accessor / isa /
-// constructor-key synthesis is still native in `visit_has_call` (a larger
-// move left as future work); this plugin is the seam for everything beyond it.
+// The core walks the `has` CST and hands this plugin every fat-comma option
+// as a value-shape-classified `ctx.arg_pairs` entry (rule #1 — only the
+// builder touches tree-sitter; no keyword allowlist in core, so a new keyword
+// needs no core edit). What lives HERE is the vocabulary: which keyword maps
+// to which name pattern and return behavior; arms below ignore keywords/shapes
+// they don't act on. The default accessor / isa / constructor-key synthesis is
+// still native in `visit_has_call`; this plugin is the seam beyond it.
 
 fn id() { "moo" }
 
@@ -36,11 +34,10 @@ fn role_makers() {
     ["Moo::Role", "Moose::Role", "Mouse::Role", "Role::Tiny"]
 }
 
-// The verbs whose args core flattens into `ctx.arg_names` — and, since
-// these are Moo's accessor declarators, the gate behind which core also
-// builds the richer `has_options` (classified shorthand/handles options a
-// flat name list can't carry). Declaring them here is what keeps core from
-// hardcoding `has`/`option`; the vocabulary lives with the plugin.
+// The verbs whose args core flattens into `ctx.arg_pairs` (the accessor
+// options) and `has_options` (the attr-name + isa head). Declaring them
+// here keeps core from hardcoding `has`/`option` — the vocabulary lives
+// with the plugin.
 fn arg_name_verbs() {
     ["has", "option"]
 }

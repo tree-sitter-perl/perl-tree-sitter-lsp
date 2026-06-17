@@ -1,30 +1,20 @@
 // dbic: DBIx::Class result-class DSL → column + relationship accessors.
 //
-// A DBIC Result class declares its table shape with class-method calls:
-//
-//     __PACKAGE__->add_columns(qw/id name email/);
-//     __PACKAGE__->add_columns(id => { data_type => 'integer' }, ...);
+// A Result class declares its table shape with class-method calls:
+//     __PACKAGE__->add_columns(qw/id name/);   # or  id => { data_type => ... }
 //     __PACKAGE__->has_many(comments => 'Schema::Result::Comment', 'post_id');
-//     __PACKAGE__->belongs_to(author => 'Schema::Result::User', 'author_id');
+//     __PACKAGE__->belongs_to(author => 'Schema::Result::User');
 //
-// Each column installs an accessor method (and a HashKeyDef so
-// `$rs->search({ name => ... })` / `$row->{name}` resolve the column).
-// Each relationship installs an accessor whose RETURN names the related
-// shape: a `has_many` / `many_to_many` yields a `DBIx::Class::ResultSet`,
-// a `belongs_to` / `has_one` / `might_have` yields the row class.
+// A column installs an accessor + a HashKeyDef (so `$rs->search({ name => ... })`
+// and `$row->{name}` resolve it). A relationship installs an accessor whose
+// return names the related shape: has_many / many_to_many → a ResultSet,
+// belongs_to / has_one / might_have → the row class.
 //
-// Core walks the call args into `ctx.arg_names` (rule #1 — the shared
-// `cst::string_list`: qw-expanded, fat-comma-key + positional strings,
-// each with its tight span, separator-agnostic). This plugin owns the
-// verb vocabulary: which name is a column vs an accessor+target-class,
-// and the typed return. The trigger (`ClassIsa("DBIx::Class")`) scopes
-// synthesis to result classes at any inheritance depth.
-//
-// `load_components` parent registration stays in core — it's generic
-// component-mixin machinery, not DBIC-specific. Parametric ResultSet
-// typing (per-method projection: `find` → row, `search` → resultset)
-// is deliberate follow-up; the accessor + plain typed return is the
-// load-bearing 80%.
+// Core feeds the flat arg names in `ctx.arg_names`; this plugin owns the verb
+// vocabulary. `ClassIsa("DBIx::Class")` scopes synthesis to result classes at
+// any depth. `load_components` parent registration stays core (generic mixin
+// machinery). Parametric ResultSet typing (per-method `find` → row) is
+// follow-up; accessor + plain typed return is the load-bearing 80%.
 
 fn id() { "dbic" }
 

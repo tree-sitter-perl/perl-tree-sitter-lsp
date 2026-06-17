@@ -5539,15 +5539,12 @@ impl<'a> Builder<'a> {
         })
     }
 
-    /// Flatten a DSL call's args to `(name, span)` for a plugin's
-    /// `CallContext::arg_names`. Shares `cst::string_list` but with a
-    /// DSL-arg fold: an `autoquoted_bareword` is a grammar-certified
-    /// fat-comma key — its value IS its text, never a constant lookup. A
-    /// plain `bareword` / `@array` is a genuine value and routes through
-    /// the constant table. (`cst::string_list` hands both kinds to the
-    /// fold, so the distinction is drawn here rather than in the shared
-    /// helper — keeping its const-folding contract intact for the
-    /// use-import / export-list callers.)
+    /// Flatten a DSL call's args to `(name, span)` for `CallContext::arg_names`.
+    /// Like `cst::string_list` but with a DSL-arg fold: an `autoquoted_bareword`
+    /// is a grammar-certified fat-comma key (its value IS its text, never a
+    /// constant lookup); a plain `bareword` / `@array` is a genuine value and
+    /// folds through the constant table. The autoquoted rule isn't pushed into
+    /// `string_list` itself — that unmasks a use-import bug; see ROADMAP.
     fn extract_arg_name_list(&self, node: Node<'a>) -> Vec<(String, Span)> {
         crate::cst::string_list(node, self.source, &mut |n| {
             if n.kind() == "autoquoted_bareword" {
@@ -7546,11 +7543,9 @@ impl<'a> Builder<'a> {
                         ctx.arg_names = self.extract_arg_name_list(node
                             .child_by_field_name("arguments")
                             .unwrap_or(node));
-                        // Moo/Moose `has`/`option`: the accessor options are
-                        // the generic value-shape pairs (`arg_pairs`); the
-                        // non-pair head (attr name(s) + resolved isa) rides
-                        // `has_options`. Built behind the same registration
-                        // gate, scoped by framework mode.
+                        // Moo/Moose `has`/`option`: options ride `arg_pairs`;
+                        // `has_options` carries only the non-pair head (attr
+                        // names + isa). Scoped by framework mode.
                         if let Some(mode) = self.current_package.as_ref()
                             .and_then(|pkg| self.framework_modes.get(pkg).copied())
                         {
@@ -9451,20 +9446,13 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Walk a `has` call's CST into the decision-ready `HasOptions` the moo
-    /// plugin reads. The split is deliberate: core owns the node walk
-    /// (rule #1) and value *classification* (shorthand `=> 1` vs explicit
-    /// string vs `handles` delegation pairs); the plugin owns the accessor
-    /// *vocabulary* (which keyword → which method-name pattern). Only the
-    /// non-default options live here — the default accessor / isa /
-    /// constructor-key synthesis stays native in `visit_has_call`. New Moo
-    /// behavior wants the plugin; this seam is where structured option data
-    /// crosses over.
-    /// `has` decomposes into a non-pair head (attr name(s) + the resolved
-    /// `isa` type) and a tail of accessor options. The head is returned in
-    /// `HasOptions`; the options are the generic value-shape-classified
-    /// `arg_pairs` the caller sets on the context. `isa` is the one
-    /// type-semantic field core still resolves (roadmapped to move out).
+    /// Walk a `has` call into its non-pair head — the `HasOptions` the moo
+    /// plugin reads (attr name(s) + resolved `isa` type). The accessor
+    /// options are the generic `arg_pairs` the caller sets alongside. Core
+    /// owns the node walk (rule #1); the plugin owns the keyword vocabulary.
+    /// `isa` is the one type-semantic field core still resolves (roadmapped
+    /// to move out); the default accessor / isa / constructor-key synthesis
+    /// stays native in `visit_has_call`.
     fn extract_has_options(
         &mut self,
         node: Node<'a>,
@@ -10373,9 +10361,8 @@ impl<'a> Builder<'a> {
                 if name == "load_components" {
                     self.visit_load_components(node);
                 }
-                // DBIC column/relationship accessor synthesis lives in the
-                // `dbic` plugin (`ClassIsa("DBIx::Class")`); core hands it
-                // `ctx.arg_names` below via the `arg_name_verbs` registration.
+                // DBIC column/relationship synthesis lives in the `dbic`
+                // plugin (`ClassIsa("DBIx::Class")`), fed `ctx.arg_names`.
                 // Class::Accessor::Grouped accessor synthesis. Not DBIC-gated:
                 // any package can `use parent 'Class::Accessor::Grouped'`. The
                 // call shape is the signal — `mk_*_accessors('group', @names)`
@@ -10409,10 +10396,7 @@ impl<'a> Builder<'a> {
                 );
                 ctx.call_kind = plugin::CallKind::Method;
                 ctx.method_name = Some(name.clone());
-                // `__PACKAGE__->m(...)` / `CurrentClass->m(...)` — a
-                // class-level call. Class-declaration DSLs (DBIC columns,
-                // load_components) gate on this so a runtime instance call
-                // (`$rs->add_columns(...)`) isn't read as a declaration.
+                // The class-level-call fact declaration DSLs gate on.
                 ctx.receiver_is_package = is_pkg_call;
                 ctx.receiver_text = invocant_text.clone();
                 ctx.receiver_type = self.receiver_type_for(invocant_node);
@@ -10453,11 +10437,8 @@ impl<'a> Builder<'a> {
                         }
                     }
                 }
-                // Flat arg-name extraction for verbs a plugin registered
-                // (`arg_name_verbs`) — the shared `cst::string_list`, run
-                // only when an applicable plugin asked for it. Core knows
-                // no DSL verb; the DBIC plugin reads columns/relationship
-                // names off `ctx.arg_names`.
+                // Flat arg-names for registered verbs (the DBIC plugin
+                // reads columns/relationship names off `ctx.arg_names`).
                 let wants_names = {
                     let query = plugin::TriggerQuery {
                         package_uses: &ctx.current_package_uses,
