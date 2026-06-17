@@ -1,0 +1,97 @@
+name: Publish Extension
+
+# The VS Code extension publish, factored out of the release flow so it can run
+# standalone (workflow_dispatch) — to retry a store, or publish to one store
+# after the other was already done manually — as well as being called by the
+# release workflow on tag.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Tag/ref to build and publish from (e.g. v0.4.2)
+        type: string
+        required: true
+      stores:
+        description: "both | vs-marketplace | open-vsx"
+        type: string
+        default: both
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag/ref to build and publish from (e.g. v0.4.2)
+        type: string
+        required: true
+      stores:
+        description: Which store(s) to publish to
+        type: choice
+        default: both
+        options: [both, vs-marketplace, open-vsx]
+
+permissions:
+  contents: read
+  id-token: write  # OIDC federated login into the VS Marketplace publisher
+
+jobs:
+  publish-extension:
+    name: Publish VS Code extension
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      # package.json must match the target version. extension.ts's VERSION names
+      # the server release whose binaries the extension downloads — it may lag
+      # (extension-only patches), but that release must exist.
+      - name: Validate versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ inputs.ref }}"; VERSION="${VERSION#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TS_VERSION=$(grep -oP 'const VERSION = "\K[^"]+' src/extension.ts)
+          if [ "$PKG_VERSION" != "$VERSION" ]; then
+            echo "ERROR: package.json version ($PKG_VERSION) != ref ($VERSION)"
+            exit 1
+          fi
+          if [ "$TS_VERSION" != "$VERSION" ]; then
+            gh release view "v$TS_VERSION" -R "$GITHUB_REPOSITORY" >/dev/null ||
+              { echo "ERROR: extension.ts VERSION ($TS_VERSION) has no GitHub release"; exit 1; }
+          fi
+
+      # MS side is secret-free: the `release` environment's OIDC token federates
+      # into a managed identity that is a Contributor on the publisher.
+      - uses: azure/login@v3
+        if: inputs.stores == 'both' || inputs.stores == 'vs-marketplace'
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          allow-no-subscriptions: true
+
+      - name: Build and package
+        run: |
+          npm ci
+          npm run compile
+          npx vsce package -o perl-lsp.vsix
+
+      - name: Publish to VS Marketplace
+        if: inputs.stores == 'both' || inputs.stores == 'vs-marketplace'
+        run: npx vsce publish --packagePath perl-lsp.vsix --azure-credential
+
+      # Same .vsix to both stores — byte-identical by construction. Open VSX has
+      # no Entra equivalent — token secret, step skips when unset.
+      - name: Publish to Open VSX
+        if: (inputs.stores == 'both' || inputs.stores == 'open-vsx') && env.OVSX_PAT != ''
+        run: npx --yes ovsx publish perl-lsp.vsix -p "$OVSX_PAT"
