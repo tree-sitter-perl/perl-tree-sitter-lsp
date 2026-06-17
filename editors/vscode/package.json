@@ -2,7 +2,7 @@
   "name": "vscode-perl-lsp",
   "displayName": "Perl (perl-lsp)",
   "description": "Perl language support powered by tree-sitter-perl — type inference, cross-file navigation, framework intelligence",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "publisher": "tree-sitter-perl",
   "license": "Artistic-2.0",
   "icon": "icon.png",

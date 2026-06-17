@@ -6,6 +6,55 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+## v0.4.2 — 2026-06-17
+
+The crate and the VS Code extension are republished together at this version.
+(0.4.1 was a vscode extension-only republish and as such is skipped.)
+
+### Frameworks & plugins
+
+- **tree-sitter-perl 1.1.3.** Fat-comma keys on continuation lines of a
+  multi-line list (`add_columns(\n  name => …,\n  status => …,\n)`, including
+  keyword-like names) now parse as literal keys, so those columns resolve.
+- DBIC support has moved out of core and into a bundled plugin.
+- **New plugin-manifest hooks** (for `.perl-lsp` / `perl-gen` plugins):
+  - `arg_name_verbs()` + `arg_pairs` / `receiver_is_package` — a generic keyval
+    surface, so list/DSL plugins read their columns / options / names without
+    any DSL verb hardcoded in core.
+  - `load_verbs()` — declares which method names load a module (Mojo's
+    `plugin`), so load tracking is trigger-independent: every `$app->plugin(…)`
+    in a nested-plugin cascade is seen, including `for qw/A B C/` loops.
+  - `role_makers()` — declares modules whose `use` makes the consumer a role,
+    so a house role engine is one manifest line in a `.perl-lsp` plugin away.
+
+### Helper-load & cross-file lint
+
+- **`helper-not-loaded` lint** (hint). A method call whose only resolution is a
+  plugin bridge from a workspace module that *no workspace file loads* — the
+  helper exists but nothing pulls it in. Honest-quiet: exact-or-tail load
+  matching (a default-namespace guess never suppresses an app-custom provider),
+  installed CPAN plugins exempt ("downloaded = intended").
+- **Loader-config param typing.** `plugin 'X', { … }` types module `X`'s
+  `register` config param from the config shapes at every call site
+  (agreement-folded across callers; keyed disagreement opens the shape).
+- **Cross-file slot typing.** `$self->{k}` reads narrow through `$self->{k} = …`
+  writes in *other* files and up the ancestry chain.
+- **Extensionless entrypoints indexed.** A shallow shebang scan over the repo
+  root + `bin/` + `script/` finds Perl entrypoint scripts with no `.pl`
+  extension (Mojo::Lite apps), so `plugin 'X'` loads wired only through them are
+  visible.
+
+### Navigation & outline
+
+- **package goto-def.** The module name in `use Foo::Bar;` now jumps to its `.pm`
+  (or the in-file package).
+- **Outline nests under packages.** `documentSymbol` folds each file-scope sub
+  under its owning `package`/`class`, so the outline, sticky-scroll, and
+  breadcrumb nest correctly. Plain scripts stay flat.
+- **Regex semantic token dropped.** `qr//` / regex literals no longer emit a
+  `regexp` token, letting the editor's TextMate `string.regexp` scope keep
+  escape-sequence highlighting.
+
 ### Role contracts, part 2 — long-distance intelligence
 
 - **Go-to-implementation** (`textDocument/implementation`, new capability).
@@ -24,15 +73,10 @@ crate / VS Code extension versions.
   it. Calibrated to zero false positives on the 2,293-module substrate and
   on a large production codebase.
 - **Runtime-generated parents recorded as incomplete ancestry.** `with
-  ReportProxy(type => ...)` — a parent edge that doesn't fold to a literal
+  ParametricRole(type => ...)` — a parent edge that doesn't fold to a literal
   name — now marks the package's ancestry incomplete, suppressing
   inheritance-dependent diagnostics on it (removed 41 false
   `unresolved-method` hints on the calibration codebase).
-- **Plugin-declared role engines** — new `role_makers()` plugin manifest
-  (array of module names whose `use` makes the consumer a role). Core
-  holds no engine list: the base four (Moo::Role, Moose::Role,
-  Mouse::Role, Role::Tiny) ride `frameworks/moo.rhai`'s manifest, and a
-  house role engine is one manifest line in a `.perl-lsp` plugin away.
 - **`children_index`** — new reverse edge in the module index (parent
   class/role → composing/inheriting modules), the shared primitive for the
   long-distance family. All reverse maps now live in one bundle fed

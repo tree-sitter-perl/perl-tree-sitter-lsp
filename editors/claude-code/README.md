@@ -9,7 +9,10 @@ server over LSP.
 
 This plugin is **configuration only**. It tells Claude Code how to talk to
 `perl-lsp`; it does **not** download or run anything on its own. Install the
-binary yourself first so it's on your `PATH`:
+binary yourself first so it's on your `PATH`. Either download a prebuilt binary
+for your platform (macOS, Linux, Windows) from the
+[releases page](https://github.com/tree-sitter-perl/perl-tree-sitter-lsp/releases)
+and put `perl-lsp` on your `PATH`, or build from source with a Rust toolchain:
 
 ```bash
 cargo install perl-lsp
