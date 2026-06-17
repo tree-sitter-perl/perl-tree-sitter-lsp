@@ -14,7 +14,7 @@ jobs:
     name: Rust tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -30,7 +30,7 @@ jobs:
     name: E2E tests (headless nvim)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -52,7 +52,7 @@ jobs:
     name: Gold corpus
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -70,7 +70,7 @@ jobs:
       # Reproducible, version-pinned module tree. Cache keyed on the snapshot so
       # a cold install (~30s) only runs when the pinned set changes.
       - name: Cache corpus substrate
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: gold-corpus/local
           key: gold-corpus-${{ runner.os }}-perl5.38-${{ hashFiles('gold-corpus/cpanfile.snapshot') }}

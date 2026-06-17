@@ -15,7 +15,7 @@ jobs:
     name: Gold corpus
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -30,7 +30,7 @@ jobs:
           install-modules-with: cpm
 
       - name: Cache corpus substrate
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: gold-corpus/local
           key: gold-corpus-${{ runner.os }}-perl5.38-${{ hashFiles('gold-corpus/cpanfile.snapshot') }}
@@ -52,7 +52,7 @@ jobs:
     needs: gold-corpus
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -84,7 +84,7 @@ jobs:
     needs: publish-crate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract CHANGELOG section for this tag
         run: |
@@ -100,7 +100,7 @@ jobs:
           fi
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: RELEASE_NOTES.md
           generate_release_notes: true
@@ -127,7 +127,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -153,7 +153,7 @@ jobs:
           cd ../../..
 
       - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: perl-lsp-${{ matrix.target }}.${{ matrix.archive }}
 
@@ -173,11 +173,11 @@ jobs:
       run:
         working-directory: editors/vscode
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version-file: editors/vscode/.node-version
+          node-version: '24'
 
       # package.json must match the tag. extension.ts's VERSION names the
       # server release whose binaries it downloads — it may lag the extension
@@ -198,7 +198,7 @@ jobs:
               { echo "ERROR: extension.ts VERSION ($TS_VERSION) has no GitHub release"; exit 1; }
           fi
 
-      - uses: azure/login@v2
+      - uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
