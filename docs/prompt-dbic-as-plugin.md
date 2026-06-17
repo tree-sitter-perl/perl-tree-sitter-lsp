@@ -11,12 +11,18 @@ synthesis out. Only phase 3 below still touches the axis question.
 
 ## Phase ladder
 
-1. **Accessor/relationship synthesis → `frameworks/dbic.rhai`.** Move
-   the `visit_dbic_add_columns` / `visit_dbic_relationship` family the
-   way moo.rhai took the accessor-option vocabulary: core walks the
-   call into decision-ready context (rule #1), the plugin owns
-   keyword → method-name + typed-return rules. `load_components`
-   parent registration stays core (it's generic parent machinery).
+1. **Accessor/relationship synthesis → `frameworks/dbic.rhai`.** ✅
+   LANDED. The `visit_dbic_*` family is gone; `frameworks/dbic.rhai`
+   (trigger `ClassIsa("DBIx::Class")`) synthesizes column accessors +
+   HashKeyDefs and relationship accessors (typed return: ResultSet for
+   has_many/many_to_many, row class for belongs_to/has_one/might_have).
+   The decision-ready context is the generic `CallContext.arg_names`
+   (the call's args as a flat `(name, span)` string list via the shared
+   `cst::string_list`), populated only for verbs a plugin registers via
+   the `arg_name_verbs()` manifest — core hardcodes no DSL verb. moo was
+   moved onto the same registration gate. `load_components` parent
+   registration stays core (generic parent machinery). Custom-resultset
+   discovery + per-column `data_type` typing are deferred to phase 3.
 2. **Meta-method suppression → manifest.** The DBIC entries in
    `symbols.rs`' `universal_methods` (comment-flagged debt) become a
    plugin manifest field; core's diagnostic consults the registry.
