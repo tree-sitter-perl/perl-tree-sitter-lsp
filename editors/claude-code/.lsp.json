@@ -1,0 +1,11 @@
+{
+  "perl": {
+    "command": "perl-lsp",
+    "extensionToLanguage": {
+      ".pl": "perl",
+      ".pm": "perl",
+      ".t": "perl"
+    },
+    "diagnostics": true
+  }
+}
