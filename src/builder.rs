@@ -2415,7 +2415,31 @@ impl<'a> Builder<'a> {
                 let name = func.utf8_text(self.source).ok()?;
                 let bare = bare_name(name);
                 let arg_count = self.extract_call_args(node).len() as u32;
-                self.bag_query_named_sub(bare, Some(arg_count))
+                if let Some(t) = self.bag_query_named_sub(bare, Some(arg_count)) {
+                    return Some(t);
+                }
+                // Parity with the method form: a function imported from a
+                // class resolves its return like the remote class method it
+                // aliases. Mojo::Lite re-exports `get`/`under`/`any`/… as
+                // functions that each call the same-named
+                // `Mojolicious::Routes::Route` method, so `under('/x')` must
+                // type as Route just like `$r->under('/x')` — otherwise the
+                // route value never brands and a downstream partial
+                // `->to('#action')` loses the inherited controller. The
+                // import map pins the class; the override lives on
+                // `MethodOnClass{class, verb}` (see `apply_type_overrides`),
+                // resolvable at build time even when the class isn't indexed.
+                // Only reached when no local/cross-file sub return was found,
+                // so this strictly adds answers (None → maybe Some).
+                let class = self.resolve_call_package(name)?;
+                self.bag_query_attachment_with(
+                    &crate::witnesses::WitnessAttachment::MethodOnClass {
+                        class,
+                        name: bare.to_string(),
+                    },
+                    Some(arg_count),
+                    None,
+                )
             }
             _ => None,
         }
