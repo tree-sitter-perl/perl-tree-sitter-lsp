@@ -43,25 +43,92 @@ name at `->name(…)` chain links, plus `MethodCallRef`s at `url_for` /
 ### Stash intelligence
 
 ```perl
-$c->stash(users => $list, title => 'Users');
-$c->render(template => 'users/list', count => 5);
-$c->stash('users');           # read
-$c->stash->{count};           # read
+# app / startup (route declarations)
+$r->under('/admin')->to('users#', layout => 'admin');   # inherited default
+$r->get('/list')->to('#list', title => 'Users');        # + local default
+
+# Users.pm (controller body)
+sub list {
+  my $c = shift;
+  $c->render(template => 'users/list', count => 5);      # render also stashes
+  $c->stash('layout');        # read  — should complete: layout, title, count
+  $c->stash->{title};         # read  — same key set
+}
 ```
 
-Need: stash-key registry per controller / action. Completion inside
-`$c->stash('…')` and `$c->stash->{…}`. Detection covers `stash(k=>v)`,
-fat-comma pairs in `render(k=>v)` after known render options, fat-comma
-pairs in `->to('c#a', k=>v)` route defaults.
+Goal: completion / hover / goto-def on stash keys at `$c->stash('…')`,
+`$c->stash->{…}`, and the `render(k=>v)` tail.
 
-`BrandedRoute` already carries an arbitrary `stash: Vec<(String,
-String)>` through `under`/`->to` chains (`adr/route-branding.md`) — a
-hover/completion surfacing the in-force inherited stash keys at a
-descendant route is the read side waiting for a consumer.
+**Decision — stash keys belong to the brand and land per-action.**
+Not per-controller (`HashKeyOwner::Class(controller)` over-broadens: two
+actions in one controller reached through different `under` branches have
+different in-force stash, e.g. `users#list` under `/admin` sees `layout`
+but `users#show` does not). The authoritative "what stash is in force
+here" is the accumulated `BrandedRoute.stash` (`adr/route-branding.md`) at
+the route value that targets the action — so the key set is per-action,
+sourced from the brand.
 
-Plugin shape: emit `HashKeyDef` with `HashKeyOwner::Class` tagged to the
-controller (or eventually `MojoAction` namespace once phase 1 of the
-unification residual lands).
+**Sources of keys (emission, route-declaration side):**
+- `->to('c#a', k => v)` and `->to(controller => …, action => …, k => v)`
+  route defaults. The brand already accumulates these — at each *terminal*
+  `->to` (one that names an action), the in-force `stash` (inherited
+  overlay + local) is that action's default set. We read the pairs with
+  the shared `classified_pairs` + `value_shape` now that the `to` work
+  landed; the keys we want are exactly the non-`controller`/`action` ones
+  `merge_to_defaults` already drops into `BrandedRoute.stash`.
+- `render(k => v)` / `stash(k => v)` *inside* the action body — action-
+  LOCAL keys (not inherited via the brand; transient per request). Detect
+  the fat-comma tail after the known render options (`template`/`format`/
+  `status`/`handler`/…). These belong to the same per-action set but are
+  defined at the call site in the controller file, not the route.
+
+So an action's key set is the union of two origins: brand-inherited
+(declared in the app file, flows through `under`/`->to`) and body-local
+(`render`/`stash` in the controller file).
+
+**Identity + the cross-file bridge.** The action is `Controller#action`.
+On the read side, inside `sub action` the identity is
+`<current_package>#<enclosing_sub_name>`, and `current_package` must map
+to the route's controller token through the SAME decamelize + namespace
+resolution goto-def already uses (`mojo-routes` controller resolution) —
+otherwise the body-side `users#list` won't meet the decl-side
+`MyApp::Controller::Users#list`. `route_emissions` already mints a Handler
+named `Controller#action` bridged to `Mojolicious::Controller` and a
+per-package `PluginNamespace`; stash defs ride the same bridge so the
+controller body (another file) finds keys declared in the app file via
+`for_each_entity_bridged_to`.
+
+**Ownership shape — pick one (the fork the old note hand-waved):**
+- (a) new `HashKeyOwner::MojoAction { class, action }` — explicit, lets
+  `HashKeyAccess` on `$c->stash->{k}` resolve through the normal owner
+  path; or
+- (b) a per-action `PluginNamespace` (`mojo-routes:<pkg>#<action>`)
+  holding the keys as entities, consistent with how routes are namespaced
+  today. (a) is better for the `->{k}` deref read (owner-keyed
+  `HashKeyAccess` is the existing machinery); (b) is better for the
+  `stash('…')` string-arg completion (namespace enumeration). They are not
+  exclusive — emit the `HashKeyDef`s with an action owner AND register the
+  namespace bridge for enumeration.
+
+**Read-side consumers (the part actually missing):**
+- `$c->stash('|')` — string-arg completion: a `MojoBranded`/query hook
+  enumerating the current action's key set (brand-inherited ∪ body-local).
+- `$c->stash->{|}` — type `stash()`'s return as a hash whose keys are the
+  action's set (or resolve the `HashKeyAccess` owner to the action), so
+  hash-key completion + goto-def to the defining `->to`/`render` work.
+- hover on an in-force key showing where it was set (which `->to`/`render`).
+
+**Ready vs missing.** Ready: `BrandedRoute.stash` accumulates through all
+chain edges; `classified_pairs`/`value_shape` read the keyvals; the
+`Controller#action` Handler + bridge exist. Missing: (1) emit per-action
+stash `HashKeyDef`s from the brand at terminal `->to` + from body-local
+`render`/`stash`, owned per-action; (2) the controller-token↔package
+identity match on the read side; (3) the two completion/deref consumers.
+
+Out of scope here (same dark edge as branding): an action whose route
+chain roots at an unbranded hashref-param boundary never accumulates a
+brand, so its inherited stash stays empty — body-local `render`/`stash`
+keys still resolve.
 
 ### Hook completion
 
