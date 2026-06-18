@@ -224,6 +224,13 @@ Registered on the engine; available in every plugin without import.
 | `type_class("Foo")` | `InferredType::ClassName("Foo")` |
 | `as_invocant_params(params)` | mark first param as the implicit invocant (drops it from sig help) |
 | `subspan_cols(base, start_delta, end_delta)` | narrow a span to a column range — useful for picking the method-name half of `"Ctrl#action"` |
+| `classified_pairs(args, start)` | pair a flat arg list into `[#{ key, value, key_span, value_span, value_content_span }, …]` from `args[start]` on (separator-agnostic); each `value` is a `value_shape`. `start` skips a leading positional head (route target / attr name) |
+
+Each `ctx.args[i]` also carries `value_shape` — the arg classified one
+level deep as `#{ Str }` / `#{ Num }` / `#{ HashPairs }` / `#{ ArrayItems }`
+/ `#{ Other }`. Branch on it for argument-shape-polymorphic slots (a value
+written as a hashref vs arrayref vs string vs pair list); `()` on a variant
+that doesn't match.
 
 ## CLI authoring tools
 

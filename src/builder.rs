@@ -2440,19 +2440,15 @@ impl<'a> Builder<'a> {
                 if let Some(t) = self.bag_query_named_sub(bare, Some(arg_count)) {
                     return Some(t);
                 }
-                // Parity with the method form: a function imported from a
-                // class resolves its return like the remote class method it
-                // aliases. Mojo::Lite re-exports `get`/`under`/`any`/… as
-                // functions that each call the same-named
-                // `Mojolicious::Routes::Route` method, so `under('/x')` must
-                // type as Route just like `$r->under('/x')` — otherwise the
-                // route value never brands and a downstream partial
-                // `->to('#action')` loses the inherited controller. The
-                // import map pins the class; the override lives on
-                // `MethodOnClass{class, verb}` (see `apply_type_overrides`),
-                // resolvable at build time even when the class isn't indexed.
-                // Only reached when no local/cross-file sub return was found,
-                // so this strictly adds answers (None → maybe Some).
+                // Parity with the method form: an imported function resolves
+                // its return like the remote class method it aliases, so a
+                // Mojo::Lite `under('/x')` (which calls
+                // `Mojolicious::Routes::Route::under`) types as Route just like
+                // `$r->under('/x')` — else the route value never brands and a
+                // partial `->to('#action')` downstream loses its inherited
+                // controller. Import map pins the class; the override lives on
+                // `MethodOnClass{class, verb}`. Only reached on a local/cross-
+                // file miss, so it strictly adds answers (None → maybe Some).
                 let class = self.resolve_call_package(name)?;
                 self.bag_query_attachment_with(
                     &crate::witnesses::WitnessAttachment::MethodOnClass {
@@ -9546,11 +9542,11 @@ impl<'a> Builder<'a> {
         if attr_names.is_empty() { return None; }
 
         // Scan the option tail for `isa` — the one Moo-semantic field core
-        // still resolves to an `InferredType` (roadmap: move onto the
-        // type_constraint seam). The plugin reads the full option set itself
-        // via the shared `classified_pairs` over the flattened args; core no
-        // longer pre-pairs. `saw_option` preserves the old gate: no options →
-        // no `has_options` (a bare `has 'x'` is all native getter).
+        // resolves to an `InferredType` (roadmap: move onto the
+        // type_constraint seam). The plugin reads the full option set via the
+        // shared `classified_pairs` over the flattened args. `saw_option`
+        // gates the result: no options → no `has_options` (a bare `has 'x'`
+        // is all native getter).
         let mut isa_value: Option<String> = None;
         let mut isa_value_node: Option<Node<'a>> = None;
         let mut saw_option = false;

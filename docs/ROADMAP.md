@@ -33,11 +33,14 @@ Type intelligence:
   file) — the `MethodOnClass` bridge pattern.
 
 Plugin genericity:
-- `has_options` final dissolution: move the `isa`-string→`InferredType`
-  mapping out of core (it's the last Moo-semantic field there) onto the
-  `type_constraint_names()` / `type_constraint_inner()` plugin seam.
-  Once it lands, `HasOptions` collapses into `arg_names` + `arg_pairs`
-  (the generic keyval primitive that already carries the options).
+- `has_options` final dissolution: the option pairing already moved out
+  of core — the plugin reads accessor options via the shared
+  `classified_pairs` over the flattened, per-arg `value_shape`-classified
+  args. The one Moo-semantic field still in core is the
+  `isa`-string→`InferredType` mapping; moving it onto the
+  `type_constraint_names()` / `type_constraint_inner()` plugin seam is the
+  last step, after which `HasOptions` dissolves entirely (attr names come
+  from `value_shape`/`arg_names`, options from `classified_pairs`).
 
 Hardening:
 - Fold safety net: `eprintln!` → `tracing::error!` (builder.rs
