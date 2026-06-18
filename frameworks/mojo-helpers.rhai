@@ -177,7 +177,12 @@ fn helper_emissions(ctx, name, params, name_span, ret_edge) {
         out += #{
             Method: #{
                 name: name,
-                span: name_span,
+                // Extent spans the whole `helper(name => sub {…})` call so
+                // the outline node encloses the callback body — that's what
+                // lets editor sticky-scroll / breadcrumb pin the helper while
+                // the cursor is inside it. `selection_span` stays the name so
+                // goto-def / highlight anchor precisely.
+                span: ctx.call_span,
                 selection_span: name_span,
                 params: params,
                 is_method: true,
@@ -284,7 +289,9 @@ fn helper_emissions(ctx, name, params, name_span, ret_edge) {
     out += #{
         Method: #{
             name: leaf,
-            span: name_span,
+            // Body-enclosing extent for sticky-scroll / breadcrumb (see the
+            // single-segment helper above); name stays the goto anchor.
+            span: ctx.call_span,
             selection_span: name_span,
             params: params,
             is_method: true,

@@ -102,7 +102,10 @@ fn on_method_call(ctx) {
                 owner: ev.owner,
                 dispatchers: ["emit"],
                 params: params,
-                span: ev.name_span,
+                // Extent covers the whole `on(name => sub {…})` so the outline
+                // node encloses the handler body — editor sticky-scroll /
+                // breadcrumb pin the event while the cursor is inside it.
+                span: ctx.call_span,
                 selection_span: ev.name_span,
             }
         };

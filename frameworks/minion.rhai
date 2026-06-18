@@ -200,7 +200,10 @@ fn on_method_call(ctx) {
                     "foreground",
                 ],
                 params: params,
-                span: task.name_span,
+                // Extent covers the whole `add_task(name => sub {…})` so the
+                // outline node encloses the task body — editor sticky-scroll /
+                // breadcrumb pin the task while the cursor is inside it.
+                span: ctx.call_span,
                 selection_span: task.name_span,
                 // Tasks render as Function, not Event — you don't
                 // subscribe to them, you enqueue calls. Matches how

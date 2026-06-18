@@ -915,6 +915,45 @@ sub three {}
     );
 }
 
+/// A Mojo helper registered inside `startup` nests under it AND its outline
+/// extent encloses the callback body — the LSP containment the editor's
+/// sticky-scroll / breadcrumb rely on to pin the helper while the cursor is
+/// in its body. `selection_span` stays the name so goto-def anchors precisely.
+#[test]
+fn mojo_helper_outline_extent_covers_callback_body() {
+    let src = "\
+package MyApp;
+use Mojo::Base 'Mojolicious', -signatures;
+sub startup ($self) {
+  $self->helper(format_money => sub ($c, $cents) {
+    my $dollars = $cents / 100;
+    return sprintf '$%.2f', $dollars;
+  });
+}
+1;
+";
+    let fa = build_fa_from_source(src);
+    let outline = fa.document_symbols();
+    let myapp = outline.iter().find(|s| s.name == "MyApp").expect("MyApp container");
+    let startup = myapp
+        .children
+        .iter()
+        .find(|s| s.name == "startup")
+        .expect("startup nested under MyApp");
+    let helper = startup
+        .children
+        .iter()
+        .find(|s| s.name.contains("format_money"))
+        .expect("helper nested under startup");
+    // Name line is L3; the callback body runs through L5.
+    assert_eq!(helper.selection_span.start.row, 3, "selection anchors the name");
+    assert!(
+        helper.span.end.row >= 5,
+        "outline extent must enclose the callback body, got end {:?}",
+        helper.span.end,
+    );
+}
+
 /// #61: goto-def on the module name in `use Foo::Bar;` must resolve as a
 /// package reference (→ external `.pm`), not fall back to the use statement's
 /// own Module symbol (the self-reference bug). The builder emits a PackageRef

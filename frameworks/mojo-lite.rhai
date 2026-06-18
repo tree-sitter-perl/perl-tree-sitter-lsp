@@ -286,7 +286,11 @@ fn on_function_call(ctx) {
             owner: #{ Class: "Mojolicious::Controller" },
             dispatchers: ["url_for", "redirect_to"],
             params: params,
-            span: args[0].span,
+            // Extent covers the whole `get '/path' => sub {…}` so the outline
+            // node encloses the route body — editor sticky-scroll / breadcrumb
+            // pin the route while the cursor is inside it. Selection stays the
+            // path string for a precise goto anchor.
+            span: ctx.call_span,
             selection_span: args[0].span,
             display: "Route",
             hide_in_outline: false,
