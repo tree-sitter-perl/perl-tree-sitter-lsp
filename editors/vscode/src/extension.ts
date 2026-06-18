@@ -85,7 +85,8 @@ async function ensureBinary(
 }
 
 const PLATFORM_MAP: Record<string, string> = {
-  "linux-x64": "perl-lsp-x86_64-unknown-linux-gnu.tar.gz",
+  "linux-x64": "perl-lsp-x86_64-unknown-linux-musl.tar.gz",
+  "linux-arm64": "perl-lsp-aarch64-unknown-linux-musl.tar.gz",
   "darwin-x64": "perl-lsp-x86_64-apple-darwin.tar.gz",
   "darwin-arm64": "perl-lsp-aarch64-apple-darwin.tar.gz",
   "win32-x64": "perl-lsp-x86_64-pc-windows-msvc.zip",
