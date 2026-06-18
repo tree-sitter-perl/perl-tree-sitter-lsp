@@ -111,8 +111,15 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # Linux ships fully-static musl binaries (no glibc dependency → runs on
+          # any distro, Alpine, scratch containers). aarch64 builds natively on
+          # GitHub's arm runner, so the bundled C deps (SQLite, zstd, grammars)
+          # need no cross toolchain — just musl-gcc from musl-tools.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
             archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -120,9 +127,12 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+          # crt-static folds the VC runtime into the .exe so it doesn't depend
+          # on vcruntime140.dll being present (UCRT itself ships with Win10+).
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
+            rustflags: "-C target-feature=+crt-static"
 
     runs-on: ${{ matrix.os }}
 
@@ -135,8 +145,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'

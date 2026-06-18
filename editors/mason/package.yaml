@@ -13,7 +13,10 @@ source:
   id: pkg:github/tree-sitter-perl/perl-tree-sitter-lsp@{{ version }}
   asset:
     - target: linux_x64
-      file: perl-lsp-x86_64-unknown-linux-gnu.tar.gz
+      file: perl-lsp-x86_64-unknown-linux-musl.tar.gz
+      bin: perl-lsp
+    - target: linux_arm64
+      file: perl-lsp-aarch64-unknown-linux-musl.tar.gz
       bin: perl-lsp
     - target: darwin_x64
       file: perl-lsp-x86_64-apple-darwin.tar.gz
