@@ -6,6 +6,35 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+## v0.5.0 — 2026-06-18
+
+### Mojolicious
+
+- Multi-arg `->to(...)` route targets resolve — goto-def / references / hover
+  land on the action even with trailing stash key/value pairs, and when the
+  action is supplied as a keyval (`->to('Ctrl#', action => 'x')`).
+- Route values from Mojolicious::Lite *function* verbs (`under` / `get` /
+  `any`) now brand the same way the `$r->under(...)` method form does, so a
+  partial `->to('#action')` on a downstream route variable resolves.
+
+### Outline
+
+- Mojo helpers, Minion tasks, Mojo::EventEmitter handlers, and Lite routes pin
+  in editor sticky-scroll and breadcrumbs while the cursor is inside their
+  body (the outline extent now encloses the callback).
+
+### Plugin authoring (`.perl-lsp` / `perl-gen`)
+
+- New per-arg `value_shape` classification and a shared `classified_pairs`
+  host fn for keyval / argument-shape-polymorphic verbs. Arg lists reach
+  plugins fully flattened.
+- `CallContext.arg_pairs` is removed (breaking for external plugins that read
+  it) — pair the args with `classified_pairs` over `value_shape` instead.
+
+### Distribution
+
+- Static binaries: Linux musl (x86_64 + aarch64) and static-CRT Windows.
+
 ## v0.4.2 — 2026-06-17
 
 The crate and the VS Code extension are republished together at this version.
