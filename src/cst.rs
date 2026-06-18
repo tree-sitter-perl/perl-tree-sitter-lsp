@@ -177,19 +177,21 @@ pub(crate) fn call_args<'a>(call_node: Node<'a>) -> Vec<Node<'a>> {
     }
 }
 
-/// Flatten a pair-list container's children into one token stream,
-/// descending tree-sitter-perl's right-associative nesting: `a => 1, b => 2`
-/// parses as `a, =>, 1, (b, =>, 2)` — the tail pairs hide inside a nested
-/// `list_expression`. The nested list's children are spliced inline so a
-/// single linear scan sees every pair. A `list_expression` that is itself a
-/// *value* (`key => (a, b)`) only nests when it's the last child, so
-/// descending the trailing wrapper is safe — a non-trailing list is a
-/// genuine multi-element value and is kept whole.
+/// Flatten a pair-list container's children into one token stream, splicing
+/// EVERY nested `list_expression` / `parenthesized_expression` inline.
+/// `a => 1, b => 2` parses with its tail pairs tucked into a right-associative
+/// trailing `list_expression`, and explicit parens (`a => (b => c)`) add more
+/// nesting — but both constructs are pure *grouping* in Perl: a bare list
+/// always flattens into its surroundings (`key => (a, b)` IS `key, a, b`; the
+/// grouped-value spelling is the ref `[a, b]`). So we descend them wherever
+/// they appear, not just trailing, yielding the flat sibling sequence a
+/// single linear scan can pair over. Ref literals (`[...]`, `{...}`) are NOT
+/// groups and stay whole.
 pub(crate) fn flatten_list<'a>(list: Node<'a>, out: &mut Vec<Node<'a>>) {
     let count = list.child_count();
     for i in 0..count {
         let Some(child) = list.child(i) else { continue };
-        if child.kind() == "list_expression" && i + 1 == count {
+        if matches!(child.kind(), "list_expression" | "parenthesized_expression") {
             flatten_list(child, out);
         } else {
             out.push(child);

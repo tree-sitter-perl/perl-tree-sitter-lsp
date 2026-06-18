@@ -126,6 +126,48 @@ pub fn make_engine() -> Engine {
         },
     );
 
+    // `classified_pairs(args, start)` — THE shared keyval-pairing primitive
+    // over a flat `ctx.args`. Pairs `args[start]`,`args[start+1]` as
+    // `(key, value)`, stepping by two — separator-agnostic (`k => v` and
+    // `'k', v` walk identically), `start` skips a leading positional head
+    // (a route target / attr name). The key is the even arg's `value_shape`
+    // Str; the value is the odd arg's full classified `value_shape`, so a
+    // caller branches on `p.value.Str` / `p.value.HashPairs` / etc. Lives in
+    // the host (not copied per plugin) so `to`, Moo `has`, and any future
+    // keyval verb share one implementation. Args reach here already peeled
+    // flat (`Builder::flat_call_args`), so the nested `has 'x' => (...)`
+    // form pairs the same as the flat `has 'x', k => v` one.
+    fn arg_map_field(d: &Dynamic, key: &str) -> Dynamic {
+        d.read_lock::<rhai::Map>()
+            .and_then(|m| m.get(key).cloned())
+            .unwrap_or(Dynamic::UNIT)
+    }
+    engine.register_fn("classified_pairs", |args: Array, start: i64| -> Array {
+        let mut out = Array::new();
+        if start < 0 {
+            return out;
+        }
+        let mut i = start as usize;
+        while i + 1 < args.len() {
+            let key = arg_map_field(&arg_map_field(&args[i], "value_shape"), "Str");
+            if let Ok(key) = key.into_string() {
+                let val_arg = &args[i + 1];
+                let mut m = rhai::Map::new();
+                m.insert("key".into(), key.into());
+                m.insert("key_span".into(), arg_map_field(&args[i], "span"));
+                m.insert("value".into(), arg_map_field(val_arg, "value_shape"));
+                m.insert(
+                    "value_content_span".into(),
+                    arg_map_field(val_arg, "content_span"),
+                );
+                m.insert("value_span".into(), arg_map_field(val_arg, "span"));
+                out.push(Dynamic::from_map(m));
+            }
+            i += 2;
+        }
+        out
+    });
+
     engine
 }
 
@@ -806,7 +848,6 @@ mod tests {
             current_package_uses: vec!["Demo".into()],
             has_options: None,
             arg_names: Vec::new(),
-            arg_pairs: Vec::new(),
             receiver_is_package: false,
         };
 
@@ -938,7 +979,6 @@ mod tests {
             current_package_uses: vec![],
             has_options: None,
             arg_names: Vec::new(),
-            arg_pairs: Vec::new(),
             receiver_is_package: false,
         };
 
@@ -1010,7 +1050,6 @@ mod tests {
                 current_package_uses: vec!["DBIx::Class::ResultDDL".into()],
                 has_options: None,
                 arg_names: Vec::new(),
-                arg_pairs: Vec::new(),
                 receiver_is_package: false,
             };
 
@@ -1058,7 +1097,6 @@ mod tests {
             current_package_uses: vec!["DBIx::Class::ResultDDL".into()],
             has_options: None,
             arg_names: Vec::new(),
-            arg_pairs: Vec::new(),
             receiver_is_package: false,
         };
 
@@ -1115,7 +1153,6 @@ mod tests {
             current_package_uses: vec![],
             has_options: None,
             arg_names: Vec::new(),
-            arg_pairs: Vec::new(),
             receiver_is_package: false,
         };
 
@@ -1258,7 +1295,6 @@ mod tests {
             current_package_uses: vec![],
             has_options: None,
             arg_names: Vec::new(),
-            arg_pairs: Vec::new(),
             receiver_is_package: false,
         };
 
@@ -1312,7 +1348,6 @@ mod tests {
             current_package_uses: vec![],
             has_options: None,
             arg_names: Vec::new(),
-            arg_pairs: Vec::new(),
             receiver_is_package: false,
         };
 
@@ -1366,7 +1401,6 @@ mod tests {
             current_package_uses: vec![],
             has_options: None,
             arg_names: Vec::new(),
-            arg_pairs: Vec::new(),
             receiver_is_package: false,
         };
 
@@ -1404,7 +1438,6 @@ mod tests {
             current_package_uses: vec![],
             has_options: None,
             arg_names: Vec::new(),
-            arg_pairs: Vec::new(),
             receiver_is_package: false,
         };
         assert!(plugin.on_function_call(&ctx).is_empty());

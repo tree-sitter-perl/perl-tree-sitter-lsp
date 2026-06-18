@@ -179,12 +179,6 @@ pub struct CallContext {
     /// for verbs a plugin registered via [`FrameworkPlugin::arg_name_verbs`].
     #[serde(default)]
     pub arg_names: Vec<(String, Span)>,
-    /// The call's fat-comma pairs, value-shape classified — the generic
-    /// keyval primitive (see [`ArgPair`]). Populated alongside `arg_names`
-    /// for registered verbs; the moo plugin reads its accessor options
-    /// from here. Empty otherwise.
-    #[serde(default)]
-    pub arg_pairs: Vec<ArgPair>,
     /// True when a method call's receiver is the current package itself
     /// (`__PACKAGE__->m(...)` / `CurrentClass->m(...)`) — a class-level
     /// call. Class-declaration DSLs (`add_columns`, `load_components`)
@@ -195,13 +189,13 @@ pub struct CallContext {
 }
 
 /// A Moo/Moose `has` declaration's non-pair head: the attribute name(s)
-/// and the resolved `isa` type. The accessor *options* ride
-/// [`CallContext::arg_pairs`] generically.
+/// and the resolved `isa` type. The accessor *options* are read by the
+/// plugin itself via the shared `classified_pairs` over the flattened args.
 ///
 /// `isa_type` is the one Moo-semantic field core resolves (`'Str'` →
 /// `String`, `"InstanceOf['X']"` → `InstanceOf`). Moving it onto the
-/// `type_constraint_*` seam — after which this struct dissolves into
-/// `arg_names` + `arg_pairs` — is roadmapped.
+/// `type_constraint_*` seam — after which this struct dissolves entirely —
+/// is roadmapped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HasOptions {
     /// `(attribute_name, name_token_span)` — one per attr (`has [qw/a b/]`
@@ -213,19 +207,6 @@ pub struct HasOptions {
     /// return to the remote method on that class.
     #[serde(default)]
     pub isa_type: Option<InferredType>,
-}
-
-/// One fat-comma pair of a call's argument list, value-shape classified —
-/// the generic keyval primitive. `key` is the autoquoted/string LHS; the
-/// builder walks the value node (rule #1) into a [`ValueShape`] so the
-/// plugin reads its meaning without touching the tree. Separator-agnostic
-/// (the LHS is a key whether written `k => v` or `'k', v`). Populated for
-/// the verbs a plugin registers (`arg_name_verbs`); see `frameworks/moo.rhai`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArgPair {
-    pub key: String,
-    pub key_span: Span,
-    pub value: ValueShape,
 }
 
 /// The classified shape of a fat-comma pair's value — generic, no DSL
@@ -887,10 +868,10 @@ pub trait FrameworkPlugin: Send + Sync {
     }
 
     /// Call verbs (method or function names) whose args this plugin wants
-    /// pre-flattened into `CallContext::arg_names` / `arg_pairs`. Core runs
-    /// the `cst::string_list` extraction only for verbs an applicable
-    /// plugin registered, so no DSL verb is hardcoded in core (rule #10).
-    /// Default empty. See `frameworks/dbic.rhai`.
+    /// pre-flattened into `CallContext::arg_names` (and, for `has`/`option`,
+    /// `has_options` resolved). Core runs the `cst::string_list` extraction
+    /// only for verbs an applicable plugin registered, so no DSL verb is
+    /// hardcoded in core (rule #10). Default empty. See `frameworks/dbic.rhai`.
     fn arg_name_verbs(&self) -> &[String] {
         &[]
     }

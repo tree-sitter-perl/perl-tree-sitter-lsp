@@ -1884,6 +1884,26 @@ impl<'a> Builder<'a> {
         crate::cst::call_args(call_node)
     }
 
+    /// The FLAT positional arg sequence plugins see — all grouping peeled.
+    /// `has 'x' => (is => 'ro')`, `has 'x', is => 'ro'`, and the lisp-y
+    /// `has(('x' => (is => ('ro'))))` are the same keyval sequence; only the
+    /// parenthesization differs, and `list_expression`/`parenthesized_expression`
+    /// are pure grouping in Perl. Delegates the recursive splice to the one
+    /// `cst::flatten_list` primitive (shared with hash/array literals and
+    /// pair walking); a non-group arg passes through whole. Plugin-facing
+    /// view ONLY — arity stays on the un-peeled `extract_call_args`.
+    fn flat_call_args(&self, args_raw: Vec<Node<'a>>) -> Vec<Node<'a>> {
+        let mut out = Vec::new();
+        for n in args_raw {
+            if matches!(n.kind(), "list_expression" | "parenthesized_expression") {
+                crate::cst::flatten_list(n, &mut out);
+            } else {
+                out.push(n);
+            }
+        }
+        out.into_iter().filter(|n| n.is_named()).collect()
+    }
+
     /// Build an `ArgInfo` for a plugin. Constant-folds literals, barewords,
     /// and `$var` references that accumulate in `constant_strings`. When the
     /// arg is an anonymous sub, also extracts its param list so plugins
@@ -2687,7 +2707,8 @@ impl<'a> Builder<'a> {
         call_span: Span,
         selection_span: Span,
     ) -> plugin::CallContext {
-        let args: Vec<plugin::ArgInfo> = args_raw.iter().map(|n| self.arg_info_for(*n)).collect();
+        let args_flat = self.flat_call_args(args_raw);
+        let args: Vec<plugin::ArgInfo> = args_flat.iter().map(|n| self.arg_info_for(*n)).collect();
         let parents = self.current_package.as_ref()
             .map(|p| self.transitive_parents(p))
             .unwrap_or_default();
@@ -2711,7 +2732,6 @@ impl<'a> Builder<'a> {
             current_package_uses: uses,
             has_options: None,
             arg_names: Vec::new(),
-            arg_pairs: Vec::new(),
             receiver_is_package: false,
         }
     }
@@ -7569,15 +7589,15 @@ impl<'a> Builder<'a> {
                         ctx.arg_names = self.extract_arg_name_list(node
                             .child_by_field_name("arguments")
                             .unwrap_or(node));
-                        // Moo/Moose `has`/`option`: options ride `arg_pairs`;
-                        // `has_options` carries only the non-pair head (attr
-                        // names + isa). Scoped by framework mode.
+                        // Moo/Moose `has`/`option`: `has_options` carries the
+                        // non-pair head (attr names + resolved isa). The plugin
+                        // pairs the option tail itself via `classified_pairs`
+                        // over the flattened args. Scoped by framework mode.
                         if let Some(mode) = self.current_package.as_ref()
                             .and_then(|pkg| self.framework_modes.get(pkg).copied())
                         {
-                            if let Some((opts, pairs)) = self.extract_has_options(node, mode) {
+                            if let Some(opts) = self.extract_has_options(node, mode) {
                                 ctx.has_options = Some(opts);
-                                ctx.arg_pairs = pairs;
                             }
                         }
                     }
@@ -9474,16 +9494,17 @@ impl<'a> Builder<'a> {
 
     /// Walk a `has` call into its non-pair head — the `HasOptions` the moo
     /// plugin reads (attr name(s) + resolved `isa` type). The accessor
-    /// options are the generic `arg_pairs` the caller sets alongside. Core
-    /// owns the node walk (rule #1); the plugin owns the keyword vocabulary.
-    /// `isa` is the one type-semantic field core still resolves (roadmapped
-    /// to move out); the default accessor / isa / constructor-key synthesis
-    /// stays native in `visit_has_call`.
+    /// options are read by the plugin itself via `classified_pairs` over the
+    /// flattened args; core only resolves `isa` here. Core owns the node walk
+    /// (rule #1); the plugin owns the keyword vocabulary. `isa` is the one
+    /// type-semantic field core still resolves (roadmapped to move out); the
+    /// default accessor / isa / constructor-key synthesis stays native in
+    /// `visit_has_call`.
     fn extract_has_options(
         &mut self,
         node: Node<'a>,
         mode: FrameworkMode,
-    ) -> Option<(plugin::HasOptions, Vec<plugin::ArgPair>)> {
+    ) -> Option<plugin::HasOptions> {
         // Mojo::Base has no accessor-option vocabulary — its `has` is just
         // getter/setter + default value, all native.
         if mode == FrameworkMode::MojoBase {
@@ -9524,26 +9545,28 @@ impl<'a> Builder<'a> {
 
         if attr_names.is_empty() { return None; }
 
-        // Option tail → generic classified pairs. `isa` rides the pairs like
-        // any other keyword (the plugin ignores keywords it doesn't act on)
-        // AND is captured here for the type resolution core still owns.
-        let mut arg_pairs: Vec<plugin::ArgPair> = Vec::new();
+        // Scan the option tail for `isa` — the one Moo-semantic field core
+        // still resolves to an `InferredType` (roadmap: move onto the
+        // type_constraint seam). The plugin reads the full option set itself
+        // via the shared `classified_pairs` over the flattened args; core no
+        // longer pre-pairs. `saw_option` preserves the old gate: no options →
+        // no `has_options` (a bare `has 'x'` is all native getter).
         let mut isa_value: Option<String> = None;
         let mut isa_value_node: Option<Node<'a>> = None;
+        let mut saw_option = false;
         if let Some(first) = first_named_idx {
             let rest = &args_children[first + 1..];
             for (k_node, v_node) in self.has_option_pair_nodes(rest) {
                 let Some(key) = self.extract_node_string(k_node) else { continue };
+                saw_option = true;
                 if key == "isa" {
                     if isa_value.is_none() { isa_value = self.extract_node_string(v_node); }
                     if isa_value_node.is_none() { isa_value_node = Some(v_node); }
                 }
-                let value = self.classify_value_shape(v_node);
-                arg_pairs.push(plugin::ArgPair { key, key_span: node_to_span(k_node), value });
             }
         }
 
-        if arg_pairs.is_empty() { return None; }
+        if !saw_option { return None; }
 
         let isa_type = isa_value
             .as_deref()
@@ -9554,7 +9577,7 @@ impl<'a> Builder<'a> {
                 self.bag_query_expr_span(node_to_span(n))?.constrained_inner().cloned()
             });
 
-        Some((plugin::HasOptions { attr_names, isa_type }, arg_pairs))
+        Some(plugin::HasOptions { attr_names, isa_type })
     }
 
     /// Collect a call's option-tail fat-comma pairs as `(key_node, value_node)`,

@@ -12,11 +12,13 @@
 //                       a class, the delegated method's return edges to the
 //                       remote method on that class
 //
-// The core walks the `has` CST and hands this plugin every fat-comma option
-// as a value-shape-classified `ctx.arg_pairs` entry (rule #1 — only the
-// builder touches tree-sitter; no keyword allowlist in core, so a new keyword
-// needs no core edit). What lives HERE is the vocabulary: which keyword maps
-// to which name pattern and return behavior; arms below ignore keywords/shapes
+// Core peels the `has` arg list flat (rule #1 — only the builder touches
+// tree-sitter) and per-arg classifies its `value_shape`; this plugin pairs
+// the option tail with the shared `classified_pairs` host fn (the same
+// primitive `to` uses) and reads each value's shape. No keyword allowlist in
+// core, so a new keyword needs no core edit. What lives HERE is the
+// vocabulary: which keyword maps to which name pattern and return behavior;
+// arms below ignore keywords/shapes
 // they don't act on. The default accessor / isa / constructor-key synthesis is
 // still native in `visit_has_call`; this plugin is the seam beyond it.
 
@@ -34,10 +36,10 @@ fn role_makers() {
     ["Moo::Role", "Moose::Role", "Mouse::Role", "Role::Tiny"]
 }
 
-// The verbs whose args core flattens into `ctx.arg_pairs` (the accessor
-// options) and `has_options` (the attr-name + isa head). Declaring them
-// here keeps core from hardcoding `has`/`option` — the vocabulary lives
-// with the plugin.
+// The verbs core resolves `has_options` (the attr-name + isa head) for, and
+// flattens the arg list of so `classified_pairs` can pair the accessor-option
+// tail. Declaring them here keeps core from hardcoding `has`/`option` — the
+// vocabulary lives with the plugin.
 fn arg_name_verbs() {
     ["has", "option"]
 }
@@ -140,8 +142,10 @@ fn on_function_call(ctx) {
     if opts == () { return out; }
 
     let cls = isa_class(opts.isa_type);
-    // The accessor options are the generic value-shape-classified pairs.
-    let pairs = ctx.arg_pairs;
+    // The accessor options are the keyval tail after the attr-name head
+    // (always one arg — a name or `[qw/…/]`), paired by the shared host fn
+    // over the flattened arg list. Each `opt.value` is a `value_shape`.
+    let pairs = classified_pairs(ctx.args, 1);
 
     for attr_pair in opts.attr_names {
         let attr = attr_pair[0];

@@ -317,33 +317,6 @@ fn decamelize(name) {
     out
 }
 
-// Positional key/value pairing over a flat arg list, reading the generic
-// per-arg `value_shape` core classified one level deep (rule #1 — the
-// plugin never touches the tree). Pairs `args[start]`,`args[start+1]` as
-// `(key, value)`, stepping by two — separator-agnostic, so `k => v` and
-// `'k', v` walk identically. `start` skips a leading positional head (the
-// `'ctrl#act'` target). The value is the FULL classified shape, so a
-// caller that cares about a hashref/arrayref/string value (Mojo's
-// polymorphic `query`/`stash`/route slots) reads `p.value.Str` /
-// `p.value.HashPairs` / `p.value.ArrayItems` and branches.
-fn classified_pairs(args, start) {
-    let pairs = [];
-    let i = start;
-    while i + 1 < args.len() {
-        let key = args[i].value_shape.Str;
-        if key != () {
-            pairs += #{
-                key: key,
-                value: args[i + 1].value_shape,
-                value_content_span: args[i + 1].content_span,
-                value_span: args[i + 1].span,
-            };
-        }
-        i += 2;
-    }
-    pairs
-}
-
 // Pull `controller`/`action` (+ the action's goto-def span) from a route
 // keyval tail. `start` is 1 to skip a leading `'ctrl#act'` target string,
 // 0 for the pure long form — Mojo lets stash pairs follow the target
