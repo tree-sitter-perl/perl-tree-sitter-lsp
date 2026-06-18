@@ -61,6 +61,17 @@ language-servers = ["perl-lsp"]
 (add-to-list 'eglot-server-programs '(perl-mode . ("perl-lsp")))
 ```
 
+### Claude Code
+
+perl-lsp is published to the [Piebald LSP marketplace](https://github.com/Piebald-AI/claude-code-lsps), giving Claude Code real-time Perl intelligence (type inference, navigation, framework awareness). With `perl-lsp` on your `PATH`, add the marketplace and install the plugin:
+
+```
+/plugin marketplace add Piebald-AI/claude-code-lsps
+/plugin install perl-lsp@claude-code-lsps
+```
+
+The server starts automatically when you open a Perl file. The plugin is configuration only — it speaks to the `perl-lsp` you installed above and downloads nothing on its own.
+
 ### Semantic Token Colors (Neovim)
 
 perl-lsp emits rich semantic tokens. Add these to your config for the best experience:
