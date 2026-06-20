@@ -6,6 +6,12 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+## v0.5.1 - 2026-06-20
+
+### Perltidy
+
+- bugfix for a deadlock between perltidy + internal change handling
+
 ## v0.5.0 — 2026-06-18
 
 ### Mojolicious
