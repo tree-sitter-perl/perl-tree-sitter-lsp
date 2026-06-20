@@ -11,7 +11,7 @@ import {
 } from "vscode-languageclient/node";
 
 const REPO = "tree-sitter-perl/perl-tree-sitter-lsp";
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 
 let client: LanguageClient | undefined;
 
