@@ -1684,7 +1684,17 @@ impl ReducerRegistry {
                             WitnessAttachment::Variable { name, scope },
                             Some(ctx),
                         ) => {
-                            let point = scope_point(ctx.scopes, *scope);
+                            // Narrowing point: an edge reached FROM a positioned
+                            // expression (a variable read recorded at `Expr(span)`)
+                            // resolves the slot at the read's own location, so a
+                            // flow-sensitive guard refines it only inside the
+                            // guard's region (docs/prompt-flow-narrowing.md). Other
+                            // edge sources have no read position; the scope end is
+                            // the standing temporal approximation.
+                            let point = match q.attachment {
+                                WitnessAttachment::Expr(span) => span.start,
+                                _ => scope_point(ctx.scopes, *scope),
+                            };
                             self.query_variable_with_visited(
                                 bag, ctx, name, *scope, point, state,
                             )

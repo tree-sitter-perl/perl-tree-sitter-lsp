@@ -181,6 +181,63 @@ sub weak_blessed {
     }
 }
 
+# ── P. Place subjects (v1b) — narrow a slot, not a variable ──
+#    Canonical access path = root + constant projections. The
+#    narrowing region is TRUNCATED at the first op that could
+#    disturb the slot (emit-time invalidation scan).
+
+sub place_block_isa {
+    my ($self) = @_;
+    if ($self->{handler}->isa('Foo')) {
+        $self->{handler}->render;       # NARROW $self->{handler} => Foo
+    }
+    $self->{handler}->render;           # WIDE (past block)
+}
+
+sub place_assert_remainder {
+    my ($self) = @_;
+    return unless ref($self->{cfg}) eq 'HASH';
+    my $port = $self->{cfg}->{port};    # NARROW $self->{cfg} => HashRef
+}
+
+sub place_method_on_value_ok {
+    my ($self) = @_;
+    return unless $self->{db}->isa('Schema');
+    $self->{db}->connect;               # NARROW $self->{db} => Schema
+    $self->{db}->query;                 # NARROW still (method on the VALUE
+                                        # doesn't disturb the slot)
+}
+
+sub place_invalidated_by_prefix_write {
+    my ($self) = @_;
+    return unless $self->{x}->isa('Foo');
+    $self->{x}->step;                   # NARROW $self->{x} => Foo
+    $self->{x} = make_other();          # WRITE to the place → truncates here
+    $self->{x}->step;                   # WIDE (re-widened past the write)
+}
+
+sub place_invalidated_by_opaque_prefix {
+    my ($self) = @_;
+    return unless $self->{x}->isa('Foo');
+    $self->{x}->step;                   # NARROW $self->{x} => Foo
+    $self->reset;                       # opaque op on prefix $self → truncates
+    $self->{x}->step;                   # WIDE (couldn't prove slot survived)
+}
+
+sub place_dynamic_key_no_narrow {
+    my ($self, $k) = @_;
+    return unless $self->{$k}->isa('Foo');
+    $self->{$k}->step;                  # NO-NARROW (dynamic key — not a
+                                        # stable place identity)
+}
+
+sub place_bind_to_lexical_already_works {
+    my ($self) = @_;
+    my $h = $self->{handler};           # v1a escape hatch: bind the slot
+    return unless $h->isa('Foo');
+    $h->render;                         # NARROW $h => Foo (plain Variable)
+}
+
 # ── H. The complement: a function whose return WANTS Optional ─
 #    Today this folds to None (arm disagreement). With Optional<Foo>
 #    it returns Foo|undef, and weak_defined above resolves it.

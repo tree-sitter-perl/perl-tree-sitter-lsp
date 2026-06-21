@@ -15049,3 +15049,139 @@ fn plugin_loads_recorded_trigger_independent_and_multivalue() {
     );
     let _ = SymKind::Sub;
 }
+
+// ── Flow-sensitive narrowing (docs/prompt-flow-narrowing.md) ──
+
+#[test]
+fn narrow_block_if_isa() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    if ($x->isa('Foo')) {\n        $x->go;\n    }\n    $x->go;\n}",
+    );
+    // Inside the then-block: narrowed to Foo.
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 8)),
+        Some(InferredType::ClassName("Foo".into())),
+        "isa guard narrows inside the block",
+    );
+    // After the block: widened back (untyped param → None).
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(6, 4)),
+        None,
+        "narrowing does not leak past the block",
+    );
+}
+
+#[test]
+fn narrow_block_ref_eq_reftype() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    if (ref($x) eq 'HASH') {\n        my $v = $x;\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 16)),
+        Some(InferredType::HashRef),
+        "ref() eq 'HASH' narrows to HashRef",
+    );
+}
+
+#[test]
+fn narrow_early_return_unless() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    return unless $x->isa('Widget');\n    $x->layout;\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 4)),
+        Some(InferredType::ClassName("Widget".into())),
+        "return-unless asserts the type over the remainder",
+    );
+}
+
+#[test]
+fn narrow_logical_or_exit() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    $x->isa('Session') or die;\n    $x->go;\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 4)),
+        Some(InferredType::ClassName("Session".into())),
+        "`G or die` narrows the remainder",
+    );
+}
+
+#[test]
+fn narrow_observed_through_method_dispatch() {
+    // The invocant of `$x->paint` inside the block resolves to Foo, so a
+    // method call dispatches on the narrowed class (the query seam).
+    let fa = build_fa(
+        "package Foo;\nsub paint { my ($self) = @_; }\npackage P;\nsub f {\n    my ($x) = @_;\n    if ($x->isa('Foo')) {\n        $x->paint;\n    }\n}",
+    );
+    let r = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "paint" && matches!(r.kind, RefKind::MethodCall { .. }))
+        .expect("paint method-call ref");
+    assert_eq!(
+        fa.method_call_invocant_class(r, None).as_deref(),
+        Some("Foo"),
+        "narrowed invocant dispatches on Foo",
+    );
+}
+
+#[test]
+fn narrow_negative_else_not_applied() {
+    // The else-branch knows `$x` is NOT Foo — no positive type to assert.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    if ($x->isa('Foo')) {\n        $x->a;\n    } else {\n        $x->b;\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 8)),
+        Some(InferredType::ClassName("Foo".into())),
+        "then-branch still narrows",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(6, 8)),
+        None,
+        "else-branch is not narrowed (negative polarity, deferred)",
+    );
+}
+
+#[test]
+fn narrow_negated_guard_skips_then_block() {
+    // `if (!G) { BODY }` proves NOT-Foo in BODY — negative, so no narrowing.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    if (!$x->isa('Foo')) {\n        $x->a;\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 8)),
+        None,
+        "negated guard does not positively narrow its block",
+    );
+}
+
+#[test]
+fn narrow_truncated_at_reassignment() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    if ($x->isa('Foo')) {\n        $x->before;\n        $x = bar();\n        $x->after;\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 8)),
+        Some(InferredType::ClassName("Foo".into())),
+        "narrowed before the reassignment",
+    );
+    assert_ne!(
+        fa.inferred_type_via_bag("$x", Point::new(6, 8)),
+        Some(InferredType::ClassName("Foo".into())),
+        "reassignment truncates the narrowing region",
+    );
+}
+
+#[test]
+fn narrow_conjunction_intersects() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    if ($x->isa('Foo') && $x->can('m')) {\n        $x->go;\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 8)),
+        Some(InferredType::ClassName("Foo".into())),
+        "&&-chain narrows on the isa conjunct",
+    );
+}

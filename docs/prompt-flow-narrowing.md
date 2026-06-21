@@ -146,7 +146,91 @@ imprecise.
 the *intersection* — emit one narrowing per recognized conjunct
 (`if ($x->isa('Foo') && $x->can('m'))` narrows on the `isa` conjunct,
 ignores `can`). A top-level `||`/`or` chain narrows nothing (neither
-disjunct is guaranteed). v1: walk top-level `&&`, skip `||`.
+disjunct is guaranteed) — intentionally punted, no union to express it.
+
+## Subjects: variables, expressions, places
+
+A guard's subject is one of **three** kinds, and only two have existing
+machinery. The narrowing must compose with both.
+
+| Subject | identity | machinery |
+| --- | --- | --- |
+| `$x` — **variable** | a named slot with a lifetime | flow-sensitive span-scoped witnesses (exists) |
+| `$obj->thing` — **expression** | functional derivation from receiver type | edge chase (exists) |
+| `$self->{x}` — **place** | slot-like identity, *spelled* as an expression | the gap |
+
+**The edge chase structurally cannot narrow.** Point-narrowing is gated
+to `Variable` attachments on purpose (`witnesses.rs:582–589`): Expression
+attachments fold *every* witness with no point filter, because a method
+call's return type doesn't depend on where you ask. That referential
+transparency is the feature for dispatch — and the exact opposite of
+narrowing, whose whole job is that `$self->{x}` is `Foo` *here* and
+`Unknown` *there*. Expressing narrowing as an edge chase is a category
+error: you'd have to break the point-independence that makes the chase
+correct. A **place** is slot-like (narrowable) but spelled as an
+expression (the chase re-derives it functionally on each occurrence,
+ignoring the narrowing) — so it falls between the two mechanisms. That
+gap is the hardness.
+
+**Why variables narrow for free but places don't — soundness.** A
+variable's writes are *syntactically attributable*: `$x = …` names `$x`,
+pushes a later-starting witness, temporal ordering picks the live one. A
+place's writes can hide behind **aliasing**: `$self->reset` or
+`frob($self)` can replace the `{x}` slot without ever naming
+`$self->{x}`. A narrowing that silently survives such a mutation lies.
+
+### v1a — variables · v1b — places (one feature, two flowing increments)
+
+The narrowing soundness lives **entirely on the emit side**, so places
+are *additive*, not a query-path rewrite — provided v1a's seams admit
+them from day one:
+
+- `emit_narrowing` takes a `NarrowSubject { Variable | Place(AccessPath) }`,
+  never a bare `&str` variable.
+- the reducer narrow-filter (`witnesses.rs:590`) reads `Variable | Place`
+  from the start; the narrowest-span / temporal / scoped-exclusion logic
+  is shared — at query time a `Place` witness is *just* a span-scoped
+  slot witness, the reducer needn't know it's a place.
+- the use-site query forms a `NarrowSubject` key generically.
+
+**v1b adds three pieces, zero engine churn:**
+
+1. **Access-path canonicalization (`cst.rs`).** Extend
+   `canonical_container_name` (today single-container, sigil-normalizing)
+   to a multi-hop path: a root (`$self` / `$x`) + projections, where a
+   projection is a *constant* key/index or a *zero-arg pure accessor*
+   (`->{x}`, `->[0]`, `->name`). Dynamic key `$self->{$k}` is not a
+   stable place — no narrowing. Two occurrences of `$self->{x}`
+   canonicalize identically.
+
+2. **Emit-time invalidation truncation — the soundness model.** When
+   emitting a place narrowing over `[guard-end .. block-end]`, scan the
+   region (the builder is already walking it) and truncate the span at
+   the first operation that could disturb the slot:
+   - an assignment to the place or a **proper prefix** (`$self->{x} =`,
+     `$self =`, `%$self =`);
+   - an **opaque op on a prefix** — a method call whose receiver is a
+     prefix (`$self->reset`), or a prefix passed as an argument
+     (`frob($self)`).
+   - **Not** invalidating: reads of the place, or method calls on the
+     place *value* (`$self->{x}->render` mutates the Foo, not the slot).
+
+   The witness carries `[guard-end .. min(block-end, first-invalidation)]`.
+   Static, monotone, computed once. It **under-narrows** (conservative)
+   rather than lies — past anything unprovable the place re-widens via
+   the same scoped-exclusion rule.
+
+3. **One query seam.** At a deref / method-call use site, form the place
+   key for the receiver and check `Place(path)` for a live narrowing
+   *before* the functional chase (`key_value_type` / `MethodOnClass`).
+   Live narrowing wins; else fall through. Additive.
+
+**The escape hatch that already works in v1a:** `my $x = $self->{x};
+return unless $x->isa('Foo'); $x->render` narrows — it's a `Variable`.
+Idiomatic Perl already binds slots to lexicals to avoid re-derefing, so
+much real-world slot-narrowing is captured the moment v1a lands. v1b is
+the "don't force the user to bind first" upgrade, on top of a flowing
+v1a — not the thing that unblocks the idiom.
 
 ## Sum / optional types — the user's question
 
@@ -196,11 +280,13 @@ demands them.
 
 ## Open questions
 
-1. **Non-variable guard subjects** — `ref($self->{x}) eq 'Foo'`,
-   `if ($obj->thing->isa(...))`. The narrowing subject isn't a
-   `Variable` attachment; it needs `Expr(span)`-keyed narrowing (the
-   query path narrows on `Variable` only — `witnesses.rs:590`) or it's
-   the untyped-boundary problem (`open-problems.md`). v1: variables only.
+1. **Place subjects** — `ref($self->{x}) eq 'Foo'`,
+   `$self->{x}->render`. Designed in §"Subjects" as v1b (canonical
+   access paths + emit-time invalidation truncation + one query seam).
+   Not punted — v1a's seams (`NarrowSubject`, the `Variable | Place`
+   filter) admit it additively. A *method-return* subject
+   (`$obj->thing->isa`) with no backing slot stays out — that's the
+   untyped-boundary problem (`open-problems.md`), not a place.
 2. **Loop-condition narrowing** — `while (my $x = shift) { ... }` (defined
    in body). Ties to Optional; defer with it.
 3. **Reassignment inside the region** — sound for free: the reassignment
