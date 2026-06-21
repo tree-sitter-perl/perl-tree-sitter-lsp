@@ -1041,6 +1041,15 @@ impl InferredType {
         }
     }
 
+    /// The wrapped type of an `Optional<T>`, else `None`. The `defined` /
+    /// `blessed` guards strip an optional to its inner via this.
+    pub fn optional_inner(&self) -> Option<&InferredType> {
+        match self {
+            InferredType::Optional(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
     /// `->{key}` narrowing on a structurally-typed hash (rule #10: ask
     /// the value). `Some(Some(t))` = key present with a known value
     /// type; `Some(None)` = key present, value type unknown; `None` =

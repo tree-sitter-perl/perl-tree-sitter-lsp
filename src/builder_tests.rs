@@ -15215,6 +15215,37 @@ fn optional_not_applied_without_undef_arm() {
     );
 }
 
+#[test]
+fn optional_defined_narrows_to_inner() {
+    // maybe() : Optional<Foo>; `defined $r` strips it so $r->go dispatches Foo.
+    let fa = build_fa(
+        "package P;\nsub maybe { return undef unless 1; return Foo->new; }\nsub use_it {\n    my $r = maybe();\n    return unless defined $r;\n    $r->go;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "go").as_deref(), Some("Foo"));
+}
+
+#[test]
+fn optional_blessed_narrows_to_inner() {
+    let fa = build_fa(
+        "package P;\nsub maybe { return undef unless 1; return Foo->new; }\nsub use_it {\n    my $r = maybe();\n    return unless blessed $r;\n    $r->go;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "go").as_deref(), Some("Foo"));
+}
+
+#[test]
+fn optional_without_defined_does_not_dispatch() {
+    // Without the guard, $r stays Optional<Foo>, which dispatches nowhere
+    // (an optional is not definitely an instance).
+    let fa = build_fa(
+        "package P;\nsub maybe { return undef unless 1; return Foo->new; }\nsub use_it {\n    my $r = maybe();\n    $r->go;\n}",
+    );
+    assert_eq!(
+        invocant_class_of(&fa, "go").as_deref(),
+        None,
+        "Optional<Foo> must be narrowed before it can dispatch",
+    );
+}
+
 // ── Place narrowing (v1b): `$self->{x}` ──
 
 /// Class an invocant resolves to for the method-call ref named `method`.

@@ -10,7 +10,7 @@
 use tree_sitter::{Node, Point};
 
 use crate::cst::node_to_span;
-use crate::file_analysis::{InferredType, Span};
+use crate::file_analysis::{InferredType, ScopeId, Span};
 
 use super::{connector_keyword_between, point_lt, raw_leading_op, raw_mid_op, Builder};
 
@@ -31,12 +31,35 @@ fn narrow_subject_of(node: Node, src: &[u8]) -> Option<NarrowSubject> {
     Some(NarrowSubject::Place { key, root })
 }
 
-/// A recognized guard fact: the subject, the type it proves, and whether
-/// the proof holds where the guard *expression* is TRUE (`!` flips it).
+/// What a guard does to the subject's type where it holds.
+pub(super) enum NarrowOp {
+    /// `isa` / `ref…eq` prove a concrete type.
+    To(InferredType),
+    /// `defined` / `blessed` strip `Optional<T>` to `T`. The strip reads
+    /// the subject's incoming type, so it can only run once that type has
+    /// converged (a re-emittable fold pass); `query_point` is the subject's
+    /// location IN THE GUARD — before the narrowed region, so the read
+    /// sees the un-narrowed `Optional`, not the pass's own output.
+    StripOptional { query_point: Point },
+}
+
+/// A recognized guard fact: the subject, what the guard proves, and
+/// whether the proof holds where the guard *expression* is TRUE (`!`
+/// flips it).
 pub(super) struct GuardFact {
     subject: NarrowSubject,
-    narrowed: InferredType,
+    op: NarrowOp,
     asserts_when_true: bool,
+}
+
+/// A pending `defined`/`blessed` narrowing — its `Optional<T> → T` strip
+/// is re-derived each fold iteration once the subject type converges.
+#[derive(Clone)]
+pub(super) struct DefinedNarrowing {
+    name: String,
+    scope: ScopeId,
+    region: Span,
+    query_point: Point,
 }
 
 /// Map a `ref(...) eq STRING` right-hand string to the type it proves.
@@ -121,8 +144,58 @@ fn recognize_guards(cond: Node, source: &[u8]) -> Vec<GuardFact> {
         }
         "method_call_expression" => recognize_isa_guard(cond, source).into_iter().collect(),
         "equality_expression" => recognize_ref_eq_guard(cond, source).into_iter().collect(),
+        "func1op_call_expression" => recognize_defined_guard(cond, source).into_iter().collect(),
+        "ambiguous_function_call_expression" | "function_call_expression" => {
+            recognize_blessed_guard(cond, source).into_iter().collect()
+        }
         _ => Vec::new(),
     }
+}
+
+/// `defined $x` / `defined($x)` → strip `Optional` off the subject.
+fn recognize_defined_guard(call: Node, source: &[u8]) -> Option<GuardFact> {
+    if call.child(0)?.utf8_text(source).ok()? != "defined" {
+        return None;
+    }
+    let arg = func1op_subject_arg(call)?;
+    Some(GuardFact {
+        subject: narrow_subject_of(arg, source)?,
+        op: NarrowOp::StripOptional { query_point: arg.start_position() },
+        asserts_when_true: true,
+    })
+}
+
+/// `blessed $x` / `blessed($x)` → strip `Optional` off the subject (v1
+/// treats `blessed` as `defined`'s strip; the extra "is an object"
+/// precision has no lattice target yet).
+fn recognize_blessed_guard(call: Node, source: &[u8]) -> Option<GuardFact> {
+    let name = call.child_by_field_name("function")?.utf8_text(source).ok()?;
+    if name != "blessed" {
+        return None;
+    }
+    let arg = first_place_or_scalar(call.child_by_field_name("arguments")?)?;
+    Some(GuardFact {
+        subject: narrow_subject_of(arg, source)?,
+        op: NarrowOp::StripOptional { query_point: arg.start_position() },
+        asserts_when_true: true,
+    })
+}
+
+/// First scalar / place-element node at or under `node` — the argument
+/// subject of a `blessed(...)` call.
+fn first_place_or_scalar<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    if matches!(
+        node.kind(),
+        "scalar" | "hash_element_expression" | "array_element_expression"
+    ) {
+        return Some(node);
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(found) = node.named_child(i).and_then(first_place_or_scalar) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// `$x->isa('Foo')` / `$x->DOES('Role')` → narrow `$x` to `ClassName`.
@@ -136,7 +209,7 @@ fn recognize_isa_guard(call: Node, source: &[u8]) -> Option<GuardFact> {
     let class = string_literal_text(call.child_by_field_name("arguments")?, source)?;
     Some(GuardFact {
         subject,
-        narrowed: InferredType::ClassName(class),
+        op: NarrowOp::To(InferredType::ClassName(class)),
         asserts_when_true: true,
     })
 }
@@ -164,7 +237,7 @@ fn recognize_ref_eq_guard(eq: Node, source: &[u8]) -> Option<GuardFact> {
     let ty = ref_string_to_type(&string_literal_text(lit, source)?)?;
     Some(GuardFact {
         subject,
-        narrowed: ty,
+        op: NarrowOp::To(ty),
         asserts_when_true: true,
     })
 }
@@ -298,12 +371,59 @@ impl<'a> Builder<'a> {
         if !point_lt(region.start, end) {
             return; // truncated to nothing
         }
-        self.bag.push(Witness {
-            attachment: WitnessAttachment::Variable { name, scope: self.current_scope() },
-            source: WitnessSource::Builder("narrowing".into()),
-            payload: WitnessPayload::InferredType(fact.narrowed),
-            span: Span { start: region.start, end },
-        });
+        let region = Span { start: region.start, end };
+        let scope = self.current_scope();
+        match fact.op {
+            NarrowOp::To(ty) => {
+                self.bag.push(Witness {
+                    attachment: WitnessAttachment::Variable { name, scope },
+                    source: WitnessSource::Builder("narrowing".into()),
+                    payload: WitnessPayload::InferredType(ty),
+                    span: region,
+                });
+            }
+            // `defined`/`blessed` strip `Optional<T>` to `T`, but the
+            // subject's type may only converge in the fold (a sub return),
+            // so record it and re-derive in `emit_defined_narrowing_witnesses`.
+            NarrowOp::StripOptional { query_point } => {
+                self.defined_narrowings.push(DefinedNarrowing {
+                    name,
+                    scope,
+                    region,
+                    query_point,
+                });
+            }
+        }
+    }
+
+    /// Re-emittable: `defined`/`blessed` narrowing. For each recorded
+    /// guard, read the subject's type at the guard point (BEFORE the
+    /// narrowed region, so this pass's own output is excluded — no
+    /// oscillation) and, if it is `Optional<T>`, narrow the region to `T`.
+    /// Clear-and-emit on tag `defined_narrowing`; converges as the
+    /// subject's (possibly fold-derived) `Optional` settles.
+    pub(super) fn emit_defined_narrowing_witnesses(&mut self) {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+        self.bag.remove_by_source_tag("defined_narrowing");
+        let guards = self.defined_narrowings.clone();
+        let mut emits: Vec<(String, ScopeId, InferredType, Span)> = Vec::new();
+        for g in &guards {
+            if let Some(inner) = self
+                .bag_query_variable(&g.name, g.scope, g.query_point)
+                .as_ref()
+                .and_then(InferredType::optional_inner)
+            {
+                emits.push((g.name.clone(), g.scope, inner.clone(), g.region));
+            }
+        }
+        for (name, scope, inner, region) in emits {
+            self.bag.push(Witness {
+                attachment: WitnessAttachment::Variable { name, scope },
+                source: WitnessSource::Builder("defined_narrowing".into()),
+                payload: WitnessPayload::InferredType(inner),
+                span: region,
+            });
+        }
     }
 
     /// Point of the first operation in `container` (at or after

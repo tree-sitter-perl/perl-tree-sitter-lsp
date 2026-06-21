@@ -88,17 +88,23 @@ green.
 6. `class_name()` untouched (Optional → `None`).
 7. Tests: the target sub; existing arm-fold tests stay green.
 
-**Phase 2 — generalize + light up narrowing:**
-- Route `BranchArmFold` (hand-rolled ternary fold) through the shared
-  join so `$c ? Foo->new : undef` ⇒ `Optional<Foo>` (DRY).
-- `SlotTypeFold` honors Optional (mostly free — undef skips the
-  class-conflict guard, flows into the join).
-- `InferredType::optional_inner()` accessor; wire the **`defined` /
-  `blessed`** guards (today unrecognized) to narrow `Optional<T> → T`.
-  This needs `GuardFact.narrowed` to become a `NarrowOp { To(InferredType),
-  Defined }` enum — `Defined` is a *query* (read the subject's incoming
-  type, strip `Optional`), not a constant type. Emit only when the
-  incoming type is `Optional` (else `defined` is identity).
+**Phase 2 — light up narrowing (LANDED for `defined`/`blessed`):**
+- `InferredType::optional_inner()` accessor; `GuardFact` carries a
+  `NarrowOp { To(InferredType), StripOptional { query_point } }`. The
+  `defined`/`blessed` guards (`func1op_call_expression` /
+  `ambiguous_function_call_expression`) recognize their subject and emit
+  `StripOptional`.
+- Because the subject's `Optional` is often a sub return that only
+  converges in the fold, the strip is a **re-emittable fold pass**
+  (`emit_defined_narrowing_witnesses`, tag `defined_narrowing`): each
+  iteration it reads the subject's type at `query_point` — the guard's
+  own location, BEFORE the narrowed region, so the pass's own output is
+  excluded (no oscillation) — and narrows the region to the inner when
+  it's `Optional`. `blessed` ships as `defined`'s strip (the extra
+  is-an-object precision has no lattice target yet).
+- Still deferred: route `BranchArmFold` (ternary `$c ? Foo->new : undef`)
+  and `SlotTypeFold` through the join so they *produce* Optional from a
+  `{T, undef}` pair (needs the same undef-marker on branch/slot arms).
 
 **Phase 3 — negatives + provenance + Type::Tiny:**
 - Negative-polarity rows (`else` of `if (defined G)`, `return if defined
