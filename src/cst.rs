@@ -296,34 +296,44 @@ pub(crate) fn canonical_container_name<'a>(node: Node<'a>, src: &'a [u8]) -> Opt
     Some(format!("{}{}", target_sigil, bare))
 }
 
-/// Canonical access-path key for a place subject — a single constant
-/// hash/array projection off a plain scalar root (`$self->{handler}`,
-/// `$self->[0]`). Returns `(key, root)`: `key` is the place's source text
-/// (the spelling the guard and the use share, so a witness keyed on it
-/// matches the use-site invocant), `root` the base scalar (for the
-/// flow-narrowing invalidation scan). Dynamic keys, deeper chains, and
-/// accessor projections return `None` — not a stable place identity.
+/// Canonical access-path key for a place subject — a chain of constant
+/// hash/array projections bottoming out at a plain scalar root
+/// (`$self->{handler}`, `$self->{a}{b}`, `$self->[0]`). Returns
+/// `(key, root)`: `key` is the place's source text (the spelling the
+/// guard and the use share, so a witness keyed on it matches the
+/// use-site invocant), `root` the base scalar (for the flow-narrowing
+/// invalidation scan). Dynamic keys and accessor projections return
+/// `None` — not a stable place identity.
 pub(crate) fn canonical_place_path<'a>(
     node: Node<'a>,
     src: &'a [u8],
 ) -> Option<(String, String)> {
-    let (root_node, constant) = match node.kind() {
+    let base = match node.kind() {
         "hash_element_expression" => {
             let key = node.child_by_field_name("key")?;
-            let constant =
-                matches!(key.kind(), "autoquoted_bareword" | "string_literal" | "number");
-            (node.named_child(0)?, constant)
+            if !matches!(key.kind(), "autoquoted_bareword" | "string_literal" | "number") {
+                return None;
+            }
+            node.named_child(0)?
         }
         "array_element_expression" => {
             let index = node.child_by_field_name("index")?;
-            (node.named_child(0)?, index.kind() == "number")
+            if index.kind() != "number" {
+                return None;
+            }
+            node.named_child(0)?
         }
         _ => return None,
     };
-    if !constant || root_node.kind() != "scalar" {
-        return None;
-    }
-    let root = canonical_var_name(root_node, src)?;
+    // The root is a plain scalar, or recurse through a nested constant
+    // projection (`$self->{a}{b}`).
+    let root = match base.kind() {
+        "scalar" => canonical_var_name(base, src)?,
+        "hash_element_expression" | "array_element_expression" => {
+            canonical_place_path(base, src)?.1
+        }
+        _ => return None,
+    };
     let key = node.text(src)?.to_string();
     Some((key, root))
 }

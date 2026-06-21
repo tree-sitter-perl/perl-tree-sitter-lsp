@@ -307,11 +307,13 @@ impl<'a> Builder<'a> {
     }
 
     /// Point of the first operation in `container` (at or after
-    /// `region.start`) that could disturb place `key` rooted at `root`:
-    /// a write to the slot, or any non-place-access use of `root` (a root
-    /// write, a method call on `root`, `root` passed as an argument). A
-    /// place READ keeps `root` as the base of a `->{…}` access, so it
-    /// doesn't trip the root rule. Conservative — it under-narrows.
+    /// `region.start`) that could disturb place `key` rooted at `root`: a
+    /// write to the slot, or an opaque use of any **proper prefix** of the
+    /// place — the root scalar or an intermediate element (`$self->{a}`
+    /// for `$self->{a}{b}`). A prefix is "guarded" (a read, not a
+    /// disturbance) when it is the base of a longer access; otherwise it is
+    /// a write, a method call on the prefix, or the prefix passed as an
+    /// argument. Conservative — it under-narrows.
     fn first_place_invalidation(
         &self,
         key: &str,
@@ -325,7 +327,16 @@ impl<'a> Builder<'a> {
                 *best = Some(p);
             }
         }
+        // `prefix` is a proper prefix of `key` at an access boundary
+        // (`$self` / `$self->{a}` of `$self->{a}{b}`), not a coincidental
+        // string prefix (`$selfish`).
+        fn is_proper_prefix(prefix: &str, key: &str) -> bool {
+            key.len() > prefix.len()
+                && key.starts_with(prefix)
+                && matches!(key.as_bytes()[prefix.len()], b'-' | b'{' | b'[')
+        }
         fn scan(node: Node, key: &str, root: &str, after: Point, src: &[u8], best: &mut Option<Point>) {
+            // Slot rewrite: `$self->{a}{b} = ...`.
             if node.kind() == "assignment_expression" {
                 if let Some(left) = node.child_by_field_name("left") {
                     if crate::cst::canonical_place_path(left, src).map(|(k, _)| k).as_deref()
@@ -335,11 +346,21 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
-            if node.kind() == "scalar"
-                && crate::cst::canonical_var_name(node, src).as_deref() == Some(root)
-            {
-                // Guarded = `root` is the base of a place access (`$self->{…}`),
-                // i.e. a read of some slot — not an opaque use.
+            // Opaque use of a proper prefix: the root scalar, or an
+            // intermediate element (`$self->{a}` of `$self->{a}{b}`). The
+            // exact place is excluded — a read / method call on the slot
+            // value doesn't disturb the slot.
+            let is_prefix = match node.kind() {
+                "scalar" => crate::cst::canonical_var_name(node, src).as_deref() == Some(root),
+                "hash_element_expression" | "array_element_expression" => {
+                    crate::cst::canonical_place_path(node, src)
+                        .is_some_and(|(k, _)| is_proper_prefix(&k, key))
+                }
+                _ => false,
+            };
+            if is_prefix {
+                // Guarded = this prefix is the base of a longer access, i.e.
+                // a read; otherwise it is a write / method call / argument.
                 let guarded = node.parent().map_or(false, |p| {
                     matches!(p.kind(), "hash_element_expression" | "array_element_expression")
                         && p.named_child(0) == Some(node)
