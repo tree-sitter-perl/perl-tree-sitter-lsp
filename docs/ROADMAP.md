@@ -5,17 +5,23 @@ This file is only what's NEXT, in order.
 
 ## Now (in order)
 
-1. **Graph walking** — the walker + the whole inheritance axis landed
-   (`adr/graph-walking.md`). The deferred Scope-node taxonomy (Openness
-   diagnostic, `home_namespace`) is forward work in
-   `prompt-graph-walking.md`. **Instance brands** (`$minion`/`$app`
-   instance identity, multi-app Mojo) were spiked and PARKED — they're a
-   consumer of the long-distance value-provenance tier (see Queued), not
-   a standalone feature; rationale + the birth-site design in
-   `prompt-graph-walking.md`.
-2. **DBIC out of core** — ungated; phase ladder in
-   `prompt-dbic-as-plugin.md`. Ends with core plugin-free except
-   generic dispatch.
+1. **Flow-sensitive narrowing** — active workstream; design doc first
+   (none yet). Guard recognition (`$x->isa('Foo')` / `ref($x) eq` /
+   `blessed`) emits span-scoped narrowing witnesses; the existing
+   temporal + narrowest-span query path in `witnesses.rs` is the
+   engine, so "un-narrowing at block exit" reduces to span computation,
+   not witness removal. Open: early-return / postfix-guard spans, and
+   else-branch negative narrowing (the one non-monotone case — likely
+   deferred in v1). Type::Tiny guards land later as
+   `type_constraint_names()` manifest entries — not a blocker (build
+   against native guards first; they're dependency-free).
+2. **DBIC out of core — phases 2–3.** Phase 1 landed (`visit_dbic_*`
+   gone; `frameworks/dbic.rhai`, trigger `ClassIsa("DBIx::Class")`).
+   Remaining: meta-method suppression → manifest (the `universal_methods`
+   rule-#10 debt still hardcoded in `symbols.rs`) and parametric
+   emission + per-method return projection (the one axis-shaped piece).
+   Ladder in `prompt-dbic-as-plugin.md`. Ends with core plugin-free
+   except generic dispatch.
 
 ## Queued (pull-driven — QA findings decide order)
 
@@ -23,14 +29,17 @@ Type intelligence:
 - Residual fact classes Parts 1–5 (invocant mutations, hash-key
   unions, method loops, functional operators, value-indexed returns)
   — `prompt-type-inference-residual.md`.
-- Flow-sensitive narrowing (`$x->isa('Foo')` / `ref($x) eq` /
-  Type::Tiny guards). Needs its own design doc first; the open
-  question is un-narrowing at block exit against monotone witnesses.
 - Conditional-reassignment disagreement-to-widen (`$spec = {...}
   unless ref $spec`) — replaces the `reassigned_scalars` trust-gate
   clause with a real lattice fold.
 - A4 v2: cross-FILE slot writes (`$self->{k} = Obj->new` in another
   file) — the `MethodOnClass` bridge pattern.
+
+Graph / diagnostics (graph-walking pillar landed; residual only):
+- Scope-node taxonomy + Openness diagnostic (`home_namespace`,
+  "when is an unresolved call real?") — forward work in
+  `prompt-graph-walking.md`; subsumes the coarse qualified-name
+  suppression noted in `open-problems.md`.
 
 Plugin genericity:
 - `has_options` final dissolution: the option pairing already moved out
@@ -83,6 +92,13 @@ QA tail:
 
 ## Parked (explicit unblock conditions)
 
+- **Instance brands** — per-object dispatch scoping (`$app->minion`
+  vs `$app->other_minion`, two Mojo::Lite apps in one workspace).
+  Spiked and closed (PRs #65/#66, branches `branded-edges` /
+  `branded-edges-accessor`); MUST NOT be rebuilt the syntactic-name
+  way (rule #10 — aliasing breaks it). A downstream consumer of the
+  long-distance value-provenance tier (`prompt-type-inference-residual.md`
+  Parts 1–5); the birth-site design lives in `prompt-graph-walking.md`.
 - **Re-export chains** — branch `worktree-agent-aae99d42f4d5d74bc`
   (correct in isolation; design in `adr/reexport-surface.md` on the
   branch). Blocked on the ts-parser-perl X1 scanner thread-safety fix
