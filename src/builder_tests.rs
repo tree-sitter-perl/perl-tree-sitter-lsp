@@ -15485,3 +15485,25 @@ fn narrow_place_ref_eq() {
         "ref(place) eq 'HASH' narrows the slot",
     );
 }
+
+#[test]
+fn optional_maybe_isa_scalar() {
+    let fa = build_fa("package P;\nuse Moo;\nhas x => (is => 'ro', isa => 'Maybe[Int]');\n");
+    assert_eq!(
+        fa.sub_return_type_at_arity("x", Some(0)),
+        Some(InferredType::Optional(Box::new(InferredType::Numeric))),
+        "Maybe[Int] accessor returns Optional<Numeric>",
+    );
+}
+
+#[test]
+fn optional_maybe_isa_instance() {
+    let fa = build_fa(
+        "package P;\nuse Moo;\nhas thing => (is => 'ro', isa => 'Maybe[InstanceOf[\"Foo\"]]');\n",
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("thing", Some(0)),
+        Some(InferredType::Optional(Box::new(InferredType::ClassName("Foo".into())))),
+        "Maybe[InstanceOf['Foo']] accessor returns Optional<Foo>",
+    );
+}

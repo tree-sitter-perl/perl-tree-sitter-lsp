@@ -10198,6 +10198,17 @@ impl<'a> Builder<'a> {
             "CodeRef" => Some(InferredType::CodeRef { return_edge: None }),
             "RegexpRef" => Some(InferredType::Regexp),
             _ => {
+                // `Maybe[T]` / `Optional[T]` (Type::Tiny / Types::Standard)
+                // → `Optional<inner>`, recursing on the wrapped constraint.
+                // Checked before the InstanceOf/Moose-class fallbacks so
+                // `Maybe[Int]` doesn't read as a class named "Maybe[Int]".
+                for prefix in ["Maybe[", "Optional["] {
+                    if let Some(inner) = isa.strip_prefix(prefix).and_then(|r| r.strip_suffix(']')) {
+                        return self
+                            .map_isa_to_type(inner.trim(), mode)
+                            .map(|t| InferredType::Optional(Box::new(t)));
+                    }
+                }
                 // InstanceOf['Foo::Bar'] (Moo style) — the isa value is
                 // valid-ish Perl syntax, so re-parse it with tree-sitter
                 // and pull the class name out of the tree rather than
