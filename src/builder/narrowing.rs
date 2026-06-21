@@ -32,6 +32,7 @@ fn narrow_subject_of(node: Node, src: &[u8]) -> Option<NarrowSubject> {
 }
 
 /// What a guard does to the subject's type where it holds.
+#[derive(Clone)]
 pub(super) enum NarrowOp {
     /// `isa` / `ref…eq` prove a concrete type.
     To(InferredType),
@@ -43,6 +44,20 @@ pub(super) enum NarrowOp {
     StripOptional { query_point: Point },
 }
 
+impl NarrowOp {
+    /// The op for the region where the guard is FALSE. Only `defined`/
+    /// `blessed` have a representable complement — the subject is `undef`
+    /// there. "Not a class" (`isa`/`ref-eq` negated) has no positive
+    /// target, so it self-suppresses (`None` → emit nothing, wide type
+    /// wins). See `docs/prompt-flow-narrowing.md` negative-polarity rows.
+    fn negated(&self) -> Option<NarrowOp> {
+        match self {
+            NarrowOp::To(_) => None,
+            NarrowOp::StripOptional { .. } => Some(NarrowOp::To(InferredType::Undef)),
+        }
+    }
+}
+
 /// A recognized guard fact: the subject, what the guard proves, and
 /// whether the proof holds where the guard *expression* is TRUE (`!`
 /// flips it).
@@ -50,6 +65,20 @@ pub(super) struct GuardFact {
     subject: NarrowSubject,
     op: NarrowOp,
     asserts_when_true: bool,
+}
+
+impl GuardFact {
+    /// The op to emit in a region where the guard holds iff the guard
+    /// expression is `holds`: the fact's own op when the polarity matches
+    /// (positive narrowing), else its negation (which may be
+    /// unrepresentable → `None`, so the region stays wide).
+    fn op_for_region(&self, holds: bool) -> Option<NarrowOp> {
+        if self.asserts_when_true == holds {
+            Some(self.op.clone())
+        } else {
+            self.op.negated()
+        }
+    }
 }
 
 /// A pending `defined`/`blessed` narrowing — its `Optional<T> → T` strip
@@ -265,6 +294,19 @@ fn is_exit_expression(node: Node, source: &[u8]) -> bool {
     }
 }
 
+/// The `block` of a direct `else` child of a `conditional_statement`, if
+/// any. elsif-chain `else` (which nests inside the trailing `elsif`) is
+/// deferred — its cumulative negation needs union types.
+fn trailing_else<'a>(cond_stmt: Node<'a>) -> Option<Node<'a>> {
+    for i in 0..cond_stmt.named_child_count() {
+        let c = cond_stmt.named_child(i)?;
+        if c.kind() == "else" {
+            return c.child_by_field_name("block");
+        }
+    }
+    None
+}
+
 impl<'a> Builder<'a> {
     /// `if/unless (G) { BODY }` — narrow the then-block where the guard's
     /// polarity is positive (`if`-body when G true, `unless`-body when
@@ -273,10 +315,27 @@ impl<'a> Builder<'a> {
         let Some(condition) = cond_stmt.child_by_field_name("condition") else { return };
         let Some(block) = cond_stmt.child_by_field_name("block") else { return };
         let Some(holds_when_true) = self.block_guard_polarity(cond_stmt, condition) else { return };
-        let region = node_to_span(block);
-        for fact in recognize_guards(condition, self.source) {
-            if fact.asserts_when_true == holds_when_true {
-                self.emit_narrowing_fact(fact, region, block);
+        let then_region = node_to_span(block);
+        // The else-block (if any) is the complement region — a direct
+        // `else` child of `conditional_statement`. A guard holds there iff
+        // its expression is FALSE, so the op is negated (only `defined`/
+        // `blessed` have a representable complement). elsif-chain else is
+        // deferred (cumulative negation needs unions).
+        let else_block = trailing_else(cond_stmt);
+        let facts = recognize_guards(condition, self.source);
+        for fact in &facts {
+            if let Some(op) = fact.op_for_region(holds_when_true) {
+                self.emit_narrowing_fact(&fact.subject, op, then_region, block);
+            }
+            if let Some(else_block) = else_block {
+                if let Some(op) = fact.op_for_region(!holds_when_true) {
+                    self.emit_narrowing_fact(
+                        &fact.subject,
+                        op,
+                        node_to_span(else_block),
+                        else_block,
+                    );
+                }
             }
         }
     }
@@ -347,24 +406,34 @@ impl<'a> Builder<'a> {
         }
         let region = Span { start: stmt.end_position(), end: block.end_position() };
         for fact in recognize_guards(condition, self.source) {
-            if fact.asserts_when_true == holds_when_true {
-                self.emit_narrowing_fact(fact, region, block);
+            if let Some(op) = fact.op_for_region(holds_when_true) {
+                self.emit_narrowing_fact(&fact.subject, op, region, block);
             }
         }
     }
 
     /// Push the span-extent narrowing witness on the subject's home scope,
     /// truncating the region at the first reassignment of the subject.
-    fn emit_narrowing_fact(&mut self, fact: GuardFact, region: Span, container: Node<'a>) {
+    /// Emit a guard's narrowing into `region`. `op` is the polarity-
+    /// resolved operation (`GuardFact::op_for_region`); the subject is
+    /// keyed and the region truncated at the first disturbance, exactly
+    /// as for a positive narrowing.
+    fn emit_narrowing_fact(
+        &mut self,
+        subject: &NarrowSubject,
+        op: NarrowOp,
+        region: Span,
+        container: Node<'a>,
+    ) {
         use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
-        let (name, end) = match fact.subject {
+        let (name, end) = match subject {
             NarrowSubject::Variable(var) => {
-                let end = self.first_subject_write(&var, region, container);
-                (var, end)
+                let end = self.first_subject_write(var, region, container);
+                (var.clone(), end)
             }
             NarrowSubject::Place { key, root } => {
-                let end = self.first_place_invalidation(&key, &root, region, container);
-                (key, end)
+                let end = self.first_place_invalidation(key, root, region, container);
+                (key.clone(), end)
             }
         };
         let end = end.unwrap_or(region.end);
@@ -373,7 +442,7 @@ impl<'a> Builder<'a> {
         }
         let region = Span { start: region.start, end };
         let scope = self.current_scope();
-        match fact.op {
+        match op {
             NarrowOp::To(ty) => {
                 self.bag.push(Witness {
                     attachment: WitnessAttachment::Variable { name, scope },

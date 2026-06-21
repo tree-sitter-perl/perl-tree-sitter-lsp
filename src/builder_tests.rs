@@ -15246,6 +15246,60 @@ fn optional_without_defined_does_not_dispatch() {
     );
 }
 
+// ── Negative lattice (phase 3): Undef on the `defined` family ──
+
+#[test]
+fn negative_return_if_defined_is_undef() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    return if defined $x;\n    my $y = $x;\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 12)),
+        Some(InferredType::Undef),
+        "after `return if defined $x`, $x is undef",
+    );
+}
+
+#[test]
+fn negative_unless_defined_block_is_undef() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    unless (defined $x) {\n        my $y = $x;\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 16)),
+        Some(InferredType::Undef),
+        "inside `unless (defined $x)`, $x is undef",
+    );
+}
+
+#[test]
+fn negative_defined_then_else_split() {
+    // then-branch strips Optional<Foo> → Foo; else-branch → Undef.
+    let fa = build_fa(
+        "package P;\nsub maybe { return undef unless 1; return Foo->new; }\nsub f {\n    my $r = maybe();\n    if (defined $r) {\n        $r->a;\n    } else {\n        my $y = $r;\n    }\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "a").as_deref(), Some("Foo"));
+    assert_eq!(
+        fa.inferred_type_via_bag("$r", Point::new(7, 16)),
+        Some(InferredType::Undef),
+        "else-branch: $r is undef",
+    );
+}
+
+#[test]
+fn negative_isa_else_stays_wide() {
+    // `isa` has no representable complement, so the else is NOT narrowed.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    if ($x->isa('Foo')) {\n        $x->a;\n    } else {\n        my $y = $x;\n    }\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "a").as_deref(), Some("Foo"));
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(6, 16)),
+        None,
+        "isa else has no positive target — stays wide, not Undef",
+    );
+}
+
 // ── Place narrowing (v1b): `$self->{x}` ──
 
 /// Class an invocant resolves to for the method-call ref named `method`.
