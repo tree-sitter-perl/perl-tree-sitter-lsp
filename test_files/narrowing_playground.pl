@@ -179,6 +179,32 @@ sub blessed_strips_optional {
     }
 }
 
+# ── N. Negative lattice — `defined` family narrows to Undef ───
+
+sub defined_else_is_undef {
+    my $r = maybe_make();
+    if (defined $r) {
+        $r->use;                        # NARROW $r => Foo (strip)
+    } else {
+        $r;                             # NARROW $r => Undef (complement)
+    }
+}
+
+sub return_if_defined_remainder_undef {
+    my ($x) = @_;
+    return if defined $x;
+    $x;                                 # NARROW $x => Undef (remainder)
+}
+
+sub isa_else_no_negative {
+    my ($x) = @_;
+    if ($x->isa('Foo')) {
+        $x->go;                         # NARROW $x => Foo
+    } else {
+        $x;                             # NO-NARROW (not-Foo has no target)
+    }
+}
+
 # ── P. Place subjects (v1b) — narrow a slot, not a variable ──
 #    Canonical access path = root + constant projections. The
 #    narrowing region is TRUNCATED at the first op that could

@@ -907,6 +907,15 @@ pub enum InferredType {
     /// `docs/prompt-optional-types.md`. Kept at the END for bincode
     /// variant-index stability (bump `EXTRACT_VERSION`).
     Optional(Box<InferredType>),
+    /// The bottom element — a value proven `undef`. Produced only by
+    /// flow narrowing: the negative side of a `defined`/`blessed` guard
+    /// (`if (defined $x) {} else { ... }`, `return if defined $x`). NOT a
+    /// class (`class_name()` → `None`), so a method call on it stays
+    /// unresolved (a value-known-undef can't dispatch). Never produced by
+    /// the return-arm join (that signals undef via a source tag, not a
+    /// type — `docs/prompt-optional-types.md`). Kept at the END for
+    /// bincode variant-index stability (bump `EXTRACT_VERSION`).
+    Undef,
 }
 
 /// Concrete parametric flavors + type-level operators. Each
@@ -8887,6 +8896,7 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
         // Optional dispatches nowhere until narrowed; tag the inner so the
         // wire format stays backward-compatible, prefixed Maybe.
         InferredType::Optional(inner) => format!("Maybe:{}", inferred_type_to_tag(inner)),
+        InferredType::Undef => "Undef".to_string(),
     }
 }
 
@@ -8952,6 +8962,7 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
             None => base.clone(),
         },
         InferredType::Optional(inner) => format!("Maybe<{}>", format_inferred_type(inner)),
+        InferredType::Undef => "Undef".to_string(),
     }
 }
 

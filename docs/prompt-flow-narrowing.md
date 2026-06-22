@@ -132,15 +132,25 @@ of the block.*
 
 A guard-internal negation (`if (!G)`, `return unless !G`) flips the row.
 
-**v1 ships only the G-true (✅) rows** — the guarded block and the
-early-return assert, the two dominant idioms. They yield a *positive*
-refinement (`$x` IS Foo), expressible in today's lattice.
+**v1 shipped the G-true (✅) rows** — the guarded block and the
+early-return assert. They yield a *positive* refinement (`$x` IS Foo).
 
-The G-false (✘) rows need a **negation / union** the lattice lacks ("`$x`
-is anything-but-Foo"). Deferred with the same dependency as the else
-branch — they light up when Optional/union lands. Skipping them is
-sound: emitting nothing leaves the wide outer type, which is correct if
-imprecise.
+**The G-false (✘) rows now land for the `defined`/`blessed` family only**
+(`InferredType::Undef`, the negative lattice). The complement of "is
+defined" is the concrete bottom element `Undef`, so the else of `if
+(defined $x)`, the remainder of `return if defined $x`, and the body of
+`unless (defined $x)` all narrow `$x` to `Undef`. Mechanically this is
+`NarrowOp::negated()`: `StripOptional` negates to `To(Undef)`, and the
+existing polarity plumbing (`GuardFact::op_for_region`) does the rest —
+the early-exit negatives came for free; only the `else`-block emit
+(`trailing_else`) was new.
+
+The `isa` / `ref-eq` G-false rows stay wide: `To(_).negated()` is `None`
+("not Foo" has no positive lookup target — no class to dispatch, complete,
+or goto, so it can't improve any consumer). General negation
+(`Not`/`Difference`) is parked; unblock condition is a real union lattice
++ a consumer that derives value from a negative fact (`docs/prompt
+-optional-types.md`). Emitting nothing leaves the wide type — sound.
 
 **Compound conditions:** a top-level `&&`/`and` chain narrows the body by
 the *intersection* — emit one narrowing per recognized conjunct

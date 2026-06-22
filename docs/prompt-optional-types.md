@@ -106,16 +106,30 @@ green.
   and `SlotTypeFold` through the join so they *produce* Optional from a
   `{T, undef}` pair (needs the same undef-marker on branch/slot arms).
 
-**Phase 3 — negatives + provenance + Type::Tiny:**
-- Negative-polarity rows (`else` of `if (defined G)`, `return if defined
-  G`) become expressible **for the `defined`/`blessed` family only** —
-  the false arm is the undef side, a concrete element. Needs a bottom
-  (`Undef`) element for the else witness. `isa`/`ref-eq` negatives still
-  need real negation/union (parked).
+**Phase 3 — negative lattice (LANDED for the `defined` family):**
+- `InferredType::Undef` (bottom), appended at the enum END; bump
+  `EXTRACT_VERSION`. `class_name() → None`, `subsumes_narrowing` needs no
+  arm (the discriminant fallback gives `(Undef, Undef) → true` and
+  `false` elsewhere). Never produced by the return-arm join — purely a
+  narrowing witness.
+- `NarrowOp::negated()`: `StripOptional → To(Undef)`; `To(_) → None`
+  (no representable complement). `GuardFact::op_for_region(holds)` picks
+  the fact's op when its polarity matches, else the negation. So the
+  early-exit negatives (`return if defined`, `unless (defined){}`) light
+  up through the *existing* polarity plumbing; only the `else`-block emit
+  (`trailing_else` on `conditional_statement`) was new. elsif-chain `else`
+  (cumulative negation) is deferred — needs unions.
+- General `Not`/`Difference` negation for `isa`/`ref-eq` negatives:
+  **parked** — a negative class yields no positive lookup target, so no
+  consumer (goto/completion/hover/dispatch) benefits. Unblock: a real
+  union lattice + a consumer of negative facts.
+
+**Phase 4 — provenance + Type::Tiny + Optional production:**
+- Route `BranchArmFold` (ternary) + `SlotTypeFold` through the join so a
+  `{T, undef}` pair *produces* `Optional<T>`.
 - `TypeProvenance::ReducerFold { reducer: "optional_join" }` for
   `--dump-package`.
-- Map Type::Tiny `Maybe[T]` / `Optional[T]` onto `Optional(Box<T>)` at
-  the `type_constraint_names` seam.
+- Map Type::Tiny `Maybe[T]` / `Optional[T]` onto `Optional(Box<T>)`.
 
 ## Sequencing wrinkle (Phase 2+)
 
