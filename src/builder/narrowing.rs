@@ -4,8 +4,9 @@
 //! private fields) rather than a sibling: narrowing is still part of the
 //! single tree-sitter consumer (rule #1) — `build()` drives it, it just
 //! lives in its own file. Recognition (`recognize_*`) is pure CST
-//! inspection; emission + span/truncation are `Builder` methods. Design +
-//! the span/polarity table: `docs/prompt-flow-narrowing.md`.
+//! inspection; emission + span/truncation are `Builder` methods.
+//! Decisions (engine-is-emission, truncation soundness, polarity +
+//! the `Undef` negative lattice): `docs/adr/flow-narrowing.md`.
 
 use tree_sitter::{Node, Point};
 
@@ -49,7 +50,7 @@ impl NarrowOp {
     /// `blessed` have a representable complement — the subject is `undef`
     /// there. "Not a class" (`isa`/`ref-eq` negated) has no positive
     /// target, so it self-suppresses (`None` → emit nothing, wide type
-    /// wins). See `docs/prompt-flow-narrowing.md` negative-polarity rows.
+    /// wins). See `docs/adr/flow-narrowing.md` negative-polarity rows.
     fn negated(&self) -> Option<NarrowOp> {
         match self {
             NarrowOp::To(_) => None,
@@ -107,48 +108,32 @@ fn ref_string_to_type(s: &str) -> Option<InferredType> {
     })
 }
 
-/// Literal content of a `string_literal` node — the class name in
-/// `isa('Foo')` / `ref($x) eq 'HASH'`. Rejects interpolated forms (a
-/// class-name guard is a plain literal).
-fn string_literal_text(node: Node, source: &[u8]) -> Option<String> {
-    if !matches!(node.kind(), "string_literal" | "interpolated_string_literal") {
-        return None;
-    }
-    let mut content: Option<String> = None;
-    for i in 0..node.named_child_count() {
-        let c = node.named_child(i)?;
-        if c.kind() != "string_content" || content.is_some() {
-            return None; // interpolation or multiple fragments
-        }
-        content = c.utf8_text(source).ok().map(|s| s.to_string());
-    }
-    content.filter(|s| !s.is_empty())
+/// A narrowable subject node: a plain scalar, or a constant hash/array
+/// place element (`$self->{x}`).
+fn is_subject_node_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "scalar" | "hash_element_expression" | "array_element_expression"
+    )
 }
 
 /// The subject argument of a `func1op_call_expression` (`ref($x)` /
-/// `ref $self->{x}`) — a plain scalar or a place element.
+/// `ref $self->{x}`) — the first scalar/place operand, groups peeled.
+/// Does NOT descend into a call/deref (`ref(f($x))` is `f`'s return, not
+/// `$x`), so the group-peeling child finder is exactly right.
 fn func1op_subject_arg<'a>(node: Node<'a>) -> Option<Node<'a>> {
-    for i in 0..node.named_child_count() {
-        let c = node.named_child(i)?;
-        if matches!(
-            c.kind(),
-            "scalar" | "hash_element_expression" | "array_element_expression"
-        ) {
-            return Some(c);
-        }
-    }
-    None
+    crate::cst::first_named_child_where(node, is_subject_node_kind)
 }
 
 /// Recognize the narrowing facts a condition proves. One fact per
 /// recognized conjunct (`&&`/`and` intersect the region); a disjunctive
 /// (`||`/`or`) or unrecognized condition yields none.
 fn recognize_guards(cond: Node, source: &[u8]) -> Vec<GuardFact> {
+    // Peel transparent `(...)` / single-element list wrappers up front, so
+    // `if (($x->isa('Foo')))` and nested grouping fall through to the real
+    // condition — one shared primitive instead of a per-shape arm.
+    let cond = crate::cst::peel_groups(cond);
     match cond.kind() {
-        "parenthesized_expression" => cond
-            .named_child(0)
-            .map(|c| recognize_guards(c, source))
-            .unwrap_or_default(),
         "unary_expression" if raw_leading_op(cond, source) == "!" => cond
             .child_by_field_name("operand")
             .map(|op| {
@@ -202,29 +187,17 @@ fn recognize_blessed_guard(call: Node, source: &[u8]) -> Option<GuardFact> {
     if name != "blessed" {
         return None;
     }
-    let arg = first_place_or_scalar(call.child_by_field_name("arguments")?)?;
+    // The `arguments` field is the lone operand; peel grouping and accept
+    // it only if it's a scalar/place — never descend into a call/deref.
+    let arg = crate::cst::peel_groups(call.child_by_field_name("arguments")?);
+    if !is_subject_node_kind(arg.kind()) {
+        return None;
+    }
     Some(GuardFact {
         subject: narrow_subject_of(arg, source)?,
         op: NarrowOp::StripOptional { query_point: arg.start_position() },
         asserts_when_true: true,
     })
-}
-
-/// First scalar / place-element node at or under `node` — the argument
-/// subject of a `blessed(...)` call.
-fn first_place_or_scalar<'a>(node: Node<'a>) -> Option<Node<'a>> {
-    if matches!(
-        node.kind(),
-        "scalar" | "hash_element_expression" | "array_element_expression"
-    ) {
-        return Some(node);
-    }
-    for i in 0..node.named_child_count() {
-        if let Some(found) = node.named_child(i).and_then(first_place_or_scalar) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 /// `$x->isa('Foo')` / `$x->DOES('Role')` → narrow `$x` to `ClassName`.
@@ -235,7 +208,7 @@ fn recognize_isa_guard(call: Node, source: &[u8]) -> Option<GuardFact> {
         return None;
     }
     let subject = narrow_subject_of(mc.invocant()?, source)?;
-    let class = string_literal_text(call.child_by_field_name("arguments")?, source)?;
+    let class = crate::cst::plain_string_literal_text(call.child_by_field_name("arguments")?, source)?;
     Some(GuardFact {
         subject,
         op: NarrowOp::To(InferredType::ClassName(class)),
@@ -263,7 +236,7 @@ fn recognize_ref_eq_guard(eq: Node, source: &[u8]) -> Option<GuardFact> {
         return None;
     }
     let subject = narrow_subject_of(func1op_subject_arg(ref_call)?, source)?;
-    let ty = ref_string_to_type(&string_literal_text(lit, source)?)?;
+    let ty = ref_string_to_type(&crate::cst::plain_string_literal_text(lit, source)?)?;
     Some(GuardFact {
         subject,
         op: NarrowOp::To(ty),

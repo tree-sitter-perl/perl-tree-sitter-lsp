@@ -199,8 +199,33 @@ pub(crate) fn flatten_list<'a>(list: Node<'a>, out: &mut Vec<Node<'a>>) {
     }
 }
 
-/// Walk a flat sibling sequence as positional `(key_node, value_node)`
-/// pairs, separator-agnostic: the `,` / `=>` between tokens is skipped by
+/// Peel transparent grouping wrappers — a `parenthesized_expression` or a
+/// single-element `list_expression` — down to the expression inside.
+/// These are pure grouping in Perl (`($x)` IS `$x`), so descending changes
+/// no semantics; a call/deref/element-access does, and is left alone.
+/// Loops, so nested `(($x))` collapse.
+pub(crate) fn peel_groups(mut node: Node) -> Node {
+    while matches!(node.kind(), "parenthesized_expression" | "list_expression") {
+        let mut named = node.named();
+        match (named.next(), named.next()) {
+            (Some(inner), None) => node = inner,
+            _ => break, // empty, or a real multi-element list
+        }
+    }
+    node
+}
+
+/// First named child of `node` (each group-peeled) whose kind satisfies
+/// `pred` — the "pull the single typed operand out of a call" primitive.
+/// The kind-filter callback keeps it reusable across callers.
+pub(crate) fn first_named_child_where<'a>(
+    node: Node<'a>,
+    pred: impl Fn(&str) -> bool,
+) -> Option<Node<'a>> {
+    node.named().map(peel_groups).find(|c| pred(c.kind()))
+}
+
+
 /// position, never matched. This is THE pairing primitive — gating pair
 /// walking on the `fat_comma` node silently drops the plain-comma spelling
 /// (`{ 'GAMMA', 3 }` is identical to `{ GAMMA => 3 }`).
@@ -388,6 +413,30 @@ pub(crate) fn string_content_text(node: Node, src: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// The literal content of a quoted node ONLY when it's a plain,
+/// non-interpolated, single-fragment literal — the shape a class-name /
+/// reftype guard (`isa('Foo')`, `ref($x) eq 'HASH'`) needs. Anything
+/// interpolated (`"$cls"`) or empty yields `None`, so an interpolated
+/// argument never reads as a literal class name. Stricter sibling of
+/// `string_content_text`.
+pub(crate) fn plain_string_literal_text(node: Node, src: &[u8]) -> Option<String> {
+    if !matches!(node.kind(), "string_literal" | "interpolated_string_literal") {
+        return None;
+    }
+    let mut content: Option<String> = None;
+    for i in 0..node.named_child_count() {
+        let c = node.named_child(i)?;
+        // Interpolation nests INSIDE the `string_content` (`"$cls"` →
+        // string_content > scalar), so a plain literal is a single
+        // `string_content` with no children of its own.
+        if c.kind() != "string_content" || content.is_some() || c.named_child_count() > 0 {
+            return None;
+        }
+        content = c.utf8_text(src).ok().map(|s| s.to_string());
+    }
+    content.filter(|s| !s.is_empty())
 }
 
 /// Span of the `string_content` inside a quoted node (selection span);

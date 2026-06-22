@@ -6986,19 +6986,21 @@ impl<'a> Builder<'a> {
         use crate::witnesses::{
             FactValue, Witness, WitnessAttachment, WitnessPayload, WitnessSource,
         };
-        let body = match return_node.named_child(0) {
-            Some(b) => b,
-            None => return, // bare `return;` — undef arm deferred (Phase 2)
-        };
-        let body_span = node_to_span(body);
+        let body = return_node.named_child(0);
+        let arm_span = body.map(node_to_span).unwrap_or_else(|| node_to_span(return_node));
 
         let Some(sub_name) = self.enclosing_sub_name() else { return };
         let Some(sym_id) = self.find_sub_symbol_for(&sub_name, scope) else { return };
 
-        // `return undef` makes the sub's value optional. It has no rvalue
-        // type to ride an `Expr` edge, so mark the arm with a Fact the fold
-        // counts; `join_return_arms` lifts `{T, undef}` to `Optional<T>`.
-        if body.kind() == "undef_expression" {
+        // A bare `return;` and `return undef` are undef arms — the sub's
+        // value is optional. Neither has an rvalue type to ride an `Expr`
+        // edge, so mark the arm with a Fact the fold counts; the arm join
+        // lifts `{T, undef}` to `Optional<T>`.
+        let is_undef_arm = match body {
+            None => true,
+            Some(b) => b.kind() == "undef_expression",
+        };
+        if is_undef_arm {
             self.bag.push(Witness {
                 attachment: WitnessAttachment::SymbolReturnArm(sym_id),
                 source: WitnessSource::Builder("undef_arm".into()),
@@ -7007,22 +7009,22 @@ impl<'a> Builder<'a> {
                     key: String::new(),
                     value: FactValue::Bool(true),
                 },
-                span: body_span,
+                span: arm_span,
             });
-        } else {
+        } else if let Some(body) = body {
             self.emit_expr_witness(body);
             self.bag.push(Witness {
                 attachment: WitnessAttachment::SymbolReturnArm(sym_id),
                 source: WitnessSource::Builder("return_arm".into()),
-                payload: WitnessPayload::Edge(WitnessAttachment::Expr(body_span)),
-                span: body_span,
+                payload: WitnessPayload::Edge(WitnessAttachment::Expr(arm_span)),
+                span: arm_span,
             });
         }
         self.bag.push(Witness {
             attachment: WitnessAttachment::Symbol(sym_id),
             source: WitnessSource::Builder("return_arm_chain".into()),
             payload: WitnessPayload::Edge(WitnessAttachment::SymbolReturnArm(sym_id)),
-            span: body_span,
+            span: arm_span,
         });
     }
 

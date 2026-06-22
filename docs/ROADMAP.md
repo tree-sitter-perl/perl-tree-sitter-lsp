@@ -5,16 +5,19 @@ This file is only what's NEXT, in order.
 
 ## Now (in order)
 
-1. **Flow-sensitive narrowing** — active workstream; design doc first
-   (none yet). Guard recognition (`$x->isa('Foo')` / `ref($x) eq` /
-   `blessed`) emits span-scoped narrowing witnesses; the existing
-   temporal + narrowest-span query path in `witnesses.rs` is the
-   engine, so "un-narrowing at block exit" reduces to span computation,
-   not witness removal. Open: early-return / postfix-guard spans, and
-   else-branch negative narrowing (the one non-monotone case — likely
-   deferred in v1). Type::Tiny guards land later as
-   `type_constraint_names()` manifest entries — not a blocker (build
-   against native guards first; they're dependency-free).
+1. **Narrowing / Optional — diagnostics + completeness.** The
+   flow-narrowing + `Optional<T>` + `Undef` lattice has landed (decision
+   records: `adr/flow-narrowing.md`, `adr/optional-types.md`), so a
+   value's type now answers "are you `undef` here?", "might you be?", "are
+   you the class this guard tested?". Two threads build on it:
+   - **Diagnostics** — turn those answers into bug detection (undef/Optional
+     derefs, redundant or contradictory guards). A diagnostic is just a
+     consumer that asks the type at the use point, never matching syntax
+     (rule #10). Plan, tiers, and build order: `prompt-narrowing-diagnostics.md`.
+   - **Completeness** — widen what the narrower recognizes: direct-element
+     places (`$hash{key}`, `$arr[0]`), and dynamic-key places
+     (`$self->{$k}`) where the key scalar is stable enough to stay sound.
+     `prompt-flow-narrowing.md` / `prompt-optional-types.md`.
 2. **DBIC out of core — phases 2–3.** Phase 1 landed (`visit_dbic_*`
    gone; `frameworks/dbic.rhai`, trigger `ClassIsa("DBIx::Class")`).
    Remaining: meta-method suppression → manifest (the `universal_methods`

@@ -251,8 +251,10 @@ sub place_invalidated_by_opaque_prefix {
 sub place_dynamic_key_no_narrow {
     my ($self, $k) = @_;
     return unless $self->{$k}->isa('Foo');
-    $self->{$k}->step;                  # NO-NARROW (dynamic key — not a
-                                        # stable place identity)
+    $self->{$k}->step;                  # NO-NARROW for now — but $k is
+                                        # locally stable, so this IS
+                                        # narrowable (scheduled; see ADR
+                                        # Residual: truncate on $k write)
 }
 
 sub place_multihop {
