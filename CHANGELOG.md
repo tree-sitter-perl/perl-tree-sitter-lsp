@@ -6,6 +6,29 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+## v0.5.2 — 2026-06-22
+
+### Type narrowing
+
+- **Flow-sensitive guards.** A `defined $x` or `blessed $x` test narrows `$x`
+  to its concrete type inside the branch — hover, completion, and goto follow
+  the guard. The negative side narrows too (a failed `defined` ⇒ undef).
+- **Nested slots, not just variables.** Guards narrow places like
+  `$self->{a}{b}`, which hold their narrowed type through the branch.
+
+### Optional types
+
+- **`Optional<T>`.** A maybe-undef value is tracked as `Optional<T>` instead of
+  collapsing to unknown. Sources: Type::Tiny `Maybe[T]` / `Optional[T]`, a bare
+  `return;`, an `undef` or empty-list (`()`) ternary arm, and mixed undef/value
+  return joins.
+- A `defined` / `blessed` guard **strips** `Optional<T>` back to `T` inside the
+  branch.
+
+### Performance
+
+- Tail POD docs parse each block once instead of re-parsing per sub.
+
 ## v0.5.1 - 2026-06-20
 
 ### Perltidy
