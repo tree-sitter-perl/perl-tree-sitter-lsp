@@ -56,6 +56,16 @@ Provenance: an `Optional` return is tagged `optional_join` in its
 
 ## Residual
 
+- **All-undef returns → `Undef`.** A sub whose every arm is `undef`
+  (`sub f { return undef }`) types `None` today, not the definitive
+  `Undef` — `join_return_arms` sees `arms=[] && has_undef` and falls
+  through. Soundness gate: return `Undef` only when `undef_count ==
+  total_arm_count`, because `arms=[] && has_undef` also covers "a value
+  arm we couldn't type (its edge materialized to nothing → no witness)
+  plus an undef arm", where the sub returns *something*. So it needs a
+  total-arm count the fold doesn't track (untypeable arms leave no
+  trace). Payoff: feeds the method-on-`Undef` (D1) and always-false-guard
+  (D4) diagnostics.
 - `SlotTypeFold` production ({T, undef} slot writes → `Optional`);
 - the bareword Type::Tiny `Maybe[…]` constructor form (the
   `TypeConstraintOf` path, vs the quoted-string form that landed);
