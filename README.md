@@ -2,6 +2,10 @@
 
 A Perl language server with deep semantic intelligence. Built on [tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl) and tower-lsp.
 
+![perl-lsp: cross-file type inference, completion, goto-def and rename](demo/perl-lsp.gif)
+
+*Hover infers `$acct` is an `Account` through the imported `make_account()`; goto-def jumps into `Bank.pm`; completion lists the class's methods; renaming the accessor cascades across files. ([demo/](demo/))*
+
 ## Install
 
 ```bash
