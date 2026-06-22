@@ -56,6 +56,13 @@ Provenance: an `Optional` return is tagged `optional_join` in its
 
 ## Residual
 
+- **Empty-list `return ()` arm.** The ternary form (`$c ? Foo->new : ()`)
+  is handled — `()` (a `stub_expression`) is marked an undef arm in the
+  branch-arm emission, lifting `{T, ()}` to `Optional<T>`. The `return ()`
+  statement form is not yet: the return-arm undef check (`is_undef_arm`)
+  recognizes a bodyless `return;` and `return undef`, but not a
+  `stub_expression` body. Same scalar-context coercion rationale as bare
+  `return;`; extend `is_undef_arm` to cover `stub_expression`.
 - **All-undef returns → `Undef`.** A sub whose every arm is `undef`
   (`sub f { return undef }`) types `None` today, not the definitive
   `Undef` — `join_return_arms` sees `arms=[] && has_undef` and falls
