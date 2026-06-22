@@ -4,8 +4,9 @@
 //! private fields) rather than a sibling: narrowing is still part of the
 //! single tree-sitter consumer (rule #1) — `build()` drives it, it just
 //! lives in its own file. Recognition (`recognize_*`) is pure CST
-//! inspection; emission + span/truncation are `Builder` methods. Design +
-//! the span/polarity table: `docs/prompt-flow-narrowing.md`.
+//! inspection; emission + span/truncation are `Builder` methods.
+//! Decisions (engine-is-emission, truncation soundness, polarity +
+//! the `Undef` negative lattice): `docs/adr/flow-narrowing.md`.
 
 use tree_sitter::{Node, Point};
 
@@ -49,7 +50,7 @@ impl NarrowOp {
     /// `blessed` have a representable complement — the subject is `undef`
     /// there. "Not a class" (`isa`/`ref-eq` negated) has no positive
     /// target, so it self-suppresses (`None` → emit nothing, wide type
-    /// wins). See `docs/prompt-flow-narrowing.md` negative-polarity rows.
+    /// wins). See `docs/adr/flow-narrowing.md` negative-polarity rows.
     fn negated(&self) -> Option<NarrowOp> {
         match self {
             NarrowOp::To(_) => None,

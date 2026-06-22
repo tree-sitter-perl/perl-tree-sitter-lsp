@@ -904,7 +904,7 @@ pub enum InferredType {
     /// `blessed $x` narrowing strips it back to `T`. NOT a class itself —
     /// `class_name()` returns `None` (an optional is not *definitely* an
     /// instance), so it cannot dispatch until narrowed. See
-    /// `docs/prompt-optional-types.md`. Kept at the END for bincode
+    /// `docs/adr/optional-types.md`. Kept at the END for bincode
     /// variant-index stability (bump `EXTRACT_VERSION`).
     Optional(Box<InferredType>),
     /// The bottom element — a value proven `undef`. Produced only by
@@ -913,7 +913,7 @@ pub enum InferredType {
     /// class (`class_name()` → `None`), so a method call on it stays
     /// unresolved (a value-known-undef can't dispatch). Never produced by
     /// the return-arm join (that signals undef via a source tag, not a
-    /// type — `docs/prompt-optional-types.md`). Kept at the END for
+    /// type — `docs/adr/optional-types.md`). Kept at the END for
     /// bincode variant-index stability (bump `EXTRACT_VERSION`).
     Undef,
 }
@@ -1339,7 +1339,7 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
 /// `{Foo, undef} → Optional<Foo>`. No undef arm leaves the fold
 /// unchanged; genuinely-conflicting value arms (`Foo` vs `Bar`) stay
 /// `None` (no arbitrary union); only-undef arms stay `None` (no useful
-/// value type). See `docs/prompt-optional-types.md`.
+/// value type). See `docs/adr/optional-types.md`.
 pub fn join_return_arms(value_types: &[InferredType], has_undef_arm: bool) -> Option<InferredType> {
     let base = resolve_return_type(value_types);
     match base {
@@ -6075,7 +6075,7 @@ impl FileAnalysis {
         // Flow-narrowing: a place invocant (`$self->{x}`) refined by a guard
         // resolves at the use-site point, ahead of the functional deref
         // chase — narrowing is strictly more precise where it applies
-        // (docs/prompt-flow-narrowing.md, v1b). Keyed on the invocant's own
+        // (docs/adr/flow-narrowing.md, v1b). Keyed on the invocant's own
         // spelling, the place narrowing witness rides the `Variable` query
         // path like any scalar.
         if let Some(span) = invocant_span {

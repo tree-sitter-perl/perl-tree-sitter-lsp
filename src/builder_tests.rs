@@ -1432,7 +1432,7 @@ fn test_return_type_self_variable() {
 #[test]
 fn test_return_type_bare_return_optional() {
     // Bare `return;` + typed return → Optional<typed>: `return unless …`
-    // means the sub can yield undef (docs/prompt-optional-types.md).
+    // means the sub can yield undef (docs/adr/optional-types.md).
     let fa = build_fa("sub get_config {\n    return unless 1;\n    return { host => 1 };\n}");
     let t = fa.sub_return_type_at_arity("get_config", None);
     assert!(
@@ -1451,7 +1451,7 @@ fn test_return_type_all_bare_returns() {
 #[test]
 fn test_return_type_undef_optional() {
     // return undef + typed return → Optional<typed>: the sub CAN return undef,
-    // so its value is optional (docs/prompt-optional-types.md). Bare `return;`
+    // so its value is optional (docs/adr/optional-types.md). Bare `return;`
     // is still filtered (Phase 2) — see test_return_type_bare_return_filtered.
     let fa = build_fa("sub maybe {\n    return undef unless 1;\n    return { a => 1 };\n}");
     let t = fa.sub_return_type_at_arity("maybe", None);
@@ -15055,7 +15055,7 @@ fn plugin_loads_recorded_trigger_independent_and_multivalue() {
     let _ = SymKind::Sub;
 }
 
-// ── Flow-sensitive narrowing (docs/prompt-flow-narrowing.md) ──
+// ── Flow-sensitive narrowing (docs/adr/flow-narrowing.md) ──
 
 #[test]
 fn narrow_block_if_isa() {
@@ -15191,7 +15191,7 @@ fn narrow_conjunction_intersects() {
     );
 }
 
-// ── Optional types (phase 1): `return undef` ──
+// ── Optional types: `return undef` ──
 
 #[test]
 fn optional_return_undef_or_value() {
@@ -15294,7 +15294,7 @@ fn optional_ternary_conflict_stays_none() {
     );
 }
 
-// ── Negative lattice (phase 3): Undef on the `defined` family ──
+// ── Negative lattice: Undef on the `defined` family ──
 
 #[test]
 fn negative_return_if_defined_is_undef() {
@@ -15348,7 +15348,7 @@ fn negative_isa_else_stays_wide() {
     );
 }
 
-// ── Place narrowing (v1b): `$self->{x}` ──
+// ── Place narrowing: `$self->{x}` ──
 
 /// Class an invocant resolves to for the method-call ref named `method`.
 fn invocant_class_of(fa: &FileAnalysis, method: &str) -> Option<String> {

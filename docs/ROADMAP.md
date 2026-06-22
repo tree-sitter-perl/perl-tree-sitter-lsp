@@ -19,8 +19,8 @@ This file is only what's NEXT, in order.
    *Foundation landed (PR stack #82–#91, unmerged):* flow narrowing
    (variables, single/multi-hop places), `Optional<T>` (return-undef,
    bare `return;`, ternary, `Maybe[T]`), `defined`/`blessed` stripping,
-   the `Undef` negative lattice, provenance. Designs:
-   `prompt-flow-narrowing.md`, `prompt-optional-types.md`. Deferred
+   the `Undef` negative lattice, provenance. ADRs:
+   `adr/flow-narrowing.md`, `adr/optional-types.md`. Deferred
    within that arc: `SlotTypeFold` Optional production, bareword
    Type::Tiny `Maybe[…]`, elsif-chain cumulative negation, and general
    `Not`/`Difference` negation (parked — no positive lookup target, no

@@ -1719,7 +1719,7 @@ impl ReducerRegistry {
                             // expression (a variable read recorded at `Expr(span)`)
                             // resolves the slot at the read's own location, so a
                             // flow-sensitive guard refines it only inside the
-                            // guard's region (docs/prompt-flow-narrowing.md). Other
+                            // guard's region (docs/adr/flow-narrowing.md). Other
                             // edge sources have no read position; the scope end is
                             // the standing temporal approximation.
                             let point = match q.attachment {

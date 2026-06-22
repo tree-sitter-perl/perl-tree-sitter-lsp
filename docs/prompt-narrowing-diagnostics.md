@@ -1,7 +1,7 @@
 # Narrowing / Optional diagnostics — forward plan
 
 **Status: planned, not built.** The flow-narrowing + `Optional<T>` +
-`Undef` lattice (`prompt-flow-narrowing.md`, `prompt-optional-types.md`)
+`Undef` lattice (`adr/flow-narrowing.md`, `adr/optional-types.md`)
 was built for hover/goto precision, but its real payoff is **bug
 detection**: each new lattice element lets the analyzer *see* a class of
 defect it previously couldn't represent. This doc enumerates those
