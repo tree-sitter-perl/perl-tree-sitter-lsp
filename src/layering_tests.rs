@@ -65,15 +65,20 @@ fn module_sources() -> Vec<(&'static str, Vec<PathBuf>)> {
             continue;
         };
         if path.is_dir() {
-            if stem == "plugin" {
+            // A module directory (`plugin/`, `builder/`) contributes its
+            // `.rs` files to that module's layer — same enforcement as the
+            // top-level `<module>.rs`, so a submodule can't dodge the DAG.
+            if let Some(name) = map.keys().copied().find(|k| *k == stem) {
                 let files = fs::read_dir(&path)
-                    .expect("read plugin/")
+                    .unwrap_or_else(|_| panic!("read {stem}/"))
                     .filter_map(|e| {
                         let p = e.ok()?.path();
-                        (p.extension()? == "rs").then_some(p)
+                        let s = p.file_stem()?.to_str()?;
+                        (p.extension()? == "rs" && !s.ends_with("_tests") && !s.ends_with("_test"))
+                            .then_some(p)
                     })
                     .collect();
-                out.push(("plugin", files));
+                out.push((name, files));
             }
             continue;
         }
