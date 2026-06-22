@@ -166,18 +166,16 @@ sub reassign_in_region {
 
 # ── G. Weak guards — recognized, no v1 target (Optional dep) ─
 
-sub weak_defined {
-    my ($x) = @_;                       # outer: ideally Optional<T> someday
-    return unless defined $x;
-    $x->use;                            # NO-NARROW in v1; becomes T once
-                                        # Optional<T> lands (defined strips undef)
+sub defined_strips_optional {
+    my $r = maybe_make();               # $r => Optional<Foo>
+    return unless defined $r;
+    $r->use;                            # NARROW $r => Foo (defined strips undef)
 }
 
-sub weak_blessed {
-    my ($x) = @_;
-    if (blessed $x) {
-        $x->method;                     # NO-NARROW in v1 (no "object" type);
-                                        # future: narrows undef/non-ref away
+sub blessed_strips_optional {
+    my $r = maybe_make();               # $r => Optional<Foo>
+    if (blessed $r) {
+        $r->method;                     # NARROW $r => Foo
     }
 }
 

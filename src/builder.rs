@@ -294,6 +294,7 @@ fn build_with_plugins_inner(
         parametric_emitted_refs: std::collections::HashSet::new(),
         method_call_ref_dedup: std::collections::HashSet::new(),
         route_branded_refs: std::collections::HashSet::new(),
+        defined_narrowings: Vec::new(),
         anon_sub_symbol_by_span: std::collections::HashMap::new(),
         modifier_invocant_pos: None,
     };
@@ -1599,6 +1600,10 @@ struct Builder<'a> {
     /// as `parametric_emitted_refs`. Cleared+refilled each fold
     /// iteration by `emit_route_brand_witnesses`.
     route_branded_refs: std::collections::HashSet<usize>,
+
+    /// Recorded `defined`/`blessed` guards whose `Optional<T> → T` strip
+    /// is re-derived each fold iteration (`emit_defined_narrowing_witnesses`).
+    defined_narrowings: Vec<narrowing::DefinedNarrowing>,
 
     /// Span (of the `anonymous_subroutine_expression` node) →
     /// SymbolId of the synthesized `(anon)` Sub symbol. Populated by
@@ -12654,6 +12659,7 @@ impl<'a> Builder<'a> {
         // and the bag oscillates (the fold never reaches a fixed point).
         self.emit_route_brand_witnesses(idx, ref_by_span);
         self.emit_method_call_return_edges();
+        self.emit_defined_narrowing_witnesses();
         let (return_types, return_provenance) = self.seed_return_types_from_bag(reg, method_sym_by_name);
         self.write_back_sub_return_types(&return_provenance);
         self.propagate_call_bindings_to_constraints(&return_types);
