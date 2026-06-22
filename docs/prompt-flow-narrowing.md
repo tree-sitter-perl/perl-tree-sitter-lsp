@@ -181,15 +181,27 @@ place's writes can hide behind **aliasing**: `$self->reset` or
 
 ### v1a — variables · v1b — places (one feature, two flowing increments)
 
-**Status:** v1a landed; v1b landed for single-hop places — a constant
-hash/array projection off a scalar root (`$self->{x}`, `$self->[0]`).
-Multi-hop chains (`$self->{a}{b}`) and zero-arg accessor projections
-(`$self->name`) are the remaining follow-up. A place is keyed by its
-source spelling on the existing `Variable` attachment (the doc's "a
-`Place` witness is *just* a span-scoped slot witness" — so the engine,
-narrow-filter, and scope-walk are untouched); the place-vs-variable
-distinction lives only in the truncation rule and the one
-`method_call_invocant_class` query seam.
+**Status:** v1a landed; v1b landed for hash/array places, **including
+multi-hop** (`$self->{a}{b}`) — a chain of constant key/index
+projections bottoming out at a scalar root. Zero-arg **accessor**
+projections (`$self->name`) are explicitly deferred: an accessor is not
+a stable slot (it can return a different object each call and may have
+side effects), so any intervening call could invalidate it — sound
+support needs a stricter "no call between guard and use" model, out of
+scope here. A place is keyed by its source spelling on the existing
+`Variable` attachment (the doc's "a `Place` witness is *just* a
+span-scoped slot witness" — so the engine, narrow-filter, and scope-walk
+are untouched); the place-vs-variable distinction lives only in the
+truncation rule and the one `method_call_invocant_class` query seam.
+
+The truncation rule generalizes cleanly to multi-hop: it invalidates on
+an opaque use of any **proper prefix** of the place — the root scalar or
+an intermediate element (`$self->{a}` for `$self->{a}{b}`) — where a
+prefix is "guarded" (a read, not a disturbance) exactly when it is the
+base of a longer access. So a method call on the *slot value*
+(`$self->{a}{b}->m`) and a *sibling* write (`$self->{a}{c} = …`) keep
+the narrowing, while a write to the slot, a root/intermediate op
+(`$self->{a}->mutate`), or the prefix passed as an argument truncate it.
 
 The narrowing soundness lives **entirely on the emit side**, so places
 are *additive*, not a query-path rewrite — provided v1a's seams admit

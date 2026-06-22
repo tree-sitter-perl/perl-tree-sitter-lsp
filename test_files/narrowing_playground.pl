@@ -231,6 +231,16 @@ sub place_dynamic_key_no_narrow {
                                         # stable place identity)
 }
 
+sub place_multihop {
+    my ($self) = @_;
+    return unless $self->{a}{b}->isa('Foo');
+    $self->{a}{b}->go;                  # NARROW $self->{a}{b} => Foo
+    $self->{a}{c} = 1;                  # sibling write — does NOT truncate
+    $self->{a}{b}->still;               # NARROW still (sibling untouched)
+    $self->{a}->mutate;                 # op on intermediate prefix → truncates
+    $self->{a}{b}->go;                  # WIDE (prefix may have changed {b})
+}
+
 sub place_bind_to_lexical_already_works {
     my ($self) = @_;
     my $h = $self->{handler};           # v1a escape hatch: bind the slot

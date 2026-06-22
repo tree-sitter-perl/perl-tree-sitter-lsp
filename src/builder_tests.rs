@@ -15269,6 +15269,52 @@ fn narrow_place_dynamic_key_skipped() {
 }
 
 #[test]
+fn narrow_place_multihop_isa() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($self) = @_;\n    return unless $self->{a}{b}->isa('Foo');\n    $self->{a}{b}->go;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "go").as_deref(), Some("Foo"));
+}
+
+#[test]
+fn narrow_place_multihop_method_on_value_keeps_slot() {
+    // A method call on the deep slot's value doesn't disturb it.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($self) = @_;\n    return unless $self->{a}{b}->isa('Foo');\n    $self->{a}{b}->one;\n    $self->{a}{b}->two;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "one").as_deref(), Some("Foo"));
+    assert_eq!(invocant_class_of(&fa, "two").as_deref(), Some("Foo"));
+}
+
+#[test]
+fn narrow_place_multihop_truncated_by_intermediate_prefix_op() {
+    // A method call on the intermediate prefix ($self->{a}) could mutate the
+    // object holding {b}, so it truncates the deeper narrowing.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($self) = @_;\n    return unless $self->{a}{b}->isa('Foo');\n    $self->{a}{b}->before;\n    $self->{a}->mutate;\n    $self->{a}{b}->after;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "before").as_deref(), Some("Foo"));
+    assert_ne!(
+        invocant_class_of(&fa, "after").as_deref(),
+        Some("Foo"),
+        "an op on the intermediate prefix truncates the deep narrowing",
+    );
+}
+
+#[test]
+fn narrow_place_multihop_sibling_write_keeps_slot() {
+    // Writing a sibling slot ($self->{a}{c}) doesn't disturb $self->{a}{b}.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($self) = @_;\n    return unless $self->{a}{b}->isa('Foo');\n    $self->{a}{c} = 1;\n    $self->{a}{b}->after;\n}",
+    );
+    assert_eq!(
+        invocant_class_of(&fa, "after").as_deref(),
+        Some("Foo"),
+        "a sibling-slot write does not truncate",
+    );
+}
+
+#[test]
 fn narrow_place_ref_eq() {
     let fa = build_fa(
         "package P;\nsub f {\n    my ($self) = @_;\n    return unless ref($self->{cfg}) eq 'HASH';\n    my $v = $self->{cfg};\n}",
