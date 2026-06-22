@@ -2,7 +2,7 @@
 
 A Perl language server with deep semantic intelligence. Built on [tree-sitter-perl](https://github.com/tree-sitter-perl/tree-sitter-perl) and tower-lsp.
 
-[![crates.io](https://img.shields.io/crates/v/perl-lsp.svg)](https://crates.io/crates/perl-lsp) [![CI](https://img.shields.io/github/actions/workflow/status/tree-sitter-perl/perl-lsp/ci.yml?branch=main)](https://github.com/tree-sitter-perl/perl-lsp/actions/workflows/ci.yml) [![VS Code](https://img.shields.io/visual-studio-marketplace/v/tree-sitter-perl.vscode-perl-lsp?label=VS%20Code)](https://marketplace.visualstudio.com/items?itemName=tree-sitter-perl.vscode-perl-lsp) [![License](https://img.shields.io/crates/l/perl-lsp.svg)](LICENSE)
+[![crates.io](https://img.shields.io/crates/v/perl-lsp.svg)](https://crates.io/crates/perl-lsp) [![CI](https://img.shields.io/github/actions/workflow/status/tree-sitter-perl/perl-lsp/ci.yml?branch=main)](https://github.com/tree-sitter-perl/perl-lsp/actions/workflows/ci.yml) [![VS Code](https://img.shields.io/badge/VS%20Code-Marketplace-blue)](https://marketplace.visualstudio.com/items?itemName=tree-sitter-perl.vscode-perl-lsp) [![License](https://img.shields.io/crates/l/perl-lsp.svg)](LICENSE)
 
 ![perl-lsp: cross-file type inference, completion, goto-def and rename](demo/perl-lsp.gif)
 
