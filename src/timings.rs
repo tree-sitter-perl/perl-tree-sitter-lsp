@@ -144,3 +144,33 @@ pub fn report() {
         total.as_secs_f64() * 1000.0
     );
 }
+
+// ── Fine-grained per-phase timing ──────────────────────────────────────
+//
+// `phase()` wraps a single build() pass or query step; `PERL_LSP_PHASE_TIMING`
+// turns it on — a finer cut than the per-module report above. All phase timing
+// routes through here (including the `bphase!` / `tphase!` call-site sugar) so
+// the gate is read once and the output format stays uniform.
+
+/// Cached `PERL_LSP_PHASE_TIMING` gate, read from the environment once so the
+/// hot build path never re-hits `std::env`.
+pub fn phases_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PERL_LSP_PHASE_TIMING").is_some())
+}
+
+/// Time `body`, returning its result; when phase timing is on, print
+/// `[PHASE] <label>  <ms>` to stderr, else run it untouched.
+#[inline]
+pub fn phase<T>(label: &str, body: impl FnOnce() -> T) -> T {
+    if !phases_enabled() {
+        return body();
+    }
+    let started = std::time::Instant::now();
+    let out = body();
+    eprintln!(
+        "[PHASE] {label:<32} {:>8.2} ms",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    out
+}

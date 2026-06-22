@@ -100,6 +100,7 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 - `module_cache.rs` — SQLite (schema v9, bincode+zstd FileAnalysis blob).
 - `cpanfile.rs` — cpanfile via tree-sitter queries.
 - `witnesses.rs` — witness bag + reducer registry for type inference.
+- `timings.rs` — **all profiling/timing instrumentation lives here.** Per-module build timings (`--timings` / `PERL_LSP_TIMINGS`, slowest-first report) and per-phase timing (`timings::phase` + the `bphase!`/`tphase!` call-site sugar, gated by `PERL_LSP_PHASE_TIMING`). Don't hand-roll env-gated `eprintln!` timers — route new timing through here so the gate is read once and the output format stays uniform.
 
 ## Cross-file resolution
 

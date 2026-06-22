@@ -166,6 +166,14 @@ fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'a> {
 }
 
 /// Build a FileAnalysis from a parsed tree in a single walk.
+/// Time one build() pass — `bphase!("walk", expr)` prints `[PHASE] build::walk`
+/// when `PERL_LSP_PHASE_TIMING` is set. Call-site sugar over `timings::phase`.
+macro_rules! bphase {
+    ($label:literal, $body:expr) => {
+        $crate::timings::phase(concat!("build::", $label), || $body)
+    };
+}
+
 pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     build_with_plugins(tree, source, default_plugin_registry())
 }
@@ -333,7 +341,7 @@ fn build_with_plugins_inner(
 
     // Create file-level scope and walk
     let file_scope = b.push_scope(ScopeKind::File, node_to_span(tree.root_node()), None);
-    b.visit_children(tree.root_node());
+    bphase!("walk(visit_children)", b.visit_children(tree.root_node()));
     // Still inside the file scope: synthesize Sub symbols for AutoLoader /
     // SelfLoader packages whose real definitions live in the `data_section`
     // after `__END__` (or `__DATA__`). Runs here so `package_uses` /
@@ -374,7 +382,7 @@ fn build_with_plugins_inner(
     b.flush_deferred_named_sub_param_types();
 
     // Post-pass 1: resolve variable refs -> resolves_to
-    b.resolve_variable_refs();
+    bphase!("resolve_variable_refs", b.resolve_variable_refs());
 
     // Export-list member refs: a `@EXPORT` / `@EXPORT_OK` / `%EXPORT_TAGS`
     // member naming a local sub gets a FunctionCall ref back to it. Runs
@@ -410,7 +418,7 @@ fn build_with_plugins_inner(
     // returning $self via an array-slice idiom). Provenance is
     // recorded in `type_provenance` (PluginOverride) so
     // `--dump-package` can answer "why does this return X?".
-    b.apply_type_overrides();
+    bphase!("apply_type_overrides", b.apply_type_overrides());
 
     // Post-walk bag-population pass: ref-derived facts that don't
     // need walk-time visibility — `HashRefAccess` observations from
@@ -418,7 +426,7 @@ fn build_with_plugins_inner(
     // writes. Variable witnesses for TCs and walk-time idiom witnesses
     // (branch arms, arity gating) are already in `b.bag` — pushed
     // live during the walk.
-    b.populate_witness_bag();
+    bphase!("populate_witness_bag", b.populate_witness_bag());
 
     // Forward-reference resolution: walk-time `expr_payload` arms for
     // `function_call_expression` / `bareword` / `scoped_identifier` did
@@ -429,7 +437,7 @@ fn build_with_plugins_inner(
     // them now against the final symbol table and push the
     // `Expr(span) → Edge(Symbol(sid))` witness the walk would have.
     // See `docs/prompt-forward-reference-resolution.md`.
-    b.resolve_forward_expr_witnesses();
+    bphase!("resolve_fwd_expr_witnesses", b.resolve_forward_expr_witnesses());
 
     // Worklist driver: one fixed-point loop over chain typing +
     // reducer dispatch (rather than a manually-ordered
@@ -453,16 +461,16 @@ fn build_with_plugins_inner(
     // Deeper chains take more iterations; `MAX_FOLD_ITERATIONS`
     // (debug-only) catches dependency-tracking bugs that would
     // otherwise spin forever.
-    let chain_idx = build_chain_typing_index(tree);
-    b.fold_to_fixed_point(&chain_idx);
+    let chain_idx = bphase!("build_chain_typing_index", build_chain_typing_index(tree));
+    bphase!("fold_to_fixed_point", b.fold_to_fixed_point(&chain_idx));
     // PostFold filled `invocant_class` on MethodCall refs after the
     // worklist exited; re-emit method-call return edges so
     // Expression(refidx) chases resolve through to
     // MethodOnClass{class, method} for any invocant freshly known.
     // Then push array contributions: spans queryable through the
     // freshly-published edges.
-    b.emit_method_call_return_edges();
-    b.emit_array_push_witnesses();
+    bphase!("emit_mc_return_edges", b.emit_method_call_return_edges());
+    bphase!("emit_array_push_witns", b.emit_array_push_witnesses());
     // Record each method-call invocant's resolved type at its span so
     // the tree-free query entry (`FileAnalysis::expr_type_at_span`) can
     // answer "what is this expression?" without a CST. Runs after array
@@ -470,14 +478,14 @@ fn build_with_plugins_inner(
     // `Variable{@arr}` Sequence. The build-time symbolic executor
     // (`invocant_type_at_node`) is the single structure-discovery site;
     // this pass records its answer.
-    b.emit_invocant_expr_witnesses(&chain_idx);
+    bphase!("emit_invocant_expr_witns", b.emit_invocant_expr_witnesses(&chain_idx));
 
     // Partial Mojo route targets (`->to('#action')`) inherit their
     // controller from a parent `->to('ctrl#')` via the route value's
     // brand, which only settles after the fold. Re-dispatch the route
     // plugins now that the brand is resolved. See
     // `docs/adr/route-branding.md`.
-    b.emit_partial_route_targets(&chain_idx);
+    bphase!("emit_partial_route_tgts", b.emit_partial_route_targets(&chain_idx));
 
     // Test-only: re-run the worklist fold one more time to pin
     // idempotency. Production callers always pass `false`; only
@@ -497,12 +505,12 @@ fn build_with_plugins_inner(
     // emission gated on the partially-resolved walk-time class, now it's
     // a single post-walk pass that joins refs to args via the chain
     // typing index.
-    b.emit_method_call_arg_keys(&chain_idx);
+    bphase!("emit_mc_arg_keys", b.emit_method_call_arg_keys(&chain_idx));
 
     // Post-pass: chained hashref-key accesses (`$obj->get_config->{host}`).
     // Runs post-fold so the method's return type is canonical — the
     // owner class is the chain receiver's type, unknowable until then.
-    b.emit_chained_hash_key_refs(&chain_idx);
+    bphase!("emit_chained_hk_refs", b.emit_chained_hash_key_refs(&chain_idx));
 
     // Post-pass: upgrade Variable-owned hash-key derefs whose variable's
     // type settled to a class DURING the fold (`my $row = $rs->find(1);
@@ -510,10 +518,10 @@ fn build_with_plugins_inner(
     // resolve_hash_key_owners ran). A Class owner routes the key to the
     // class's defs (DBIC columns, Moo slots); variables without a class
     // type keep their lexical grouping.
-    b.upgrade_variable_hash_key_owners();
+    bphase!("upgrade_var_hk_owners", b.upgrade_variable_hash_key_owners());
 
     // Post-pass 5: fill in tail POD docs for subs that didn't get preceding doc
-    b.resolve_tail_pod_docs();
+    bphase!("resolve_tail_pod_docs", b.resolve_tail_pod_docs());
 
     let mut fa = FileAnalysis::new(crate::file_analysis::FileAnalysisParts {
         scopes: b.scopes,
@@ -552,7 +560,7 @@ fn build_with_plugins_inner(
     // For every assignment the unified typer (run before
     // `resolve_return_types` above) couldn't handle, MCB fills in.
     // Cross-file enrichment also reuses MCB resolution without a tree.
-    fa.finalize_post_walk();
+    bphase!("finalize_post_walk", fa.finalize_post_walk());
 
     fa
 }
@@ -11747,6 +11755,31 @@ impl<'a> Builder<'a> {
         if self.pod_texts.is_empty() {
             return;
         }
+        if crate::timings::phases_enabled() {
+            let nsubs = self.symbols.iter().filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method)).count();
+            let podbytes: usize = self.pod_texts.iter().map(|p| p.len()).sum();
+            eprintln!(
+                "[PHASE] {:<32} {} subs, {} pod_texts, {} pod_bytes",
+                "build::tail_pod_inputs",
+                nsubs,
+                self.pod_texts.len(),
+                podbytes
+            );
+        }
+        // One name → doc map across every POD block. Within a block `=head2`
+        // wins over `=item`; across blocks the earlier `pod_text` wins
+        // (`or_insert`), so a sub resolves to the first matching section in
+        // source order.
+        let mut sections: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for pod_text in &self.pod_texts {
+            for (name, md) in crate::pod::extract_sub_doc_sections(pod_text) {
+                sections.entry(name).or_insert(md);
+            }
+        }
+        if sections.is_empty() {
+            return;
+        }
         for sym in &mut self.symbols {
             if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                 continue;
@@ -11755,20 +11788,8 @@ impl<'a> Builder<'a> {
                 if doc.is_some() {
                     continue; // already has preceding doc
                 }
-                // Search pod texts for =head2 matching this sub name, fall back to =item
-                for pod_text in &self.pod_texts {
-                    if let Some(md) = crate::pod::extract_head2_section(&sym.name, pod_text) {
-                        if !md.is_empty() {
-                            *doc = Some(md);
-                            break;
-                        }
-                    }
-                    if let Some(md) = crate::pod::extract_item_section(&sym.name, pod_text) {
-                        if !md.is_empty() {
-                            *doc = Some(md);
-                            break;
-                        }
-                    }
+                if let Some(md) = sections.get(&sym.name) {
+                    *doc = Some(md.clone());
                 }
             }
         }
@@ -12044,6 +12065,14 @@ impl<'a> Builder<'a> {
             prev = cur;
         }
         self.run_chain_typing_reducer(idx, ChainPassMode::PostFold);
+        if crate::timings::phases_enabled() {
+            eprintln!(
+                "[PHASE] {:<32} {} iters, bag.len={}",
+                "build::fold_iterations",
+                iters,
+                self.bag.len()
+            );
+        }
     }
 
     /// Snapshot of the answers the worklist driver tracks for fixed

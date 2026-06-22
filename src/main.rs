@@ -628,16 +628,24 @@ fn cli_semantic_tokens(root: &str, file: &str) {
 /// Build an open `Document` (tree + analysis + stable_outline) and enrich it
 /// against the index exactly like the server's open-file path. Shared by the
 /// interactive CLI modes.
+/// Time one CLI query step — `tphase!("completion_items", expr)` prints a
+/// `[PHASE]` line when `PERL_LSP_PHASE_TIMING` is set. Sugar over `timings::phase`.
+macro_rules! tphase {
+    ($label:literal, $body:expr) => {
+        $crate::timings::phase($label, || $body)
+    };
+}
+
 fn cli_open_document(file: &str, idx: &module_index::ModuleIndex) -> document::Document {
     let text = std::fs::read_to_string(file).unwrap_or_else(|e| {
         eprintln!("Cannot read {}: {}", file, e);
         std::process::exit(1);
     });
-    let mut doc = document::Document::new(text).unwrap_or_else(|| {
+    let mut doc = tphase!("Document::new (parse+build)", document::Document::new(text).unwrap_or_else(|| {
         eprintln!("Parse failed: {}", file);
         std::process::exit(1);
-    });
-    doc.analysis.enrich_imported_types_with_keys(Some(idx));
+    }));
+    tphase!("enrich_imported_types", doc.analysis.enrich_imported_types_with_keys(Some(idx)));
     doc
 }
 
@@ -853,9 +861,9 @@ fn run_one(
         }
         "completion" => {
             let doc = cli_open_document(file, idx);
-            let items = symbols::completion_items(
+            let items = tphase!("completion_items", symbols::completion_items(
                 &doc.analysis, &doc.tree, &doc.text, pos, idx,
-                Some(doc.stable_outline.package_lines()));
+                Some(doc.stable_outline.package_lines())));
             let mut out = String::new();
             for it in &items {
                 match &it.detail {

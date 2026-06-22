@@ -155,6 +155,85 @@ pub fn extract_perlfunc_items(pod_text: &str) -> std::collections::HashMap<Strin
     out
 }
 
+/// Extract a doc section for every documented sub name in a POD block —
+/// both `=head2 name` sections and `=item name` entries — into one
+/// `name → markdown` map in a single parse + linear walk. `=head2` wins over
+/// `=item` for the same name. The batched companion to `extract_head2_section`
+/// / `extract_item_section`: for callers that want every sub's doc at once
+/// rather than one block-parse per sub.
+pub fn extract_sub_doc_sections(pod_text: &str) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let tree = match parse_pod(pod_text) {
+        Some(t) => t,
+        None => return out,
+    };
+    let bytes = pod_text.as_bytes();
+    let root = tree.root_node();
+
+    // `current` is the section currently being collected, tagged by whether it
+    // came from a `=head2` (priority) or an `=item`. We flush on the next
+    // boundary command. A `=head2`-sourced section overwrites a prior
+    // `=item`-sourced one for the same name; never the reverse.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Src { Head2, Item }
+    let mut current: Option<(String, Src, String)> = None;
+
+    let flush = |out: &mut std::collections::HashMap<String, String>,
+                 sec: Option<(String, Src, String)>| {
+        if let Some((name, src, body)) = sec {
+            let body = body.trim().to_string();
+            if body.is_empty() {
+                return;
+            }
+            match (src, out.get(&name)) {
+                // head2 always wins; item only fills a gap.
+                (Src::Head2, _) => { out.insert(name, body); }
+                (Src::Item, None) => { out.insert(name, body); }
+                (Src::Item, Some(_)) => {}
+            }
+        }
+    };
+
+    for i in 0..root.named_child_count() {
+        let child = match root.named_child(i) {
+            Some(c) => c,
+            None => continue,
+        };
+        if child.kind() == "command_paragraph" {
+            let cmd = get_command_name(&child, bytes);
+            if cmd == "=head2" {
+                flush(&mut out, current.take());
+                let content = get_content_text(&child, bytes);
+                let head_name = content
+                    .split(|c: char| c == '(' || c.is_whitespace())
+                    .next()
+                    .unwrap_or("");
+                if !head_name.is_empty() {
+                    current = Some((head_name.to_string(), Src::Head2, String::new()));
+                }
+                continue;
+            }
+            if cmd == "=item" {
+                flush(&mut out, current.take());
+                let content = get_content_text(&child, bytes);
+                if let Some(name) = extract_item_method_name(&content) {
+                    current = Some((name.to_string(), Src::Item, String::new()));
+                }
+                continue;
+            }
+            if cmd == "=back" || cmd == "=head1" || cmd == "=head3" || cmd == "=cut" {
+                flush(&mut out, current.take());
+                continue;
+            }
+        }
+        if let Some((_, _, body)) = current.as_mut() {
+            render_node(child, bytes, body);
+        }
+    }
+    flush(&mut out, current.take());
+    out
+}
+
 /// Identifier name from a `=item` line in `perlfunc.pod`. Each entry
 /// looks like `=item NAME[ SIGNATURE]`; we take the first
 /// whitespace-delimited token and validate it as a plausible builtin

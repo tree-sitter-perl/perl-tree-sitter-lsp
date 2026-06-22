@@ -41,7 +41,9 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("file_store", Index),
         ("resolve", Index),
         ("document", Index),
-        ("timings", Index),
+        // Leaf instrumentation util (std-only, no crate imports): lives at the
+        // bottom so every layer — builder included — may import it downward.
+        ("timings", Model),
         ("builtins_pod", Index),
         ("backend", Lsp),
         ("symbols", Lsp),

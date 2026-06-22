@@ -29,8 +29,17 @@ impl Document {
         if elapsed.as_millis() > 100 {
             log::warn!("Slow parse (new): {:?} for {} bytes", elapsed, text.len());
         }
-        let analysis = builder::build(&tree, text.as_bytes());
-        let stable_outline = StableOutline::from_analysis(&analysis);
+        if crate::timings::phases_enabled() {
+            eprintln!(
+                "[PHASE] {:<32} {:>8.2} ms ({} bytes)",
+                "parse",
+                elapsed.as_secs_f64() * 1000.0,
+                text.len()
+            );
+        }
+        let analysis = crate::timings::phase("build()", || builder::build(&tree, text.as_bytes()));
+        let stable_outline =
+            crate::timings::phase("stable_outline", || StableOutline::from_analysis(&analysis));
         Some(Document { text, tree, analysis, stable_outline })
     }
 
