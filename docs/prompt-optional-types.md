@@ -133,11 +133,17 @@ green.
   lifts the agreed `T` to `Optional<T>` when an undef arm is present.
   Composes with `defined`: `my $x = $c ? Foo->new : undef; return unless
   defined $x; $x->go` dispatches on `Foo`.
+- **Type::Tiny `Maybe[T]` / `Optional[T]` (LANDED):** `map_isa_to_type`
+  maps a `Maybe[…]` / `Optional[…]` isa string to `Optional<inner>`,
+  recursing on the wrapped constraint (`Maybe[Int] → Optional<Numeric>`,
+  `Maybe[InstanceOf['Foo']] → Optional<Foo>`). Checked before the
+  InstanceOf/Moose-class fallbacks. Covers the quoted-string isa form;
+  the bareword Type::Tiny constructor form (its own
+  `TypeConstraintOf` path) is a follow-up.
 - Still deferred: `SlotTypeFold` ({T, undef} slot writes → Optional);
   bare `return;` as an undef arm (wider gold blast radius);
   `TypeProvenance::ReducerFold { reducer: "optional_join" }` for
-  `--dump-package`; Type::Tiny `Maybe[T]` / `Optional[T]` →
-  `Optional(Box<T>)`.
+  `--dump-package`; the bareword Type::Tiny `Maybe[…]` form.
 
 ## Sequencing wrinkle (Phase 2+)
 
