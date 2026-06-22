@@ -898,6 +898,15 @@ pub enum InferredType {
         keys: Vec<(String, Option<Box<InferredType>>)>,
         open: bool,
     },
+    /// `Optional(Box<T>)` — value-or-undef (Type::Tiny `Maybe[T]` /
+    /// `Optional[T]`). Produced when an arm/branch fold sees `{T, undef}`:
+    /// the join of a concrete arm with an undef arm. `defined $x` /
+    /// `blessed $x` narrowing strips it back to `T`. NOT a class itself —
+    /// `class_name()` returns `None` (an optional is not *definitely* an
+    /// instance), so it cannot dispatch until narrowed. See
+    /// `docs/prompt-optional-types.md`. Kept at the END for bincode
+    /// variant-index stability (bump `EXTRACT_VERSION`).
+    Optional(Box<InferredType>),
 }
 
 /// Concrete parametric flavors + type-level operators. Each
@@ -1203,6 +1212,14 @@ impl InferredType {
             }
             (InferredType::Sequence(_), InferredType::ArrayRef) => true,
             (a @ InferredType::Sequence(_), b @ InferredType::Sequence(_)) => a == b,
+            // An optional subsumes a narrowing only as specifically as its
+            // inner does; a CONCRETE self is at least as specific as an
+            // optional narrowing (the narrowing already happened). The
+            // reverse — `Optional` vs a concrete narrowing — falls to the
+            // discriminant check below and is `false`, so a `defined` /
+            // `blessed` guard's `Optional<T> → T` refinement wins.
+            (InferredType::Optional(a), InferredType::Optional(b)) => a.subsumes_narrowing(b),
+            (a, InferredType::Optional(b)) => a.subsumes_narrowing(b),
             // Unit-shape variants subsume themselves; mismatched
             // discriminants don't subsume.
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
@@ -1295,6 +1312,24 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
         }
     }
     object
+}
+
+/// Join return/branch arms where some arm may be `undef` (a bare
+/// `return;`, `return undef`, or an `undef` branch). The value arms fold
+/// by [`resolve_return_type`]; if any arm was undef and the value arms
+/// agree on a single non-optional `T`, the result is `Optional<T>` —
+/// `{Foo, undef} → Optional<Foo>`. No undef arm leaves the fold
+/// unchanged; genuinely-conflicting value arms (`Foo` vs `Bar`) stay
+/// `None` (no arbitrary union); only-undef arms stay `None` (no useful
+/// value type). See `docs/prompt-optional-types.md`.
+pub fn join_return_arms(value_types: &[InferredType], has_undef_arm: bool) -> Option<InferredType> {
+    let base = resolve_return_type(value_types);
+    match base {
+        Some(t) if has_undef_arm && !matches!(t, InferredType::Optional(_)) => {
+            Some(InferredType::Optional(Box::new(t)))
+        }
+        other => other,
+    }
 }
 
 // ---- Handler owner ----
@@ -8840,6 +8875,9 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
         InferredType::TypeConstraintOf(_) => "Object:Type::Tiny".to_string(),
         // Method dispatch is against the base; tag like any object.
         InferredType::BrandedRoute { base, .. } => format!("Object:{}", base),
+        // Optional dispatches nowhere until narrowed; tag the inner so the
+        // wire format stays backward-compatible, prefixed Maybe.
+        InferredType::Optional(inner) => format!("Maybe:{}", inferred_type_to_tag(inner)),
     }
 }
 
@@ -8904,6 +8942,7 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
             Some(c) => format!("{}<controller={}>", base, c),
             None => base.clone(),
         },
+        InferredType::Optional(inner) => format!("Maybe<{}>", format_inferred_type(inner)),
     }
 }
 

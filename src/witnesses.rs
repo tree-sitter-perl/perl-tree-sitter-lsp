@@ -845,19 +845,30 @@ impl WitnessReducer for SymbolReturnArmFold {
     }
 
     fn claims(&self, w: &Witness) -> bool {
-        matches!(w.attachment, WitnessAttachment::SymbolReturnArm(_))
-            && matches!(w.payload, WitnessPayload::InferredType(_))
+        if !matches!(w.attachment, WitnessAttachment::SymbolReturnArm(_)) {
+            return false;
+        }
+        match &w.payload {
+            WitnessPayload::InferredType(_) => true,
+            // The `return undef` arm marker (no rvalue type to materialize).
+            WitnessPayload::Fact { family, .. } => family == "undef_arm",
+            _ => false,
+        }
     }
 
     fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
-        let arms: Vec<InferredType> = ws
-            .iter()
-            .filter_map(|w| match &w.payload {
-                WitnessPayload::InferredType(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
-        match crate::file_analysis::resolve_return_type(&arms) {
+        let mut arms: Vec<InferredType> = Vec::new();
+        let mut has_undef_arm = false;
+        for w in ws {
+            match &w.payload {
+                WitnessPayload::InferredType(t) => arms.push(t.clone()),
+                WitnessPayload::Fact { family, .. } if family == "undef_arm" => {
+                    has_undef_arm = true
+                }
+                _ => {}
+            }
+        }
+        match crate::file_analysis::join_return_arms(&arms, has_undef_arm) {
             Some(t) => ReducedValue::Type(t),
             None => ReducedValue::None,
         }

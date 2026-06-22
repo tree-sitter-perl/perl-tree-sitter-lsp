@@ -1447,12 +1447,15 @@ fn test_return_type_all_bare_returns() {
 }
 
 #[test]
-fn test_return_type_undef_filtered() {
-    // return undef + typed return → undef is filtered, typed return wins
+fn test_return_type_undef_optional() {
+    // return undef + typed return → Optional<typed>: the sub CAN return undef,
+    // so its value is optional (docs/prompt-optional-types.md). Bare `return;`
+    // is still filtered (Phase 2) — see test_return_type_bare_return_filtered.
     let fa = build_fa("sub maybe {\n    return undef unless 1;\n    return { a => 1 };\n}");
+    let t = fa.sub_return_type_at_arity("maybe", None);
     assert!(
-        fa.sub_return_type_at_arity("maybe", None).is_some_and(|t| t.is_hash_shaped()),
-        "hash-shaped",
+        matches!(&t, Some(InferredType::Optional(inner)) if inner.is_hash_shaped()),
+        "Optional<hash-shaped>, got {t:?}",
     );
 }
 
@@ -15183,6 +15186,32 @@ fn narrow_conjunction_intersects() {
         fa.inferred_type_via_bag("$x", Point::new(4, 8)),
         Some(InferredType::ClassName("Foo".into())),
         "&&-chain narrows on the isa conjunct",
+    );
+}
+
+// ── Optional types (phase 1): `return undef` ──
+
+#[test]
+fn optional_return_undef_or_value() {
+    let fa = build_fa(
+        "package P;\nsub maybe_make {\n    my ($ok) = @_;\n    return undef unless $ok;\n    return Foo->new;\n}",
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("maybe_make", None),
+        Some(InferredType::Optional(Box::new(InferredType::ClassName("Foo".into())))),
+        "return undef + return Foo->new folds to Optional<Foo>",
+    );
+}
+
+#[test]
+fn optional_not_applied_without_undef_arm() {
+    // No undef arm → plain ClassName, not Optional (existing behavior).
+    let fa = build_fa(
+        "package P;\nsub make {\n    my ($ok) = @_;\n    return Foo->new;\n}",
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("make", None),
+        Some(InferredType::ClassName("Foo".into())),
     );
 }
 
