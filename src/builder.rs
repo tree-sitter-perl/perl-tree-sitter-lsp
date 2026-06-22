@@ -6846,10 +6846,11 @@ impl<'a> Builder<'a> {
                 node.child_by_field_name("alternative"),
             ];
             for arm in arms.into_iter().flatten() {
-                // An `undef` arm makes the ternary optional; mark it like a
-                // `return undef` arm so `BranchArmFold` lifts `{T, undef}`
-                // to `Optional<T>` via the shared join.
-                if arm.kind() == "undef_expression" {
+                // `undef` and the empty list `()` (a `stub_expression`,
+                // which coerces to undef in scalar context) make the ternary
+                // optional; mark either like a `return undef` arm so
+                // `BranchArmFold` lifts `{T, undef}` to `Optional<T>`.
+                if matches!(arm.kind(), "undef_expression" | "stub_expression") {
                     self.bag.push(Witness {
                         attachment: arm_att.clone(),
                         source: WitnessSource::Builder("undef_arm".into()),

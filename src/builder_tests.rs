@@ -15259,6 +15259,19 @@ fn optional_ternary_production() {
 }
 
 #[test]
+fn optional_ternary_empty_list_arm() {
+    // `()` coerces to undef in scalar context, so it's an undef arm too.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($c) = @_;\n    my $x = $c ? Foo->new : ();\n    $x;\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 4)),
+        Some(InferredType::Optional(Box::new(InferredType::ClassName("Foo".into())))),
+        "$c ? Foo->new : () produces Optional<Foo>",
+    );
+}
+
+#[test]
 fn optional_ternary_then_defined_narrows() {
     let fa = build_fa(
         "package P;\nsub f {\n    my ($c) = @_;\n    my $x = $c ? Foo->new : undef;\n    return unless defined $x;\n    $x->go;\n}",
