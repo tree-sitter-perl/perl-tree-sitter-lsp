@@ -87,6 +87,13 @@ iteration (clear-and-emit on tag `defined_narrowing`).
   the constant-key aliasing conservatism (a write via a *different* key
   spelling that equals `$k` at runtime doesn't truncate — already true
   for constant keys; a precision gap, never a crash).
+  - *Tradeoff to decide at implementation:* alternatively treat **any
+    dynamic-key write to the container** (`$self->{$j} = …`) as an
+    *escape* that re-widens every narrowed slot of that container. That
+    closes the aliasing hole (sound) at the cost of precision
+    (over-truncates when the dynamic write hit a different key). Applies
+    to constant-key places too — it's the general soundness-vs-precision
+    knob for slot narrowing.
 - elsif-chain cumulative negation (needs intersection across conditions);
 - general `Not`/`Difference` negation — parked, no positive lookup
   target, no consumer value;
