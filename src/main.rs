@@ -17,6 +17,8 @@ mod plugin_cli;
 mod pod;
 mod query_cache;
 mod resolve;
+#[cfg(feature = "salsa_bench")]
+mod salsa_bench;
 mod symbols;
 mod timings;
 mod witnesses;
@@ -46,6 +48,11 @@ async fn main() {
     match args.get(1).map(|s| s.as_str()) {
         Some("--check") => {
             cli_check(&args[2..]);
+            return;
+        }
+        #[cfg(feature = "salsa_bench")]
+        Some("--salsa-bench") if args.len() >= 3 => {
+            salsa_bench::run(&args[2]);
             return;
         }
         Some("--outline") if args.len() >= 3 => {

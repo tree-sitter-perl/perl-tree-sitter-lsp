@@ -22,8 +22,13 @@ default = []
 # perpetual yellow output. Run with:
 #   cargo test --release --features perf_bench bench_refs_to
 perf_bench = []
+# Salsa incremental-computation evaluation spike (`--salsa-bench <root>`).
+# Off by default; pulls in the `salsa` crate only when evaluating the
+# incremental-framework migration. See docs/eval-salsa-incremental.md.
+salsa_bench = ["dep:salsa"]
 
 [dependencies]
+salsa = { version = "0.27", optional = true }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
 tree-sitter = "0.25"

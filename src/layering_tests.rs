@@ -51,6 +51,9 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("plugin_cli", Lsp),
         ("main", Lsp),
         ("layering_tests", Lsp),
+        // Feature-gated eval spike (`--features salsa_bench`); CLI-driven like
+        // `main`, imports only downward (builder/model/index).
+        ("salsa_bench", Lsp),
     ])
 }
 
