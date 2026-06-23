@@ -114,9 +114,14 @@ shaping the node.
 
 - **File roles** stay `RoleMask` — enumeration, not traversal
   (`adr/graph-walking.md`).
-- **Stack-graphs upstream** — evaluated, not adopted. The Rust-API
-  construction path would restate Perl-specific emission (plugin
-  namespaces, framework synthesis) in their pipeline; a custom
-  typed-edge view integrates with the existing builder + witness/
-  reducer pipeline at a few hundred lines. Revisit only if their path
-  semantics + tooling become worth that boundary.
+- **Stack-graphs upstream** — evaluated with a running spike + a gold-corpus
+  coverage census + a dependency/LOC count; **not adopted**. Full write-up:
+  `docs/adr/stack-graphs-evaluation.md` (spike: `docs/stack-graphs-spike.rs`).
+  The short of it: stack graphs do name binding, not type inference, and in
+  Perl the dominant `$obj->method` case is type-gated — so they'd cover ~38%
+  of resolution rows while re-encoding rules we already have, and leave the
+  ~62% type/framework-gated rows on the witness bag. The custom typed-edge
+  view (`graph.rs`, 172 lines) integrates with the witness/reducer pipeline
+  and carries types on edges, which stack graphs cannot. Revisit only if
+  stack graphs gain value/type-flow semantics AND an upstream Perl definition
+  exists.
