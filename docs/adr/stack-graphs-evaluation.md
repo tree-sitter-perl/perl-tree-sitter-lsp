@@ -166,6 +166,27 @@ class), and (2) an upstream Perl `tree-sitter-stack-graphs` definition exists
 Absent both, the custom typed-edge view (`graph.rs`) integrated with the
 witness/reducer pipeline remains the smaller, more elegant, type-aware design.
 
+## Baseline (CI-measured, gold corpus, PR #95)
+
+The current engine — *with* type inference — on the pinned substrate
+(`run.pl`, GitHub Actions): **187 PASS / 12 xfail / 0 FAIL / 0 CRASH**.
+Per-capability query cost (mean / max ms, end-to-end incl. harness overhead):
+
+| capability | n | mean | max |
+|---|---|---|---|
+| definition | 22 | 19.6 | 80.8 |
+| references | 21 | 32.9 | 114.8 |
+| rename | 9 | 23.8 | 27.8 |
+| hover | 28 | 35.2 | 103.9 |
+| type-at | 20 | 31.5 | 102.9 |
+
+Startup (cold workspace index + cache warm): tiny fixtures 28–65 ms; the **full
+CPAN substrate 5.65 s** (one-time, cached after). Suite wall 16.2 s, peak RSS
+540 MB. Takeaway: resolution is already interactive (~20–35 ms mean) *including*
+the type inference stack graphs can't do, and the dominant cost is the cross-file
+index — which a second stack-graph store would also have to pay, on top. There is
+no latency headroom for stack graphs to unlock.
+
 ## Reproduce
 
 - Spike: copy `docs/stack-graphs-spike.rs` into a crate with
