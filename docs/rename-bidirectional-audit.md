@@ -136,13 +136,59 @@ single-file `rename_at` path.
   query time. Where the owner can't be resolved, the site simply doesn't match
   — no false edit.
 
-**Recommended direction (decide before fixing #1–#4):** drop the
-`supports_cross_file_rename` gate for the owner-resolved hash-key/handler kinds
-and route their rename through `refs_to` (masked to EDITABLE), exactly like
-references. The single-file `rename_at` path stays only for genuinely lexical
-targets (`Local`). This is one change that fixes findings #1 and the in-file
-half of #3, and aligns rename with references by construction (rule #5: shared
-extraction, one source of truth).
+**Recommended direction (decide before fixing #1–#4):** route the
+owner-resolved hash-key/handler kinds through `refs_to` (masked to EDITABLE),
+exactly like references, leaving the single-file `rename_at` path only for
+genuinely lexical (`Local`) targets.
+
+### Update — the gate is necessary but NOT sufficient (experiment, this branch)
+
+Flipping the gate per kind and measuring (fixtures in `scratchpad/hk/`, plus
+`test_files/plugin_events_*.pl`) revised the picture. **Removing the gate alone
+delivers none of the cross-file wins** — it's a symptom, not the lever:
+
+- **Handler** (finding #1): flipping it *does* fan out in-file + cross-file
+  symmetrically (def↔emit↔unsubscribe, both stacked `->on` registrations) —
+  BUT every edit spans the event name *with its surrounding quotes*
+  (`'connect'` → `RENAMED`, dropping the quotes and breaking the literal). The
+  name span is `args[0].span` from `frameworks/mojo-events.rhai` (the whole
+  string-literal node). So the gate's "not wired yet" was partly *real*:
+  handler rename needs a rename-ready inner-name span (and matching
+  `prepareRename`) before it can be unblocked. This is true even single-file —
+  the old path was already quote-stripping, just on one site.
+- **Hash keys** (findings #2/#3): flipping `HashKeyOfClass`/`HashKeyOfSub`
+  changed the cross-file result **not at all**. Renaming a return-hash key from
+  the producer def still doesn't reach the consumer access, because the
+  producer's key is owned `Sub{Some("Cfg"), get_config}` while the consumer's
+  enriched access is owned `Sub{None, get_config}` (`enrich_imported_types_
+  with_keys` stamps imported subs with `package: None`). The `HashKeyOfSub` arm
+  in `collect_from_analysis` requires `package` *and* `name` to match, so the
+  two never link. The phantom `(0,0)` synthetic-def edit (finding #3b) is also
+  present **with the gate either way**. In-file rename stays correct after the
+  flip (the three landed fixes already made it symmetric via the single-file
+  path; `refs_to` returns the same set), so the flip is *safe* but inert.
+- One test, `resolve::tests::test_resolve_symbol_owned_hash_key`, explicitly
+  asserts `!supports_cross_file_rename()` for a `HashKeyOfClass` — it pins the
+  in-file-only assumption and must be updated when the gate moves.
+
+**Revised plan — fix the real blockers first, then drop the gate per kind as
+the *last* step of each:**
+
+1. **Hash keys cross-file** (finding #3): reconcile consumer owner identity —
+   either stamp the enriched/synthetic access owner with the *producer's*
+   package (`Sub{Some(pkg),f}`), or relax the `HashKeyOfSub` match to treat a
+   `None` package as a wildcard for a known imported sub. Then suppress the
+   zero-span synthetic def (#3b). *Then* flip the gate for `HashKeyOfSub`/
+   `HashKeyOfClass` and update the pinning test. In-file already symmetric.
+2. **Moo slot / mapped accessors** (finding #2): add the `field_group_at` arm
+   (`HashKeyAccess{owner:Class(C)}` → group) + mapped-accessor→attr reverse
+   index. This routes through the `Group` path (already cross-file), so it may
+   not even need the gate change.
+3. **Handlers** (finding #1): give event names a rename-ready inner-name span
+   (plugin emit + `prepareRename`), *then* flip the gate for `Handler`.
+
+The shared end-state is still "rename == references" — but each kind needs its
+own blocker cleared; the gate is the final flip, not the fix.
 
 ---
 

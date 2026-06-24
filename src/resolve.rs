@@ -78,11 +78,17 @@ impl TargetRef {
         TargetRef { name, kind, method_classes: Vec::new() }
     }
 
-    /// Rename policy, asked of the target rather than re-encoded per handler:
-    /// callables and packages rewrite everywhere; hash keys are in-file-only
-    /// by design (an unowned spelling elsewhere may be a different key);
-    /// handler cross-file rename isn't wired yet. References intentionally
-    /// ignores this — it walks every target kind cross-file.
+    /// Which targets rename through `refs_to` (cross-file, owner/scope-
+    /// structural) rather than the single-file `rename_at` fallback —
+    /// references walks *every* kind cross-file; rename does not. The gap is
+    /// being closed per kind (see `docs/rename-bidirectional-audit.md`), but
+    /// the gate is NOT the sole blocker: flipping it for the remaining kinds
+    /// changes nothing useful on its own. Hash keys need producer↔consumer
+    /// owner reconciliation (`Sub{Some(pkg),f}` vs the enriched/synthetic
+    /// `Sub{None,f}`) plus suppression of the zero-span synthetic def;
+    /// handlers need rename-ready name spans (the event-name span includes
+    /// its surrounding quotes today, so a bare replacement would strip them).
+    /// Until those land, widening this predicate ships broken edits.
     pub fn supports_cross_file_rename(&self) -> bool {
         matches!(
             self.kind,
