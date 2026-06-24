@@ -5377,7 +5377,7 @@ sub run {
                 owner: HandlerOwner::Class("Producer".to_string()),
                 name: "ready".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -9385,7 +9385,7 @@ $minion->enqueue(task_x => ['arg'] => { });
     }
 
     // Completion path surfaces the plugin's HashKeyDefs.
-    let candidates = fa.complete_hash_keys_for_sub("enqueue", cursor);
+    let candidates = fa.complete_hash_keys_for_sub("enqueue", cursor, None);
     let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
     for expected in &["priority", "queue", "delay", "attempts"] {
         assert!(
@@ -10729,7 +10729,7 @@ sub action {
     // so this stays a soft observation for the spike rather than a
     // hard assert. The load-bearing claim is the array hop, not the
     // FA-side hash-key API.
-    let keys = app_fa.complete_hash_keys_for_class("Some::User", Point::new(0, 0));
+    let keys = app_fa.complete_hash_keys_for_class("Some::User", Point::new(0, 0), None);
     let key_names: std::collections::HashSet<&str> =
         keys.iter().map(|c| c.label.as_str()).collect();
     let _ = key_names; // intentionally not asserted in the spike
@@ -11865,7 +11865,7 @@ fn sub_exporter_member_goto_def_and_references() {
             kind: TargetKind::Sub {
                 package: Some("My::Exp".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -12513,7 +12513,7 @@ sub go {
             &TargetRef {
                 name: name.to_string(),
                 kind: TargetKind::Sub { package: Some("Foo".to_string()) },
-                method_classes: Vec::new(),
+                method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
             },
             RoleMask::EDITABLE,
         );
@@ -12631,7 +12631,7 @@ sub go {
             &TargetRef {
                 name: name.to_string(),
                 kind: TargetKind::Sub { package: Some("Foo".to_string()) },
-                method_classes: Vec::new(),
+                method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
             },
             RoleMask::EDITABLE,
         );
@@ -13398,7 +13398,7 @@ sub retry {
             kind: TargetKind::Sub {
                 package: Some("QA::C".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -13518,7 +13518,7 @@ sub opt_b { 'b' }
             kind: TargetKind::Sub {
                 package: Some("QA::E".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );

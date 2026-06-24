@@ -2500,6 +2500,12 @@ pub struct FieldProjections {
     /// An `InternalKey` projection was minted (hash-backed repr) —
     /// `$obj->{attr}` slot pokes join the group, cross-file included.
     pub has_internal: bool,
+    /// A `Class(class)`-owned `HashKeyDef` backs this attr (DBIC columns,
+    /// `Class::Accessor`): the key is reached `found_by`-style, so every
+    /// access named `attr` — direct deref `$row->{attr}`, search/find/update
+    /// arg keys (`Sub{class, verb}`-owned) — joins the group. Distinct from
+    /// `has_internal` (STRICT `Class` match, Moo/bless internal slots).
+    pub has_class_key: bool,
     /// Origin-file variable spellings (decl + body uses), bare-adjusted.
     pub variable_spans: Vec<Span>,
     /// Plugin-declared, name-mapped members (`predicate => has_size`).
@@ -3608,7 +3614,13 @@ impl FileAnalysis {
         // the only piece still needed by enrichment; imported return
         // types are reached lazily by `query_sub_return_type` walking
         // `module_index.find_exporters(name)`.
-        let mut imported_hash_keys: HashMap<String, Vec<String>> = HashMap::new();
+        // func name → (producer package, keys). The producer package is the
+        // load-bearing piece: a consumer's `$cfg->{host}` access must carry the
+        // SAME owner the producer's `host` HashKeyDef does
+        // (`Sub{Some("Cfg"), get_config}`), or cross-file rename/references
+        // never link the two. Dropping it to `None` (the old default) was a
+        // lossy projection of a package the index already knows.
+        let mut imported_hash_keys: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
         let mut imported_returns: HashMap<String, InferredType> = HashMap::new();
         if let Some(idx) = module_index {
             for import in &self.imports {
@@ -3628,7 +3640,8 @@ impl FileAnalysis {
                     if let Some(sub_info) = cached.sub_info(&sym.name) {
                         let hk = sub_info.hash_keys();
                         if !hk.is_empty() {
-                            imported_hash_keys.insert(sym.name.clone(), hk.to_vec());
+                            imported_hash_keys
+                                .insert(sym.name.clone(), (sym.package.clone(), hk.to_vec()));
                         }
                     }
                 }
@@ -3658,34 +3671,12 @@ impl FileAnalysis {
             self.push_type_constraint(tc);
         }
 
-        // Inject synthetic HashKeyDef symbols for imported functions' hash keys.
-        // Imported subs have no local package — package=None mirrors the
-        // HashKeyAccess fixup's default for imported bindings.
-        for (func_name, keys) in &imported_hash_keys {
-            let owner = HashKeyOwner::Sub { package: None, name: func_name.clone() };
-            for key_name in keys {
-                let id = SymbolId(self.symbols.len() as u32);
-                let zero_span = Span {
-                    start: Point { row: 0, column: 0 },
-                    end: Point { row: 0, column: 0 },
-                };
-                self.symbols.push(Symbol {
-                    id,
-                    name: key_name.clone(),
-                    kind: SymKind::HashKeyDef,
-                    span: zero_span,
-                    selection_span: zero_span,
-                    scope: ScopeId(0),
-                    package: None,
-                    detail: SymbolDetail::HashKeyDef {
-                        owner: owner.clone(),
-                        is_dynamic: false,
-                    },
-                    namespace: Namespace::Language,
-                    outline_label: None,
-                });
-            }
-        }
+        // No synthetic HashKeyDef is materialized for imported keys: the
+        // producer's real def is the single source. Completion reaches it
+        // cross-file (`complete_hash_keys_for_owner` walks the index for a
+        // `Sub` owner); rename/references/goto-def reach it via the owner edge
+        // the fixup below stamps. A location-less stub would only re-appear as
+        // a phantom `0:0` decl in those queries.
 
         // HashKeyAccess owner fixup for imports: the builder's pass
         // only ran for bindings where the func's return type was
@@ -3714,10 +3705,10 @@ impl FileAnalysis {
                         continue;
                     }
                     if let Some(func_name) = binding_by_var.get(var_text.as_str()) {
-                        if let Some(keys) = imported_hash_keys.get(func_name) {
+                        if let Some((pkg, keys)) = imported_hash_keys.get(func_name) {
                             if keys.iter().any(|k| k == &r.target_name) {
                                 *owner = Some(HashKeyOwner::Sub {
-                                    package: None,
+                                    package: pkg.clone(),
                                     name: func_name.clone(),
                                 });
                                 r.resolves_to = None;
@@ -5338,6 +5329,14 @@ impl FileAnalysis {
                             return Some(g);
                         }
                     }
+                    // Name-mapped accessor call (`$w->has_size`, `clear_size`)
+                    // → the attr it projects from. Symmetric with renaming the
+                    // attr, which re-derives these names.
+                    if let Some(attr) = self.attr_for_mapped_accessor(bare, &class) {
+                        if let Some(g) = self.attr_group_for(&attr, &class) {
+                            return Some(g);
+                        }
+                    }
                 }
                 return None;
             }
@@ -5356,22 +5355,53 @@ impl FileAnalysis {
                 _ => return None,
             },
         };
-        let HashKeyOwner::Sub { package: Some(class), name } = owner else {
-            return None;
+        // The owner names the class two ways: a constructor key
+        // (`Sub{class, new}` — `Foo->new(size => …)`) or an internal slot
+        // (`Class(class)` — `$self->{size}` / `$obj->{size}`). Both are
+        // spellings of the same attr; resolve each to the one group.
+        let class = match &owner {
+            HashKeyOwner::Sub { package: Some(c), name }
+                if crate::conventions::is_constructor_name(name) =>
+            {
+                c.clone()
+            }
+            HashKeyOwner::Class(c) => c.clone(),
+            _ => return None,
         };
-        if !crate::conventions::is_constructor_name(&name) {
-            return None;
-        }
-        let field_name = format!("${}", key);
+        self.attr_group_for(&key, &class)
+    }
+
+    /// The attr a name-mapped accessor projects from: `has_size` /
+    /// `clear_size` → `size`. Moo's `predicate`/`clearer`/`writer`/… mint an
+    /// `Accessor` projection whose `method` is the derived name; the reverse
+    /// lookup lets a cursor on that method reach the one attr group (rule #9:
+    /// every projection traces back to its source). The bare reader
+    /// (`method == attr`) is the identity case the caller already handles.
+    fn attr_for_mapped_accessor(&self, method: &str, class: &str) -> Option<String> {
+        self.attr_projections.iter().find_map(|a| match &a.kind {
+            AttrProjectionKind::Accessor { method: m, .. }
+                if a.class == class && m == method && a.attr != method =>
+            {
+                Some(a.attr.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// The attr group for `attr` on `class`, whether it's a Corinna field
+    /// (variable-backed) or a Moo/`has`-style pair. One entry point so every
+    /// spelling (decl, ctor key, internal slot, reader, mapped accessor)
+    /// resolves to the same group.
+    fn attr_group_for(&self, attr: &str, class: &str) -> Option<FieldGroup> {
+        let field_name = format!("${}", attr);
         if let Some(sym) = self.symbols.iter().find(|s| {
             matches!(s.kind, SymKind::Field)
                 && s.name == field_name
-                && s.package.as_deref() == Some(class.as_str())
+                && s.package.as_deref() == Some(class)
         }) {
             return self.field_group_of(sym);
         }
-        // Moo-style attr: the ctor key names a `has`-synthesized pair.
-        self.attr_pair_group(&key, &class)
+        self.attr_pair_group(attr, class)
     }
 
     /// A `has`-synthesized attr pair: accessor Method + constructor
@@ -5380,7 +5410,9 @@ impl FileAnalysis {
     /// what distinguishes the pair from a real `sub name` that happens
     /// to share a class with someone's ctor key).
     fn attr_pair_group(&self, bare: &str, class: &str) -> Option<FieldGroup> {
-        let key_def = self.symbols.iter().find(|s| {
+        // (1) Constructor-key pairing (Moo/Mojo `has`): the ctor-key HashKeyDef
+        // is the anchor; the accessor (if any) shares its selection span.
+        if let Some(key_def) = self.symbols.iter().find(|s| {
             matches!(s.kind, SymKind::HashKeyDef)
                 && s.name == bare
                 && matches!(
@@ -5390,20 +5422,51 @@ impl FileAnalysis {
                         ..
                     } if p == class && crate::conventions::is_constructor_name(name)
                 )
-        })?;
+        }) {
+            let accessor = self.symbols.iter().find(|s| {
+                matches!(s.kind, SymKind::Method)
+                    && s.name == bare
+                    && s.package.as_deref() == Some(class)
+                    && s.selection_span == key_def.selection_span
+            });
+            return Some(FieldGroup {
+                field_sym: None,
+                decl_span: Some(key_def.selection_span),
+                class: class.to_string(),
+                bare: bare.to_string(),
+                has_param: true,
+                has_reader: accessor.is_some(),
+            });
+        }
+        // (2) Class-key pairing (DBIC `add_columns`, Class::Accessor): an
+        // accessor Method and a `Class`-owned HashKeyDef of the same name
+        // minted from the SAME token (span equality is the synthesized-pair
+        // signal). The key side is reached via the `has_class_key` member;
+        // here we just confirm the pair exists and pin the decl span.
         let accessor = self.symbols.iter().find(|s| {
             matches!(s.kind, SymKind::Method)
                 && s.name == bare
                 && s.package.as_deref() == Some(class)
-                && s.selection_span == key_def.selection_span
+        })?;
+        let paired = self.symbols.iter().any(|s| {
+            matches!(s.kind, SymKind::HashKeyDef)
+                && s.name == bare
+                && s.selection_span == accessor.selection_span
+                && matches!(
+                    &s.detail,
+                    SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(c), .. } if c == class
+                )
         });
+        if !paired {
+            return None;
+        }
         Some(FieldGroup {
             field_sym: None,
-            decl_span: Some(key_def.selection_span),
+            decl_span: Some(accessor.selection_span),
             class: class.to_string(),
             bare: bare.to_string(),
-            has_param: true,
-            has_reader: accessor.is_some(),
+            has_param: false,
+            has_reader: true,
         })
     }
 
@@ -5606,7 +5669,9 @@ impl FileAnalysis {
         key_ref: &Ref,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<HashKeyOwner> {
-        let enclosing = self
+        // Inline method-chain receiver: `$obj->method->{key}` — the key
+        // belongs to `method`'s return value, owned `Sub{invocant_class, method}`.
+        if let Some(enclosing) = self
             .refs
             .iter()
             .filter(|c| {
@@ -5614,16 +5679,82 @@ impl FileAnalysis {
                     && contains_point(&c.span, key_ref.span.start)
                     && contains_point(&c.span, key_ref.span.end)
             })
-            .min_by_key(|c| span_size(&c.span))?;
-        let class = enclosing
-            .resolved_method_target
-            .as_ref()
-            .map(|t| t.invocant_class().to_string())
-            .or_else(|| self.method_call_invocant_class(enclosing, module_index))?;
-        Some(HashKeyOwner::Sub {
-            package: Some(class),
-            name: enclosing.unqualified_target_name().to_string(),
-        })
+            .min_by_key(|c| span_size(&c.span))
+        {
+            if let Some(class) = enclosing
+                .resolved_method_target
+                .as_ref()
+                .map(|t| t.invocant_class().to_string())
+                .or_else(|| self.method_call_invocant_class(enclosing, module_index))
+            {
+                return Some(HashKeyOwner::Sub {
+                    package: Some(class),
+                    name: enclosing.unqualified_target_name().to_string(),
+                });
+            }
+        }
+        // Variable bound to an imported function call: `$c = get_config();
+        // $c->{key}`. The build-time walk only pins the owner when the sub's
+        // return keys were known locally; for an imported sub the producer's
+        // package lives across the index. Enrichment stamps this eagerly on
+        // OPEN docs — recover it here for the unenriched workspace file (the
+        // producer-origin rename's consumer), so the owner edge is symmetric
+        // regardless of which side is open. Same lazy seam as above.
+        if let (RefKind::HashKeyAccess { var_text, .. }, Some(idx)) =
+            (&key_ref.kind, module_index)
+        {
+            if let Some(binding) = self.call_bindings.iter().find(|b| &b.variable == var_text) {
+                let func = split_qualified(&binding.func_name).1;
+                if let Some((pkg, keys)) = self.imported_sub_keys(func, idx) {
+                    if keys.iter().any(|k| k == &key_ref.target_name) {
+                        return Some(HashKeyOwner::Sub {
+                            package: pkg,
+                            name: func.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve the package a walk-time-unresolved bare call
+    /// (`resolved_package: None`) actually targets, by asking which `use`d
+    /// module binds the name. A bare `use Bank;` auto-imports `Bank`'s
+    /// `@EXPORT` — a fact only the index knows, so the single-file walk left
+    /// the call unpinned. The lazy re-resolution seam method dispatch
+    /// (`resolved_method_target: None`) and deferred hash-key owners already
+    /// use: where the index is in hand at query time, recover what the
+    /// single-file builder couldn't. Returns the module the call resolves to,
+    /// or `None` when no imported module binds the name (genuinely local /
+    /// builtin / unresolved).
+    pub fn deferred_call_package(
+        &self,
+        call_ref: &Ref,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<String> {
+        let RefKind::FunctionCall { resolved_package: None } = &call_ref.kind else {
+            return None;
+        };
+        // Qualified calls (`Foo::bar`) pin at build time; only truly-bare
+        // unresolved calls reach the index.
+        if split_qualified(&call_ref.target_name).0.is_some() {
+            return None;
+        }
+        let idx = module_index?;
+        let name = call_ref.unqualified_target_name();
+        // Later `use` wins, mirroring `resolve_call_package`'s import scan.
+        for import in self.imports.iter().rev() {
+            let Some(cached) = idx.get_cached(&import.module_name) else { continue };
+            let surface = cached.analysis.export_surface_with_index(idx);
+            if imported_names(import, &surface)
+                .iter()
+                .any(|(local, _)| local.as_str() == name)
+            {
+                return Some(import.module_name.clone());
+            }
+        }
+        None
     }
 
     /// The cross-file-facing view of the field group at `point`: the
@@ -5642,17 +5773,16 @@ impl FileAnalysis {
     /// its owner edge to this class's analysis and asks for the group
     /// the cursor file can't see.
     pub fn field_projections_named(&self, bare: &str, class: &str) -> Option<FieldProjections> {
-        let field_name = format!("${}", bare);
+        // `bare` may name the attr directly (field / ctor key / internal slot /
+        // reader) OR a name-mapped accessor (`has_size` → `size`); both resolve
+        // to the one group, so a consumer-side cursor on any spelling chases to
+        // the same source.
         let g = self
-            .symbols
-            .iter()
-            .find(|s| {
-                matches!(s.kind, SymKind::Field)
-                    && s.name == field_name
-                    && s.package.as_deref() == Some(class)
-            })
-            .and_then(|sym| self.field_group_of(sym))
-            .or_else(|| self.attr_pair_group(bare, class))?;
+            .attr_group_for(bare, class)
+            .or_else(|| {
+                self.attr_for_mapped_accessor(bare, class)
+                    .and_then(|attr| self.attr_group_for(&attr, class))
+            })?;
         Some(self.projections_of(g))
     }
 
@@ -5689,12 +5819,24 @@ impl FileAnalysis {
                 && a.attr == g.bare
                 && matches!(a.kind, AttrProjectionKind::InternalKey)
         });
+        // A `Class`-owned HashKeyDef for this attr (DBIC column / Class::Accessor)
+        // — its key uses (`$row->{attr}`, `search({attr=>…})`) are reached
+        // `found_by`-style, so the group needs a `HashKeyOfClass` member.
+        let has_class_key = self.symbols.iter().any(|s| {
+            matches!(s.kind, SymKind::HashKeyDef)
+                && s.name == g.bare
+                && matches!(
+                    &s.detail,
+                    SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(c), .. } if *c == g.class
+                )
+        });
         FieldProjections {
             class: g.class,
             bare: g.bare,
             has_param: g.has_param,
             has_reader: g.has_reader,
             has_internal,
+            has_class_key,
             variable_spans,
             mapped,
         }
@@ -5715,10 +5857,17 @@ impl FileAnalysis {
                 RefKind::FunctionCall { resolved_package } => {
                     // A qualified call (`Foo::baz()`) carries the whole path
                     // in `target_name`; the renamable identifier is the bare
-                    // tail, scoped by `resolved_package` (the qualifier).
+                    // tail, scoped by `resolved_package` (the qualifier). When
+                    // the walk left the call unresolved (a bare imported call
+                    // — `use Bank;` auto-imports `@EXPORT`, invisible single-
+                    // file), recover the exporting module via the index so the
+                    // target scopes to the source package, not `None`.
+                    let package = resolved_package.clone().or_else(|| {
+                        self.deferred_call_package(r, module_index)
+                    });
                     return Some(RenameKind::Function {
                         name: r.unqualified_target_name().to_string(),
-                        package: resolved_package.clone(),
+                        package,
                     });
                 }
                 RefKind::MethodCall { .. } => {
@@ -5737,6 +5886,17 @@ impl FileAnalysis {
                 RefKind::PackageRef => return Some(RenameKind::Package(r.target_name.clone())),
                 RefKind::HashKeyAccess { .. } => return Some(RenameKind::HashKey(r.target_name.clone())),
                 RefKind::DispatchCall { owner: Some(owner), .. } => {
+                    // A dispatch name spelled via a variable (`my $e = 'x';
+                    // $obj->on($e)`) has no literal token to rewrite — the
+                    // cursor sits on the variable, so rename the variable, not
+                    // the event. A literal site carries no co-located Variable
+                    // ref, so this only diverts the folded case.
+                    if self.refs.iter().any(|o| {
+                        matches!(o.kind, RefKind::Variable | RefKind::ContainerAccess)
+                            && contains_point(&o.span, point)
+                    }) {
+                        return Some(RenameKind::Variable);
+                    }
                     return Some(RenameKind::Handler {
                         owner: owner.clone(),
                         name: r.target_name.clone(),
@@ -5767,6 +5927,14 @@ impl FileAnalysis {
                         Some(RenameKind::Handler { owner: owner.clone(), name: sym.name.clone() })
                     } else { None }
                 }
+                // A hash-key def with no field group (a return-hash key, the
+                // `return { host => 1 }` shape) — `field_group_at` already
+                // claimed the constructor/`has` cases ahead of us. The owner
+                // recovers from `hash_key_owner_at`, so resolve_symbol's
+                // `HashKey` arm mints the same `HashKeyOfSub`/`HashKeyOfClass`
+                // target a `$result->{key}` access would, making def→accesses
+                // symmetric with access→def.
+                SymKind::HashKeyDef => Some(RenameKind::HashKey(sym.name.clone())),
                 _ => None,
             };
         }
@@ -5979,6 +6147,21 @@ impl FileAnalysis {
                     }
                 }
                 RefKind::DispatchCall { owner: Some(owner), .. } => {
+                    // Folded name (`$obj->on($evt)`): the cursor is on the
+                    // variable, so resolve the variable — not the event. Mirrors
+                    // the `rename_kind_at` guard so references/highlight/rename
+                    // agree (the event's literal sites still resolve from there).
+                    if let Some(var) = self.refs.iter().find(|o| {
+                        matches!(o.kind, RefKind::Variable | RefKind::ContainerAccess)
+                            && contains_point(&o.span, point)
+                    }) {
+                        if let Some(sym_id) = var
+                            .resolves_to
+                            .or_else(|| self.resolve_variable(&var.target_name, point).map(|s| s.id))
+                        {
+                            return Some((sym_id, true));
+                        }
+                    }
                     for sym in &self.symbols {
                         if sym.name != r.target_name { continue; }
                         if let SymbolDetail::Handler { owner: o, .. } = &sym.detail {
@@ -5994,7 +6177,15 @@ impl FileAnalysis {
 
         // Check if cursor is directly on a symbol declaration
         if let Some(sym) = self.symbol_at(point) {
-            return Some((sym.id, false));
+            // A hash-key def has no ref at its own token (unlike a variable
+            // decl, which carries a `Variable` ref and so resolves with
+            // `include_decl = true` via the ref arm above). The generic decl
+            // case excludes the declaration (references' includeDeclaration=
+            // false convention), which would drop the key from its own
+            // rename/reference set — asymmetric with the access-side path,
+            // which returns def + every access. Include it for hash-key defs.
+            let include_decl = matches!(sym.kind, SymKind::HashKeyDef);
+            return Some((sym.id, include_decl));
         }
 
         None
@@ -6558,6 +6749,56 @@ impl FileAnalysis {
     /// (inclusive); intermediate ancestors that *override* are
     /// skipped because they're a different method from the
     /// inheritance perspective.
+    /// The full **override family** of `(class, method)` — the contract root
+    /// (topmost ancestor defining the method) plus every class that inherits or
+    /// overrides it. The membership set for `OverrideScope::Hierarchy` rename:
+    /// renaming any member rewrites them all, so an override never silently
+    /// desyncs from its base (the standard IDE refactor;
+    /// docs/rename-bidirectional-audit.md #5). Gathered over PROVEN inheritance
+    /// edges only (`@ISA`/`use parent`/Moo via `GraphView`), NEVER name matches
+    /// — two unrelated classes both defining `sub render {}` with no edge
+    /// between them are not a family.
+    pub fn method_override_family(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<String> {
+        let defines = |cls: &str| {
+            matches!(
+                self.resolve_method_in_ancestors(cls, method_name, module_index),
+                Some(MethodResolution::Local { class: ref c, .. })
+                    | Some(MethodResolution::CrossFile { class: ref c, .. })
+                    if c == cls
+            )
+        };
+        // Contract root: the topmost ancestor (incl. the cursor class) that
+        // defines the method — an override roots at the base it overrides.
+        let mut root = class_name.to_string();
+        self.for_each_ancestor_class(class_name, module_index, |cls| {
+            if defines(cls) {
+                root = cls.to_string();
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        // Root + all transitive descendants (`walk` excludes the origin).
+        let mut family = vec![root.clone()];
+        let graph = crate::graph::GraphView::new(self, module_index);
+        graph.walk(
+            crate::graph::Node::Class(root),
+            crate::graph::EdgeKindMask::INHERITS_INV,
+            &mut |n| {
+                if let crate::graph::Node::Class(c) = n {
+                    if !family.iter().any(|f| f == c) {
+                        family.push(c.clone());
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        family
+    }
+
     pub fn method_rename_chain(
         &self,
         class_name: &str,
@@ -7967,7 +8208,11 @@ impl FileAnalysis {
     }
 
     /// Complete hash keys for a resolved owner.
-    fn complete_hash_keys_for_owner(&self, owner: &HashKeyOwner) -> Vec<CompletionCandidate> {
+    fn complete_hash_keys_for_owner(
+        &self,
+        owner: &HashKeyOwner,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<CompletionCandidate> {
         let defs = self.hash_key_defs_for_owner(owner);
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
@@ -7999,28 +8244,91 @@ impl FileAnalysis {
             });
         }
 
+        // Imported return-hash keys live on the producer's real HashKeyDef, not
+        // a local stub — reach them cross-file (the same scan enrichment does
+        // for the owner fixup, run at query time so completion has one source).
+        if let (HashKeyOwner::Sub { name, .. }, Some(idx)) = (owner, module_index) {
+            if let Some((_pkg, keys)) = self.imported_sub_keys(name, idx) {
+                for key in keys {
+                    if seen.insert(key.clone()) {
+                        candidates.push(CompletionCandidate {
+                            label: key.clone(),
+                            kind: SymKind::Variable,
+                            detail: Some(format!("{}()->{{{}}}", name, key)),
+                            insert_text: None,
+                            sort_priority: PRIORITY_FILE_WIDE,
+                            additional_edits: vec![],
+                            display_override: None,
+                        });
+                    }
+                }
+            }
+        }
+
         candidates
     }
 
+    /// `(producer package, return-hash keys)` of an imported sub, resolved
+    /// cross-file through the index. The producer's real `HashKeyDef`s are the
+    /// single source — enrichment no longer materializes a consumer-side stub,
+    /// so completion reads keys here and the deferred owner reads the package,
+    /// exactly as rename/references/goto-def reach them via the owner edge.
+    fn imported_sub_keys(
+        &self,
+        sub_name: &str,
+        module_index: &dyn CrossFileLookup,
+    ) -> Option<(Option<String>, Vec<String>)> {
+        for import in &self.imports {
+            let Some(cached) = module_index.get_cached(&import.module_name) else { continue };
+            for sym in &cached.analysis.symbols {
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                if sym.name != sub_name { continue; }
+                if !cached.analysis.exports_name(&sym.name) { continue; }
+                if let Some(sub_info) = cached.sub_info(&sym.name) {
+                    let hk = sub_info.hash_keys();
+                    if !hk.is_empty() {
+                        return Some((sym.package.clone(), hk.to_vec()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Complete hash keys for a variable at a point.
-    pub fn complete_hash_keys(&self, var_text: &str, point: Point) -> Vec<CompletionCandidate> {
+    pub fn complete_hash_keys(
+        &self,
+        var_text: &str,
+        point: Point,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<CompletionCandidate> {
         match self.resolve_hash_key_owner(var_text, point) {
-            Some(owner) => self.complete_hash_keys_for_owner(&owner),
+            Some(owner) => self.complete_hash_keys_for_owner(&owner, module_index),
             None => Vec::new(),
         }
     }
 
     /// Complete hash keys for a known class name (from expression type resolution).
-    pub fn complete_hash_keys_for_class(&self, class_name: &str, _point: Point) -> Vec<CompletionCandidate> {
-        self.complete_hash_keys_for_owner(&HashKeyOwner::Class(class_name.to_string()))
+    pub fn complete_hash_keys_for_class(
+        &self,
+        class_name: &str,
+        _point: Point,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<CompletionCandidate> {
+        self.complete_hash_keys_for_owner(&HashKeyOwner::Class(class_name.to_string()), module_index)
     }
 
     /// Complete hash keys for a sub's return value (from expression type resolution).
     ///
-    /// Tries the caller's enclosing package first (local subs), then falls
-    /// back to an unpackaged owner (imported subs whose synthetic HashKeyDef
-    /// was added during enrichment with `package: None`).
-    pub fn complete_hash_keys_for_sub(&self, sub_name: &str, _point: Point) -> Vec<CompletionCandidate> {
+    /// Tries the caller's enclosing package first (local subs), then an
+    /// unpackaged owner, then the cross-file producer (imported subs' return
+    /// keys live on the producer's real HashKeyDef, reached via the index).
+    pub fn complete_hash_keys_for_sub(
+        &self,
+        sub_name: &str,
+        _point: Point,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<CompletionCandidate> {
         // Try each candidate owner variant until one has defs.
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -8034,11 +8342,11 @@ impl FileAnalysis {
         for sym in &self.symbols {
             if (sym.kind == SymKind::Sub || sym.kind == SymKind::Method) && sym.name == sub_name {
                 let owner = HashKeyOwner::Sub { package: sym.package.clone(), name: sub_name.to_string() };
-                push_unique(self.complete_hash_keys_for_owner(&owner), &mut out, &mut seen);
+                push_unique(self.complete_hash_keys_for_owner(&owner, module_index), &mut out, &mut seen);
             }
         }
         let imported_owner = HashKeyOwner::Sub { package: None, name: sub_name.to_string() };
-        push_unique(self.complete_hash_keys_for_owner(&imported_owner), &mut out, &mut seen);
+        push_unique(self.complete_hash_keys_for_owner(&imported_owner, module_index), &mut out, &mut seen);
 
         // Final sweep: match any HashKeyDef whose owner is Sub{name: sub_name}
         // regardless of package. Covers plugin-synthesized options (e.g.

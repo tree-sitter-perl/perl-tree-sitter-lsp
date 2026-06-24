@@ -759,7 +759,7 @@ fn completion_items_native(
             let used = cursor_context::used_keys_in_enclosing_hash(tree, source.as_bytes(), point);
             let class_name = owner_type.as_ref().and_then(|t| t.class_name());
             let candidates = if let Some(cn) = class_name {
-                analysis.complete_hash_keys_for_class(cn, point)
+                analysis.complete_hash_keys_for_class(cn, point, Some(module_index))
             } else if let Some(ref sub_name) = source_sub {
                 // Routes to HashKeyOwner::Sub { name } — catches both
                 // plugin-emitted HashKeyDefs (minion enqueue options)
@@ -767,9 +767,9 @@ fn completion_items_native(
                 // in a final-hashref param. Previously this branch
                 // was skipped when owner_type was None, so real hash
                 // literals at a call-arg position returned nothing.
-                analysis.complete_hash_keys_for_sub(sub_name, point)
+                analysis.complete_hash_keys_for_sub(sub_name, point, Some(module_index))
             } else {
-                analysis.complete_hash_keys(var_text, point)
+                analysis.complete_hash_keys(var_text, point, Some(module_index))
             };
             candidates.into_iter().filter(|c| !used.contains(&c.label)).collect()
         }

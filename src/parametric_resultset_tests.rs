@@ -317,7 +317,7 @@ $schema->resultset('Schema::Result::Users')->search({ name => 'X' });
     let target = TargetRef {
         name: "name".to_string(),
         kind: TargetKind::HashKeyOfClass("Schema::Result::Users".to_string()),
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs
@@ -441,7 +441,7 @@ my $name = $schema->resultset('Schema::Result::Users')->find(1)->name;
             kind: TargetKind::Method {
                 class: "Schema::Result::Users".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -758,7 +758,7 @@ sub action {
     let target = TargetRef {
         name: "name".to_string(),
         kind: TargetKind::HashKeyOfClass("Schema::Result::Sner".to_string()),
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs
@@ -828,7 +828,7 @@ sub action {
     let target = TargetRef {
         name: "name".to_string(),
         kind: TargetKind::HashKeyOfClass("Schema::Result::Sner".to_string()),
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs

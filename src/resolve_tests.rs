@@ -33,7 +33,7 @@ fn test_refs_to_finds_sub_across_workspace_files() {
             kind: TargetKind::Sub {
                 package: Some("A".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -80,7 +80,7 @@ fn test_refs_to_exporter_extensible_cross_file() {
         &TargetRef {
             name: "foo".to_string(),
             kind: TargetKind::Sub { package: Some("Ext".to_string()) },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -119,7 +119,7 @@ fn test_refs_to_exporter_declare_cross_file() {
         &TargetRef {
             name: "foo".to_string(),
             kind: TargetKind::Sub { package: Some("Decl".to_string()) },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -158,7 +158,7 @@ fn test_refs_to_importer_consumer_cross_file() {
         &TargetRef {
             name: "foo".to_string(),
             kind: TargetKind::Sub { package: Some("Src::Mod".to_string()) },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -190,7 +190,7 @@ fn test_refs_to_export_not_registered_without_use() {
         &TargetRef {
             name: "phantom".to_string(),
             kind: TargetKind::Sub { package: Some("Plain".to_string()) },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -229,7 +229,7 @@ $app->routes->post('/users')->to(controller => 'Users', action => 'create');
             kind: TargetKind::Method {
                 class: "Mojolicious::Controller::_Helper::users".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -257,7 +257,7 @@ $app->routes->post('/users')->to(controller => 'Users', action => 'create');
             kind: TargetKind::Method {
                 class: "Users".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -311,7 +311,7 @@ $b->run;
             kind: TargetKind::Method {
                 class: "Foo".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -347,7 +347,7 @@ $b->run;
             kind: TargetKind::Method {
                 class: "Bar".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -409,7 +409,7 @@ sub run {
             kind: TargetKind::Method {
                 class: "Widget".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -470,7 +470,7 @@ sub run {
             kind: TargetKind::Method {
                 class: "Widget".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -593,7 +593,7 @@ Bler->new->hi;
             kind: TargetKind::Method {
                 class: "Sner".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -639,7 +639,7 @@ Bler->new->hi;
             kind: TargetKind::Method {
                 class: "Bler".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -784,7 +784,7 @@ $b->run;
         Some(RenameKind::Method { name, class }) => TargetRef {
             name,
             kind: TargetKind::Method { class },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         other => panic!(
             "rename_kind_at($f->run) should be Method{{class=Foo}}, got {:?}",
@@ -940,14 +940,14 @@ hi();
             kind: TargetKind::Sub {
                 package: package.clone(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         Some(RenameKind::Method { name, class }) => TargetRef {
             name: name.clone(),
             kind: TargetKind::Method {
                 class: class.clone(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         other => panic!("unexpected rename_kind_at = {:?}", other),
     };
@@ -1216,7 +1216,7 @@ $u->create(name => 'alice');
         Some(RenameKind::Method { name, class }) => TargetRef {
             name,
             kind: TargetKind::Method { class },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         other => panic!("expected Method, got {:?}", other),
     };
@@ -1287,7 +1287,7 @@ fn test_refs_to_empty_when_no_hits() {
         &TargetRef {
             name: "nonexistent".to_string(),
             kind: TargetKind::Sub { package: None },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -1322,7 +1322,7 @@ fn test_refs_to_finds_hash_key_def_and_access_same_file() {
                 package: Some("Lib".to_string()),
                 name: "get_config".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -1357,7 +1357,7 @@ fn test_refs_to_finds_cross_file_hash_key_def() {
                 package: Some("Lib".to_string()),
                 name: "get_config".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -1398,7 +1398,7 @@ fn test_refs_to_package_qualified_sub_owner_isolates_name_collisions() {
                 package: Some("Alpha".to_string()),
                 name: "get_config".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -1443,7 +1443,7 @@ fn test_refs_to_qualified_call_resolves_to_def() {
             kind: TargetKind::Sub {
                 package: Some("A".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -1482,7 +1482,7 @@ fn test_refs_to_qualified_call_isolates_package() {
             kind: TargetKind::Sub {
                 package: Some("A".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -1508,7 +1508,7 @@ fn test_refs_to_role_mask_excludes_workspace() {
         &TargetRef {
             name: "foo".to_string(),
             kind: TargetKind::Sub { package: None },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::OPEN,
     );
@@ -1605,7 +1605,7 @@ $b->touch();
     let target = TargetRef {
         name: "touch".to_string(),
         kind: TargetKind::Method { class: "B".to_string() },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs.iter().any(|r| {
@@ -1739,7 +1739,7 @@ $x->ping();
         &TargetRef {
             name: "ping".to_string(),
             kind: TargetKind::Method { class: "C".to_string() },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::WORKSPACE,
     );
@@ -1816,7 +1816,7 @@ sub touch  { 1 }
     let target = TargetRef {
         name: "touch".to_string(),
         kind: TargetKind::Method { class: "B".to_string() },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
 
     // Warm-up — JIT'd registry caches, lazy index allocs.
@@ -1912,7 +1912,7 @@ $x->makeFoo()->ping();
         &TargetRef {
             name: "ping".to_string(),
             kind: TargetKind::Method { class: "P".to_string() },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::WORKSPACE,
     );
@@ -2019,7 +2019,7 @@ sub fire ($minion) {\n  $minion->enqueue('send_email' => ['a@b']);\n}\n1;\n",
                 owner: crate::file_analysis::HandlerOwner::Class("Minion".to_string()),
                 name: "send_email".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -2097,7 +2097,7 @@ sub fire {\n  my $self = shift;\n  my $minion = My::Minion->new;\n  $minion->enq
                 owner: crate::file_analysis::HandlerOwner::Class("Minion".to_string()),
                 name: "send_email".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -2147,7 +2147,7 @@ fn refs_to_fans_runtime_exported_sub_to_consumer() {
         &TargetRef {
             name: "sweeten".to_string(),
             kind: TargetKind::Sub { package: Some("Sugar::Sub".to_string()) },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -2163,6 +2163,110 @@ fn refs_to_fans_runtime_exported_sub_to_consumer() {
         "expected the consumer's import/call of sweeten to fan out; got {:?}",
         results,
     );
+}
+
+/// Bare `use Bank;` auto-imports `@EXPORT` — a fact the single-file walk
+/// can't see, so the consumer's `make_account()` call is left
+/// `resolved_package: None`. Both rename directions must still link source
+/// and consumer: `refs_to` defers the call's package resolution to the
+/// index at query time (`deferred_call_package`), the same lazy seam method
+/// dispatch + deferred hash-key owners use. (The explicit-`qw/.../` case
+/// already pins at build time — this is the implicit-export gap.)
+#[test]
+fn refs_to_links_implicit_export_to_bare_use_consumer() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let def = PathBuf::from("/tmp/impl_export_def.pm");
+    let consumer = PathBuf::from("/tmp/impl_export_use.pl");
+
+    let def_src = "package Bank;\n\
+         use Exporter 'import';\n\
+         our @EXPORT = ('make_account');\n\
+         sub make_account { 1 }\n1;\n";
+    // Bare `use Bank;` — no import list; `make_account` arrives via @EXPORT.
+    let use_src = "use Bank;\nmy $a = make_account('Ada');\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(def.clone(), Arc::new(parse(def_src)));
+
+    store.insert_workspace(def.clone(), parse(def_src));
+    store.insert_workspace(consumer.clone(), parse(use_src));
+
+    let target = TargetRef {
+        name: "make_account".to_string(),
+        kind: TargetKind::Sub { package: Some("Bank".to_string()) },
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
+    };
+    let refs = refs_to(&store, Some(&idx), &target, RoleMask::EDITABLE);
+    let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
+
+    assert!(hit(&def), "missed Bank::make_account decl. hits: {:?}", refs);
+    assert!(
+        hit(&consumer),
+        "missed bare-`use`-consumer's make_account() call (implicit @EXPORT). hits: {:?}",
+        refs,
+    );
+}
+
+/// Cross-file return-hash key rename: a sub's `return { host => … }` key,
+/// consumed in another file as `$c->{host}` where `$c = imported_sub()`.
+/// Both directions must reach the producer's real def + the consumer access:
+///   * owner identity is unified (producer package stamped on the consumer
+///     access — `Sub{Some("Cfg"), get_config}` both sides);
+///   * the consumer access in an UNENRICHED workspace file (owner `Variable`)
+///     re-derives cross-file via `deferred_hash_key_owner`'s function-binding
+///     arm, so a producer-origin rename doesn't depend on open-doc enrichment;
+///   * no synthetic stub exists, so no phantom `0:0` decl appears.
+#[test]
+fn refs_to_links_return_hash_key_cross_file() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let prod = PathBuf::from("/tmp/rk_cfg.pm");
+    let cons = PathBuf::from("/tmp/rk_consumer.pl");
+
+    let prod_src = "package Cfg;\n\
+         use Exporter 'import';\n\
+         our @EXPORT = ('get_config');\n\
+         sub get_config { return { host => 'h', port => 1 }; }\n1;\n";
+    let cons_src = "use Cfg;\nmy $c = get_config();\nmy $h = $c->{host};\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(prod.clone(), Arc::new(parse(prod_src)));
+    store.insert_workspace(prod.clone(), parse(prod_src));
+    // Consumer stays UNENRICHED in the store (a workspace file), exercising the
+    // deferred owner re-derivation rather than the eager enrichment fixup.
+    store.insert_workspace(cons.clone(), parse(cons_src));
+
+    let target = TargetRef {
+        name: "host".to_string(),
+        kind: TargetKind::HashKeyOfSub {
+            package: Some("Cfg".to_string()),
+            name: "get_config".to_string(),
+        },
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
+    };
+    assert!(target.supports_cross_file_rename(), "HashKeyOfSub must rename cross-file now");
+
+    let refs = refs_to(&store, Some(&idx), &target, RoleMask::EDITABLE);
+    let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
+    assert!(hit(&prod), "missed producer's host def. hits: {:?}", refs);
+    assert!(
+        hit(&cons),
+        "missed consumer's $c->{{host}} access (deferred cross-file owner). hits: {:?}",
+        refs,
+    );
+    // The unified model has no zero-span synthetic stub → no phantom decl.
+    assert!(
+        !refs.iter().any(|r| r.span.start.row == 0 && r.span.start.column == 0),
+        "phantom 0:0 edit must not appear. hits: {:?}",
+        refs,
+    );
+    // `port` (sibling key, same sub) must stay out.
+    assert_eq!(refs.len(), 2, "exactly producer def + consumer access. hits: {:?}", refs);
 }
 
 /// Cross-file plain-sub references: an exported sub defined in one
@@ -2201,7 +2305,7 @@ fn references_cross_file_sub_fans_out_and_stays_package_scoped() {
     let target = TargetRef {
         name: "info_to_task".to_string(),
         kind: TargetKind::Sub { package: Some("TaskInfo".to_string()) },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
     let refs = refs_to(&store, None, &target, RoleMask::EDITABLE);
     let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
@@ -2255,7 +2359,7 @@ fn references_cross_file_method_matches_inheriting_invocant() {
     let target = TargetRef {
         name: "success".to_string(),
         kind: TargetKind::Method { class: "Role::REST".to_string() },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::EDITABLE);
     let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
@@ -2289,7 +2393,7 @@ fn references_mask_scopes_to_editable_for_project_symbols() {
     let in_ws = TargetRef {
         name: "thing".to_string(),
         kind: TargetKind::Sub { package: Some("Proj".to_string()) },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
     assert_eq!(
         references_mask_for(&store, None, &in_ws).bits(),
@@ -2302,7 +2406,7 @@ fn references_mask_scopes_to_editable_for_project_symbols() {
     let dep_only = TargetRef {
         name: "nowhere".to_string(),
         kind: TargetKind::Sub { package: Some("CPAN::Thing".to_string()) },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
     assert_eq!(
         references_mask_for(&store, None, &dep_only).bits(),
@@ -2393,7 +2497,7 @@ $d->ping;
     let target = TargetRef {
         name: "ping".to_string(),
         kind: TargetKind::Method { class: "Base".to_string() },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
 
     // Rename uses EDITABLE — workspace-only, no dep scan.
@@ -2461,7 +2565,7 @@ $b->ping;
     let target = TargetRef {
         name: "ping".to_string(),
         kind: TargetKind::Method { class: "Base".to_string() },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
 
     // EDITABLE mask — rename never scans deps.
@@ -2532,7 +2636,7 @@ $g->hello;
     let target = TargetRef {
         name: "hello".to_string(),
         kind: TargetKind::Method { class: "Greeter".to_string() },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
 
     // references uses references_mask_for (EDITABLE when def in workspace).
@@ -2615,7 +2719,7 @@ fn rename_from_child_call_site_includes_inherited_base_declaration() {
         "precondition: call-site rename_kind_at should resolve invocant class MyWorker, got {:?}",
         rk,
     );
-    let target = TargetRef::from_rename_kind(rk.unwrap(), &script_fa, Some(&idx))
+    let target = TargetRef::from_rename_kind(rk.unwrap(), &script_fa, Some(&idx), OverrideScope::Dispatch)
         .expect("Method maps to a target");
     assert!(
         target.method_classes.iter().any(|c| c == "BaseWorker"),
@@ -2693,13 +2797,14 @@ sub bump { my ($self) = @_; $self->{count}++; my $local = 1; return $local }
 }
 
 /// An owned hash key resolves to a cross-file HashKeyOfClass target —
-/// walkable by references — but reports itself non-renameable
-/// cross-file (hash-key rename is in-file-only by design). This is the
-/// divergence the CLI used to have: its references path dropped owned
-/// hash keys to single-file because the owner mapping lived only in the
-/// LSP handler.
+/// A Moo internal slot (`$self->{size}`) is one spelling of the `size` attr,
+/// so it resolves to the attr's projection Group — the same group its `has`
+/// decl, ctor key, reader, and mapped accessors resolve to (finding #2). It
+/// is NOT a plain `HashKeyOfClass` rename: that would miss the accessor /
+/// ctor-key sites the group carries. The group walks cross-file via
+/// `group_rename_edits`.
 #[test]
-fn test_resolve_symbol_owned_hash_key() {
+fn test_resolve_symbol_internal_slot_resolves_to_attr_group() {
     let src = "\
 package Widget;
 use Moo;
@@ -2711,16 +2816,17 @@ sub describe { my ($self) = @_; return $self->{size} }
     // Cursor on `size` inside `$self->{size}`.
     let col = src.lines().nth(3).unwrap().find("{size}").unwrap() + 1;
     match resolve_symbol(&fa, tree_sitter::Point { row: 3, column: col }, None) {
-        Some(ResolvedTarget::Target(t)) => {
-            assert_eq!(t.name, "size");
+        Some(ResolvedTarget::Group { members, .. }) => {
             assert!(
-                matches!(&t.kind, TargetKind::HashKeyOfClass(c) if c == "Widget"),
-                "expected HashKeyOfClass(Widget), got {:?}",
-                t.kind,
+                members.iter().any(|m| matches!(
+                    m.target.kind,
+                    TargetKind::HashKeyOfSub { .. } | TargetKind::InternalHashKey { .. }
+                )),
+                "slot group should carry the attr's ctor-key / internal-slot members: {:?}",
+                members,
             );
-            assert!(!t.supports_cross_file_rename());
         }
-        other => panic!("expected owned hash-key target, got {:?}", other),
+        other => panic!("expected the size attr projection Group, got {:?}", other),
     }
 }
 
@@ -2899,6 +3005,239 @@ fn test_group_rename_rederives_mapped_members_cross_file() {
     );
 }
 
+/// `OverrideScope` toggle: a method overridden in a child resolves to the
+/// whole override family under `Hierarchy` (the default IDE refactor) but only
+/// its own dispatch chain under `Dispatch`. Membership is edge-gated (`@ISA`),
+/// never name-matched. See `docs/rename-bidirectional-audit.md` #5.
+#[test]
+fn override_scope_hierarchy_unions_dispatch_is_precise() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let base = PathBuf::from("/tmp/os_base.pm");
+    let child = PathBuf::from("/tmp/os_child.pm");
+    let base_src = "package Base;\nsub new { bless {}, shift }\nsub shared { 1 }\n1;\n";
+    let child_src =
+        "package Child;\nuse parent 'Base';\nsub shared { my $s = shift; $s->SUPER::shared() + 1 }\n1;\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(base.clone(), Arc::new(parse(base_src)));
+    idx.register_workspace_module(child.clone(), Arc::new(parse(child_src)));
+    store.insert_workspace(base.clone(), parse(base_src));
+    store.insert_workspace(child.clone(), parse(child_src));
+
+    let base_fa = store.workspace_raw().get(&base).unwrap().value().clone();
+
+    // Hierarchy (default): Base::shared's family includes the Child override,
+    // so a rename reaches Child's file.
+    let h = TargetRef::method(
+        "shared".to_string(), "Base".to_string(), &base_fa, Some(&idx), OverrideScope::Hierarchy,
+    );
+    assert!(
+        h.method_classes.iter().any(|c| c == "Child"),
+        "hierarchy family must include the override class: {:?}",
+        h.method_classes,
+    );
+    let hrefs = refs_to(&store, Some(&idx), &h, RoleMask::EDITABLE);
+    assert!(
+        hrefs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &child)),
+        "hierarchy rename must reach the Child override: {:?}",
+        hrefs,
+    );
+
+    // Dispatch: precise — the chain stops at the defining class, so the Child
+    // override is NOT pulled into Base::shared's family.
+    let d = TargetRef::method(
+        "shared".to_string(), "Base".to_string(), &base_fa, Some(&idx), OverrideScope::Dispatch,
+    );
+    assert!(
+        !d.method_classes.iter().any(|c| c == "Child"),
+        "dispatch chain must NOT include the override class: {:?}",
+        d.method_classes,
+    );
+}
+
+/// Finding #6: renaming imports (`use Exp beta => { -as => 'rb' }`). Two
+/// distinct identities: the REMOTE name `beta` is the source `Exp::beta`
+/// (renames together, across all consumers); the LOCAL alias `rb` is a
+/// binding in the CONSUMING package (the `-as` value + local calls) that
+/// never touches the exporter — not `Exp::beta`, not a stray `Exp::rb`.
+#[test]
+fn test_renaming_import_remote_joins_source_alias_stays_local() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let exp = PathBuf::from("/tmp/rni_exp.pm");
+    let cons = PathBuf::from("/tmp/rni_cons.pm");
+    let exp_src = "package Exp;\nuse Exporter 'import';\nour @EXPORT_OK = ('beta');\nsub beta { 1 }\n1;\n";
+    let cons_src = "package Consumer;\nuse Exp beta => { -as => 'rb' };\nsub run { rb() }\n1;\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(exp.clone(), Arc::new(parse(exp_src)));
+    store.insert_workspace(exp.clone(), parse(exp_src));
+    store.insert_workspace(cons.clone(), parse(cons_src));
+
+    let hit = |refs: &[RefLocation], p: &PathBuf| {
+        refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p))
+    };
+
+    // Source rename reaches the consumer's REMOTE `beta` token.
+    let src = TargetRef {
+        name: "beta".to_string(),
+        kind: TargetKind::Sub { package: Some("Exp".to_string()) },
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
+    };
+    let src_refs = refs_to(&store, Some(&idx), &src, RoleMask::EDITABLE);
+    assert!(hit(&src_refs, &exp), "source def missing: {:?}", src_refs);
+    assert!(hit(&src_refs, &cons), "remote `beta` token must join the source: {:?}", src_refs);
+
+    // Alias rename is local to the consuming package — never the exporter.
+    let alias = TargetRef {
+        name: "rb".to_string(),
+        kind: TargetKind::Sub { package: Some("Consumer".to_string()) },
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
+    };
+    let alias_refs = refs_to(&store, Some(&idx), &alias, RoleMask::EDITABLE);
+    assert!(hit(&alias_refs, &cons), "alias `-as` value + call missing: {:?}", alias_refs);
+    assert!(
+        !hit(&alias_refs, &exp),
+        "alias rename must NOT touch the exporter: {:?}",
+        alias_refs,
+    );
+    assert!(alias_refs.len() >= 2, "alias group = `-as` value + call: {:?}", alias_refs);
+}
+
+/// Finding #1: event (Handler) rename. Literal event-name sites are
+/// rewritable (rename rewrites the inside-the-quotes name); a const-folded
+/// site (`my $e = 'connect'; $self->on($e)`) whose span IS the variable is a
+/// reference but NOT rewritable — references lists it, rename skips it (so it
+/// can't corrupt the variable). `refs_to` carries the distinction.
+#[test]
+fn test_event_handler_refs_mark_folded_site_non_rewritable() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/ev_handler.pm");
+    let src = "package App;\n\
+         use parent 'Mojo::EventEmitter';\n\
+         sub setup {\n\
+         my $self = shift;\n\
+         $self->on('connect', sub { 1 });\n\
+         my $e = 'connect';\n\
+         $self->on($e, sub { 1 });\n\
+         $self->emit('connect');\n\
+         }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+
+    let target = TargetRef {
+        name: "connect".to_string(),
+        kind: TargetKind::Handler {
+            owner: crate::file_analysis::HandlerOwner::Class("App".to_string()),
+            name: "connect".to_string(),
+        },
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
+    };
+    assert!(target.supports_cross_file_rename(), "Handler renames cross-file now");
+
+    let refs = refs_to(&store, None, &target, RoleMask::EDITABLE);
+    let rewritable = refs.iter().filter(|r| r.rewritable).count();
+    let frozen = refs.iter().filter(|r| !r.rewritable).count();
+    // The folded `$e` site is a reference (present) but non-rewritable; the
+    // literal sites (two `on` + `emit`) are rewritable.
+    assert!(
+        frozen >= 1,
+        "the folded $e dispatch site must be present but non-rewritable; refs: {:?}",
+        refs,
+    );
+    assert!(
+        rewritable >= 2,
+        "literal event sites must be rewritable; refs: {:?}",
+        refs,
+    );
+}
+
+/// Finding #4: a DBIC column's accessor (`$row->name`) and its key uses
+/// (`search({name=>…})`, `$row->{name}`) are one renameable unit. The
+/// synthesized accessor Method + the same-span `Class`-owned column HashKeyDef
+/// form an attr group whose `HashKeyOfClass` member catches the key uses
+/// (`found_by` reaches the `Sub{class, verb}`-owned search args), so rename
+/// from either face rewrites both. Before, accessor → `Method` and column key
+/// → `HashKeyOfClass` were disjoint.
+#[test]
+fn test_dbic_column_accessor_and_key_form_one_group() {
+    let fa = parse(
+        "package Schema::Result::User;\n\
+         use base 'DBIx::Class::Core';\n\
+         __PACKAGE__->add_columns(qw/id name/);\n\
+         1;\n",
+    );
+    // Cursor on the synthesized accessor / column `name` token (row 2).
+    let col = "__PACKAGE__->add_columns(qw/id ".len();
+    let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None)
+        .expect("column resolves");
+    let ResolvedTarget::Group { members, .. } = resolved else {
+        panic!("expected a column attr Group, got {:?}", resolved);
+    };
+    assert!(
+        members.iter().any(|m| matches!(m.target.kind, TargetKind::Method { .. })),
+        "group carries the accessor Method member: {:?}",
+        members,
+    );
+    assert!(
+        members.iter().any(|m| matches!(m.target.kind, TargetKind::HashKeyOfClass(_))),
+        "group carries the HashKeyOfClass member (search/deref keys): {:?}",
+        members,
+    );
+}
+
+/// Finding #2 (reverse direction): a consumer-side cursor on a name-mapped
+/// accessor (`$w->has_size`) OR an internal slot (`$w->{size}`) resolves to
+/// the same cross-file attr group as the decl — so rename from any spelling
+/// rewrites every spelling. Before, the slot fell to a plain
+/// `HashKeyOfClass` (single-file, missed the accessors) and the mapped
+/// accessor only matched itself + the decl.
+#[test]
+fn test_consumer_mapped_accessor_and_slot_resolve_to_attr_group_cross_file() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let class_path = PathBuf::from("/tmp/grp_rev_widget.pm");
+    let user_path = PathBuf::from("/tmp/grp_rev_user.pl");
+    let class_src =
+        "package Widget;\nuse Moo;\nhas size => (is => 'rw', predicate => 1, clearer => 1);\n1;\n";
+    let user_src = "use Widget;\n\
+         my $w = Widget->new(size => 3);\n\
+         $w->has_size;\n\
+         my $d = $w->{size};\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(class_path.clone(), Arc::new(parse(class_src)));
+    let store = FileStore::new();
+    store.insert_workspace(class_path.clone(), parse(class_src));
+    store.insert_workspace(user_path.clone(), parse(user_src));
+
+    let consumer = store.workspace_raw().get(&user_path).unwrap().value().clone();
+
+    // Both spellings must mint the remote group (pinned to the class file) and
+    // carry the accessor / ctor-key members, so a rename fans out across both.
+    for (label, row, needle) in [("mapped accessor", 2usize, "has_size"), ("internal slot", 3, "{size}")] {
+        let col = user_src.lines().nth(row).unwrap().find(needle).unwrap()
+            + if needle.starts_with('{') { 1 } else { 0 };
+        let resolved = resolve_symbol(&consumer, tree_sitter::Point { row, column: col }, Some(&idx))
+            .unwrap_or_else(|| panic!("{label} cursor should resolve"));
+        let ResolvedTarget::Group { pinned_spans, members, .. } = resolved else {
+            panic!("{label}: expected remote Group, got {:?}", resolved);
+        };
+        assert!(!pinned_spans.is_empty(), "{label}: group pinned to the class file");
+        assert!(
+            members.iter().any(|m| !m.target.method_classes.is_empty()
+                || matches!(m.target.kind, TargetKind::Method { .. } | TargetKind::HashKeyOfSub { .. })),
+            "{label}: group carries accessor/ctor-key members: {:?}",
+            members,
+        );
+    }
+}
+
 /// Internal slot pokes join the group cross-file: a subclass (or any
 /// promiscuous consumer) reaching into `$self->{size}` renames with the
 /// attr — under STRICT Class-owner matching, so another sub's
@@ -2947,6 +3286,48 @@ fn test_internal_slot_pokes_join_group_cross_file() {
     );
 }
 
+/// Old-school `bless { key => ... }, $class` keys are instance slots of the
+/// class — renaming the bless key must reach every `$self->{key}` access,
+/// symmetric with renaming from an access. Before the `InternalKey`
+/// projection on bless keys, the from-key direction minted only the strict
+/// `HashKeyOfSub{C, new}` member (matching the bless key alone) and missed
+/// the `Class(C)`-owned accesses; the from-access direction worked via
+/// `found_by`. This pins the symmetry.
+#[test]
+fn rename_from_bless_key_reaches_self_slot_accesses() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/bless_slot.pm");
+    let src = "package Calc;\n\
+         sub new { my ($class) = @_; return bless { history => [] }, $class; }\n\
+         sub add { my ($self) = @_; push @{$self->{history}}, 1; }\n\
+         sub log { my ($self) = @_; return $self->{history}; }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    // Cursor on the bless key `history` (row 1, inside `bless { history`).
+    let key_col = src.lines().nth(1).unwrap().find("history").unwrap();
+    let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 1, column: key_col }, None)
+        .expect("bless key resolves");
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+        panic!("expected Group, got {:?}", resolved);
+    };
+    assert!(
+        members.iter().any(|m| matches!(m.target.kind, TargetKind::InternalHashKey { .. })),
+        "bless key must mint an internal-key member so $self->{{history}} accesses join: {:?}",
+        members,
+    );
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()),
+        &local_spans, &pinned_spans, &members, "log",
+    );
+    // bless key (1) + two $self->{history} accesses (rows 2, 3) = 3 spellings.
+    assert_eq!(
+        edits.len(), 3,
+        "bless key + both $self->{{history}} accesses should rename; edits: {:?}",
+        edits,
+    );
+}
+
 #[test]
 fn test_implementations_of_role_requires_fans_out_to_composers() {
     use crate::module_index::{CachedModule, ModuleIndex};
@@ -2979,7 +3360,7 @@ fn test_implementations_of_role_requires_fans_out_to_composers() {
     let target = TargetRef {
         name: "fetch".to_string(),
         kind: TargetKind::Method { class: "My::Role".to_string() },
-        method_classes: Vec::new(),
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch,
     };
     let origin = parse("package Probe;\n1;\n");
     let results = implementations_of(&origin, Some(&idx), &target);

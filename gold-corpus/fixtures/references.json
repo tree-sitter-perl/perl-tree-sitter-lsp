@@ -109,6 +109,8 @@
       "col": 4,
       "query": "",
       "newname": "",
+      "renameScope": "dispatch",
+      "comment": "DISPATCH mode: references for URI::http::canonical are the def + dispatch-to-it sites only — NOT the base URI.pm::canonical nor sibling _server.pm. The default hierarchy mode lists the whole family (see ref-uri-canonical-hierarchy).",
       "expect": {
         "all": [
           "\"file\":\"http.pm\",\"line\":\"12\""
@@ -116,6 +118,28 @@
         "none": [
           "\"file\":\"_server.pm\",\"line\":\"150\"",
           "\"file\":\"URI.pm\",\"line\":\"353\""
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "ref-uri-canonical-hierarchy",
+      "difficulty": "tricky",
+      "semantic_area": "oo-isa",
+      "file": "URI/http.pm",
+      "line": 11,
+      "col": 4,
+      "query": "",
+      "newname": "",
+      "comment": "HIERARCHY mode (default): references for URI::http::canonical span the whole override family — the base URI.pm def + `URI->new(...)->canonical` call sites corpus-wide (CGI.pm), edge-gated so unrelated same-named methods (Mojo::Path) stay out.",
+      "expect": {
+        "all": [
+          "\"file\":\"http.pm\"",
+          "\"file\":\"URI.pm\"",
+          "\"file\":\"CGI.pm\""
+        ],
+        "none": [
+          "\"file\":\"Mojo/Path.pm\""
         ]
       },
       "status": "gold"

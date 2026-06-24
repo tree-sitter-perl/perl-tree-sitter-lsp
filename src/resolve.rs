@@ -33,11 +33,42 @@ bitflags::bitflags! {
     }
 }
 
+/// How a method that participates in an inheritance hierarchy is scoped for
+/// references + rename — `initializationOptions.rename.overrideScope`.
+///
+/// * `Hierarchy` (default) — the standard IDE refactor: the whole override
+///   family (base decl + every override + all dispatching call sites), gathered
+///   over proven `@ISA`/`use parent`/role edges (never name matches).
+/// * `Dispatch` — precise: only the cursor's own definition + the call sites
+///   that dispatch to *that* definition (incl. `SUPER::` calls targeting it),
+///   leaving sibling overrides untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverrideScope {
+    #[default]
+    Hierarchy,
+    Dispatch,
+}
+
+impl OverrideScope {
+    /// Parse the `initializationOptions.rename.overrideScope` string; anything
+    /// unrecognized (or absent) is the default `Hierarchy`.
+    pub fn from_option(s: &str) -> Self {
+        match s {
+            "dispatch" => OverrideScope::Dispatch,
+            _ => OverrideScope::Hierarchy,
+        }
+    }
+}
+
 /// Identifies what we're collecting references to.
 #[derive(Debug, Clone)]
 pub struct TargetRef {
     pub name: String,
     pub kind: TargetKind,
+    /// Override-fan-out scope for callable (`Sub`/`Method`) targets — read by
+    /// `collect_from_analysis` to pick family-membership (Hierarchy) vs
+    /// dispatch-chain (Dispatch) matching. Irrelevant for other kinds.
+    pub scope: OverrideScope,
     /// For a `Method` target, the inheritance rename-chain
     /// `[cursor_class, ..., defining_class]` computed ONCE from the
     /// originating analysis (the only file that knows the cursor class's
@@ -60,12 +91,14 @@ impl TargetRef {
         class: String,
         origin: &FileAnalysis,
         module_index: Option<&dyn CrossFileLookup>,
+        scope: OverrideScope,
     ) -> Self {
-        let method_classes = origin.method_rename_chain(&class, &name, module_index);
+        let method_classes = method_classes_for(origin, &class, &name, module_index, scope);
         TargetRef {
             name,
             kind: TargetKind::Method { class },
             method_classes,
+            scope,
         }
     }
 
@@ -75,18 +108,27 @@ impl TargetRef {
             !matches!(kind, TargetKind::Method { .. }),
             "use TargetRef::method so the rename chain is populated"
         );
-        TargetRef { name, kind, method_classes: Vec::new() }
+        TargetRef { name, kind, method_classes: Vec::new(), scope: OverrideScope::default() }
     }
 
-    /// Rename policy, asked of the target rather than re-encoded per handler:
-    /// callables and packages rewrite everywhere; hash keys are in-file-only
-    /// by design (an unowned spelling elsewhere may be a different key);
-    /// handler cross-file rename isn't wired yet. References intentionally
-    /// ignores this — it walks every target kind cross-file.
+    /// Which targets rename through `refs_to` (cross-file, owner/scope-
+    /// structural) rather than the single-file `rename_at` fallback —
+    /// references walks *every* kind cross-file; rename is being brought into
+    /// line one kind at a time (see `docs/rename-bidirectional-audit.md`).
+    /// `HashKeyOfSub` joined once producer↔consumer owner identity was unified
+    /// (enrichment stamps the consumer access with the producer's package, and
+    /// the consumer-side completion stub is gone — the producer's real def is
+    /// the single source). Still single-file: `HashKeyOfClass` (Moo slots need
+    /// the projection-group arm — finding #2) and `Handler` (event names need
+    /// rename-ready spans — their span includes the surrounding quotes today).
     pub fn supports_cross_file_rename(&self) -> bool {
         matches!(
             self.kind,
-            TargetKind::Sub { .. } | TargetKind::Method { .. } | TargetKind::Package
+            TargetKind::Sub { .. }
+                | TargetKind::Method { .. }
+                | TargetKind::Package
+                | TargetKind::HashKeyOfSub { .. }
+                | TargetKind::Handler { .. }
         )
     }
 
@@ -99,14 +141,24 @@ impl TargetRef {
         kind: crate::file_analysis::RenameKind,
         origin: &FileAnalysis,
         module_index: Option<&dyn CrossFileLookup>,
+        scope: OverrideScope,
     ) -> Option<Self> {
         use crate::file_analysis::RenameKind;
         Some(match kind {
             RenameKind::Function { name, package } => {
-                TargetRef::new(name, TargetKind::Sub { package })
+                // A `sub` in a class IS a method (Perl's only sub/method
+                // distinction is call shape), so it carries the same override
+                // family/chain — a base-`sub` rename reaches overrides + their
+                // dispatch sites. A package-less script sub has no class, hence
+                // no family.
+                let method_classes = match &package {
+                    Some(class) => method_classes_for(origin, class, &name, module_index, scope),
+                    None => Vec::new(),
+                };
+                TargetRef { name, kind: TargetKind::Sub { package }, method_classes, scope }
             }
             RenameKind::Method { name, class } => {
-                TargetRef::method(name, class, origin, module_index)
+                TargetRef::method(name, class, origin, module_index, scope)
             }
             RenameKind::Package(name) => TargetRef::new(name, TargetKind::Package),
             RenameKind::Handler { owner, name } => {
@@ -182,6 +234,19 @@ pub fn resolve_symbol(
     point: tree_sitter::Point,
     module_index: Option<&dyn CrossFileLookup>,
 ) -> Option<ResolvedTarget> {
+    resolve_symbol_scoped(analysis, point, module_index, OverrideScope::default())
+}
+
+/// `resolve_symbol` with an explicit override scope — the rename/references
+/// handlers pass the configured `rename.overrideScope` so a callable target's
+/// `method_classes` is built as the override family (Hierarchy, default) or the
+/// dispatch chain (Dispatch). Other callers use `resolve_symbol` (Hierarchy).
+pub fn resolve_symbol_scoped(
+    analysis: &FileAnalysis,
+    point: tree_sitter::Point,
+    module_index: Option<&dyn CrossFileLookup>,
+    scope: OverrideScope,
+) -> Option<ResolvedTarget> {
     use crate::file_analysis::{HashKeyOwner, RenameKind};
     // Field projections claim first: from any spelling of a field group,
     // the answer is the whole group (rename and references stay in
@@ -198,23 +263,35 @@ pub fn resolve_symbol(
     if let (Some(idx), Some(r)) = (module_index, analysis.ref_at(point)) {
         use crate::file_analysis::HashKeyOwner;
         match &r.kind {
-            RefKind::HashKeyAccess { owner: None, .. } => {
-                if let Some(HashKeyOwner::Sub { package: Some(class), name }) =
-                    analysis.deferred_hash_key_owner(r, module_index)
-                {
-                    if crate::conventions::is_constructor_name(&name) {
-                        if let Some(cached) = idx.get_cached(&class) {
-                            if let Some(p) = cached
-                                .analysis
-                                .field_projections_named(&r.target_name, &class)
-                            {
-                                return Some(group_from_projections(
-                                    p,
-                                    &cached.analysis,
-                                    Some(cached.path.clone()),
-                                    module_index,
-                                ));
-                            }
+            RefKind::HashKeyAccess { owner, .. } => {
+                // The owning class lives elsewhere; reach it so a consumer-side
+                // cursor on `$obj->{attr}` (internal slot, `Class` owner) or a
+                // deferred constructor key (`owner: None`) resolves to the same
+                // projection group the class file mints.
+                let class = match owner {
+                    Some(HashKeyOwner::Class(c)) => Some(c.clone()),
+                    _ => match analysis.deferred_hash_key_owner(r, module_index) {
+                        Some(HashKeyOwner::Sub { package: Some(c), name })
+                            if crate::conventions::is_constructor_name(&name) =>
+                        {
+                            Some(c)
+                        }
+                        Some(HashKeyOwner::Class(c)) => Some(c),
+                        _ => None,
+                    },
+                };
+                if let Some(class) = class {
+                    if let Some(cached) = idx.get_cached(&class) {
+                        if let Some(p) = cached
+                            .analysis
+                            .field_projections_named(&r.target_name, &class)
+                        {
+                            return Some(group_from_projections(
+                                p,
+                                &cached.analysis,
+                                Some(cached.path.clone()),
+                                module_index,
+                            ));
                         }
                     }
                 }
@@ -256,7 +333,7 @@ pub fn resolve_symbol(
             _ => ResolvedTarget::Local,
         },
         kind => ResolvedTarget::Target(
-            TargetRef::from_rename_kind(kind, analysis, module_index)
+            TargetRef::from_rename_kind(kind, analysis, module_index, scope)
                 .expect("Function/Method/Package/Handler kinds map to a target"),
         ),
     })
@@ -308,6 +385,12 @@ pub struct RefLocation {
     /// migrate to `refs_to` in a follow-up.
     #[allow(dead_code)]
     pub access: AccessKind,
+    /// Whether rename may rewrite this span. `false` for a site whose name has
+    /// no literal token to replace — a const-folded event name
+    /// (`my $e = 'ready'; $obj->on($e)`) whose dispatch span IS the variable.
+    /// References lists it (it's a real use); rename skips it (rewriting the
+    /// variable would corrupt it). True for every literal occurrence.
+    pub rewritable: bool,
 }
 
 impl RefLocation {
@@ -338,6 +421,7 @@ fn group_from_projections(
                 p.class.clone(),
                 class_analysis,
                 module_index,
+                OverrideScope::Hierarchy,
             ),
             rename: MemberRename::Bare,
         });
@@ -363,6 +447,18 @@ fn group_from_projections(
             rename: MemberRename::Bare,
         });
     }
+    if p.has_class_key {
+        // `Class`-backed attr (DBIC column): a `HashKeyOfClass` member catches
+        // every `attr`-named key use `found_by`-style — direct deref plus
+        // search/find/update arg keys owned `Sub{class, verb}`.
+        members.push(GroupMember {
+            target: TargetRef::new(
+                p.bare.clone(),
+                TargetKind::HashKeyOfClass(p.class.clone()),
+            ),
+            rename: MemberRename::Bare,
+        });
+    }
     for m in &p.mapped {
         members.push(GroupMember {
             target: TargetRef::method(
@@ -370,6 +466,7 @@ fn group_from_projections(
                 p.class.clone(),
                 class_analysis,
                 module_index,
+                OverrideScope::Hierarchy,
             ),
             rename: match &m.affix {
                 Some((pre, suf)) => MemberRename::Affixed {
@@ -418,12 +515,14 @@ pub fn group_refs(
             key: origin.clone(),
             span: *span,
             access: AccessKind::Read,
+            rewritable: true,
         })
         .collect();
     out.extend(pinned_spans.iter().map(|(path, span)| RefLocation {
         key: FileKey::Path(path.clone()),
         span: *span,
         access: AccessKind::Read,
+        rewritable: true,
     }));
     for m in members {
         let mask = mask_override
@@ -459,7 +558,7 @@ pub fn group_rename_edits(
         .iter()
         .map(|span| {
             (
-                RefLocation { key: origin.clone(), span: *span, access: AccessKind::Read },
+                RefLocation { key: origin.clone(), span: *span, access: AccessKind::Read, rewritable: true },
                 bare_new.to_string(),
             )
         })
@@ -470,6 +569,7 @@ pub fn group_rename_edits(
                 key: FileKey::Path(path.clone()),
                 span: *span,
                 access: AccessKind::Read,
+                rewritable: true,
             },
             bare_new.to_string(),
         )
@@ -635,6 +735,7 @@ pub fn implementations_of(
                         key: FileKey::Path(cached.path.clone()),
                         span: s.selection_span,
                         access: AccessKind::Declaration,
+                        rewritable: true,
                     });
                 }
             }
@@ -663,6 +764,32 @@ fn file_key_eq(a: &FileKey, b: &FileKey) -> bool {
     key_for_sort(a) == key_for_sort(b)
 }
 
+/// The classes whose declarations a callable rename should match: the override
+/// FAMILY for `Hierarchy` (root + every overrider/inheritor), the dispatch
+/// CHAIN for `Dispatch` (cursor class up to the def its dispatch lands on).
+fn method_classes_for(
+    origin: &FileAnalysis,
+    class: &str,
+    name: &str,
+    module_index: Option<&dyn CrossFileLookup>,
+    scope: OverrideScope,
+) -> Vec<String> {
+    match scope {
+        OverrideScope::Hierarchy => origin.method_override_family(class, name, module_index),
+        OverrideScope::Dispatch => origin.method_rename_chain(class, name, module_index),
+    }
+}
+
+/// A name spelled by a variable at `span` — a `Variable`/`ContainerAccess`
+/// ref covers it exactly. The signal that a dispatch site is const-folded
+/// (`$obj->on($evt)`): its name span IS the `$evt` token, so rename must not
+/// rewrite it. Literal names never coincide with a variable ref.
+fn span_variable_spelled(analysis: &FileAnalysis, span: Span) -> bool {
+    analysis.refs.iter().any(|r| {
+        matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) && r.span == span
+    })
+}
+
 /// True when `sym` is a declaration of `target` (decl-span match).
 /// Shared by `collect_from_analysis` (to emit decl locations) and
 /// `mask_for_target` (to decide whether the def lives in editable space).
@@ -678,7 +805,16 @@ fn symbol_defines_target(sym: &crate::file_analysis::Symbol, target: &TargetRef)
     // with stricter intent.
     match &target.kind {
         TargetKind::Sub { package } => {
-            matches!(sym.kind, SymKind::Sub | SymKind::Method) && sym.package == *package
+            // Exact scope, OR — under Hierarchy — any class in the override
+            // family (so a base-`sub` rename also rewrites every override's
+            // decl). Dispatch keeps the strict single-scope match.
+            let in_scope = sym.package == *package
+                || (target.scope == OverrideScope::Hierarchy
+                    && target
+                        .method_classes
+                        .iter()
+                        .any(|c| Some(c.as_str()) == sym.package.as_deref()));
+            matches!(sym.kind, SymKind::Sub | SymKind::Method) && in_scope
         }
         TargetKind::Method { class } => {
             // A `sub NAME` declaration belongs to this target if it lives in
@@ -793,6 +929,13 @@ fn collect_from_analysis(
     let mut rename_chain_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
+    // Only handler (event) names can be spelled by a variable (const-folded
+    // `$obj->on($evt)`); for every other target kind the span is a literal name
+    // token, always rewritable. Gating the variable-overlap scan to handlers
+    // keeps it off the hot path.
+    let is_handler = matches!(target.kind, TargetKind::Handler { .. });
+    let rewritable_at = |span: Span| !(is_handler && span_variable_spelled(analysis, span));
+
     // Include declaration spans when this file defines the target.
     for sym in &analysis.symbols {
         if symbol_defines_target(sym, target) {
@@ -800,6 +943,7 @@ fn collect_from_analysis(
                 key: key.clone(),
                 span: sym.selection_span,
                 access: AccessKind::Declaration,
+                rewritable: rewritable_at(sym.selection_span),
             });
         }
     }
@@ -830,7 +974,21 @@ fn collect_from_analysis(
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
              RefKind::FunctionCall { resolved_package }) => {
                 let scope = callable_scope_for_refs.as_ref().unwrap();
-                resolved_package == scope
+                // Under Hierarchy a bare call into ANY family class matches (the
+                // whole override family); Dispatch keeps the strict single
+                // scope. A bare imported call the single-file walk couldn't pin
+                // (`use Bank;` auto-imports `@EXPORT`, invisible at build) has
+                // `resolved_package: None` — re-derive it here, where the index
+                // is in hand.
+                let pkg_matches = |pkg: &Option<String>| {
+                    pkg == scope
+                        || (target.scope == OverrideScope::Hierarchy
+                            && target.method_classes.iter().any(|c| Some(c) == pkg.as_ref()))
+                };
+                match resolved_package {
+                    Some(_) => pkg_matches(resolved_package),
+                    None => pkg_matches(&analysis.deferred_call_package(r, module_index)),
+                }
             }
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
              RefKind::MethodCall { .. }) => {
@@ -853,13 +1011,27 @@ fn collect_from_analysis(
                     };
                     match (resolved_class, scope) {
                         (Some(cn), Some(pkg)) => {
-                            cn == *pkg || rename_chain_cache
-                                .entry(cn.clone())
-                                .or_insert_with(|| {
-                                    analysis.method_rename_chain(&cn, method, module_index)
-                                })
-                                .iter()
-                                .any(|c| c == pkg)
+                            if target.scope == OverrideScope::Hierarchy {
+                                // The override family is precomputed; a call
+                                // matches iff its invocant is in it — so
+                                // `$child->m` and `$base->m` rename together.
+                                // (Every family member is a descendant of the
+                                // root, so inheriting-without-override calls are
+                                // covered by membership.)
+                                target.method_classes.iter().any(|c| c == &cn)
+                            } else {
+                                // Dispatch: the call matches only if it
+                                // dispatches to THIS def — `$child->m` reaches an
+                                // ancestor target via the per-invocant chain,
+                                // unrelated same-named methods stay out.
+                                cn == *pkg || rename_chain_cache
+                                    .entry(cn.clone())
+                                    .or_insert_with(|| {
+                                        analysis.method_rename_chain(&cn, method, module_index)
+                                    })
+                                    .iter()
+                                    .any(|c| c == pkg)
+                            }
                         }
                         _ => false,
                     }
@@ -873,10 +1045,13 @@ fn collect_from_analysis(
                 Some(HashKeyOwner::Sub { package: op, name: on }) => {
                     op == package && on == name
                 }
-                // Deferred (`owner: None`): the build-time gate couldn't see
-                // the class — re-derive the owner here, where the index is
-                // in hand (same lazy seam method dispatch uses above).
-                None => analysis
+                // owner `None` (build gate blind) OR `Variable` (the var is
+                // bound to an imported call enrichment didn't reach in this
+                // unenriched workspace file) — re-derive cross-file, the same
+                // lazy seam method dispatch + deferred owners use above. This
+                // is what makes a producer-origin rename reach the consumer's
+                // `$c->{key}` access without depending on open-doc enrichment.
+                _ => analysis
                     .deferred_hash_key_owner(r, module_index)
                     .is_some_and(|o| {
                         matches!(
@@ -885,7 +1060,6 @@ fn collect_from_analysis(
                                 if op == *package && on == *name
                         )
                     }),
-                Some(_) => false,
             },
             (TargetKind::HashKeyOfClass(wanted), RefKind::HashKeyAccess { owner, .. }) => {
                 // `Class(wanted)` is the canonical shape for "this
@@ -932,6 +1106,7 @@ fn collect_from_analysis(
                 key: key.clone(),
                 span,
                 access: r.access,
+                rewritable: rewritable_at(span),
             });
         }
     }
@@ -950,6 +1125,7 @@ fn collect_from_analysis(
                     key: key.clone(),
                     span: applied.span,
                     access: AccessKind::Read,
+                    rewritable: rewritable_at(applied.span),
                 });
             }
         }
