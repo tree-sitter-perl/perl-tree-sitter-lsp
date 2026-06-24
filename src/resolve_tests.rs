@@ -3005,6 +3005,40 @@ fn test_group_rename_rederives_mapped_members_cross_file() {
     );
 }
 
+/// Finding #4: a DBIC column's accessor (`$row->name`) and its key uses
+/// (`search({name=>…})`, `$row->{name}`) are one renameable unit. The
+/// synthesized accessor Method + the same-span `Class`-owned column HashKeyDef
+/// form an attr group whose `HashKeyOfClass` member catches the key uses
+/// (`found_by` reaches the `Sub{class, verb}`-owned search args), so rename
+/// from either face rewrites both. Before, accessor → `Method` and column key
+/// → `HashKeyOfClass` were disjoint.
+#[test]
+fn test_dbic_column_accessor_and_key_form_one_group() {
+    let fa = parse(
+        "package Schema::Result::User;\n\
+         use base 'DBIx::Class::Core';\n\
+         __PACKAGE__->add_columns(qw/id name/);\n\
+         1;\n",
+    );
+    // Cursor on the synthesized accessor / column `name` token (row 2).
+    let col = "__PACKAGE__->add_columns(qw/id ".len();
+    let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None)
+        .expect("column resolves");
+    let ResolvedTarget::Group { members, .. } = resolved else {
+        panic!("expected a column attr Group, got {:?}", resolved);
+    };
+    assert!(
+        members.iter().any(|m| matches!(m.target.kind, TargetKind::Method { .. })),
+        "group carries the accessor Method member: {:?}",
+        members,
+    );
+    assert!(
+        members.iter().any(|m| matches!(m.target.kind, TargetKind::HashKeyOfClass(_))),
+        "group carries the HashKeyOfClass member (search/deref keys): {:?}",
+        members,
+    );
+}
+
 /// Finding #2 (reverse direction): a consumer-side cursor on a name-mapped
 /// accessor (`$w->has_size`) OR an internal slot (`$w->{size}`) resolves to
 /// the same cross-file attr group as the decl — so rename from any spelling

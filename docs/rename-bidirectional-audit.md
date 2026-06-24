@@ -50,7 +50,7 @@ seam (§3).
 | Moo `has` ctor-key / accessor-call / decl | ✓ | ✓ | symmetric (among themselves) |
 | Return-hash key (`HashKeyOfSub`), **cross-file** | ✓ | ✓ | symmetric (finding #3 — fixed) |
 | Mojo-events handler (`->on`/`->emit`) | 1-of-N in-file | 0 edits | **ASYMMETRIC + lossy** — finding #1 |
-| DBIC column (def/accessor/search-key) | HashKeyOfClass | Method | **ASYMMETRIC** — finding #4 |
+| DBIC column (def/accessor/search-key) | ✓ | ✓ | symmetric (finding #4 — fixed) |
 
 ---
 
@@ -287,7 +287,29 @@ Original report retained below for context.
   unmatchable span) and exclude them from reference/rename decl emission in
   `collect_from_analysis` / `collect_refs_for_target`.
 
-### #4 — DBIC column vs accessor resolve to different target kinds — MEDIUM
+### #4 — DBIC column vs accessor — FIXED
+**Resolved** by grouping the synthesized accessor with its column key:
+- `attr_pair_group` gained a second anchor — an accessor `Method` + a
+  same-span `Class`-owned `HashKeyDef` (DBIC `add_columns`, `Class::Accessor`).
+  Span equality is the synthesized-pair signal (same as the Moo ctor-key case).
+- `FieldProjections` gained `has_class_key`; `group_from_projections` emits a
+  `HashKeyOfClass` member for it, which catches every `attr`-named key use
+  `found_by`-style — direct deref `$row->{name}` AND search/find/update arg
+  keys (`Sub{class, verb}`-owned). Distinct from `has_internal` (STRICT
+  `Class`, Moo/bless slots).
+- No gate change (routes through the `Group` path). Cross-file works the same
+  way `field_projections_named` already chases.
+
+Note: a column rename correctly spans every file defining the same FQ result
+class (the audit's "over-reach into oop_playground.pl" was a fixture-name
+collision — both files declare `package Schema::Result::User` — not a bug).
+
+Zero special-casing: one extra `attr_pair_group` anchor + one member kind,
+both keyed on real symbol shapes (span-matched pair, `Class` owner).
+
+Original report retained below.
+
+### #4 (orig) — DBIC column vs accessor resolve to different target kinds — MEDIUM
 `add_columns` synthesizes a column hash-key *and* an accessor method, but they
 aren't joined into one group (unlike Corinna). Column-def cursor →
 `HashKeyOfClass` (and via `found_by` lands on `add_columns`/search-arg spans,

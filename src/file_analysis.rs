@@ -2500,6 +2500,12 @@ pub struct FieldProjections {
     /// An `InternalKey` projection was minted (hash-backed repr) —
     /// `$obj->{attr}` slot pokes join the group, cross-file included.
     pub has_internal: bool,
+    /// A `Class(class)`-owned `HashKeyDef` backs this attr (DBIC columns,
+    /// `Class::Accessor`): the key is reached `found_by`-style, so every
+    /// access named `attr` — direct deref `$row->{attr}`, search/find/update
+    /// arg keys (`Sub{class, verb}`-owned) — joins the group. Distinct from
+    /// `has_internal` (STRICT `Class` match, Moo/bless internal slots).
+    pub has_class_key: bool,
     /// Origin-file variable spellings (decl + body uses), bare-adjusted.
     pub variable_spans: Vec<Span>,
     /// Plugin-declared, name-mapped members (`predicate => has_size`).
@@ -5404,7 +5410,9 @@ impl FileAnalysis {
     /// what distinguishes the pair from a real `sub name` that happens
     /// to share a class with someone's ctor key).
     fn attr_pair_group(&self, bare: &str, class: &str) -> Option<FieldGroup> {
-        let key_def = self.symbols.iter().find(|s| {
+        // (1) Constructor-key pairing (Moo/Mojo `has`): the ctor-key HashKeyDef
+        // is the anchor; the accessor (if any) shares its selection span.
+        if let Some(key_def) = self.symbols.iter().find(|s| {
             matches!(s.kind, SymKind::HashKeyDef)
                 && s.name == bare
                 && matches!(
@@ -5414,20 +5422,51 @@ impl FileAnalysis {
                         ..
                     } if p == class && crate::conventions::is_constructor_name(name)
                 )
-        })?;
+        }) {
+            let accessor = self.symbols.iter().find(|s| {
+                matches!(s.kind, SymKind::Method)
+                    && s.name == bare
+                    && s.package.as_deref() == Some(class)
+                    && s.selection_span == key_def.selection_span
+            });
+            return Some(FieldGroup {
+                field_sym: None,
+                decl_span: Some(key_def.selection_span),
+                class: class.to_string(),
+                bare: bare.to_string(),
+                has_param: true,
+                has_reader: accessor.is_some(),
+            });
+        }
+        // (2) Class-key pairing (DBIC `add_columns`, Class::Accessor): an
+        // accessor Method and a `Class`-owned HashKeyDef of the same name
+        // minted from the SAME token (span equality is the synthesized-pair
+        // signal). The key side is reached via the `has_class_key` member;
+        // here we just confirm the pair exists and pin the decl span.
         let accessor = self.symbols.iter().find(|s| {
             matches!(s.kind, SymKind::Method)
                 && s.name == bare
                 && s.package.as_deref() == Some(class)
-                && s.selection_span == key_def.selection_span
+        })?;
+        let paired = self.symbols.iter().any(|s| {
+            matches!(s.kind, SymKind::HashKeyDef)
+                && s.name == bare
+                && s.selection_span == accessor.selection_span
+                && matches!(
+                    &s.detail,
+                    SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(c), .. } if c == class
+                )
         });
+        if !paired {
+            return None;
+        }
         Some(FieldGroup {
             field_sym: None,
-            decl_span: Some(key_def.selection_span),
+            decl_span: Some(accessor.selection_span),
             class: class.to_string(),
             bare: bare.to_string(),
-            has_param: true,
-            has_reader: accessor.is_some(),
+            has_param: false,
+            has_reader: true,
         })
     }
 
@@ -5780,12 +5819,24 @@ impl FileAnalysis {
                 && a.attr == g.bare
                 && matches!(a.kind, AttrProjectionKind::InternalKey)
         });
+        // A `Class`-owned HashKeyDef for this attr (DBIC column / Class::Accessor)
+        // — its key uses (`$row->{attr}`, `search({attr=>…})`) are reached
+        // `found_by`-style, so the group needs a `HashKeyOfClass` member.
+        let has_class_key = self.symbols.iter().any(|s| {
+            matches!(s.kind, SymKind::HashKeyDef)
+                && s.name == g.bare
+                && matches!(
+                    &s.detail,
+                    SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(c), .. } if *c == g.class
+                )
+        });
         FieldProjections {
             class: g.class,
             bare: g.bare,
             has_param: g.has_param,
             has_reader: g.has_reader,
             has_internal,
+            has_class_key,
             variable_spans,
             mapped,
         }

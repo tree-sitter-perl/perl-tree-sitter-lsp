@@ -383,6 +383,18 @@ fn group_from_projections(
             rename: MemberRename::Bare,
         });
     }
+    if p.has_class_key {
+        // `Class`-backed attr (DBIC column): a `HashKeyOfClass` member catches
+        // every `attr`-named key use `found_by`-style — direct deref plus
+        // search/find/update arg keys owned `Sub{class, verb}`.
+        members.push(GroupMember {
+            target: TargetRef::new(
+                p.bare.clone(),
+                TargetKind::HashKeyOfClass(p.class.clone()),
+            ),
+            rename: MemberRename::Bare,
+        });
+    }
     for m in &p.mapped {
         members.push(GroupMember {
             target: TargetRef::method(
