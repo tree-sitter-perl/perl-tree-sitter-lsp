@@ -48,7 +48,7 @@ seam (§3).
 | Moo `has` internal slot `$self->{attr}` | reaches slot | slot→group fails | **ASYMMETRIC** — finding #2 |
 | Moo `has` mapped accessors (`has_x`/`clear_x`) | renames them | accessor→group fails | **ASYMMETRIC** — finding #2 |
 | Moo `has` ctor-key / accessor-call / decl | ✓ | ✓ | symmetric (among themselves) |
-| Return-hash key (`HashKeyOfSub`), **cross-file** | def→def only | consumer→consumer + phantom | **ASYMMETRIC + phantom-edit** — finding #3 |
+| Return-hash key (`HashKeyOfSub`), **cross-file** | ✓ | ✓ | symmetric (finding #3 — fixed) |
 | Mojo-events handler (`->on`/`->emit`) | 1-of-N in-file | 0 edits | **ASYMMETRIC + lossy** — finding #1 |
 | DBIC column (def/accessor/search-key) | HashKeyOfClass | Method | **ASYMMETRIC** — finding #4 |
 
@@ -228,7 +228,31 @@ full 7-member group. But:
   (Contrast: bless keys are symmetric because key + slot share one synthesized
   symbol/owner.)
 
-### #3 — Return-hash key cross-file + phantom `0:0` edit — MEDIUM
+### #3 — Return-hash key cross-file + phantom `0:0` edit — FIXED (total unification)
+**Resolved** by unifying owner identity and removing the consumer-side stub:
+- Enrichment stamps the consumer access owner with the **producer's package**
+  (`Sub{Some("Cfg"), get_config}`) instead of the lossy `None` — so producer
+  and consumer agree on the owner.
+- The consumer-side synthetic `HashKeyDef` stub is **gone**. The producer's
+  real def is the single source: completion reaches it cross-file
+  (`complete_hash_keys_for_owner` walks the index for a `Sub` owner via
+  `imported_sub_keys`); rename/references/goto-def reach it via the owner edge.
+  No stub → no phantom `0:0` by construction.
+- For a producer-origin rename, the consumer lives in an **unenriched**
+  workspace file (owner `Variable`), so `deferred_hash_key_owner` grew a
+  function-call-binding arm: `$c = get_config(); $c->{key}` re-derives
+  `Sub{Some(pkg), get_config}` at query time through the index — the same lazy
+  seam method dispatch + deferred owners use. `collect_from_analysis` now tries
+  it for `None` *and* `Variable` owners.
+- `HashKeyOfSub` flipped into `supports_cross_file_rename`.
+
+Zero special-casing (the user's bar): one owner identity, one source, one lazy
+resolver shared by eager (open) + lazy (workspace) paths. `HashKeyOfClass`
+(finding #2) and `Handler` (finding #1) remain single-file.
+
+Original report retained below for context.
+
+### #3 (orig) — Return-hash key cross-file + phantom `0:0` edit — MEDIUM
 `Config1::get_config` returns `{ host => …, port => … }`; consumer does
 `$cfg->{host}`.
 - From def `Config1.pm:7:13` → 1 edit (def only; `HashKeyOfSub` is

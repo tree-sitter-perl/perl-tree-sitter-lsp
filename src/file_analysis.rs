@@ -3608,7 +3608,13 @@ impl FileAnalysis {
         // the only piece still needed by enrichment; imported return
         // types are reached lazily by `query_sub_return_type` walking
         // `module_index.find_exporters(name)`.
-        let mut imported_hash_keys: HashMap<String, Vec<String>> = HashMap::new();
+        // func name → (producer package, keys). The producer package is the
+        // load-bearing piece: a consumer's `$cfg->{host}` access must carry the
+        // SAME owner the producer's `host` HashKeyDef does
+        // (`Sub{Some("Cfg"), get_config}`), or cross-file rename/references
+        // never link the two. Dropping it to `None` (the old default) was a
+        // lossy projection of a package the index already knows.
+        let mut imported_hash_keys: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
         let mut imported_returns: HashMap<String, InferredType> = HashMap::new();
         if let Some(idx) = module_index {
             for import in &self.imports {
@@ -3628,7 +3634,8 @@ impl FileAnalysis {
                     if let Some(sub_info) = cached.sub_info(&sym.name) {
                         let hk = sub_info.hash_keys();
                         if !hk.is_empty() {
-                            imported_hash_keys.insert(sym.name.clone(), hk.to_vec());
+                            imported_hash_keys
+                                .insert(sym.name.clone(), (sym.package.clone(), hk.to_vec()));
                         }
                     }
                 }
@@ -3658,34 +3665,12 @@ impl FileAnalysis {
             self.push_type_constraint(tc);
         }
 
-        // Inject synthetic HashKeyDef symbols for imported functions' hash keys.
-        // Imported subs have no local package — package=None mirrors the
-        // HashKeyAccess fixup's default for imported bindings.
-        for (func_name, keys) in &imported_hash_keys {
-            let owner = HashKeyOwner::Sub { package: None, name: func_name.clone() };
-            for key_name in keys {
-                let id = SymbolId(self.symbols.len() as u32);
-                let zero_span = Span {
-                    start: Point { row: 0, column: 0 },
-                    end: Point { row: 0, column: 0 },
-                };
-                self.symbols.push(Symbol {
-                    id,
-                    name: key_name.clone(),
-                    kind: SymKind::HashKeyDef,
-                    span: zero_span,
-                    selection_span: zero_span,
-                    scope: ScopeId(0),
-                    package: None,
-                    detail: SymbolDetail::HashKeyDef {
-                        owner: owner.clone(),
-                        is_dynamic: false,
-                    },
-                    namespace: Namespace::Language,
-                    outline_label: None,
-                });
-            }
-        }
+        // No synthetic HashKeyDef is materialized for imported keys: the
+        // producer's real def is the single source. Completion reaches it
+        // cross-file (`complete_hash_keys_for_owner` walks the index for a
+        // `Sub` owner); rename/references/goto-def reach it via the owner edge
+        // the fixup below stamps. A location-less stub would only re-appear as
+        // a phantom `0:0` decl in those queries.
 
         // HashKeyAccess owner fixup for imports: the builder's pass
         // only ran for bindings where the func's return type was
@@ -3714,10 +3699,10 @@ impl FileAnalysis {
                         continue;
                     }
                     if let Some(func_name) = binding_by_var.get(var_text.as_str()) {
-                        if let Some(keys) = imported_hash_keys.get(func_name) {
+                        if let Some((pkg, keys)) = imported_hash_keys.get(func_name) {
                             if keys.iter().any(|k| k == &r.target_name) {
                                 *owner = Some(HashKeyOwner::Sub {
-                                    package: None,
+                                    package: pkg.clone(),
                                     name: func_name.clone(),
                                 });
                                 r.resolves_to = None;
@@ -5606,7 +5591,9 @@ impl FileAnalysis {
         key_ref: &Ref,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<HashKeyOwner> {
-        let enclosing = self
+        // Inline method-chain receiver: `$obj->method->{key}` — the key
+        // belongs to `method`'s return value, owned `Sub{invocant_class, method}`.
+        if let Some(enclosing) = self
             .refs
             .iter()
             .filter(|c| {
@@ -5614,16 +5601,43 @@ impl FileAnalysis {
                     && contains_point(&c.span, key_ref.span.start)
                     && contains_point(&c.span, key_ref.span.end)
             })
-            .min_by_key(|c| span_size(&c.span))?;
-        let class = enclosing
-            .resolved_method_target
-            .as_ref()
-            .map(|t| t.invocant_class().to_string())
-            .or_else(|| self.method_call_invocant_class(enclosing, module_index))?;
-        Some(HashKeyOwner::Sub {
-            package: Some(class),
-            name: enclosing.unqualified_target_name().to_string(),
-        })
+            .min_by_key(|c| span_size(&c.span))
+        {
+            if let Some(class) = enclosing
+                .resolved_method_target
+                .as_ref()
+                .map(|t| t.invocant_class().to_string())
+                .or_else(|| self.method_call_invocant_class(enclosing, module_index))
+            {
+                return Some(HashKeyOwner::Sub {
+                    package: Some(class),
+                    name: enclosing.unqualified_target_name().to_string(),
+                });
+            }
+        }
+        // Variable bound to an imported function call: `$c = get_config();
+        // $c->{key}`. The build-time walk only pins the owner when the sub's
+        // return keys were known locally; for an imported sub the producer's
+        // package lives across the index. Enrichment stamps this eagerly on
+        // OPEN docs — recover it here for the unenriched workspace file (the
+        // producer-origin rename's consumer), so the owner edge is symmetric
+        // regardless of which side is open. Same lazy seam as above.
+        if let (RefKind::HashKeyAccess { var_text, .. }, Some(idx)) =
+            (&key_ref.kind, module_index)
+        {
+            if let Some(binding) = self.call_bindings.iter().find(|b| &b.variable == var_text) {
+                let func = split_qualified(&binding.func_name).1;
+                if let Some((pkg, keys)) = self.imported_sub_keys(func, idx) {
+                    if keys.iter().any(|k| k == &key_ref.target_name) {
+                        return Some(HashKeyOwner::Sub {
+                            package: pkg,
+                            name: func.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Resolve the package a walk-time-unresolved bare call
@@ -8029,7 +8043,11 @@ impl FileAnalysis {
     }
 
     /// Complete hash keys for a resolved owner.
-    fn complete_hash_keys_for_owner(&self, owner: &HashKeyOwner) -> Vec<CompletionCandidate> {
+    fn complete_hash_keys_for_owner(
+        &self,
+        owner: &HashKeyOwner,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<CompletionCandidate> {
         let defs = self.hash_key_defs_for_owner(owner);
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
@@ -8061,28 +8079,91 @@ impl FileAnalysis {
             });
         }
 
+        // Imported return-hash keys live on the producer's real HashKeyDef, not
+        // a local stub — reach them cross-file (the same scan enrichment does
+        // for the owner fixup, run at query time so completion has one source).
+        if let (HashKeyOwner::Sub { name, .. }, Some(idx)) = (owner, module_index) {
+            if let Some((_pkg, keys)) = self.imported_sub_keys(name, idx) {
+                for key in keys {
+                    if seen.insert(key.clone()) {
+                        candidates.push(CompletionCandidate {
+                            label: key.clone(),
+                            kind: SymKind::Variable,
+                            detail: Some(format!("{}()->{{{}}}", name, key)),
+                            insert_text: None,
+                            sort_priority: PRIORITY_FILE_WIDE,
+                            additional_edits: vec![],
+                            display_override: None,
+                        });
+                    }
+                }
+            }
+        }
+
         candidates
     }
 
+    /// `(producer package, return-hash keys)` of an imported sub, resolved
+    /// cross-file through the index. The producer's real `HashKeyDef`s are the
+    /// single source — enrichment no longer materializes a consumer-side stub,
+    /// so completion reads keys here and the deferred owner reads the package,
+    /// exactly as rename/references/goto-def reach them via the owner edge.
+    fn imported_sub_keys(
+        &self,
+        sub_name: &str,
+        module_index: &dyn CrossFileLookup,
+    ) -> Option<(Option<String>, Vec<String>)> {
+        for import in &self.imports {
+            let Some(cached) = module_index.get_cached(&import.module_name) else { continue };
+            for sym in &cached.analysis.symbols {
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                if sym.name != sub_name { continue; }
+                if !cached.analysis.exports_name(&sym.name) { continue; }
+                if let Some(sub_info) = cached.sub_info(&sym.name) {
+                    let hk = sub_info.hash_keys();
+                    if !hk.is_empty() {
+                        return Some((sym.package.clone(), hk.to_vec()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Complete hash keys for a variable at a point.
-    pub fn complete_hash_keys(&self, var_text: &str, point: Point) -> Vec<CompletionCandidate> {
+    pub fn complete_hash_keys(
+        &self,
+        var_text: &str,
+        point: Point,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<CompletionCandidate> {
         match self.resolve_hash_key_owner(var_text, point) {
-            Some(owner) => self.complete_hash_keys_for_owner(&owner),
+            Some(owner) => self.complete_hash_keys_for_owner(&owner, module_index),
             None => Vec::new(),
         }
     }
 
     /// Complete hash keys for a known class name (from expression type resolution).
-    pub fn complete_hash_keys_for_class(&self, class_name: &str, _point: Point) -> Vec<CompletionCandidate> {
-        self.complete_hash_keys_for_owner(&HashKeyOwner::Class(class_name.to_string()))
+    pub fn complete_hash_keys_for_class(
+        &self,
+        class_name: &str,
+        _point: Point,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<CompletionCandidate> {
+        self.complete_hash_keys_for_owner(&HashKeyOwner::Class(class_name.to_string()), module_index)
     }
 
     /// Complete hash keys for a sub's return value (from expression type resolution).
     ///
-    /// Tries the caller's enclosing package first (local subs), then falls
-    /// back to an unpackaged owner (imported subs whose synthetic HashKeyDef
-    /// was added during enrichment with `package: None`).
-    pub fn complete_hash_keys_for_sub(&self, sub_name: &str, _point: Point) -> Vec<CompletionCandidate> {
+    /// Tries the caller's enclosing package first (local subs), then an
+    /// unpackaged owner, then the cross-file producer (imported subs' return
+    /// keys live on the producer's real HashKeyDef, reached via the index).
+    pub fn complete_hash_keys_for_sub(
+        &self,
+        sub_name: &str,
+        _point: Point,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<CompletionCandidate> {
         // Try each candidate owner variant until one has defs.
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -8096,11 +8177,11 @@ impl FileAnalysis {
         for sym in &self.symbols {
             if (sym.kind == SymKind::Sub || sym.kind == SymKind::Method) && sym.name == sub_name {
                 let owner = HashKeyOwner::Sub { package: sym.package.clone(), name: sub_name.to_string() };
-                push_unique(self.complete_hash_keys_for_owner(&owner), &mut out, &mut seen);
+                push_unique(self.complete_hash_keys_for_owner(&owner, module_index), &mut out, &mut seen);
             }
         }
         let imported_owner = HashKeyOwner::Sub { package: None, name: sub_name.to_string() };
-        push_unique(self.complete_hash_keys_for_owner(&imported_owner), &mut out, &mut seen);
+        push_unique(self.complete_hash_keys_for_owner(&imported_owner, module_index), &mut out, &mut seen);
 
         // Final sweep: match any HashKeyDef whose owner is Sub{name: sub_name}
         // regardless of package. Covers plugin-synthesized options (e.g.

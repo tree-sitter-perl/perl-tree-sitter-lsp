@@ -80,19 +80,21 @@ impl TargetRef {
 
     /// Which targets rename through `refs_to` (cross-file, owner/scope-
     /// structural) rather than the single-file `rename_at` fallback —
-    /// references walks *every* kind cross-file; rename does not. The gap is
-    /// being closed per kind (see `docs/rename-bidirectional-audit.md`), but
-    /// the gate is NOT the sole blocker: flipping it for the remaining kinds
-    /// changes nothing useful on its own. Hash keys need producer↔consumer
-    /// owner reconciliation (`Sub{Some(pkg),f}` vs the enriched/synthetic
-    /// `Sub{None,f}`) plus suppression of the zero-span synthetic def;
-    /// handlers need rename-ready name spans (the event-name span includes
-    /// its surrounding quotes today, so a bare replacement would strip them).
-    /// Until those land, widening this predicate ships broken edits.
+    /// references walks *every* kind cross-file; rename is being brought into
+    /// line one kind at a time (see `docs/rename-bidirectional-audit.md`).
+    /// `HashKeyOfSub` joined once producer↔consumer owner identity was unified
+    /// (enrichment stamps the consumer access with the producer's package, and
+    /// the consumer-side completion stub is gone — the producer's real def is
+    /// the single source). Still single-file: `HashKeyOfClass` (Moo slots need
+    /// the projection-group arm — finding #2) and `Handler` (event names need
+    /// rename-ready spans — their span includes the surrounding quotes today).
     pub fn supports_cross_file_rename(&self) -> bool {
         matches!(
             self.kind,
-            TargetKind::Sub { .. } | TargetKind::Method { .. } | TargetKind::Package
+            TargetKind::Sub { .. }
+                | TargetKind::Method { .. }
+                | TargetKind::Package
+                | TargetKind::HashKeyOfSub { .. }
         )
     }
 
@@ -888,10 +890,13 @@ fn collect_from_analysis(
                 Some(HashKeyOwner::Sub { package: op, name: on }) => {
                     op == package && on == name
                 }
-                // Deferred (`owner: None`): the build-time gate couldn't see
-                // the class — re-derive the owner here, where the index is
-                // in hand (same lazy seam method dispatch uses above).
-                None => analysis
+                // owner `None` (build gate blind) OR `Variable` (the var is
+                // bound to an imported call enrichment didn't reach in this
+                // unenriched workspace file) — re-derive cross-file, the same
+                // lazy seam method dispatch + deferred owners use above. This
+                // is what makes a producer-origin rename reach the consumer's
+                // `$c->{key}` access without depending on open-doc enrichment.
+                _ => analysis
                     .deferred_hash_key_owner(r, module_index)
                     .is_some_and(|o| {
                         matches!(
@@ -900,7 +905,6 @@ fn collect_from_analysis(
                                 if op == *package && on == *name
                         )
                     }),
-                Some(_) => false,
             },
             (TargetKind::HashKeyOfClass(wanted), RefKind::HashKeyAccess { owner, .. }) => {
                 // `Class(wanted)` is the canonical shape for "this

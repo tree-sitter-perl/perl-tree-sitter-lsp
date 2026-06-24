@@ -2210,6 +2210,65 @@ fn refs_to_links_implicit_export_to_bare_use_consumer() {
     );
 }
 
+/// Cross-file return-hash key rename: a sub's `return { host => … }` key,
+/// consumed in another file as `$c->{host}` where `$c = imported_sub()`.
+/// Both directions must reach the producer's real def + the consumer access:
+///   * owner identity is unified (producer package stamped on the consumer
+///     access — `Sub{Some("Cfg"), get_config}` both sides);
+///   * the consumer access in an UNENRICHED workspace file (owner `Variable`)
+///     re-derives cross-file via `deferred_hash_key_owner`'s function-binding
+///     arm, so a producer-origin rename doesn't depend on open-doc enrichment;
+///   * no synthetic stub exists, so no phantom `0:0` decl appears.
+#[test]
+fn refs_to_links_return_hash_key_cross_file() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let prod = PathBuf::from("/tmp/rk_cfg.pm");
+    let cons = PathBuf::from("/tmp/rk_consumer.pl");
+
+    let prod_src = "package Cfg;\n\
+         use Exporter 'import';\n\
+         our @EXPORT = ('get_config');\n\
+         sub get_config { return { host => 'h', port => 1 }; }\n1;\n";
+    let cons_src = "use Cfg;\nmy $c = get_config();\nmy $h = $c->{host};\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(prod.clone(), Arc::new(parse(prod_src)));
+    store.insert_workspace(prod.clone(), parse(prod_src));
+    // Consumer stays UNENRICHED in the store (a workspace file), exercising the
+    // deferred owner re-derivation rather than the eager enrichment fixup.
+    store.insert_workspace(cons.clone(), parse(cons_src));
+
+    let target = TargetRef {
+        name: "host".to_string(),
+        kind: TargetKind::HashKeyOfSub {
+            package: Some("Cfg".to_string()),
+            name: "get_config".to_string(),
+        },
+        method_classes: Vec::new(),
+    };
+    assert!(target.supports_cross_file_rename(), "HashKeyOfSub must rename cross-file now");
+
+    let refs = refs_to(&store, Some(&idx), &target, RoleMask::EDITABLE);
+    let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
+    assert!(hit(&prod), "missed producer's host def. hits: {:?}", refs);
+    assert!(
+        hit(&cons),
+        "missed consumer's $c->{{host}} access (deferred cross-file owner). hits: {:?}",
+        refs,
+    );
+    // The unified model has no zero-span synthetic stub → no phantom decl.
+    assert!(
+        !refs.iter().any(|r| r.span.start.row == 0 && r.span.start.column == 0),
+        "phantom 0:0 edit must not appear. hits: {:?}",
+        refs,
+    );
+    // `port` (sibling key, same sub) must stay out.
+    assert_eq!(refs.len(), 2, "exactly producer def + consumer access. hits: {:?}", refs);
+}
+
 /// Cross-file plain-sub references: an exported sub defined in one
 /// workspace file, imported and called from two others, plus an
 /// unrelated same-named sub in a *different* package that must NOT

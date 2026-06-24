@@ -9385,7 +9385,7 @@ $minion->enqueue(task_x => ['arg'] => { });
     }
 
     // Completion path surfaces the plugin's HashKeyDefs.
-    let candidates = fa.complete_hash_keys_for_sub("enqueue", cursor);
+    let candidates = fa.complete_hash_keys_for_sub("enqueue", cursor, None);
     let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
     for expected in &["priority", "queue", "delay", "attempts"] {
         assert!(
@@ -10729,7 +10729,7 @@ sub action {
     // so this stays a soft observation for the spike rather than a
     // hard assert. The load-bearing claim is the array hop, not the
     // FA-side hash-key API.
-    let keys = app_fa.complete_hash_keys_for_class("Some::User", Point::new(0, 0));
+    let keys = app_fa.complete_hash_keys_for_class("Some::User", Point::new(0, 0), None);
     let key_names: std::collections::HashSet<&str> =
         keys.iter().map(|c| c.label.as_str()).collect();
     let _ = key_names; // intentionally not asserted in the spike
