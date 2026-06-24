@@ -5626,6 +5626,45 @@ impl FileAnalysis {
         })
     }
 
+    /// Resolve the package a walk-time-unresolved bare call
+    /// (`resolved_package: None`) actually targets, by asking which `use`d
+    /// module binds the name. A bare `use Bank;` auto-imports `Bank`'s
+    /// `@EXPORT` — a fact only the index knows, so the single-file walk left
+    /// the call unpinned. The lazy re-resolution seam method dispatch
+    /// (`resolved_method_target: None`) and deferred hash-key owners already
+    /// use: where the index is in hand at query time, recover what the
+    /// single-file builder couldn't. Returns the module the call resolves to,
+    /// or `None` when no imported module binds the name (genuinely local /
+    /// builtin / unresolved).
+    pub fn deferred_call_package(
+        &self,
+        call_ref: &Ref,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<String> {
+        let RefKind::FunctionCall { resolved_package: None } = &call_ref.kind else {
+            return None;
+        };
+        // Qualified calls (`Foo::bar`) pin at build time; only truly-bare
+        // unresolved calls reach the index.
+        if split_qualified(&call_ref.target_name).0.is_some() {
+            return None;
+        }
+        let idx = module_index?;
+        let name = call_ref.unqualified_target_name();
+        // Later `use` wins, mirroring `resolve_call_package`'s import scan.
+        for import in self.imports.iter().rev() {
+            let Some(cached) = idx.get_cached(&import.module_name) else { continue };
+            let surface = cached.analysis.export_surface_with_index(idx);
+            if imported_names(import, &surface)
+                .iter()
+                .any(|(local, _)| local.as_str() == name)
+            {
+                return Some(import.module_name.clone());
+            }
+        }
+        None
+    }
+
     /// The cross-file-facing view of the field group at `point`: the
     /// class + bare name + which projections exist, plus the origin-file
     /// variable spellings (fields are lexical to the class block, so the
@@ -5715,10 +5754,17 @@ impl FileAnalysis {
                 RefKind::FunctionCall { resolved_package } => {
                     // A qualified call (`Foo::baz()`) carries the whole path
                     // in `target_name`; the renamable identifier is the bare
-                    // tail, scoped by `resolved_package` (the qualifier).
+                    // tail, scoped by `resolved_package` (the qualifier). When
+                    // the walk left the call unresolved (a bare imported call
+                    // — `use Bank;` auto-imports `@EXPORT`, invisible single-
+                    // file), recover the exporting module via the index so the
+                    // target scopes to the source package, not `None`.
+                    let package = resolved_package.clone().or_else(|| {
+                        self.deferred_call_package(r, module_index)
+                    });
                     return Some(RenameKind::Function {
                         name: r.unqualified_target_name().to_string(),
-                        package: resolved_package.clone(),
+                        package,
                     });
                 }
                 RefKind::MethodCall { .. } => {

@@ -830,7 +830,16 @@ fn collect_from_analysis(
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
              RefKind::FunctionCall { resolved_package }) => {
                 let scope = callable_scope_for_refs.as_ref().unwrap();
-                resolved_package == scope
+                // A bare imported call the single-file walk couldn't pin
+                // (`use Bank;` auto-imports `@EXPORT`, invisible at build) has
+                // `resolved_package: None`. Re-derive it here — where the index
+                // is in hand — so a rename from the source sub reaches the
+                // consumer call site (the lazy seam method dispatch + deferred
+                // hash-key owners use elsewhere in this fn).
+                match resolved_package {
+                    Some(_) => resolved_package == scope,
+                    None => &analysis.deferred_call_package(r, module_index) == scope,
+                }
             }
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
              RefKind::MethodCall { .. }) => {

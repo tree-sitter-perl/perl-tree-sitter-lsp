@@ -2165,6 +2165,51 @@ fn refs_to_fans_runtime_exported_sub_to_consumer() {
     );
 }
 
+/// Bare `use Bank;` auto-imports `@EXPORT` — a fact the single-file walk
+/// can't see, so the consumer's `make_account()` call is left
+/// `resolved_package: None`. Both rename directions must still link source
+/// and consumer: `refs_to` defers the call's package resolution to the
+/// index at query time (`deferred_call_package`), the same lazy seam method
+/// dispatch + deferred hash-key owners use. (The explicit-`qw/.../` case
+/// already pins at build time — this is the implicit-export gap.)
+#[test]
+fn refs_to_links_implicit_export_to_bare_use_consumer() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let def = PathBuf::from("/tmp/impl_export_def.pm");
+    let consumer = PathBuf::from("/tmp/impl_export_use.pl");
+
+    let def_src = "package Bank;\n\
+         use Exporter 'import';\n\
+         our @EXPORT = ('make_account');\n\
+         sub make_account { 1 }\n1;\n";
+    // Bare `use Bank;` — no import list; `make_account` arrives via @EXPORT.
+    let use_src = "use Bank;\nmy $a = make_account('Ada');\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(def.clone(), Arc::new(parse(def_src)));
+
+    store.insert_workspace(def.clone(), parse(def_src));
+    store.insert_workspace(consumer.clone(), parse(use_src));
+
+    let target = TargetRef {
+        name: "make_account".to_string(),
+        kind: TargetKind::Sub { package: Some("Bank".to_string()) },
+        method_classes: Vec::new(),
+    };
+    let refs = refs_to(&store, Some(&idx), &target, RoleMask::EDITABLE);
+    let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
+
+    assert!(hit(&def), "missed Bank::make_account decl. hits: {:?}", refs);
+    assert!(
+        hit(&consumer),
+        "missed bare-`use`-consumer's make_account() call (implicit @EXPORT). hits: {:?}",
+        refs,
+    );
+}
+
 /// Cross-file plain-sub references: an exported sub defined in one
 /// workspace file, imported and called from two others, plus an
 /// unrelated same-named sub in a *different* package that must NOT
