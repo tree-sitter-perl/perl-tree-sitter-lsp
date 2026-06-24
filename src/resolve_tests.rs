@@ -2797,13 +2797,14 @@ sub bump { my ($self) = @_; $self->{count}++; my $local = 1; return $local }
 }
 
 /// An owned hash key resolves to a cross-file HashKeyOfClass target —
-/// walkable by references — but reports itself non-renameable
-/// cross-file (hash-key rename is in-file-only by design). This is the
-/// divergence the CLI used to have: its references path dropped owned
-/// hash keys to single-file because the owner mapping lived only in the
-/// LSP handler.
+/// A Moo internal slot (`$self->{size}`) is one spelling of the `size` attr,
+/// so it resolves to the attr's projection Group — the same group its `has`
+/// decl, ctor key, reader, and mapped accessors resolve to (finding #2). It
+/// is NOT a plain `HashKeyOfClass` rename: that would miss the accessor /
+/// ctor-key sites the group carries. The group walks cross-file via
+/// `group_rename_edits`.
 #[test]
-fn test_resolve_symbol_owned_hash_key() {
+fn test_resolve_symbol_internal_slot_resolves_to_attr_group() {
     let src = "\
 package Widget;
 use Moo;
@@ -2815,16 +2816,17 @@ sub describe { my ($self) = @_; return $self->{size} }
     // Cursor on `size` inside `$self->{size}`.
     let col = src.lines().nth(3).unwrap().find("{size}").unwrap() + 1;
     match resolve_symbol(&fa, tree_sitter::Point { row: 3, column: col }, None) {
-        Some(ResolvedTarget::Target(t)) => {
-            assert_eq!(t.name, "size");
+        Some(ResolvedTarget::Group { members, .. }) => {
             assert!(
-                matches!(&t.kind, TargetKind::HashKeyOfClass(c) if c == "Widget"),
-                "expected HashKeyOfClass(Widget), got {:?}",
-                t.kind,
+                members.iter().any(|m| matches!(
+                    m.target.kind,
+                    TargetKind::HashKeyOfSub { .. } | TargetKind::InternalHashKey { .. }
+                )),
+                "slot group should carry the attr's ctor-key / internal-slot members: {:?}",
+                members,
             );
-            assert!(!t.supports_cross_file_rename());
         }
-        other => panic!("expected owned hash-key target, got {:?}", other),
+        other => panic!("expected the size attr projection Group, got {:?}", other),
     }
 }
 
@@ -3001,6 +3003,54 @@ fn test_group_rename_rederives_mapped_members_cross_file() {
         "consumer ctor key renamed bare; user edits: {:?}",
         user_edits,
     );
+}
+
+/// Finding #2 (reverse direction): a consumer-side cursor on a name-mapped
+/// accessor (`$w->has_size`) OR an internal slot (`$w->{size}`) resolves to
+/// the same cross-file attr group as the decl — so rename from any spelling
+/// rewrites every spelling. Before, the slot fell to a plain
+/// `HashKeyOfClass` (single-file, missed the accessors) and the mapped
+/// accessor only matched itself + the decl.
+#[test]
+fn test_consumer_mapped_accessor_and_slot_resolve_to_attr_group_cross_file() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let class_path = PathBuf::from("/tmp/grp_rev_widget.pm");
+    let user_path = PathBuf::from("/tmp/grp_rev_user.pl");
+    let class_src =
+        "package Widget;\nuse Moo;\nhas size => (is => 'rw', predicate => 1, clearer => 1);\n1;\n";
+    let user_src = "use Widget;\n\
+         my $w = Widget->new(size => 3);\n\
+         $w->has_size;\n\
+         my $d = $w->{size};\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(class_path.clone(), Arc::new(parse(class_src)));
+    let store = FileStore::new();
+    store.insert_workspace(class_path.clone(), parse(class_src));
+    store.insert_workspace(user_path.clone(), parse(user_src));
+
+    let consumer = store.workspace_raw().get(&user_path).unwrap().value().clone();
+
+    // Both spellings must mint the remote group (pinned to the class file) and
+    // carry the accessor / ctor-key members, so a rename fans out across both.
+    for (label, row, needle) in [("mapped accessor", 2usize, "has_size"), ("internal slot", 3, "{size}")] {
+        let col = user_src.lines().nth(row).unwrap().find(needle).unwrap()
+            + if needle.starts_with('{') { 1 } else { 0 };
+        let resolved = resolve_symbol(&consumer, tree_sitter::Point { row, column: col }, Some(&idx))
+            .unwrap_or_else(|| panic!("{label} cursor should resolve"));
+        let ResolvedTarget::Group { pinned_spans, members, .. } = resolved else {
+            panic!("{label}: expected remote Group, got {:?}", resolved);
+        };
+        assert!(!pinned_spans.is_empty(), "{label}: group pinned to the class file");
+        assert!(
+            members.iter().any(|m| !m.target.method_classes.is_empty()
+                || matches!(m.target.kind, TargetKind::Method { .. } | TargetKind::HashKeyOfSub { .. })),
+            "{label}: group carries accessor/ctor-key members: {:?}",
+            members,
+        );
+    }
 }
 
 /// Internal slot pokes join the group cross-file: a subclass (or any

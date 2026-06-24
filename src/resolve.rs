@@ -206,23 +206,35 @@ pub fn resolve_symbol(
     if let (Some(idx), Some(r)) = (module_index, analysis.ref_at(point)) {
         use crate::file_analysis::HashKeyOwner;
         match &r.kind {
-            RefKind::HashKeyAccess { owner: None, .. } => {
-                if let Some(HashKeyOwner::Sub { package: Some(class), name }) =
-                    analysis.deferred_hash_key_owner(r, module_index)
-                {
-                    if crate::conventions::is_constructor_name(&name) {
-                        if let Some(cached) = idx.get_cached(&class) {
-                            if let Some(p) = cached
-                                .analysis
-                                .field_projections_named(&r.target_name, &class)
-                            {
-                                return Some(group_from_projections(
-                                    p,
-                                    &cached.analysis,
-                                    Some(cached.path.clone()),
-                                    module_index,
-                                ));
-                            }
+            RefKind::HashKeyAccess { owner, .. } => {
+                // The owning class lives elsewhere; reach it so a consumer-side
+                // cursor on `$obj->{attr}` (internal slot, `Class` owner) or a
+                // deferred constructor key (`owner: None`) resolves to the same
+                // projection group the class file mints.
+                let class = match owner {
+                    Some(HashKeyOwner::Class(c)) => Some(c.clone()),
+                    _ => match analysis.deferred_hash_key_owner(r, module_index) {
+                        Some(HashKeyOwner::Sub { package: Some(c), name })
+                            if crate::conventions::is_constructor_name(&name) =>
+                        {
+                            Some(c)
+                        }
+                        Some(HashKeyOwner::Class(c)) => Some(c),
+                        _ => None,
+                    },
+                };
+                if let Some(class) = class {
+                    if let Some(cached) = idx.get_cached(&class) {
+                        if let Some(p) = cached
+                            .analysis
+                            .field_projections_named(&r.target_name, &class)
+                        {
+                            return Some(group_from_projections(
+                                p,
+                                &cached.analysis,
+                                Some(cached.path.clone()),
+                                module_index,
+                            ));
                         }
                     }
                 }

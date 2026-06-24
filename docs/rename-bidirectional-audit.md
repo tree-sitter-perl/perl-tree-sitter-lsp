@@ -45,8 +45,8 @@ seam (§3).
 | `our`/package variable | decl-only | decl-only | symmetric-but-broken — see §4 |
 | Corinna `field` (decl/ctor-key/reader, cross-file) | ✓ | ✓ | symmetric |
 | Blessed-hash key ↔ internal slot | ✓ | ✓ | symmetric (fix `3a0ebff`) |
-| Moo `has` internal slot `$self->{attr}` | reaches slot | slot→group fails | **ASYMMETRIC** — finding #2 |
-| Moo `has` mapped accessors (`has_x`/`clear_x`) | renames them | accessor→group fails | **ASYMMETRIC** — finding #2 |
+| Moo `has` internal slot `$self->{attr}` | ✓ | ✓ | symmetric (finding #2 — fixed) |
+| Moo `has` mapped accessors (`has_x`/`clear_x`) | ✓ | ✓ | symmetric (finding #2 — fixed) |
 | Moo `has` ctor-key / accessor-call / decl | ✓ | ✓ | symmetric (among themselves) |
 | Return-hash key (`HashKeyOfSub`), **cross-file** | ✓ | ✓ | symmetric (finding #3 — fixed) |
 | Mojo-events handler (`->on`/`->emit`) | 1-of-N in-file | 0 edits | **ASYMMETRIC + lossy** — finding #1 |
@@ -211,7 +211,27 @@ Handlers are `HashKeyOfClass` → `supports_cross_file_rename=false` → single-
 - **Fix:** route `Handler` rename through `refs_to` (it already supports the
   `Handler` target + `applicable_dispatches`), i.e. the §3 gate change.
 
-### #2 — Moo `has` internal slot + mapped accessors don't reverse-map to the attr group — HIGH
+### #2 — Moo `has` internal slot + mapped accessors — FIXED
+**Resolved** by teaching the projection-group resolver every spelling:
+- `field_group_at` gained an internal-slot arm (a `Class(C)`-owned
+  `HashKeyAccess` cursor → the attr group via `attr_group_for`) and a
+  mapped-accessor arm (`attr_for_mapped_accessor` reverses `has_size`→`size`).
+- `field_projections_named` (the consumer-side by-name entry) now also reverses
+  mapped accessors, so a cross-file cursor on `$w->has_size` / `$w->{size}`
+  chases to the same group.
+- `resolve_symbol`'s consumer-side `HashKeyAccess` arm handles `Class`-owned
+  slots (not just deferred ctor keys).
+- No gate change needed — these route through the already-cross-file `Group`
+  path (`group_rename_edits`). Mapped members keep their affixed rename
+  (`has_size`→`has_DIM`). All 7 spellings now mint the one group.
+
+Zero special-casing: one `attr_group_for` + one mapped-accessor reverse,
+shared by the in-file (`field_group_at`) and cross-file
+(`field_projections_named`) entries.
+
+Original report retained below.
+
+### #2 (orig) — Moo `has` internal slot + mapped accessors don't reverse-map to the attr group — HIGH
 The `has`-decl, accessor-call, ctor-key, and consumer-accessor cursors mint the
 full 7-member group. But:
 - Internal slot `$self->{size}` → **2 edits** (slot + `has` token). References

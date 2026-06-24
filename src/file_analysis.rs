@@ -5323,6 +5323,14 @@ impl FileAnalysis {
                             return Some(g);
                         }
                     }
+                    // Name-mapped accessor call (`$w->has_size`, `clear_size`)
+                    // → the attr it projects from. Symmetric with renaming the
+                    // attr, which re-derives these names.
+                    if let Some(attr) = self.attr_for_mapped_accessor(bare, &class) {
+                        if let Some(g) = self.attr_group_for(&attr, &class) {
+                            return Some(g);
+                        }
+                    }
                 }
                 return None;
             }
@@ -5341,22 +5349,53 @@ impl FileAnalysis {
                 _ => return None,
             },
         };
-        let HashKeyOwner::Sub { package: Some(class), name } = owner else {
-            return None;
+        // The owner names the class two ways: a constructor key
+        // (`Sub{class, new}` — `Foo->new(size => …)`) or an internal slot
+        // (`Class(class)` — `$self->{size}` / `$obj->{size}`). Both are
+        // spellings of the same attr; resolve each to the one group.
+        let class = match &owner {
+            HashKeyOwner::Sub { package: Some(c), name }
+                if crate::conventions::is_constructor_name(name) =>
+            {
+                c.clone()
+            }
+            HashKeyOwner::Class(c) => c.clone(),
+            _ => return None,
         };
-        if !crate::conventions::is_constructor_name(&name) {
-            return None;
-        }
-        let field_name = format!("${}", key);
+        self.attr_group_for(&key, &class)
+    }
+
+    /// The attr a name-mapped accessor projects from: `has_size` /
+    /// `clear_size` → `size`. Moo's `predicate`/`clearer`/`writer`/… mint an
+    /// `Accessor` projection whose `method` is the derived name; the reverse
+    /// lookup lets a cursor on that method reach the one attr group (rule #9:
+    /// every projection traces back to its source). The bare reader
+    /// (`method == attr`) is the identity case the caller already handles.
+    fn attr_for_mapped_accessor(&self, method: &str, class: &str) -> Option<String> {
+        self.attr_projections.iter().find_map(|a| match &a.kind {
+            AttrProjectionKind::Accessor { method: m, .. }
+                if a.class == class && m == method && a.attr != method =>
+            {
+                Some(a.attr.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// The attr group for `attr` on `class`, whether it's a Corinna field
+    /// (variable-backed) or a Moo/`has`-style pair. One entry point so every
+    /// spelling (decl, ctor key, internal slot, reader, mapped accessor)
+    /// resolves to the same group.
+    fn attr_group_for(&self, attr: &str, class: &str) -> Option<FieldGroup> {
+        let field_name = format!("${}", attr);
         if let Some(sym) = self.symbols.iter().find(|s| {
             matches!(s.kind, SymKind::Field)
                 && s.name == field_name
-                && s.package.as_deref() == Some(class.as_str())
+                && s.package.as_deref() == Some(class)
         }) {
             return self.field_group_of(sym);
         }
-        // Moo-style attr: the ctor key names a `has`-synthesized pair.
-        self.attr_pair_group(&key, &class)
+        self.attr_pair_group(attr, class)
     }
 
     /// A `has`-synthesized attr pair: accessor Method + constructor
@@ -5695,17 +5734,16 @@ impl FileAnalysis {
     /// its owner edge to this class's analysis and asks for the group
     /// the cursor file can't see.
     pub fn field_projections_named(&self, bare: &str, class: &str) -> Option<FieldProjections> {
-        let field_name = format!("${}", bare);
+        // `bare` may name the attr directly (field / ctor key / internal slot /
+        // reader) OR a name-mapped accessor (`has_size` → `size`); both resolve
+        // to the one group, so a consumer-side cursor on any spelling chases to
+        // the same source.
         let g = self
-            .symbols
-            .iter()
-            .find(|s| {
-                matches!(s.kind, SymKind::Field)
-                    && s.name == field_name
-                    && s.package.as_deref() == Some(class)
-            })
-            .and_then(|sym| self.field_group_of(sym))
-            .or_else(|| self.attr_pair_group(bare, class))?;
+            .attr_group_for(bare, class)
+            .or_else(|| {
+                self.attr_for_mapped_accessor(bare, class)
+                    .and_then(|attr| self.attr_group_for(&attr, class))
+            })?;
         Some(self.projections_of(g))
     }
 
