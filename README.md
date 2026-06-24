@@ -206,6 +206,24 @@ perl-lsp --workspace-symbol <root> <query>
 perl-lsp --check . --severity warning
 ```
 
+## Server Options
+
+Editor-agnostic settings, passed to the server via LSP `initializationOptions`
+(every editor has its own syntax for this — see the per-editor setup above).
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `rename.overrideScope` | `"hierarchy"` | How a method that participates in an inheritance hierarchy is scoped for rename (and the references that share its resolution). `"hierarchy"` is the standard IDE refactor: rename the whole override family — the base declaration, every override, and all call sites that dispatch into it. `"dispatch"` is the precise mode: rename only the cursor's own definition plus the call sites that dispatch to *that* definition (including `SUPER::` calls that target it), leaving sibling overrides untouched. Scope is gathered over proven `@ISA`/`use parent`/role edges, never name matches. |
+| `diagnostics.unresolvedDispatch` | `false` | Enables the `unresolved-dispatch` diagnostic — flags string-dispatched calls (Mojo events, etc.) whose handler can't be resolved. A QA / plugin-author channel; off by default. |
+
+Example (Neovim `lspconfig`):
+
+```lua
+require('lspconfig').perl_lsp.setup({
+  init_options = { rename = { overrideScope = 'dispatch' } },
+})
+```
+
 ## Plugins
 
 Framework intelligence (Mojolicious, Minion, …) ships as bundled
