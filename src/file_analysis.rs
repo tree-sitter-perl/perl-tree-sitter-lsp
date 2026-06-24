@@ -6095,10 +6095,10 @@ impl FileAnalysis {
         // point, ahead of the functional deref chase, since narrowing is
         // strictly more precise where it applies (docs/adr/flow-narrowing.md).
         // Keyed on the invocant's own spelling, the place narrowing witness
-        // rides the `Variable` query path like any scalar; the subscript
-        // (`->` / `{` / `[`) is what distinguishes a place from a plain var.
+        // rides the `Variable` query path like any scalar. `is_element_place`
+        // tells a real place from a scalar deref (`${$ref}` is not a hash).
         if let Some(span) = invocant_span {
-            if invocant.contains("->") || invocant.contains('{') || invocant.contains('[') {
+            if InvocantText::parse(invocant).is_element_place() {
                 if let Some(cn) = self
                     .inferred_type_via_bag_ctx(invocant, span.start, module_index)
                     .and_then(|t| t.class_name_lenient().map(|s| s.to_string()))
