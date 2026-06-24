@@ -2992,6 +2992,48 @@ fn test_internal_slot_pokes_join_group_cross_file() {
     );
 }
 
+/// Old-school `bless { key => ... }, $class` keys are instance slots of the
+/// class — renaming the bless key must reach every `$self->{key}` access,
+/// symmetric with renaming from an access. Before the `InternalKey`
+/// projection on bless keys, the from-key direction minted only the strict
+/// `HashKeyOfSub{C, new}` member (matching the bless key alone) and missed
+/// the `Class(C)`-owned accesses; the from-access direction worked via
+/// `found_by`. This pins the symmetry.
+#[test]
+fn rename_from_bless_key_reaches_self_slot_accesses() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/bless_slot.pm");
+    let src = "package Calc;\n\
+         sub new { my ($class) = @_; return bless { history => [] }, $class; }\n\
+         sub add { my ($self) = @_; push @{$self->{history}}, 1; }\n\
+         sub log { my ($self) = @_; return $self->{history}; }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    // Cursor on the bless key `history` (row 1, inside `bless { history`).
+    let key_col = src.lines().nth(1).unwrap().find("history").unwrap();
+    let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 1, column: key_col }, None)
+        .expect("bless key resolves");
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+        panic!("expected Group, got {:?}", resolved);
+    };
+    assert!(
+        members.iter().any(|m| matches!(m.target.kind, TargetKind::InternalHashKey { .. })),
+        "bless key must mint an internal-key member so $self->{{history}} accesses join: {:?}",
+        members,
+    );
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()),
+        &local_spans, &pinned_spans, &members, "log",
+    );
+    // bless key (1) + two $self->{history} accesses (rows 2, 3) = 3 spellings.
+    assert_eq!(
+        edits.len(), 3,
+        "bless key + both $self->{{history}} accesses should rename; edits: {:?}",
+        edits,
+    );
+}
+
 #[test]
 fn test_implementations_of_role_requires_fans_out_to_composers() {
     use crate::module_index::{CachedModule, ModuleIndex};

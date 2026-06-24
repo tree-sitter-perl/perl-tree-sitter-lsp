@@ -10741,10 +10741,44 @@ impl<'a> Builder<'a> {
 
         // Collect hash-literal keys as HashKeyDef symbols
         if let Some(ref owner) = owner {
-            self.collect_pair_keys(node, owner);
+            let keys = self.collect_pair_keys(node, owner);
+            // A blessed hash's keys are instance slots of the class — the same
+            // `$self->{key}` slots a Moo `has` mints an `InternalKey` for
+            // (rule #9: provenance — bless key → internal hash key). Emit the
+            // projection so rename/references from the constructor key reach
+            // the `Class(C)`-owned `$self->{key}` accesses via the group's
+            // `InternalHashKey` member. A `return { ... }` hash is NOT instance
+            // slots (its keys are the sub's return shape, consumed `Sub`-owned),
+            // so only the bless context mints this.
+            if let HashKeyOwner::Sub { package: Some(class), .. } = owner {
+                if self.anon_hash_is_blessed(node) {
+                    for key in keys {
+                        self.attr_projections.push(crate::file_analysis::AttrProjection {
+                            class: class.clone(),
+                            attr: key,
+                            kind: crate::file_analysis::AttrProjectionKind::InternalKey,
+                        });
+                    }
+                }
+            }
         }
 
         self.visit_children(node);
+    }
+
+    /// Is this anon-hash node the operand of a `bless` call (within 5
+    /// ancestors)? Mirrors `detect_anon_hash_owner`'s bless branch — bless
+    /// keys are instance slots; `return { ... }` keys are not.
+    fn anon_hash_is_blessed(&self, anon_hash: Node<'a>) -> bool {
+        let mut ancestor = anon_hash.parent();
+        for _ in 0..5 {
+            let Some(a) = ancestor else { return false };
+            if self.is_bless_call(a) {
+                return true;
+            }
+            ancestor = a.parent();
+        }
+        false
     }
 
     // ---- Fold ranges ----
@@ -11563,7 +11597,7 @@ impl<'a> Builder<'a> {
     /// of the flat pair sequence — `{ a => 1, 'b', 2 }` is `{ 'a', 1, 'b', 2 }`,
     /// so the separator (`,` vs `=>`) is irrelevant; we pair positionally via
     /// the shared node-level walker and take each key node.
-    fn collect_pair_keys(&mut self, node: Node<'a>, owner: &HashKeyOwner) {
+    fn collect_pair_keys(&mut self, node: Node<'a>, owner: &HashKeyOwner) -> Vec<String> {
         let mut defs: Vec<(String, Span)> = Vec::new();
         for (k_node, _val) in crate::cst::pair_nodes(node) {
             if matches!(
@@ -11577,6 +11611,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        let keys: Vec<String> = defs.iter().map(|(k, _)| k.clone()).collect();
         for (key, span) in defs {
             self.add_symbol(
                 key,
@@ -11586,6 +11621,7 @@ impl<'a> Builder<'a> {
                 SymbolDetail::HashKeyDef { owner: owner.clone(), is_dynamic: false },
             );
         }
+        keys
     }
 
     /// Synthesize `Sub` symbols for AutoLoader / SelfLoader packages whose
