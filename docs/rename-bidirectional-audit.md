@@ -36,7 +36,7 @@ seam (§3).
 | Cross-file exported sub — explicit `qw/…/` | ✓ | ✓ | symmetric |
 | Cross-file exported sub — `@EXPORT_OK` | ✓ | ✓ | symmetric |
 | Cross-file exported sub — `:tag` | ✓ | ✓ | symmetric |
-| Renamed import `name => {-as=>'x'}` | partial | partial | **ASYMMETRIC (minor)** — finding #6 |
+| Renamed import `name => {-as=>'x'}` | ✓ | ✓ | symmetric (finding #6 — fixed) |
 | Package/class name + `use` stmt | ✓ | ✓ | symmetric |
 | `use parent`/`use base` parent ref | ✓ | ✓ | symmetric |
 | Non-overridden inherited method (`$child->m`) | ✓ | ✓ | symmetric |
@@ -355,7 +355,31 @@ operations and silently breaks the override if only one is done.
 - **Decision needed:** treat an override + its base as one renameable unit
   (union both classes' chains) vs. keep strict. Not obviously a bug.
 
-### #6 — Renamed-import `-as` origin token not updated — LOW (suspected-minor)
+### #6 — Renaming imports — FIXED
+**Resolved** by capturing the `-as` spec token spans (core) + giving plugins
+the same power. `use Exp beta => { -as => 'rb' }` has two identities:
+- **Remote `beta`** → `FunctionCall{ name: beta, package: Exp }` at the remote
+  token span → renames with the source `Sub{Exp, beta}`, across every consumer.
+- **Local alias `rb`** → `FunctionCall{ name: rb, package: <consuming pkg> }`
+  at the `-as` value span; the alias *calls* also resolve to the consuming
+  package (`resolve_call_package` keys an aliased import locally, since the
+  module doesn't define the local name). So the alias is a self-contained
+  local group — never the exporter (not `Exp::beta`, not a stray `Exp::rb`).
+  goto-def still reaches `Exp::beta` via the import binding's remote name,
+  which `resolve_imported_function` reads independently of `resolved_package`.
+
+Plugins get the same capability via `EmitAction::ImportRef { name, package,
+span }` (the plugin-facing `emit_refs_for_strings`), so BYO/house exporters
+make their custom rename-spec tokens navigable identically to core.
+
+No limitation: independent consumers are different packages, so their aliases
+are independent by construction. Zero special-casing — two `FunctionCall`
+refs reusing existing matching; the only new rule (aliased call → consuming
+package) is *more* correct (the module has no sub by the local name).
+
+Original report retained below.
+
+### #6 (orig) — Renamed-import `-as` origin token not updated — LOW (suspected-minor)
 Renaming the source sub `beta_optional` does not rewrite the origin-name token
 in `use Exporter1 beta_optional => {-as=>'renamed_beta'}` (consumer), leaving a
 dangling reference. Renaming from the local alias `renamed_beta()` touches only

@@ -2172,7 +2172,17 @@ impl<'a> Builder<'a> {
         }
         // (3) Imports — walk in reverse order so later `use` wins.
         for imp in self.imports.iter().rev() {
-            if imp.imported_symbols.iter().any(|s| s.local_name == *call_name) {
+            if let Some(sym) = imp.imported_symbols.iter().find(|s| s.local_name == *call_name) {
+                // A renaming import (`use Exp beta => { -as => 'rb' }`) binds a
+                // LOCAL alias the module doesn't define under that name. The
+                // alias belongs to the CONSUMING package — keying its calls
+                // there keeps rename/references local (and off the exporter's
+                // unrelated symbols, e.g. a stray `Exp::rb`). goto-def still
+                // reaches `Exp::beta` via the import binding's remote name,
+                // which `resolve_imported_function` reads independently.
+                if sym.remote_name.is_some() {
+                    return self.current_package.clone();
+                }
                 return Some(imp.module_name.clone());
             }
         }
@@ -3211,6 +3221,21 @@ impl<'a> Builder<'a> {
                         span,
                     });
                 }
+            }
+            plugin::EmitAction::ImportRef { name, package, span } => {
+                // The plugin-facing equivalent of core's qw/`-as` import-token
+                // refs: a BYO exporter plugin makes its custom rename-spec
+                // tokens navigable by emitting a `FunctionCall` ref pinned to a
+                // package — the exporting module for a remote name (joins the
+                // source sub's rename), or the consuming package for a local
+                // alias (a self-contained local group). See
+                // `docs/rename-bidirectional-audit.md` #6.
+                self.add_ref(
+                    RefKind::FunctionCall { resolved_package: package },
+                    span,
+                    name,
+                    AccessKind::Read,
+                );
             }
             plugin::EmitAction::PackageParent { package, parent } => {
                 self.package_parents.entry(package).or_default().push(parent);
@@ -5353,11 +5378,32 @@ impl<'a> Builder<'a> {
             .collect();
         let mut empty_import = false;
         if let Some(node) = node {
-            for (local, remote) in self.extract_as_renames(node) {
+            for (local, remote, alias_span, remote_span) in self.extract_as_renames(node) {
                 // The `-as` arg already appears as a bare name in `imports`
                 // (the origin) and a string in the hashref (the local); drop
                 // both flat entries and replace with the renamed binding.
                 imported_symbols.retain(|s| s.local_name != remote && s.local_name != local);
+                // Two distinct rename identities (docs/rename-bidirectional-audit.md #6):
+                //   * the remote-name token IS the source sub — pin it to the
+                //     exporting module so renaming `Module::remote` rewrites it.
+                //   * the local alias is a binding in the CONSUMING package —
+                //     pin it there so it renames with its local calls (which
+                //     `resolve_call_package` also keys to this package), never
+                //     touching the exporter's symbols.
+                if module_name != "parent" && module_name != "base" {
+                    self.add_ref(
+                        RefKind::FunctionCall { resolved_package: Some(module_name.clone()) },
+                        remote_span,
+                        remote.clone(),
+                        AccessKind::Read,
+                    );
+                    self.add_ref(
+                        RefKind::FunctionCall { resolved_package: self.current_package.clone() },
+                        alias_span,
+                        local.clone(),
+                        AccessKind::Read,
+                    );
+                }
                 imported_symbols.push(ImportedSymbol::renamed(local, remote));
             }
             // `use Foo ();` — explicit empty parens suppress even `@EXPORT`.
@@ -5867,7 +5913,12 @@ impl<'a> Builder<'a> {
     /// bareword/string `name` immediately followed by a hashref whose `-as`
     /// (or `as`) key names the local alias. Sub::Exporter / Exporter::Tiny /
     /// Exporter's `-as` all spell it this way, so one shape covers them.
-    fn extract_as_renames(&self, node: Node<'a>) -> Vec<(String, String)> {
+    /// `(local_alias, remote_name, alias_span, remote_span)` for each
+    /// `name => { -as => 'local' }` pair. The two spans are what make the
+    /// renaming import navigable: `remote_span` (the `name` token) joins the
+    /// SOURCE sub's rename; `alias_span` (the `-as` value) joins the local
+    /// alias group (see `process_use`).
+    fn extract_as_renames(&self, node: Node<'a>) -> Vec<(String, String, Span, Span)> {
         let mut out = Vec::new();
         // The args live in a `list_expression` (multiple) or directly under the
         // use node. Walk every descendant list once, pairing a name token with
@@ -5877,21 +5928,21 @@ impl<'a> Builder<'a> {
     }
 
     /// Recurse for `name => { -as => 'local' }` pairs. `pending_name` carries a
-    /// just-seen bareword/string awaiting its hashref; when a hashref follows,
-    /// its `-as` value becomes the local alias for that name.
+    /// just-seen bareword/string (+ its span) awaiting its hashref; when a
+    /// hashref follows, its `-as` value becomes the local alias for that name.
     fn collect_as_renames(
         &self,
         node: Node<'a>,
-        pending_name: &mut Option<String>,
-        out: &mut Vec<(String, String)>,
+        pending_name: &mut Option<(String, Span)>,
+        out: &mut Vec<(String, String, Span, Span)>,
     ) {
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             match child.kind() {
                 "anonymous_hash_expression" => {
-                    if let Some(remote) = pending_name.take() {
-                        if let Some(local) = self.extract_as_alias(child) {
-                            out.push((local, remote));
+                    if let Some((remote, remote_span)) = pending_name.take() {
+                        if let Some((local, alias_span)) = self.extract_as_alias(child) {
+                            out.push((local, remote, alias_span, remote_span));
                         }
                     }
                 }
@@ -5901,7 +5952,14 @@ impl<'a> Builder<'a> {
                     // Skip option flags (`-as` appears at top level too in some
                     // forms) — only real names seed a pending rename.
                     if !name.is_empty() && !name.starts_with('-') {
-                        *pending_name = Some(name);
+                        // Content span for a quoted remote name; the whole token
+                        // for a bareword (`beta`) — either way, just the name.
+                        let span = if child.kind() == "string_literal" {
+                            crate::cst::string_content_span(child)
+                        } else {
+                            node_to_span(child)
+                        };
+                        *pending_name = Some((name, span));
                     }
                 }
                 "list_expression" | "parenthesized_expression" => {
@@ -5921,7 +5979,7 @@ impl<'a> Builder<'a> {
     /// The key is matched on its *normalized text* (`-as` parses as a
     /// `unary_expression` wrapping `as` in the fat-comma form, a `string_literal`
     /// in the plain-comma form), never on a `=>` gate.
-    fn extract_as_alias(&self, hashref: Node<'a>) -> Option<String> {
+    fn extract_as_alias(&self, hashref: Node<'a>) -> Option<(String, Span)> {
         let body = (0..hashref.named_child_count())
             .filter_map(|i| hashref.named_child(i))
             .find(|c| c.kind() == "list_expression")
@@ -5947,7 +6005,9 @@ impl<'a> Builder<'a> {
                     .trim_start_matches('-')
                     .to_string();
                 if !local.is_empty() {
-                    alias = Some(local);
+                    // Content span (inside the quotes) so rename rewrites just
+                    // the alias name, not `'renamed_beta'`.
+                    alias = Some((local, crate::cst::string_content_span(v_node)));
                     return false;
                 }
             }

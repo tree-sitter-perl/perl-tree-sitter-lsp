@@ -418,6 +418,20 @@ pub enum EmitAction {
         span: Span,
         access: AccessKind,
     },
+    /// Emit an import-name reference at a span, pinned to a package — the
+    /// plugin-facing equivalent of core's `qw(...)` / `-as` import-token refs
+    /// (`emit_refs_for_strings`). A BYO exporter plugin uses it to make its own
+    /// rename-spec tokens navigable, identically to core: emit the **remote**
+    /// name with `package = Some(exporting_module)` so it renames with the
+    /// source sub, and a renaming alias's **local** name with `package =
+    /// Some(consuming_package)` so it forms a self-contained local group that
+    /// never touches the exporter. See `docs/rename-bidirectional-audit.md` #6.
+    ImportRef {
+        name: String,
+        #[serde(default)]
+        package: Option<String>,
+        span: Span,
+    },
     /// Register a parent class on the current package. Used for
     /// `use Mojo::Base 'App'` style inheritance detection.
     PackageParent { package: String, parent: String },

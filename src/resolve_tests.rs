@@ -3005,6 +3005,57 @@ fn test_group_rename_rederives_mapped_members_cross_file() {
     );
 }
 
+/// Finding #6: renaming imports (`use Exp beta => { -as => 'rb' }`). Two
+/// distinct identities: the REMOTE name `beta` is the source `Exp::beta`
+/// (renames together, across all consumers); the LOCAL alias `rb` is a
+/// binding in the CONSUMING package (the `-as` value + local calls) that
+/// never touches the exporter — not `Exp::beta`, not a stray `Exp::rb`.
+#[test]
+fn test_renaming_import_remote_joins_source_alias_stays_local() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let exp = PathBuf::from("/tmp/rni_exp.pm");
+    let cons = PathBuf::from("/tmp/rni_cons.pm");
+    let exp_src = "package Exp;\nuse Exporter 'import';\nour @EXPORT_OK = ('beta');\nsub beta { 1 }\n1;\n";
+    let cons_src = "package Consumer;\nuse Exp beta => { -as => 'rb' };\nsub run { rb() }\n1;\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(exp.clone(), Arc::new(parse(exp_src)));
+    store.insert_workspace(exp.clone(), parse(exp_src));
+    store.insert_workspace(cons.clone(), parse(cons_src));
+
+    let hit = |refs: &[RefLocation], p: &PathBuf| {
+        refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p))
+    };
+
+    // Source rename reaches the consumer's REMOTE `beta` token.
+    let src = TargetRef {
+        name: "beta".to_string(),
+        kind: TargetKind::Sub { package: Some("Exp".to_string()) },
+        method_classes: Vec::new(),
+    };
+    let src_refs = refs_to(&store, Some(&idx), &src, RoleMask::EDITABLE);
+    assert!(hit(&src_refs, &exp), "source def missing: {:?}", src_refs);
+    assert!(hit(&src_refs, &cons), "remote `beta` token must join the source: {:?}", src_refs);
+
+    // Alias rename is local to the consuming package — never the exporter.
+    let alias = TargetRef {
+        name: "rb".to_string(),
+        kind: TargetKind::Sub { package: Some("Consumer".to_string()) },
+        method_classes: Vec::new(),
+    };
+    let alias_refs = refs_to(&store, Some(&idx), &alias, RoleMask::EDITABLE);
+    assert!(hit(&alias_refs, &cons), "alias `-as` value + call missing: {:?}", alias_refs);
+    assert!(
+        !hit(&alias_refs, &exp),
+        "alias rename must NOT touch the exporter: {:?}",
+        alias_refs,
+    );
+    assert!(alias_refs.len() >= 2, "alias group = `-as` value + call: {:?}", alias_refs);
+}
+
 /// Finding #1: event (Handler) rename. Literal event-name sites are
 /// rewritable (rename rewrites the inside-the-quotes name); a const-folded
 /// site (`my $e = 'connect'; $self->on($e)`) whose span IS the variable is a
