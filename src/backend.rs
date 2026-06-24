@@ -19,6 +19,10 @@ pub struct Backend {
     /// resolver refresh callback (which also publishes diagnostics), hence the
     /// atomic. Default off — QA/plugin-author channel.
     unresolved_dispatch: Arc<std::sync::atomic::AtomicBool>,
+    /// `initializationOptions.rename.overrideScope`: when set to `"dispatch"`,
+    /// method-override references/rename use the precise dispatch scope instead
+    /// of the default whole-hierarchy family. Set once at init.
+    dispatch_override: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Backend {
@@ -27,6 +31,15 @@ impl Backend {
             unresolved_dispatch: self
                 .unresolved_dispatch
                 .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// The configured method-override fan-out scope for references + rename.
+    fn override_scope(&self) -> crate::resolve::OverrideScope {
+        if self.dispatch_override.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::resolve::OverrideScope::Dispatch
+        } else {
+            crate::resolve::OverrideScope::Hierarchy
         }
     }
 }
@@ -87,6 +100,7 @@ impl Backend {
             client,
             files,
             unresolved_dispatch,
+            dispatch_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -247,6 +261,18 @@ impl LanguageServer for Backend {
                 .unwrap_or(false);
             self.unresolved_dispatch
                 .store(on, std::sync::atomic::Ordering::Relaxed);
+
+            // `{ "rename": { "overrideScope": "dispatch" } }` opts into the
+            // precise method-override scope; absent / "hierarchy" = the default
+            // whole-family refactor.
+            let dispatch = opts
+                .get("rename")
+                .and_then(|r| r.get("overrideScope"))
+                .and_then(|v| v.as_str())
+                .map(|s| matches!(crate::resolve::OverrideScope::from_option(s), crate::resolve::OverrideScope::Dispatch))
+                .unwrap_or(false);
+            self.dispatch_override
+                .store(dispatch, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(InitializeResult {
@@ -516,10 +542,10 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        use crate::resolve::{group_refs, refs_to, resolve_symbol, ResolvedTarget};
+        use crate::resolve::{group_refs, refs_to, resolve_symbol_scoped, ResolvedTarget};
 
         let point = symbols::position_to_point(pos);
-        let target = match resolve_symbol(&doc.analysis, point, Some(&*self.module_index)) {
+        let target = match resolve_symbol_scoped(&doc.analysis, point, Some(&*self.module_index), self.override_scope()) {
             Some(ResolvedTarget::Target(t)) => t,
             Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => {
                 let origin = FileKey::Url(uri.clone());
@@ -582,7 +608,7 @@ impl LanguageServer for Backend {
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        use crate::resolve::{resolve_symbol, ResolvedTarget};
+        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
 
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
@@ -593,7 +619,7 @@ impl LanguageServer for Backend {
         };
 
         let point = symbols::position_to_point(pos);
-        match resolve_symbol(&doc.analysis, point, Some(&*self.module_index)) {
+        match resolve_symbol_scoped(&doc.analysis, point, Some(&*self.module_index), self.override_scope()) {
             Some(ResolvedTarget::Target(target)) if target.supports_cross_file_rename() => {
                 drop(doc);
                 Ok(rename_via_refs_to(&self.files, Some(&*self.module_index), &target, new_name))

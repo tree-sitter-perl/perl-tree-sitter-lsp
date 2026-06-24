@@ -40,7 +40,7 @@ seam (§3).
 | Package/class name + `use` stmt | ✓ | ✓ | symmetric |
 | `use parent`/`use base` parent ref | ✓ | ✓ | symmetric |
 | Non-overridden inherited method (`$child->m`) | ✓ | ✓ | symmetric |
-| Overridden method (base + child both `sub m`) | subset | subset | **ASYMMETRIC** — finding #5 |
+| Overridden method (base + child both `sub m`) | ✓ | ✓ | configurable (finding #5 — fixed) |
 | Lexical variable | ✓ | ✓ | symmetric (single-file by design) |
 | `our`/package variable | decl-only | decl-only | symmetric-but-broken — see §4 |
 | Corinna `field` (decl/ctor-key/reader, cross-file) | ✓ | ✓ | symmetric |
@@ -344,7 +344,35 @@ even cross-file into `oop_playground.pl`); `$user->name` accessor cursor →
 - **Fix:** synthesize a projection group for DBIC columns the way Corinna
   fields / Moo `has` ctor-key do (column-def ↔ accessor-call ↔ search-arg-key).
 
-### #5 — Overridden-method rename splits into two disjoint groups — MEDIUM (partly by-design)
+### #5 — Overridden-method rename — FIXED (configurable)
+**Resolved** by making the override scope a setting,
+`initializationOptions.rename.overrideScope` (CLI: `PERL_LSP_RENAME_SCOPE`):
+
+- **`hierarchy` (DEFAULT)** — the standard IDE refactor. A method rename unions
+  the whole override family: the contract root + every override + all call
+  sites dispatching into it (`$base->m`, `$child->m`, `Foo->new->m`
+  corpus-wide). `FileAnalysis::method_override_family` gathers it over PROVEN
+  `@ISA`/`use parent`/Moo edges via `GraphView` — never name matches, so
+  unrelated same-named methods (`Mojo::Path::canonical` vs `URI::*::canonical`)
+  stay out. Verified on `URI::*::canonical` (gold `rename-12` / refs hierarchy):
+  all URI-subclass defs + every `URI->new(...)->canonical` call in CGI/Plack/
+  Catalyst, excluding `Mojo::Path`/`PPI`.
+- **`dispatch` (opt-in)** — the original precise behavior: the cursor's own def
+  + the sites that dispatch to *it* (incl. `SUPER::`), each override a separate
+  method. This is the sophisticated model the gold `rename-11` /
+  `ref-uri-canonical-http` rows protect (now run under the per-row
+  `renameScope: dispatch`).
+
+The two engines are `method_override_family` (Hierarchy) vs `method_rename_chain`
+(Dispatch), selected by `OverrideScope` on the `TargetRef`;
+`collect_from_analysis` branches its callable matching on it. The research
+(see git history) found whole-hierarchy is what every static-typed tool does;
+the dispatch mode preserves this project's more-refined dynamic-OO precision as
+the documented opt-in.
+
+Original report (now the dispatch mode) retained below.
+
+### #5 (orig) — Overridden-method rename splits into two disjoint groups — MEDIUM (partly by-design)
 `shared_method` defined in both `Base1` and `Child1`. Base1-def + the
 `SUPER::shared_method` call form one group (`Method{Base1}`); Child1-def +
 `$self->shared_method` + consumer `$c->shared_method` form another

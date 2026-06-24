@@ -33,11 +33,42 @@ bitflags::bitflags! {
     }
 }
 
+/// How a method that participates in an inheritance hierarchy is scoped for
+/// references + rename — `initializationOptions.rename.overrideScope`.
+///
+/// * `Hierarchy` (default) — the standard IDE refactor: the whole override
+///   family (base decl + every override + all dispatching call sites), gathered
+///   over proven `@ISA`/`use parent`/role edges (never name matches).
+/// * `Dispatch` — precise: only the cursor's own definition + the call sites
+///   that dispatch to *that* definition (incl. `SUPER::` calls targeting it),
+///   leaving sibling overrides untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverrideScope {
+    #[default]
+    Hierarchy,
+    Dispatch,
+}
+
+impl OverrideScope {
+    /// Parse the `initializationOptions.rename.overrideScope` string; anything
+    /// unrecognized (or absent) is the default `Hierarchy`.
+    pub fn from_option(s: &str) -> Self {
+        match s {
+            "dispatch" => OverrideScope::Dispatch,
+            _ => OverrideScope::Hierarchy,
+        }
+    }
+}
+
 /// Identifies what we're collecting references to.
 #[derive(Debug, Clone)]
 pub struct TargetRef {
     pub name: String,
     pub kind: TargetKind,
+    /// Override-fan-out scope for callable (`Sub`/`Method`) targets — read by
+    /// `collect_from_analysis` to pick family-membership (Hierarchy) vs
+    /// dispatch-chain (Dispatch) matching. Irrelevant for other kinds.
+    pub scope: OverrideScope,
     /// For a `Method` target, the inheritance rename-chain
     /// `[cursor_class, ..., defining_class]` computed ONCE from the
     /// originating analysis (the only file that knows the cursor class's
@@ -60,12 +91,14 @@ impl TargetRef {
         class: String,
         origin: &FileAnalysis,
         module_index: Option<&dyn CrossFileLookup>,
+        scope: OverrideScope,
     ) -> Self {
-        let method_classes = origin.method_rename_chain(&class, &name, module_index);
+        let method_classes = method_classes_for(origin, &class, &name, module_index, scope);
         TargetRef {
             name,
             kind: TargetKind::Method { class },
             method_classes,
+            scope,
         }
     }
 
@@ -75,7 +108,7 @@ impl TargetRef {
             !matches!(kind, TargetKind::Method { .. }),
             "use TargetRef::method so the rename chain is populated"
         );
-        TargetRef { name, kind, method_classes: Vec::new() }
+        TargetRef { name, kind, method_classes: Vec::new(), scope: OverrideScope::default() }
     }
 
     /// Which targets rename through `refs_to` (cross-file, owner/scope-
@@ -108,14 +141,24 @@ impl TargetRef {
         kind: crate::file_analysis::RenameKind,
         origin: &FileAnalysis,
         module_index: Option<&dyn CrossFileLookup>,
+        scope: OverrideScope,
     ) -> Option<Self> {
         use crate::file_analysis::RenameKind;
         Some(match kind {
             RenameKind::Function { name, package } => {
-                TargetRef::new(name, TargetKind::Sub { package })
+                // A `sub` in a class IS a method (Perl's only sub/method
+                // distinction is call shape), so it carries the same override
+                // family/chain — a base-`sub` rename reaches overrides + their
+                // dispatch sites. A package-less script sub has no class, hence
+                // no family.
+                let method_classes = match &package {
+                    Some(class) => method_classes_for(origin, class, &name, module_index, scope),
+                    None => Vec::new(),
+                };
+                TargetRef { name, kind: TargetKind::Sub { package }, method_classes, scope }
             }
             RenameKind::Method { name, class } => {
-                TargetRef::method(name, class, origin, module_index)
+                TargetRef::method(name, class, origin, module_index, scope)
             }
             RenameKind::Package(name) => TargetRef::new(name, TargetKind::Package),
             RenameKind::Handler { owner, name } => {
@@ -190,6 +233,19 @@ pub fn resolve_symbol(
     analysis: &FileAnalysis,
     point: tree_sitter::Point,
     module_index: Option<&dyn CrossFileLookup>,
+) -> Option<ResolvedTarget> {
+    resolve_symbol_scoped(analysis, point, module_index, OverrideScope::default())
+}
+
+/// `resolve_symbol` with an explicit override scope — the rename/references
+/// handlers pass the configured `rename.overrideScope` so a callable target's
+/// `method_classes` is built as the override family (Hierarchy, default) or the
+/// dispatch chain (Dispatch). Other callers use `resolve_symbol` (Hierarchy).
+pub fn resolve_symbol_scoped(
+    analysis: &FileAnalysis,
+    point: tree_sitter::Point,
+    module_index: Option<&dyn CrossFileLookup>,
+    scope: OverrideScope,
 ) -> Option<ResolvedTarget> {
     use crate::file_analysis::{HashKeyOwner, RenameKind};
     // Field projections claim first: from any spelling of a field group,
@@ -277,7 +333,7 @@ pub fn resolve_symbol(
             _ => ResolvedTarget::Local,
         },
         kind => ResolvedTarget::Target(
-            TargetRef::from_rename_kind(kind, analysis, module_index)
+            TargetRef::from_rename_kind(kind, analysis, module_index, scope)
                 .expect("Function/Method/Package/Handler kinds map to a target"),
         ),
     })
@@ -365,6 +421,7 @@ fn group_from_projections(
                 p.class.clone(),
                 class_analysis,
                 module_index,
+                OverrideScope::Hierarchy,
             ),
             rename: MemberRename::Bare,
         });
@@ -409,6 +466,7 @@ fn group_from_projections(
                 p.class.clone(),
                 class_analysis,
                 module_index,
+                OverrideScope::Hierarchy,
             ),
             rename: match &m.affix {
                 Some((pre, suf)) => MemberRename::Affixed {
@@ -706,6 +764,22 @@ fn file_key_eq(a: &FileKey, b: &FileKey) -> bool {
     key_for_sort(a) == key_for_sort(b)
 }
 
+/// The classes whose declarations a callable rename should match: the override
+/// FAMILY for `Hierarchy` (root + every overrider/inheritor), the dispatch
+/// CHAIN for `Dispatch` (cursor class up to the def its dispatch lands on).
+fn method_classes_for(
+    origin: &FileAnalysis,
+    class: &str,
+    name: &str,
+    module_index: Option<&dyn CrossFileLookup>,
+    scope: OverrideScope,
+) -> Vec<String> {
+    match scope {
+        OverrideScope::Hierarchy => origin.method_override_family(class, name, module_index),
+        OverrideScope::Dispatch => origin.method_rename_chain(class, name, module_index),
+    }
+}
+
 /// A name spelled by a variable at `span` — a `Variable`/`ContainerAccess`
 /// ref covers it exactly. The signal that a dispatch site is const-folded
 /// (`$obj->on($evt)`): its name span IS the `$evt` token, so rename must not
@@ -731,7 +805,16 @@ fn symbol_defines_target(sym: &crate::file_analysis::Symbol, target: &TargetRef)
     // with stricter intent.
     match &target.kind {
         TargetKind::Sub { package } => {
-            matches!(sym.kind, SymKind::Sub | SymKind::Method) && sym.package == *package
+            // Exact scope, OR — under Hierarchy — any class in the override
+            // family (so a base-`sub` rename also rewrites every override's
+            // decl). Dispatch keeps the strict single-scope match.
+            let in_scope = sym.package == *package
+                || (target.scope == OverrideScope::Hierarchy
+                    && target
+                        .method_classes
+                        .iter()
+                        .any(|c| Some(c.as_str()) == sym.package.as_deref()));
+            matches!(sym.kind, SymKind::Sub | SymKind::Method) && in_scope
         }
         TargetKind::Method { class } => {
             // A `sub NAME` declaration belongs to this target if it lives in
@@ -891,15 +974,20 @@ fn collect_from_analysis(
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
              RefKind::FunctionCall { resolved_package }) => {
                 let scope = callable_scope_for_refs.as_ref().unwrap();
-                // A bare imported call the single-file walk couldn't pin
+                // Under Hierarchy a bare call into ANY family class matches (the
+                // whole override family); Dispatch keeps the strict single
+                // scope. A bare imported call the single-file walk couldn't pin
                 // (`use Bank;` auto-imports `@EXPORT`, invisible at build) has
-                // `resolved_package: None`. Re-derive it here — where the index
-                // is in hand — so a rename from the source sub reaches the
-                // consumer call site (the lazy seam method dispatch + deferred
-                // hash-key owners use elsewhere in this fn).
+                // `resolved_package: None` — re-derive it here, where the index
+                // is in hand.
+                let pkg_matches = |pkg: &Option<String>| {
+                    pkg == scope
+                        || (target.scope == OverrideScope::Hierarchy
+                            && target.method_classes.iter().any(|c| Some(c) == pkg.as_ref()))
+                };
                 match resolved_package {
-                    Some(_) => resolved_package == scope,
-                    None => &analysis.deferred_call_package(r, module_index) == scope,
+                    Some(_) => pkg_matches(resolved_package),
+                    None => pkg_matches(&analysis.deferred_call_package(r, module_index)),
                 }
             }
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
@@ -923,13 +1011,27 @@ fn collect_from_analysis(
                     };
                     match (resolved_class, scope) {
                         (Some(cn), Some(pkg)) => {
-                            cn == *pkg || rename_chain_cache
-                                .entry(cn.clone())
-                                .or_insert_with(|| {
-                                    analysis.method_rename_chain(&cn, method, module_index)
-                                })
-                                .iter()
-                                .any(|c| c == pkg)
+                            if target.scope == OverrideScope::Hierarchy {
+                                // The override family is precomputed; a call
+                                // matches iff its invocant is in it — so
+                                // `$child->m` and `$base->m` rename together.
+                                // (Every family member is a descendant of the
+                                // root, so inheriting-without-override calls are
+                                // covered by membership.)
+                                target.method_classes.iter().any(|c| c == &cn)
+                            } else {
+                                // Dispatch: the call matches only if it
+                                // dispatches to THIS def — `$child->m` reaches an
+                                // ancestor target via the per-invocant chain,
+                                // unrelated same-named methods stay out.
+                                cn == *pkg || rename_chain_cache
+                                    .entry(cn.clone())
+                                    .or_insert_with(|| {
+                                        analysis.method_rename_chain(&cn, method, module_index)
+                                    })
+                                    .iter()
+                                    .any(|c| c == pkg)
+                            }
                         }
                         _ => false,
                     }

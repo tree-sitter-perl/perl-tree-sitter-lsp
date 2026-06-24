@@ -5377,7 +5377,7 @@ sub run {
                 owner: HandlerOwner::Class("Producer".to_string()),
                 name: "ready".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -11865,7 +11865,7 @@ fn sub_exporter_member_goto_def_and_references() {
             kind: TargetKind::Sub {
                 package: Some("My::Exp".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -12513,7 +12513,7 @@ sub go {
             &TargetRef {
                 name: name.to_string(),
                 kind: TargetKind::Sub { package: Some("Foo".to_string()) },
-                method_classes: Vec::new(),
+                method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
             },
             RoleMask::EDITABLE,
         );
@@ -12631,7 +12631,7 @@ sub go {
             &TargetRef {
                 name: name.to_string(),
                 kind: TargetKind::Sub { package: Some("Foo".to_string()) },
-                method_classes: Vec::new(),
+                method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
             },
             RoleMask::EDITABLE,
         );
@@ -13398,7 +13398,7 @@ sub retry {
             kind: TargetKind::Sub {
                 package: Some("QA::C".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -13518,7 +13518,7 @@ sub opt_b { 'b' }
             kind: TargetKind::Sub {
                 package: Some("QA::E".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );

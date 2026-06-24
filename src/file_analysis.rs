@@ -6749,6 +6749,56 @@ impl FileAnalysis {
     /// (inclusive); intermediate ancestors that *override* are
     /// skipped because they're a different method from the
     /// inheritance perspective.
+    /// The full **override family** of `(class, method)` — the contract root
+    /// (topmost ancestor defining the method) plus every class that inherits or
+    /// overrides it. The membership set for `OverrideScope::Hierarchy` rename:
+    /// renaming any member rewrites them all, so an override never silently
+    /// desyncs from its base (the standard IDE refactor;
+    /// docs/rename-bidirectional-audit.md #5). Gathered over PROVEN inheritance
+    /// edges only (`@ISA`/`use parent`/Moo via `GraphView`), NEVER name matches
+    /// — two unrelated classes both defining `sub render {}` with no edge
+    /// between them are not a family.
+    pub fn method_override_family(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<String> {
+        let defines = |cls: &str| {
+            matches!(
+                self.resolve_method_in_ancestors(cls, method_name, module_index),
+                Some(MethodResolution::Local { class: ref c, .. })
+                    | Some(MethodResolution::CrossFile { class: ref c, .. })
+                    if c == cls
+            )
+        };
+        // Contract root: the topmost ancestor (incl. the cursor class) that
+        // defines the method — an override roots at the base it overrides.
+        let mut root = class_name.to_string();
+        self.for_each_ancestor_class(class_name, module_index, |cls| {
+            if defines(cls) {
+                root = cls.to_string();
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        // Root + all transitive descendants (`walk` excludes the origin).
+        let mut family = vec![root.clone()];
+        let graph = crate::graph::GraphView::new(self, module_index);
+        graph.walk(
+            crate::graph::Node::Class(root),
+            crate::graph::EdgeKindMask::INHERITS_INV,
+            &mut |n| {
+                if let crate::graph::Node::Class(c) = n {
+                    if !family.iter().any(|f| f == c) {
+                        family.push(c.clone());
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        family
+    }
+
     pub fn method_rename_chain(
         &self,
         class_name: &str,

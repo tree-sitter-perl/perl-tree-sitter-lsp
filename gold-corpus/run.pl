@@ -138,7 +138,7 @@ sub batch_req {
 # Run a batch of requests through ONE --batch process (one startup) against a
 # given root, return id -> response. Rows are grouped by root by the caller.
 sub run_batch {
-    my ($reqs, $root, $p5lib) = @_;
+    my ($reqs, $root, $p5lib, $rename_scope) = @_;
     $root  //= $corpus;
     $p5lib //= p5lib_for($root);
     my $jsonl = join("\n", map { encode_json($_) } @$reqs) . "\n";
@@ -158,6 +158,8 @@ sub run_batch {
         open(STDIN, '<', $tpath) or exit 127;
         open(STDERR, '>', '/dev/null');
         $ENV{PERL5LIB} = $p5lib if defined $p5lib;
+        if ($rename_scope) { $ENV{PERL_LSP_RENAME_SCOPE} = $rename_scope; }
+        else { delete $ENV{PERL_LSP_RENAME_SCOPE}; }
         exec($bin, '--batch', $root) or exit 127;
     }
     # Read line-by-line (the binary flushes per response): each arrival
@@ -247,19 +249,26 @@ if ($list_only) {
 }
 
 # ---- run suite: group rows by workspace root, one --batch per root ----
-my %groups; my %meta; my @order;
+my %groups; my %meta; my @order; my %gctx;
 for my $r (@rows) {
     my $spec = $CAP{$r->{capability}} or next;
     my $key = "$r->{capability}/$r->{id}";
     $meta{$key} = [ $r, $spec ];
     push @order, $key;
     my $root = root_for($r);
-    push @{ $groups{$root} }, batch_req($r->{capability}, $spec, $r, $key, $root);
+    # Rows that pin `renameScope` ("dispatch") run in their own batch with
+    # PERL_LSP_RENAME_SCOPE set — the override-fan-out mode is process-wide,
+    # so it groups separately from the default (hierarchy) rows for that root.
+    my $scope = $r->{renameScope} // '';
+    my $gkey = "$root\x00$scope";
+    $gctx{$gkey} //= { root => $root, scope => $scope };
+    push @{ $groups{$gkey} }, batch_req($r->{capability}, $spec, $r, $key, $root);
 }
 my $resp = {};
 my @batch_metrics;
-for my $root (sort keys %groups) {
-    my ($by, $met) = run_batch($groups{$root}, $root, p5lib_for($root));
+for my $gkey (sort keys %groups) {
+    my ($root, $scope) = @{ $gctx{$gkey} }{qw(root scope)};
+    my ($by, $met) = run_batch($groups{$gkey}, $root, p5lib_for($root), $scope);
     %$resp = (%$resp, %$by);
     push @batch_metrics, $met;
 }
