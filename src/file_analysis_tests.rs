@@ -740,19 +740,29 @@ fn test_phase5_find_references_on_hash_key_def_without_tree() {
         })
         .expect("host HashKeyDef");
 
-    // Cursor on the def — convention is that find_references returns the
-    // *usages*, not the def itself. Previously this returned 0 without a
-    // tree; phase 5 returns the access sites via refs_by_target.
+    // Cursor on the def returns the def itself + every access — the same
+    // set an access-site cursor returns, so def↔access rename/references
+    // stay symmetric (a hash-key def has no ref at its own token, so it
+    // must opt into `include_decl` explicitly). Previously this returned 0
+    // without a tree; phase 5 links access→def at build time.
     let point = def_host.selection_span.start;
     let refs = fa.find_references(point, None);
-    assert!(
-        !refs.is_empty(),
-        "expected at least one access for 'host' via refs_by_target (no tree), got empty",
-    );
-    // Sanity: the access should point at `$cfg->{host}`.
+    // The access at `$cfg->{host}` (row 3).
     assert!(
         refs.iter().any(|s| s.start.row == 3),
         "expected to find the access on row 3 ($cfg->{{host}}), got {:?}",
+        refs,
+    );
+    // The def token itself must be present (symmetry with the access side).
+    assert!(
+        refs.iter().any(|s| *s == def_host.selection_span),
+        "expected the def token in its own reference set, got {:?}",
+        refs,
+    );
+    // `port` is a different key on the same sub — must NOT be swept in.
+    assert!(
+        !refs.iter().any(|s| s.start.row == 4),
+        "unrelated key 'port' (row 4) must stay out of host's set, got {:?}",
         refs,
     );
 }

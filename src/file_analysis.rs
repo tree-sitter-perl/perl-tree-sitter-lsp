@@ -5813,6 +5813,14 @@ impl FileAnalysis {
                         Some(RenameKind::Handler { owner: owner.clone(), name: sym.name.clone() })
                     } else { None }
                 }
+                // A hash-key def with no field group (a return-hash key, the
+                // `return { host => 1 }` shape) — `field_group_at` already
+                // claimed the constructor/`has` cases ahead of us. The owner
+                // recovers from `hash_key_owner_at`, so resolve_symbol's
+                // `HashKey` arm mints the same `HashKeyOfSub`/`HashKeyOfClass`
+                // target a `$result->{key}` access would, making def→accesses
+                // symmetric with access→def.
+                SymKind::HashKeyDef => Some(RenameKind::HashKey(sym.name.clone())),
                 _ => None,
             };
         }
@@ -6040,7 +6048,15 @@ impl FileAnalysis {
 
         // Check if cursor is directly on a symbol declaration
         if let Some(sym) = self.symbol_at(point) {
-            return Some((sym.id, false));
+            // A hash-key def has no ref at its own token (unlike a variable
+            // decl, which carries a `Variable` ref and so resolves with
+            // `include_decl = true` via the ref arm above). The generic decl
+            // case excludes the declaration (references' includeDeclaration=
+            // false convention), which would drop the key from its own
+            // rename/reference set — asymmetric with the access-side path,
+            // which returns def + every access. Include it for hash-key defs.
+            let include_decl = matches!(sym.kind, SymKind::HashKeyDef);
+            return Some((sym.id, include_decl));
         }
 
         None
