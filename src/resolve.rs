@@ -95,6 +95,7 @@ impl TargetRef {
                 | TargetKind::Method { .. }
                 | TargetKind::Package
                 | TargetKind::HashKeyOfSub { .. }
+                | TargetKind::Handler { .. }
         )
     }
 
@@ -328,6 +329,12 @@ pub struct RefLocation {
     /// migrate to `refs_to` in a follow-up.
     #[allow(dead_code)]
     pub access: AccessKind,
+    /// Whether rename may rewrite this span. `false` for a site whose name has
+    /// no literal token to replace — a const-folded event name
+    /// (`my $e = 'ready'; $obj->on($e)`) whose dispatch span IS the variable.
+    /// References lists it (it's a real use); rename skips it (rewriting the
+    /// variable would corrupt it). True for every literal occurrence.
+    pub rewritable: bool,
 }
 
 impl RefLocation {
@@ -450,12 +457,14 @@ pub fn group_refs(
             key: origin.clone(),
             span: *span,
             access: AccessKind::Read,
+            rewritable: true,
         })
         .collect();
     out.extend(pinned_spans.iter().map(|(path, span)| RefLocation {
         key: FileKey::Path(path.clone()),
         span: *span,
         access: AccessKind::Read,
+        rewritable: true,
     }));
     for m in members {
         let mask = mask_override
@@ -491,7 +500,7 @@ pub fn group_rename_edits(
         .iter()
         .map(|span| {
             (
-                RefLocation { key: origin.clone(), span: *span, access: AccessKind::Read },
+                RefLocation { key: origin.clone(), span: *span, access: AccessKind::Read, rewritable: true },
                 bare_new.to_string(),
             )
         })
@@ -502,6 +511,7 @@ pub fn group_rename_edits(
                 key: FileKey::Path(path.clone()),
                 span: *span,
                 access: AccessKind::Read,
+                rewritable: true,
             },
             bare_new.to_string(),
         )
@@ -667,6 +677,7 @@ pub fn implementations_of(
                         key: FileKey::Path(cached.path.clone()),
                         span: s.selection_span,
                         access: AccessKind::Declaration,
+                        rewritable: true,
                     });
                 }
             }
@@ -693,6 +704,16 @@ fn key_for_sort(k: &FileKey) -> PathBuf {
 
 fn file_key_eq(a: &FileKey, b: &FileKey) -> bool {
     key_for_sort(a) == key_for_sort(b)
+}
+
+/// A name spelled by a variable at `span` — a `Variable`/`ContainerAccess`
+/// ref covers it exactly. The signal that a dispatch site is const-folded
+/// (`$obj->on($evt)`): its name span IS the `$evt` token, so rename must not
+/// rewrite it. Literal names never coincide with a variable ref.
+fn span_variable_spelled(analysis: &FileAnalysis, span: Span) -> bool {
+    analysis.refs.iter().any(|r| {
+        matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) && r.span == span
+    })
 }
 
 /// True when `sym` is a declaration of `target` (decl-span match).
@@ -825,6 +846,13 @@ fn collect_from_analysis(
     let mut rename_chain_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
+    // Only handler (event) names can be spelled by a variable (const-folded
+    // `$obj->on($evt)`); for every other target kind the span is a literal name
+    // token, always rewritable. Gating the variable-overlap scan to handlers
+    // keeps it off the hot path.
+    let is_handler = matches!(target.kind, TargetKind::Handler { .. });
+    let rewritable_at = |span: Span| !(is_handler && span_variable_spelled(analysis, span));
+
     // Include declaration spans when this file defines the target.
     for sym in &analysis.symbols {
         if symbol_defines_target(sym, target) {
@@ -832,6 +860,7 @@ fn collect_from_analysis(
                 key: key.clone(),
                 span: sym.selection_span,
                 access: AccessKind::Declaration,
+                rewritable: rewritable_at(sym.selection_span),
             });
         }
     }
@@ -975,6 +1004,7 @@ fn collect_from_analysis(
                 key: key.clone(),
                 span,
                 access: r.access,
+                rewritable: rewritable_at(span),
             });
         }
     }
@@ -993,6 +1023,7 @@ fn collect_from_analysis(
                     key: key.clone(),
                     span: applied.span,
                     access: AccessKind::Read,
+                    rewritable: rewritable_at(applied.span),
                 });
             }
         }

@@ -5886,6 +5886,17 @@ impl FileAnalysis {
                 RefKind::PackageRef => return Some(RenameKind::Package(r.target_name.clone())),
                 RefKind::HashKeyAccess { .. } => return Some(RenameKind::HashKey(r.target_name.clone())),
                 RefKind::DispatchCall { owner: Some(owner), .. } => {
+                    // A dispatch name spelled via a variable (`my $e = 'x';
+                    // $obj->on($e)`) has no literal token to rewrite — the
+                    // cursor sits on the variable, so rename the variable, not
+                    // the event. A literal site carries no co-located Variable
+                    // ref, so this only diverts the folded case.
+                    if self.refs.iter().any(|o| {
+                        matches!(o.kind, RefKind::Variable | RefKind::ContainerAccess)
+                            && contains_point(&o.span, point)
+                    }) {
+                        return Some(RenameKind::Variable);
+                    }
                     return Some(RenameKind::Handler {
                         owner: owner.clone(),
                         name: r.target_name.clone(),
@@ -6136,6 +6147,21 @@ impl FileAnalysis {
                     }
                 }
                 RefKind::DispatchCall { owner: Some(owner), .. } => {
+                    // Folded name (`$obj->on($evt)`): the cursor is on the
+                    // variable, so resolve the variable — not the event. Mirrors
+                    // the `rename_kind_at` guard so references/highlight/rename
+                    // agree (the event's literal sites still resolve from there).
+                    if let Some(var) = self.refs.iter().find(|o| {
+                        matches!(o.kind, RefKind::Variable | RefKind::ContainerAccess)
+                            && contains_point(&o.span, point)
+                    }) {
+                        if let Some(sym_id) = var
+                            .resolves_to
+                            .or_else(|| self.resolve_variable(&var.target_name, point).map(|s| s.id))
+                        {
+                            return Some((sym_id, true));
+                        }
+                    }
                     for sym in &self.symbols {
                         if sym.name != r.target_name { continue; }
                         if let SymbolDetail::Handler { owner: o, .. } = &sym.detail {

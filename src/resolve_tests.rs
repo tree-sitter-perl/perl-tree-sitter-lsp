@@ -3005,6 +3005,53 @@ fn test_group_rename_rederives_mapped_members_cross_file() {
     );
 }
 
+/// Finding #1: event (Handler) rename. Literal event-name sites are
+/// rewritable (rename rewrites the inside-the-quotes name); a const-folded
+/// site (`my $e = 'connect'; $self->on($e)`) whose span IS the variable is a
+/// reference but NOT rewritable — references lists it, rename skips it (so it
+/// can't corrupt the variable). `refs_to` carries the distinction.
+#[test]
+fn test_event_handler_refs_mark_folded_site_non_rewritable() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/ev_handler.pm");
+    let src = "package App;\n\
+         use parent 'Mojo::EventEmitter';\n\
+         sub setup {\n\
+         my $self = shift;\n\
+         $self->on('connect', sub { 1 });\n\
+         my $e = 'connect';\n\
+         $self->on($e, sub { 1 });\n\
+         $self->emit('connect');\n\
+         }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+
+    let target = TargetRef {
+        name: "connect".to_string(),
+        kind: TargetKind::Handler {
+            owner: crate::file_analysis::HandlerOwner::Class("App".to_string()),
+            name: "connect".to_string(),
+        },
+        method_classes: Vec::new(),
+    };
+    assert!(target.supports_cross_file_rename(), "Handler renames cross-file now");
+
+    let refs = refs_to(&store, None, &target, RoleMask::EDITABLE);
+    let rewritable = refs.iter().filter(|r| r.rewritable).count();
+    let frozen = refs.iter().filter(|r| !r.rewritable).count();
+    // The folded `$e` site is a reference (present) but non-rewritable; the
+    // literal sites (two `on` + `emit`) are rewritable.
+    assert!(
+        frozen >= 1,
+        "the folded $e dispatch site must be present but non-rewritable; refs: {:?}",
+        refs,
+    );
+    assert!(
+        rewritable >= 2,
+        "literal event sites must be rewritable; refs: {:?}",
+        refs,
+    );
+}
+
 /// Finding #4: a DBIC column's accessor (`$row->name`) and its key uses
 /// (`search({name=>…})`, `$row->{name}`) are one renameable unit. The
 /// synthesized accessor Method + the same-span `Class`-owned column HashKeyDef

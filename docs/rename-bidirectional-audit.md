@@ -49,7 +49,7 @@ seam (§3).
 | Moo `has` mapped accessors (`has_x`/`clear_x`) | ✓ | ✓ | symmetric (finding #2 — fixed) |
 | Moo `has` ctor-key / accessor-call / decl | ✓ | ✓ | symmetric (among themselves) |
 | Return-hash key (`HashKeyOfSub`), **cross-file** | ✓ | ✓ | symmetric (finding #3 — fixed) |
-| Mojo-events handler (`->on`/`->emit`) | 1-of-N in-file | 0 edits | **ASYMMETRIC + lossy** — finding #1 |
+| Mojo-events handler (`->on`/`->emit`) | ✓ | ✓ | symmetric (finding #1 — fixed) |
 | DBIC column (def/accessor/search-key) | ✓ | ✓ | symmetric (finding #4 — fixed) |
 
 ---
@@ -198,7 +198,33 @@ Repros use `./target/release/perl-lsp --rename <root> <file> <row> <col> <new>`
 (0-based row/col). Fixture workspace + diff harness left at
 `scratchpad/ws/` + `scratchpad/sym.pl` (under the session scratchpad).
 
-### #1 — Mojo-events handler rename is lossy and direction-broken — HIGH
+### #1 — Mojo-events handler rename — FIXED (rewritable split)
+**Resolved** by routing handler rename through `refs_to` (like references) and
+adding a references-vs-rename **rewritable** distinction:
+- The `mojo-events` plugin now uses the string-**content** span for the event
+  name, so rename rewrites `connect`, not `'connect'` (quotes preserved).
+- `RefLocation` gained `rewritable`. A dispatch site whose name span coincides
+  with a `Variable` ref is a const-folded name (`my $e='x'; $obj->on($e)`) —
+  `refs_to` marks it `rewritable: false`. References lists it (real use);
+  rename callers (`locations_to_workspace_edit`, CLI `run_rename`) skip it, so
+  the variable is never corrupted. Every literal occurrence stays rewritable.
+- A cursor ON a folded site resolves to the *variable* (guards in
+  `rename_kind_at` + `resolve_target_at`), so renaming there renames the
+  variable, not the event.
+- `Handler` joined `supports_cross_file_rename`; stacked `->on` registrations,
+  `emit`/`unsubscribe`, and cross-file consumer sites all fan out symmetrically.
+
+Known limitation: renaming a literal event does NOT rewrite the *source*
+string of a folded name (`my $e='ready'`) — there's no literal event token
+there and the variable can't be safely rewritten. The folded site stays a
+(non-rewritable) reference. Rare; documented rather than guessed-at.
+
+The `rewritable` flag is a clean general mechanism (any non-literal reference
+can use it), not event-specific special-casing.
+
+Original report retained below.
+
+### #1 (orig) — Mojo-events handler rename is lossy and direction-broken — HIGH
 Handlers are `HashKeyOfClass` → `supports_cross_file_rename=false` → single-file
 `rename_at` → symbol-identity `resolve_target_at`. References is fully symmetric
 (all 6 sites both directions); rename is not.

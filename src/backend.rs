@@ -168,6 +168,12 @@ fn locations_to_workspace_edit(
     let mut all_changes: std::collections::HashMap<Url, Vec<TextEdit>> =
         std::collections::HashMap::new();
     for loc in locations {
+        // Skip non-rewritable sites (a const-folded event name spelled by a
+        // variable): it's a reference, not a literal to rewrite. References
+        // (`refs_to_locations`) keeps it; only rename drops it.
+        if !loc.rewritable {
+            continue;
+        }
         if let Some(uri) = loc.to_url() {
             all_changes.entry(uri).or_default().push(TextEdit {
                 range: symbols::span_to_range(loc.span),

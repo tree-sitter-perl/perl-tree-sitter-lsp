@@ -1109,6 +1109,11 @@ fn run_rename(
         }
     };
     for loc in locations {
+        // A non-rewritable site (a const-folded event name spelled by a
+        // variable) is a reference, not a renameable literal — skip it.
+        if !loc.rewritable {
+            continue;
+        }
         let path = match &loc.key {
             file_store::FileKey::Path(p) => p.display().to_string(),
             file_store::FileKey::Url(u) => u.to_file_path()
