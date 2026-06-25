@@ -77,6 +77,25 @@
   declarator: (field_identifier) @def.var.name) @def.var
 
 ; ---- calls ----
-(call_expression function: (identifier) @ref.call)
+(call_expression function: (identifier) @ref.call) @expr.call
 (call_expression
   function: (field_expression field: (field_identifier) @ref.method))
+
+; ---- type witnesses: C++ leaks types at every DECLARATION site (its
+; static-typing richness — the annot_type predicate carries the load).
+; `T x = init;` emits both the declared-type witness and a flow edge to
+; the initializer; `T x;` emits the declared type alone. `auto` defers
+; to the edge (annot_type returns None), driving the cross-var chase. ----
+(declaration
+  type: (_) @type.annot
+  declarator: (init_declarator
+    declarator: (identifier) @flow.target
+    value: (_) @flow.source))
+(declaration
+  type: (_) @type.annot
+  declarator: (identifier) @flow.target)
+
+; ---- literals + variable reads (the edge-chase substrate) ----
+(number_literal) @expr.lit.number
+(string_literal) @expr.lit.string
+(identifier) @expr.read.var

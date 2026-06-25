@@ -240,10 +240,37 @@ Surfaced en route: a genuine Tier-1 skeleton gap — pointer/reference
 returning methods (`Foo* m()`) nest the `function_declarator` inside a
 `pointer_declarator`; added to `queries/cpp/skeleton.scm`.
 
-Open for the next pass (the "layer the worklist" half): the validate
-gate is per-file, wants to be per-splice; the source pass is single,
-wants a fixpoint for nested calls; and none of this yet feeds the
-witness bag — extraction runs on the reparsed tree, but the C++ pack
-emits no type witnesses, so there is nothing for the worklist to fold
-yet. That seam — capture events → witnesses, on the reparsed tree — is
-where the bag re-enters.
+## The worklist, layered (landed)
+
+The bag re-entered. `queries/cpp/skeleton.scm` now emits type witnesses
+and `cpp_pack` carries the predicates — C++'s leak is *declared types*
+(pervasive, unlike Python's optional annotations), so `annot_type` on
+every `declaration` carries the load, with literals and an `auto` edge
+filling the rest. Two tests prove the whole stack on a **walker-free,
+production** FileAnalysis:
+
+- `cpp_walker_free_type_queries` — `int n = 5` → Numeric, `std::string s`
+  → String, `geo::Circle c` → ClassName, and `auto m = n` resolves
+  through the **three-hop edge chase** (`m → Expr(n) → Variable(n) →
+  Numeric`) in the production reducer registry, untouched. Temporality
+  holds for free: a variable has no type before its declaration point.
+- `cpp_type_inference_through_macro_reparse` — the compose: a class
+  destroyed by `class API_EXPORT Box` is recovered by validated
+  expansion, and *then* the bag types `Box b` as `ClassName("Box")` and
+  chases `auto same = b` — on the macro-reparsed tree. The nominal type
+  always existed; reparse made it RESOLVABLE (the class symbol + its
+  `width` field come back).
+
+The result the skeleton spike predicted, now true for a third axis: the
+witness bag is the language-agnostic core, and a language the engine
+never heard of — reparsed past its preprocessor — answers type queries
+through the same reducers, with **zero engine edits**. Everything lived
+in two `.scm` files, the pack predicates, the driver, and the reparse
+seam.
+
+Open for the next pass: the validate gate is per-file, wants to be
+per-splice; the source pass is single, wants a fixpoint for nested
+calls (X-macros); method-call return typing (`MethodOnClass`) needs the
+class-shape emission the pack does not do yet; and none of it is wired
+into the build pipeline — these remain measured spikes, lifted when a
+second language ships in-editor (`prompt-multi-language.md`).

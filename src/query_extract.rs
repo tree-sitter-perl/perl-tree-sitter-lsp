@@ -293,8 +293,34 @@ pub fn cpp_pack() -> LangPack {
         query_source: include_str!("../queries/cpp/skeleton.scm"),
         shape_name: |_, raw| raw.to_string(),
         default_name: |_| None,
-        annot_type: |_| None,
-        ctor_class: |_| None,
+        // C++ declared types ARE the witness source. Primitives → the
+        // value lattice; `auto`/`void` defer (None → edge carries);
+        // anything else identifier-shaped is a class instance.
+        annot_type: |text| {
+            use InferredType::*;
+            match text.trim() {
+                "int" | "long" | "short" | "unsigned" | "size_t" | "int32_t" | "int64_t"
+                | "uint32_t" | "uint64_t" | "double" | "float" | "bool" | "char" => Some(Numeric),
+                "std::string" | "string" | "std::string_view" => Some(String),
+                "auto" | "void" => None,
+                t => {
+                    let typeish = !t.is_empty()
+                        && !t.contains(' ')
+                        && t.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
+                    typeish.then(|| ClassName(t.to_string()))
+                }
+            }
+        },
+        // explicit constructor call `Foo(...)`: capitalized (or
+        // namespaced-capitalized) callee names a class — the C++ idiom,
+        // same role conventions.rs plays for Perl.
+        ctor_class: |callee| {
+            let last = callee.rsplit("::").next().unwrap_or(callee);
+            last.chars()
+                .next()
+                .is_some_and(|c| c.is_uppercase())
+                .then(|| callee.to_string())
+        },
         // #include "a/b.h" / <vector>: strip the delimiters; a quoted
         // path is workspace-relative verbatim, a system header resolves
         // through include dirs (library_roots, later). Tier 1: identity.

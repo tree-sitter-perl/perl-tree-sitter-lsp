@@ -845,6 +845,7 @@ fn cpp_obstacle_course_damage_report() {
     assert_eq!(errors, 0, "clean baseline must parse error-free");
 }
 
+
 #[test]
 fn dbg_cpp_attr_probe() {
     let mut parser = cpp_parser();
@@ -919,6 +920,101 @@ fn cpp_clean_baseline_outline() {
     // namespace stickiness: Shape/Circle carry package=geo
     let shape = skel.symbols.iter().find(|s| s.name == "Shape").unwrap();
     assert_eq!(shape.package.as_deref(), Some("geo"), "namespace context");
+}
+
+#[test]
+fn cpp_walker_free_type_queries() {
+    // The same proof the Python pack gives, on C++ syntax: a REAL
+    // FileAnalysis built from capture events alone answers type queries
+    // through the production witness bag + reducer registry. C++'s leak
+    // is declared types — pervasive, so annot_type carries the load.
+    let src = "\
+namespace geo { class Circle { public: double area(); }; }
+int main() {
+    int n = 5;
+    std::string s = \"hi\";
+    geo::Circle c;
+    auto m = n;
+    return 0;
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    use crate::file_analysis::InferredType;
+    // cursor on `return 0;` (row 6) — past every declaration. Queries
+    // are TEMPORAL: a variable has no type before its declaration point,
+    // which is exactly the production rule (no guessing the future).
+    let inside = tree_sitter::Point { row: 6, column: 4 };
+    assert_eq!(fa.inferred_type_via_bag("n", inside), Some(InferredType::Numeric), "int decl");
+    assert_eq!(fa.inferred_type_via_bag("s", inside), Some(InferredType::String), "std::string decl");
+    assert_eq!(
+        fa.inferred_type_via_bag("c", inside),
+        Some(InferredType::ClassName("geo::Circle".into())),
+        "class-instance decl",
+    );
+    // `auto m = n` — the cross-variable edge chase: m → Expr(n) →
+    // Variable(n) → Numeric, through the production registry untouched.
+    assert_eq!(fa.inferred_type_via_bag("m", inside), Some(InferredType::Numeric), "auto edge chase");
+    // and temporality holds: before its declaration, n has no type
+    assert_eq!(
+        fa.inferred_type_via_bag("n", tree_sitter::Point { row: 1, column: 0 }),
+        None,
+        "no type before declaration",
+    );
+}
+
+#[test]
+fn cpp_type_inference_through_macro_reparse() {
+    // The whole stack composes. A declarator-position macro DESTROYS the
+    // class (it reparses as a function), so the class SYMBOL — the thing
+    // goto-def / members / inheritance need — does not exist. `b`'s
+    // *nominal* type (`ClassName("Box")`) survives, because it comes from
+    // b's own declaration, but it points at nothing. Reparse via
+    // expansion recovers the class symbol and its fields, making that
+    // nominal type RESOLVABLE; the bag then types `b` and the edge chase
+    // `auto same = b` on the reparsed tree.
+    let mut parser = cpp_parser();
+    let src = "\
+#define API_EXPORT __attribute__((visibility(\"default\")))
+class API_EXPORT Box {
+public:
+    int width;
+};
+int main() {
+    Box b;
+    auto same = b;
+    return 0;
+}
+";
+    // pre-reparse: the class SYMBOL evaporated (only its corrupted
+    // remains), so navigation to `Box` and its `width` field is dead.
+    let raw_defs: Vec<(String, String)> = cpp_skel(src)
+        .symbols
+        .iter()
+        .map(|s| (s.kind.clone(), s.name.clone()))
+        .collect();
+    assert!(!raw_defs.contains(&("class".into(), "Box".into())), "class lost pre-reparse: {raw_defs:?}");
+
+    // reparse (validated macro expansion), then extract + query
+    let (rewritten, _map) = crate::cpp_reparse::preprocess_validated(&mut parser, src);
+    let skel = cpp_skel(&rewritten);
+    let defs: Vec<(String, String)> = skel.symbols.iter().map(|s| (s.kind.clone(), s.name.clone())).collect();
+    assert!(defs.contains(&("class".into(), "Box".into())), "class recovered: {defs:?}");
+    assert!(defs.contains(&("var".into(), "width".into())), "field recovered: {defs:?}");
+
+    use crate::file_analysis::InferredType;
+    let fa = skel.into_file_analysis();
+    let pt = tree_sitter::Point { row: 8, column: 4 }; // on `return 0;`
+    assert_eq!(
+        fa.inferred_type_via_bag("b", pt),
+        Some(InferredType::ClassName("Box".into())),
+        "b types as the recovered class through the bag",
+    );
+    // the edge chase rides on top of the macro-reparsed tree
+    assert_eq!(
+        fa.inferred_type_via_bag("same", pt),
+        Some(InferredType::ClassName("Box".into())),
+        "auto edge chase on a macro-recovered class",
+    );
 }
 
 #[test]
@@ -1018,3 +1114,4 @@ fn cmake_cross_file_function_rename_and_subdirectory_resolution() {
     assert!(files.contains(&"CMakeLists.txt".to_string()), "call: {files:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
