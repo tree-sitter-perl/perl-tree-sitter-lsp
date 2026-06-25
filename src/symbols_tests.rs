@@ -5398,3 +5398,41 @@ fn test_helper_not_loaded_exempts_installed_plugins() {
     assert!(lint_messages(&idx, consumer).is_empty());
 }
 
+
+// D5 — redundant RE-narrowing. Subsumed by D3: an earlier guard's narrowing
+// becomes the subject's prior type at a later same-type guard (the narrowing
+// witness survives because no reassignment truncated it), so D3 flags the
+// second guard. No separate diagnostic path — this test pins that coverage.
+#[test]
+fn d5_sequential_renarrow_is_flagged_by_d3() {
+    let src = r#"
+package Foo;
+sub new { bless {}, shift }
+sub frob { 1 }
+package Main;
+sub f {
+    my ($self, $x) = @_;
+    return unless $x->isa('Foo');
+    $x->frob;
+    return unless $x->isa('Foo');
+    return 1;
+}
+1;
+"#;
+    let analysis = parse_analysis(src);
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let on = DiagnosticOptions { redundant_guard: true, ..Default::default() };
+    let redundant: Vec<_> = collect_diagnostics(&analysis, &idx, on)
+        .into_iter()
+        .filter(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "redundant-guard"))
+        .collect();
+    // Exactly the SECOND guard (line 9, 0-based) is redundant; the first
+    // (line 6) narrows from an un-typed prior and is not.
+    assert_eq!(
+        redundant.len(),
+        1,
+        "second guard redundant, first not: {:?}",
+        redundant.iter().map(|d| (d.range.start.line, &d.message)).collect::<Vec<_>>(),
+    );
+    assert_eq!(redundant[0].range.start.line, 9);
+}
