@@ -1860,6 +1860,30 @@ pub struct UntypedDispatch {
     pub gate: String,
 }
 
+/// The dereference form at a `DerefSite` — what the receiver is being used
+/// as, which decides both the diagnostic wording and (for D6) the rep the
+/// access demands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DerefForm {
+    /// `$x->method(...)` — carries the method name.
+    Method(String),
+    /// `$x->{key}` hash dereference.
+    HashKey,
+}
+
+/// A scalar-receiver dereference paired with the receiver's narrowed type
+/// at the use point — see `FileAnalysis::deref_receiver_sites`.
+#[derive(Debug, Clone)]
+pub struct DerefSite {
+    /// The diagnostic range (the dereferencing ref's span).
+    pub span: Span,
+    /// Receiver spelling (`$x`).
+    pub receiver: String,
+    /// Receiver type at the use point, with narrowing applied.
+    pub receiver_ty: InferredType,
+    pub form: DerefForm,
+}
+
 // ---- Import ----
 
 /// One name brought into scope by a `use` statement.
@@ -4029,6 +4053,57 @@ impl FileAnalysis {
             }
         }
         None
+    }
+
+    /// Every scalar-receiver dereference in this file, paired with the
+    /// receiver's **narrowed** type at the use point. The one lattice read
+    /// the undef/Optional/shape diagnostics (D1/D2/D6,
+    /// `docs/prompt-narrowing-diagnostics.md`) consume — each is a filter
+    /// over this stream that asks the type, never the syntax (rule #10).
+    ///
+    /// A site is included only when the receiver's type resolves; an
+    /// unresolvable receiver is omitted (honest silence — the diagnostics
+    /// built on top miss it rather than guess). Covered receiver forms are
+    /// the ones that carry a typed scalar handle on a ref: a method-call
+    /// invocant (`$x->m`) and a scalar hash deref (`$x->{k}`). Array
+    /// (`$x->[i]`) and code (`$x->()`) derefs don't surface a receiver-typed
+    /// ref today and are the documented residual.
+    pub fn deref_receiver_sites(
+        &self,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<DerefSite> {
+        use crate::conventions::InvocantText;
+        let mut out = Vec::new();
+        for r in &self.refs {
+            let (receiver, form) = match &r.kind {
+                RefKind::MethodCall { invocant, .. } => {
+                    // Only a scalar invocant can be undef/Optional; a
+                    // bareword/`__PACKAGE__`/chain receiver never narrows here.
+                    if !matches!(invocant.classify(), InvocantText::Scalar(_)) {
+                        continue;
+                    }
+                    (invocant.to_string(), DerefForm::Method(r.target_name.clone()))
+                }
+                // A scalar `var_text` is the arrow form `$x->{k}`; the direct
+                // `$h{k}` form's base is the named hash, which can't be an
+                // undef *receiver* (and won't type as Undef/Optional anyway).
+                RefKind::HashKeyAccess { var_text, .. } if var_text.starts_with('$') => {
+                    (var_text.clone(), DerefForm::HashKey)
+                }
+                _ => continue,
+            };
+            if let Some(ty) =
+                self.inferred_type_via_bag_ctx(&receiver, r.span.start, module_index)
+            {
+                out.push(DerefSite {
+                    span: r.span,
+                    receiver,
+                    receiver_ty: ty,
+                    form,
+                });
+            }
+        }
+        out
     }
 
     /// Gated dispatch candidates in THIS file whose receiver couldn't be

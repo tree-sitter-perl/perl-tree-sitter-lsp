@@ -5,7 +5,7 @@ use tree_sitter::{Point, Tree};
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
     contains_point, format_inferred_type, CompletionCandidate, CrossFileLookup, FileAnalysis, FoldKind,
-    HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
+    DerefForm, HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
     SymKind as FaSymKind, SymbolDetail, PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT,
     PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
@@ -2746,6 +2746,37 @@ pub fn collect_diagnostics(
                 "'{}' is not defined in {}",
                 method_name, class_name,
             ),
+            ..Default::default()
+        });
+    }
+
+    // 5g: undef-deref (D1) — a method call or hash deref on a receiver the
+    // lattice proves is `Undef` at that point (the `else` of `if defined`,
+    // the fall-through after `return if defined`, an `unless defined` body).
+    // Runtime is a hard die. Maximal confidence — the type *is* undef, not
+    // *may be* — so this is always-on `WARNING`, the one narrowing diagnostic
+    // that doesn't wait behind an opt-in flag (rule #10: it reads the type
+    // at the use point, never the syntax). See docs/prompt-narrowing-diagnostics.md.
+    for site in analysis.deref_receiver_sites(Some(module_index)) {
+        if !matches!(site.receiver_ty, InferredType::Undef) {
+            continue;
+        }
+        let message = match &site.form {
+            DerefForm::Method(name) => format!(
+                "'{}' is undef here; calling '{}' on it dies at runtime",
+                site.receiver, name,
+            ),
+            DerefForm::HashKey => format!(
+                "'{}' is undef here; dereferencing it dies at runtime",
+                site.receiver,
+            ),
+        };
+        diagnostics.push(Diagnostic {
+            range: span_to_range(site.span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("undef-deref".into())),
+            source: Some("perl-lsp".into()),
+            message,
             ..Default::default()
         });
     }

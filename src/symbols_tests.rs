@@ -204,6 +204,133 @@ sub speak {
     );
 }
 
+/// Codes of all diagnostics carrying a string code.
+fn diag_codes(diags: &[Diagnostic]) -> Vec<String> {
+    diags
+        .iter()
+        .filter_map(|d| match &d.code {
+            Some(NumberOrString::String(c)) => Some(c.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn undef_deref_diags(source: &str) -> Vec<Diagnostic> {
+    let analysis = parse_analysis(source);
+    let module_index = crate::module_index::ModuleIndex::new_for_test();
+    collect_diagnostics(&analysis, &module_index, Default::default())
+        .into_iter()
+        .filter(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "undef-deref"))
+        .collect()
+}
+
+// D1 — method/deref on a provably-`Undef` receiver. The three guard forms
+// that drive a subject to the `Undef` bottom (docs/prompt-narrowing-diagnostics.md).
+
+#[test]
+fn d1_undef_deref_else_of_if_defined() {
+    // The `else` arm of `if (defined $x)` — $x is undef there.
+    let src = r#"
+package P;
+sub f {
+    my ($self, $x) = @_;
+    if (defined $x) {
+        return $x->name;
+    } else {
+        return $x->name;
+    }
+}
+1;
+"#;
+    let diags = undef_deref_diags(src);
+    assert_eq!(diags.len(), 1, "exactly the else-arm deref fires: {:?}", diag_codes(&undef_deref_diags(src)));
+    assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert!(diags[0].message.contains("$x"), "{}", diags[0].message);
+}
+
+#[test]
+fn d1_undef_deref_after_return_if_defined() {
+    // Fall-through after `return if defined $x` — $x is undef.
+    let src = r#"
+package P;
+sub f {
+    my ($self, $x) = @_;
+    return if defined $x;
+    $x->name;
+}
+1;
+"#;
+    let diags = undef_deref_diags(src);
+    assert_eq!(diags.len(), 1, "fall-through deref fires");
+}
+
+#[test]
+fn d1_undef_deref_unless_defined_body() {
+    let src = r#"
+package P;
+sub f {
+    my ($self, $x) = @_;
+    unless (defined $x) {
+        $x->name;
+    }
+}
+1;
+"#;
+    let diags = undef_deref_diags(src);
+    assert_eq!(diags.len(), 1, "unless-defined body deref fires");
+}
+
+#[test]
+fn d1_undef_deref_hash_form() {
+    let src = r#"
+package P;
+sub f {
+    my ($self, $x) = @_;
+    return if defined $x;
+    return $x->{host};
+}
+1;
+"#;
+    let diags = undef_deref_diags(src);
+    assert_eq!(diags.len(), 1, "hash deref on undef fires");
+    assert!(diags[0].message.contains("dereferencing"), "{}", diags[0].message);
+}
+
+#[test]
+fn d1_no_undef_deref_in_guarded_branch() {
+    // The defined branch strips Optional / leaves a live value — no warning.
+    let src = r#"
+package P;
+sub f {
+    my ($self, $x) = @_;
+    if (defined $x) {
+        return $x->name;
+    }
+    return;
+}
+1;
+"#;
+    assert!(
+        undef_deref_diags(src).is_empty(),
+        "guarded use must not warn: {:?}",
+        undef_deref_diags(src).iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn d1_no_undef_deref_without_guard() {
+    // An ordinary untyped receiver is not `Undef` — D1 stays silent.
+    let src = r#"
+package P;
+sub f {
+    my ($self, $x) = @_;
+    return $x->name;
+}
+1;
+"#;
+    assert!(undef_deref_diags(src).is_empty(), "no guard, no Undef, no warning");
+}
+
 #[test]
 fn test_code_action_from_diagnostic() {
     let source = "use Carp qw(croak);\ncarp('oops');\n";
