@@ -19,6 +19,10 @@ pub struct Backend {
     /// resolver refresh callback (which also publishes diagnostics), hence the
     /// atomic. Default off — QA/plugin-author channel.
     unresolved_dispatch: Arc<std::sync::atomic::AtomicBool>,
+    /// `initializationOptions.diagnostics.unresolvedMethodCrossFile` (D8) —
+    /// extend `unresolved-method` to cross-file classes. Same atomic-sharing
+    /// reason as above. Default off.
+    unresolved_method_cross_file: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Backend {
@@ -26,6 +30,9 @@ impl Backend {
         symbols::DiagnosticOptions {
             unresolved_dispatch: self
                 .unresolved_dispatch
+                .load(std::sync::atomic::Ordering::Relaxed),
+            unresolved_method_cross_file: self
+                .unresolved_method_cross_file
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -39,10 +46,12 @@ impl Backend {
         // Two-phase init: create ModuleIndex whose refresh callback references
         // a later-set Arc<ModuleIndex>, then wire up the Arc.
         let unresolved_dispatch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unresolved_method_cross_file = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let refresh_client = client.clone();
         let refresh_files = Arc::clone(&files);
         let refresh_unresolved_dispatch = Arc::clone(&unresolved_dispatch);
+        let refresh_unresolved_method_cross_file = Arc::clone(&unresolved_method_cross_file);
 
         let module_index_holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>> =
             Arc::new(std::sync::OnceLock::new());
@@ -56,6 +65,7 @@ impl Backend {
             let files = Arc::clone(&refresh_files);
             let holder = Arc::clone(&holder_clone);
             let unresolved_dispatch = Arc::clone(&refresh_unresolved_dispatch);
+            let unresolved_method_cross_file = Arc::clone(&refresh_unresolved_method_cross_file);
             tokio_handle.spawn(async move {
                 let module_index = match holder.get() {
                     Some(idx) => idx,
@@ -66,6 +76,8 @@ impl Backend {
                 let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
                 let options = symbols::DiagnosticOptions {
                     unresolved_dispatch: unresolved_dispatch
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    unresolved_method_cross_file: unresolved_method_cross_file
                         .load(std::sync::atomic::Ordering::Relaxed),
                 };
                 files.for_each_open_mut(|uri, doc| {
@@ -87,6 +99,7 @@ impl Backend {
             client,
             files,
             unresolved_dispatch,
+            unresolved_method_cross_file,
         }
     }
 
@@ -234,13 +247,16 @@ impl LanguageServer for Backend {
         // `{ "diagnostics": { "unresolvedDispatch": true } }` enables the
         // QA/plugin-author `unresolved-dispatch` channel; absent = off.
         if let Some(opts) = &params.initialization_options {
-            let on = opts
-                .get("diagnostics")
-                .and_then(|d| d.get("unresolvedDispatch"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let diag = opts.get("diagnostics");
+            let flag = |key: &str| {
+                diag.and_then(|d| d.get(key))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            };
             self.unresolved_dispatch
-                .store(on, std::sync::atomic::Ordering::Relaxed);
+                .store(flag("unresolvedDispatch"), std::sync::atomic::Ordering::Relaxed);
+            self.unresolved_method_cross_file
+                .store(flag("unresolvedMethodCrossFile"), std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(InitializeResult {

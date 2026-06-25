@@ -103,7 +103,7 @@ fn unresolved_dispatch_fires_only_when_enabled_and_only_on_untyped_receiver() {
     );
 
     // Enabled: exactly one unresolved-dispatch on the untyped receiver.
-    let on = DiagnosticOptions { unresolved_dispatch: true };
+    let on = DiagnosticOptions { unresolved_dispatch: true, ..Default::default() };
     let diags = collect_diagnostics(&analysis, &module_index, on);
     let dispatch_diags: Vec<_> = diags.iter().filter(|d|
         matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-dispatch")).collect();
@@ -122,7 +122,7 @@ fn unresolved_dispatch_silent_on_does_not_apply() {
     let source = "package W;\nsub fire {\n  my $x = Some::Other->new;\n  $x->enqueue('send_email');\n}\npackage Some::Other;\nsub new { bless {}, shift }\nsub enqueue { 1 }\n1;\n";
     let analysis = parse_analysis(source);
     let module_index = crate::module_index::ModuleIndex::new_for_test();
-    let on = DiagnosticOptions { unresolved_dispatch: true };
+    let on = DiagnosticOptions { unresolved_dispatch: true, ..Default::default() };
     let diags = collect_diagnostics(&analysis, &module_index, on);
     assert!(
         !diags.iter().any(|d|
@@ -329,6 +329,126 @@ sub f {
 1;
 "#;
     assert!(undef_deref_diags(src).is_empty(), "no guard, no Undef, no warning");
+}
+
+// D8 — extend `unresolved-method` to cross-file-resolvable classes. A
+// cached module whose internal package name IS the class queried (so
+// resolution keys line up), unlike `fake_cached`'s always-`Fake` package.
+fn cached_class(module: &str, methods: &[&str]) -> std::sync::Arc<crate::module_index::CachedModule> {
+    let mut src = format!("package {};\n", module);
+    for m in methods {
+        src.push_str(&format!("sub {} {{}}\n", m));
+    }
+    src.push_str("1;\n");
+    std::sync::Arc::new(crate::module_index::CachedModule::new(
+        std::path::PathBuf::from(format!("/fake/{}.pm", module.replace("::", "/"))),
+        std::sync::Arc::new(parse_analysis(&src)),
+    ))
+}
+
+fn unresolved_method_diags(
+    source: &str,
+    idx: &crate::module_index::ModuleIndex,
+    opts: DiagnosticOptions,
+) -> Vec<String> {
+    let analysis = parse_analysis(source);
+    collect_diagnostics(&analysis, idx, opts)
+        .into_iter()
+        .filter(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-method"))
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn d8_narrowed_local_class_fires_by_default() {
+    // The local-class narrowing case is always-on (no flag) — the receiver
+    // narrows to an in-file class that lacks the method.
+    let src = r#"
+package Foo;
+sub real { 1 }
+package Main;
+sub g {
+    my ($self, $x) = @_;
+    if ($x->isa('Foo')) {
+        $x->bogus;
+    }
+}
+1;
+"#;
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let diags = unresolved_method_diags(src, &idx, DiagnosticOptions::default());
+    assert_eq!(diags.len(), 1, "local narrowed bogus fires by default: {:?}", diags);
+    assert!(diags[0].contains("bogus") && diags[0].contains("Foo"), "{}", diags[0]);
+}
+
+#[test]
+fn d8_narrowed_cross_file_class_gated_behind_flag() {
+    let src = r#"
+package Main;
+sub g {
+    my ($self, $x) = @_;
+    if ($x->isa('My::Dep')) {
+        $x->bogus;
+    }
+}
+1;
+"#;
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    idx.insert_cache("My::Dep", Some(cached_class("My::Dep", &["known_method"])));
+
+    // Default: cross-file extension off → no diagnostic.
+    assert!(
+        unresolved_method_diags(src, &idx, DiagnosticOptions::default()).is_empty(),
+        "cross-file unresolved-method must stay silent without the opt-in",
+    );
+
+    // Opt-in: the cross-file class is known and lacks `bogus` → fires.
+    let on = DiagnosticOptions { unresolved_method_cross_file: true, ..Default::default() };
+    let diags = unresolved_method_diags(src, &idx, on);
+    assert_eq!(diags.len(), 1, "opt-in cross-file bogus fires: {:?}", diags);
+    assert!(diags[0].contains("My::Dep"), "{}", diags[0]);
+}
+
+#[test]
+fn d8_cross_file_existing_method_does_not_fire() {
+    let src = r#"
+package Main;
+sub g {
+    my ($self, $x) = @_;
+    if ($x->isa('My::Dep')) {
+        $x->known_method;
+    }
+}
+1;
+"#;
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    idx.insert_cache("My::Dep", Some(cached_class("My::Dep", &["known_method"])));
+    let on = DiagnosticOptions { unresolved_method_cross_file: true, ..Default::default() };
+    assert!(
+        unresolved_method_diags(src, &idx, on).is_empty(),
+        "a method that exists cross-file must not fire",
+    );
+}
+
+#[test]
+fn d8_unknown_class_stays_silent_even_with_flag() {
+    // Not local, not cached — external/uninstalled. Even opt-in stays silent.
+    let src = r#"
+package Main;
+sub g {
+    my ($self, $x) = @_;
+    if ($x->isa('Totally::Unknown')) {
+        $x->bogus;
+    }
+}
+1;
+"#;
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let on = DiagnosticOptions { unresolved_method_cross_file: true, ..Default::default() };
+    assert!(
+        unresolved_method_diags(src, &idx, on).is_empty(),
+        "an unknown class is never flagged — we can't enumerate its methods",
+    );
 }
 
 #[test]
@@ -4538,7 +4658,7 @@ my $maybe = $open->{whatever};
     let diags = collect_diagnostics(
         &analysis,
         &idx,
-        DiagnosticOptions { unresolved_dispatch: false },
+        DiagnosticOptions::default(),
     );
     let keys: Vec<&str> = diags
         .iter()
@@ -4585,7 +4705,7 @@ my $silent = $taken{anything};
     let diags = collect_diagnostics(
         &analysis,
         &idx,
-        DiagnosticOptions { unresolved_dispatch: false },
+        DiagnosticOptions::default(),
     );
     let keys: Vec<&str> = diags
         .iter()
@@ -4614,7 +4734,7 @@ cfg()->{hsot2};
     let diags = collect_diagnostics(
         &analysis,
         &idx,
-        DiagnosticOptions { unresolved_dispatch: false },
+        DiagnosticOptions::default(),
     );
     let keys: Vec<&str> = diags
         .iter()
@@ -4666,7 +4786,7 @@ sub run {
     let diags = collect_diagnostics(
         &analysis,
         &idx,
-        DiagnosticOptions { unresolved_dispatch: false },
+        DiagnosticOptions::default(),
     );
     let unresolved: Vec<&str> = diags
         .iter()

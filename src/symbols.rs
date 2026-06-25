@@ -2470,6 +2470,15 @@ pub struct DiagnosticOptions {
     /// be typed (`GateResult::ReceiverUntyped`) — never on a settled
     /// `DoesNotApply`. Off by default.
     pub unresolved_dispatch: bool,
+    /// Extend `unresolved-method` past locally-defined classes to any
+    /// cross-file-resolvable class (D8). The local case is always-on; this
+    /// opt-in lifts the `is_local_class` gate so a narrowed or otherwise
+    /// cross-file-typed receiver (`$x->isa('Some::Dep'); $x->bogus`) is
+    /// checked too, gated by the same complete-ancestry honest-silent valve.
+    /// Off by default: cross-file classes carry more codegen/XS methods the
+    /// static walker can't see (the diag-09/10 Log4perl-accessor class), so
+    /// it earns trust before promotion. See docs/prompt-narrowing-diagnostics.md.
+    pub unresolved_method_cross_file: bool,
 }
 
 pub fn collect_diagnostics(
@@ -2706,19 +2715,31 @@ pub fn collect_diagnostics(
             None => continue,
         };
 
-        // Only fire for locally-defined classes
+        // Fire for classes we can fully see. Always-on: classes defined in
+        // THIS file (high precision — you wrote it, the walker sees its
+        // methods). Opt-in (D8): also cross-file-resolvable classes, so a
+        // narrowed or cross-file-typed receiver is checked. A class that is
+        // neither local nor cached is external/uninstalled — stay silent, we
+        // can't enumerate its methods. The complete-ancestry valve below is
+        // the shared honest-silent guard for both.
         let is_local_class = analysis.symbols.iter().any(|s| {
             matches!(s.kind, FaSymKind::Class | FaSymKind::Package) && s.name == class_name
         });
-        if !is_local_class {
+        let is_cached_class =
+            options.unresolved_method_cross_file && module_index.get_cached(&class_name).is_some();
+        if !is_local_class && !is_cached_class {
             continue;
         }
 
-        // Check the class has at least one method (otherwise likely external)
-        let has_methods = analysis.symbols.iter().any(|s| {
-            matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
-                && analysis.symbol_in_class(s.id, &class_name)
-        });
+        // A local class must define ≥1 method we can see (else it's likely a
+        // forward decl / external alias re-opened here). A cached cross-file
+        // class is already a real module — its methods live in its analysis,
+        // which `resolve_method_in_ancestors` consults below.
+        let has_methods = is_cached_class
+            || analysis.symbols.iter().any(|s| {
+                matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
+                    && analysis.symbol_in_class(s.id, &class_name)
+            });
         if !has_methods {
             continue;
         }
