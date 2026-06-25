@@ -846,6 +846,21 @@ fn cpp_obstacle_course_damage_report() {
 }
 
 #[test]
+fn dbg_cpp_attr_probe() {
+    let mut parser = cpp_parser();
+    let cases = [
+        ("expand-to-attr", "class __attribute__((visibility(\"default\"))) Widget {\npublic:\n  void draw();\n};\n"),
+        ("strip-empty",     "class  Widget {\npublic:\n  void draw();\n};\n"),
+        ("declspec-attr",   "class __declspec(dllexport) Widget {\npublic:\n  void draw();\n};\n"),
+    ];
+    for (name, src) in cases {
+        let tree = parser.parse(src, None).unwrap();
+        let (errors, missing, _) = count_damage(tree.root_node());
+        println!("\n--- {name}: errors={errors} missing={missing} ---\n{}", tree.root_node().to_sexp());
+    }
+}
+
+#[test]
 fn dbg_cpp_cst() {
     use cpp_obstacle::SAMPLES;
     let mut parser = cpp_parser();

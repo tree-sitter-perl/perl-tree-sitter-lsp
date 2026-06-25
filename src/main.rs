@@ -16,6 +16,7 @@ mod plugin;
 mod plugin_cli;
 mod pod;
 mod query_cache;
+mod cpp_reparse;
 mod query_extract;
 mod reparse;
 mod resolve;

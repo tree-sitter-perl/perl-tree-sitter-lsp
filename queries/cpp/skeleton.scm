@@ -63,6 +63,16 @@
 (field_declaration
   declarator: (function_declarator
     declarator: (field_identifier) @def.method.name)) @def.method
+; pointer- / reference-returning methods (`Foo* m()`, `Foo& m()`):
+; the function_declarator nests inside a pointer/reference wrapper.
+(field_declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (field_identifier) @def.method.name))) @def.method
+(field_declaration
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (field_identifier) @def.method.name))) @def.method
 (field_declaration
   declarator: (field_identifier) @def.var.name) @def.var
 

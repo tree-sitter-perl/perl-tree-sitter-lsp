@@ -40,6 +40,8 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("cpp_obstacle", Build),
         // stratified reparse seam (Perl prototype reparenthesizer spike)
         ("reparse", Build),
+        // C++ reparse seam (macro expansion before extraction spike)
+        ("cpp_reparse", Build),
         ("module_index", Index),
         ("module_resolver", Index),
         ("module_cache", Index),

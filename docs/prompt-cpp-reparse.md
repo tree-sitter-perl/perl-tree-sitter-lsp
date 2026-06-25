@@ -196,3 +196,54 @@ Start per-region.
 Step 1 is days and de-risks the soundness claim; everything after is
 additive against a fixed engine, same discipline the skeleton spike
 proved.
+
+## What landed (spike, measured)
+
+`src/reparse.rs` (Perl) and `src/cpp_reparse.rs` (C++) carry the seam
+end to end, each measured against its obstacle course, neither wired
+into the build pipeline.
+
+**Perl reparenthesizer** — learns prototype shapes by query,
+reparenthesizes call sites (`sner 1, 2` → `sner(1), 2` under `($)`;
+`sner + 1` → `sner() + 1` under `()`), re-parses to the corrected tree,
+and remaps spans through an `AnchorMap`.
+
+**C++ macro expansion** — `preprocess` expands object-like and
+function-like macros (single source-level pass, bodies pre-expanded);
+`preprocess_validated` keeps the transform only if it does not increase
+the parser's own ERROR+MISSING count. The before→after delta over the
+obstacle course:
+
+| sample | errors b→a | Tier-1 recall b→a | note |
+|---|---|---|---|
+| `api_export_attr` | 1 → 0 | 2/3 → **3/3** | class recovered (reparse-hook) |
+| `decl_macro` | 1 → 0 | 1/3 → **2/3** | `GetRuntimeClass` synthesized by expansion (emit via expand) |
+| `x_macro` | 2 → 2 | 2/5 | nested macro CALLS — gate discards, no-op |
+| `token_paste` | 2 → 2 | 0/3 | `##` paste — gate discards, no-op |
+| others | 0 → 0 | unchanged | no expandable macros |
+
+Two findings the spike pinned:
+
+1. **Expansion fixes the parse with no special-casing.** The probe
+   showed tree-sitter-cpp parses `__attribute__((...))` and
+   `__declspec(...)` in declarator position cleanly — the macro only
+   *hid* the attribute. So "expand to body, re-parse" is the whole rule;
+   no strip-vs-expand heuristic.
+2. **The parser is the validator.** The validate-by-reparse gate makes
+   expansion monotone (errors 9 → 7 over the course, never up): the
+   common, high-value idioms land; the nested/token-paste tail is
+   discarded rather than corrupting a file. That tail is the
+   "amortize full cpp to once" case — a learned plugin that captures the
+   real preprocessor's output, not a per-keystroke `cpp`.
+
+Surfaced en route: a genuine Tier-1 skeleton gap — pointer/reference
+returning methods (`Foo* m()`) nest the `function_declarator` inside a
+`pointer_declarator`; added to `queries/cpp/skeleton.scm`.
+
+Open for the next pass (the "layer the worklist" half): the validate
+gate is per-file, wants to be per-splice; the source pass is single,
+wants a fixpoint for nested calls; and none of this yet feeds the
+witness bag — extraction runs on the reparsed tree, but the C++ pack
+emits no type witnesses, so there is nothing for the worklist to fold
+yet. That seam — capture events → witnesses, on the reparsed tree — is
+where the bag re-enters.
