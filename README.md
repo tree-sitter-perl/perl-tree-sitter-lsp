@@ -187,6 +187,11 @@ perl-lsp doubles as a command-line analysis toolkit:
 ```bash
 # Batch diagnostics (CI-ready — resolves imports, uses SQLite cache)
 perl-lsp --check [<root>] [--severity error|warning] [--format json|human]
+#   Opt-in flow-narrowing lints (default off; LSP: initializationOptions.diagnostics):
+#     --optional-deref               unguarded Optional<T> dereference  (optionalDeref)
+#     --redundant-guard              always-true / always-false guard   (redundantGuard)
+#     --deref-shape                  hash deref on a guarded array/code ref (derefShape)
+#     --unresolved-method-cross-file extend unresolved-method cross-file (unresolvedMethodCrossFile)
 
 # Code exploration
 perl-lsp --outline <file>

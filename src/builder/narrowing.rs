@@ -364,6 +364,9 @@ impl<'a> Builder<'a> {
             // subject; a prior arm's negation must not override it.
             let mut covered: Vec<String> = Vec::new();
             if let Some(c) = own_cond {
+                // Record the arm's own guard once (not the priors re-walked
+                // for cumulative negation) — D3/D4 want each condition once.
+                self.record_guard_sites(c);
                 for fact in recognize_guards(self, c, self.source) {
                     if let Some(op) = fact.op_for_region(enter) {
                         covered.push(subject_key(&fact.subject));
@@ -386,6 +389,32 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Record each guard recognized in `condition` as a `GuardSite` for the
+    /// D3/D4 redundancy diagnostics — subject, predicate, polarity, and the
+    /// point at which to read the subject's prior (un-narrowed) type (the
+    /// condition's own location, before any narrowed region). Recognition is
+    /// shared with emission; this is the query-time projection of it.
+    fn record_guard_sites(&mut self, condition: Node<'a>) {
+        use crate::file_analysis::{GuardPredicate, GuardSite};
+        let scope = self.current_scope();
+        let before = condition.start_position();
+        let span = node_to_span(condition);
+        for fact in recognize_guards(self, condition, self.source) {
+            let predicate = match &fact.op {
+                NarrowOp::To(ty) => GuardPredicate::IsType(ty.clone()),
+                NarrowOp::StripOptional { .. } => GuardPredicate::Defined,
+            };
+            self.guard_sites.push(GuardSite {
+                subject: subject_key(&fact.subject),
+                scope,
+                predicate,
+                asserts_when_true: fact.asserts_when_true,
+                span,
+                before_point: before,
+            });
         }
     }
 
@@ -454,6 +483,7 @@ impl<'a> Builder<'a> {
             return;
         }
         let region = Span { start: stmt.end_position(), end: block.end_position() };
+        self.record_guard_sites(condition);
         for fact in recognize_guards(self, condition, self.source) {
             if let Some(op) = fact.op_for_region(holds_when_true) {
                 self.emit_narrowing_fact(&fact.subject, op, region, block);

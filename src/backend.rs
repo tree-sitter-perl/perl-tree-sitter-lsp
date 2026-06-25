@@ -14,20 +14,17 @@ pub struct Backend {
     client: Client,
     files: Arc<FileStore>,
     module_index: Arc<ModuleIndex>,
-    /// Opt-in `unresolved-dispatch` diagnostic toggle, set from
-    /// `initializationOptions.diagnostics.unresolvedDispatch`. Shared with the
-    /// resolver refresh callback (which also publishes diagnostics), hence the
-    /// atomic. Default off — QA/plugin-author channel.
-    unresolved_dispatch: Arc<std::sync::atomic::AtomicBool>,
+    /// Opt-in diagnostic toggles, set from `initializationOptions.diagnostics`.
+    /// Shared with the resolver refresh callback (which also publishes
+    /// diagnostics), hence the `Arc<Mutex<_>>`. `DiagnosticOptions` is `Copy`,
+    /// so readers lock only to copy it out — never across an await. All
+    /// default off; the always-on hints ignore these.
+    diag_options: Arc<std::sync::Mutex<symbols::DiagnosticOptions>>,
 }
 
 impl Backend {
     fn diagnostic_options(&self) -> symbols::DiagnosticOptions {
-        symbols::DiagnosticOptions {
-            unresolved_dispatch: self
-                .unresolved_dispatch
-                .load(std::sync::atomic::Ordering::Relaxed),
-        }
+        *self.diag_options.lock().unwrap()
     }
 }
 
@@ -38,11 +35,11 @@ impl Backend {
         // We need Arc<ModuleIndex> so the refresh callback can access it.
         // Two-phase init: create ModuleIndex whose refresh callback references
         // a later-set Arc<ModuleIndex>, then wire up the Arc.
-        let unresolved_dispatch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let diag_options = Arc::new(std::sync::Mutex::new(symbols::DiagnosticOptions::default()));
 
         let refresh_client = client.clone();
         let refresh_files = Arc::clone(&files);
-        let refresh_unresolved_dispatch = Arc::clone(&unresolved_dispatch);
+        let refresh_diag_options = Arc::clone(&diag_options);
 
         let module_index_holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>> =
             Arc::new(std::sync::OnceLock::new());
@@ -55,7 +52,7 @@ impl Backend {
             let client = refresh_client.clone();
             let files = Arc::clone(&refresh_files);
             let holder = Arc::clone(&holder_clone);
-            let unresolved_dispatch = Arc::clone(&refresh_unresolved_dispatch);
+            let diag_options = Arc::clone(&refresh_diag_options);
             tokio_handle.spawn(async move {
                 let module_index = match holder.get() {
                     Some(idx) => idx,
@@ -64,10 +61,7 @@ impl Backend {
                 // Collect (uri, diagnostics) first without holding the store lock
                 // across the await — publishing is async and could deadlock.
                 let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
-                let options = symbols::DiagnosticOptions {
-                    unresolved_dispatch: unresolved_dispatch
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                };
+                let options = *diag_options.lock().unwrap();
                 files.for_each_open_mut(|uri, doc| {
                     doc.analysis.enrich_imported_types_with_keys(Some(module_index.as_ref()));
                     let diagnostics = symbols::collect_diagnostics(&doc.analysis, module_index, options);
@@ -86,7 +80,7 @@ impl Backend {
             module_index,
             client,
             files,
-            unresolved_dispatch,
+            diag_options,
         }
     }
 
@@ -234,13 +228,19 @@ impl LanguageServer for Backend {
         // `{ "diagnostics": { "unresolvedDispatch": true } }` enables the
         // QA/plugin-author `unresolved-dispatch` channel; absent = off.
         if let Some(opts) = &params.initialization_options {
-            let on = opts
-                .get("diagnostics")
-                .and_then(|d| d.get("unresolvedDispatch"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            self.unresolved_dispatch
-                .store(on, std::sync::atomic::Ordering::Relaxed);
+            let diag = opts.get("diagnostics");
+            let flag = |key: &str| {
+                diag.and_then(|d| d.get(key))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            };
+            *self.diag_options.lock().unwrap() = symbols::DiagnosticOptions {
+                unresolved_dispatch: flag("unresolvedDispatch"),
+                unresolved_method_cross_file: flag("unresolvedMethodCrossFile"),
+                optional_deref: flag("optionalDeref"),
+                redundant_guard: flag("redundantGuard"),
+                deref_shape: flag("derefShape"),
+            };
         }
 
         Ok(InitializeResult {

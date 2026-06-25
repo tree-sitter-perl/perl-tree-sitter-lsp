@@ -1,11 +1,25 @@
 # Narrowing / Optional diagnostics — forward plan
 
-**Status: planned, not built.** The flow-narrowing + `Optional<T>` +
-`Undef` lattice (`adr/flow-narrowing.md`, `adr/optional-types.md`)
-was built for hover/goto precision, but its real payoff is **bug
-detection**: each new lattice element lets the analyzer *see* a class of
-defect it previously couldn't represent. This doc enumerates those
-diagnostics in confidence/value tiers.
+**Status: D1, D2, D3/D4, D6, D8 landed; D5 subsumed by D3; D7/D9 parked.**
+The flow-narrowing + `Optional<T>` + `Undef` lattice
+(`adr/flow-narrowing.md`, `adr/optional-types.md`) was built for hover/goto
+precision, but its real payoff is **bug detection**: each new lattice
+element lets the analyzer *see* a class of defect it previously couldn't
+represent. This doc enumerates those diagnostics in confidence/value tiers.
+
+**Landed shape.** All consumers read the lattice through two shared seams,
+never matching syntax (rule #10): `FileAnalysis::deref_receiver_sites`
+(each scalar-receiver deref + its narrowed receiver type — D1/D2/D6) and
+`FileAnalysis::guard_redundancies` over build-recorded `guard_sites`
+(D3/D4). D1 is always-on (`undef-deref`, WARNING); the rest are opt-in
+`DiagnosticOptions` flags (`optionalDeref`, `redundantGuard`,
+`derefShape`, `unresolvedMethodCrossFile`) mirrored as `--…` CLI flags,
+default-off until each earns trust. All four arrow-deref forms are
+covered: the method-call invocant and scalar hash deref come from refs;
+array (`$x->[i]`) and code (`$x->()`) derefs carry no typed ref, so the
+builder records them as `arrow_deref_sites` and `deref_receiver_sites`
+merges the two sources. D6 generalizes over them via `DerefForm::demands_rep`
+vs `RepKind::of(guard_rep)` — one axis, every direction.
 
 **The thesis.** A value's type at a point now answers questions it
 couldn't before — "are you `undef` here?", "might you be `undef`?", "are
@@ -86,10 +100,15 @@ dead.
   (MRO / cross-file) to avoid flagging legitimate downcasts — reuse
   `resolve_method_in_ancestors`/`parents_of`, don't hand-roll.
 
-### D5 — redundant re-narrowing
+### D5 — redundant re-narrowing — SUBSUMED BY D3
 Two guards narrowing the same subject to the same type with no
-intervening invalidation (the truncation scan already computes
-invalidation points — reuse it). Low value, cheap once D3/D4 exist.
+intervening invalidation. **No separate path:** the first guard's
+narrowing witness *is* the subject's prior type at the second guard (it
+survives precisely because no reassignment truncated it — the truncation
+scan the doc anticipated reusing is what keeps it alive), so D3's
+prior-vs-predicate check already flags the second guard as redundant.
+Pinned by `d5_sequential_renarrow_is_flagged_by_d3`. Building a parallel
+scan would duplicate D3 (rule #5).
 
 ---
 
@@ -106,12 +125,14 @@ so a mismatched deref is a representable type error.
   is often `HashRef` by default and would false-positive — fire only on
   guard-narrowed reps initially.
 
-### D7 — `Optional` into a non-optional sink
+### D7 — `Optional` into a non-optional sink — PARKED
 A `Maybe[T]` / `return undef` value assigned to a slot/attribute typed
 non-optional, or returned from a sub whose declared contract is
 non-optional. **Blocked on** declared sink types (the `param_types` /
 signature-return work) — without a non-optional *target* there's nothing
-to violate. Park until declared returns/params land.
+to violate. Unblock condition: a declared non-optional return/param/slot
+type lands; then this is a one-pass comparison of the source `Optional`
+against the sink's declared type. Park until then.
 
 ### D8 — method-doesn't-exist on a narrowed receiver
 Narrowing makes a previously-unknown receiver class known (`if
@@ -134,24 +155,45 @@ is the existing safety valve — without it, every external class with an
 out-of-workspace parent would false-positive). Same gate the whole
 `unresolved-method` diagnostic shares; not narrowing-specific.
 
-### D9 — dead code after exhaustive early-exit
+### D9 — dead code after exhaustive early-exit — PARKED
 `return unless defined $x; …; if (!defined $x) { DEAD }`. Needs a
-reachability notion on top of narrowing; furthest out.
+reachability notion on top of narrowing (the lattice proves the *type*,
+not the *unreachability*). Furthest out; unblock condition is a
+control-flow-reachability pass — none exists today. Note D4 already
+catches the *guard* here (`if (!defined $x)` is contradictory once `$x`
+is proven defined), so the marginal D9-only signal is the dead *block*,
+not the dead guard. Park until a reachability pass exists.
 
 ---
 
-## Sequencing
+## Sequencing — as landed
 
-1. **D1** (provably-`Undef` deref) — definite bug, cleanest, default-on.
-   The flagship: it's the reason `Undef` is in the lattice.
-2. **D8** (narrowed-receiver unresolved-method) — reuses the existing
-   diagnostic; narrowing just widens its reach. Cheap, high value.
-3. **D2** (unguarded `Optional` deref) — opt-in nullable-deref + the
-   interactive quick-fix. The headline IDE feature.
-4. **D3/D4** (always-true/false guards) — the redundancy family; gated
-   on confident prior types + MRO relatedness.
-5. **D6** (deref shape mismatch) — guard-narrowed reps only at first.
-6. **D5 / D7 / D9** — as the redundancy/infra/reachability pieces land.
+1. **D1** (provably-`Undef` deref) — LANDED, always-on `undef-deref`
+   WARNING. The flagship: it's the reason `Undef` is in the lattice.
+2. **D8** (narrowed-receiver unresolved-method) — LANDED behind
+   `unresolvedMethodCrossFile`. The always-on local case was already
+   there; this lifts the `is_local_class` gate to cross-file (kept opt-in
+   because cross-file classes carry codegen/XS methods the walker can't
+   see — the diag-09/10 class).
+3. **D2** (unguarded `Optional` deref) — LANDED behind `optionalDeref`,
+   INFORMATION + the `return unless defined` quick-fix.
+4. **D3/D4** (redundant / contradictory guards) — LANDED behind
+   `redundantGuard`, INFORMATION. Confident prior types + MRO relatedness
+   via `for_each_ancestor_class`; scoped to isa/DOES + defined/blessed
+   (rep `ref…eq` redundancy is the residual).
+5. **D6** (deref shape mismatch) — LANDED behind `derefShape`, WARNING,
+   guard-narrowed reps only (reads `guard_narrowed_rep`, not the merged
+   type, to dodge the deref's self-inferred rep). Covers every form ×
+   every guarded rep (`$x->{k}` on array/code, `$x->[i]` on hash/code,
+   `$x->()` on hash/array) via the `demands_rep`/`RepKind::of` axis;
+   objects (`RepKind::of` → `None`) are never a mismatch.
+6. **D5** — SUBSUMED by D3 (above). **D7 / D9** — PARKED with explicit
+   unblock conditions (declared sink types / a reachability pass).
+
+**Promotion path.** The opt-in flags graduate to default-on once the gold
+substrate + real projects show no false-positive flood. D1 already
+defaults on (maximal confidence). D8's cross-file extension is the most
+codegen-sensitive and should promote last.
 
 ## Discipline (read before building)
 
