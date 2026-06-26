@@ -112,6 +112,50 @@ The truly-interleaved case (an *inferred* type changing the parse) does
 not appear to exist for our purposes. If one ever does, isolate it; do
 not promote the whole pipeline to interleaved.
 
+### Overload does NOT threaten stratification — it's dispatch, not grouping
+
+A recurring worry (Perl `use overload`, C++ `operator+`): overload is
+type-sensitive, so does it break the "parse facts are type-independent"
+claim? No — because "type-sensitive" splits in two, and overload is the
+harmless half:
+
+- **type-sensitive PARSING** — does the parse-tree *shape* depend on a
+  type? This is what would break stratification. For our languages it
+  always reduces to a **declaration fact** (prototype-ness, type-vs-value,
+  template-ness), never an inferred type (previous subsection).
+- **type-sensitive DISPATCH** — given a *fixed* parse, which function
+  does a call/operator invoke? Inherently about inferred types, lives
+  **downstream in the worklist**, never touches the parse.
+
+**Overload is dispatch.** `$a + $b` / `a + b`, `$obj->[0]`, `*a`,
+`obj(x)` all parse identically whether or not the operator/deref is
+overloaded; the overload only changes which sub runs. So overload is
+*operator-spelled method dispatch* — the worklist already resolves
+type-dependent dispatch monotonically (`MethodOnClass`, invocant
+resolution), and overload rides the same path. It cannot interleave with
+the reparse because it produces types from a fixed parse; it never asks
+the parse to change.
+
+The disentanglement that makes the worry feel real: overload touches a
+*different* claim than stratification. **Stratification** (is reparse
+upstream of types?) — survives overload. The **no-Clang depth ceiling**
+(how deep can C++ go without a frontend?) — overload *resolution*
+(ranking + ADL + conversions) is genuinely hard and already sits on the
+Clang/EDG side (`research-static-analysis.md`), with templates and ODR.
+Conflating the two is what makes overload look like a reparse threat; it
+is a *depth* concern, already fenced.
+
+Real work overload does imply, both downstream:
+- **Perl**: a `use overload '+' => \&add` *emission* — emit an
+  operator→method edge so `$obj + $x` types through the bag. A reducer/
+  emission addition, not a reparse.
+- **C++**: overload resolution stays on the deep/Clang tier.
+
+The genuine type→parse breaker remains **dependent-context template
+instantiation** (`T::x < y`), which C++ forces back to a declaration fact
+via `template`/`typename` (stratifiable) or hands to a real frontend
+(already fenced). Overload is a red herring for stratification.
+
 ## The seam: one transform, two hook flavors
 
 ```
