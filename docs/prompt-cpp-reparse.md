@@ -156,6 +156,30 @@ instantiation** (`T::x < y`), which C++ forces back to a declaration fact
 via `template`/`typename` (stratifiable) or hands to a real frontend
 (already fenced). Overload is a red herring for stratification.
 
+### NEXT (when we pick up): multimethods / multiple dispatch
+
+Overload-on-one-operator (`overload_pi.rs`) is the unary/binary case of a
+bigger thing: **dispatch on the runtime types of MULTIPLE arguments.**
+
+- **C++** — this is *overload resolution itself*, the bread-and-butter:
+  select among `f(int,int)` / `f(int,double)` / `f(Foo,Bar)` by the
+  argument-type tuple. (Full ranking + ADL + conversions stay deep/Clang
+  tier; the *selection among declared signatures by arg types* is the
+  multimethod shape.)
+- **Perl** — no native multimethods, so it's a **plugin-emission seam**:
+  a plugin declares a multimethod and its arg-type→impl table, emitting
+  the dispatch (same shape as the existing dispatch plugins).
+
+**The engine seam is already half-there.** `ReturnExpr::UnionOnArgs {
+branches: Vec<(ArgGuard, ReturnExpr)> }` is a dispatch table keyed on
+`ArgGuard` — today arity-based. Multimethods = generalize `ArgGuard` to
+match argument **types** (a tuple pattern), so `UnionOnArgs` becomes the
+multimethod table; `Arg(n)` (the spike's new free variable) carries each
+argument's type into the guard. So the build is: extend `ArgGuard` with a
+type-tuple variant, teach the reducer to match `q.arg_types` against it,
+and give the Perl plugin a way to declare the table. Reuses `UnionOnArgs`
++ `Arg(n)`; no new dispatch machinery.
+
 ## The seam: one transform, two hook flavors
 
 ```
