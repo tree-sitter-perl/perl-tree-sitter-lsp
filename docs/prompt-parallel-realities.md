@@ -9,6 +9,84 @@ a2_parallel_realities_reduce_to_presence_conditions`); everything past it
 is open. This doc captures the idea, the open questions, and the
 tradeoffs so the decision can be made cold, not in the heat of a spike.
 
+**Read the reframe first.** As of 2026-06-26 the live thinking is that
+two distinct things were tangled here: **superposition** (cheap, reuses
+the arm-fold, the LSP path — likely buildable soon) and **config-lifted
+analysis** (2^N, presence conditions, the defect-finding tier — stays
+parked). The reframe section below is the load-bearing update; the
+original config-lifted writeup is retained beneath it as the defect-tier
+design.
+
+## Reframe (2026-06-26): superposition, not enumeration — the LSP path
+
+The framing below (presence conditions, config cross-product) is the
+**defect-finding** tier. For **LSP** purposes the goal is weaker and much
+cheaper: not "which config is this?" but a *hand-wave of useful info from
+both branches*. That collapses the 2^N problem for the common case.
+
+**The key fact (probed):** a **branch-complete** `#ifdef` — one whose
+arms are whole statements / returns / declarations — is kept by
+tree-sitter with **both arms in the tree, error-free**:
+
+```c
+int f(void) {
+#ifdef FAST
+    return 1;
+#else
+    return compute();
+#endif
+}
+```
+→ `(compound_statement (preproc_ifdef name:(identifier) (return_statement
+(number_literal)) alternative:(preproc_else (return_statement
+(call_expression …)))))`, `errors=0`. Both returns are siblings. No
+reparse, no config, no enumeration — the superposition is already in the
+parse.
+
+**Both halves of the idea are adapters onto existing reducers:**
+- *"each `#ifdef` is actual code → a function with multiple returns → the
+  real return type is a union that can monomorphize to concrete"* — that
+  is **exactly** `SymbolReturnArmFold` / `BranchArmFold`. The `#ifdef`
+  arms are another *arm source*, structurally identical to a ternary or
+  if/else: arms agree → one concrete type (monomorphize), diverge →
+  union. Zero new type machinery.
+- *"narrowing guards by creating a scope"* — the `preproc_ifdef` becomes
+  a **scope node**, which lands on the deferred Scope-node taxonomy
+  (`prompt-graph-walking.md`). A branch is a scope; its locals don't leak
+  to the sibling arm; the guard (`defined(X)`) is available for narrowing
+  later.
+
+**The three cases (this split IS the insight):**
+
+| case | tree-sitter | mechanism |
+|---|---|---|
+| **branch-complete** (the ~90%) | keeps **both** arms, error-free | **superposition** — walk both arms as live code, arm-fold unions returns, scope per branch. cheap, no config, no 2^N |
+| **construct-splitting** (A2) | ERROR nodes | reparse / `select_config` — cannot superpose two different function names |
+| **type/value collision** (`#ifdef X int t; #else typedef int t;`) | parses, but `t` is value-*or*-type by config | leaks into B1 (the lexer hack); needs config-lifting. rare |
+
+**Consequence for this doc:** the 2^N / presence-condition machinery
+below is a **defect-finding** concern ("under which config does this bug
+fire" — MISRA, taint). **LSP does not need it** — it needs the *union*,
+which superposition delivers at parse speed by reusing the arm-fold.
+Superposition is the cheap default that covers nav / hover / completion /
+types; config-lifting is the separate, heavier tier for the defect
+product. They are two products with two needs, not one feature at two
+fidelities.
+
+**What superposition still owes (its own open questions):**
+- The builder must *walk into* `preproc_ifdef`/`preproc_else` as live
+  code (today most tree consumers would treat directives as opaque). For
+  the query-pack world this is a `.scm` that captures both arms as
+  siblings + a scope on the `preproc_ifdef`.
+- Same-name-different-shape across arms (case 3) is the leak: a name that
+  is a type in one arm and a value in the other cannot be superposed
+  cleanly, because it changes how *other* code parses (B1). Detect and
+  fall back, don't silently union.
+- Whether an LSP union ever wants a presence tag (probably not — `int |
+  char*` is enough; "which arm" is rarely the LSP question).
+
+---
+
 ## The idea in one paragraph
 
 A `#ifdef` is a fork in the source's *reality*. The build-coupled tools

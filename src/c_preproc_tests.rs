@@ -175,3 +175,4 @@ int rel(void){return 0;}
     assert!(presence.contains(&("dbg".into(), Presence::When("defined(DEBUG)".into()))), "{presence:?}");
     assert!(presence.contains(&("rel".into(), Presence::When("!defined(DEBUG)".into()))), "{presence:?}");
 }
+
