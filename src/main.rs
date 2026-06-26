@@ -18,6 +18,7 @@ mod pod;
 mod query_cache;
 mod c_preproc;
 mod c_reparse;
+mod c_superpose;
 mod cpp_reparse;
 mod query_extract;
 mod reparse;

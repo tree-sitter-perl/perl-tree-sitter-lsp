@@ -119,3 +119,39 @@ fn lexer_hack_cross_file_typedef_stays_declaration() {
     assert_eq!(stmt_kind_at(&parse(&mut p, &rw), 0), "declaration");
 }
 
+
+
+#[test]
+fn b1_leak_collision_detected_and_monomorphized() {
+    // The B1 leak: an #ifdef makes `a` a TYPE in one arm, a VALUE in the
+    // other, so `a * b;` outside the #ifdef is config-dependent.
+    let mut p = c_parser();
+    let src = "#ifdef X\ntypedef int a;\n#else\nint a;\n#endif\na * b;\n";
+
+    // superposed (config-less): the table sees BOTH → Ambiguous, and
+    // disambiguate refuses to silently pick (identity, no false flip).
+    let tree = parse(&mut p, src);
+    let table = SymbolTable::from_tree(&tree, src.as_bytes());
+    assert_eq!(table.classify("a"), Category::Ambiguous, "type-and-value collision");
+    let (rw, _) = disambiguate(&tree, src, &table);
+    assert_eq!(rw, src, "ambiguous name → no rewrite, no silent flip");
+
+    // MONOMORPHIZE by config — the pieces compose: select_config blanks
+    // the dead arm, so the table is unambiguous again.
+    use crate::c_preproc::{select_config, Config};
+    // X defined → only `typedef int a` survives → a is a Type → decl.
+    let sel_x = select_config(src, &Config::new().with("X", "1"));
+    let tx = parse(&mut p, &sel_x.source);
+    let tab_x = SymbolTable::from_tree(&tx, sel_x.source.as_bytes());
+    assert_eq!(tab_x.classify("a"), Category::Type, "X → a is a type");
+    let (rw_x, _) = disambiguate(&tx, &sel_x.source, &tab_x);
+    assert!(!rw_x.contains("(a * b)"), "X → declaration, no wrap: {rw_x:?}");
+
+    // !X → only `int a` survives → a is a Value → multiply (wrapped).
+    let sel_nx = select_config(src, &Config::new());
+    let tnx = parse(&mut p, &sel_nx.source);
+    let tab_nx = SymbolTable::from_tree(&tnx, sel_nx.source.as_bytes());
+    assert_eq!(tab_nx.classify("a"), Category::Value, "!X → a is a value");
+    let (rw_nx, _) = disambiguate(&tnx, &sel_nx.source, &tab_nx);
+    assert!(rw_nx.contains("(a * b)"), "!X → multiply, wrapped: {rw_nx:?}");
+}

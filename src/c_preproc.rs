@@ -41,7 +41,7 @@ impl Config {
     pub fn define(&mut self, name: &str, value: &str) {
         self.defined.insert(name.to_string(), value.to_string());
     }
-    fn is_defined(&self, name: &str) -> bool {
+    pub fn is_defined(&self, name: &str) -> bool {
         self.defined.contains_key(name)
     }
 }

@@ -36,6 +36,17 @@ use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 /// The one fact the lexer hack turns on, per name: type or value?
 /// Collected per file; `merge`d across files for the cross-file
 /// resolution tree-sitter structurally cannot do.
+/// A name's lexer-hack-relevant category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    Type,
+    Value,
+    /// Both a type and a value across the file — config-dependent (B1
+    /// leak). Never disambiguate these by superposition.
+    Ambiguous,
+    Unknown,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SymbolTable {
     pub types: HashSet<String>,
@@ -54,14 +65,18 @@ impl SymbolTable {
         self.values.extend(other.values.iter().cloned());
     }
 
-    /// `Some(true)` = type, `Some(false)` = value, `None` = unknown.
-    pub fn classify(&self, name: &str) -> Option<bool> {
-        if self.types.contains(name) {
-            Some(true)
-        } else if self.values.contains(name) {
-            Some(false)
-        } else {
-            None
+    /// A name's category. `Ambiguous` = collected as BOTH a type and a
+    /// value across the file (the B1 leak: an `#ifdef` made it a type in
+    /// one arm and a value in another, so code outside the `#ifdef`
+    /// parses differently per config). Disambiguation must NOT silently
+    /// pick for an ambiguous name — it's config-dependent; monomorphize
+    /// by running `select_config` first, then collecting the table.
+    pub fn classify(&self, name: &str) -> Category {
+        match (self.types.contains(name), self.values.contains(name)) {
+            (true, true) => Category::Ambiguous,
+            (true, false) => Category::Type,
+            (false, true) => Category::Value,
+            (false, false) => Category::Unknown,
         }
     }
 
@@ -163,7 +178,10 @@ pub fn disambiguate(tree: &Tree, src: &str, table: &SymbolTable) -> (String, Anc
         }
         let (Some(lhs), Some(rhs)) = (lhs, rhs) else { continue };
         let name = lhs.utf8_text(src.as_bytes()).unwrap_or("");
-        if table.classify(name) == Some(false) {
+        // rewrite ONLY on unambiguous value evidence. Type / Unknown keep
+        // tree-sitter's declaration default; Ambiguous is config-
+        // dependent and must not be silently flipped.
+        if table.classify(name) == Category::Value {
             inserts.push((lhs.start_byte(), true)); // `(` before the lhs
             inserts.push((rhs.end_byte(), false)); // `)` after the rhs
         }

@@ -46,6 +46,8 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("c_reparse", Build),
         // C preprocessor #ifdef config selection (A2 spike)
         ("c_preproc", Build),
+        // C #ifdef superposition → presence-tagged return union (spike)
+        ("c_superpose", Build),
         ("module_index", Index),
         ("module_resolver", Index),
         ("module_cache", Index),
