@@ -16,10 +16,11 @@
 (preproc_include path: (string_literal (string_content) @import.name))
 (preproc_include path: (system_lib_string) @import.name)
 
-; ---- namespaces: sticky context + a real scope for its body ----
+; ---- namespaces: a Package SYMBOL (so its members nest under it in the
+; outline) + a sticky context + a real scope for its body ----
 (namespace_definition
-  name: (namespace_identifier) @context.namespace
-  body: (declaration_list) @scope)
+  name: (namespace_identifier) @def.package.name @context.namespace
+  body: (declaration_list) @scope) @def.package
 
 ; ---- type defs: class / struct / union / enum ----
 (class_specifier

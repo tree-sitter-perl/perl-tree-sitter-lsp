@@ -7470,7 +7470,14 @@ impl FileAnalysis {
                     (sym.name.clone(), Some("class".to_string()), children)
                 }
                 SymKind::Package => {
-                    (sym.name.clone(), Some("package".to_string()), Vec::new())
+                    // Statement-form Perl `package Foo;` has no body scope
+                    // (folded via nest_under_packages); a pack-language
+                    // namespace has a Block body whose members nest here.
+                    let children = self
+                        .find_body_scope(sym)
+                        .map(|s| self.outline_children_of(s))
+                        .unwrap_or_default();
+                    (sym.name.clone(), Some("package".to_string()), children)
                 }
                 // `use` statements are not structure — mainstream language
                 // servers (rust-analyzer, pyright, tsserver, gopls, clangd)
@@ -7558,7 +7565,7 @@ impl FileAnalysis {
 
     /// Find the body scope for a sub/method/class symbol.
     fn find_body_scope(&self, sym: &Symbol) -> Option<ScopeId> {
-        self.scopes.iter().find(|s| {
+        if let Some(id) = self.scopes.iter().find(|s| {
             let kind_matches = match (&s.kind, &sym.kind) {
                 (ScopeKind::Sub { name: sn }, SymKind::Sub) => sn == &sym.name,
                 (ScopeKind::Method { name: mn }, SymKind::Method) => mn == &sym.name,
@@ -7566,7 +7573,27 @@ impl FileAnalysis {
                 _ => false,
             };
             kind_matches && s.span == sym.span
-        }).map(|s| s.id)
+        }).map(|s| s.id) {
+            return Some(id);
+        }
+        // Pack-language outline: the query driver mints UNNAMED `Block`
+        // scopes for class/namespace bodies, so the Perl name-keyed match
+        // above can't find them. A container's body is the Block scope
+        // directly inside its span whose parent is the container's own
+        // scope. Gated on `Block` so Perl's named containers (which take
+        // the exact arm) are untouched.
+        if matches!(sym.kind, SymKind::Package | SymKind::Class) {
+            let start = (sym.span.start.row, sym.span.start.column);
+            let end = (sym.span.end.row, sym.span.end.column);
+            return self.scopes.iter().find(|s| {
+                matches!(s.kind, ScopeKind::Block)
+                    && s.parent == Some(sym.scope)
+                    && s.span != sym.span
+                    && (s.span.start.row, s.span.start.column) >= start
+                    && (s.span.end.row, s.span.end.column) <= end
+            }).map(|s| s.id);
+        }
+        None
     }
 
     // ---- Semantic tokens ----
