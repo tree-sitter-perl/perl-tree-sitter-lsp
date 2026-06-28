@@ -225,7 +225,7 @@ fn undef_deref_diags(source: &str) -> Vec<Diagnostic> {
 }
 
 // D1 — method/deref on a provably-`Undef` receiver. The three guard forms
-// that drive a subject to the `Undef` bottom (docs/prompt-narrowing-diagnostics.md).
+// that drive a subject to the `Undef` bottom (docs/adr/narrowing-diagnostics.md).
 
 #[test]
 fn d1_undef_deref_else_of_if_defined() {

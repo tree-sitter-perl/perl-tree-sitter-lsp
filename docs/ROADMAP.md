@@ -5,19 +5,17 @@ This file is only what's NEXT, in order.
 
 ## Now (in order)
 
-1. **Narrowing / Optional — diagnostics + completeness.** The
-   flow-narrowing + `Optional<T>` + `Undef` lattice has landed (decision
-   records: `adr/flow-narrowing.md`, `adr/optional-types.md`), so a
-   value's type now answers "are you `undef` here?", "might you be?", "are
-   you the class this guard tested?". Two threads build on it:
-   - **Diagnostics** — turn those answers into bug detection (undef/Optional
-     derefs, redundant or contradictory guards). A diagnostic is just a
-     consumer that asks the type at the use point, never matching syntax
-     (rule #10). Plan, tiers, and build order: `prompt-narrowing-diagnostics.md`.
-   - **Completeness** — widen what the narrower recognizes: direct-element
-     places (`$hash{key}`, `$arr[0]`), and dynamic-key places
-     (`$self->{$k}`) where the key scalar is stable enough to stay sound.
-     `prompt-flow-narrowing.md` / `prompt-optional-types.md`.
+1. **Narrowing / Optional — completeness.** The flow-narrowing +
+   `Optional<T>` + `Undef` lattice and the bug-detection diagnostics it
+   feeds have both landed (decision records: `adr/flow-narrowing.md`,
+   `adr/optional-types.md`, `adr/narrowing-diagnostics.md`). What remains
+   is **completeness** — widen what the narrower recognizes: direct-element
+   places (`$hash{key}`, `$arr[0]`), and dynamic-key places (`$self->{$k}`)
+   where the key scalar is stable enough to stay sound
+   (`prompt-flow-narrowing.md` / `prompt-optional-types.md`) — and graduate
+   the opt-in diagnostic flags to default-on per code as the gold substrate
+   and real projects show no false-positive flood (the promotion path in
+   `adr/narrowing-diagnostics.md`).
 2. **DBIC out of core — phases 2–3.** Phase 1 landed (`visit_dbic_*`
    gone; `frameworks/dbic.rhai`, trigger `ClassIsa("DBIx::Class")`).
    Remaining: meta-method suppression → manifest (the `universal_methods`

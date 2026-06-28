@@ -32,5 +32,5 @@
 
 ### Consumption
 
-Diagnostics on unguarded `Optional` / known-`Undef` derefs:
-`docs/prompt-narrowing-diagnostics.md`.
+Diagnostics on unguarded `Optional` / known-`Undef` derefs (landed):
+`docs/adr/narrowing-diagnostics.md`.

@@ -2477,7 +2477,7 @@ pub struct DiagnosticOptions {
     /// checked too, gated by the same complete-ancestry honest-silent valve.
     /// Off by default: cross-file classes carry more codegen/XS methods the
     /// static walker can't see (the diag-09/10 Log4perl-accessor class), so
-    /// it earns trust before promotion. See docs/prompt-narrowing-diagnostics.md.
+    /// it earns trust before promotion. See docs/adr/narrowing-diagnostics.md.
     pub unresolved_method_cross_file: bool,
     /// Fire `optional-deref` (D2) when a receiver is `Optional<T>` at an
     /// unguarded use point (a possible undef deref — the strictNullChecks
@@ -2797,7 +2797,7 @@ pub fn collect_diagnostics(
     // Runtime is a hard die. Maximal confidence — the type *is* undef, not
     // *may be* — so this is always-on `WARNING`, the one narrowing diagnostic
     // that doesn't wait behind an opt-in flag (rule #10: it reads the type
-    // at the use point, never the syntax). See docs/prompt-narrowing-diagnostics.md.
+    // at the use point, never the syntax). See docs/adr/narrowing-diagnostics.md.
     // D2 (`optional-deref`) shares this same lattice read: a receiver typed
     // `Optional<T>` at an UNGUARDED use point — narrowing already strips the
     // `Optional` wherever a `defined`/`blessed` guard dominates, so a

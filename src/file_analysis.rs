@@ -4189,7 +4189,7 @@ impl FileAnalysis {
     /// Every scalar-receiver dereference in this file, paired with the
     /// receiver's **narrowed** type at the use point. The one lattice read
     /// the undef/Optional/shape diagnostics (D1/D2/D6,
-    /// `docs/prompt-narrowing-diagnostics.md`) consume — each is a filter
+    /// `docs/adr/narrowing-diagnostics.md`) consume — each is a filter
     /// over this stream that asks the type, never the syntax (rule #10).
     ///
     /// A site is included only when the receiver's type resolves; an
