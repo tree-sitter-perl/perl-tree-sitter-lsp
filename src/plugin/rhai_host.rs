@@ -890,6 +890,43 @@ mod tests {
     }
 
     #[test]
+    fn generators_manifest_parses_from_rhai() {
+        // The symbol-generator manifest round-trips through Rhai maps:
+        // flat `#{ emit, kind }` / `#{ generate, args }` actions.
+        let src = r#"
+            fn id() { "gen-demo" }
+            fn triggers() { [ #{ Always: () } ] }
+            fn generators() {
+                [
+                    #{ name: "make_crud_helpers", params: ["thing"], actions: [
+                        #{ emit: "${thing}_id", kind: "accessor" },
+                        #{ emit: "get_${thing}", kind: "method" },
+                    ] },
+                    #{ name: "make_resource", params: ["res"], actions: [
+                        #{ emit: "${res}_table", kind: "accessor" },
+                        #{ generate: "make_crud_helpers", args: ["${res}"] },
+                    ] },
+                ]
+            }
+        "#;
+        let engine = Arc::new(make_engine());
+        let plugin = RhaiPlugin::from_source(src, engine).expect("compiles");
+        let gens = plugin.generators();
+        assert_eq!(gens.len(), 2);
+
+        let crud = gens.iter().find(|g| g.name == "make_crud_helpers").unwrap();
+        assert_eq!(crud.params, vec!["thing".to_string()]);
+        assert_eq!(crud.actions.len(), 2);
+        assert_eq!(crud.actions[0].emit.as_deref(), Some("${thing}_id"));
+        assert_eq!(crud.actions[0].kind.as_deref(), Some("accessor"));
+
+        let res = gens.iter().find(|g| g.name == "make_resource").unwrap();
+        let nested = res.actions.iter().find(|a| a.generate.is_some()).unwrap();
+        assert_eq!(nested.generate.as_deref(), Some("make_crud_helpers"));
+        assert_eq!(nested.args, vec!["${res}".to_string()]);
+    }
+
+    #[test]
     fn plugin_fingerprint_invariants() {
         // Two contracts in one test (env var is process-global, so
         // splitting these into parallel-safe tests would race):
