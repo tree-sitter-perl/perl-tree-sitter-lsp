@@ -270,6 +270,21 @@ fn parse_file(path: &str) -> (String, tree_sitter::Tree, file_analysis::FileAnal
         eprintln!("Cannot read {}: {}", path, e);
         std::process::exit(1);
     });
+    // Route a pack language (cpp, ...) through its driver so the CLI
+    // capabilities (--outline, --hover, --batch/gold) match the LSP
+    // server. Perl + unknown extensions keep the existing path.
+    let reg = language_driver::LanguageRegistry::with_enabled();
+    if let Some(driver) =
+        reg.for_path(std::path::Path::new(path)).filter(|d| d.id() != "perl")
+    {
+        let mut parser = driver.make_parser();
+        let tree = parser.parse(&source, None).unwrap_or_else(|| {
+            eprintln!("Parse failed: {}", path);
+            std::process::exit(1);
+        });
+        let analysis = driver.analyze(&source);
+        return (source, tree, analysis);
+    }
     let mut parser = module_resolver::create_parser();
     let tree = parser.parse(&source, None).unwrap_or_else(|| {
         eprintln!("Parse failed: {}", path);
