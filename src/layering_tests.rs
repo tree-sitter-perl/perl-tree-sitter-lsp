@@ -42,6 +42,8 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("reparse", Build),
         // C++ reparse seam (macro expansion before extraction spike)
         ("cpp_reparse", Build),
+        // C++ multiple-dispatch / overload-resolution PoC (spike)
+        ("cpp_multidispatch", Build),
         // C lexer-hack resolution via the symbol table (B1 spike)
         ("c_reparse", Build),
         // C preprocessor #ifdef config selection (A2 spike)
