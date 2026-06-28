@@ -28,4 +28,28 @@ t.test("goto-def: compute(21) jumps to int compute", function()
   if t.eq(N, expected, def, "definition line") then t.pass(N) end
 end)
 
+
+t.test("references: compute is referenced at its call site", function()
+  local N = "references compute"
+  local dl, dc = b.find_pos(buf, "int compute(int x)")
+  if not t.ok(N, dl, "no compute def") then return end
+  local lines = lsp.reference_lines(buf, dl, dc + 4)
+  if not t.ok(N, lines and #lines >= 2, "expected def+call refs, got " .. #lines) then return end
+  local call_line = select(1, b.find_pos(buf, "compute(21)"))
+  local found = false
+  for _, l in ipairs(lines) do if l == call_line then found = true end end
+  if t.ok(N, found, "call site not in refs: [" .. table.concat(lines, ",") .. "]") then t.pass(N) end
+end)
+
+t.test("rename: compute touches def and call", function()
+  local N = "rename compute"
+  local dl, dc = b.find_pos(buf, "int compute(int x)")
+  if not t.ok(N, dl, "no compute def") then return end
+  local edit = lsp.rename(buf, dl, dc + 4, "calc")
+  if not t.ok(N, edit and edit.changes, "no rename edit") then return end
+  local n = 0
+  for _, edits in pairs(edit.changes) do n = n + #edits end
+  if t.ok(N, n >= 2, "rename should touch def + call, got " .. n) then t.pass(N) end
+end)
+
 t.finish()
