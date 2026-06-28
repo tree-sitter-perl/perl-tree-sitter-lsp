@@ -1178,3 +1178,14 @@ void f(Base* b) {
         "dynamic_cast'd d typed to Derived",
     );
 }
+
+#[test]
+fn cpp_reference_declared_var_types_to_referent() {
+    let src = "void f(Widget& src) {\n    Widget& r = src;\n    r.run();\n}\n";
+    let fa = cpp_skel(src).into_file_analysis();
+    use crate::file_analysis::InferredType;
+    assert_eq!(
+        fa.inferred_type_via_bag("r", tree_sitter::Point { row: 2, column: 4 }),
+        Some(InferredType::ClassName("Widget".into())),
+    );
+}

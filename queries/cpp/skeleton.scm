@@ -109,6 +109,15 @@
   declarator: (init_declarator
     declarator: (pointer_declarator declarator: (identifier) @flow.target)
     value: (_) @flow.source))
+; reference-declared locals: `T& r = x;` (the referent names the class).
+(declaration
+  type: (_) @type.annot
+  declarator: (reference_declarator (identifier) @flow.target))
+(declaration
+  type: (_) @type.annot
+  declarator: (init_declarator
+    declarator: (reference_declarator (identifier) @flow.target)
+    value: (_) @flow.source))
 
 ; ---- literals + variable reads (the edge-chase substrate) ----
 (number_literal) @expr.lit.number
