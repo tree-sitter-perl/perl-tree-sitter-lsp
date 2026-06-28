@@ -19,14 +19,21 @@
 //!      `Widget::value_type` once `T=Widget`; the `typename` problem
 //!      evaporates.
 //!
-//! Cross-language note (why we care for Perl): a Perl generator — "a
-//! helper that creates a group of helpers/tasks" — is the SAME
-//! witness-collection. The difference is the projection mechanism: C++
-//! template bodies are STRUCTURAL (substitute + re-resolve, here); Perl
-//! codegen is arbitrary CODE, so it's EXECUTE-against-a-probe
-//! (`docs/adr/importbase-plugin-gen.md`). Both collect the concrete
-//! invocations as witnesses and produce per-witness content. Not wired
-//! into the pipeline; measured by `cpp_templates_tests.rs`.
+//! Cross-language note (why we care for Perl): a Perl plugin symbol
+//! generator — "a helper that creates a group of helpers/tasks" — is the
+//! SAME lane: STRUCTURAL PROJECTION over witnesses, NOT execution. The
+//! generator's definition is abstract; at each call site (the witness)
+//! you substitute the literal args as if written there, then run the
+//! projected form through plugin-based symbol SYNTHESIS — symbolic, not
+//! run. The only language-specific piece is the projection function: C++
+//! substitutes type-params and re-runs name/overload resolution; Perl
+//! substitutes literal args and runs the plugin's declarative synthesis.
+//! Witness-collection, substitution, the worklist, and the seen-set spine
+//! are shared. (Execute-against-a-probe —
+//! `docs/adr/importbase-plugin-gen.md` — is the FALLBACK for opaque
+//! generators that can't be projected, e.g. Import::Base coderefs; not the
+//! primary design.) Not wired into the pipeline; measured by
+//! `cpp_templates_tests.rs`.
 
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Tree};
