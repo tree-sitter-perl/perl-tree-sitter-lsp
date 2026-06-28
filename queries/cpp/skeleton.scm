@@ -95,6 +95,21 @@
   type: (_) @type.annot
   declarator: (identifier) @flow.target)
 
+; pointer-declared locals: `T* p;`, `T* p = init;`, and the
+; condition-form `if (Derived* d = dynamic_cast<Derived*>(b))` — the
+; pointee names the variable's class (pointer-ness dropped for nav). The
+; cast-in-condition is captured by the bare form (its `value` field is
+; on the declaration, simply ignored here).
+(declaration
+  type: (_) @type.annot
+  declarator: (pointer_declarator
+    declarator: (identifier) @flow.target))
+(declaration
+  type: (_) @type.annot
+  declarator: (init_declarator
+    declarator: (pointer_declarator declarator: (identifier) @flow.target)
+    value: (_) @flow.source))
+
 ; ---- literals + variable reads (the edge-chase substrate) ----
 (number_literal) @expr.lit.number
 (string_literal) @expr.lit.string

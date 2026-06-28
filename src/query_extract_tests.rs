@@ -1149,3 +1149,32 @@ y = 1
         "narrowing scoped to the block — gone after",
     );
 }
+
+#[test]
+fn cpp_pointer_declared_vars_get_their_pointee_type() {
+    // `T* p;` and the dynamic_cast condition-form both type the var to
+    // the pointee class (pointer-ness dropped for navigation).
+    let src = "\
+void f(Base* b) {
+    Widget* w;
+    if (Derived* d = dynamic_cast<Derived*>(b)) {
+        d->go();
+    }
+    w->run();
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    use crate::file_analysis::InferredType;
+    // w at its use (row 5)
+    assert_eq!(
+        fa.inferred_type_via_bag("w", tree_sitter::Point { row: 5, column: 4 }),
+        Some(InferredType::ClassName("Widget".into())),
+        "T* w typed to Widget",
+    );
+    // d declared in the if-condition, used in the block (row 3)
+    assert_eq!(
+        fa.inferred_type_via_bag("d", tree_sitter::Point { row: 3, column: 8 }),
+        Some(InferredType::ClassName("Derived".into())),
+        "dynamic_cast'd d typed to Derived",
+    );
+}
