@@ -1,11 +1,11 @@
 {
   "capability": "outline",
-  "note": "STAGED C++ gold fixture. Self-contained (own root) so it does NOT load via the Perl run.pl. Running it needs: (1) a --features cpp binary (run.pl uses the default perl-only release), and (2) it bypasses the CPAN substrate check (self-contained root, no Perl deps). The fixture FORMAT + expect-substring assertions are reused verbatim; a small cpp-gold runner (or a run.pl extension that picks the cpp binary + skips the substrate gate for rows with their own root) is the integration step. Authored from `perl-lsp --outline gold-corpus/cpp-fixture/sample.cpp`.",
   "rows": [
     {
       "id": "cpp-outline-namespace-classes-and-functions",
       "difficulty": "simple",
       "semantic_area": "cpp-multilang",
+      "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
       "file": "sample.cpp",
       "line": 0,
@@ -21,10 +21,10 @@
           "\"kind\":\"Sub\",\"line\":\"15\",\"name\":\"main\""
         ],
         "none": [
-          "\"name\":\"main\",\"package\":\"main\""
+          "\"package\":\"main\""
         ]
       },
-      "status": "provisional"
+      "status": "gold"
     }
   ]
 }

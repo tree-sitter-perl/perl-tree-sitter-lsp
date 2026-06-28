@@ -50,6 +50,18 @@ my $corpus = $ENV{CORPUS} || "$RealBin/local/lib/perl5";
 my $fxdir  = "$RealBin/fixtures";
 
 die "binary not found: $bin (cargo build --release)\n" unless -x $bin;
+
+# Languages this binary serves — `perl-lsp --languages` prints e.g.
+# "perl-lsp 0.5.3 — languages: perl, cpp". A fixture row tagged with a
+# `lang` the binary does NOT serve is SKIPPED, so a default perl-only
+# build's gold run stays clean while a `--features cpp` build exercises
+# the C++ fixtures from the SAME harness. (Untagged rows are Perl —
+# always run.) This is the multi-language seam for the gold corpus.
+my %served = do {
+    my $out = qx{$bin --languages 2>/dev/null};
+    my @langs = $out =~ /languages:\s*(.+?)\s*$/m ? split /\s*,\s*/, $1 : ('perl');
+    map { $_ => 1 } @langs;
+};
 unless (-d $corpus) {
     die "substrate not found at $corpus.\n"
       . "Build it: cd gold-corpus && carton install   (or cpm install -L local --resolver snapshot)\n";
@@ -239,6 +251,17 @@ for my $jf (sort glob("$fxdir/*.json")) {
     next if @want && !grep { $_ eq $j->{capability} } @want;
     push @rows, map { { %$_, capability => $j->{capability} } } @{ $j->{rows} || [] };
 }
+# Drop rows the binary's languages can't serve (e.g. C++ fixtures on a
+# perl-only build) — reported as `lang-skip`, never a failure.
+my @lang_skip;
+@rows = grep {
+    !$_->{lang} || $served{$_->{lang}} || do {
+        push @lang_skip, "$_->{capability}/$_->{id} (lang=$_->{lang}; binary serves: "
+            . join(', ', sort keys %served) . ")";
+        0;
+    }
+} @rows;
+
 if ($list_only) {
     my %c; $c{$_->{capability}}{$_->{status} // 'gold'}++ for @rows;
     printf "%-20s %5s %6s %5s\n", 'capability', 'gold', 'xfail', 'prov';
@@ -292,11 +315,13 @@ printf "  %-9s %d\n", 'XPASS', scalar @xpass;
 printf "  %-9s %d\n", 'CRASH', scalar @crash;
 printf "  %-9s %d\n", 'prov?', scalar @prov if @prov;
 printf "  %-9s %d\n", 'skip',  scalar @skip if @skip;
+printf "  %-9s %d\n", 'lang-skip', scalar @lang_skip if @lang_skip;
 print "\n!! CRASH (process aborted):\n",                 map { "  - $_\n" } @crash if @crash;
 print "\n!! FAIL (gold assertion no longer holds):\n",   map { "  - $_\n" } @fail  if @fail;
 print "\n** XPASS (known gap fixed — update fixture):\n", map { "  - $_\n" } @xpass if @xpass;
 print "\nprovisional misses:\n",                         map { "  - $_\n" } @prov  if @prov;
 print "\nskipped:\n",                                    map { "  - $_\n" } @skip  if @skip;
+print "\nlang-skipped (binary doesn't serve that language):\n", map { "  - $_\n" } @lang_skip if @lang_skip;
 print "\n";
 
 # ---- cost report: what do features cost? ----
