@@ -80,11 +80,23 @@ impl FileStore {
     /// Open a file from text. Parses and builds analysis. If a workspace entry
     /// exists for the same path, it's replaced by the Open entry.
     pub fn open(&self, url: Url, text: String) -> bool {
-        let doc = match Document::new(text) {
-            Some(d) => d,
-            None => return false,
+        // Route by extension: a PACK language (cpp, ...) goes through its
+        // driver; Perl and unknown extensions keep the exact existing path
+        // (Document::new) so the reference behaviour is byte-for-byte.
+        let reg = crate::language_driver::LanguageRegistry::with_enabled();
+        let path = url.to_file_path().ok();
+        let pack = path.as_ref().and_then(|p| reg.for_path(p)).filter(|d| d.id() != "perl");
+        let doc = match pack {
+            Some(driver) => match Document::new_routed(text, driver) {
+                Some(d) => d,
+                None => return false,
+            },
+            None => match Document::new(text) {
+                Some(d) => d,
+                None => return false,
+            },
         };
-        if let Ok(path) = url.to_file_path() {
+        if let Some(path) = path {
             self.workspace.remove(&path);
             self.url_to_path.insert(url.clone(), path);
         }
@@ -200,6 +212,28 @@ impl FileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cpp")]
+    #[test]
+    fn open_routes_cpp_file_to_the_cpp_driver() {
+        // The backend seam: opening a .cpp routes through the C++ driver,
+        // so the document is language-tagged "cpp" and its analysis is the
+        // C++ outline (here, a macro-recovered class). A .pm stays Perl.
+        let store = FileStore::new();
+        let cpp = Url::parse("file:///tmp/route_test.cpp").unwrap();
+        assert!(store.open(
+            cpp.clone(),
+            "#define API __attribute__((visibility(\"default\")))\nclass API Box { public: int width; };\n"
+                .to_string()
+        ));
+        let doc = store.get_open(&cpp).unwrap();
+        assert_eq!(doc.language, "cpp");
+        assert!(doc.analysis.symbols.iter().any(|s| s.name == "Box"), "cpp class via the driver");
+
+        let perl = Url::parse("file:///tmp/route_test.pm").unwrap();
+        assert!(store.open(perl.clone(), "package Foo; sub bar { 1 }\n".to_string()));
+        assert_eq!(store.get_open(&perl).unwrap().language, "perl");
+    }
 
     #[test]
     fn test_open_then_close_demotes_to_workspace() {

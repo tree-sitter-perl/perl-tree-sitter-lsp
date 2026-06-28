@@ -18,8 +18,13 @@ use std::path::Path;
 pub trait LanguageDriver: Send + Sync {
     fn id(&self) -> &'static str;
     fn extensions(&self) -> &[&'static str];
-    /// Source → `FileAnalysis`. The driver owns its parser (and any
-    /// pre-parse transform, e.g. C++ macro expansion).
+    /// A fresh parser for this language — for the open `Document` to hold
+    /// a tree (incremental edits, position handlers). NOTE: this parses
+    /// the ORIGINAL source; `analyze` may run a pre-parse transform (C++
+    /// macro expansion) internally, so the two trees can differ on
+    /// macro-heavy files (the span-remap follow-up reconciles them).
+    fn make_parser(&self) -> tree_sitter::Parser;
+    /// Source → `FileAnalysis`.
     fn analyze(&self, source: &str) -> FileAnalysis;
     /// Module name → workspace-relative candidate paths.
     fn module_paths(&self, module: &str) -> Vec<String>;
@@ -35,6 +40,9 @@ impl LanguageDriver for PerlDriver {
     }
     fn extensions(&self) -> &[&'static str] {
         &["pm", "pl", "t"]
+    }
+    fn make_parser(&self) -> tree_sitter::Parser {
+        crate::builder::create_parser()
     }
     fn analyze(&self, source: &str) -> FileAnalysis {
         let mut parser = crate::builder::create_parser();
@@ -70,6 +78,9 @@ impl LanguageDriver for PackDriver {
     }
     fn extensions(&self) -> &[&'static str] {
         self.exts
+    }
+    fn make_parser(&self) -> tree_sitter::Parser {
+        (self.make_parser)()
     }
     fn analyze(&self, source: &str) -> FileAnalysis {
         let mut parser = (self.make_parser)();

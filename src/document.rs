@@ -18,9 +18,25 @@ pub struct Document {
     pub tree: Tree,
     pub analysis: FileAnalysis,
     pub stable_outline: StableOutline,
+    /// Driver id: "perl" (the reference path) or a pack language ("cpp").
+    /// The FileAnalysis-based handlers are language-agnostic; the
+    /// tree/cursor handlers (completion, signature-help, selection-range)
+    /// are Perl cursor-context-specific and skip when this isn't "perl".
+    pub language: &'static str,
 }
 
 impl Document {
+    /// Build a pack-language document through its driver (the multi-
+    /// language path). Holds the original-source tree + the driver's
+    /// analysis. Full reparse on update (no incremental for v1).
+    pub fn new_routed(text: String, driver: &dyn crate::language_driver::LanguageDriver) -> Option<Self> {
+        let mut parser = driver.make_parser();
+        let tree = parser.parse(&text, None)?;
+        let analysis = driver.analyze(&text);
+        let stable_outline = StableOutline::from_analysis(&analysis);
+        Some(Document { text, tree, analysis, stable_outline, language: driver.id() })
+    }
+
     pub fn new(text: String) -> Option<Self> {
         let mut parser = create_parser();
         let t0 = std::time::Instant::now();
@@ -40,10 +56,25 @@ impl Document {
         let analysis = crate::timings::phase("build()", || builder::build(&tree, text.as_bytes()));
         let stable_outline =
             crate::timings::phase("stable_outline", || StableOutline::from_analysis(&analysis));
-        Some(Document { text, tree, analysis, stable_outline })
+        Some(Document { text, tree, analysis, stable_outline, language: "perl" })
     }
 
     pub fn update(&mut self, new_text: String) {
+        // Pack languages: full reparse through the driver (no incremental
+        // edit path yet). The Perl branch below is untouched.
+        if self.language != "perl" {
+            let reg = crate::language_driver::LanguageRegistry::with_enabled();
+            if let Some(driver) = reg.for_id(self.language) {
+                let mut parser = driver.make_parser();
+                if let Some(tree) = parser.parse(&new_text, None) {
+                    self.tree = tree;
+                }
+                self.text = new_text;
+                self.analysis = driver.analyze(&self.text);
+                self.stable_outline.update(&self.analysis, &self.text);
+            }
+            return;
+        }
         // Diff old vs new to find the changed region, then tell tree-sitter
         // exactly what changed so it can do targeted incremental reparsing.
         // This preserves valid nodes outside the edit, producing much better

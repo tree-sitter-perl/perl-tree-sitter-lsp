@@ -92,7 +92,11 @@ impl Backend {
 
     fn enrich_analysis(&self, uri: &Url) {
         if let Some(mut doc) = self.files.get_open_mut(uri) {
-            doc.analysis.enrich_imported_types_with_keys(Some(&*self.module_index));
+            // enrichment is Perl-flavored (imported-type/hash-key keys);
+            // pack languages skip it.
+            if doc.language == "perl" {
+                doc.analysis.enrich_imported_types_with_keys(Some(&*self.module_index));
+            }
         }
     }
 
@@ -100,8 +104,12 @@ impl Backend {
         self.enrich_analysis(uri);
         let options = self.diagnostic_options();
         let diagnostics = match self.files.get_open(uri) {
-            Some(doc) => symbols::collect_diagnostics(&doc.analysis, &self.module_index, options),
-            None => vec![],
+            // pack languages ship NO diagnostics in v1 (no calibration →
+            // no false positives — the honesty discipline).
+            Some(doc) if doc.language == "perl" => {
+                symbols::collect_diagnostics(&doc.analysis, &self.module_index, options)
+            }
+            _ => vec![],
         };
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
@@ -644,6 +652,11 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
+        // cursor-context completion is Perl-specific; pack languages get
+        // no completion in v1 (symbol-table completion is a follow-up).
+        if doc.language != "perl" {
+            return Ok(None);
+        }
         let items = symbols::completion_items(
             &doc.analysis,
             &doc.tree,
@@ -689,6 +702,9 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
+        if doc.language != "perl" {
+            return Ok(None); // Perl cursor-context handler
+        }
         Ok(symbols::signature_help(&doc.analysis, &doc.tree, &doc.text, pos, &self.module_index))
     }
 
@@ -719,6 +735,9 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
+        if doc.language != "perl" {
+            return Ok(None); // tree-shape handler, Perl-tuned for v1
+        }
         let ranges: Vec<SelectionRange> = params
             .positions
             .iter()
