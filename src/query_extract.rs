@@ -473,6 +473,18 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     let mut narrow_var: HashMap<usize, String> = HashMap::new();
     let mut narrow_type: HashMap<usize, String> = HashMap::new();
     let mut narrow_guard: HashMap<usize, String> = HashMap::new();
+    // A context whose same-match `@scope` starts AFTER it (C++ namespace:
+    // `@context` is on the name, `@scope` on the body `{`) must be
+    // registered at the BODY depth, not the file depth — else it goes
+    // sticky and leaks past the closing brace. Pre-index each match's
+    // scope start; defer such contexts to the scope push.
+    let mut scope_start_by_match: HashMap<usize, usize> = HashMap::new();
+    for e in &events {
+        if e.cap == "scope" {
+            scope_start_by_match.entry(e.match_id).or_insert(e.start_byte);
+        }
+    }
+    let mut pending_context: HashMap<usize, String> = HashMap::new();
 
     for e in &events {
         while scope_stack.len() > 1
@@ -497,6 +509,14 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 });
                 scope_stack.push((e.end_byte, id));
                 out.scope_count += 1;
+                // a context deferred to THIS scope (C++ namespace) →
+                // register at the body depth so it pops with the block.
+                if let Some(text) = pending_context.remove(&e.match_id) {
+                    while context_stack.last().is_some_and(|&(d, _)| d >= scope_stack.len()) {
+                        context_stack.pop();
+                    }
+                    context_stack.push((scope_stack.len(), text));
+                }
                 // a guard narrowing whose block is THIS scope → the
                 // refined type holds within `id` (and is invisible
                 // outside it). annot_type maps primitive guards; anything
@@ -530,15 +550,22 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 narrow_guard.insert(e.match_id, e.text.clone());
             }
             cap if cap.starts_with("context.") => {
-                // Replace any context at the same depth; deeper ones
-                // were already popped with their scopes.
-                while context_stack
-                    .last()
-                    .is_some_and(|&(d, _)| d >= scope_stack.len())
-                {
-                    context_stack.pop();
+                // If this match's `@scope` starts AFTER this context, the
+                // context belongs to that (not-yet-pushed) body — defer it
+                // so it registers at the body depth and pops with the block.
+                if scope_start_by_match.get(&e.match_id).is_some_and(|&s| s > e.start_byte) {
+                    pending_context.insert(e.match_id, e.text.clone());
+                } else {
+                    // Replace any context at the same depth; deeper ones
+                    // were already popped with their scopes.
+                    while context_stack
+                        .last()
+                        .is_some_and(|&(d, _)| d >= scope_stack.len())
+                    {
+                        context_stack.pop();
+                    }
+                    context_stack.push((scope_stack.len(), e.text.clone()));
                 }
-                context_stack.push((scope_stack.len(), e.text.clone()));
             }
             cap if cap.starts_with("def.") && !cap.ends_with(".name") => {
                 let kind = cap.strip_prefix("def.").unwrap().to_string();

@@ -1189,3 +1189,4 @@ fn cpp_reference_declared_var_types_to_referent() {
         Some(InferredType::ClassName("Widget".into())),
     );
 }
+
