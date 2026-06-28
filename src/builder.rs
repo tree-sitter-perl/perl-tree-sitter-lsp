@@ -269,6 +269,8 @@ fn build_with_plugins_inner(
         plugins,
         dispatch_manifest: std::collections::HashMap::new(),
         load_manifest: std::collections::HashMap::new(),
+        generator_manifest: std::collections::HashMap::new(),
+        generator_plugin: std::collections::HashMap::new(),
         type_constraint_names: std::collections::HashSet::new(),
         app_surface_consumers: Vec::new(),
         param_type_manifest: std::collections::HashMap::new(),
@@ -320,6 +322,10 @@ fn build_with_plugins_inner(
         .collect();
     b.role_maker_modules
         .extend(b.plugins.role_makers().map(|s| s.to_string()));
+    for (plugin_id, g) in b.plugins.generators() {
+        b.generator_plugin.insert(g.name.clone(), plugin_id.to_string());
+        b.generator_manifest.insert(g.name.clone(), g.clone());
+    }
     for pt in b.plugins.param_types() {
         match &pt.method {
             Some(name) => {
@@ -1461,6 +1467,13 @@ struct Builder<'a> {
     /// dispatch collection in the method-call walk.
     dispatch_manifest: std::collections::HashMap<String, plugin::DispatchVerb>,
     load_manifest: std::collections::HashMap<String, plugin::LoadVerb>,
+    /// Symbol-generator manifest from plugin `generators()`, keyed by call
+    /// name. A function / method call naming one of these projects its
+    /// synthesis rules into real symbols (`synthesize_generator_call`).
+    generator_manifest: std::collections::HashMap<String, plugin::GeneratorDef>,
+    /// Generator name → declaring plugin id, so synthesized symbols carry the
+    /// owning plugin's `Namespace::Framework`.
+    generator_plugin: std::collections::HashMap<String, String>,
     /// Constraint-constructor name gate from plugin `type_constraint_names()`
     /// (`InstanceOf`, …), flattened once. A call to one of these is typed as
     /// `TypeConstraintOf` via the plugin's fold rather than its callee return.
@@ -2784,7 +2797,62 @@ impl<'a> Builder<'a> {
     /// Run every applicable plugin's `on_function_call` hook. Used for
     /// top-level calls (`get '/path' => sub {}`, `has 'attr' => ...`)
     /// that aren't method calls. Mirrors dispatch_method_call_plugins.
+    /// Project a generator call site into its synthesized symbol GROUP. The
+    /// synthesis rules are the plugin's (`generator_manifest`, rule #10);
+    /// core substitutes the call's literal string args and runs the
+    /// projection worklist (`crate::generators`), which threads the call span
+    /// as provenance and chains it through nested generation. Each member is
+    /// a REAL symbol whose `span` points at the generator call, so
+    /// documentSymbol shows it and goto-def / rename on it (or on a call to
+    /// it) land on the invocation. This is the generalization of
+    /// `visit_has_call`'s Moo `has` accessor synthesis. Trigger-independent:
+    /// keyed off the global manifest, like `record_provisional_dispatch`.
+    fn synthesize_generator_call(&mut self, name: &str, ctx: &plugin::CallContext) {
+        if !self.generator_manifest.contains_key(name) {
+            return;
+        }
+        // Literal string args, in order — the substitution the templates
+        // interpolate (`make_crud_helpers('user')` → params bound to "user").
+        let args: Vec<String> =
+            ctx.args.iter().filter_map(|a| a.string_value.clone()).collect();
+        let root = crate::generators::GenWitness {
+            generator: name.to_string(),
+            args,
+            prov: ctx.call_span,
+        };
+        for m in crate::generators::project(&self.generator_manifest, root) {
+            let plugin_id = self
+                .generator_plugin
+                .get(&m.from_generator)
+                .cloned()
+                .unwrap_or_default();
+            let is_method = matches!(m.kind.as_str(), "method" | "accessor");
+            let kind = if is_method { SymKind::Method } else { SymKind::Sub };
+            let detail = SymbolDetail::Sub {
+                params: vec![],
+                is_method,
+                doc: None,
+                display: None,
+                hide_in_outline: false,
+                opaque_return: false,
+                is_constant: false,
+                lexical: false,
+            };
+            self.add_symbol_ns(
+                m.name,
+                kind,
+                m.prov,             // span: the generator call site (provenance)
+                ctx.selection_span, // selection: the generator-name token
+                detail,
+                Namespace::framework(plugin_id),
+            );
+        }
+    }
+
     fn dispatch_function_call_plugins(&mut self, ctx: plugin::CallContext) {
+        if let Some(name) = ctx.function_name.clone() {
+            self.synthesize_generator_call(&name, &ctx);
+        }
         if self.plugins.is_empty() { return; }
         let parents = self.current_package.as_ref()
             .map(|p| self.transitive_parents(p))
@@ -2810,6 +2878,9 @@ impl<'a> Builder<'a> {
     }
 
     fn dispatch_method_call_plugins(&mut self, ctx: plugin::CallContext) {
+        if let Some(name) = ctx.method_name.clone() {
+            self.synthesize_generator_call(&name, &ctx);
+        }
         if self.plugins.is_empty() { return; }
         let parents = self.current_package.as_ref()
             .map(|p| self.transitive_parents(p))

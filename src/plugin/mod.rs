@@ -844,6 +844,61 @@ pub enum OverrideTarget {
     },
 }
 
+/// A plugin-declared SYMBOL GENERATOR: a helper call that synthesizes a
+/// GROUP of symbols from its literal arguments — `make_crud_helpers('user')`
+/// projecting a `user_id` accessor + `get_user`/`set_user` methods. This is
+/// the generalization of Moo `has` synthesis: a call witness projected into a
+/// symbol group, every member tracing (provenance) to the call site.
+///
+/// The plugin owns the SYNTHESIS RULES (rule #10 — core never enumerates
+/// generator names); core owns the MECHANISM — collecting the call witnesses,
+/// substituting the literal args, and running the projection worklist
+/// (`crate::generators`). Trigger-independent, like `dispatch_verbs()` /
+/// `overrides()`: read from every loaded plugin and keyed by `name`.
+///
+/// Rhai shape:
+/// ```rhai
+/// fn generators() {
+///   [ #{ name: "make_crud_helpers", params: ["thing"], actions: [
+///         #{ emit: "${thing}_id", kind: "accessor" },
+///         #{ emit: "get_${thing}", kind: "method" },
+///         #{ generate: "make_audit", args: ["${thing}"] },
+///   ] } ]
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratorDef {
+    /// The generator's call name (`make_crud_helpers`). Matched against the
+    /// function-call / method-call name regardless of triggers.
+    pub name: String,
+    /// Positional parameter names the templates interpolate (`${thing}`).
+    pub params: Vec<String>,
+    /// The abstract synthesis actions, parameterized over `params`.
+    pub actions: Vec<GeneratorAction>,
+}
+
+/// One abstract synthesis step of a [`GeneratorDef`]. A flat struct (not a
+/// tagged enum) so it round-trips cleanly through Rhai maps. Exactly one of
+/// `emit` / `generate` is set per action:
+/// - `emit` + `kind`: synthesize a symbol whose name interpolates the params.
+/// - `generate` + `args`: invoke another generator (nested generation, the
+///   worklist's fuel — its symbols chain provenance to the ROOT call site).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GeneratorAction {
+    /// Name template of a symbol to synthesize, e.g. `"${thing}_id"`.
+    #[serde(default)]
+    pub emit: Option<String>,
+    /// Symbol kind for `emit` (`"method"` / `"accessor"` / `"sub"`).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Name of a nested generator to invoke.
+    #[serde(default)]
+    pub generate: Option<String>,
+    /// Argument templates for the nested generator, e.g. `["${thing}"]`.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 pub trait FrameworkPlugin: Send + Sync {
     fn id(&self) -> &str;
     fn triggers(&self) -> &[Trigger];
@@ -911,6 +966,14 @@ pub trait FrameworkPlugin: Send + Sync {
     /// engine module here and consumers are marked roles directly.
     /// Default empty.
     fn role_makers(&self) -> &[String] {
+        &[]
+    }
+
+    /// Static SYMBOL GENERATOR manifest — see [`GeneratorDef`]. Read once at
+    /// plugin load; core matches a generator's `name` against every function /
+    /// method call and projects its synthesis rules into real symbols with
+    /// provenance to the call site. Trigger-independent. Default empty.
+    fn generators(&self) -> &[GeneratorDef] {
         &[]
     }
 
@@ -1236,6 +1299,15 @@ impl PluginRegistry {
         self.plugins
             .iter()
             .flat_map(|p| p.role_makers().iter().map(|s| s.as_str()))
+    }
+
+    /// Yield every (plugin_id, generator) pair across the registry.
+    /// Trigger-independent, same rationale as `dispatch_verbs` — a generator
+    /// call is recognized by its name regardless of the file's `use`s.
+    pub fn generators<'a>(&'a self) -> impl Iterator<Item = (&'a str, &'a GeneratorDef)> + 'a {
+        self.plugins
+            .iter()
+            .flat_map(|p| p.generators().iter().map(move |g| (p.id(), g)))
     }
 
     /// Fold a constraint constructor → its inner type, asking the plugin(s)

@@ -8,6 +8,7 @@ mod cursor_context;
 mod document;
 mod file_analysis;
 mod file_store;
+mod generators;
 mod graph;
 mod module_cache;
 mod module_index;

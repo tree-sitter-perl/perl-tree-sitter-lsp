@@ -31,6 +31,7 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("graph", Model),
         ("cst", Cst),
         ("builder", Build),
+        ("generators", Build),
         ("plugin", Build),
         ("pod", Build),
         ("cpanfile", Build),

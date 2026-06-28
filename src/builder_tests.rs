@@ -15057,3 +15057,128 @@ fn plugin_loads_recorded_trigger_independent_and_multivalue() {
 
 #[path = "builder/narrowing_tests.rs"]
 mod narrowing;
+
+// Productive Perl projection: a plugin-declared symbol GENERATOR
+// (`generators()` manifest) projecting a call site into a real symbol group
+// with provenance to the call. The generalization of Moo `has` synthesis.
+mod symbol_generators {
+    use super::*;
+    use crate::file_analysis::{Namespace, SymKind};
+    use crate::plugin::{
+        CompletionQueryContext, FrameworkPlugin, GeneratorAction, GeneratorDef,
+        PluginCompletionAnswer, PluginRegistry, PluginSigHelpAnswer, SigHelpQueryContext, Trigger,
+    };
+    use std::sync::{Arc, OnceLock};
+
+    /// Declares two generators: `make_crud_helpers($thing)` synthesizes an
+    /// accessor + getter + setter; `make_resource($res)` emits a table
+    /// accessor AND invokes `make_crud_helpers` (nested generation).
+    struct CrudGenPlugin;
+
+    fn emit(name: &str, kind: &str) -> GeneratorAction {
+        GeneratorAction { emit: Some(name.into()), kind: Some(kind.into()), ..Default::default() }
+    }
+    fn generate(name: &str, args: &[&str]) -> GeneratorAction {
+        GeneratorAction {
+            generate: Some(name.into()),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    impl FrameworkPlugin for CrudGenPlugin {
+        fn id(&self) -> &str { "gen-test" }
+        fn triggers(&self) -> &[Trigger] {
+            static T: [Trigger; 1] = [Trigger::Always];
+            &T
+        }
+        fn generators(&self) -> &[GeneratorDef] {
+            static G: OnceLock<Vec<GeneratorDef>> = OnceLock::new();
+            G.get_or_init(|| {
+                vec![
+                    GeneratorDef {
+                        name: "make_crud_helpers".into(),
+                        params: vec!["thing".into()],
+                        actions: vec![
+                            emit("${thing}_id", "accessor"),
+                            emit("get_${thing}", "method"),
+                            emit("set_${thing}", "method"),
+                        ],
+                    },
+                    GeneratorDef {
+                        name: "make_resource".into(),
+                        params: vec!["res".into()],
+                        actions: vec![
+                            emit("${res}_table", "accessor"),
+                            generate("make_crud_helpers", &["${res}"]),
+                        ],
+                    },
+                ]
+            })
+        }
+        fn on_signature_help(&self, _: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> { None }
+        fn on_completion(&self, _: &CompletionQueryContext) -> Option<PluginCompletionAnswer> { None }
+    }
+
+    fn build(source: &str) -> FileAnalysis {
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(CrudGenPlugin));
+        let plugins = Arc::new(reg);
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        super::super::build_with_plugins(&tree, source.as_bytes(), plugins)
+    }
+
+    #[test]
+    fn generator_call_synthesizes_real_symbol_group_with_provenance() {
+        // `make_crud_helpers('user')` is on row 1, columns 0..25.
+        let src = "package Thing;\nmake_crud_helpers('user');\n";
+        let fa = build(src);
+        let by_name = |n: &str| fa.symbols.iter().find(|s| s.name == n).cloned();
+
+        for name in ["user_id", "get_user", "set_user"] {
+            let s = by_name(name).unwrap_or_else(|| {
+                panic!(
+                    "missing synthesized symbol {name}; have {:?}",
+                    fa.symbols.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+                )
+            });
+            // Provenance: the symbol's span points at the generator CALL SITE,
+            // so goto-def / rename land on the invocation.
+            assert_eq!(s.span.start.row, 1, "{name} provenance row");
+            assert_eq!(s.span.start.column, 0, "{name} provenance start col");
+            assert_eq!(s.span.end.column, 25, "{name} span covers the call");
+            assert!(
+                matches!(s.namespace, Namespace::Framework { .. }),
+                "{name} is owned by the plugin namespace, not native Perl"
+            );
+        }
+        assert_eq!(by_name("user_id").unwrap().kind, SymKind::Method, "accessor → Method");
+        assert_eq!(by_name("get_user").unwrap().kind, SymKind::Method);
+    }
+
+    #[test]
+    fn nested_generator_synthesizes_transitively_with_root_provenance() {
+        let src = "package Thing;\nmake_resource('widget');\n";
+        let fa = build(src);
+        let by_name = |n: &str| fa.symbols.iter().find(|s| s.name == n).cloned();
+        // Direct (`widget_table`) + transitive via the worklist
+        // (`get_widget`/`set_widget`), all tracing to the one `make_resource`.
+        for name in ["widget_table", "get_widget", "set_widget"] {
+            let s = by_name(name)
+                .unwrap_or_else(|| panic!("missing {name} (nested generation)"));
+            assert_eq!(s.span.start.row, 1, "{name} traces to the make_resource call");
+            assert_eq!(s.span.start.column, 0);
+        }
+    }
+
+    #[test]
+    fn non_generator_call_synthesizes_nothing() {
+        let fa = build("package Thing;\nregular_function('user');\n");
+        assert!(
+            fa.symbols.iter().all(|s| s.name != "user_id"),
+            "a plain call that isn't a declared generator synthesizes no group"
+        );
+    }
+}
