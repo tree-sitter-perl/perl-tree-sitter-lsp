@@ -31,6 +31,16 @@
 (struct_specifier
   name: (type_identifier) @def.class.name @context.class
   body: (field_declaration_list) @scope) @def.class
+
+; ---- inheritance: `class Circle : public Shape` → Circle parent Shape.
+; A dedicated pattern (non-inheriting classes keep matching the body
+; pattern above); one @parent per base, so multiple inheritance works.
+(class_specifier
+  name: (type_identifier) @def.class.name
+  (base_class_clause (type_identifier) @parent))
+(struct_specifier
+  name: (type_identifier) @def.class.name
+  (base_class_clause (type_identifier) @parent))
 (union_specifier name: (type_identifier) @def.class.name) @def.class
 (enum_specifier name: (type_identifier) @def.class.name) @def.class
 

@@ -8,6 +8,14 @@
       "file": "members.cpp", "line": 9, "col": 7,
       "expect": { "all": ["grow", "width", "height"], "none": ["use_box"] },
       "status": "gold"
+    },
+    {
+      "id": "cpp-completion-inherited-members",
+      "difficulty": "moderate", "semantic_area": "cpp-multilang",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "inh.cpp", "line": 11, "col": 6,
+      "expect": { "all": ["roll", "draw", "color"], "none": [] },
+      "status": "gold"
     }
   ]
 }

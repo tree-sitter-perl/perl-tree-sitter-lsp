@@ -62,6 +62,8 @@ pub struct SkeletonAnalysis {
     pub scope_count: usize,
     pub scopes: Vec<crate::file_analysis::Scope>,
     pub witnesses: Vec<crate::witnesses::Witness>,
+    /// (child class, parent class) inheritance edges — `@parent` captures.
+    pub parents: Vec<(String, String)>,
 }
 
 impl SkeletonAnalysis {
@@ -114,11 +116,17 @@ impl SkeletonAnalysis {
                 resolved_method_target: None,
             })
             .collect();
+        let mut package_parents: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (child, parent) in &self.parents {
+            package_parents.entry(child.clone()).or_default().push(parent.clone());
+        }
         let mut fa = FileAnalysis::new(FileAnalysisParts {
             scopes: self.scopes,
             symbols,
             refs,
             witnesses: bag,
+            package_parents,
             ..Default::default()
         });
         // Seal base_*_count so a later enrich pass (the CLI/--batch path
@@ -580,6 +588,15 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                         context_stack.pop();
                     }
                     context_stack.push((scope_stack.len(), e.text.clone()));
+                }
+            }
+            "parent" => {
+                // `@parent` (a base class) pairs with the `@def.class.name`
+                // in the same match — record the inheritance edge.
+                if let Some((child, _, _)) =
+                    names_by_match.get(&(e.match_id, "def.class".to_string()))
+                {
+                    out.parents.push((child.clone(), e.text.clone()));
                 }
             }
             cap if cap.starts_with("def.") && !cap.ends_with(".name") => {

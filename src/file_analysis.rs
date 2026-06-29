@@ -4359,36 +4359,41 @@ impl FileAnalysis {
         self.collect_ancestor_methods(
             class_name, class_name, module_index, &mut candidates, &mut seen, 0,
         );
-        // Data members live DIRECTLY in the class body scope; a Variable in
-        // a deeper (method) scope is a local/param (Python's `self`), not a
-        // field. Pack scopes are all `Block` (scope_within_sub_body can't
-        // tell them apart), so anchor on where the class's methods are
-        // declared — that IS the body scope, whichever node carries it.
-        let class_body = self
-            .symbols
-            .iter()
-            .find(|s| {
-                matches!(s.kind, SymKind::Sub | SymKind::Method)
-                    && self.symbol_in_class(s.id, class_name)
-            })
-            .map(|m| m.scope);
-        for sym in &self.symbols {
-            if matches!(sym.kind, SymKind::Variable | SymKind::Field)
-                && self.symbol_in_class(sym.id, class_name)
-                && class_body.is_none_or(|cb| sym.scope == cb)
-                && seen.insert(sym.name.clone())
-            {
-                candidates.push(CompletionCandidate {
-                    label: sym.name.clone(),
-                    kind: sym.kind,
-                    detail: None,
-                    insert_text: None,
-                    sort_priority: PRIORITY_LOCAL,
-                    additional_edits: vec![],
-                    display_override: None,
-                });
+        // Data members from this class AND its ancestors. A field lives
+        // DIRECTLY in its class body scope; a Variable in a deeper (method)
+        // scope is a local/param (Python's `self`), not a field. Pack
+        // scopes are all `Block` (scope_within_sub_body can't tell them
+        // apart), so anchor on where each class's methods are declared —
+        // that IS the body scope, whichever node carries it.
+        self.for_each_ancestor_class(class_name, module_index, |cls| {
+            let class_body = self
+                .symbols
+                .iter()
+                .find(|s| {
+                    matches!(s.kind, SymKind::Sub | SymKind::Method)
+                        && self.symbol_in_class(s.id, cls)
+                })
+                .map(|m| m.scope);
+            for sym in &self.symbols {
+                if matches!(sym.kind, SymKind::Variable | SymKind::Field)
+                    && self.symbol_in_class(sym.id, cls)
+                    && class_body.is_none_or(|cb| sym.scope == cb)
+                    && !seen.contains(&sym.name)
+                {
+                    seen.insert(sym.name.clone());
+                    candidates.push(CompletionCandidate {
+                        label: sym.name.clone(),
+                        kind: sym.kind,
+                        detail: None,
+                        insert_text: None,
+                        sort_priority: PRIORITY_LOCAL,
+                        additional_edits: vec![],
+                        display_override: None,
+                    });
+                }
             }
-        }
+            std::ops::ControlFlow::Continue(())
+        });
         candidates
     }
 
