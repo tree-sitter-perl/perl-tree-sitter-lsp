@@ -205,6 +205,20 @@
   declarator: (pointer_declarator
     declarator: (pointer_declarator
       declarator: (identifier) @flow.target @def.local)))
+; triple / quadruple pointer locals (enumerated, see params above).
+(declaration
+  type: (_) @type.annot
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (pointer_declarator
+        declarator: (identifier) @flow.target @def.local))))
+(declaration
+  type: (_) @type.annot
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (pointer_declarator
+        declarator: (pointer_declarator
+          declarator: (identifier) @flow.target @def.local)))))
 (declaration
   type: (_) @type.annot
   declarator: (init_declarator
@@ -236,6 +250,22 @@
   declarator: (pointer_declarator
     declarator: (pointer_declarator
       declarator: (identifier) @flow.target @def.local)))
+; triple / quadruple pointer (`char***`, `int****`) — tree-sitter queries
+; can't express arbitrary declarator nesting, so depths are enumerated; the
+; driver is capture-event-based (no tree walk) so it can't peel them either.
+(parameter_declaration
+  type: (_) @type.annot
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (pointer_declarator
+        declarator: (identifier) @flow.target @def.local))))
+(parameter_declaration
+  type: (_) @type.annot
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (pointer_declarator
+        declarator: (pointer_declarator
+          declarator: (identifier) @flow.target @def.local)))))
 (parameter_declaration
   type: (_) @type.annot
   declarator: (reference_declarator (identifier) @flow.target @def.local))
