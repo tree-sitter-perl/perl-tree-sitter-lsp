@@ -1804,7 +1804,18 @@ fn cli_parse(path: &str) {
             }
         }
     };
-    let mut parser = builder::create_parser();
+    // Route to the file's grammar by extension (cpp/python/r/cmake), so
+    // --parse shows the SAME tree the pack extractor sees. Perl + stdin +
+    // unknown extensions keep the Perl grammar.
+    let mut parser = if path != "-" {
+        let reg = crate::language_driver::LanguageRegistry::with_enabled();
+        reg.for_path(std::path::Path::new(path))
+            .filter(|d| d.id() != "perl")
+            .map(|d| d.make_parser())
+            .unwrap_or_else(builder::create_parser)
+    } else {
+        builder::create_parser()
+    };
     let Some(tree) = parser.parse(&source, None) else {
         eprintln!("parse failed");
         std::process::exit(1);
