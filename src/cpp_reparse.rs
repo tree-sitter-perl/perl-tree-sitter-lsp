@@ -364,7 +364,18 @@ pub fn preprocess_validated_with(
     }
     match parser.parse(&rewritten, None) {
         Some(after) if parse_damage(after.root_node()) <= before => (rewritten, map, recovered),
-        _ => (src.to_string(), SpliceMap::default(), recovered),
+        _ => {
+            // Full rewrite raised damage (perl.h-style macro soup, all-or-
+            // nothing). Keep only the provably-safe IDENTIFIER-ALIAS
+            // expansions (`op_prune_chain_head → Perl_op_prune_chain_head`)
+            // so macro-name indirection — goto-def + references THROUGH the
+            // alias — survives even when the rest is discarded.
+            let (alias_rw, alias_map) = preprocess_with_mode(&tree, src, external, true);
+            match (alias_rw != src).then(|| parser.parse(&alias_rw, None)).flatten() {
+                Some(a) if parse_damage(a.root_node()) <= before => (alias_rw, alias_map, recovered),
+                _ => (src.to_string(), SpliceMap::default(), recovered),
+            }
+        }
     }
 }
 
@@ -663,14 +674,40 @@ pub fn preprocess(tree: &Tree, src: &str) -> (String, SpliceMap) {
 /// `preprocess` plus EXTERNAL macros (gathered from #included headers via
 /// `included_macros`). The file's own #defines win on conflict; the
 /// external set fills in cross-file names like `SPDLOG_NAMESPACE_BEGIN`.
+/// An object-like macro whose body is a single bare identifier — a pure
+/// rename (`op_prune_chain_head → Perl_op_prune_chain_head`). Expanding it
+/// is provably parse-safe (an identifier replaces an identifier; the token
+/// structure is unchanged), so it can be kept even when the full
+/// expansion's validate gate rejects the file.
+fn is_identifier_alias(m: &Macro) -> bool {
+    m.params.is_none()
+        && !m.body.is_empty()
+        && m.body.bytes().all(is_ident_byte)
+}
+
 pub fn preprocess_with(
     tree: &Tree,
     src: &str,
     external: &BTreeMap<String, Macro>,
 ) -> (String, SpliceMap) {
+    preprocess_with_mode(tree, src, external, false)
+}
+
+/// `alias_only` restricts expansion to identifier-alias macros (the
+/// validate-gate-safe subset) — used as the fallback when the full
+/// expansion raises parse damage.
+fn preprocess_with_mode(
+    tree: &Tree,
+    src: &str,
+    external: &BTreeMap<String, Macro>,
+    alias_only: bool,
+) -> (String, SpliceMap) {
     let mut macros = collect_macros(tree, src.as_bytes());
     for (k, v) in external {
         macros.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    if alias_only {
+        macros.retain(|_, m| is_identifier_alias(m));
     }
     let macros = pre_expand_bodies(&macros);
     if macros.is_empty() {
