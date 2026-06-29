@@ -92,7 +92,8 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 - `cst.rs` — typed view over the CST (typed wrappers, `NodeExt`, pair walking, call args, varname canonicalization). The vocabulary every tree consumer uses.
 - `conventions.rs` — Perl name semantics, parsed once: `MethodToken` (FQ/SUPER/main method-token qualifier), `InvocantText` (variable/bareword/`__PACKAGE__`/positional-receiver invocant shape), plus name predicates (constructor, conventional invocant, `__PACKAGE__`). Pure `&str`; no tree-sitter. Never re-derive these shapes with `rsplit_once("::")` / `starts_with('$')` string ops in a consumer.
 - `pod.rs` — POD→markdown via tree-sitter-pod.
-- `cursor_context.rs` — position-dependent context.
+- `cursor_context.rs` — position-dependent context (Perl completion/sig-help).
+- `cursor_sentinel.rs` — sentinel-reparse member-access cursor context for pack languages (`obj.`/`obj->` → receiver). `docs/adr/cursor-context-completion.md` covers the two-half pack completion (in-scope symbols + sentinel member access + the trigger-char gate); Perl keeps `cursor_context.rs`.
 - `symbols.rs` — LSP adapter.
 - `resolve.rs` — cross-file `refs_to` + `RoleMask` (OPEN/WORKSPACE/DEPENDENCY/BUILTIN). All cross-file queries route here.
 - `module_index.rs` — cross-file dep API, `CachedModule`, `SubInfo`, reverse index (`func → modules`).

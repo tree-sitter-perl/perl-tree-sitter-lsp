@@ -1,33 +1,28 @@
-//! SPIKE: sentinel re-parse for member-access cursor context.
+//! Sentinel reparse for member-access cursor context — the pack-language
+//! member-completion seam (`docs/adr/cursor-context-completion.md`).
 //!
-//! A member of the reparse family (`docs/prompt-cpp-reparse.md`,
-//! `src/cpp_reparse.rs`, `src/reparse.rs`): a **source edit + re-parse +
-//! span remap**. The others fix a parse corrupted by a *declaration*
-//! (a macro, a prototype). This one fixes a parse corrupted by
-//! *incompleteness*: at the instant a user triggers completion, the
-//! buffer reads `box.` / `box->` / `obj.` — a member access with no
-//! member, so tree-sitter produces an ERROR and the receiver is no
+//! A member of the reparse family (`cpp_reparse.rs`, `reparse.rs`): a
+//! **source edit + reparse + span remap**. The others fix a parse
+//! corrupted by a *declaration* (a macro, a prototype). This one fixes a
+//! parse corrupted by *incompleteness*: at the instant a user triggers
+//! completion the buffer reads `box.` / `box->` / `obj.` — a member access
+//! with no member, so tree-sitter produces an ERROR and the receiver is no
 //! longer reachable through the typed `field_expression` / `attribute`
 //! shape the rest of the engine speaks.
 //!
-//! The fix is the same shape as expansion: splice a placeholder
-//! identifier (`__CURSOR__`) at the cursor so the access becomes
-//! *syntactically complete and unambiguous*, re-parse, locate the
-//! placeholder node, and walk to its receiver. Steps (b)/(c) of
-//! completion — type the receiver, list members — are already solved
-//! (`expr_type_at_span`, `complete_methods_for_class`); this module
-//! does only step (a): *detect member access + identify the receiver*.
+//! The fix is the same shape as expansion: splice a placeholder identifier
+//! (`__CURSOR__`) at the cursor so the access becomes syntactically
+//! complete, reparse, locate the placeholder, and take its member node's
+//! receiver. This module does only step (a) — detect member access +
+//! identify the receiver; the backend feeds the receiver span to
+//! `expr_type_at_span` + `complete_members_for_class` for (b)/(c).
 //!
 //! Coordinate remap is trivial here, and that is the whole appeal: the
 //! splice lands AT the cursor, strictly AFTER the receiver, so every
-//! receiver byte offset is identical in patched and original source. No
-//! `SpliceMap` / `AnchorMap` needed for the receiver — the one anchor
-//! the others must carry, this one gets for free (proved in tests).
-//!
-//! Deliberately not wired into the build pipeline or `cursor_context`;
-//! measured by `cursor_sentinel_tests.rs`. Language config is a tiny
-//! table, not a per-language branch (rule #10): the member-access node
-//! kinds and the receiver-first invariant are the only facts that vary.
+//! receiver byte offset is identical in patched and original source — the
+//! one anchor the other reparse siblings must carry, this one gets free.
+//! Language config is a two-field table (rule #10): the member-access node
+//! kinds and the don't-splice-here set are the only facts that vary.
 
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
