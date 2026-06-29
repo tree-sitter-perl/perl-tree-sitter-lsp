@@ -18,6 +18,11 @@ use std::path::Path;
 pub trait LanguageDriver: Send + Sync {
     fn id(&self) -> &'static str;
     fn extensions(&self) -> &[&'static str];
+    /// Exact filenames the driver claims (e.g. `CMakeLists.txt`), beyond
+    /// extensions. Default none.
+    fn filenames(&self) -> &[&'static str] {
+        &[]
+    }
     /// A fresh parser for this language — for the open `Document` to hold
     /// a tree (incremental edits, position handlers). NOTE: this parses
     /// the ORIGINAL source; `analyze` may run a pre-parse transform (C++
@@ -80,6 +85,9 @@ impl LanguageDriver for PerlDriver {
 pub struct PackDriver {
     id: &'static str,
     exts: &'static [&'static str],
+    /// Exact filenames this driver also claims (extensionless conventions
+    /// like `CMakeLists.txt`). Matched before extension.
+    filenames: &'static [&'static str],
     make_parser: fn() -> tree_sitter::Parser,
     pack: fn() -> crate::query_extract::LangPack,
     /// (source, external macros) → (transformed source, anchor map), run
@@ -111,6 +119,9 @@ impl LanguageDriver for PackDriver {
     }
     fn extensions(&self) -> &[&'static str] {
         self.exts
+    }
+    fn filenames(&self) -> &[&'static str] {
+        self.filenames
     }
     fn make_parser(&self) -> tree_sitter::Parser {
         (self.make_parser)()
@@ -156,6 +167,7 @@ fn cpp_driver() -> PackDriver {
         // `.c` too — tree-sitter-cpp parses C (a near-subset), and MISRA /
         // embedded code is C-heavy. One driver serves both.
         exts: &["cpp", "cc", "cxx", "hpp", "hh", "h", "c"],
+        filenames: &[],
         make_parser: || {
             let mut p = tree_sitter::Parser::new();
             p.set_language(&tree_sitter_cpp::LANGUAGE.into()).expect("cpp grammar");
@@ -174,6 +186,7 @@ fn python_driver() -> PackDriver {
     PackDriver {
         id: "python",
         exts: &["py"],
+        filenames: &[],
         make_parser: || {
             let mut p = tree_sitter::Parser::new();
             p.set_language(&tree_sitter_python::LANGUAGE.into()).expect("python grammar");
@@ -190,6 +203,7 @@ fn r_driver() -> PackDriver {
     PackDriver {
         id: "r",
         exts: &["R", "r"],
+        filenames: &[],
         make_parser: || {
             let mut p = tree_sitter::Parser::new();
             p.set_language(&tree_sitter_r::LANGUAGE.into()).expect("r grammar");
@@ -207,6 +221,7 @@ fn cmake_driver() -> PackDriver {
         // CMakeLists.txt (no extension match) is a follow-up; `.cmake` now.
         id: "cmake",
         exts: &["cmake"],
+        filenames: &["CMakeLists.txt"],
         make_parser: || {
             let mut p = tree_sitter::Parser::new();
             p.set_language(&tree_sitter_cmake::LANGUAGE.into()).expect("cmake grammar");
@@ -311,6 +326,12 @@ impl LanguageRegistry {
     }
 
     pub fn for_path(&self, path: &Path) -> Option<&dyn LanguageDriver> {
+        // Exact filename first (CMakeLists.txt has no extension), then ext.
+        if let Some(name) = path.file_name().and_then(|f| f.to_str()) {
+            if let Some(d) = self.drivers.iter().find(|d| d.filenames().contains(&name)) {
+                return Some(d.as_ref());
+            }
+        }
         let ext = path.extension()?.to_str()?;
         self.drivers.iter().find(|d| d.extensions().contains(&ext)).map(|d| d.as_ref())
     }
