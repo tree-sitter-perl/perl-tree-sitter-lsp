@@ -1,0 +1,13 @@
+{
+  "capability": "completion",
+  "rows": [
+    {
+      "id": "c-typedef-member-completion",
+      "difficulty": "moderate", "semantic_area": "c-misra",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "cstruct.c", "line": 6, "col": 6,
+      "expect": { "all": ["width", "height"], "none": [] },
+      "status": "gold"
+    }
+  ]
+}

@@ -52,6 +52,21 @@
 (union_specifier name: (type_identifier) @def.class.name) @def.class
 (enum_specifier name: (type_identifier) @def.class.name) @def.class
 
+; ---- C typedef'd aggregates: `typedef struct { ... } Name;` — the
+; dominant C type idiom (the anonymous struct has no name of its own, so
+; the typedef NAME is the type). The name comes AFTER the body, so
+; @context.class can't tag the members (already walked) — a body-scope
+; post-pass in into_file_analysis does that instead.
+(type_definition
+  type: (struct_specifier body: (field_declaration_list) @scope)
+  declarator: (type_identifier) @def.class.name) @def.class
+(type_definition
+  type: (union_specifier body: (field_declaration_list) @scope)
+  declarator: (type_identifier) @def.class.name) @def.class
+(type_definition
+  type: (enum_specifier)
+  declarator: (type_identifier) @def.class.name) @def.class
+
 ; ---- free functions & out-of-line / inline method definitions ----
 ; the name lives at the bottom of the declarator chain; one pattern per
 ; shape it can take (plain / member / qualified / pointer-return).

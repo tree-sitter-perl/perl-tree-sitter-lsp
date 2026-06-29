@@ -74,10 +74,18 @@ impl SkeletonAnalysis {
     /// indices, production reducer registry behind every query — from
     /// nothing but capture events. The existence proof that the engine
     /// is language-agnostic above this seam.
-    pub fn into_file_analysis(self) -> crate::file_analysis::FileAnalysis {
+    pub fn into_file_analysis(mut self) -> crate::file_analysis::FileAnalysis {
         use crate::file_analysis::{
             FileAnalysis, FileAnalysisParts, SymKind, Symbol, SymbolDetail, SymbolId,
         };
+        // A NAMED typedef `typedef struct N {...} N;` matches both the
+        // struct_specifier and the type_definition → two `class N`. C
+        // can't have two types of one name, so keep the first.
+        {
+            let mut seen = std::collections::HashSet::new();
+            self.symbols
+                .retain(|s| s.kind != "class" || seen.insert(s.name.clone()));
+        }
         let mut bag = crate::witnesses::WitnessBag::default();
         for w in self.witnesses {
             bag.push(w);
@@ -105,6 +113,36 @@ impl SkeletonAnalysis {
                 outline_label: None,
             })
             .collect();
+        // Tag a typedef-struct's members with its name. `typedef struct
+        // {...} T;` names the type AFTER its body, so @context.class can't
+        // reach the members (already walked). For each class, members
+        // directly in its body scope that are still UNTAGGED inherit the
+        // class name. Idempotent for normal classes (members already tagged
+        // via @context.class are skipped).
+        let class_bodies: Vec<(crate::file_analysis::ScopeId, String)> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Class))
+            .filter_map(|c| {
+                let cs = c.span;
+                self.scopes
+                    .iter()
+                    .find(|s| {
+                        s.span != cs
+                            && (s.span.start.row, s.span.start.column)
+                                >= (cs.start.row, cs.start.column)
+                            && (s.span.end.row, s.span.end.column) <= (cs.end.row, cs.end.column)
+                    })
+                    .map(|s| (s.id, c.name.clone()))
+            })
+            .collect();
+        for (body, cname) in class_bodies {
+            for s in &mut symbols {
+                if s.package.is_none() && s.scope == body {
+                    s.package = Some(cname.clone());
+                }
+            }
+        }
+
         // A function whose owning package is a CLASS is a method. Covers
         // template members, which tree-sitter parses as a plain
         // `declaration` (identifier, not field_identifier) so they classify

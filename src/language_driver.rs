@@ -153,7 +153,9 @@ impl LanguageDriver for PackDriver {
 fn cpp_driver() -> PackDriver {
     PackDriver {
         id: "cpp",
-        exts: &["cpp", "cc", "cxx", "hpp", "hh", "h"],
+        // `.c` too — tree-sitter-cpp parses C (a near-subset), and MISRA /
+        // embedded code is C-heavy. One driver serves both.
+        exts: &["cpp", "cc", "cxx", "hpp", "hh", "h", "c"],
         make_parser: || {
             let mut p = tree_sitter::Parser::new();
             p.set_language(&tree_sitter_cpp::LANGUAGE.into()).expect("cpp grammar");

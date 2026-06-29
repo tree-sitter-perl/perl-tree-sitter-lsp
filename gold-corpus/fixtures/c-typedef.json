@@ -1,0 +1,13 @@
+{
+  "capability": "outline",
+  "rows": [
+    {
+      "id": "c-typedef-anonymous-struct",
+      "difficulty": "moderate", "semantic_area": "c-misra",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "cstruct.c", "line": 0, "col": 0,
+      "expect": { "all": ["\"kind\":\"Class\",\"line\":\"0\",\"name\":\"Rect\""], "none": [] },
+      "status": "gold"
+    }
+  ]
+}
