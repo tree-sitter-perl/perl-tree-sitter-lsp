@@ -19,14 +19,15 @@
   (macro_command
     (argument_list . (argument) @def.sub.name))) @def.sub @scope
 
-; ---- every command: name + its FIRST argument (the entity it declares —
-; `set(VAR ...)`, `add_library(TARGET ...)`; all cmake Def effects are
-; name_arg:0). The `.` anchor is load-bearing: without it the pattern
-; matched once PER argument, so `set(V ${X} PARENT_SCOPE)` named the var
-; ref + the keyword as defs too. ----
+; ---- every command: name + ALL args in ONE match, ordered. The `+`
+; quantifier is load-bearing: `(argument)` alone matches once PER argument,
+; so each arg landed in its own match at index 0 and `Def{name_arg:0}`
+; named every one (`set(V ${X} PARENT_SCOPE)` → V + the ref + the keyword).
+; With `+` the driver groups them by command and indexes correctly: arg 0
+; is the def, RefArgsFrom refs the rest (keywords filtered). ----
 (normal_command
   (identifier) @cmd
-  (argument_list . (argument) @cmd.arg))
+  (argument_list (argument)+ @cmd.arg))
 ; commands with no arguments still get their invocation ref
 (normal_command
   (identifier) @cmd)
