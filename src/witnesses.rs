@@ -454,6 +454,18 @@ impl WitnessBag {
         self.rebuild_index();
     }
 
+    /// Does `att` carry a witness sourced from `Builder(tag)`? Used to ask
+    /// "was this variable's type written EXPLICITLY" (`skeleton-annot`) vs
+    /// inferred — the inlay-hint suppression for languages with explicit
+    /// types (`int c` needs no `: int` hint; `auto x` does).
+    pub fn has_builder_source(&self, att: &WitnessAttachment, tag: &str) -> bool {
+        self.index.get(att).is_some_and(|idxs| {
+            idxs.iter().any(|&i| {
+                matches!(&self.witnesses[i].source, WitnessSource::Builder(s) if s == tag)
+            })
+        })
+    }
+
     /// Drop every `Builder(tag)`-sourced witness and rebuild the index;
     /// returns the count removed. Re-emittable builder passes call this
     /// at the start of each fold iteration so the bag stays

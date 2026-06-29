@@ -2129,6 +2129,20 @@ pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
                 if crate::conventions::is_conventional_invocant_name(&sym.name) {
                     continue;
                 }
+                // Skip variables whose type is written EXPLICITLY (`int c`,
+                // `Box b`) — the hint just echoes the source. Languages with
+                // explicit types mark the declaration with a `skeleton-annot`
+                // witness; inferred ones (`auto`, Perl) have none, so they
+                // still get the hint.
+                if analysis.witnesses.has_builder_source(
+                    &crate::witnesses::WitnessAttachment::Variable {
+                        name: sym.name.clone(),
+                        scope: sym.scope,
+                    },
+                    "skeleton-annot",
+                ) {
+                    continue;
+                }
                 if let Some(ty) = analysis.inferred_type_via_bag(&sym.name, sym.span.start) {
                     // Only show Object/HashRef/ArrayRef/CodeRef/Regexp — not Numeric/String
                     if matches!(ty, InferredType::Numeric | InferredType::String) {
