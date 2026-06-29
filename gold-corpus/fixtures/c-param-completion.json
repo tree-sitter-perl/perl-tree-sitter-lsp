@@ -1,0 +1,23 @@
+{
+  "capability": "completion",
+  "rows": [
+    {
+      "id": "c-param-member-completion",
+      "difficulty": "moderate",
+      "semantic_area": "c-misra",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "cparam.c",
+      "line": 5,
+      "col": 7,
+      "expect": {
+        "all": [
+          "x",
+          "y"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}

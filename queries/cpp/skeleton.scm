@@ -66,6 +66,18 @@
 (type_definition
   type: (enum_specifier)
   declarator: (type_identifier) @def.class.name) @def.class
+; enum CONSTANTS (RED, GREEN) — named values, findable + completable.
+(enumerator name: (identifier) @def.var.name) @def.var
+; scalar / function-pointer typedefs: `typedef uint32_t u32;`,
+; `typedef void (*CB)(int);` — the named alias is a findable type. (The
+; struct/union/enum forms above already matched with a @scope; the
+; name-dedup in into_file_analysis collapses the overlap.)
+(type_definition
+  declarator: (type_identifier) @def.class.name) @def.class
+(type_definition
+  declarator: (function_declarator
+    declarator: (pointer_declarator
+      declarator: (type_identifier) @def.class.name))) @def.class
 
 ; ---- free functions & out-of-line / inline method definitions ----
 ; the name lives at the bottom of the declarator chain; one pattern per
@@ -173,6 +185,19 @@
   declarator: (init_declarator
     declarator: (reference_declarator (identifier) @flow.target)
     value: (_) @flow.source))
+
+; ---- function PARAMETERS carry a type too (the dominant embedded site:
+; `void f(Handle *h) { h->... }`). Value / pointer / reference forms;
+; pointer-/reference-ness dropped for navigation, like locals. ----
+(parameter_declaration
+  type: (_) @type.annot
+  declarator: (identifier) @flow.target)
+(parameter_declaration
+  type: (_) @type.annot
+  declarator: (pointer_declarator declarator: (identifier) @flow.target))
+(parameter_declaration
+  type: (_) @type.annot
+  declarator: (reference_declarator (identifier) @flow.target))
 
 ; ---- literals + variable reads (the edge-chase substrate) ----
 (number_literal) @expr.lit.number

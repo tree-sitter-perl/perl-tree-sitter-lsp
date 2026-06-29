@@ -1,0 +1,24 @@
+{
+  "capability": "outline",
+  "rows": [
+    {
+      "id": "c-enum-constants",
+      "difficulty": "moderate",
+      "semantic_area": "c-misra",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "cenum.c",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"name\":\"RED\"",
+          "\"name\":\"Color\"",
+          "\"name\":\"u32\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}
