@@ -88,6 +88,13 @@
       declarator: (field_identifier) @def.method.name))) @def.method
 (field_declaration
   declarator: (field_identifier) @def.var.name) @def.var
+; a data member's TYPE — the type witness needs field_declaration (the
+; `declaration` patterns below only see locals). Only plain-field
+; declarators match (a function_declarator is a method, not a field), so
+; member-access chains (`box.inner.`) can type `inner` on its class.
+(field_declaration
+  type: (_) @type.annot
+  declarator: (field_identifier) @flow.target)
 
 ; ---- calls ----
 (call_expression function: (identifier) @ref.call) @expr.call

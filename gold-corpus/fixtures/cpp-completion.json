@@ -60,6 +60,44 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-completion-chained-field",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "chain.cpp",
+      "line": 12,
+      "col": 12,
+      "expect": {
+        "all": [
+          "deep",
+          "leaf"
+        ],
+        "none": [
+          "grow"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-completion-deep-chain",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "c3.cpp",
+      "line": 5,
+      "col": 10,
+      "expect": {
+        "all": [
+          "z",
+          "zz"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

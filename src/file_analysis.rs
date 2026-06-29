@@ -4397,6 +4397,32 @@ impl FileAnalysis {
         candidates
     }
 
+    /// The declared type of data field `field` on `class` (or an ancestor)
+    /// — a member's type for pack-language member-access chains (`a.b.`).
+    /// Finds the field symbol (package == the class) and reads its bag type.
+    pub fn field_type_on_class(
+        &self,
+        class: &str,
+        field: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<InferredType> {
+        let mut found = None;
+        self.for_each_ancestor_class(class, module_index, |c| {
+            if let Some(sym) = self.symbols.iter().find(|s| {
+                matches!(s.kind, SymKind::Variable | SymKind::Field)
+                    && s.name == field
+                    && s.package.as_deref() == Some(c)
+            }) {
+                found = self.inferred_type_via_bag(field, sym.span.end);
+                if found.is_some() {
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        found
+    }
+
     /// Recursively collect methods from a class and its ancestors, deduping by name.
     fn collect_ancestor_methods(
         &self,

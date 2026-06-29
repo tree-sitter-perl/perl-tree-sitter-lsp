@@ -28,15 +28,13 @@ pub fn pack_completion(
         {
             let cursor = crate::cursor_sentinel::point_to_byte(source, point);
             let mut parser = driver.make_parser();
-            if let Some(recv) = crate::cursor_sentinel::receiver_at_incremental(
-                &mut parser, cfg, source, tree, cursor,
-            ) {
-                let span = crate::file_analysis::Span {
-                    start: crate::cursor_sentinel::byte_to_point(source, recv.start),
-                    end: crate::cursor_sentinel::byte_to_point(source, recv.end),
-                };
+            if let Some(class) = crate::cursor_sentinel::receiver_type_at_incremental(
+                &mut parser, cfg, source, tree, cursor, analysis, Some(module_index),
+            )
+            .and_then(|ty| ty.class_name().map(|s| s.to_string()))
+            {
                 if let Some(items) =
-                    symbols::member_completion_for_span(analysis, span, module_index)
+                    symbols::member_completion_for_class(analysis, &class, module_index)
                 {
                     return items;
                 }

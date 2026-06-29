@@ -24,6 +24,7 @@
 //! Language config is a two-field table (rule #10): the member-access node
 //! kinds and the don't-splice-here set are the only facts that vary.
 
+use crate::file_analysis::{CrossFileLookup, FileAnalysis, InferredType, Span};
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 /// The placeholder spliced at the cursor to complete a dangling member
@@ -254,7 +255,65 @@ pub fn receiver_at_incremental(
     receiver_of(member, &patched, cursor)
 }
 
-pub fn byte_to_point(src: &str, byte: usize) -> Point {
+/// Resolve the TYPE of the member-access receiver at the cursor (the chain
+/// left of the `.`/`->`), recursing through field accesses: `box.` → type
+/// of `box`; `box.inner.` → type of field `inner` on box's class;
+/// `a.b.c.` chases transitively. `None` when not a member access or the
+/// receiver doesn't type. The patched tree's receiver spans equal the
+/// original (free-anchor), so they line up with the bag's witnesses.
+pub fn receiver_type_at_incremental(
+    parser: &mut Parser,
+    cfg: &LangCfg,
+    src: &str,
+    old: &Tree,
+    cursor: usize,
+    analysis: &FileAnalysis,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> Option<InferredType> {
+    if cursor_in_skip(old, src, cursor, cfg) {
+        return None;
+    }
+    let patched = patch(src, cursor);
+    let mut edited = old.clone();
+    let pos = byte_to_point(src, cursor);
+    edited.edit(&InputEdit {
+        start_byte: cursor,
+        old_end_byte: cursor,
+        new_end_byte: cursor + SENTINEL.len(),
+        start_position: pos,
+        old_end_position: pos,
+        new_end_position: Point::new(pos.row, pos.column + SENTINEL.len()),
+    });
+    let tree = parser.parse(&patched, Some(&edited))?;
+    let node = find_sentinel(tree.root_node(), &patched, cursor)?;
+    let member = climb_to_member(node, cfg)?;
+    let receiver = member.named_child(0)?;
+    resolve_node_type(receiver, cfg, &patched, analysis, module_index)
+}
+
+/// Type a receiver node. A member-access node (`field_expression` /
+/// `attribute`) is field-on-class — recurse the base, look the field up on
+/// its class; anything else (an identifier, a call) resolves by its exact
+/// span through the bag (`expr_type_at_span`).
+fn resolve_node_type(
+    node: Node,
+    cfg: &LangCfg,
+    src: &str,
+    analysis: &FileAnalysis,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> Option<InferredType> {
+    if cfg.member_kinds.contains(&node.kind()) {
+        let base = node.named_child(0)?;
+        let field = node.named_child(node.named_child_count() - 1)?;
+        let class = resolve_node_type(base, cfg, src, analysis, module_index)?.class_name()?.to_string();
+        let field_name = field.utf8_text(src.as_bytes()).ok()?;
+        return analysis.field_type_on_class(&class, field_name, module_index);
+    }
+    let span = Span { start: node.start_position(), end: node.end_position() };
+    analysis.expr_type_at_span(span, module_index)
+}
+
+fn byte_to_point(src: &str, byte: usize) -> Point {
     let mut row = 0;
     let mut col = 0;
     for (i, ch) in src.char_indices() {
