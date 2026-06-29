@@ -240,9 +240,22 @@ fn remap_spans(
         s.name_start = r(s.name_start);
         s.name_end = r(s.name_end);
     }
+    // A ref/read that came OUT of a macro expansion collapses to a
+    // zero-width point under `to_original` (every expanded byte maps to the
+    // splice site) — goto-def/hover would then miss it. Give it the macro
+    // CALL site's extent instead, so `newThing(5)` resolves to the expanded
+    // `Perl_newThing` (see-through to the function).
+    let remap_span = |start: Point, end: Point| -> (Point, Point) {
+        match map.replacement_at(t.byte(start)) {
+            Some((os, oe)) => (o.point(os), o.point(oe)),
+            None => (r(start), r(end)),
+        }
+    };
     for rf in &mut skel.refs {
-        rf.start = r(rf.start);
-        rf.end = r(rf.end);
+        (rf.start, rf.end) = remap_span(rf.start, rf.end);
+    }
+    for (_, _, span) in &mut skel.var_reads {
+        (span.start, span.end) = remap_span(span.start, span.end);
     }
     for sc in &mut skel.scopes {
         sc.span.start = r(sc.span.start);

@@ -11,6 +11,7 @@ PERL_LSP_BIN="$PWD/target/release/perl-lsp" \
   PERL_LSP_BIN="$PWD/target/release/perl-lsp" \
   nvim --headless --clean -u e2e/init_cpp.lua -l e2e/cpp_members.lua
   nvim --headless --clean -u e2e/init_cpp.lua -l e2e/cpp_locals.lua
+  nvim --headless --clean -u e2e/init_cpp.lua -l e2e/cpp_macro_calls.lua
 
 PERL_LSP_BIN="$PWD/target/release/perl-lsp" \
   nvim --headless --clean -u e2e/init_python.lua -l e2e/python_members.lua

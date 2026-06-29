@@ -73,6 +73,27 @@ impl SpliceMap {
         }
         (transformed as isize - shift) as usize
     }
+
+    /// If `transformed` falls INSIDE a replacement (a macro expansion),
+    /// return the replacement's ORIGINAL extent `(orig_start, orig_end)` —
+    /// the macro-call site. A symbol/ref that came out of an expansion
+    /// (`newThing(5)` → `Perl_newThing(aTHX_ 5)`) collapses to a zero-width
+    /// point under `to_original`; callers use this to give it the call
+    /// site's span instead, so goto-def/hover land on the macro call.
+    pub fn replacement_at(&self, transformed: usize) -> Option<(usize, usize)> {
+        let mut shift: isize = 0;
+        for &(os, oe, nlen) in &self.edits {
+            let ts = (os as isize + shift) as usize;
+            if transformed < ts {
+                return None;
+            }
+            if transformed < ts + nlen {
+                return Some((os, oe));
+            }
+            shift += nlen as isize - (oe - os) as isize;
+        }
+        None
+    }
 }
 
 const MACRO_DEF_QUERY: &str = r#"
