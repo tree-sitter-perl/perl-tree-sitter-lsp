@@ -13,6 +13,13 @@
   ["<-" "="]
   rhs: (function_definition)) @def.sub
 
+; `name = function(...)` as a list()/R6Class() member — the R OOP idiom.
+; These are `argument` nodes, not `binary_operator`, so the pattern above
+; misses them (the scout found 195 such method defs lost across tidyverse).
+(argument
+  name: (identifier) @def.sub.name
+  value: (function_definition)) @def.sub @scope
+
 (binary_operator
   lhs: (identifier) @def.var.name @flow.target
   ["<-" "="]
