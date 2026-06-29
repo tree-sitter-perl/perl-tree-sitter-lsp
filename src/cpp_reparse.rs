@@ -289,6 +289,25 @@ pub fn included_macros(
     macros
 }
 
+/// A header's own #defines + its include edges — cached by (path, mtime)
+/// so the per-edit re-gather doesn't re-read + re-parse the same dozens of
+/// transitive headers every keystroke (the server is long-lived; headers
+/// rarely change mid-edit, and mtime invalidates when they do).
+struct CachedHeader {
+    macros: BTreeMap<String, Macro>,
+    includes: Vec<String>,
+}
+
+type HeaderCache = std::collections::HashMap<
+    std::path::PathBuf,
+    (std::time::SystemTime, std::sync::Arc<CachedHeader>),
+>;
+
+fn header_cache() -> &'static std::sync::Mutex<HeaderCache> {
+    static C: std::sync::OnceLock<std::sync::Mutex<HeaderCache>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(HeaderCache::new()))
+}
+
 fn gather_macros_rec(
     path: &std::path::Path,
     parser: &mut tree_sitter::Parser,
@@ -300,16 +319,34 @@ fn gather_macros_rec(
         return;
     }
     let Some(canon) = path.canonicalize().ok() else { return };
-    if !seen.insert(canon) {
+    if !seen.insert(canon.clone()) {
         return;
     }
-    let Ok(src) = std::fs::read_to_string(path) else { return };
-    let Some(tree) = parser.parse(&src, None) else { return };
-    for (k, v) in collect_macros(&tree, src.as_bytes()) {
-        macros.entry(k).or_insert(v);
+    let mtime = std::fs::metadata(&canon).and_then(|m| m.modified()).ok();
+    let hit = header_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&canon).and_then(|(t, info)| (Some(*t) == mtime).then(|| info.clone())));
+    let info = match hit {
+        Some(info) => info,
+        None => {
+            let Ok(src) = std::fs::read_to_string(&canon) else { return };
+            let Some(tree) = parser.parse(&src, None) else { return };
+            let info = std::sync::Arc::new(CachedHeader {
+                macros: collect_macros(&tree, src.as_bytes()),
+                includes: include_paths_tree(&tree, &src),
+            });
+            if let (Some(t), Ok(mut c)) = (mtime, header_cache().lock()) {
+                c.insert(canon.clone(), (t, info.clone()));
+            }
+            info
+        }
+    };
+    for (k, v) in &info.macros {
+        macros.entry(k.clone()).or_insert_with(|| v.clone());
     }
-    for inc in include_paths_tree(&tree, &src) {
-        if let Some(next) = resolve_include(path, &inc) {
+    for inc in &info.includes {
+        if let Some(next) = resolve_include(&canon, inc) {
             gather_macros_rec(&next, parser, macros, seen, depth + 1);
         }
     }

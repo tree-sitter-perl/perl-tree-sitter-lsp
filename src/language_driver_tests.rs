@@ -65,3 +65,4 @@ fn cpp_adds_dot_trigger() {
     let tc = LanguageRegistry::with_enabled().trigger_chars();
     assert!(tc.iter().any(|s| s == "."), "cpp build should add '.' trigger: {tc:?}");
 }
+
