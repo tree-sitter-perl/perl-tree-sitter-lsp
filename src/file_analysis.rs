@@ -4359,9 +4359,23 @@ impl FileAnalysis {
         self.collect_ancestor_methods(
             class_name, class_name, module_index, &mut candidates, &mut seen, 0,
         );
+        // Data members live DIRECTLY in the class body scope; a Variable in
+        // a deeper (method) scope is a local/param (Python's `self`), not a
+        // field. Pack scopes are all `Block` (scope_within_sub_body can't
+        // tell them apart), so anchor on where the class's methods are
+        // declared — that IS the body scope, whichever node carries it.
+        let class_body = self
+            .symbols
+            .iter()
+            .find(|s| {
+                matches!(s.kind, SymKind::Sub | SymKind::Method)
+                    && self.symbol_in_class(s.id, class_name)
+            })
+            .map(|m| m.scope);
         for sym in &self.symbols {
             if matches!(sym.kind, SymKind::Variable | SymKind::Field)
                 && self.symbol_in_class(sym.id, class_name)
+                && class_body.is_none_or(|cb| sym.scope == cb)
                 && seen.insert(sym.name.clone())
             {
                 candidates.push(CompletionCandidate {
