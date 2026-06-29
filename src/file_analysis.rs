@@ -4343,6 +4343,41 @@ impl FileAnalysis {
         candidates
     }
 
+    /// Members (methods + data fields) of a class for pack-language member
+    /// completion (`obj.` / `obj->`). Unlike `complete_methods_for_class`
+    /// (Perl-shaped: methods + a synthesized `new`), this includes data
+    /// fields and mints no constructor — C++/Python member access lists
+    /// the real members. Methods (and inherited ones) come from the shared
+    /// ancestor walk; fields are this class's `Variable`/`Field` symbols.
+    pub fn complete_members_for_class(
+        &self,
+        class_name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<CompletionCandidate> {
+        let mut candidates = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        self.collect_ancestor_methods(
+            class_name, class_name, module_index, &mut candidates, &mut seen, 0,
+        );
+        for sym in &self.symbols {
+            if matches!(sym.kind, SymKind::Variable | SymKind::Field)
+                && self.symbol_in_class(sym.id, class_name)
+                && seen.insert(sym.name.clone())
+            {
+                candidates.push(CompletionCandidate {
+                    label: sym.name.clone(),
+                    kind: sym.kind,
+                    detail: None,
+                    insert_text: None,
+                    sort_priority: PRIORITY_LOCAL,
+                    additional_edits: vec![],
+                    display_override: None,
+                });
+            }
+        }
+        candidates
+    }
+
     /// Recursively collect methods from a class and its ancestors, deduping by name.
     fn collect_ancestor_methods(
         &self,

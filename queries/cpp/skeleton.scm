@@ -23,11 +23,13 @@
   body: (declaration_list) @scope) @def.package
 
 ; ---- type defs: class / struct / union / enum ----
+; @context.class tags the body's members with the class name (package),
+; so member completion (`obj.`) and symbol_in_class resolve them.
 (class_specifier
-  name: (type_identifier) @def.class.name
+  name: (type_identifier) @def.class.name @context.class
   body: (field_declaration_list) @scope) @def.class
 (struct_specifier
-  name: (type_identifier) @def.class.name
+  name: (type_identifier) @def.class.name @context.class
   body: (field_declaration_list) @scope) @def.class
 (union_specifier name: (type_identifier) @def.class.name) @def.class
 (enum_specifier name: (type_identifier) @def.class.name) @def.class

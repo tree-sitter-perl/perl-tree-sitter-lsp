@@ -1068,6 +1068,26 @@ fn ref_type_snippet_completions(ty: &InferredType) -> Vec<CompletionItem> {
 /// cursor on a def directly, or on a call/ref to the local def it names.
 /// The Perl `hover_info` renderer is Perl-specific (```perl fences,
 /// method-resolution prose); pack languages get this instead.
+/// Member completion for a pack language: given the receiver's span (the
+/// expression left of the `.`/`->`, recovered by the sentinel reparse),
+/// resolve its type and list the class's members. The tree work (sentinel
+/// reparse → receiver span) happens in the backend; this is the tree-free
+/// span → type → members → items half, reusing the same `expr_type_at_span`
+/// + `complete_methods_for_class` the Perl path uses.
+pub fn member_completion_for_span(
+    analysis: &FileAnalysis,
+    receiver_span: crate::file_analysis::Span,
+    module_index: &ModuleIndex,
+) -> Option<Vec<CompletionItem>> {
+    let ty = analysis.expr_type_at_span(receiver_span, Some(module_index))?;
+    let class = ty.class_name()?;
+    let candidates = analysis.complete_members_for_class(class, Some(module_index));
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(candidates.into_iter().map(candidate_to_completion_item).collect())
+}
+
 pub fn pack_hover_markdown(
     analysis: &FileAnalysis,
     source: &str,

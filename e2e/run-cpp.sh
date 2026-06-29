@@ -8,3 +8,5 @@ echo "building --features cpp release..."
 cargo build --release --features cpp >/dev/null 2>&1
 PERL_LSP_BIN="$PWD/target/release/perl-lsp" \
   nvim --headless --clean -u e2e/init_cpp.lua -l e2e/cpp.lua
+  PERL_LSP_BIN="$PWD/target/release/perl-lsp" \
+  nvim --headless --clean -u e2e/init_cpp.lua -l e2e/cpp_members.lua
