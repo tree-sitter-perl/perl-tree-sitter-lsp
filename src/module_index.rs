@@ -707,6 +707,23 @@ impl ModuleIndex {
         self.cache.insert(module_name, Some(cached));
     }
 
+    /// Register a pack-language file (C++) under each CLASS name it
+    /// defines — unlike Perl (one package per file), a C++ header holds
+    /// many classes, and cross-file lookup is class-keyed. So
+    /// `get_cached("Box")` finds the header defining `Box`, and the same
+    /// MethodOnClass / member-completion machinery resolves across files.
+    pub fn register_cpp_classes(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
+        use crate::file_analysis::SymKind;
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let cached = Arc::new(CachedModule::new(path, analysis.clone()));
+        for sym in &analysis.symbols {
+            if matches!(sym.kind, SymKind::Class) {
+                self.workspace_modules.insert(sym.name.clone(), ());
+                self.cache.insert(sym.name.clone(), Some(cached.clone()));
+            }
+        }
+    }
+
     /// Rebuild the reverse index (`func → modules`) from the current cache.
     /// `warm_cache` writes straight into `cache_raw()` and never touches the
     /// reverse index, so a CLI/full-startup warm path that skips this leaves

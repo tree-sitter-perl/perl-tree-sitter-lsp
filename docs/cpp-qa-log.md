@@ -42,3 +42,13 @@ projects) — now guarded.
 - **`auto`/deduced return types** (cpp-xfail-auto-deduced-return). The
   return depends on the body, which needs the iterative fold the cpp pack
   doesn't run. Declared returns work; `auto` is the tail.
+
+## Note: cpp cross-file resolution
+
+Method-return resolution flows through MethodOnClass, which is cross-file
+CAPABLE (the reducer recurses into a cached module's bag). But C++ has no
+workspace/module index yet — only the queried file + its #included macros
+are analyzed. So cross-file method returns + goto-def into another header
+aren't active yet; that's the next cross-file piece (a cpp workspace
+indexer, mirroring the Perl module_resolver). Single-file + inheritance
+within the file work today.
