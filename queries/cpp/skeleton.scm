@@ -163,11 +163,11 @@
 (declaration
   type: (_) @type.annot
   declarator: (init_declarator
-    declarator: (identifier) @flow.target
+    declarator: (identifier) @flow.target @def.local
     value: (_) @flow.source))
 (declaration
   type: (_) @type.annot
-  declarator: (identifier) @flow.target)
+  declarator: (identifier) @flow.target @def.local)
 
 ; pointer-declared locals: `T* p;`, `T* p = init;`, and the
 ; condition-form `if (Derived* d = dynamic_cast<Derived*>(b))` — the
@@ -177,20 +177,20 @@
 (declaration
   type: (_) @type.annot
   declarator: (pointer_declarator
-    declarator: (identifier) @flow.target))
+    declarator: (identifier) @flow.target @def.local))
 (declaration
   type: (_) @type.annot
   declarator: (init_declarator
-    declarator: (pointer_declarator declarator: (identifier) @flow.target)
+    declarator: (pointer_declarator declarator: (identifier) @flow.target @def.local)
     value: (_) @flow.source))
 ; reference-declared locals: `T& r = x;` (the referent names the class).
 (declaration
   type: (_) @type.annot
-  declarator: (reference_declarator (identifier) @flow.target))
+  declarator: (reference_declarator (identifier) @flow.target @def.local))
 (declaration
   type: (_) @type.annot
   declarator: (init_declarator
-    declarator: (reference_declarator (identifier) @flow.target)
+    declarator: (reference_declarator (identifier) @flow.target @def.local)
     value: (_) @flow.source))
 
 ; ---- function PARAMETERS carry a type too (the dominant embedded site:
@@ -198,13 +198,13 @@
 ; pointer-/reference-ness dropped for navigation, like locals. ----
 (parameter_declaration
   type: (_) @type.annot
-  declarator: (identifier) @flow.target)
+  declarator: (identifier) @flow.target @def.local)
 (parameter_declaration
   type: (_) @type.annot
-  declarator: (pointer_declarator declarator: (identifier) @flow.target))
+  declarator: (pointer_declarator declarator: (identifier) @flow.target @def.local))
 (parameter_declaration
   type: (_) @type.annot
-  declarator: (reference_declarator (identifier) @flow.target))
+  declarator: (reference_declarator (identifier) @flow.target @def.local))
 
 ; ---- literals + variable reads (the edge-chase substrate) ----
 (number_literal) @expr.lit.number

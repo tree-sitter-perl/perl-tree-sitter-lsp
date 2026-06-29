@@ -1105,6 +1105,18 @@ pub fn pack_hover_markdown(
         FaSymKind::Variable | FaSymKind::Field => "variable",
         _ => "symbol",
     };
+    // For a variable, surface its inferred CLASS — the resolved object type
+    // (`box: Box`, a chain result) the syntactic decl line doesn't spell
+    // out. Primitives fall through to the decl line (which already shows the
+    // type).
+    if matches!(sym.kind, FaSymKind::Variable | FaSymKind::Field) {
+        if let Some(class) = analysis
+            .inferred_type_via_bag(&sym.name, point)
+            .and_then(|t| t.class_name().map(str::to_string))
+        {
+            return Some(format!("```{}\n{}: {}\n```\n\n*variable*", language, sym.name, class));
+        }
+    }
     Some(format!("```{}\n{}\n```\n\n*{}*", language, sig, kind))
 }
 

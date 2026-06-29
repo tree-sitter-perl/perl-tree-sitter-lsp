@@ -67,6 +67,10 @@ pub struct SkeletonAnalysis {
     pub witnesses: Vec<crate::witnesses::Witness>,
     /// (child class, parent class) inheritance edges — `@parent` captures.
     pub parents: Vec<(String, String)>,
+    /// Variable reads (`@expr.read.var`): (name, scope, span). Each resolves
+    /// to the nearest visible Variable declaration by lexical scope walk →
+    /// local goto-def + hover. Resolution runs in `into_file_analysis`.
+    pub var_reads: Vec<(String, crate::file_analysis::ScopeId, crate::file_analysis::Span)>,
 }
 
 impl SkeletonAnalysis {
@@ -205,7 +209,63 @@ impl SkeletonAnalysis {
                 }
             }
         }
-        let refs: Vec<crate::file_analysis::Ref> = self
+        // ---- Local/param vars: a variable READ resolves to the nearest
+        // visible Variable declaration by lexical scope walk → local
+        // goto-def + hover. Declarations are already Variable symbols
+        // (`@def.local`/`@def.var`); fields are excluded naturally (their
+        // class scope isn't on a local read's scope chain).
+        let mut defs_by_name: std::collections::HashMap<
+            String,
+            Vec<(crate::file_analysis::ScopeId, Span, SymbolId)>,
+        > = std::collections::HashMap::new();
+        for s in &symbols {
+            if matches!(s.kind, SymKind::Variable) {
+                defs_by_name
+                    .entry(s.name.clone())
+                    .or_default()
+                    .push((s.scope, s.selection_span, s.id));
+            }
+        }
+        let scope_parent: std::collections::HashMap<
+            crate::file_analysis::ScopeId,
+            Option<crate::file_analysis::ScopeId>,
+        > = self.scopes.iter().map(|s| (s.id, s.parent)).collect();
+        let mut local_refs: Vec<crate::file_analysis::Ref> = Vec::new();
+        for (name, read_scope, read_span) in &self.var_reads {
+            let Some(cands) = defs_by_name.get(name) else { continue };
+            let rp = (read_span.start.row, read_span.start.column);
+            let mut cur = Some(*read_scope);
+            let mut resolved: Option<SymbolId> = None;
+            while let Some(sc) = cur {
+                // nearest decl of this name in THIS scope level, declared at
+                // or before the read (latest-wins for redeclaration).
+                let mut best: Option<((usize, usize), SymbolId)> = None;
+                for (dscope, dspan, did) in cands {
+                    let dp = (dspan.start.row, dspan.start.column);
+                    if *dscope == sc && dp <= rp && best.is_none_or(|(bp, _)| dp > bp) {
+                        best = Some((dp, *did));
+                    }
+                }
+                if let Some((_, did)) = best {
+                    resolved = Some(did);
+                    break;
+                }
+                cur = scope_parent.get(&sc).copied().flatten();
+            }
+            if let Some(did) = resolved {
+                local_refs.push(crate::file_analysis::Ref {
+                    kind: crate::file_analysis::RefKind::Variable,
+                    span: *read_span,
+                    scope: *read_scope,
+                    target_name: name.clone(),
+                    access: crate::file_analysis::AccessKind::Read,
+                    resolves_to: Some(did),
+                    resolved_method_target: None,
+                });
+            }
+        }
+
+        let mut refs: Vec<crate::file_analysis::Ref> = self
             .refs
             .iter()
             .filter(|r| r.kind == "call")
@@ -219,6 +279,7 @@ impl SkeletonAnalysis {
                 resolved_method_target: None,
             })
             .collect();
+        refs.extend(local_refs);
         let mut package_parents: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for (child, parent) in &self.parents {
@@ -787,6 +848,13 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 // whatever the Variable resolves to — same shape the
                 // builder's emit_expr_witness uses.
                 let span = Span { start: e.start, end: e.end };
+                // …and a candidate local-var reference, resolved to its
+                // declaration in into_file_analysis (goto-def + hover).
+                out.var_reads.push((
+                    (pack.shape_name)("ref.var", &e.text),
+                    cur_scope,
+                    span,
+                ));
                 out.witnesses.push(crate::witnesses::Witness {
                     attachment: crate::witnesses::WitnessAttachment::Expr(span),
                     source: crate::witnesses::WitnessSource::Builder("skeleton".into()),

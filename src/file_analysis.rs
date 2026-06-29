@@ -7498,6 +7498,25 @@ impl FileAnalysis {
             if sym.scope != parent_scope {
                 continue;
             }
+            // Local variables — navigation targets (goto-def, hover) but not
+            // outline structure. A local is an unpackaged Variable inside a
+            // Sub/Method/Block/ForLoop; fields carry their class as `package`
+            // and file/package-level vars live in the File/Package scope, so
+            // both still surface.
+            if matches!(sym.kind, SymKind::Variable)
+                && sym.package.is_none()
+                && self.scopes.iter().find(|s| s.id == parent_scope).is_some_and(|s| {
+                    matches!(
+                        s.kind,
+                        ScopeKind::Sub { .. }
+                            | ScopeKind::Method { .. }
+                            | ScopeKind::Block
+                            | ScopeKind::ForLoop { .. }
+                    )
+                })
+            {
+                continue;
+            }
             // Per-symbol opt-out. Plugins mark DSL imports / internal
             // infrastructure so the outline stays focused on real
             // user-visible structure.
