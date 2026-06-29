@@ -28,6 +28,10 @@ pub trait LanguageDriver: Send + Sync {
     fn analyze(&self, source: &str) -> FileAnalysis;
     /// Module name → workspace-relative candidate paths.
     fn module_paths(&self, module: &str) -> Vec<String>;
+    /// Completion trigger characters for this language — the registry
+    /// unions them into the LSP `completionProvider` slot, so the client
+    /// auto-fires completion (e.g. on `.`/`->`) for the right files.
+    fn trigger_chars(&self) -> &[&'static str];
 }
 
 /// Perl — the reference driver. Wraps the production builder; behaviour
@@ -53,6 +57,11 @@ impl LanguageDriver for PerlDriver {
     }
     fn module_paths(&self, module: &str) -> Vec<String> {
         vec![format!("{}.pm", module.replace("::", "/"))]
+    }
+    fn trigger_chars(&self) -> &[&'static str] {
+        // Sigils open variable completion; `>`/`:`/`{` open
+        // method/pkg/hash-key slots; `(`/`,` are signature-help adjacent.
+        &["$", "@", "%", ">", ":", "{", "(", ","]
     }
 }
 
@@ -104,6 +113,9 @@ impl LanguageDriver for PackDriver {
     }
     fn module_paths(&self, module: &str) -> Vec<String> {
         ((self.pack)().module_paths)(module)
+    }
+    fn trigger_chars(&self) -> &[&'static str] {
+        (self.pack)().trigger_chars
     }
 }
 
@@ -261,6 +273,20 @@ impl LanguageRegistry {
     /// Configured language ids — what this distribution serves.
     pub fn languages(&self) -> Vec<&'static str> {
         self.drivers.iter().map(|d| d.id()).collect()
+    }
+
+    /// Union of every served language's completion trigger characters,
+    /// for the LSP `completionProvider.triggerCharacters` slot.
+    pub fn trigger_chars(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for d in &self.drivers {
+            for c in d.trigger_chars() {
+                if !out.iter().any(|s| s == c) {
+                    out.push((*c).to_string());
+                }
+            }
+        }
+        out
     }
 }
 

@@ -49,3 +49,19 @@ fn cpp_macro_recovered_spans_are_in_original_coords() {
     let line = src.lines().nth(1).unwrap();
     assert_eq!(&line[p.column..p.column + 3], "Box");
 }
+
+#[test]
+fn perl_trigger_chars_unchanged() {
+    let tc = LanguageRegistry::with_enabled().trigger_chars();
+    // The Perl reference set — a perl-only build must keep exactly these.
+    for c in ["$", "@", "%", ">", ":", "{", "(", ","] {
+        assert!(tc.iter().any(|s| s == c), "missing perl trigger {c}");
+    }
+}
+
+#[cfg(feature = "cpp")]
+#[test]
+fn cpp_adds_dot_trigger() {
+    let tc = LanguageRegistry::with_enabled().trigger_chars();
+    assert!(tc.iter().any(|s| s == "."), "cpp build should add '.' trigger: {tc:?}");
+}

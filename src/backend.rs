@@ -279,16 +279,12 @@ impl LanguageServer for Backend {
                 document_range_formatting_provider: Some(OneOf::Left(true)),
                 linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![
-                        "$".to_string(),
-                        "@".to_string(),
-                        "%".to_string(),
-                        ">".to_string(),
-                        ":".to_string(),
-                        "{".to_string(),
-                        "(".to_string(),
-                        ",".to_string(),
-                    ]),
+                    // Union of every served language's trigger chars — Perl
+                    // sigils/`->`/`{`, plus a pack language's `.`/`::` etc.
+                    // A perl-only build is byte-identical to the old list.
+                    trigger_characters: Some(
+                        crate::language_driver::LanguageRegistry::with_enabled().trigger_chars(),
+                    ),
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {

@@ -171,6 +171,11 @@ pub struct LangPack {
     /// "which guard means which refinement" (rule #10); core just scopes
     /// the witness to the block.
     pub narrow_guard: fn(guard: &str, type_text: &str) -> Option<InferredType>,
+    /// Completion trigger characters for the LSP
+    /// `completionProvider.triggerCharacters` slot — the client auto-fires
+    /// completion (and reports the char in `CompletionContext`) when one is
+    /// typed. C++ `. > :` cover `.`/`->`/`::`; the member path keys off them.
+    pub trigger_chars: &'static [&'static str],
 }
 
 /// One effect of a command-dispatched statement.
@@ -209,6 +214,7 @@ pub fn perl_pack() -> LangPack {
         import_call: |_, _| None,
         cmd_effects: |_| vec![],
         narrow_guard: |_, _| None,
+        trigger_chars: &["$", "@", "%", ">", ":", "{"],
     }
 }
 
@@ -243,6 +249,7 @@ pub fn python_pack() -> LangPack {
         cmd_effects: |_| vec![],
         // `isinstance(x, Foo)` narrows x to Foo inside the guard.
         narrow_guard: |guard, ty| (guard == "isinstance").then(|| InferredType::ClassName(ty.to_string())),
+        trigger_chars: &["."],
     }
 }
 
@@ -266,6 +273,7 @@ pub fn r_pack() -> LangPack {
         },
         cmd_effects: |_| vec![],
         narrow_guard: |_, _| None,
+        trigger_chars: &["$", "@", ":"],
     }
 }
 
@@ -302,6 +310,7 @@ pub fn cmake_pack() -> LangPack {
             _ => vec![],
         },
         narrow_guard: |_, _| None,
+        trigger_chars: &["{", "("],
     }
 }
 
@@ -349,6 +358,7 @@ pub fn cpp_pack() -> LangPack {
         import_call: |_, _| None,
         cmd_effects: |_| vec![],
         narrow_guard: |_, _| None,
+        trigger_chars: &[".", ">", ":"],
     }
 }
 
