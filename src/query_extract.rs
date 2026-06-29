@@ -441,10 +441,16 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // ---- join def name-captures to their def event ----
     use std::collections::HashMap;
     let mut names_by_match: HashMap<(usize, String), (String, Point, Point)> = HashMap::new();
+    // `@qualifier` (a `Class::` on an out-of-line def) — pre-collected like
+    // names because the `@def` event fires before the inner qualifier.
+    let mut qualifier_by_match: HashMap<usize, String> = HashMap::new();
     for e in &events {
         if let Some(prefix) = e.cap.strip_suffix(".name") {
             names_by_match
                 .insert((e.match_id, prefix.to_string()), (e.text.clone(), e.start, e.end));
+        }
+        if e.cap == "qualifier" {
+            qualifier_by_match.insert(e.match_id, e.text.clone());
         }
     }
 
@@ -612,6 +618,13 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     })
                     .unwrap_or((e.text.clone(), e.start, e.end));
                 def_name_spans.push((e.start_byte, e.end_byte));
+                // An out-of-line def's `Class::` qualifier names its owner
+                // (the LAST `::` segment, the unqualified class the engine
+                // keys by) — override the enclosing-namespace context.
+                let pkg = qualifier_by_match
+                    .get(&e.match_id)
+                    .map(|q| q.rsplit("::").next().unwrap_or(q).to_string())
+                    .or_else(|| package.clone());
                 out.symbols.push(SkelSymbol {
                     name: (pack.shape_name)(&format!("def.{kind}"), &name),
                     kind,
@@ -619,7 +632,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     end: e.end,
                     name_start,
                     name_end,
-                    package: package.clone(),
+                    package: pkg,
                     scope_depth: scope_stack.len(),
                     scope: cur_scope,
                 });

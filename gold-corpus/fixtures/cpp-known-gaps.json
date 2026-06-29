@@ -3,11 +3,39 @@
   "rows": [
     {
       "id": "cpp-xfail-cross-file-namespace-macro",
-      "difficulty": "hard", "semantic_area": "cpp-multilang-macros",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "ns_macro.cpp", "line": 0, "col": 0,
-      "expect": { "all": ["\"kind\":\"Class\",\"line\":\"6\",\"name\":\"Logger\""], "none": [] },
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "ns_macro.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Class\",\"line\":\"6\",\"name\":\"Logger\""
+        ],
+        "none": []
+      },
       "status": "xfail"
+    },
+    {
+      "id": "cpp-out-of-line-method-qualifier",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "outofline.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"name\":\"area\",\"package\":\"Widget\""
+        ],
+        "none": [
+          "\"name\":\"area\",\"package\":\"ns\""
+        ]
+      },
+      "status": "gold"
     }
   ]
 }

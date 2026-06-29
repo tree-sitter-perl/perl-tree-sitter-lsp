@@ -53,9 +53,13 @@
 (function_definition
   declarator: (function_declarator
     declarator: (field_identifier) @def.method.name)) @def.method @scope
+; out-of-line definition `RetT Class::method(...) { ... }` — @qualifier
+; carries the `Class::` so the method attributes to its class, not the
+; enclosing namespace.
 (function_definition
   declarator: (function_declarator
     declarator: (qualified_identifier
+      scope: (_) @qualifier
       name: (identifier) @def.method.name))) @def.method @scope
 (function_definition
   declarator: (pointer_declarator
@@ -70,6 +74,7 @@
 (declaration
   declarator: (function_declarator
     declarator: (qualified_identifier
+      scope: (_) @qualifier
       name: (identifier) @def.method.name))) @def.method
 
 ; ---- in-class method declarations (prototypes) & member fields ----
