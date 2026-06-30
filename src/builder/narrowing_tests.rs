@@ -130,6 +130,49 @@ fn narrow_truncated_at_reassignment() {
     );
 }
 
+// Truncation must recognize EVERY way Perl rebinds a scalar, not just
+// `$x = …` / `my $x` — else a stale narrowing leaks past the rebind (an
+// always-on false `undef-deref` for the `defined`-guard flavor). One test
+// per binding shape `cst::rebinds_scalar` must catch.
+
+#[test]
+fn narrow_truncated_at_list_assignment() {
+    // `($x, $y) = …` rebinds BOTH targets. The parenthesized LHS is where
+    // `child_by_field_name("left")` returns None, so truncation reads the first
+    // named child instead. Narrow `$y` — the non-first target — to prove every
+    // element of the list ends its own narrowing.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x, $y) = @_;\n    if ($y->isa('Bar')) {\n        $y->before;\n        ($x, $y) = pair();\n        $y->after;\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$y", Point::new(4, 8)),
+        Some(InferredType::ClassName("Bar".into())),
+        "narrowed before the list-assignment",
+    );
+    assert_ne!(
+        fa.inferred_type_via_bag("$y", Point::new(6, 8)),
+        Some(InferredType::ClassName("Bar".into())),
+        "list-assignment rebinds $y (a non-first target) → truncates",
+    );
+}
+
+#[test]
+fn narrow_truncated_at_foreach_loop_var() {
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    if ($x->isa('Foo')) {\n        $x->before;\n        for $x (@items) {\n            $x->after;\n        }\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 8)),
+        Some(InferredType::ClassName("Foo".into())),
+        "narrowed before the loop",
+    );
+    assert_ne!(
+        fa.inferred_type_via_bag("$x", Point::new(6, 12)),
+        Some(InferredType::ClassName("Foo".into())),
+        "foreach loop variable rebinds $x → truncates",
+    );
+}
+
 #[test]
 fn narrow_conjunction_intersects() {
     let fa = build_fa(
