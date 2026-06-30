@@ -563,6 +563,20 @@ impl Symbol {
             _ => &self.name,
         }
     }
+
+    /// The displayed TYPE of this symbol: the inferred type's exact class (or
+    /// the generic primitive name) plus this symbol's pointer/reference stack
+    /// (`Box**`, `const Box*`). THE single "name: type" projection — hover,
+    /// member hover, inlay hints, and signature help all render through it, so
+    /// the pointer stars can't vanish on some surfaces and not others.
+    pub fn display_type(&self, ty: &InferredType) -> String {
+        let base = ty
+            .class_name()
+            .map(String::from)
+            .unwrap_or_else(|| format_inferred_type(ty));
+        let stars: String = self.deref_stack.iter().map(|s| s.render()).collect();
+        format!("{}{}", base, stars)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -4599,75 +4613,34 @@ impl FileAnalysis {
     /// field lives in THIS analysis (current file); `Some(path)` = a
     /// cross-file class. Drives goto-def on `obj->field`. Same cross-file
     /// ancestor walk as member completion.
-    pub fn member_def_site(
-        &self,
-        class: &str,
-        field: &str,
-        module_index: Option<&dyn CrossFileLookup>,
-    ) -> Option<(Option<std::path::PathBuf>, Span)> {
-        let mut found = None;
-        self.for_each_ancestor_class(class, module_index, |cls| {
-            let is_member = |s: &&Symbol| {
-                matches!(s.kind, SymKind::Variable | SymKind::Field)
-                    && s.name == field
-                    && s.package.as_deref() == Some(cls)
-            };
-            if let Some(sym) = self.symbols.iter().find(is_member) {
-                found = Some((None, sym.selection_span));
-                return std::ops::ControlFlow::Break(());
-            }
-            if let Some(cached) = module_index.and_then(|mi| mi.get_cached(cls)) {
-                if let Some(sym) = cached.analysis.symbols.iter().find(is_member) {
-                    found = Some((Some(cached.path.clone()), sym.selection_span));
-                    return std::ops::ControlFlow::Break(());
-                }
-            }
-            std::ops::ControlFlow::Continue(())
-        });
-        found
-    }
-
-    /// `field: type` for hover on `obj->field` — the member's name + its
-    /// rendered type (exact class for objects + the pointer stack, generic
-    /// for primitives), resolved through the cross-file ancestor walk. Reads
-    /// the type from the field's OWNING analysis (self or the cached module).
+    /// `field: type` for hover on `obj->field`, resolved through the SAME
+    /// `resolve_method_in_ancestors` walk goto-def uses — no parallel walk.
+    /// Type read from the field's OWNING analysis; rendered via the one
+    /// `display_type` projection.
     pub fn member_hover(
         &self,
         class: &str,
         field: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<String> {
-        let render = |analysis: &FileAnalysis, cls: &str| -> Option<String> {
-            let sym = analysis.symbols.iter().find(|s| {
-                matches!(s.kind, SymKind::Variable | SymKind::Field)
-                    && s.name == field
-                    && s.package.as_deref() == Some(cls)
-            })?;
-            let ty = analysis.inferred_type_via_bag(field, sym.span.end);
-            let base = ty
-                .as_ref()
-                .map(|t| t.class_name().map(String::from).unwrap_or_else(|| format_inferred_type(t)));
-            let stars: String = sym.deref_stack.iter().map(|s| s.render()).collect();
-            Some(match base {
-                Some(b) => format!("{}: {}{}", field, b, stars),
-                None => field.to_string(),
-            })
+        let render = |analysis: &FileAnalysis, sym: &Symbol| match analysis
+            .inferred_type_via_bag(field, sym.span.end)
+        {
+            Some(ty) => format!("{}: {}", field, sym.display_type(&ty)),
+            None => field.to_string(),
         };
-        let mut result = None;
-        self.for_each_ancestor_class(class, module_index, |cls| {
-            if let Some(h) = render(self, cls) {
-                result = Some(h);
-                return std::ops::ControlFlow::Break(());
+        match self.resolve_method_in_ancestors(class, field, module_index)? {
+            MethodResolution::Local { sym_id, .. } => Some(render(self, self.symbol(sym_id))),
+            MethodResolution::CrossFile { class, .. } => {
+                let cached = module_index?.get_cached(&class)?;
+                let sym = cached.analysis.symbols.iter().find(|s| {
+                    matches!(s.kind, SymKind::Variable | SymKind::Field)
+                        && s.name == field
+                        && s.package.as_deref() == Some(class.as_str())
+                })?;
+                Some(render(&cached.analysis, sym))
             }
-            if let Some(cached) = module_index.and_then(|mi| mi.get_cached(cls)) {
-                if let Some(h) = render(&cached.analysis, cls) {
-                    result = Some(h);
-                    return std::ops::ControlFlow::Break(());
-                }
-            }
-            std::ops::ControlFlow::Continue(())
-        });
-        result
+        }
     }
 
     /// The declared type of data field `field` on `class` (or an ancestor)

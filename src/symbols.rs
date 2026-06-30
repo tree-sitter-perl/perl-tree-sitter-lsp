@@ -1171,6 +1171,13 @@ pub fn pack_hover_markdown(
     // the cross-file index and render its signature from the defining file.
     let midx = module_index?;
     let r = analysis.ref_at(point)?;
+    // Member access (`obj->field`): the MethodCall ref resolves its invocant
+    // class, then the field's `name: type` — the same ref goto-def lands on.
+    if matches!(r.kind, RefKind::MethodCall { .. }) {
+        let cn = analysis.method_call_invocant_class(r, Some(midx))?;
+        let h = analysis.member_hover(&cn, r.unqualified_target_name(), Some(midx))?;
+        return Some(format!("```{}\n{}\n```\n\n*field*", language, h));
+    }
     if !matches!(r.kind, RefKind::FunctionCall { .. }) {
         return None;
     }
@@ -1202,14 +1209,12 @@ fn render_symbol_hover(
 ) -> String {
     if matches!(sym.kind, FaSymKind::Variable | FaSymKind::Field) {
         if let Some(ty) = analysis.inferred_type_via_bag(&sym.name, type_point) {
-            let base = ty
-                .class_name()
-                .map(String::from)
-                .unwrap_or_else(|| crate::file_analysis::format_inferred_type(&ty));
-            // The deref stack restores the exact pointer/reference type that
-            // resolution drops (`pp: Box**`, `c: Box* const`).
-            let stars: String = sym.deref_stack.iter().map(|s| s.render()).collect();
-            return format!("```{}\n{}: {}{}\n```\n\n*variable*", language, sym.name, base, stars);
+            return format!(
+                "```{}\n{}: {}\n```\n\n*variable*",
+                language,
+                sym.name,
+                sym.display_type(&ty)
+            );
         }
     }
     let line = source.lines().nth(line_at.row).unwrap_or("").trim();
@@ -2225,7 +2230,7 @@ pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
                     }
                     hints.push(InlayHint {
                         position: point_to_position(decl_point),
-                        label: InlayHintLabel::String(format!(": {}", format_inferred_type(&ty))),
+                        label: InlayHintLabel::String(format!(": {}", sym.display_type(&ty))),
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
                         tooltip: None,
