@@ -380,33 +380,56 @@ pub fn find_definition(
             }
         }
 
-        // Cross-file method goto-def: resolve inherited methods through module index
+        // Method/member goto-def: resolve `recv.field` / `$obj->m` through the
+        // invocant's class + the ancestor walk. Perl pre-fills `Local` into
+        // `resolved_method_target` (handled above); cpp mints the ref without a
+        // pre-fill, so re-resolve here — Local (same-file member) AND data
+        // fields, not just cross-file methods.
         if matches!(r.kind, RefKind::MethodCall { .. }) {
-            use crate::file_analysis::MethodResolution;
+            use crate::file_analysis::{MethodResolution, SymKind};
             // FQ `$o->Foo::Bar::m` dispatches the bare `m` on the named class.
             let method = r.unqualified_target_name();
-            let class_name = analysis.method_call_invocant_class(r, Some(module_index));
-            if let Some(ref cn) = class_name {
-                if let Some(MethodResolution::CrossFile { ref class, ref def_module }) = analysis.resolve_method_in_ancestors(cn, method, Some(module_index)) {
-                    // One path for both: a real inherited method lives in
-                    // `class`'s own module; a plugin-bridged helper lives in
-                    // `def_module` (the bridging file). Same lookup either way.
-                    let module = def_module.as_deref().unwrap_or(class);
-                    if let Some(cached) = module_index.get_cached(module) {
-                        if let Some(sub_info) = cached.sub_info(method) {
-                            if let Ok(module_uri) = Url::from_file_path(&cached.path) {
-                                let line = sub_info.def_line();
-                                let def_range = Range {
-                                    start: Position { line, character: 0 },
-                                    end: Position { line, character: 0 },
-                                };
-                                return Some(GotoDefinitionResponse::Scalar(Location {
-                                    uri: module_uri,
-                                    range: def_range,
-                                }));
+            if let Some(ref cn) = analysis.method_call_invocant_class(r, Some(module_index)) {
+                match analysis.resolve_method_in_ancestors(cn, method, Some(module_index)) {
+                    Some(MethodResolution::Local { sym_id, .. }) => {
+                        return Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: uri.clone(),
+                            range: span_to_range(analysis.symbol(sym_id).selection_span),
+                        }));
+                    }
+                    Some(MethodResolution::CrossFile { ref class, ref def_module }) => {
+                        // A real inherited method lives in `class`'s module; a
+                        // plugin-bridged helper in `def_module`. Same lookup.
+                        let module = def_module.as_deref().unwrap_or(class);
+                        if let Some(cached) = module_index.get_cached(module) {
+                            if let Some(sub_info) = cached.sub_info(method) {
+                                if let Ok(module_uri) = Url::from_file_path(&cached.path) {
+                                    let line = sub_info.def_line();
+                                    return Some(GotoDefinitionResponse::Scalar(Location {
+                                        uri: module_uri,
+                                        range: Range {
+                                            start: Position { line, character: 0 },
+                                            end: Position { line, character: 0 },
+                                        },
+                                    }));
+                                }
+                            }
+                            // cpp data field: a Variable/Field member, not a sub.
+                            if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                                matches!(s.kind, SymKind::Variable | SymKind::Field)
+                                    && s.name == method
+                                    && s.package.as_deref() == Some(class.as_str())
+                            }) {
+                                if let Ok(module_uri) = Url::from_file_path(&cached.path) {
+                                    return Some(GotoDefinitionResponse::Scalar(Location {
+                                        uri: module_uri,
+                                        range: span_to_range(sym.selection_span),
+                                    }));
+                                }
                             }
                         }
                     }
+                    None => {}
                 }
             }
         }

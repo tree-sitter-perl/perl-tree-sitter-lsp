@@ -776,23 +776,9 @@ impl LanguageServer for Backend {
         if let Some(resp) = symbols::find_definition(&doc.analysis, pos, uri, idx) {
             return Ok(Some(resp));
         }
-        // A struct/class member access (`obj->field`) is not a captured ref —
-        // resolve the receiver at the cursor + jump to the field's def site.
+        // Member access (`obj->field`) now flows through `find_definition`
+        // above: cpp mints a `MethodCall` ref core resolves like any other.
         if doc.language != "perl" {
-            if let Some((class, field)) = self.pack_member_at(&doc, pos, idx) {
-                if let Some((path, span)) = doc.analysis.member_def_site(&class, &field, Some(idx)) {
-                    let target = match path {
-                        Some(p) => Url::from_file_path(&p).ok(),
-                        None => Some(uri.clone()),
-                    };
-                    if let Some(target) = target {
-                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: target,
-                            range: symbols::span_to_range(span),
-                        })));
-                    }
-                }
-            }
             // A macro / enum-constant / global usage (`OP_NULL`, `BASEOP`) —
             // the raw word names a local-or-cross-file symbol.
             if let Some((target, span, _)) = self.pack_xfile_word_at(&doc, pos, idx) {

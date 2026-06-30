@@ -195,8 +195,17 @@
 
 ; ---- calls ----
 (call_expression function: (identifier) @ref.call) @expr.call
-(call_expression
-  function: (field_expression field: (field_identifier) @ref.method))
+
+; ---- member access (`recv.field` / `recv->field`, AND `recv.method(...)`):
+; the field is the "method", the receiver subtree the invocant. Mints the same
+; MethodCall ref core resolves for Perl `$obj->m` — goto-def / hover /
+; references / rename all flow from it. @member.recv carries the receiver
+; (span+text) for query-time typing via expr_type_at_span. The trailing `()`
+; of a method call doesn't change the reference, so calls + plain field access
+; share one pattern.
+(field_expression
+  argument: (_) @member.recv
+  field: (field_identifier) @ref.member)
 
 ; ---- type witnesses: C++ leaks types at every DECLARATION site (its
 ; static-typing richness — the annot_type predicate carries the load).

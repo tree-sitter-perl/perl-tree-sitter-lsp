@@ -58,6 +58,11 @@ pub struct SkelRef {
     pub start: Point,
     pub end: Point,
     pub scope: crate::file_analysis::ScopeId,
+    /// For a member access (`recv.field`) — the receiver subtree's (span,
+    /// text), so `into_file_analysis` mints a `RefKind::MethodCall` whose
+    /// invocant types query-time via `expr_type_at_span(span)` (text → the
+    /// `InvocantName`). `None` for plain calls / var refs.
+    pub invocant: Option<(crate::file_analysis::Span, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -312,15 +317,33 @@ impl SkeletonAnalysis {
         let mut refs: Vec<crate::file_analysis::Ref> = self
             .refs
             .iter()
-            .filter(|r| r.kind == "call")
-            .map(|r| crate::file_analysis::Ref {
-                kind: crate::file_analysis::RefKind::FunctionCall { resolved_package: None },
-                span: Span { start: r.start, end: r.end },
-                scope: r.scope,
-                target_name: r.name.clone(),
-                access: crate::file_analysis::AccessKind::Read,
-                resolves_to: None,
-                resolved_method_target: None,
+            .filter_map(|r| {
+                use crate::file_analysis::RefKind;
+                let kind = match r.kind.as_str() {
+                    "call" => RefKind::FunctionCall { resolved_package: None },
+                    // `recv.field` / `recv->field`: the SAME MethodCall ref
+                    // core resolves for Perl `$obj->m`. The invocant types
+                    // query-time via `expr_type_at_span(invocant_span)`;
+                    // `find_definition`/`refs_to`/hover all flow from it.
+                    "member" => {
+                        let (inv_span, inv_text) = r.invocant.clone()?;
+                        RefKind::MethodCall {
+                            invocant: crate::conventions::InvocantName::assume_canonical(inv_text),
+                            invocant_span: Some(inv_span),
+                            method_name_span: Span { start: r.start, end: r.end },
+                        }
+                    }
+                    _ => return None,
+                };
+                Some(crate::file_analysis::Ref {
+                    kind,
+                    span: Span { start: r.start, end: r.end },
+                    scope: r.scope,
+                    target_name: r.name.clone(),
+                    access: crate::file_analysis::AccessKind::Read,
+                    resolves_to: None,
+                    resolved_method_target: None,
+                })
             })
             .collect();
         refs.extend(local_refs);
@@ -419,6 +442,11 @@ pub struct LangPack {
     /// (`type_qualifier` → `const`/`volatile`/`restrict`). Generic so new
     /// qualifiers + const-correctness diagnostics needn't touch core.
     pub nested_annot_kinds: &'static [&'static str],
+    /// Transparent expression wrappers a member-access RECEIVER peels through
+    /// to its typed inner (`(*p)`, `(&o)`, `(p)` → `p`): pointer-/ref-ness is
+    /// dropped, so the invocant types via the inner's span. The build-time
+    /// twin of the cursor-completion peel.
+    pub recv_wrapper_kinds: &'static [&'static str],
     /// Member-access node kinds (`receiver OP member`) — extraction records
     /// each site (simple-variable receiver, operator token span, `->` vs
     /// `.`) for the operator-DX consumer (`p.` on a `Box*` should be `->`).
@@ -469,6 +497,7 @@ pub fn perl_pack() -> LangPack {
         nested_peel: &[],
         nested_leaves: &[],
         nested_annot_kinds: &[],
+        recv_wrapper_kinds: &[],
         member_kinds: &[],
     }
 }
@@ -509,6 +538,7 @@ pub fn python_pack() -> LangPack {
         nested_peel: &[],
         nested_leaves: &[],
         nested_annot_kinds: &[],
+        recv_wrapper_kinds: &[],
         member_kinds: &[],
     }
 }
@@ -538,6 +568,7 @@ pub fn r_pack() -> LangPack {
         nested_peel: &[],
         nested_leaves: &[],
         nested_annot_kinds: &[],
+        recv_wrapper_kinds: &[],
         member_kinds: &[],
     }
 }
@@ -580,6 +611,7 @@ pub fn cmake_pack() -> LangPack {
         nested_peel: &[],
         nested_leaves: &[],
         nested_annot_kinds: &[],
+        recv_wrapper_kinds: &[],
         member_kinds: &[],
     }
 }
@@ -649,6 +681,7 @@ pub fn cpp_pack() -> LangPack {
         ],
         nested_leaves: &[("identifier", "def.local"), ("field_identifier", "def.var")],
         nested_annot_kinds: &["type_qualifier"],
+        recv_wrapper_kinds: &["parenthesized_expression", "pointer_expression"],
         // `box.m` and `box->m` both parse as field_expression — the one
         // member-access shape, operator distinguished by the inner token.
         member_kinds: &["field_expression"],
@@ -681,6 +714,24 @@ struct Event {
     text: String,
     /// Query match id — name captures join their parent def through it.
     match_id: usize,
+}
+
+/// Peel transparent expression wrappers (`(*p)`, `(&o)`, `(p)`) off a
+/// member-access receiver to its typed inner. Pointer-/reference-ness is
+/// dropped for navigation, so the inner's type IS the receiver's. The pack
+/// declares `recv_wrapper_kinds`; core descends the first named child while
+/// the kind matches. Depth-capped against a pathological tree.
+fn peel_recv<'a>(mut node: tree_sitter::Node<'a>, pack: &LangPack) -> tree_sitter::Node<'a> {
+    for _ in 0..32 {
+        if !pack.recv_wrapper_kinds.contains(&node.kind()) {
+            break;
+        }
+        match node.named_child(0) {
+            Some(inner) => node = inner,
+            None => break,
+        }
+    }
+    node
 }
 
 /// Unravel a pointer/reference declarator chain (the `@nested.target`
@@ -775,6 +826,23 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 }
                 continue;
             }
+            // `@member.recv`: a member access receiver. Peel transparent
+            // wrappers (`(*p)`, `(&o)`, `(p)`) to the typed inner where the
+            // node is live, so the minted MethodCall ref's invocant_span lands
+            // on the inner expression `expr_type_at_span` already types.
+            if cap == "member.recv" {
+                let inner = peel_recv(node, pack);
+                events.push(Event {
+                    start_byte: inner.start_byte(),
+                    end_byte: inner.end_byte(),
+                    start: inner.start_position(),
+                    end: inner.end_position(),
+                    cap: cap.to_string(),
+                    text: inner.utf8_text(source).unwrap_or("").to_string(),
+                    match_id: match_counter,
+                });
+                continue;
+            }
             events.push(Event {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
@@ -802,6 +870,9 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // `@def` event fires before these inner captures.
     let mut qualifier_by_match: HashMap<usize, String> = HashMap::new();
     let mut rettype_by_match: HashMap<usize, String> = HashMap::new();
+    // `@member.recv` → the receiver span of a `recv.field` access, joined to
+    // its `@ref.member` by match_id so the minted MethodCall ref carries it.
+    let mut member_recv: HashMap<usize, (crate::file_analysis::Span, String)> = HashMap::new();
     for e in &events {
         if let Some(prefix) = e.cap.strip_suffix(".name") {
             names_by_match
@@ -1010,6 +1081,12 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     Span { start: e.start, end: e.end },
                 ));
             }
+            "member.recv" => {
+                member_recv.insert(
+                    e.match_id,
+                    (crate::file_analysis::Span { start: e.start, end: e.end }, e.text.clone()),
+                );
+            }
             cap if cap.starts_with("ref.") => {
                 // Generic suppression: a "reference" inside a def's own
                 // header is the declaration, not a use.
@@ -1027,6 +1104,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                         start: e.start,
                         end: e.end,
                         scope: cur_scope,
+                        invocant: member_recv.get(&e.match_id).cloned(),
                     });
                 }
             }
@@ -1241,6 +1319,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             start: cmd_span.start,
             end: cmd_span.end,
             scope: *scope,
+            invocant: None,
         });
         for effect in (pack.cmd_effects)(cmd) {
             match effect {
@@ -1272,6 +1351,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                                 start: span.start,
                                 end: span.end,
                                 scope: *scope,
+                                invocant: None,
                             });
                         }
                     }

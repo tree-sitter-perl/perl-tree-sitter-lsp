@@ -6947,11 +6947,16 @@ impl FileAnalysis {
         method_name: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<MethodResolution> {
-        // (a) Local symbols in this file packaged under `cls`.
+        // (a) Local symbols in this file packaged under `cls`. Methods AND
+        // data members: cpp `obj->field` mints the same `MethodCall` ref as a
+        // method call, and a `Variable`/`Field` member is its def. (Perl
+        // members are always Sub/Method, so this is a no-op there.)
         for &sid in self.symbols_named(method_name) {
             let sym = self.symbol(sid);
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method)
-                && self.symbol_in_class(sid, cls)
+            if matches!(
+                sym.kind,
+                SymKind::Sub | SymKind::Method | SymKind::Variable | SymKind::Field
+            ) && self.symbol_in_class(sid, cls)
             {
                 return Some(MethodResolution::Local { class: cls.to_string(), sym_id: sid });
             }
@@ -6973,7 +6978,13 @@ impl FileAnalysis {
         // bridged_to`).
         if let Some(idx) = module_index {
             if let Some(cached) = idx.get_cached(cls) {
-                if cached.has_sub(method_name) {
+                let has_member = cached.has_sub(method_name)
+                    || cached.analysis.symbols.iter().any(|s| {
+                        matches!(s.kind, SymKind::Variable | SymKind::Field)
+                            && s.name == method_name
+                            && s.package.as_deref() == Some(cls)
+                    });
+                if has_member {
                     return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
                 }
             }
