@@ -8,9 +8,9 @@
 //! - `=>` is a comma that autoquotes its LHS — pair walking
 //!   ([`pair_nodes`]) is separator-agnostic by construction, so the
 //!   plain-comma spelling can't be silently dropped.
-//! - tree-sitter-perl nests pair tails right-associatively (`a => 1, b => 2`
-//!   parses as `a, 1, (b, 2)`) — [`flatten_list`] splices the trailing
-//!   wrapper so a linear scan sees every pair.
+//! - a plain comma list is flat (tree-sitter-perl ≥1.1.4), but EXPLICIT parens
+//!   still nest a sub-list (`a => (b => c)` → `a, (b, c)`) — [`flatten_list`]
+//!   splices the wrapper so a linear scan sees every pair.
 //! - call arguments may arrive as a bare node or a `list_expression` /
 //!   `parenthesized_expression` — [`call_args`] always yields the flat
 //!   positional sequence.
@@ -178,13 +178,12 @@ pub(crate) fn call_args<'a>(call_node: Node<'a>) -> Vec<Node<'a>> {
 }
 
 /// Flatten a pair-list container's children into one token stream, splicing
-/// EVERY nested `list_expression` / `parenthesized_expression` inline.
-/// `a => 1, b => 2` parses with its tail pairs tucked into a right-associative
-/// trailing `list_expression`, and explicit parens (`a => (b => c)`) add more
-/// nesting — but both constructs are pure *grouping* in Perl: a bare list
-/// always flattens into its surroundings (`key => (a, b)` IS `key, a, b`; the
-/// grouped-value spelling is the ref `[a, b]`). So we descend them wherever
-/// they appear, not just trailing, yielding the flat sibling sequence a
+/// EVERY nested `list_expression` / `parenthesized_expression` inline. A plain
+/// comma list is already flat (tree-sitter-perl ≥1.1.4), but explicit parens
+/// (`a => (b => c)`) still nest a sub-list — and that's pure *grouping* in Perl:
+/// a bare list always flattens into its surroundings (`key => (a, b)` IS
+/// `key, a, b`; the grouped-value spelling is the ref `[a, b]`). So we descend
+/// nested groups wherever they appear, yielding the flat sibling sequence a
 /// single linear scan can pair over. Ref literals (`[...]`, `{...}`) are NOT
 /// groups and stay whole.
 pub(crate) fn flatten_list<'a>(list: Node<'a>, out: &mut Vec<Node<'a>>) {
@@ -335,25 +334,26 @@ pub(crate) fn canonical_place_path<'a>(
 ) -> Option<(String, String)> {
     let base = match node.kind() {
         "hash_element_expression" => {
-            let key = node.child_by_field_name("key")?;
-            if !matches!(key.kind(), "autoquoted_bareword" | "string_literal" | "number") {
+            if !is_stable_subscript(node.child_by_field_name("key")?, src) {
                 return None;
             }
             node.named_child(0)?
         }
         "array_element_expression" => {
-            let index = node.child_by_field_name("index")?;
-            if index.kind() != "number" {
+            if !is_stable_subscript(node.child_by_field_name("index")?, src) {
                 return None;
             }
             node.named_child(0)?
         }
         _ => return None,
     };
-    // The root is a plain scalar, or recurse through a nested constant
-    // projection (`$self->{a}{b}`).
+    // The root is a plain scalar (arrow form `$self->{a}`), the named
+    // container itself (direct form `$h{a}` / `$h[0]`, whose base is a
+    // `container_variable` resolving to `%h` / `@h`), or a nested constant
+    // projection (`$self->{a}{b}`, `$h{a}{b}`).
     let root = match base.kind() {
         "scalar" => canonical_var_name(base, src)?,
+        "container_variable" => canonical_container_name(base, src)?,
         "hash_element_expression" | "array_element_expression" => {
             canonical_place_path(base, src)?.1
         }
@@ -361,6 +361,51 @@ pub(crate) fn canonical_place_path<'a>(
     };
     let key = node.text(src)?.to_string();
     Some((key, root))
+}
+
+/// A place subscript is stable when it pins one slot deterministically:
+/// a constant key/index (`{foo}`, `[0]`) or a **plain scalar** (`{$k}`,
+/// `[$i]`) whose identity is the variable spelling. A scalar key keeps
+/// the place stable only while that scalar is unchanged — the narrower
+/// tracks it via `place_dynamic_key_vars` and truncates on reassignment.
+/// Deref / computed keys (`{$h{x}}`, `{compute()}`, `{$obj->m}`) are not
+/// stable identities and disqualify the place.
+fn is_stable_subscript(sub: Node, src: &[u8]) -> bool {
+    match sub.kind() {
+        "autoquoted_bareword" | "string_literal" | "number" => true,
+        "scalar" => canonical_var_name(sub, src).is_some(),
+        _ => false,
+    }
+}
+
+/// The plain-scalar key/index variables along a place path
+/// (`$self->{$k}` → `[$k]`, `$self->{$k}{$j}` → `[$k, $j]`). These are
+/// the dynamic stability dependencies of the place: reassigning any of
+/// them breaks its identity, so the narrowing region must truncate
+/// there. Empty for a fully-constant place. Assumes `node` already
+/// passed `canonical_place_path` (every subscript is stable).
+pub(crate) fn place_dynamic_key_vars<'a>(node: Node<'a>, src: &'a [u8]) -> Vec<String> {
+    let mut vars = Vec::new();
+    let mut cur = node;
+    loop {
+        let sub = match cur.kind() {
+            "hash_element_expression" => cur.child_by_field_name("key"),
+            "array_element_expression" => cur.child_by_field_name("index"),
+            _ => break,
+        };
+        if let Some(sub) = sub {
+            if sub.kind() == "scalar" {
+                if let Some(v) = canonical_var_name(sub, src) {
+                    vars.push(v);
+                }
+            }
+        }
+        match cur.named_child(0) {
+            Some(base) => cur = base,
+            None => break,
+        }
+    }
+    vars
 }
 
 /// Per-word `(text, span)` pairs of a `quoted_word_list`, multi-line

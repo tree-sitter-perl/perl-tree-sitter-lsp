@@ -1162,6 +1162,45 @@ sub fire {
         .starts_with(' '));
 }
 
+/// Completion peels an `Optional<Foo>` receiver to offer `Foo`'s methods,
+/// even though the same receiver does NOT dispatch (hover/goto correctly
+/// refuse an unguarded optional). Completion is suggestive — the author
+/// may not have written the `defined` guard yet.
+#[test]
+fn completion_peels_optional_receiver() {
+    let src = r#"package Foo;
+sub go { my ($self) = @_; }
+sub spin { my ($self) = @_; }
+package P;
+sub maybe { return undef unless 1; return Foo->new; }
+sub use_it {
+    my $r = maybe();
+    $r->
+}
+"#;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let analysis = crate::builder::build(&tree, src.as_bytes());
+    let idx = ModuleIndex::new_for_test();
+
+    let (line_idx, line) = src
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.trim() == "$r->")
+        .unwrap();
+    let col = line.find("$r->").unwrap() + "$r->".len();
+    let pos = Position { line: line_idx as u32, character: col as u32 };
+
+    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    assert!(
+        items.iter().any(|i| i.label == "go"),
+        "Optional<Foo> receiver should offer Foo's methods (peeled): {:?}",
+        items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+    );
+    assert!(items.iter().any(|i| i.label == "spin"));
+}
+
 /// Bug B: dispatch-target items set their `insert_text` to
 /// `'name'` (quoted) but left `filter_text` unset — some LSP
 /// clients fall back to `insert_text` for client-side prefix

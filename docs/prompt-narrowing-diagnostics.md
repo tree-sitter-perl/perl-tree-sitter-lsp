@@ -42,6 +42,28 @@ undefined value", "Can't use an undefined value as a HASH reference").
 - **Quick-fix:** none obvious (the code is already wrong); the message
   points at the guard that proved it undef.
 
+### D10 — column hash-deref on a DBIC row (`$row->{col}`)
+`$row->{col}` where `$row` resolves to a DBIC Result class and `col` is
+one of its `Bridged` columns. A DBIC column is NOT a hash slot — it lives
+behind `_column_data`, so `$row->{col}` is `undef`; the author meant the
+accessor `$row->col`. (This is the inverse of the deref-resolution fix
+that put columns on `HashKeyOwner::Bridged`, not `Class`.)
+
+- **Reads:** invocant type → class
+  (`method_call_invocant_class` / `inferred_type_via_bag`), then
+  `field_projections_named(key, class)` carries a `Bridged` column for
+  the key (rule #10 — ask the type; the row answers "my columns aren't
+  slots"). The detection seam is already TODO-marked in
+  `collect_diagnostics`.
+- **Confidence:** high — `undef` in standard DBIC.
+- **BLOCKED on:** HashRefInflator tracking.
+  `$rs->result_class('DBIx::Class::ResultClass::HashRefInflator')` (or a
+  `{ result_class => … }` search attr) makes find/search return plain
+  hashrefs where `$row->{col}` IS valid. We don't model that result-class
+  override yet, so the warning must gate on NOT-HRI to avoid
+  false-positives — build that first.
+- **Quick-fix:** `$row->{col}` → `$row->col`.
+
 ---
 
 ## Tier 2 — likely bugs (opt-in lint; `WARNING`/`INFORMATION`)

@@ -472,12 +472,13 @@ fn test_phase5_dynamic_method_call_via_constant_folding() {
     );
 }
 
-/// Cross-file consumer-side resolution (the phase-5 follow-up).
+/// Cross-file consumer-side resolution (the phase-5 follow-up, unified).
 /// Consumer has `my $c = Imported::get_config(); $c->{host}`. At build
-/// time we don't know get_config returns HashRef. Enrichment injects
-/// synthetic HashKeyDefs and now ALSO retries the HashKeyAccess owner
-/// fixup + rebuilds refs_by_target. Result: the access links to the
-/// synthetic def, so rename / references / refs_by_target all work.
+/// time we don't know get_config returns HashRef. Enrichment stamps the
+/// access owner with the PRODUCER's package — no consumer-side synthetic
+/// stub is materialized; the producer's real HashKeyDef is the single
+/// source. rename / references / goto-def all route cross-file through
+/// that owner edge.
 #[test]
 fn test_phase5_consumer_side_cross_file_resolves_via_enrichment() {
     use crate::module_index::ModuleIndex;
@@ -521,25 +522,74 @@ sub get_config { return { host => 'h', port => 1, name => 'n' }; }
     );
     fa.enrich_imported_types_with_keys(Some(&idx));
 
-    // The synthetic HashKeyDef `host` owned by Sub{None, "get_config"}
-    // must now have the access indexed under it.
-    let def = fa
-        .symbols
-        .iter()
-        .find(|s| {
-            s.name == "host"
-                && s.kind == SymKind::HashKeyDef
-                && matches!(&s.detail, SymbolDetail::HashKeyDef {
-                    owner: HashKeyOwner::Sub { package: None, name }, ..
-                } if name == "get_config")
-        })
-        .expect("synthetic HashKeyDef host");
-
-    let indexed = fa.refs_to_symbol(def.id);
+    // Unified model: no consumer-side synthetic HashKeyDef is materialized —
+    // the producer's real def is the single source.
     assert!(
-            !indexed.is_empty(),
-            "consumer-side $c->{{host}} access should link to synthetic HashKeyDef after enrichment, got empty refs_by_target entry",
-        );
+        !fa.symbols.iter().any(|s| s.name == "host" && s.kind == SymKind::HashKeyDef),
+        "no consumer-side synthetic HashKeyDef should be injected (producer def is the source)",
+    );
+
+    // Enrichment stamps the access owner with the producer's package, so the
+    // `$c->{host}` access reaches the producer's `host` def cross-file. This
+    // owner edge is what rename / references / goto-def walk.
+    let hka = fa
+        .refs
+        .iter()
+        .find(|r| matches!(r.kind, RefKind::HashKeyAccess { .. }) && r.target_name == "host")
+        .expect("HashKeyAccess host");
+    assert!(
+        matches!(
+            &hka.kind,
+            RefKind::HashKeyAccess {
+                owner: Some(HashKeyOwner::Sub { package: Some(p), name }),
+                ..
+            } if p == "TestExporter" && name == "get_config"
+        ),
+        "access owner must carry the producer package (Sub{{Some(TestExporter), get_config}}), got {:?}",
+        hka.kind,
+    );
+}
+
+/// Cross-file hash-key completion reads the producer's real keys through the
+/// index — no consumer-side stub. `$c = get_config(); $c->{<TAB>` offers the
+/// producer's `host`/`port`, resolved by `complete_hash_keys_for_owner`'s
+/// cross-file walk (the single source rename/references also use).
+#[test]
+fn imported_hash_key_completion_resolves_cross_file_without_stub() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let producer = r#"
+package Cfg;
+use Exporter 'import';
+our @EXPORT = ('get_config');
+sub get_config { return { host => 'h', port => 1 }; }
+1;
+"#;
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(
+        std::path::PathBuf::from("/tmp/Cfg.pm"),
+        Arc::new(build_fa_from_source(producer)),
+    );
+
+    let consumer = build_fa_from_source(
+        "use Cfg;\nmy $c = get_config();\nmy $h = $c->{};\n",
+    );
+    // No stub injected; completion still offers the producer's keys cross-file.
+    assert!(
+        !consumer.symbols.iter().any(|s| s.kind == SymKind::HashKeyDef),
+        "no synthetic HashKeyDef stub should exist in the consumer",
+    );
+    let keys: std::collections::HashSet<String> = consumer
+        .complete_hash_keys("$c", Point::new(2, 12), Some(&idx))
+        .into_iter()
+        .map(|c| c.label)
+        .collect();
+    assert!(
+        keys.contains("host") && keys.contains("port"),
+        "cross-file completion should offer imported keys host+port, got {:?}",
+        keys,
+    );
 }
 
 /// End-to-end demo shape: mirrors `test_files/phase5_demo.pl` so a
@@ -742,19 +792,29 @@ fn test_phase5_find_references_on_hash_key_def_without_tree() {
         })
         .expect("host HashKeyDef");
 
-    // Cursor on the def — convention is that find_references returns the
-    // *usages*, not the def itself. Previously this returned 0 without a
-    // tree; phase 5 returns the access sites via refs_by_target.
+    // Cursor on the def returns the def itself + every access — the same
+    // set an access-site cursor returns, so def↔access rename/references
+    // stay symmetric (a hash-key def has no ref at its own token, so it
+    // must opt into `include_decl` explicitly; the access→def link is made
+    // at build time, no tree needed here).
     let point = def_host.selection_span.start;
     let refs = fa.find_references(point, None);
-    assert!(
-        !refs.is_empty(),
-        "expected at least one access for 'host' via refs_by_target (no tree), got empty",
-    );
-    // Sanity: the access should point at `$cfg->{host}`.
+    // The access at `$cfg->{host}` (row 3).
     assert!(
         refs.iter().any(|s| s.start.row == 3),
         "expected to find the access on row 3 ($cfg->{{host}}), got {:?}",
+        refs,
+    );
+    // The def token itself must be present (symmetry with the access side).
+    assert!(
+        refs.iter().any(|s| *s == def_host.selection_span),
+        "expected the def token in its own reference set, got {:?}",
+        refs,
+    );
+    // `port` is a different key on the same sub — must NOT be swept in.
+    assert!(
+        !refs.iter().any(|s| s.start.row == 4),
+        "unrelated key 'port' (row 4) must stay out of host's set, got {:?}",
         refs,
     );
 }

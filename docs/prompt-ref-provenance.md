@@ -32,6 +32,14 @@ edit at the source span.
 `HashMap<String, Vec<(String, Span)>>`. Span follows the value through the
 chain.
 
+Same shape elsewhere: a lexical hash-key literal with a variable/constant key
+(`my $k = 'name'; my %h = ($k => 1); $h{name}`). `emit_lexical_hash_literal_keys`
+deliberately skips non-literal keys today — folding `$k` would give the value but
+no safe rename target (the key ref would land on `$k` and renaming would rewrite
+the variable, not the key). `folded_from` is exactly what unblocks it: emit the
+key carrying the `'name'` source span, so a rename of the key rewrites the source
+literal, not `$k`.
+
 ### Framework-attribute unified rename
 
 `has name => (is => 'ro')` produces three things named `name`:

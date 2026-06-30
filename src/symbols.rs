@@ -829,7 +829,10 @@ fn completion_items_native(
         CursorContext::Variable { sigil } => analysis.complete_variables(point, sigil),
         CursorContext::Method { ref invocant_type, ref invocant_text } => {
             if let Some(ref ty) = invocant_type {
-                if let Some(cn) = ty.class_name() {
+                // `class_name_lenient` peels `Optional<Foo>` to `Foo` so an
+                // unguarded optional receiver still offers its methods — the
+                // same lenient receiver projection goto/hover/refs now use.
+                if let Some(cn) = ty.class_name_lenient() {
                     analysis.complete_methods_for_class(cn, Some(module_index))
                 } else {
                     // Ref types get deref snippet completions (handled below)
@@ -848,7 +851,7 @@ fn completion_items_native(
             let used = cursor_context::used_keys_in_enclosing_hash(tree, source.as_bytes(), point);
             let class_name = owner_type.as_ref().and_then(|t| t.class_name());
             let candidates = if let Some(cn) = class_name {
-                analysis.complete_hash_keys_for_class(cn, point)
+                analysis.complete_hash_keys_for_class(cn, point, Some(module_index))
             } else if let Some(ref sub_name) = source_sub {
                 // Routes to HashKeyOwner::Sub { name } — catches both
                 // plugin-emitted HashKeyDefs (minion enqueue options)
@@ -856,9 +859,9 @@ fn completion_items_native(
                 // in a final-hashref param. Previously this branch
                 // was skipped when owner_type was None, so real hash
                 // literals at a call-arg position returned nothing.
-                analysis.complete_hash_keys_for_sub(sub_name, point)
+                analysis.complete_hash_keys_for_sub(sub_name, point, Some(module_index))
             } else {
-                analysis.complete_hash_keys(var_text, point)
+                analysis.complete_hash_keys(var_text, point, Some(module_index))
             };
             candidates.into_iter().filter(|c| !used.contains(&c.label)).collect()
         }
@@ -3113,6 +3116,13 @@ pub fn collect_diagnostics(
     // skips reassigned/escaped vars (the trust-gate stand-in for the
     // unmodeled lattice widenings — docs/adr/structural-shapes.md).
     // HINT severity, per the quiet-by-design diagnostics convention.
+    //
+    // TODO(dbic-row-deref): warn on `$row->{col}` where `$row` is a DBIC Result
+    // class and `col` is a `Bridged` column — a column isn't a hash slot, so the
+    // deref is `undef` (meant `$row->col`). Detection seam is here (invocant type
+    // → class → `field_projections_named` has a bridged column for the key), but
+    // it must gate on NOT-HashRefInflator first (where `$row->{col}` IS valid),
+    // which we don't model yet. Spec: docs/prompt-narrowing-diagnostics.md (D10).
     use crate::file_analysis::InferredType;
     for r in &analysis.refs {
         let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };

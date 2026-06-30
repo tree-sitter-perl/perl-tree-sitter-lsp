@@ -418,6 +418,20 @@ pub enum EmitAction {
         span: Span,
         access: AccessKind,
     },
+    /// Emit an import-name reference at a span, pinned to a package — the
+    /// plugin-facing equivalent of core's `qw(...)` / `-as` import-token refs
+    /// (`emit_refs_for_strings`). A BYO exporter plugin uses it to make its own
+    /// rename-spec tokens navigable, identically to core: emit the **remote**
+    /// name with `package = Some(exporting_module)` so it renames with the
+    /// source sub, and a renaming alias's **local** name with `package =
+    /// Some(consuming_package)` so it forms a self-contained local group that
+    /// never touches the exporter.
+    ImportRef {
+        name: String,
+        #[serde(default)]
+        package: Option<String>,
+        span: Span,
+    },
     /// Register a parent class on the current package. Used for
     /// `use Mojo::Base 'App'` style inheritance detection.
     PackageParent { package: String, parent: String },
@@ -943,6 +957,25 @@ pub trait FrameworkPlugin: Send + Sync {
         &[]
     }
 
+    /// Method verbs whose FIRST hashref arg is keyed by the receiver class's
+    /// COLUMN names (DBIC `search(\%cond, …)` / `create(\%cols)` etc.). Core
+    /// links those keys to the class's columns for rename/references and walks
+    /// only the first hashref (the trailing `\%attrs` hash isn't column-keyed).
+    /// The plugin owns its framework's verb list; core stays generic. Default
+    /// empty.
+    fn column_keyed_verbs(&self) -> &[String] {
+        &[]
+    }
+
+    /// Fluent verbs — a call that returns the invocant's type unchanged (DBIC
+    /// `search`/`search_rs` on a resultset → a same-row resultset). Only fires on
+    /// an actual resultset invocant; the chain composes through the existing
+    /// `RowOf`/`find` projections (`$rs->find` → row → `$row->col`). The plugin
+    /// owns its verb list. Default empty.
+    fn fluent_verbs(&self) -> &[String] {
+        &[]
+    }
+
     /// A topic-scoped route DSL this plugin owns (the
     /// Mojolicious::Lite shape): file-level route verbs whose implicit
     /// base a [`EmitAction::SetRouteBase`] emission sets and a scope
@@ -1280,6 +1313,21 @@ impl PluginRegistry {
         self.plugins
             .iter()
             .flat_map(|p| p.role_makers().iter().map(|s| s.as_str()))
+    }
+
+    /// Union of column-keyed call verbs across the registry — the verbs whose
+    /// first hashref arg is keyed by the receiver class's columns.
+    pub fn column_keyed_verbs<'a>(&'a self) -> impl Iterator<Item = &'a str> + 'a {
+        self.plugins
+            .iter()
+            .flat_map(|p| p.column_keyed_verbs().iter().map(|s| s.as_str()))
+    }
+
+    /// Union of fluent verbs (call type follows the invocant) across the registry.
+    pub fn fluent_verbs<'a>(&'a self) -> impl Iterator<Item = &'a str> + 'a {
+        self.plugins
+            .iter()
+            .flat_map(|p| p.fluent_verbs().iter().map(|s| s.as_str()))
     }
 
     /// Fold a constraint constructor → its inner type, asking the plugin(s)

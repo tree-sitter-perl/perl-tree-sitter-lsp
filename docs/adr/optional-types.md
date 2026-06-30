@@ -14,18 +14,32 @@ appended at the **END** of the enum for bincode variant-index stability
 (bump `EXTRACT_VERSION`); exhaustive matches are confined to
 `file_analysis.rs` and use `_ =>`, so the blast radius is small.
 
-## The variants don't dispatch — that's the point
+## Strict typing, lenient receiver projection
 
-`class_name()` returns `None` for both `Optional` and `Undef`, so
-`is_object()` is `false` and method dispatch finds nothing. An optional
-is *not definitely* an instance and a known-`Undef` definitely isn't —
-letting either dispatch as its inner would be the exact unsoundness these
-variants exist to surface. The user narrows first; the narrowing yields a
-concrete `ClassName` that *does* dispatch. `subsumes_narrowing`: a
-concrete `self` subsumes an incoming `Optional` narrowing (narrowing
-already happened); the reverse is `false` so a `defined` guard's
-`Optional<T> → T` wins. `Undef` rides the discriminant fallback
-(`(Undef, Undef) → true`, else `false`).
+Two projections, deliberately split:
+
+- **`class_name()` stays strict** — `None` for both `Optional` and
+  `Undef`. The fold's return-type math depends on this: a sub returning
+  `Optional<Foo>` must keep *typing* as `Optional<Foo>` (else
+  `{Optional<Foo>, Foo}` arm joins would collapse and lose the
+  optionality). `subsumes_narrowing`: a concrete `self` subsumes an
+  incoming `Optional` narrowing (narrowing already happened); the reverse
+  is `false` so a `defined` guard's `Optional<T> → T` wins. `Undef` rides
+  the discriminant fallback (`(Undef, Undef) → true`, else `false`).
+
+- **`class_name_lenient()` peels `Optional`** — the consumer-side
+  receiver projection that `method_call_invocant_class` (and thus
+  goto-def / hover / references / rename / completion) uses. An
+  `Optional<Foo>` receiver resolves its methods on `Foo` *without* a
+  guard: type-silence on a half-written value reads as a broken IDE, not
+  a hint, so navigation stays lenient. The "might be `undef`" warning is
+  owned by a deref **diagnostic** (`docs/prompt-narrowing-diagnostics.md`,
+  next round of the epic), not by a dead receiver. `Undef` still peels to
+  nothing — you can't navigate the methods of *definitely* nothing.
+
+The narrowing path is unchanged and still wins where it applies: a
+`defined`/`blessed` guard yields a concrete `ClassName` that dispatches
+strictly, ahead of the lenient peel.
 
 ## The undef arm is a marker, not a lattice value
 
@@ -49,7 +63,11 @@ side of a `defined` guard), never from the arm join.
   'Maybe[T]'` via `map_isa_to_type` recursing on the inner constraint.
 - **Consumption:** `defined`/`blessed` strip `Optional<T> → T`
   (`flow-narrowing.md`); the `else`/`return if` negative narrows to
-  `Undef`.
+  `Undef`. Every method-receiver feature (goto-def / hover / references /
+  rename / completion) peels an unguarded `Optional<T>` to `T` via
+  `class_name_lenient` — see "Strict typing, lenient receiver projection"
+  above. The deref-safety diagnostic is the deferred other half
+  (`docs/prompt-narrowing-diagnostics.md`).
 
 Provenance: an `Optional` return is tagged `optional_join` in its
 `TypeProvenance::ReducerFold` evidence so `--dump-package` explains it.

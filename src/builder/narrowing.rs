@@ -15,21 +15,24 @@ use crate::file_analysis::{InferredType, ScopeId, Span};
 
 use super::{connector_keyword_between, point_lt, raw_leading_op, raw_mid_op, Builder};
 
-/// The subject a guard narrows — a plain scalar, or a constant
-/// hash/array place (`$self->{x}`) keyed by its source spelling.
+/// The subject a guard narrows — a plain scalar, or a hash/array place
+/// (`$self->{x}`, `$h{k}`, `$self->{$k}`) keyed by its source spelling.
+/// `key_vars` are the place's dynamic-key scalars (`$k` in `$self->{$k}`);
+/// reassigning any of them ends the narrowing region.
 pub(super) enum NarrowSubject {
     Variable(String),
-    Place { key: String, root: String },
+    Place { key: String, root: String, key_vars: Vec<String> },
 }
 
 /// Classify a guard's operand into the subject it narrows: a plain
-/// scalar (`Variable`), else a constant place path (`Place`).
+/// scalar (`Variable`), else a stable place path (`Place`).
 fn narrow_subject_of(node: Node, src: &[u8]) -> Option<NarrowSubject> {
     if let Some(v) = crate::cst::canonical_var_name(node, src) {
         return Some(NarrowSubject::Variable(v));
     }
     let (key, root) = crate::cst::canonical_place_path(node, src)?;
-    Some(NarrowSubject::Place { key, root })
+    let key_vars = crate::cst::place_dynamic_key_vars(node, src);
+    Some(NarrowSubject::Place { key, root, key_vars })
 }
 
 /// What a guard does to the subject's type where it holds.
@@ -108,6 +111,14 @@ fn ref_string_to_type(s: &str) -> Option<InferredType> {
     })
 }
 
+/// The earlier of two optional truncation points (`None` = no bound).
+fn earliest_point(a: Option<Point>, b: Option<Point>) -> Option<Point> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if point_lt(x, y) { x } else { y }),
+        (some, None) | (None, some) => some,
+    }
+}
+
 /// A narrowable subject node: a plain scalar, or a constant hash/array
 /// place element (`$self->{x}`).
 fn is_subject_node_kind(kind: &str) -> bool {
@@ -127,8 +138,10 @@ fn func1op_subject_arg<'a>(node: Node<'a>) -> Option<Node<'a>> {
 
 /// Recognize the narrowing facts a condition proves. One fact per
 /// recognized conjunct (`&&`/`and` intersect the region); a disjunctive
-/// (`||`/`or`) or unrecognized condition yields none.
-fn recognize_guards(cond: Node, source: &[u8]) -> Vec<GuardFact> {
+/// (`||`/`or`) or unrecognized condition yields none. `builder` is
+/// threaded so recognizers can consult constant-fold state (a folded
+/// class name in `$x->isa($CLASS)`).
+fn recognize_guards(builder: &Builder, cond: Node, source: &[u8]) -> Vec<GuardFact> {
     // Peel transparent `(...)` / single-element list wrappers up front, so
     // `if (($x->isa('Foo')))` and nested grouping fall through to the real
     // condition — one shared primitive instead of a per-shape arm.
@@ -137,7 +150,7 @@ fn recognize_guards(cond: Node, source: &[u8]) -> Vec<GuardFact> {
         "unary_expression" if raw_leading_op(cond, source) == "!" => cond
             .child_by_field_name("operand")
             .map(|op| {
-                recognize_guards(op, source)
+                recognize_guards(builder, op, source)
                     .into_iter()
                     .map(|mut f| {
                         f.asserts_when_true = !f.asserts_when_true;
@@ -149,14 +162,14 @@ fn recognize_guards(cond: Node, source: &[u8]) -> Vec<GuardFact> {
         "binary_expression" if matches!(raw_mid_op(cond, source).as_str(), "&&" | "and") => {
             let mut out = Vec::new();
             if let Some(l) = cond.child_by_field_name("left") {
-                out.extend(recognize_guards(l, source));
+                out.extend(recognize_guards(builder, l, source));
             }
             if let Some(r) = cond.child_by_field_name("right") {
-                out.extend(recognize_guards(r, source));
+                out.extend(recognize_guards(builder, r, source));
             }
             out
         }
-        "method_call_expression" => recognize_isa_guard(cond, source).into_iter().collect(),
+        "method_call_expression" => recognize_isa_guard(builder, cond, source).into_iter().collect(),
         "equality_expression" => recognize_ref_eq_guard(cond, source).into_iter().collect(),
         "func1op_call_expression" => recognize_defined_guard(cond, source).into_iter().collect(),
         "ambiguous_function_call_expression" | "function_call_expression" => {
@@ -201,14 +214,18 @@ fn recognize_blessed_guard(call: Node, source: &[u8]) -> Option<GuardFact> {
 }
 
 /// `$x->isa('Foo')` / `$x->DOES('Role')` → narrow `$x` to `ClassName`.
-fn recognize_isa_guard(call: Node, source: &[u8]) -> Option<GuardFact> {
+/// The class argument is a string literal, or a scalar that the builder's
+/// constant fold pins to a single class (`my $C = 'Foo'; $x->isa($C)`).
+fn recognize_isa_guard(builder: &Builder, call: Node, source: &[u8]) -> Option<GuardFact> {
     let mc = crate::cst::MethodCall::cast(call)?;
     let method = mc.method()?.utf8_text(source).ok()?;
     if method != "isa" && method != "DOES" {
         return None;
     }
     let subject = narrow_subject_of(mc.invocant()?, source)?;
-    let class = crate::cst::plain_string_literal_text(call.child_by_field_name("arguments")?, source)?;
+    let arg = call.child_by_field_name("arguments")?;
+    let class = crate::cst::plain_string_literal_text(arg, source)
+        .or_else(|| builder.folded_class_name_arg(arg))?;
     Some(GuardFact {
         subject,
         op: NarrowOp::To(InferredType::ClassName(class)),
@@ -267,47 +284,106 @@ fn is_exit_expression(node: Node, source: &[u8]) -> bool {
     }
 }
 
-/// The `block` of a direct `else` child of a `conditional_statement`, if
-/// any. elsif-chain `else` (which nests inside the trailing `elsif`) is
-/// deferred — its cumulative negation needs union types.
-fn trailing_else<'a>(cond_stmt: Node<'a>) -> Option<Node<'a>> {
-    for i in 0..cond_stmt.named_child_count() {
-        let c = cond_stmt.named_child(i)?;
-        if c.kind() == "else" {
-            return c.child_by_field_name("block");
-        }
+/// First named child of `node` with the given `kind` (the `elsif` / `else`
+/// arm hanging off a `conditional_statement` or `elsif`).
+fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i))
+        .find(|c| c.kind() == kind)
+}
+
+/// A subject's identity for dedup across arms (its source spelling).
+fn subject_key(subject: &NarrowSubject) -> String {
+    match subject {
+        NarrowSubject::Variable(v) => v.clone(),
+        NarrowSubject::Place { key, .. } => key.clone(),
     }
-    None
 }
 
 impl<'a> Builder<'a> {
-    /// `if/unless (G) { BODY }` — narrow the then-block where the guard's
-    /// polarity is positive (`if`-body when G true, `unless`-body when
-    /// false; only the positive case is expressible in today's lattice).
+    /// A scalar `isa`/`DOES` argument (`$x->isa($C)`) that the constant
+    /// fold pins to exactly one class name. A multi-valued fold can't name
+    /// a single dispatch class, so it doesn't narrow. `None` for non-scalar
+    /// args (literals are handled by `plain_string_literal_text`).
+    fn folded_class_name_arg(&self, arg: Node<'a>) -> Option<String> {
+        if arg.kind() != "scalar" {
+            return None;
+        }
+        let key = crate::cst::canonical_var_name(arg, self.source)?;
+        match self.resolve_constant_strings(&key, 0).as_deref() {
+            Some([class]) => Some(class.clone()),
+            _ => None,
+        }
+    }
+
+    /// Narrow an `if` / `elsif`* / `else` chain. Each arm runs only when its
+    /// own condition holds (positive narrowing) AND every preceding
+    /// condition fell through (cumulative negation). Only representable
+    /// negations survive — `defined`/`blessed` complement to `Undef`, while
+    /// `isa`/`ref-eq` have no positive complement (stay wide). The `else`
+    /// arm is pure cumulative negation; an `elsif` arm combines its own
+    /// guard with the priors' negation.
     pub(super) fn narrow_block_guard(&mut self, cond_stmt: Node<'a>) {
         let Some(condition) = cond_stmt.child_by_field_name("condition") else { return };
         let Some(block) = cond_stmt.child_by_field_name("block") else { return };
-        let Some(holds_when_true) = self.block_guard_polarity(cond_stmt, condition) else { return };
-        let then_region = node_to_span(block);
-        // The else-block (if any) is the complement region — a direct
-        // `else` child of `conditional_statement`. A guard holds there iff
-        // its expression is FALSE, so the op is negated (only `defined`/
-        // `blessed` have a representable complement). elsif-chain else is
-        // deferred (cumulative negation needs unions).
-        let else_block = trailing_else(cond_stmt);
-        let facts = recognize_guards(condition, self.source);
-        for fact in &facts {
-            if let Some(op) = fact.op_for_region(holds_when_true) {
-                self.emit_narrowing_fact(&fact.subject, op, then_region, block);
+        // The truth value the first condition must take for its block to run
+        // (`if` → true, `unless` → false). `elsif` arms are always positive.
+        let Some(first_enter) = self.block_guard_polarity(cond_stmt, condition) else { return };
+
+        // Walk the chain: `(condition?, block, enter_polarity)` per arm.
+        // The `else`/`elsif` nest inside the trailing `elsif`, so descend.
+        let mut arms: Vec<(Option<Node<'a>>, Node<'a>, bool)> =
+            vec![(Some(condition), block, first_enter)];
+        let mut tail = cond_stmt;
+        loop {
+            let Some(next) =
+                child_of_kind(tail, "elsif").or_else(|| child_of_kind(tail, "else"))
+            else {
+                break;
+            };
+            if next.kind() == "elsif" {
+                let (Some(c), Some(b)) =
+                    (next.child_by_field_name("condition"), next.child_by_field_name("block"))
+                else {
+                    break;
+                };
+                arms.push((Some(c), b, true));
+                tail = next;
+            } else {
+                if let Some(b) = next.child_by_field_name("block") {
+                    arms.push((None, b, true));
+                }
+                break;
             }
-            if let Some(else_block) = else_block {
-                if let Some(op) = fact.op_for_region(!holds_when_true) {
-                    self.emit_narrowing_fact(
-                        &fact.subject,
-                        op,
-                        node_to_span(else_block),
-                        else_block,
-                    );
+        }
+
+        for k in 0..arms.len() {
+            let (own_cond, blk, enter) = arms[k];
+            let region = node_to_span(blk);
+            // The arm's own guard is the more direct statement about a
+            // subject; a prior arm's negation must not override it.
+            let mut covered: Vec<String> = Vec::new();
+            if let Some(c) = own_cond {
+                for fact in recognize_guards(self, c, self.source) {
+                    if let Some(op) = fact.op_for_region(enter) {
+                        covered.push(subject_key(&fact.subject));
+                        self.emit_narrowing_fact(&fact.subject, op, region, blk);
+                    }
+                }
+            }
+            for &(prior_cond, _, prior_enter) in &arms[..k] {
+                let Some(prior_cond) = prior_cond else { continue };
+                for fact in recognize_guards(self, prior_cond, self.source) {
+                    let key = subject_key(&fact.subject);
+                    if covered.contains(&key) {
+                        continue;
+                    }
+                    // A prior arm not taken means its condition held at the
+                    // opposite of its enter polarity.
+                    if let Some(op) = fact.op_for_region(!prior_enter) {
+                        covered.push(key);
+                        self.emit_narrowing_fact(&fact.subject, op, region, blk);
+                    }
                 }
             }
         }
@@ -378,7 +454,7 @@ impl<'a> Builder<'a> {
             return;
         }
         let region = Span { start: stmt.end_position(), end: block.end_position() };
-        for fact in recognize_guards(condition, self.source) {
+        for fact in recognize_guards(self, condition, self.source) {
             if let Some(op) = fact.op_for_region(holds_when_true) {
                 self.emit_narrowing_fact(&fact.subject, op, region, block);
             }
@@ -404,8 +480,15 @@ impl<'a> Builder<'a> {
                 let end = self.first_subject_write(var, region, container);
                 (var.clone(), end)
             }
-            NarrowSubject::Place { key, root } => {
-                let end = self.first_place_invalidation(key, root, region, container);
+            NarrowSubject::Place { key, root, key_vars } => {
+                // The place is stable while its container/prefixes AND every
+                // dynamic-key scalar are unchanged; truncate at the earliest
+                // disturbance of either.
+                let mut end = self.first_place_invalidation(key, root, region, container);
+                for kv in key_vars {
+                    let kv_end = self.first_subject_write(kv, region, container);
+                    end = earliest_point(end, kv_end);
+                }
                 (key.clone(), end)
             }
         };
@@ -513,7 +596,21 @@ impl<'a> Builder<'a> {
             // exact place is excluded — a read / method call on the slot
             // value doesn't disturb the slot.
             let is_prefix = match node.kind() {
-                "scalar" => crate::cst::canonical_var_name(node, src).as_deref() == Some(root),
+                // Arrow-form root scalar (`$self`), or the whole named
+                // container of a direct-form place (`%h` / `@h` used as a
+                // unit — `keys %h`, `%h = (...)`, `\@h`). A bare
+                // appearance of either is an opaque use; the slot reads
+                // `$h{...}` go through `container_variable`, which is NOT
+                // matched here, so they don't truncate.
+                "scalar" | "hash" | "array" => {
+                    crate::cst::canonical_var_name(node, src).as_deref() == Some(root)
+                }
+                // Slice of the named container (`@h{...}` / `@h[...]`) can
+                // write multiple slots — treat any appearance as a
+                // disturbance (sound; over-truncates a pure slice read).
+                "slice_container_variable" | "keyval_container_variable" => {
+                    crate::cst::canonical_container_name(node, src).as_deref() == Some(root)
+                }
                 "hash_element_expression" | "array_element_expression" => {
                     crate::cst::canonical_place_path(node, src)
                         .is_some_and(|(k, _)| is_proper_prefix(&k, key))

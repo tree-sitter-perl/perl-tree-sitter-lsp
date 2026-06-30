@@ -554,6 +554,7 @@ fn build_with_plugins_inner(
         contract_symbols: b.contract_symbols,
         dynamic_parent_packages: b.dynamic_parent_packages,
         role_packages: b.role_packages,
+        column_keyed_verbs: b.plugins.column_keyed_verbs().map(|s| s.to_string()).collect(),
         plugin_loads: b.plugin_loads,
         loader_config_params: b.loader_config_params,
     });
@@ -1651,6 +1652,13 @@ enum Gate {
     StrictOrDefer(HashKeyOwner),
     Open(HashKeyOwner),
     Deferred,
+    /// A plugin-declared column-keyed verb (DBIC `search`/`create`/…): walk only
+    /// the FIRST hashref arg (the `\%cond`/`\%cols`; the trailing `\%attrs` hash
+    /// is not column-keyed). A key that is a `Class` column of the receiver gets
+    /// the column owner; otherwise it falls back to the supplied `Sub{class,verb}`
+    /// owner (so a generic-named verb like `new` still binds Moo/Corinna ctor
+    /// keys). Carries the `Sub{class,verb}` owner.
+    ColumnKeyed(HashKeyOwner),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2174,7 +2182,17 @@ impl<'a> Builder<'a> {
         }
         // (3) Imports — walk in reverse order so later `use` wins.
         for imp in self.imports.iter().rev() {
-            if imp.imported_symbols.iter().any(|s| s.local_name == *call_name) {
+            if let Some(sym) = imp.imported_symbols.iter().find(|s| s.local_name == *call_name) {
+                // A renaming import (`use Exp beta => { -as => 'rb' }`) binds a
+                // LOCAL alias the module doesn't define under that name. The
+                // alias belongs to the CONSUMING package — keying its calls
+                // there keeps rename/references local (and off the exporter's
+                // unrelated symbols, e.g. a stray `Exp::rb`). goto-def still
+                // reaches `Exp::beta` via the import binding's remote name,
+                // which `resolve_imported_function` reads independently.
+                if sym.remote_name.is_some() {
+                    return self.current_package.clone();
+                }
                 return Some(imp.module_name.clone());
             }
         }
@@ -3214,6 +3232,20 @@ impl<'a> Builder<'a> {
                         span,
                     });
                 }
+            }
+            plugin::EmitAction::ImportRef { name, package, span } => {
+                // The plugin-facing equivalent of core's qw/`-as` import-token
+                // refs: a BYO exporter plugin makes its custom rename-spec
+                // tokens navigable by emitting a `FunctionCall` ref pinned to a
+                // package — the exporting module for a remote name (joins the
+                // source sub's rename), or the consuming package for a local
+                // alias (a self-contained local group).
+                self.add_ref(
+                    RefKind::FunctionCall { resolved_package: package },
+                    span,
+                    name,
+                    AccessKind::Read,
+                );
             }
             plugin::EmitAction::PackageParent { package, parent } => {
                 self.package_parents.entry(package).or_default().push(parent);
@@ -4651,6 +4683,31 @@ impl<'a> Builder<'a> {
                 AccessKind::Declaration,
             );
 
+            // Connect a lexical hash/hashref's literal keys to its accesses so a
+            // key rename rewrites the def too (not just the `$h{k}`/`$h->{k}`
+            // reads, else the container keeps the old key and the renamed reads
+            // miss). The valid RHS is sigil-keyed: `%h = (LIST)` — a hashref
+            // `%h = {…}` is an uneven-list bug, never valid — and `$h = {HASHREF}`
+            // — a `$h = (…)` list is scalar-of-last, not a hashref. A `bless {…}`
+            // / `func()` RHS is a CALL, not a bare literal, so it's excluded here
+            // (those keys are owned elsewhere — bless `InternalKey`, return `Sub`).
+            // `child_by_field_name("right")` still returns the `(` token, so find
+            // the RHS by named child.
+            let rhs_kinds: &[&str] = match sigil {
+                '%' => &["list_expression", "parenthesized_expression"],
+                '$' => &["anonymous_hash_expression"],
+                _ => &[],
+            };
+            if !rhs_kinds.is_empty() {
+                if let Some(rhs) = node.parent().filter(|p| p.kind() == "assignment_expression").and_then(|p| {
+                    (0..p.named_child_count())
+                        .filter_map(|i| p.named_child(i))
+                        .find(|c| c.id() != node.id() && rhs_kinds.contains(&c.kind()))
+                }) {
+                    self.emit_lexical_hash_literal_keys(name, rhs);
+                }
+            }
+
             // Synthesize accessor methods for `field $x :reader` / `:writer`
             if decl_kind == DeclKind::Field {
                 let bare_name = &name[1..]; // strip sigil
@@ -5356,11 +5413,32 @@ impl<'a> Builder<'a> {
             .collect();
         let mut empty_import = false;
         if let Some(node) = node {
-            for (local, remote) in self.extract_as_renames(node) {
+            for (local, remote, alias_span, remote_span) in self.extract_as_renames(node) {
                 // The `-as` arg already appears as a bare name in `imports`
                 // (the origin) and a string in the hashref (the local); drop
                 // both flat entries and replace with the renamed binding.
                 imported_symbols.retain(|s| s.local_name != remote && s.local_name != local);
+                // Two distinct rename identities:
+                //   * the remote-name token IS the source sub — pin it to the
+                //     exporting module so renaming `Module::remote` rewrites it.
+                //   * the local alias is a binding in the CONSUMING package —
+                //     pin it there so it renames with its local calls (which
+                //     `resolve_call_package` also keys to this package), never
+                //     touching the exporter's symbols.
+                if module_name != "parent" && module_name != "base" {
+                    self.add_ref(
+                        RefKind::FunctionCall { resolved_package: Some(module_name.clone()) },
+                        remote_span,
+                        remote.clone(),
+                        AccessKind::Read,
+                    );
+                    self.add_ref(
+                        RefKind::FunctionCall { resolved_package: self.current_package.clone() },
+                        alias_span,
+                        local.clone(),
+                        AccessKind::Read,
+                    );
+                }
                 imported_symbols.push(ImportedSymbol::renamed(local, remote));
             }
             // `use Foo ();` — explicit empty parens suppress even `@EXPORT`.
@@ -5870,7 +5948,12 @@ impl<'a> Builder<'a> {
     /// bareword/string `name` immediately followed by a hashref whose `-as`
     /// (or `as`) key names the local alias. Sub::Exporter / Exporter::Tiny /
     /// Exporter's `-as` all spell it this way, so one shape covers them.
-    fn extract_as_renames(&self, node: Node<'a>) -> Vec<(String, String)> {
+    /// `(local_alias, remote_name, alias_span, remote_span)` for each
+    /// `name => { -as => 'local' }` pair. The two spans are what make the
+    /// renaming import navigable: `remote_span` (the `name` token) joins the
+    /// SOURCE sub's rename; `alias_span` (the `-as` value) joins the local
+    /// alias group (see `process_use`).
+    fn extract_as_renames(&self, node: Node<'a>) -> Vec<(String, String, Span, Span)> {
         let mut out = Vec::new();
         // The args live in a `list_expression` (multiple) or directly under the
         // use node. Walk every descendant list once, pairing a name token with
@@ -5880,21 +5963,21 @@ impl<'a> Builder<'a> {
     }
 
     /// Recurse for `name => { -as => 'local' }` pairs. `pending_name` carries a
-    /// just-seen bareword/string awaiting its hashref; when a hashref follows,
-    /// its `-as` value becomes the local alias for that name.
+    /// just-seen bareword/string (+ its span) awaiting its hashref; when a
+    /// hashref follows, its `-as` value becomes the local alias for that name.
     fn collect_as_renames(
         &self,
         node: Node<'a>,
-        pending_name: &mut Option<String>,
-        out: &mut Vec<(String, String)>,
+        pending_name: &mut Option<(String, Span)>,
+        out: &mut Vec<(String, String, Span, Span)>,
     ) {
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             match child.kind() {
                 "anonymous_hash_expression" => {
-                    if let Some(remote) = pending_name.take() {
-                        if let Some(local) = self.extract_as_alias(child) {
-                            out.push((local, remote));
+                    if let Some((remote, remote_span)) = pending_name.take() {
+                        if let Some((local, alias_span)) = self.extract_as_alias(child) {
+                            out.push((local, remote, alias_span, remote_span));
                         }
                     }
                 }
@@ -5904,7 +5987,14 @@ impl<'a> Builder<'a> {
                     // Skip option flags (`-as` appears at top level too in some
                     // forms) — only real names seed a pending rename.
                     if !name.is_empty() && !name.starts_with('-') {
-                        *pending_name = Some(name);
+                        // Content span for a quoted remote name; the whole token
+                        // for a bareword (`beta`) — either way, just the name.
+                        let span = if child.kind() == "string_literal" {
+                            crate::cst::string_content_span(child)
+                        } else {
+                            node_to_span(child)
+                        };
+                        *pending_name = Some((name, span));
                     }
                 }
                 "list_expression" | "parenthesized_expression" => {
@@ -5924,7 +6014,7 @@ impl<'a> Builder<'a> {
     /// The key is matched on its *normalized text* (`-as` parses as a
     /// `unary_expression` wrapping `as` in the fat-comma form, a `string_literal`
     /// in the plain-comma form), never on a `=>` gate.
-    fn extract_as_alias(&self, hashref: Node<'a>) -> Option<String> {
+    fn extract_as_alias(&self, hashref: Node<'a>) -> Option<(String, Span)> {
         let body = (0..hashref.named_child_count())
             .filter_map(|i| hashref.named_child(i))
             .find(|c| c.kind() == "list_expression")
@@ -5950,7 +6040,9 @@ impl<'a> Builder<'a> {
                     .trim_start_matches('-')
                     .to_string();
                 if !local.is_empty() {
-                    alias = Some(local);
+                    // Content span (inside the quotes) so rename rewrites just
+                    // the alias name, not `'renamed_beta'`.
+                    alias = Some((local, crate::cst::string_content_span(v_node)));
                     return false;
                 }
             }
@@ -10434,6 +10526,30 @@ impl<'a> Builder<'a> {
                     // resolve through the same `Operator(RowOf(
                     // Receiver))` substitution.
                     self.emit_parametric_return_expr_decls(&ty);
+                } else if self.is_fluent_verb_call(node) {
+                    // A fluent verb (`$rs->search`) returns its invocant's type
+                    // UNCHANGED. Edge the call's type to the invocant's rather
+                    // than minting one — any invocant type flows through, no
+                    // re-mint (edges-not-values). Skip the standard MethodOnClass
+                    // edge: `search` has no return-type def to resolve through.
+                    if let RefKind::MethodCall { invocant_span: Some(inv_span), .. } =
+                        self.refs[idx].kind
+                    {
+                        self.parametric_emitted_refs.insert(idx);
+                        let r_span = self.refs[idx].span;
+                        self.bag.push(crate::witnesses::Witness {
+                            attachment: crate::witnesses::WitnessAttachment::Expression(
+                                crate::witnesses::RefIdx(idx as u32),
+                            ),
+                            source: crate::witnesses::WitnessSource::Builder(
+                                "fluent_passthrough".into(),
+                            ),
+                            payload: crate::witnesses::WitnessPayload::Edge(
+                                crate::witnesses::WitnessAttachment::Expr(inv_span),
+                            ),
+                            span: r_span,
+                        });
+                    }
                 }
             }
         }
@@ -10747,10 +10863,44 @@ impl<'a> Builder<'a> {
 
         // Collect hash-literal keys as HashKeyDef symbols
         if let Some(ref owner) = owner {
-            self.collect_pair_keys(node, owner);
+            let keys = self.collect_pair_keys(node, owner);
+            // A blessed hash's keys are instance slots of the class — the same
+            // `$self->{key}` slots a Moo `has` mints an `InternalKey` for
+            // (rule #9: provenance — bless key → internal hash key). Emit the
+            // projection so rename/references from the constructor key reach
+            // the `Class(C)`-owned `$self->{key}` accesses via the group's
+            // `InternalHashKey` member. A `return { ... }` hash is NOT instance
+            // slots (its keys are the sub's return shape, consumed `Sub`-owned),
+            // so only the bless context mints this.
+            if let HashKeyOwner::Sub { package: Some(class), .. } = owner {
+                if self.anon_hash_is_blessed(node) {
+                    for key in keys {
+                        self.attr_projections.push(crate::file_analysis::AttrProjection {
+                            class: class.clone(),
+                            attr: key,
+                            kind: crate::file_analysis::AttrProjectionKind::InternalKey,
+                        });
+                    }
+                }
+            }
         }
 
         self.visit_children(node);
+    }
+
+    /// Is this anon-hash node the operand of a `bless` call (within 5
+    /// ancestors)? Mirrors `detect_anon_hash_owner`'s bless branch — bless
+    /// keys are instance slots; `return { ... }` keys are not.
+    fn anon_hash_is_blessed(&self, anon_hash: Node<'a>) -> bool {
+        let mut ancestor = anon_hash.parent();
+        for _ in 0..5 {
+            let Some(a) = ancestor else { return false };
+            if self.is_bless_call(a) {
+                return true;
+            }
+            ancestor = a.parent();
+        }
+        false
     }
 
     // ---- Fold ranges ----
@@ -11077,22 +11227,35 @@ impl<'a> Builder<'a> {
     /// (variable, computed) means the row class is dynamic and
     /// we don't claim.
     fn extract_resultset_parametric(&self, node: Node<'a>) -> Option<InferredType> {
+        use crate::file_analysis::ParametricType;
         if node.kind() != "method_call_expression" {
             return None;
         }
         let method = node.child_by_field_name("method")?;
-        if method.utf8_text(self.source).ok() != Some("resultset") {
-            return None;
+        let mtext = method.utf8_text(self.source).ok()?;
+        // `recv->resultset('Foo')` — row class from the string arg.
+        if mtext == "resultset" {
+            let args = node.child_by_field_name("arguments")?;
+            let row_class = self.first_string_or_constfold_arg(args)?;
+            let base = self
+                .discover_resultset_class(&row_class)
+                .unwrap_or_else(|| "DBIx::Class::ResultSet".to_string());
+            return Some(InferredType::Parametric(ParametricType::ResultSet { base, row: row_class }));
         }
-        let args = node.child_by_field_name("arguments")?;
-        let row_class = self.first_string_or_constfold_arg(args)?;
-        let base = self
-            .discover_resultset_class(&row_class)
-            .unwrap_or_else(|| "DBIx::Class::ResultSet".to_string());
-        Some(InferredType::Parametric(crate::file_analysis::ParametricType::ResultSet {
-            base,
-            row: row_class,
-        }))
+        None
+    }
+
+    /// Is this call a plugin-declared FLUENT verb (`$rs->search`)? A fluent verb
+    /// returns its invocant's type UNCHANGED — whatever it is — so the call site
+    /// edges the call's type to the invocant's rather than minting one (DBIC's
+    /// `search`/`search_rs` keep a resultset a resultset; this stays generic).
+    /// The verb list is the plugin's (#10/#8).
+    fn is_fluent_verb_call(&self, node: Node<'a>) -> bool {
+        node.kind() == "method_call_expression"
+            && node
+                .child_by_field_name("method")
+                .and_then(|m| m.utf8_text(self.source).ok())
+                .is_some_and(|m| self.plugins.fluent_verbs().any(|v| v == m))
     }
 
     /// Push `ReturnExpr` declarations on `MethodOnClass{base, m}`
@@ -11466,6 +11629,39 @@ impl<'a> Builder<'a> {
     /// Foo { field $x :param }` — Point->new(x => 3, …) needs the
     /// MethodCall ref's `find_param_field` fallback in
     /// `find_definition`).
+    /// Emit `HashKeyAccess` refs for the keys of a `my %h = (k => …)` literal,
+    /// keyed by the hash variable (`var_text = %h`, `owner: None`). The post-walk
+    /// owner fixup resolves them to `Variable{%h, def_scope}` — the same owner
+    /// the `$h{k}` accesses get — so they group with the accesses for rename.
+    fn emit_lexical_hash_literal_keys(&mut self, hash_name: &str, rhs: Node<'a>) {
+        for (key_node, _value) in crate::cst::pair_nodes(rhs) {
+            if !matches!(
+                key_node.kind(),
+                "bareword" | "autoquoted_bareword" | "string_literal" | "interpolated_string_literal"
+            ) {
+                continue;
+            }
+            let Some((key, is_dynamic)) = self.extract_key_text(key_node) else { continue };
+            if is_dynamic {
+                continue;
+            }
+            let span = if matches!(key_node.kind(), "string_literal" | "interpolated_string_literal") {
+                self.string_content_span(key_node)
+            } else {
+                node_to_span(key_node)
+            };
+            self.refs.push(Ref {
+                kind: RefKind::HashKeyAccess { var_text: hash_name.to_string(), owner: None },
+                span,
+                scope: self.scope_at_point(span.start),
+                target_name: key,
+                access: AccessKind::Write,
+                resolves_to: None,
+                resolved_method_target: None,
+            });
+        }
+    }
+
     fn emit_call_arg_key_accesses(&mut self, args_node: Node<'a>, gate: Gate) {
         // Unwrap one level into a hash literal / paren wrapper —
         // search's `{KEY=>...}` is `anonymous_hash_expression`
@@ -11474,35 +11670,46 @@ impl<'a> Builder<'a> {
         // pair list. Constructor-style args without the wrapper
         // pass through unchanged.
         let mut effective = args_node;
-        if matches!(effective.kind(), "anonymous_hash_expression" | "parenthesized_expression")
-            && effective.named_child_count() == 1
-        {
-            if let Some(inner) = effective.named_child(0) {
-                if matches!(inner.kind(), "list_expression" | "anonymous_hash_expression") {
-                    effective = inner;
-                }
+        // A column-keyed verb's column hash is POSITIONALLY the first arg
+        // (`search(\%cond, \%attrs)` → `\%cond`; `create(\%cols)`). Narrow to it
+        // only when arg 0 is itself a hash literal — a scalar/arrayref cond
+        // (`search($cond, \%attrs)`) carries no inline keys, and the trailing
+        // `\%attrs` hash (`order_by`/`rows`/…) must never be mistaken for it
+        // (picking "first hash among args" would walk it).
+        if matches!(gate, Gate::ColumnKeyed(_)) {
+            let arg0 = if effective.kind() == "anonymous_hash_expression" {
+                Some(effective)
+            } else {
+                effective.named_child(0)
+            };
+            match arg0 {
+                // Hashref cond/cols (`search({…})`, `create({…})`): narrow to it.
+                Some(h) if h.kind() == "anonymous_hash_expression" => effective = h,
+                // Flat constructor pairs (`new(name => 1)`): arg 0 is a stringy
+                // key — walk the top-level pair list (effective unchanged).
+                Some(k) if matches!(
+                    k.kind(),
+                    "bareword" | "autoquoted_bareword" | "string_literal" | "interpolated_string_literal"
+                ) => {}
+                // A positional non-key first arg (`search($cond, \%attrs)`): the
+                // cond is a prebuilt ref with no inline keys, and the trailing
+                // `\%attrs` hash is not column-keyed. Walk nothing.
+                _ => return,
             }
         }
-        let named: Vec<Node<'a>> = (0..effective.named_child_count())
-            .filter_map(|i| effective.named_child(i))
-            .collect();
-        // Single-arg calls present the arg directly (no list_expression
-        // wrapper). One arg can't be a key/value pair.
-        if named.len() < 2
-            && effective.kind() != "list_expression"
-            && effective.kind() != "parenthesized_expression"
-        {
-            return;
-        }
-        for (idx, child) in named.iter().enumerate() {
-            if idx % 2 != 0 { continue; }
+        // Pair-walk via the shared `cst::pair_nodes`: Perl tucks the tail pairs
+        // of `a => 1, b => 2` into a right-nested `list_expression`, so manual
+        // even/odd iteration over the top-level children sees only the FIRST
+        // pair. `pair_nodes` flattens the nesting (and skips separators), so
+        // every key is walked. (CLAUDE.md: don't re-derive pair-walking.)
+        for (child, _value) in crate::cst::pair_nodes(effective) {
             if !matches!(
                 child.kind(),
                 "bareword" | "autoquoted_bareword" | "string_literal" | "interpolated_string_literal"
             ) {
                 continue;
             }
-            let Some((key, is_dynamic)) = self.extract_key_text(*child) else { continue };
+            let Some((key, is_dynamic)) = self.extract_key_text(child) else { continue };
             if is_dynamic { continue; }
             // Gate decides whether to emit + what owner to record.
             // Strict checks the local symbol table for a matching
@@ -11518,6 +11725,25 @@ impl<'a> Builder<'a> {
                     if !self.has_hash_key_def(&key, owner) { continue; }
                     Some(owner.clone())
                 }
+                Gate::ColumnKeyed(sub_owner) => {
+                    // First-hashref narrowing already happened in `effective`.
+                    // A key that's an actual column → the column owner; else fall
+                    // back to the `Sub{class,verb}` owner if the verb declares it
+                    // (Moo/Corinna ctor keys under a generic-named `new`); else
+                    // skip (so `order_by` and friends never latch on).
+                    let class = match sub_owner {
+                        HashKeyOwner::Sub { package: Some(c), .. } => c.clone(),
+                        _ => continue,
+                    };
+                    let col = HashKeyOwner::Bridged { class };
+                    if self.has_hash_key_def(&key, &col) {
+                        Some(col)
+                    } else if self.has_hash_key_def(&key, sub_owner) {
+                        Some(sub_owner.clone())
+                    } else {
+                        continue;
+                    }
+                }
                 Gate::StrictOrDefer(owner) => {
                     if self.has_hash_key_def(&key, owner) {
                         Some(owner.clone())
@@ -11528,14 +11754,25 @@ impl<'a> Builder<'a> {
                 Gate::Open(owner) => Some(owner.clone()),
                 Gate::Deferred => None,
             };
-            let access = self.determine_access(*child);
+            let access = self.determine_access(child);
             // `scope_at_point` instead of `current_scope` so this
             // works both inside the walk (function-call args path)
             // and post-walk (method-call args path; scope_stack is
             // empty by then). Equivalent at walk-time because a
             // node's innermost containing scope IS what
             // current_scope would return.
-            let span = node_to_span(*child);
+            //
+            // A quoted key (`{ "name", 2 }`) must rename its CONTENT, not the
+            // whole literal — rewriting the quotes turns it into a bareword
+            // (`{ fullname, 2 }`), a `strict subs` error in a plain-comma list.
+            let span = if matches!(
+                child.kind(),
+                "string_literal" | "interpolated_string_literal"
+            ) {
+                self.string_content_span(child)
+            } else {
+                node_to_span(child)
+            };
             self.refs.push(Ref {
                 kind: RefKind::HashKeyAccess {
                     var_text: String::new(),
@@ -11569,7 +11806,7 @@ impl<'a> Builder<'a> {
     /// of the flat pair sequence — `{ a => 1, 'b', 2 }` is `{ 'a', 1, 'b', 2 }`,
     /// so the separator (`,` vs `=>`) is irrelevant; we pair positionally via
     /// the shared node-level walker and take each key node.
-    fn collect_pair_keys(&mut self, node: Node<'a>, owner: &HashKeyOwner) {
+    fn collect_pair_keys(&mut self, node: Node<'a>, owner: &HashKeyOwner) -> Vec<String> {
         let mut defs: Vec<(String, Span)> = Vec::new();
         for (k_node, _val) in crate::cst::pair_nodes(node) {
             if matches!(
@@ -11583,6 +11820,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        let keys: Vec<String> = defs.iter().map(|(k, _)| k.clone()).collect();
         for (key, span) in defs {
             self.add_symbol(
                 key,
@@ -11592,6 +11830,7 @@ impl<'a> Builder<'a> {
                 SymbolDetail::HashKeyDef { owner: owner.clone(), is_dynamic: false },
             );
         }
+        keys
     }
 
     /// Synthesize `Sub` symbols for AutoLoader / SelfLoader packages whose
@@ -11943,7 +12182,13 @@ impl<'a> Builder<'a> {
                             if name != &ref_target { return false; }
                             if *decl_point > ref_span_start { return false; }
                             match gating_package {
-                                Some(decl_pkg) => use_pkg.as_deref() == Some(decl_pkg.as_str()),
+                                // A package-less script (no `package` stmt) puts
+                                // both the `our` decl and bare uses in the default
+                                // `main`, but `package_at_pos` yields `None` there
+                                // — so an absent enclosing package reads as `main`.
+                                Some(decl_pkg) => {
+                                    use_pkg.as_deref().unwrap_or("main") == decl_pkg.as_str()
+                                }
                                 None => true,
                             }
                         })
@@ -12467,7 +12712,12 @@ impl<'a> Builder<'a> {
             Strict(HashKeyOwner, Node<'a>),
             StrictOrDefer(HashKeyOwner, Node<'a>),
             Deferred(Node<'a>),
+            ColumnKeyed(HashKeyOwner, Node<'a>),
         }
+        // Plugin-declared verbs whose first hashref arg is column-keyed (owned
+        // so it doesn't borrow `self` across the `&mut self` emit loop below).
+        let column_keyed: std::collections::HashSet<String> =
+            self.plugins.column_keyed_verbs().map(|s| s.to_string()).collect();
         let mut pending: Vec<Path<'a>> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
             if !matches!(r.kind, RefKind::MethodCall { .. }) {
@@ -12502,10 +12752,26 @@ impl<'a> Builder<'a> {
                 let local_class = self.symbols.iter().any(|s| {
                     matches!(s.kind, SymKind::Package | SymKind::Class) && s.name == *cls
                 });
+                // A column-keyed verb (`search`/`create`/…) on a locally-defined
+                // class: link the first hashref's column keys to the class's
+                // columns. Cross-file (class elsewhere) stays `StrictOrDefer` —
+                // the deferred owner mints the column owner at query time.
                 let owner = HashKeyOwner::Sub {
                     package: Some(cls.clone()),
                     name: r.target_name.clone(),
                 };
+                // A class that defines its OWN `sub <verb>` has overridden DBIC's
+                // verb — the call dispatches to the user's method, whose hash arg
+                // is not column-keyed — so don't column-key it (fall to Strict).
+                let user_shadows_verb = self.symbols.iter().any(|s| {
+                    matches!(s.kind, SymKind::Sub | SymKind::Method)
+                        && s.name == r.target_name
+                        && s.package.as_deref() == Some(cls.as_str())
+                });
+                if local_class && !user_shadows_verb && column_keyed.contains(&r.target_name) {
+                    pending.push(Path::ColumnKeyed(owner, args));
+                    continue;
+                }
                 pending.push(if local_class {
                     Path::Strict(owner, args)
                 } else {
@@ -12541,6 +12807,9 @@ impl<'a> Builder<'a> {
                 }
                 Path::Deferred(args) => {
                     self.emit_call_arg_key_accesses(args, Gate::Deferred);
+                }
+                Path::ColumnKeyed(owner, args) => {
+                    self.emit_call_arg_key_accesses(args, Gate::ColumnKeyed(owner));
                 }
             }
         }

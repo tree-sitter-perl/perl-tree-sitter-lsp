@@ -1,15 +1,15 @@
 {
   "capability": "references",
-  "comment": "Tier 1 references: the row-key access and the column def are one reference set, cross-file.",
+  "comment": "Tier 1 references: a $row->{name} deref on a DBIC row is NOT a column reference (a column isn't a hash slot), so it never joins the column's cross-file reference set — references from the deref must not reach the column file.",
   "rows": [
     {
-      "id": "nested-row-key-references",
+      "id": "nested-row-key-deref-not-in-column-refs",
       "root": "gold-corpus/nested-fixture",
       "file": "main.pl",
       "line": 22,
       "col": 17,
       "status": "gold",
-      "expect": { "all": ["\"file\":\"NestedRow.pm\"", "\"file\":\"main.pl\""] }
+      "expect": { "none": ["\"file\":\"NestedRow.pm\""] }
     }
   ]
 }

@@ -186,16 +186,55 @@ fn optional_blessed_narrows_to_inner() {
 }
 
 #[test]
-fn optional_without_defined_does_not_dispatch() {
-    // Without the guard, $r stays Optional<Foo>, which dispatches nowhere
-    // (an optional is not definitely an instance).
+fn optional_dispatches_leniently_without_guard() {
+    // An unguarded Optional<Foo> still resolves its method receiver to Foo
+    // (lenient navigation — goto/hover/completion shouldn't go dark just
+    // because a `defined` guard hasn't been written; a future deref
+    // diagnostic owns the "might be undef" warning). The lattice keeps the
+    // value typed Optional<Foo> — only the receiver projection peels.
     let fa = build_fa(
         "package P;\nsub maybe { return undef unless 1; return Foo->new; }\nsub use_it {\n    my $r = maybe();\n    $r->go;\n}",
     );
     assert_eq!(
+        fa.inferred_type_via_bag("$r", Point::new(4, 4)),
+        Some(InferredType::Optional(Box::new(InferredType::ClassName("Foo".into())))),
+        "the value stays typed Optional<Foo> (the lattice is unchanged)",
+    );
+    assert_eq!(
+        invocant_class_of(&fa, "go").as_deref(),
+        Some("Foo"),
+        "the receiver dispatches leniently to Foo without a guard",
+    );
+}
+
+#[test]
+fn optional_receiver_goto_def_resolves() {
+    // The motivating case: goto-def on a method called on an unguarded
+    // Optional<Foo> lands on Foo's method, via the stamped nav edge that
+    // `method_call_invocant_class` now resolves leniently.
+    let fa = build_fa(
+        "package Foo;\nsub go { my ($self) = @_; }\npackage P;\nsub maybe { return undef unless 1; return Foo->new; }\nsub use_it {\n    my $r = maybe();\n    $r->go;\n}",
+    );
+    let foo_go = fa.symbols.iter().find(|s| s.name == "go").unwrap();
+    // Cursor on the `go` token of `$r->go`.
+    assert_eq!(
+        fa.find_definition(Point::new(6, 8), None),
+        Some(foo_go.selection_span),
+        "goto-def lands on Foo::go through the optional receiver",
+    );
+}
+
+#[test]
+fn undef_receiver_does_not_dispatch() {
+    // A provably-Undef receiver dispatches nowhere — you can't navigate the
+    // methods of nothing. `Undef` peels to None, unlike `Optional`.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    return if defined $x;\n    $x->go;\n}",
+    );
+    assert_eq!(
         invocant_class_of(&fa, "go").as_deref(),
         None,
-        "Optional<Foo> must be narrowed before it can dispatch",
+        "a definitely-Undef receiver stays dark",
     );
 }
 
@@ -299,6 +338,48 @@ fn negative_isa_else_stays_wide() {
     );
 }
 
+// ── elsif-chain cumulative negation ──
+
+#[test]
+fn narrow_elsif_else_defined_is_undef() {
+    // The `else` of an `if (defined) / elsif / else` chain asserts the
+    // negation of every preceding condition — `!defined $x` → Undef.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x, $c) = @_;\n    if (defined $x) {\n        my $a = $x;\n    } elsif ($c) {\n        my $b = $x;\n    } else {\n        my $z = $x;\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(8, 16)),
+        Some(InferredType::Undef),
+        "elsif-chain else: !defined $x → Undef",
+    );
+    // The intervening elsif block also runs only when !defined $x.
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(6, 16)),
+        Some(InferredType::Undef),
+        "elsif block: prior !defined $x → Undef",
+    );
+    // The then-block still strips to the inner (defined holds there).
+    assert_ne!(
+        fa.inferred_type_via_bag("$x", Point::new(4, 16)),
+        Some(InferredType::Undef),
+        "then-block is not Undef (defined holds)",
+    );
+}
+
+#[test]
+fn narrow_elsif_else_isa_stays_wide() {
+    // `isa` has no representable complement, so an elsif-chain else over an
+    // isa guard stays wide (no false Undef).
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x, $c) = @_;\n    if ($x->isa('Foo')) {\n        my $a = $x;\n    } elsif ($c) {\n        my $b = $x;\n    } else {\n        my $z = $x;\n    }\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$x", Point::new(8, 16)),
+        None,
+        "isa has no positive complement — elsif else stays wide",
+    );
+}
+
 // ── Place narrowing: `$self->{x}` ──
 
 /// Class an invocant resolves to for the method-call ref named `method`.
@@ -370,14 +451,45 @@ fn narrow_place_truncated_by_opaque_root_op() {
 }
 
 #[test]
-fn narrow_place_dynamic_key_skipped() {
+fn narrow_place_dynamic_key() {
+    // A plain-scalar key is a stable place keyed by its spelling
+    // (`$self->{$k}`), so it narrows like a constant-key place.
     let fa = build_fa(
         "package P;\nsub f {\n    my ($self, $k) = @_;\n    return unless $self->{$k}->isa('Foo');\n    $self->{$k}->go;\n}",
     );
-    assert_ne!(
+    assert_eq!(
         invocant_class_of(&fa, "go").as_deref(),
         Some("Foo"),
-        "a dynamic key is not a stable place — no narrowing",
+        "a plain-scalar key is a stable place and narrows",
+    );
+}
+
+#[test]
+fn narrow_place_dynamic_key_truncated_by_key_reassign() {
+    // Reassigning the key scalar `$k` breaks the place identity, so the
+    // narrowing ends there.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($self, $k) = @_;\n    return unless $self->{$k}->isa('Foo');\n    $self->{$k}->before;\n    $k = 'other';\n    $self->{$k}->after;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "before").as_deref(), Some("Foo"));
+    assert_ne!(
+        invocant_class_of(&fa, "after").as_deref(),
+        Some("Foo"),
+        "reassigning the key scalar truncates the dynamic-key narrowing",
+    );
+}
+
+#[test]
+fn narrow_place_dynamic_key_truncated_by_slot_write() {
+    // Writing the same dynamic slot truncates (exact-spelling match).
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($self, $k) = @_;\n    return unless $self->{$k}->isa('Foo');\n    $self->{$k}->before;\n    $self->{$k} = other();\n    $self->{$k}->after;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "before").as_deref(), Some("Foo"));
+    assert_ne!(
+        invocant_class_of(&fa, "after").as_deref(),
+        Some("Foo"),
+        "writing the dynamic slot truncates the narrowing",
     );
 }
 
@@ -439,6 +551,55 @@ fn narrow_place_ref_eq() {
     );
 }
 
+// ── Place narrowing: direct element form (`$h{k}` / `$a[0]`) ──
+
+#[test]
+fn narrow_place_direct_hash_isa() {
+    // Direct hash element — base is `%h`, not a scalar deref.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my %h = @_;\n    return unless $h{cfg}->isa('Cfg');\n    $h{cfg}->load;\n}",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$h{cfg}", Point::new(4, 4)),
+        Some(InferredType::ClassName("Cfg".into())),
+        "direct hash-element isa guard narrows the slot",
+    );
+    assert_eq!(invocant_class_of(&fa, "load").as_deref(), Some("Cfg"));
+}
+
+#[test]
+fn narrow_place_direct_array_isa() {
+    // Direct array element — base is `@a`.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my @a = @_;\n    return unless $a[0]->isa('Widget');\n    $a[0]->paint;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "paint").as_deref(), Some("Widget"));
+}
+
+#[test]
+fn narrow_place_direct_truncated_by_whole_container_write() {
+    // Reassigning the whole `%h` truncates the slot narrowing.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my %h = @_;\n    return unless $h{x}->isa('Foo');\n    $h{x}->before;\n    %h = ();\n    $h{x}->after;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "before").as_deref(), Some("Foo"));
+    assert_ne!(
+        invocant_class_of(&fa, "after").as_deref(),
+        Some("Foo"),
+        "reassigning the whole hash truncates the narrowing",
+    );
+}
+
+#[test]
+fn narrow_place_direct_slot_read_keeps_slot() {
+    // Reading the slot value doesn't disturb it — both uses stay narrowed.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my %h = @_;\n    return unless $h{db}->isa('Schema');\n    $h{db}->connect;\n    $h{db}->disconnect;\n}",
+    );
+    assert_eq!(invocant_class_of(&fa, "connect").as_deref(), Some("Schema"));
+    assert_eq!(invocant_class_of(&fa, "disconnect").as_deref(), Some("Schema"));
+}
+
 #[test]
 fn optional_bare_return_then_defined() {
     // The dominant idiom: `return unless …; return Obj->new` is Optional,
@@ -489,6 +650,20 @@ fn optional_maybe_isa_instance() {
 //    the shared `cst` primitives (cst::peel_groups /
 //    cst::first_named_child_where / cst::plain_string_literal_text) ──
 
+
+#[test]
+fn narrow_isa_const_folded_class_arg() {
+    // `my $C = 'Foo'; $x->isa($C)` — the fold pins $C to one class, so the
+    // guard narrows just like a literal class name.
+    let fa = build_fa(
+        "package P;\nsub f {\n    my ($x) = @_;\n    my $C = 'Foo';\n    return unless $x->isa($C);\n    $x->go;\n}",
+    );
+    assert_eq!(
+        invocant_class_of(&fa, "go").as_deref(),
+        Some("Foo"),
+        "a const-folded class name narrows the isa guard",
+    );
+}
 
 #[test]
 fn narrow_isa_interpolated_arg_stays_wide() {

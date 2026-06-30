@@ -289,7 +289,7 @@ $schema->resultset('Schema::Result::Users')->search({{ definitely_not_a_column =
 /// `$schema->resultset('Schema::Result::Users')->search({ KEY })`.
 /// The parametric type must compose through cross-file enrichment
 /// — the column def lives in the producer, the call site in the
-/// consumer; refs_to(HashKeyOfClass) finds the consumer's hash-key
+/// consumer; refs_to(HashKeyOfBridged) finds the consumer's hash-key
 /// access ref pointing at the producer's column def.
 #[test]
 fn cross_file_resultset_column_resolution() {
@@ -316,8 +316,8 @@ $schema->resultset('Schema::Result::Users')->search({ name => 'X' });
 
     let target = TargetRef {
         name: "name".to_string(),
-        kind: TargetKind::HashKeyOfClass("Schema::Result::Users".to_string()),
-        method_classes: Vec::new(),
+        kind: TargetKind::HashKeyOfBridged("Schema::Result::Users".to_string()),
+        method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs
@@ -325,7 +325,7 @@ $schema->resultset('Schema::Result::Users')->search({ name => 'X' });
         .any(|r| matches!(&r.key, FileKey::Path(p) if p == &consumer_path));
     assert!(
         consumer_hit,
-        "refs_to(HashKeyOfClass(Schema::Result::Users), name) must include the \
+        "refs_to(HashKeyOfBridged(Schema::Result::Users), name) must include the \
          consumer's $$schema->resultset('…')->search({{ name => … }}) call site. \
          the parametric type must compose through cross-file enrichment. hits: {:?}",
         refs.iter().map(|r| (&r.key, r.span.start.row)).collect::<Vec<_>>(),
@@ -441,7 +441,7 @@ my $name = $schema->resultset('Schema::Result::Users')->find(1)->name;
             kind: TargetKind::Method {
                 class: "Schema::Result::Users".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -711,7 +711,7 @@ sub action {
 /// **Composition: same as the in-file test, split across two
 /// files.** Producer declares `Schema::Result::Sner` + the
 /// `MyApp` helper; consumer is a Mojolicious::Controller subclass
-/// using the helper. `refs_to(HashKeyOfClass(Sner), name)` should
+/// using the helper. `refs_to(HashKeyOfBridged(Sner), name)` should
 /// find the consumer's call site if cross-file enrichment carries
 /// the Parametric all the way through.
 #[test]
@@ -757,8 +757,8 @@ sub action {
 
     let target = TargetRef {
         name: "name".to_string(),
-        kind: TargetKind::HashKeyOfClass("Schema::Result::Sner".to_string()),
-        method_classes: Vec::new(),
+        kind: TargetKind::HashKeyOfBridged("Schema::Result::Sner".to_string()),
+        method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs
@@ -827,8 +827,8 @@ sub action {
 
     let target = TargetRef {
         name: "name".to_string(),
-        kind: TargetKind::HashKeyOfClass("Schema::Result::Sner".to_string()),
-        method_classes: Vec::new(),
+        kind: TargetKind::HashKeyOfBridged("Schema::Result::Sner".to_string()),
+        method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
     };
     let refs = refs_to(&store, Some(&idx), &target, RoleMask::WORKSPACE);
     let consumer_hit = refs
@@ -982,13 +982,13 @@ sub action {
 
 // ---- Tier 1 nested-hashkey: direct `$row->{col}` deref ----
 
-/// `$row->{name}` on a typed row (DBIC HRI shape): the deref's hash key
-/// resolves to the column def, same as `$row->name` does. The row's
-/// class comes from the RowOf projection (`$rs->find` →
-/// ClassName(Schema::Result::Users)); the key's owner must land on
-/// `Class(row)` so goto-def / references reach the add_columns def.
+/// `$row->{name}` on a DBIC row does NOT resolve to the column: a column is a
+/// `Bridged` key (accessor + condition-arg), not a hash slot — `$row->{name}`
+/// is `undef` in real DBIC (columns live behind `_column_data`). So the deref
+/// is a plain (unresolved) hash access; only `$row->name` reaches the column.
+/// Guards against re-conflating the column with a literal instance hash key.
 #[test]
-fn row_hashref_deref_resolves_column() {
+fn row_hashref_deref_does_not_resolve_column() {
     let src = format!(
         "{}{}",
         USERS_RESULT,
@@ -1002,11 +1002,10 @@ my $n = $row->{name};
     let key = point_at(&src, "name};");
     let def = fa.find_definition(key, None);
     assert!(
-        def.is_some(),
-        "$row->{{name}} resolves to the column def; ref at cursor: {:?}",
-        fa.ref_at(key),
+        def.is_none(),
+        "$row->{{name}} is NOT the column (a column isn't a hash slot); got: {:?}",
+        def,
     );
-    assert_eq!(def.unwrap().start.row, NAME_COL_DEF_ROW, "lands on the name column");
 }
 
 /// The negative space of tier 1: a key that isn't a column resolves to

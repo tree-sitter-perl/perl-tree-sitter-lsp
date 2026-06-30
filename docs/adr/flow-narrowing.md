@@ -37,16 +37,21 @@ but never invent a false `Undef`/`Optional`.
 
 ## Subjects: variables and places, one keying
 
-A guard subject is a variable (`$x`) or a **place** — a chain of constant
-hash/array projections off a scalar root (`$self->{a}{b}`,
-`cst::canonical_place_path`). Both are keyed by the subject's **source
-spelling** on the same `Variable` attachment, so the reducer, scope-walk,
-and narrow-filter are untouched — a place witness is just a span-scoped
-slot witness. The place-vs-variable distinction lives in exactly two
-spots: the truncation rule and the one `method_call_invocant_class` query
-seam. Truncation generalizes to multi-hop as "an opaque use of any
-**proper prefix** of the place (root or intermediate element) disturbs
-it, unless that prefix is the base of a longer access (a read)."
+A guard subject is a variable (`$x`) or a **place** — a chain of stable
+hash/array projections (`cst::canonical_place_path`). A projection is
+stable when its subscript pins one slot: a constant key/index (`{a}`,
+`[0]`) or a plain scalar (`{$k}`, `[$i]`), off a scalar root
+(`$self->{a}{b}`, arrow form) or the named container itself
+(`$h{a}`/`$h[0]`, direct form, root `%h`/`@h`). Both subject kinds are
+keyed by the subject's **source spelling** on the same `Variable`
+attachment, so the reducer, scope-walk, and narrow-filter are untouched —
+a place witness is just a span-scoped slot witness. The place-vs-variable
+distinction lives in exactly two spots: the truncation rule and the one
+`method_call_invocant_class` query seam (which fires for any invocant
+carrying a subscript — `->` / `{` / `[`). Truncation generalizes to
+multi-hop as "an opaque use of any **proper prefix** of the place (root,
+intermediate element, or — for a dynamic-key place — a key scalar)
+disturbs it, unless that prefix is the base of a longer access (a read)."
 
 Accessor places (`$self->name`) are out: an accessor isn't a stable slot
 (it can return a different object per call, with side effects), so
@@ -63,8 +68,13 @@ lookup target → emit nothing, stay wide); `StripOptional.negated()` is
 `To(Undef)`. So the `defined`-family negatives (`else` of `if (defined
 $x)`, `return if defined $x`, `unless (defined $x)`) narrow to the bottom
 `Undef`, lighting up the early-exit rows **for free** through the
-existing polarity plumbing — only the `else`-block emit (`trailing_else`)
-was new code. General negation stays parked (see `optional-types.md`).
+existing polarity plumbing. `narrow_block_guard` walks the whole
+`if`/`elsif`*/`else` chain: each arm narrows by its own condition plus the
+cumulative negation of every preceding condition, so an elsif-chain `else`
+(and the intervening elsif blocks) light up the `defined`-family negatives
+too — non-representable negations (`isa`) contribute nothing, making the
+cross-condition intersection automatic. General negation stays parked
+(see `optional-types.md`).
 
 ## `defined`/`blessed` strip via a re-emittable fold pass
 
@@ -78,7 +88,8 @@ iteration (clear-and-emit on tag `defined_narrowing`).
 
 ## Forward work
 
-Residual subject coverage (direct/dynamic-key places), const-folded
-guards, and the deferred negation tiers live in
-`docs/prompt-flow-narrowing.md`. Diagnostics the lattice enables:
+The remaining residuals — accessor places and the general
+`Not`/`Difference` negation tier — live in
+`docs/prompt-flow-narrowing.md` (which also records the dynamic-key
+soundness knob, Option A vs B). Diagnostics the lattice enables:
 `docs/prompt-narrowing-diagnostics.md`.

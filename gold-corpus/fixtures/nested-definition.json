@@ -1,15 +1,15 @@
 {
   "capability": "definition",
-  "comment": "Tier 1: $row->{name} on a typed row resolves to the column def — cross-file, the class file carries the add_columns HashKeyDef.",
+  "comment": "Tier 1: $row->{name} on a DBIC row does NOT resolve to the column. A column is a Bridged key (accessor + condition-arg), not a literal hash slot — $row->{name} is undef in real DBIC (columns live behind _column_data). Guards against re-conflating a column with the object's own hash keys.",
   "rows": [
     {
-      "id": "nested-row-key-to-column-def",
+      "id": "nested-row-key-deref-is-not-the-column",
       "root": "gold-corpus/nested-fixture",
       "file": "main.pl",
       "line": 22,
       "col": 17,
       "status": "gold",
-      "expect": { "all": ["NestedRow.pm:7:5"] }
+      "expect": { "none": ["NestedRow.pm"] }
     }
   ]
 }

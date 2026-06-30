@@ -97,8 +97,21 @@
       "line": 90,
       "col": 4,
       "newname": "RENAMED",
-      "comment": "Renames URI::urn::canonical: the def (urn.pm:90) AND the subclass SUPER call that targets it (isbn.pm:97, $self->SUPER::canonical). NOT isbn's own canonical override (isbn.pm:94) nor _generic.pm's $rel->canonical (dispatches to a different class).",
+      "renameScope": "dispatch",
+      "comment": "DISPATCH mode (rename.overrideScope=dispatch). Renames URI::urn::canonical: the def (urn.pm:90) AND the subclass SUPER call that targets it (isbn.pm:97, $self->SUPER::canonical). NOT isbn's own canonical override (isbn.pm:94) nor _generic.pm's $rel->canonical (dispatches to a different class). The default hierarchy mode renames the whole family — see rename-12.",
       "expect": {"all":["urn.pm","\"line\":\"90\"","isbn.pm","\"line\":\"97\""],"none":["_generic.pm","\"line\":\"94\""]},
+      "status": "gold"
+    },
+    {
+      "id": "rename-12-urn-canonical-hierarchy",
+      "difficulty": "tricky",
+      "semantic_area": "oo-isa",
+      "file": "URI/urn.pm",
+      "line": 90,
+      "col": 4,
+      "newname": "RENAMED",
+      "comment": "HIERARCHY mode (the DEFAULT rename.overrideScope=hierarchy) — the standard IDE refactor. Renames URI::urn::canonical across the whole override family: the base URI.pm def, the sibling-branch override (_generic.pm), AND `URI->new(...)->canonical` call sites corpus-wide (CGI.pm, Plack/Request.pm). Edge-gated over @ISA: unrelated same-named methods (Mojo::Path::canonical, PPI::Token) stay OUT.",
+      "expect": {"all":["urn.pm","URI.pm","_generic.pm","CGI.pm"],"none":["Mojo/Path.pm","PPI/"]},
       "status": "gold"
     }
   ]
