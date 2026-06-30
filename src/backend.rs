@@ -14,33 +14,26 @@ pub struct Backend {
     client: Client,
     files: Arc<FileStore>,
     module_index: Arc<ModuleIndex>,
-    /// Opt-in `unresolved-dispatch` diagnostic toggle, set from
-    /// `initializationOptions.diagnostics.unresolvedDispatch`. Shared with the
-    /// resolver refresh callback (which also publishes diagnostics), hence the
-    /// atomic. Default off — QA/plugin-author channel.
-    unresolved_dispatch: Arc<std::sync::atomic::AtomicBool>,
-    /// `initializationOptions.rename.overrideScope`: when set to `"dispatch"`,
-    /// method-override references/rename use the precise dispatch scope instead
-    /// of the default whole-hierarchy family. Set once at init.
-    dispatch_override: Arc<std::sync::atomic::AtomicBool>,
+    /// Opt-in diagnostic toggles, set from `initializationOptions.diagnostics`.
+    /// Shared with the resolver refresh callback (which also publishes
+    /// diagnostics), hence the `Arc<Mutex<_>>`. `DiagnosticOptions` is `Copy`,
+    /// so readers lock only to copy it out — never across an await. All
+    /// default off; the always-on hints ignore these.
+    diag_options: Arc<std::sync::Mutex<symbols::DiagnosticOptions>>,
+    /// `initializationOptions.rename` options (the serde `RenameOptions` schema,
+    /// same pattern as `diag_options`). `overrideScope = "dispatch"` picks the
+    /// precise method-override scope; default is the whole-hierarchy family.
+    rename_options: Arc<std::sync::Mutex<crate::resolve::RenameOptions>>,
 }
 
 impl Backend {
     fn diagnostic_options(&self) -> symbols::DiagnosticOptions {
-        symbols::DiagnosticOptions {
-            unresolved_dispatch: self
-                .unresolved_dispatch
-                .load(std::sync::atomic::Ordering::Relaxed),
-        }
+        *self.diag_options.lock().unwrap()
     }
 
     /// The configured method-override fan-out scope for references + rename.
     fn override_scope(&self) -> crate::resolve::OverrideScope {
-        if self.dispatch_override.load(std::sync::atomic::Ordering::Relaxed) {
-            crate::resolve::OverrideScope::Dispatch
-        } else {
-            crate::resolve::OverrideScope::Hierarchy
-        }
+        self.rename_options.lock().unwrap().override_scope
     }
 }
 
@@ -51,11 +44,11 @@ impl Backend {
         // We need Arc<ModuleIndex> so the refresh callback can access it.
         // Two-phase init: create ModuleIndex whose refresh callback references
         // a later-set Arc<ModuleIndex>, then wire up the Arc.
-        let unresolved_dispatch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let diag_options = Arc::new(std::sync::Mutex::new(symbols::DiagnosticOptions::default()));
 
         let refresh_client = client.clone();
         let refresh_files = Arc::clone(&files);
-        let refresh_unresolved_dispatch = Arc::clone(&unresolved_dispatch);
+        let refresh_diag_options = Arc::clone(&diag_options);
 
         let module_index_holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>> =
             Arc::new(std::sync::OnceLock::new());
@@ -68,7 +61,7 @@ impl Backend {
             let client = refresh_client.clone();
             let files = Arc::clone(&refresh_files);
             let holder = Arc::clone(&holder_clone);
-            let unresolved_dispatch = Arc::clone(&refresh_unresolved_dispatch);
+            let diag_options = Arc::clone(&refresh_diag_options);
             tokio_handle.spawn(async move {
                 let module_index = match holder.get() {
                     Some(idx) => idx,
@@ -77,10 +70,7 @@ impl Backend {
                 // Collect (uri, diagnostics) first without holding the store lock
                 // across the await — publishing is async and could deadlock.
                 let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
-                let options = symbols::DiagnosticOptions {
-                    unresolved_dispatch: unresolved_dispatch
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                };
+                let options = *diag_options.lock().unwrap();
                 files.for_each_open_mut(|uri, doc| {
                     doc.analysis.enrich_imported_types_with_keys(Some(module_index.as_ref()));
                     let diagnostics = symbols::collect_diagnostics(&doc.analysis, module_index, options);
@@ -99,8 +89,8 @@ impl Backend {
             module_index,
             client,
             files,
-            unresolved_dispatch,
-            dispatch_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            diag_options,
+            rename_options: Arc::new(std::sync::Mutex::new(crate::resolve::RenameOptions::default())),
         }
     }
 
@@ -251,28 +241,34 @@ impl LanguageServer for Backend {
         crate::plugin::rhai_host::set_workspace_root(root);
 
         // Opt-in diagnostics from `initializationOptions.diagnostics`.
-        // `{ "diagnostics": { "unresolvedDispatch": true } }` enables the
-        // QA/plugin-author `unresolved-dispatch` channel; absent = off.
-        if let Some(opts) = &params.initialization_options {
-            let on = opts
-                .get("diagnostics")
-                .and_then(|d| d.get("unresolvedDispatch"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            self.unresolved_dispatch
-                .store(on, std::sync::atomic::Ordering::Relaxed);
-
-            // `{ "rename": { "overrideScope": "dispatch" } }` opts into the
-            // precise method-override scope; absent / "hierarchy" = the default
-            // whole-family refactor.
-            let dispatch = opts
-                .get("rename")
-                .and_then(|r| r.get("overrideScope"))
-                .and_then(|v| v.as_str())
-                .map(|s| matches!(crate::resolve::OverrideScope::from_option(s), crate::resolve::OverrideScope::Dispatch))
-                .unwrap_or(false);
-            self.dispatch_override
-                .store(dispatch, std::sync::atomic::Ordering::Relaxed);
+        // The `diagnostics` sub-object deserializes straight into
+        // `DiagnosticOptions` (the struct is the schema — camelCase keys,
+        // absent ones default to false, e.g. `unresolvedDispatch`). A malformed
+        // value leaves the defaults in place rather than failing initialize.
+        if let Some(diag) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("diagnostics"))
+        {
+            if let Ok(parsed) =
+                serde_json::from_value::<symbols::DiagnosticOptions>(diag.clone())
+            {
+                *self.diag_options.lock().unwrap() = parsed;
+            }
+        }
+        // The `rename` sub-object deserializes into `RenameOptions` the same way
+        // (`{ "rename": { "overrideScope": "dispatch" } }`); absent / malformed
+        // leaves the default whole-hierarchy scope.
+        if let Some(rename) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("rename"))
+        {
+            if let Ok(parsed) =
+                serde_json::from_value::<crate::resolve::RenameOptions>(rename.clone())
+            {
+                *self.rename_options.lock().unwrap() = parsed;
+            }
         }
 
         Ok(InitializeResult {

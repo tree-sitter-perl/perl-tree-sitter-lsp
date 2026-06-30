@@ -5,7 +5,7 @@ use tree_sitter::{Point, Tree};
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
     contains_point, format_inferred_type, CompletionCandidate, CrossFileLookup, FileAnalysis, FoldKind,
-    HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
+    GuardVerdict, HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
     SymKind as FaSymKind, SymbolDetail, PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT,
     PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
 };
@@ -2462,14 +2462,69 @@ fn is_perl_builtin(name: &str) -> bool {
 
 /// Opt-in diagnostic toggles. Defaults are all-off for the QA/plugin-author
 /// channels (noise for end users); the always-on hints (`unresolved-function`
-/// / `unresolved-method`) ignore this. Parsed from `initializationOptions`
-/// in `backend.rs`. See `docs/adr/receiver-gated-dispatch.md`.
-#[derive(Debug, Clone, Copy, Default)]
+/// / `unresolved-method`) ignore this.
+///
+/// **The struct is the schema.** `rename_all = "camelCase"` makes each field
+/// its own LSP key under `initializationOptions.diagnostics`, so `backend.rs`
+/// parses the whole block with one `serde_json::from_value` — no hand-mapped
+/// key strings to drift. `default` fills any absent key with `false`. The CLI
+/// surface (`DiagnosticOptions::from_cli_args`) is the one spelling serde
+/// can't derive; `cli_flags_match_diagnostic_option_fields` guards it against
+/// drift. A `Config` god-struct, a generated editor schema, and richer
+/// per-code config are a design note in `docs/prompt-config-schema.md`. See
+/// `docs/adr/receiver-gated-dispatch.md`, `docs/adr/narrowing-diagnostics.md`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct DiagnosticOptions {
     /// Fire `unresolved-dispatch` when a known dispatch verb's receiver can't
     /// be typed (`GateResult::ReceiverUntyped`) — never on a settled
     /// `DoesNotApply`. Off by default.
     pub unresolved_dispatch: bool,
+    /// Extend `unresolved-method` past locally-defined classes to any
+    /// cross-file-resolvable class (D8). The local case is always-on; this
+    /// opt-in lifts the `is_local_class` gate so a narrowed or otherwise
+    /// cross-file-typed receiver (`$x->isa('Some::Dep'); $x->bogus`) is
+    /// checked too, gated by the same complete-ancestry honest-silent valve.
+    /// Off by default: cross-file classes carry more codegen/XS methods the
+    /// static walker can't see (the diag-09/10 Log4perl-accessor class), so
+    /// it earns trust before promotion. See docs/adr/narrowing-diagnostics.md.
+    pub unresolved_method_cross_file: bool,
+    /// Fire `optional-deref` (D2) when a receiver is `Optional<T>` at an
+    /// unguarded use point (a possible undef deref — the strictNullChecks
+    /// analog). Narrowing strips the `Optional` under a dominating
+    /// `defined`/`blessed` guard, so a surviving `Optional` is unguarded by
+    /// construction. "May be undef", not "is" — opt-in, INFORMATION severity,
+    /// with a guard-insertion quick-fix. Off by default.
+    pub optional_deref: bool,
+    /// Fire `redundant-guard` (D3) / `contradictory-guard` (D4): a guard whose
+    /// outcome is constant given the subject's prior type (`if (defined $x)`
+    /// where `$x` is already a confident value; `$x->isa('Foo')` where `$x` is
+    /// already `Foo` or an unrelated class). Off by default — needs confident
+    /// prior types and MRO relatedness, so it earns trust before promotion.
+    pub redundant_guard: bool,
+    /// Fire `deref-shape-mismatch` (D6): a deref whose form demands one
+    /// container rep while a `ref…eq` guard proved another (`$x->{k}` on
+    /// array/code, `$x->[i]` on hash/code, `$x->()` on hash/array) — a
+    /// guaranteed runtime die. Guard-narrowed reps only; objects are never a
+    /// mismatch. Off by default.
+    pub deref_shape: bool,
+}
+
+impl DiagnosticOptions {
+    /// Parse the opt-in flags from CLI args (`--optional-deref`, …). The kebab
+    /// flag for each field mirrors its serde camelCase key; the mapping is
+    /// explicit here (serde doesn't parse argv) and pinned by
+    /// `cli_flags_match_diagnostic_option_fields`.
+    pub fn from_cli_args(args: &[String]) -> Self {
+        let has = |flag: &str| args.iter().any(|a| a == flag);
+        DiagnosticOptions {
+            unresolved_dispatch: has("--unresolved-dispatch"),
+            unresolved_method_cross_file: has("--unresolved-method-cross-file"),
+            optional_deref: has("--optional-deref"),
+            redundant_guard: has("--redundant-guard"),
+            deref_shape: has("--deref-shape"),
+        }
+    }
 }
 
 pub fn collect_diagnostics(
@@ -2706,19 +2761,31 @@ pub fn collect_diagnostics(
             None => continue,
         };
 
-        // Only fire for locally-defined classes
+        // Fire for classes we can fully see. Always-on: classes defined in
+        // THIS file (high precision — you wrote it, the walker sees its
+        // methods). Opt-in (D8): also cross-file-resolvable classes, so a
+        // narrowed or cross-file-typed receiver is checked. A class that is
+        // neither local nor cached is external/uninstalled — stay silent, we
+        // can't enumerate its methods. The complete-ancestry valve below is
+        // the shared honest-silent guard for both.
         let is_local_class = analysis.symbols.iter().any(|s| {
             matches!(s.kind, FaSymKind::Class | FaSymKind::Package) && s.name == class_name
         });
-        if !is_local_class {
+        let is_cached_class =
+            options.unresolved_method_cross_file && module_index.get_cached(&class_name).is_some();
+        if !is_local_class && !is_cached_class {
             continue;
         }
 
-        // Check the class has at least one method (otherwise likely external)
-        let has_methods = analysis.symbols.iter().any(|s| {
-            matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
-                && analysis.symbol_in_class(s.id, &class_name)
-        });
+        // A local class must define ≥1 method we can see (else it's likely a
+        // forward decl / external alias re-opened here). A cached cross-file
+        // class is already a real module — its methods live in its analysis,
+        // which `resolve_method_in_ancestors` consults below.
+        let has_methods = is_cached_class
+            || analysis.symbols.iter().any(|s| {
+                matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
+                    && analysis.symbol_in_class(s.id, &class_name)
+            });
         if !has_methods {
             continue;
         }
@@ -2748,6 +2815,108 @@ pub fn collect_diagnostics(
             ),
             ..Default::default()
         });
+    }
+
+    // 5g: undef-deref (D1) — a method call or hash deref on a receiver the
+    // lattice proves is `Undef` at that point (the `else` of `if defined`,
+    // the fall-through after `return if defined`, an `unless defined` body).
+    // Runtime is a hard die. Maximal confidence — the type *is* undef, not
+    // *may be* — so this is always-on `WARNING`, the one narrowing diagnostic
+    // that doesn't wait behind an opt-in flag (rule #10: it reads the type
+    // at the use point, never the syntax). See docs/adr/narrowing-diagnostics.md.
+    // D2 (`optional-deref`) shares this same lattice read: a receiver typed
+    // `Optional<T>` at an UNGUARDED use point — narrowing already strips the
+    // `Optional` wherever a `defined`/`blessed` guard dominates, so a
+    // surviving `Optional` here is unguarded by construction. "May be undef",
+    // not "is" → opt-in, INFORMATION, with a guard-insertion quick-fix.
+    for site in analysis.deref_receiver_sites(Some(module_index)) {
+        match &site.receiver_ty {
+            InferredType::Undef => {
+                diagnostics.push(Diagnostic {
+                    range: span_to_range(site.span),
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    code: Some(NumberOrString::String("undef-deref".into())),
+                    source: Some("perl-lsp".into()),
+                    message: format!(
+                        "'{}' is undef here; {} on it dies at runtime",
+                        site.receiver,
+                        site.form.access_phrase(),
+                    ),
+                    ..Default::default()
+                });
+            }
+            InferredType::Optional(_) if options.optional_deref => {
+                diagnostics.push(Diagnostic {
+                    range: span_to_range(site.span),
+                    severity: Some(DiagnosticSeverity::INFORMATION),
+                    code: Some(NumberOrString::String("optional-deref".into())),
+                    source: Some("perl-lsp".into()),
+                    // The quick-fix reads the receiver back to synthesize
+                    // `return unless defined $r;`.
+                    data: Some(serde_json::json!({ "receiver": site.receiver })),
+                    message: format!(
+                        "'{}' may be undef here; {} on it could die — guard with `defined`",
+                        site.receiver,
+                        site.form.access_phrase(),
+                    ),
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+
+        // D6 — a deref whose form demands one container rep while a `ref…eq`
+        // guard proved the receiver is another (a guaranteed runtime die).
+        // Read the GUARD-narrowed rep specifically: a deref self-infers its
+        // own demanded rep as a zero-extent witness at the use point, masking
+        // any conflict under the merged query, so only a guard surfaces here.
+        // `RepKind::of` answers `None` for objects (overloadable) — never a
+        // mismatch.
+        if options.deref_shape {
+            if let Some(demanded) = site.form.demands_rep() {
+                if let Some(rep) = analysis
+                    .guard_narrowed_rep(&site.receiver, site.span.start)
+                    .and_then(|t| crate::file_analysis::RepKind::of(&t))
+                {
+                    if rep != demanded {
+                        diagnostics.push(Diagnostic {
+                            range: span_to_range(site.span),
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            code: Some(NumberOrString::String("deref-shape-mismatch".into())),
+                            source: Some("perl-lsp".into()),
+                            message: format!(
+                                "'{}' is {} here; {} dies at runtime",
+                                site.receiver,
+                                rep.noun(),
+                                site.form.access_phrase(),
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // D3/D4 — a guard whose outcome the lattice already fixes: redundant
+    // (always true → the `else` is dead) or contradictory (always false →
+    // the `then` is dead). Opt-in; gated hard on confident prior types in
+    // `guard_redundancies` (rule #10 — the type answers, never the syntax).
+    if options.redundant_guard {
+        for (span, verdict, message) in analysis.guard_redundancies(Some(module_index)) {
+            let code = match verdict {
+                GuardVerdict::AlwaysTrue => "redundant-guard",
+                GuardVerdict::AlwaysFalse => "contradictory-guard",
+            };
+            diagnostics.push(Diagnostic {
+                range: span_to_range(span),
+                severity: Some(DiagnosticSeverity::INFORMATION),
+                code: Some(NumberOrString::String(code.into())),
+                source: Some("perl-lsp".into()),
+                message,
+                ..Default::default()
+            });
+        }
     }
 
     // 5f: role-requires-unfulfilled — the composer-mismatch contract
@@ -2880,7 +3049,7 @@ pub fn collect_diagnostics(
     // deref is `undef` (meant `$row->col`). Detection seam is here (invocant type
     // → class → `field_projections_named` has a bridged column for the key), but
     // it must gate on NOT-HashRefInflator first (where `$row->{col}` IS valid),
-    // which we don't model yet. Spec: docs/prompt-narrowing-diagnostics.md (D10).
+    // which we don't model yet. Spec: docs/adr/narrowing-diagnostics.md (Forward work).
     use crate::file_analysis::InferredType;
     for r in &analysis.refs {
         let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };
@@ -3059,6 +3228,14 @@ pub fn code_actions(
     let mut actions = Vec::new();
 
     for diag in diagnostics {
+        // D2 guard-insertion quick-fix.
+        if matches!(&diag.code, Some(NumberOrString::String(s)) if s == "optional-deref") {
+            if let Some(action) = make_optional_guard_action(uri, diag) {
+                actions.push(action);
+            }
+            continue;
+        }
+
         let code_matches = matches!(
             &diag.code,
             Some(NumberOrString::String(s)) if s == "unresolved-function"
@@ -3133,6 +3310,34 @@ pub fn code_actions(
     }
 
     actions
+}
+
+/// D2 quick-fix: insert `return unless defined $r;` on its own line just
+/// before the flagged dereference. Indented to the receiver's column (the
+/// diagnostic range start), which is exact for a statement-leading deref and
+/// harmless otherwise. Produces precisely the guard the narrower then
+/// consumes to strip the `Optional`.
+fn make_optional_guard_action(uri: &Url, diag: &Diagnostic) -> Option<CodeActionOrCommand> {
+    let receiver = diag.data.as_ref()?.get("receiver")?.as_str()?;
+    let indent = " ".repeat(diag.range.start.character as usize);
+    let insert_pos = Position { line: diag.range.start.line, character: 0 };
+    let edit = TextEdit {
+        range: Range { start: insert_pos, end: insert_pos },
+        new_text: format!("{}return unless defined {};\n", indent, receiver),
+    };
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Guard: return unless defined {}", receiver),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        is_preferred: Some(true),
+        ..Default::default()
+    }))
 }
 
 /// Generate a code action that adds a function to an existing `qw()` import list.

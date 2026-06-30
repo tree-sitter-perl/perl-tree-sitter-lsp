@@ -32,4 +32,4 @@ matching spelling). Revisit if a motivating soundness case appears.
 - **General `Not` / `Difference` negation** — parked: no positive lookup
   target, no consumer value. "Not Foo" has nothing to dispatch on.
 
-Diagnostics the lattice now enables: `docs/prompt-narrowing-diagnostics.md`.
+Diagnostics the lattice enables (landed): `docs/adr/narrowing-diagnostics.md`.

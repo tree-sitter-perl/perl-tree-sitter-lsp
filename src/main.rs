@@ -426,9 +426,7 @@ fn cli_check(args: &[String]) {
     let min_severity = get_arg_value(args, "--severity").unwrap_or("warning");
     let min_rank = severity_rank(min_severity);
     // Opt-in QA channel, mirrors the LSP `initializationOptions` toggle.
-    let options = symbols::DiagnosticOptions {
-        unresolved_dispatch: args.iter().any(|a| a == "--unresolved-dispatch"),
-    };
+    let options = symbols::DiagnosticOptions::from_cli_args(args);
 
     if args.iter().any(|a| a == "--timings") {
         timings::enable();
@@ -1174,7 +1172,7 @@ fn enriched_tree_diagnostics(
 /// Whole-tree diagnostics as the pretty-JSON array string (warning+; shared by
 /// `--batch` diagnostics requests). Mirrors `cli_check`'s JSON path.
 fn batch_diagnostics(ws: &file_store::FileStore, idx: &module_index::ModuleIndex) -> String {
-    let options = symbols::DiagnosticOptions { unresolved_dispatch: false };
+    let options = symbols::DiagnosticOptions::default();
     let mut all = Vec::new();
     for (file, d) in enriched_tree_diagnostics(ws, idx, options) {
         let sev = match d.severity {

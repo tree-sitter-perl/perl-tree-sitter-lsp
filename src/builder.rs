@@ -295,6 +295,8 @@ fn build_with_plugins_inner(
         method_call_ref_dedup: std::collections::HashSet::new(),
         route_branded_refs: std::collections::HashSet::new(),
         defined_narrowings: Vec::new(),
+        guard_sites: Vec::new(),
+        arrow_deref_sites: Vec::new(),
         anon_sub_symbol_by_span: std::collections::HashMap::new(),
         modifier_invocant_pos: None,
     };
@@ -546,6 +548,8 @@ fn build_with_plugins_inner(
         witnesses: b.bag,
         package_framework: b.package_framework,
         provisional_dispatches: b.provisional_dispatches,
+        guard_sites: b.guard_sites,
+        arrow_deref_sites: b.arrow_deref_sites,
         attr_projections: b.attr_projections,
         gated_param_types: b.gated_param_types,
         reassigned_scalars: b.reassigned_scalars,
@@ -1605,6 +1609,16 @@ struct Builder<'a> {
     /// Recorded `defined`/`blessed` guards whose `Optional<T> → T` strip
     /// is re-derived each fold iteration (`emit_defined_narrowing_witnesses`).
     defined_narrowings: Vec<narrowing::DefinedNarrowing>,
+
+    /// Recognized guard conditions, for the redundant/contradictory-guard
+    /// diagnostics (D3/D4). Recorded alongside narrowing emission; moved into
+    /// `FileAnalysis.guard_sites`.
+    guard_sites: Vec<crate::file_analysis::GuardSite>,
+
+    /// `$x->[i]` / `$x->()` arrow-deref receivers — the forms with no typed
+    /// ref. Moved into `FileAnalysis.arrow_deref_sites` for the deref
+    /// diagnostics.
+    arrow_deref_sites: Vec<crate::file_analysis::ArrowDerefSite>,
 
     /// Span (of the `anonymous_subroutine_expression` node) →
     /// SymbolId of the synthesized `(anon)` Sub symbol. Populated by
@@ -3470,6 +3484,11 @@ impl<'a> Builder<'a> {
             // Dereference expressions → type constraints on operand
             "array_element_expression" => {
                 self.infer_deref_type(node, InferredType::ArrayRef);
+                // Only the arrow form `$x->[i]` has a scalar-ref receiver; the
+                // direct `$arr[i]` indexes the named array.
+                if crate::cst::element_arrow_deref(node, self.source) {
+                    self.record_arrow_deref(node, crate::file_analysis::DerefForm::ArrayIndex);
+                }
                 self.visit_children(node);
             }
             "coderef_call_expression" => {
@@ -3485,6 +3504,7 @@ impl<'a> Builder<'a> {
                 // the lattice settles. No witness emission here;
                 // no post-walk pass.
                 self.infer_deref_type(node, InferredType::CodeRef { return_edge: None });
+                self.record_arrow_deref(node, crate::file_analysis::DerefForm::Call);
                 self.visit_children(node);
             }
             // Symbolic code-deref: `&{ EXPR }` / `&{ EXPR }(...)`. The operand
@@ -7233,6 +7253,26 @@ impl<'a> Builder<'a> {
             }
             self.push_var_type_constraint(operand, node, narrowing);
         }
+    }
+
+    /// Record a `$x->[i]` / `$x->()` arrow deref whose receiver is a plain
+    /// scalar, for the deref diagnostics (the array/code analog of the
+    /// method-call / hash-deref refs). Only a scalar operand can be undef /
+    /// Optional / rep-narrowed; a chain receiver (`f()->[0]`) is skipped.
+    fn record_arrow_deref(&mut self, node: Node<'a>, form: crate::file_analysis::DerefForm) {
+        let Some(operand) = node.named_child(0) else { return };
+        if operand.kind() != "scalar" {
+            return;
+        }
+        let Ok(text) = operand.utf8_text(self.source) else { return };
+        if !text.starts_with('$') {
+            return;
+        }
+        self.arrow_deref_sites.push(crate::file_analysis::ArrowDerefSite {
+            receiver: text.to_string(),
+            span: node_to_span(node),
+            form,
+        });
     }
 
     /// Infer types from binary operator expressions.

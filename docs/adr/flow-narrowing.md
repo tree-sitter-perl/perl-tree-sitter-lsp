@@ -92,4 +92,4 @@ The remaining residuals — accessor places and the general
 `Not`/`Difference` negation tier — live in
 `docs/prompt-flow-narrowing.md` (which also records the dynamic-key
 soundness knob, Option A vs B). Diagnostics the lattice enables:
-`docs/prompt-narrowing-diagnostics.md`.
+`docs/adr/narrowing-diagnostics.md`.

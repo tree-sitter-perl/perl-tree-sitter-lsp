@@ -21,6 +21,22 @@ always a hard fail. Run it alongside `cargo test` + `./e2e/run.sh` before
 calling a change verified; `gold-corpus/run.pl --emit <cap> <file> <row>
 <col>` authors new rows. Known gaps live in `gold-corpus/KNOWN-GAPS.md`.
 
+**Building the substrate (`gold-corpus/local/`)** needs `cpm`. In a sandbox
+where the proxy 403s the metacpan metadata hosts (`fastapi.metacpan.org`,
+`cpanmetadb.plackperl.org`) but allows `www.cpan.org` tarball/`02packages`
+paths, point cpm at the cpan.org mirror — and install `Carton::Snapshot`
+first, since the `snapshot` resolver requires it:
+
+```
+curl -sSL https://raw.githubusercontent.com/skaji/cpm/main/cpm -o /tmp/cpm && chmod +x /tmp/cpm
+/tmp/cpm install -g --mirror https://www.cpan.org/ --resolver 02packages Carton::Snapshot
+cd gold-corpus && /tmp/cpm install -L local --mirror https://www.cpan.org/ --resolver snapshot
+```
+
+(Outside a restricted sandbox, plain `cpm install -L local --resolver
+snapshot` or `carton install --deployment` from `gold-corpus/` works.)
+`e2e/run.sh` needs `nvim`, absent in some sandboxes — let CI cover e2e then.
+
 ## Architecture
 
 Four layers, data flows down only — enforced by `src/layering_tests.rs`

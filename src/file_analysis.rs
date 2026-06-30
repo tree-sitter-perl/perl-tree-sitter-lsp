@@ -1870,6 +1870,142 @@ pub struct UntypedDispatch {
     pub gate: String,
 }
 
+/// The dereference form at a `DerefSite` — what the receiver is being used
+/// as, which decides both the diagnostic wording and (for D6) the rep the
+/// access demands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DerefForm {
+    /// `$x->method(...)` — carries the method name.
+    Method(String),
+    /// `$x->{key}` hash dereference.
+    HashKey,
+    /// `$x->[i]` array dereference.
+    ArrayIndex,
+    /// `$x->(...)` code-ref call.
+    Call,
+}
+
+impl DerefForm {
+    /// The container rep this form requires of its receiver, if any. A method
+    /// call requires nothing structural (any object/value can receive one).
+    pub fn demands_rep(&self) -> Option<RepKind> {
+        match self {
+            DerefForm::HashKey => Some(RepKind::Hash),
+            DerefForm::ArrayIndex => Some(RepKind::Array),
+            DerefForm::Call => Some(RepKind::Code),
+            DerefForm::Method(_) => None,
+        }
+    }
+
+    /// Human phrase for diagnostics ("a hash deref", …).
+    pub fn access_phrase(&self) -> &'static str {
+        match self {
+            DerefForm::HashKey => "a `->{...}` hash deref",
+            DerefForm::ArrayIndex => "a `->[...]` array deref",
+            DerefForm::Call => "a `->(...)` call",
+            DerefForm::Method(_) => "a method call",
+        }
+    }
+}
+
+/// The container rep of a value — what `ref()` reports. The D6 axis: a deref
+/// form demands one rep; a guard may prove the receiver is another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepKind {
+    Hash,
+    Array,
+    Code,
+}
+
+impl RepKind {
+    /// The rep of a type, if it has a concrete container rep. `ClassName`
+    /// (a blessed object) answers `None` — it can legitimately overload any
+    /// deref, so it is never a mismatch.
+    pub fn of(ty: &InferredType) -> Option<RepKind> {
+        if ty.is_hash_shaped() {
+            Some(RepKind::Hash)
+        } else if ty.is_array_shaped() {
+            Some(RepKind::Array)
+        } else if matches!(ty, InferredType::CodeRef { .. }) {
+            Some(RepKind::Code)
+        } else {
+            None
+        }
+    }
+
+    pub fn noun(self) -> &'static str {
+        match self {
+            RepKind::Hash => "a hash ref",
+            RepKind::Array => "an array ref",
+            RepKind::Code => "a code ref",
+        }
+    }
+}
+
+/// A scalar-receiver dereference paired with the receiver's narrowed type
+/// at the use point — see `FileAnalysis::deref_receiver_sites`.
+#[derive(Debug, Clone)]
+pub struct DerefSite {
+    /// The diagnostic range (the dereferencing ref's span).
+    pub span: Span,
+    /// Receiver spelling (`$x`).
+    pub receiver: String,
+    /// Receiver type at the use point, with narrowing applied.
+    pub receiver_ty: InferredType,
+    pub form: DerefForm,
+}
+
+/// A builder-recorded arrow-deref receiver for the forms that carry no
+/// typed ref of their own (`$x->[i]`, `$x->()`) — the array/code analog of
+/// the method-call and hash-deref refs `deref_receiver_sites` reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArrowDerefSite {
+    pub receiver: String,
+    pub span: Span,
+    pub form: DerefForm,
+}
+
+/// What a recorded guard tests about its subject — the build-time
+/// recognition (`builder/narrowing.rs`) projected to a query-time fact so
+/// the redundant/contradictory-guard diagnostics (D3/D4) can compare it
+/// against the subject's prior type without re-walking the tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GuardPredicate {
+    /// `isa`/`DOES`/`ref…eq` proving a concrete type.
+    IsType(InferredType),
+    /// `defined`/`blessed` — asserts the subject is not undef.
+    Defined,
+}
+
+/// A guard condition recorded at build time for the redundancy diagnostics
+/// (D3/D4). The narrowing engine already recognizes these; this captures
+/// the subject + predicate + the point to read the subject's PRIOR type
+/// (in the guard, before any narrowed region).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardSite {
+    /// Subject's source spelling (`$x`, or a place key).
+    pub subject: String,
+    pub scope: ScopeId,
+    pub predicate: GuardPredicate,
+    /// Whether the predicate holds where the guard EXPRESSION is true (`!`
+    /// flips it) — lets D3/D4 resolve always-true vs always-false.
+    pub asserts_when_true: bool,
+    /// Diagnostic range (the guard condition).
+    pub span: Span,
+    /// Where to read the subject's prior (un-narrowed) type.
+    #[serde(with = "PointDef")]
+    pub before_point: Point,
+}
+
+/// A D3/D4 verdict on a recorded guard, ready for `symbols.rs` to render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardVerdict {
+    /// The condition is always true given the subject's prior type (D3).
+    AlwaysTrue,
+    /// The condition is always false (D4).
+    AlwaysFalse,
+}
+
 // ---- Import ----
 
 /// One name brought into scope by a `use` statement.
@@ -2311,6 +2447,19 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
 
+    /// Guard conditions recognized by the narrowing engine, recorded for the
+    /// redundant/contradictory-guard diagnostics (D3/D4). Open-doc only in
+    /// practice (we don't diagnose deps), but rides the cache blob like every
+    /// other field.
+    #[serde(default)]
+    pub guard_sites: Vec<GuardSite>,
+
+    /// Arrow-deref receivers for `$x->[i]` / `$x->()` — the forms with no
+    /// typed ref. `deref_receiver_sites` merges these with the method-call /
+    /// hash-deref refs so the deref diagnostics cover every arrow form.
+    #[serde(default)]
+    pub arrow_deref_sites: Vec<ArrowDerefSite>,
+
     /// Plugin `param_types()` role-contract TCs, each gated on the enclosing
     /// package's `isa` the rule's `in_role` class. The builder emits one per
     /// matching sub declaration UNCONDITIONALLY (no local-ancestry
@@ -2442,6 +2591,8 @@ pub struct FileAnalysisParts {
     pub witnesses: crate::witnesses::WitnessBag,
     pub package_framework: HashMap<String, crate::witnesses::FrameworkFact>,
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
+    pub guard_sites: Vec<GuardSite>,
+    pub arrow_deref_sites: Vec<ArrowDerefSite>,
     pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
     pub attr_projections: Vec<AttrProjection>,
     pub reassigned_scalars: HashSet<String>,
@@ -2600,6 +2751,8 @@ impl FileAnalysis {
             mut witnesses,
             package_framework,
             provisional_dispatches,
+            guard_sites,
+            arrow_deref_sites,
             gated_param_types,
             attr_projections,
             reassigned_scalars,
@@ -2638,6 +2791,8 @@ impl FileAnalysis {
             base_witness_count: 0,
             base_ref_count: 0,
             provisional_dispatches,
+            guard_sites,
+            arrow_deref_sites,
             gated_param_types,
             attr_projections,
             reassigned_scalars,
@@ -4043,6 +4198,202 @@ impl FileAnalysis {
             }
         }
         None
+    }
+
+    /// Every scalar-receiver dereference in this file, paired with the
+    /// receiver's **narrowed** type at the use point. The one lattice read
+    /// the undef/Optional/shape diagnostics (D1/D2/D6,
+    /// `docs/adr/narrowing-diagnostics.md`) consume — each is a filter
+    /// over this stream that asks the type, never the syntax (rule #10).
+    ///
+    /// A site is included only when the receiver's type resolves; an
+    /// unresolvable receiver is omitted (honest silence — the diagnostics
+    /// built on top miss it rather than guess). Covered receiver forms are
+    /// the ones that carry a typed scalar handle on a ref: a method-call
+    /// invocant (`$x->m`) and a scalar hash deref (`$x->{k}`). Array
+    /// (`$x->[i]`) and code (`$x->()`) derefs don't surface a receiver-typed
+    /// ref today and are the documented residual.
+    pub fn deref_receiver_sites(
+        &self,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<DerefSite> {
+        use crate::conventions::InvocantText;
+        let mut out = Vec::new();
+        for r in &self.refs {
+            let (receiver, form) = match &r.kind {
+                RefKind::MethodCall { invocant, .. } => {
+                    // Only a scalar invocant can be undef/Optional; a
+                    // bareword/`__PACKAGE__`/chain receiver never narrows here.
+                    if !matches!(invocant.classify(), InvocantText::Scalar(_)) {
+                        continue;
+                    }
+                    (invocant.to_string(), DerefForm::Method(r.target_name.clone()))
+                }
+                // A scalar `var_text` is the arrow form `$x->{k}`; the direct
+                // `$h{k}` form's base is the named hash, which can't be an
+                // undef *receiver* (and won't type as Undef/Optional anyway).
+                RefKind::HashKeyAccess { var_text, .. } if var_text.starts_with('$') => {
+                    (var_text.clone(), DerefForm::HashKey)
+                }
+                _ => continue,
+            };
+            if let Some(ty) =
+                self.inferred_type_via_bag_ctx(&receiver, r.span.start, module_index)
+            {
+                out.push(DerefSite {
+                    span: r.span,
+                    receiver,
+                    receiver_ty: ty,
+                    form,
+                });
+            }
+        }
+        // Array (`$x->[i]`) / code (`$x->()`) derefs have no typed ref; the
+        // builder records them so they join the same stream.
+        for s in &self.arrow_deref_sites {
+            if let Some(ty) =
+                self.inferred_type_via_bag_ctx(&s.receiver, s.span.start, module_index)
+            {
+                out.push(DerefSite {
+                    span: s.span,
+                    receiver: s.receiver.clone(),
+                    receiver_ty: ty,
+                    form: s.form.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// True if `ancestor` is on `descendant`'s inheritance chain (or they are
+    /// the same class) — the relatedness test D4 uses to avoid flagging a
+    /// legitimate downcast as a contradiction.
+    fn is_ancestor_of(
+        &self,
+        ancestor: &str,
+        descendant: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> bool {
+        let mut found = false;
+        self.for_each_ancestor_class(descendant, module_index, |c| {
+            if c == ancestor {
+                found = true;
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        found
+    }
+
+    /// D3/D4: each recorded guard whose outcome is constant given its
+    /// subject's prior (pre-guard) type — redundant (always-true) or
+    /// contradictory (always-false). Only fires on a *confident* prior type
+    /// (a concrete class / rep / `Undef`); an absent or merely-Optional prior
+    /// leaves the guard meaningful and is skipped (rule #10 — ask the type).
+    /// Scoped to `isa`/`DOES` (class) and `defined`/`blessed` guards; rep
+    /// `ref…eq` guards are the documented residual.
+    pub fn guard_redundancies(
+        &self,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<(Span, GuardVerdict, String)> {
+        let mut out = Vec::new();
+        for g in &self.guard_sites {
+            let Some(prior) =
+                self.inferred_type_via_bag_ctx(&g.subject, g.before_point, module_index)
+            else {
+                continue;
+            };
+            // (definitely satisfies the raw predicate, definitely contradicts it)
+            let (satisfied, contradicted) = match &g.predicate {
+                GuardPredicate::Defined => match &prior {
+                    InferredType::Undef => (false, true),
+                    // The genuine "maybe undef" — the guard is doing its job.
+                    InferredType::Optional(_) => continue,
+                    // Any other concrete type is definitely defined.
+                    _ => (true, false),
+                },
+                GuardPredicate::IsType(InferredType::ClassName(target)) => {
+                    let Some(prior_cls) = prior.class_name() else { continue };
+                    if prior_cls == target
+                        || self.is_ancestor_of(target, prior_cls, module_index)
+                    {
+                        (true, false) // prior is-a target
+                    } else if self.is_ancestor_of(prior_cls, target, module_index) {
+                        continue; // target is a subclass of prior — a legit downcast
+                    } else {
+                        (false, true) // unrelated concrete classes
+                    }
+                }
+                // Rep `ref…eq` guards (HASH/ARRAY/CODE) — residual.
+                GuardPredicate::IsType(_) => continue,
+            };
+            let always_true =
+                (satisfied && g.asserts_when_true) || (contradicted && !g.asserts_when_true);
+            let always_false =
+                (satisfied && !g.asserts_when_true) || (contradicted && g.asserts_when_true);
+            let verdict = if always_true {
+                GuardVerdict::AlwaysTrue
+            } else if always_false {
+                GuardVerdict::AlwaysFalse
+            } else {
+                continue;
+            };
+            let subject = &g.subject;
+            let detail = match (&verdict, &g.predicate) {
+                (GuardVerdict::AlwaysTrue, GuardPredicate::Defined) => {
+                    format!("'{subject}' is always defined here; this guard is redundant")
+                }
+                (GuardVerdict::AlwaysFalse, GuardPredicate::Defined) => {
+                    format!("'{subject}' is undef here; this guard can never pass")
+                }
+                (GuardVerdict::AlwaysTrue, GuardPredicate::IsType(t)) => format!(
+                    "'{subject}' is already {}; this guard is redundant",
+                    format_inferred_type(t),
+                ),
+                (GuardVerdict::AlwaysFalse, GuardPredicate::IsType(t)) => format!(
+                    "'{subject}' is not {} here; this guard can never pass",
+                    format_inferred_type(t),
+                ),
+            };
+            out.push((g.span, verdict, detail));
+        }
+        out
+    }
+
+    /// The rep a `ref…eq` / `isa` GUARD established for `subject` at `point`,
+    /// read from **narrowing-sourced witnesses only**. Distinct from
+    /// `inferred_type_via_bag`: a `$x->{k}` deref pushes a zero-extent
+    /// `HashRef` belief sitting exactly at the use point, which would mask the
+    /// guard's rep under the merged query — so D6 reads the guard's assertion
+    /// directly. Innermost (narrowest) containing region wins. `None` when no
+    /// guard narrows the subject here (so D6 fires only on guard-narrowed
+    /// reps, per the plan).
+    pub fn guard_narrowed_rep(&self, subject: &str, point: Point) -> Option<InferredType> {
+        use crate::witnesses::{WitnessAttachment, WitnessPayload, WitnessSource};
+        let mut best: Option<&crate::witnesses::Witness> = None;
+        for w in self.witnesses.filter(|w| {
+            matches!(&w.source, WitnessSource::Builder(s) if s == "narrowing" || s == "defined_narrowing")
+                && matches!(&w.attachment, WitnessAttachment::Variable { name, .. } if name == subject)
+        }) {
+            if !contains_point(&w.span, point) {
+                continue;
+            }
+            if !matches!(&w.payload, WitnessPayload::InferredType(_)) {
+                continue;
+            }
+            let innermost = match best {
+                None => true,
+                Some(b) => (w.span.start.row, w.span.start.column) >= (b.span.start.row, b.span.start.column),
+            };
+            if innermost {
+                best = Some(w);
+            }
+        }
+        match best.map(|w| &w.payload) {
+            Some(WitnessPayload::InferredType(t)) => Some(t.clone()),
+            _ => None,
+        }
     }
 
     /// Gated dispatch candidates in THIS file whose receiver couldn't be

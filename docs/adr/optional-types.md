@@ -33,8 +33,8 @@ Two projections, deliberately split:
   `Optional<Foo>` receiver resolves its methods on `Foo` *without* a
   guard: type-silence on a half-written value reads as a broken IDE, not
   a hint, so navigation stays lenient. The "might be `undef`" warning is
-  owned by a deref **diagnostic** (`docs/prompt-narrowing-diagnostics.md`,
-  next round of the epic), not by a dead receiver. `Undef` still peels to
+  owned by the deref **diagnostics** (`docs/adr/narrowing-diagnostics.md`),
+  not by a dead receiver. `Undef` still peels to
   nothing — you can't navigate the methods of *definitely* nothing.
 
 The narrowing path is unchanged and still wins where it applies: a
@@ -66,8 +66,8 @@ side of a `defined` guard), never from the arm join.
   `Undef`. Every method-receiver feature (goto-def / hover / references /
   rename / completion) peels an unguarded `Optional<T>` to `T` via
   `class_name_lenient` — see "Strict typing, lenient receiver projection"
-  above. The deref-safety diagnostic is the deferred other half
-  (`docs/prompt-narrowing-diagnostics.md`).
+  above. The deref-safety diagnostic is the other half
+  (`docs/adr/narrowing-diagnostics.md`).
 
 Provenance: an `Optional` return is tagged `optional_join` in its
 `TypeProvenance::ReducerFold` evidence so `--dump-package` explains it.
@@ -77,4 +77,4 @@ Provenance: an `Optional` return is tagged `optional_join` in its
 Production gaps (empty-list `return ()`, all-undef → `Undef`,
 `SlotTypeFold`, the bareword `Maybe[…]` constructor form) live in
 `docs/prompt-optional-types.md`. Diagnostics on unguarded `Optional` /
-known-`Undef` derefs: `docs/prompt-narrowing-diagnostics.md`.
+known-`Undef` derefs: `docs/adr/narrowing-diagnostics.md`.
