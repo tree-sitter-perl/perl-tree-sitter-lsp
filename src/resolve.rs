@@ -397,8 +397,8 @@ pub fn resolve_symbol_scoped(
             // global from another's. Stay file-local here (a real package fans
             // out): collect this file's spellings (decl + bare reads + `$main::x`
             // / `$::x`) as a flat group. Lift this once entrypoint analysis can
-            // group a program's files — the same gap as multi-app Mojo instance
-            // brands (docs/prompt-graph-walking.md).
+            // group a program's files (docs/prompt-entrypoint-analysis.md — the
+            // same root as multi-app Mojo instance brands).
             let mut locs = Vec::new();
             collect_package_var(&FileKey::Path(PathBuf::new()), analysis, &package, &name, &mut locs);
             let mut spans: Vec<Span> = locs.into_iter().map(|l| l.span).collect();

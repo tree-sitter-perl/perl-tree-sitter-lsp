@@ -10023,6 +10023,27 @@ fn lexical_hash_key_renames_literal_and_accesses_in_scope() {
     );
 }
 
+/// A lexical hashref scalar (`my $h = { k => … }; $h->{k}`) gets the same
+/// renameable-unit treatment as `my %h`: the literal def + every `$h->{k}`
+/// deref rename together, scoped to the `my $h` declaration. (`$h = {…}` takes a
+/// hashref; `%h = {…}` would be an uneven-list bug and emits nothing — the RHS
+/// shape is sigil-keyed.)
+#[test]
+fn lexical_hashref_scalar_renames_literal_and_derefs() {
+    let src = "my $cfg = { host => 'h', port => 8080 };\n\
+my $h = $cfg->{host};\n\
+print $cfg->{host};\n";
+    let fa = build_fa(src);
+    let col = src.lines().nth(1).unwrap().find("host").unwrap();
+    let edits = fa
+        .rename_at(tree_sitter::Point { row: 1, column: col }, "HOST")
+        .expect("renameable");
+    let rows: std::collections::BTreeSet<usize> = edits.iter().map(|(s, _)| s.start.row).collect();
+    // literal def (0) + both `$cfg->{host}` derefs (1, 2); `port` untouched.
+    assert_eq!(rows, [0, 1, 2].into_iter().collect(), "literal + 2 derefs: {edits:?}");
+    assert!(edits.iter().all(|(_, t)| t == "HOST"), "every edit writes the new key");
+}
+
 /// A QUOTED call-arg key (`{ "name", 2 }`) emits its `HashKeyAccess` at the
 /// string CONTENT span, not the whole literal — so rename keeps the quotes
 /// (rewriting them yields a bareword, a `strict subs` error in a comma list).

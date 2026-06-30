@@ -4680,25 +4680,26 @@ impl<'a> Builder<'a> {
                 AccessKind::Declaration,
             );
 
-            // `my %h = (k => v, …)`: emit the literal keys as hash-key accesses
-            // on the variable, so a lexical hash-key rename rewrites the def too
-            // — not just the `$h{k}` accesses (else the hash would still define
-            // the old key and the renamed reads would miss).
-            // `child_by_field_name("right")` still returns the `(` token on an
-            // assignment, so find the RHS by named child (the non-`left` list).
-            if sigil == '%' {
+            // Connect a lexical hash/hashref's literal keys to its accesses so a
+            // key rename rewrites the def too (not just the `$h{k}`/`$h->{k}`
+            // reads, else the container keeps the old key and the renamed reads
+            // miss). The valid RHS is sigil-keyed: `%h = (LIST)` — a hashref
+            // `%h = {…}` is an uneven-list bug, never valid — and `$h = {HASHREF}`
+            // — a `$h = (…)` list is scalar-of-last, not a hashref. A `bless {…}`
+            // / `func()` RHS is a CALL, not a bare literal, so it's excluded here
+            // (those keys are owned elsewhere — bless `InternalKey`, return `Sub`).
+            // `child_by_field_name("right")` still returns the `(` token, so find
+            // the RHS by named child.
+            let rhs_kinds: &[&str] = match sigil {
+                '%' => &["list_expression", "parenthesized_expression"],
+                '$' => &["anonymous_hash_expression"],
+                _ => &[],
+            };
+            if !rhs_kinds.is_empty() {
                 if let Some(rhs) = node.parent().filter(|p| p.kind() == "assignment_expression").and_then(|p| {
                     (0..p.named_child_count())
                         .filter_map(|i| p.named_child(i))
-                        .find(|c| {
-                            c.id() != node.id()
-                                && matches!(
-                                    c.kind(),
-                                    "list_expression"
-                                        | "anonymous_hash_expression"
-                                        | "parenthesized_expression"
-                                )
-                        })
+                        .find(|c| c.id() != node.id() && rhs_kinds.contains(&c.kind()))
                 }) {
                     self.emit_lexical_hash_literal_keys(name, rhs);
                 }

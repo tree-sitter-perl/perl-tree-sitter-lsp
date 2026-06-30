@@ -2875,16 +2875,12 @@ pub fn collect_diagnostics(
     // unmodeled lattice widenings — docs/adr/structural-shapes.md).
     // HINT severity, per the quiet-by-design diagnostics convention.
     //
-    // TODO(dbic-row-deref): warn on `$row->{col}` where `$row` is typed to a
-    // DBIC Result class and `col` is one of its `Bridged` columns — a column
-    // isn't a hash slot, so the deref is `undef` (the user meant `$row->name`).
-    // The detection is here: invocant type → class → `field_projections_named`
-    // has a bridged column for the key. GATE on NOT being a HashRefInflator row:
-    // `$rs->result_class('DBIx::Class::ResultClass::HashRefInflator')` (or the
-    // `{ result_class => … }` search attr) makes `find`/`search` return plain
-    // hashrefs where `$row->{col}` IS valid — we don't track that result-class
-    // override yet, so emitting the warning now would false-positive on it.
-    // Needs that machinery first.
+    // TODO(dbic-row-deref): warn on `$row->{col}` where `$row` is a DBIC Result
+    // class and `col` is a `Bridged` column — a column isn't a hash slot, so the
+    // deref is `undef` (meant `$row->col`). Detection seam is here (invocant type
+    // → class → `field_projections_named` has a bridged column for the key), but
+    // it must gate on NOT-HashRefInflator first (where `$row->{col}` IS valid),
+    // which we don't model yet. Spec: docs/prompt-narrowing-diagnostics.md (D10).
     use crate::file_analysis::InferredType;
     for r in &analysis.refs {
         let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };
