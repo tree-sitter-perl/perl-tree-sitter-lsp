@@ -1,22 +1,28 @@
 ; Perl value-flow capture pack — the assignment SHAPES, declarative.
 ;
 ; Run inside build() by `mint_flow_edges_via_query` (NOT the spike extractor),
-; so FlowEdges carry the BUILDER's scope, not a skeleton scope. The capture
-; vocabulary is the same the cpp pack speaks:
+; so FlowEdges carry the BUILDER's scope. Capture vocabulary:
 ;
-;   @flow.target   a binding that receives a value (the LHS var)
-;   @flow.source   the value expression it receives (the RHS)
+;   @flow.lhs      a `my`/`local`/`our` declaration LHS (single OR list) —
+;                  the minter iterates its slots (positional for a list)
+;   @flow.target   a bare scalar LHS (reassignment) — a single Whole target
+;   @flow.source   the value expression the LHS receives
 ;
-; The driver mints one FlowEdge per (target, source); positional/extraction
-; logic lives in the minter, shared with cpp. STRUCTURAL forms only — the
-; `right:` field misses a parenthesized RHS (a tree-sitter-perl field quirk),
-; so the RHS is matched by node, not field, where it matters.
+; The minter reuses `lhs_list_targets`/`list_element_nodes` for the positional
+; pairing — the shape is declared here, the pairing logic is shared. STRUCTURAL
+; forms where the `right:` field misses a parenthesized RHS (a tree-sitter-perl
+; quirk; see the perl-query-field-quirk note).
 
-; bare-RHS declaration: `my $x = EXPR`, `my @a = EXPR`, `my %h = EXPR`
-; (a parenthesized list RHS is handled by the list pattern, added next slice).
+; `my $x = EXPR` / `my @a = EXPR` / `my ($a, $b) = EXPR` — bare RHS.
 (assignment_expression
-  left: (variable_declaration [(scalar) (array) (hash)] @flow.target)
+  left: (variable_declaration) @flow.lhs
   right: (_) @flow.source)
+
+; parenthesized-list RHS (`= (1, 2)`, `= @arr` is bare so above): the `right:`
+; field points at `(`, so match the list_expression structurally.
+(assignment_expression
+  left: (variable_declaration) @flow.lhs
+  (list_expression) @flow.source)
 
 ; bare reassignment: `$x = EXPR`
 (assignment_expression

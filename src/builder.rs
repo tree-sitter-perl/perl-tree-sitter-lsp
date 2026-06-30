@@ -1780,7 +1780,7 @@ impl<'a> Builder<'a> {
     /// here — the same FlowEdge concept the cpp pack produces. The forcing-
     /// function start of Perl-on-the-query-engine. Provenance-only for now
     /// (no lowering): the shapes' types still come from the walk.
-    fn mint_flow_edges_via_query(&mut self, tree: &Tree) {
+    fn mint_flow_edges_via_query(&mut self, tree: &'a Tree) {
         use tree_sitter::{Query, QueryCursor, StreamingIterator};
         static FLOW_SCM: &str = include_str!("../queries/perl/flow.scm");
         let lang = tree.language();
@@ -1789,54 +1789,97 @@ impl<'a> Builder<'a> {
             Err(_) => return,
         };
         let cap_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
-        // Collect (targets, source) per match FIRST — the cursor borrows
-        // `self.source`, so we can't mutate `self.flow_edges` until it drops.
-        let mut pending: Vec<(Vec<Node>, Node)> = Vec::new();
+        // Collect (lhs decl?, scalar target?, source) per match FIRST — the
+        // cursor borrows `self.source`, so we can't mutate until it drops.
+        let mut pending: Vec<(Option<Node>, Option<Node>, Node)> = Vec::new();
         {
             let mut cursor = QueryCursor::new();
             let mut matches = cursor.matches(&query, tree.root_node(), self.source);
             while let Some(m) = matches.next() {
-                let mut targets: Vec<Node> = Vec::new();
-                let mut source: Option<Node> = None;
+                let (mut lhs, mut target, mut source) = (None, None, None);
                 for c in m.captures {
                     match cap_names[c.index as usize].as_str() {
-                        "flow.target" => targets.push(c.node),
+                        "flow.lhs" => lhs = Some(c.node),
+                        "flow.target" => target = Some(c.node),
                         "flow.source" => source = Some(c.node),
                         _ => {}
                     }
                 }
                 if let Some(src) = source {
-                    pending.push((targets, src));
+                    pending.push((lhs, target, src));
                 }
             }
         }
-        for (targets, src) in pending {
+        for (lhs, target, src) in pending {
             let source_span = node_to_span(src);
-            for t in targets {
-                let Ok(name) = t.utf8_text(self.source) else { continue };
-                let name = name.to_string();
-                let at = t.start_position();
-                let scope = self.scope_at_point(at);
-                // Lower as a FALLBACK only: a refined eager TC (a direct
-                // InferredType witness, resolvable pre-fold) wins; the query
-                // Edge fills in when the walk left the variable untyped (the
-                // cross-file-chain case the manual `assign_edge` used to cover).
-                let already_typed = self.bag_query_variable(&name, scope, at).is_some();
-                let fe = crate::file_analysis::FlowEdge {
-                    target_name: name,
-                    target_scope: scope,
-                    target_at: at,
-                    source: source_span,
-                    extraction: crate::file_analysis::Extraction::Whole,
-                };
-                if !already_typed {
-                    if let Some(w) = fe.lower_to_witness() {
-                        self.bag.push(w);
+            if let Some(lhs_node) = lhs {
+                if let Some(targets) = self.lhs_list_targets(lhs_node) {
+                    // List/destructuring: each slot edges to its literal element
+                    // (Whole) or a Positional projection — the logic that used
+                    // to live in `visit_assignment`'s paren arm, now driven by
+                    // the declarative capture.
+                    let elem_nodes = self.list_element_nodes(src);
+                    let at = lhs_node.start_position();
+                    for (vt, extraction) in targets {
+                        let (source, extraction) = match (&elem_nodes, &extraction) {
+                            (Some(nodes), crate::file_analysis::Extraction::Positional(n))
+                                if *n < nodes.len() =>
+                            {
+                                self.emit_expr_witness(nodes[*n]);
+                                (node_to_span(nodes[*n]), crate::file_analysis::Extraction::Whole)
+                            }
+                            _ => (source_span, extraction),
+                        };
+                        self.push_flow_edge(vt, at, source, extraction);
                     }
+                } else if let Some(vt) = self.get_var_text_from_lhs(lhs_node) {
+                    self.push_flow_edge(
+                        vt,
+                        lhs_node.start_position(),
+                        source_span,
+                        crate::file_analysis::Extraction::Whole,
+                    );
                 }
-                self.flow_edges.push(fe);
+            } else if let Some(tnode) = target {
+                if let Ok(vt) = tnode.utf8_text(self.source) {
+                    let vt = vt.to_string();
+                    self.push_flow_edge(
+                        vt,
+                        tnode.start_position(),
+                        source_span,
+                        crate::file_analysis::Extraction::Whole,
+                    );
+                }
             }
         }
+    }
+
+    /// Mint a FlowEdge + lower it as a FALLBACK: a refined eager TC (a direct
+    /// InferredType witness, resolvable pre-fold) wins; the query Edge fills in
+    /// only when the walk left the variable untyped. The single mint+lower for
+    /// the query pass.
+    fn push_flow_edge(
+        &mut self,
+        name: String,
+        at: Point,
+        source: Span,
+        extraction: crate::file_analysis::Extraction,
+    ) {
+        let scope = self.scope_at_point(at);
+        let already_typed = self.bag_query_variable(&name, scope, at).is_some();
+        let fe = crate::file_analysis::FlowEdge {
+            target_name: name,
+            target_scope: scope,
+            target_at: at,
+            source,
+            extraction,
+        };
+        if !already_typed {
+            if let Some(w) = fe.lower_to_witness() {
+                self.bag.push(w);
+            }
+        }
+        self.flow_edges.push(fe);
     }
 
     // ---- Symbol/Ref creation ----
@@ -6370,40 +6413,13 @@ impl<'a> Builder<'a> {
                         }
                     }
                 }
-                if let Some(targets) = self.lhs_list_targets(left) {
-                    // List / destructuring assignment (`my ($a, $b) = RHS`):
-                    // a FlowEdge per slot. When the RHS is a LITERAL list, edge
-                    // each var straight to its element's own span (Whole — the
-                    // element types directly); otherwise a Positional projection
-                    // of the whole source. (The single-var paths below are
-                    // untouched.) Fixes the prior bug where only the first var
-                    // typed — every other slot was dropped.
-                    let elem_nodes = self.list_element_nodes(right);
-                    let rhs_span = node_to_span(right);
-                    let at = node_to_span(node).start;
-                    for (vt, extraction) in targets {
-                        let (source, extraction) = match (&elem_nodes, &extraction) {
-                            (Some(nodes), crate::file_analysis::Extraction::Positional(n))
-                                if *n < nodes.len() =>
-                            {
-                                // Edge straight to the element + ensure it's typed.
-                                self.emit_expr_witness(nodes[*n]);
-                                (node_to_span(nodes[*n]), crate::file_analysis::Extraction::Whole)
-                            }
-                            _ => (rhs_span, extraction),
-                        };
-                        let fe = crate::file_analysis::FlowEdge {
-                            target_name: vt,
-                            target_scope: self.current_scope(),
-                            target_at: at,
-                            source,
-                            extraction,
-                        };
-                        if let Some(w) = fe.lower_to_witness() {
-                            self.bag.push(w);
-                        }
-                        self.flow_edges.push(fe);
-                    }
+                if self.lhs_list_targets(left).is_some() {
+                    // List/destructuring assignment is minted + typed by the
+                    // declarative `@flow` query pass (`mint_flow_edges_via_query`),
+                    // which reuses the same `lhs_list_targets`/`list_element_nodes`
+                    // pairing. This guard just keeps the eager arm below from
+                    // mis-typing a list's first var (`get_var_text_from_lhs`
+                    // returns only `$a`) as the whole RHS.
                 } else if let Some(it) = inferred {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
                         self.push_type_constraint(TypeConstraint {
