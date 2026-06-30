@@ -542,6 +542,18 @@ pub enum Extraction {
     Slurpy(usize),
     /// The value at a literal key of the source (`my %h = (k => v)` keyed).
     KeyOf(String),
+    /// A scalar bind that CLEARS to undef — `my $x;` / `local $x;`. The undef
+    /// is a REGION assertion (true from the bind until the next rebind: `my $x;
+    /// $x->[0]` autovivifies, ending it), so its TYPING composes with the
+    /// narrowing tier (region + cutoff), NOT a plain position-blind bag
+    /// witness. Producers emit `Rebind` for the cutoff today; this variant +
+    /// its `Undef` lowering land when narrowing goes edge-driven.
+    Cleared,
+    /// A rebind event whose inflowing type we don't (yet) determine —
+    /// `foreach my $x (…)` (element), `our $x;` (alias), lvalue-sub. Lowers to
+    /// NO type witness; it exists for provenance + the narrowing cutoff (an
+    /// edge targeting the subject ends a narrowed region).
+    Rebind,
 }
 
 /// A VALUE-FLOW EDGE: a value flows from a `source` expression to a `target`
@@ -589,6 +601,11 @@ impl FlowEdge {
             Extraction::Slurpy(_) => WitnessPayload::Edge(WitnessAttachment::Expr(self.source)),
             // KeyOf awaits its HashKey-projection lowering (a later stage).
             Extraction::KeyOf(_) => return None,
+            // A bare bind clears to undef — a value the bind uniquely knows
+            // (like a literal), so a direct `InferredType`, not an edge.
+            Extraction::Cleared => WitnessPayload::InferredType(InferredType::Undef),
+            // Rebind-only: recorded in `flow_edges` for the cutoff, no type.
+            Extraction::Rebind => return None,
         };
         Some(Witness {
             attachment: WitnessAttachment::Variable {

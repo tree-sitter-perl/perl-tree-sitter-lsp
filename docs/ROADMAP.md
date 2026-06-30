@@ -3,6 +3,12 @@
 Landed work lives in `docs/adr/` and `CHANGELOG.md` — never here.
 This file is only what's NEXT, in order.
 
+> **`spike/cpp-support` branch:** the multi-language (cpp/python) go-live arc has
+> its own altitude map — `docs/cpp-golive-map.md`. The Flow/value-flow tier
+> (FlowEdge spine, query-driven assignment shapes, narrowing-on-edges) lives
+> there; it's shared seam, not Perl-specific. Consult it before zooming into a
+> Flow slice.
+
 ## Now (in order)
 
 1. **Narrowing / Optional — diagnostics + completeness.** The

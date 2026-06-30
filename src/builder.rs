@@ -1789,30 +1789,78 @@ impl<'a> Builder<'a> {
             Err(_) => return,
         };
         let cap_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
-        // Collect (lhs decl?, scalar target?, source) per match FIRST — the
-        // cursor borrows `self.source`, so we can't mutate until it drops.
-        let mut pending: Vec<(Option<Node>, Option<Node>, Node)> = Vec::new();
+        // Collect captures per match FIRST — the cursor borrows `self.source`,
+        // so we can't mutate until it drops. `source` is optional: bind shapes
+        // (`@flow.bare`) carry no inflowing value.
+        struct FlowCaps<'t> {
+            lhs: Option<Node<'t>>,
+            target: Option<Node<'t>>,
+            bare: Option<Node<'t>>,
+            loopvar: Option<Node<'t>>,
+            source: Option<Node<'t>>,
+        }
+        let mut pending: Vec<FlowCaps> = Vec::new();
         {
             let mut cursor = QueryCursor::new();
             let mut matches = cursor.matches(&query, tree.root_node(), self.source);
             while let Some(m) = matches.next() {
-                let (mut lhs, mut target, mut source) = (None, None, None);
+                let mut caps = FlowCaps {
+                    lhs: None,
+                    target: None,
+                    bare: None,
+                    loopvar: None,
+                    source: None,
+                };
                 for c in m.captures {
                     match cap_names[c.index as usize].as_str() {
-                        "flow.lhs" => lhs = Some(c.node),
-                        "flow.target" => target = Some(c.node),
-                        "flow.source" => source = Some(c.node),
+                        "flow.lhs" => caps.lhs = Some(c.node),
+                        "flow.target" => caps.target = Some(c.node),
+                        "flow.bare" => caps.bare = Some(c.node),
+                        "flow.loopvar" => caps.loopvar = Some(c.node),
+                        "flow.source" => caps.source = Some(c.node),
                         _ => {}
                     }
                 }
-                if let Some(src) = source {
-                    pending.push((lhs, target, src));
+                if caps.lhs.or(caps.target).or(caps.bare).or(caps.loopvar).is_some() {
+                    pending.push(caps);
                 }
             }
         }
-        for (lhs, target, src) in pending {
+        for caps in pending {
+            // Bind shapes: no inflowing value. A bare `my`/`local` CLEARS to
+            // undef (`Cleared`); a `foreach` var rebinds per element (`Rebind`,
+            // type TBD). Both record the rebind for the narrowing cutoff.
+            if let Some(bare) = caps.bare {
+                let at = bare.start_position();
+                for name in self.bare_bind_names(bare) {
+                    // Record the rebind (for the narrowing cutoff). A scalar
+                    // clears to undef — but that `Undef` is a REGION assertion
+                    // truncated at the next rebind (`my $x; $x->[0]` autoviv
+                    // ends it), so it lands with the narrowing tier (where
+                    // region+cutoff compose), not as a plain bag witness here.
+                    self.push_flow_edge(
+                        name,
+                        at,
+                        node_to_span(bare),
+                        crate::file_analysis::Extraction::Rebind,
+                    );
+                }
+                continue;
+            }
+            if let Some(loopvar) = caps.loopvar {
+                if let (Ok(name), Some(src)) = (loopvar.utf8_text(self.source), caps.source) {
+                    self.push_flow_edge(
+                        name.to_string(),
+                        loopvar.start_position(),
+                        node_to_span(src),
+                        crate::file_analysis::Extraction::Rebind,
+                    );
+                }
+                continue;
+            }
+            let Some(src) = caps.source else { continue };
             let source_span = node_to_span(src);
-            if let Some(lhs_node) = lhs {
+            if let Some(lhs_node) = caps.lhs {
                 if let Some(targets) = self.lhs_list_targets(lhs_node) {
                     // List/destructuring: each slot edges to its literal element
                     // (Whole) or a Positional projection — the logic that used
@@ -1840,7 +1888,7 @@ impl<'a> Builder<'a> {
                         crate::file_analysis::Extraction::Whole,
                     );
                 }
-            } else if let Some(tnode) = target {
+            } else if let Some(tnode) = caps.target {
                 if let Ok(vt) = tnode.utf8_text(self.source) {
                     let vt = vt.to_string();
                     self.push_flow_edge(
@@ -1852,6 +1900,23 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+    }
+
+    /// The variable name(s) a bare bind (`@flow.bare`) targets — a
+    /// `variable_declaration` (single or paren list) or a `localization`
+    /// scalar.
+    fn bare_bind_names(&self, bare: Node<'a>) -> Vec<String> {
+        if bare.kind() == "variable_declaration" {
+            if let Some(targets) = self.lhs_list_targets(bare) {
+                return targets.into_iter().map(|(n, _)| n).collect();
+            }
+            return self.get_var_text_from_lhs(bare).into_iter().collect();
+        }
+        bare.utf8_text(self.source)
+            .ok()
+            .map(|s| s.to_string())
+            .into_iter()
+            .collect()
     }
 
     /// Mint a FlowEdge + lower it as a FALLBACK: a refined eager TC (a direct

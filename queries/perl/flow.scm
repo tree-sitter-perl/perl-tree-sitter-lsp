@@ -28,3 +28,19 @@
 (assignment_expression
   left: (scalar) @flow.target
   right: (_) @flow.source)
+
+; --- binding shapes (no inflowing value) — the rebind coverage the narrowing
+; --- cutoff needs, plus a real type where the bind clears the var. ---
+
+; bare `my $x;` / `my ($x,$y);` — a declaration that is NOT an assignment LHS
+; (a direct child of the statement; the `= …` form nests under assignment_expression
+; and so won't match here). Clears to undef.
+(expression_statement (variable_declaration) @flow.bare)
+
+; bare `local $x;` — clears the scalar to undef for the dynamic scope.
+(localization_expression (scalar) @flow.bare)
+
+; `foreach my $x (LIST)` — the loop var rebinds per element (element type TBD).
+(for_statement
+  variable: (scalar) @flow.loopvar
+  list: (_) @flow.source)

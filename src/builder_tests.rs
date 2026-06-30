@@ -15224,3 +15224,24 @@ sub f {
     assert_eq!(fa.inferred_type_via_bag("$t", p), Some(Numeric));
     assert_eq!(fa.inferred_type_via_bag("$s", p), Some(Numeric));
 }
+
+#[test]
+fn bind_shapes_mint_flow_edges() {
+    // Every bind shape records a FlowEdge for the narrowing cutoff: bare
+    // `my`/`local` + `foreach` var all mint a `Rebind`. (The scalar-clear
+    // Undef TYPING lands with the narrowing tier — see Extraction::Cleared.)
+    use crate::file_analysis::Extraction;
+    let fa = build_fa("package T;
+sub f {
+  my $x;
+  local $y;
+  for my $i (1, 2) { g($i); }
+}
+1;
+");
+    for v in ["$x", "$y", "$i"] {
+        assert!(fa.flow_edges.iter().any(|fe| fe.target_name == v
+            && matches!(fe.extraction, Extraction::Rebind)), "{v} rebind edge");
+    }
+}
+
