@@ -642,38 +642,17 @@ impl<'a> Builder<'a> {
     /// Point of the first reassignment of `$var` inside `container` at or
     /// after `region.start` — the narrowing region's truncation bound.
     fn first_subject_write(&self, var: &str, region: Span, container: Node<'a>) -> Option<Point> {
-        fn writes_var(left: Node, var: &str, src: &[u8]) -> bool {
-            match left.kind() {
-                "scalar" => crate::cst::canonical_var_name(left, src).as_deref() == Some(var),
-                // `my $x = ...` / `my ($x) = ...` rebinds → also truncates.
-                "variable_declaration" => {
-                    let mut stack = vec![left];
-                    while let Some(n) = stack.pop() {
-                        if n.kind() == "scalar"
-                            && crate::cst::canonical_var_name(n, src).as_deref() == Some(var)
-                        {
-                            return true;
-                        }
-                        for i in 0..n.named_child_count() {
-                            if let Some(c) = n.named_child(i) {
-                                stack.push(c);
-                            }
-                        }
-                    }
-                    false
-                }
-                _ => false,
-            }
-        }
+        // Truncate the narrowed region at the first node that rebinds `$var`,
+        // in ANY of Perl's binding shapes (`cst::rebinds_scalar` is the single
+        // detector — assignment, `my`/`local`, list-assign, foreach loop var,
+        // lvalue-sub). Recursing into every node and taking the earliest hit
+        // keeps the truncation conservative (a rebind in a nested branch only
+        // shrinks the region — under-narrowing, never a false `Undef`).
         fn scan(node: Node, var: &str, after: Point, src: &[u8], best: &mut Option<Point>) {
-            if node.kind() == "assignment_expression" {
-                if let Some(left) = node.child_by_field_name("left") {
-                    if writes_var(left, var, src) {
-                        let p = node.start_position();
-                        if !point_lt(p, after) && best.map_or(true, |b| point_lt(p, b)) {
-                            *best = Some(p);
-                        }
-                    }
+            if crate::cst::rebinds_scalar(node, var, src) {
+                let p = node.start_position();
+                if !point_lt(p, after) && best.map_or(true, |b| point_lt(p, b)) {
+                    *best = Some(p);
                 }
             }
             for i in 0..node.named_child_count() {
