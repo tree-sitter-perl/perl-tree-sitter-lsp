@@ -2635,6 +2635,12 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub flow_edges: Vec<FlowEdge>,
 
+    /// `std::move(x)` sites: (moved var name, move-call span, enclosing scope).
+    /// A read of the var after the call and before its next rebind is a
+    /// use-after-move bug — see `use_after_move_reads`.
+    #[serde(default)]
+    pub moved_from: Vec<(String, Span, ScopeId)>,
+
 
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
@@ -2704,6 +2710,7 @@ pub struct FileAnalysisParts {
     pub plugin_loads: Vec<PluginLoadFact>,
     pub loader_config_params: Vec<LoaderConfigParam>,
     pub flow_edges: Vec<FlowEdge>,
+    pub moved_from: Vec<(String, Span, ScopeId)>,
 }
 
 /// "This file loads plugin `name`, passing the config value at
@@ -2863,6 +2870,7 @@ impl FileAnalysis {
             plugin_loads,
             loader_config_params,
             flow_edges,
+            moved_from,
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
@@ -2903,6 +2911,7 @@ impl FileAnalysis {
             plugin_loads,
             loader_config_params,
             flow_edges,
+            moved_from,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -3370,6 +3379,39 @@ impl FileAnalysis {
     /// such variable resolved (don't offer a correction).
     pub fn var_deref_stack_at(&self, name: &str, point: Point) -> Option<&[DerefStep]> {
         self.resolve_variable(name, point).map(|s| s.deref_stack.as_slice())
+    }
+
+    /// Each READ of a variable that occurs after a `std::move` of it and
+    /// before it is reassigned — a use-after-move bug. The moved-from region
+    /// runs from the move call to the earliest FlowEdge rebinding the var (the
+    /// SAME edge-driven cutoff narrowing uses, `earliest_rebind_in`), or the
+    /// enclosing scope's end. Reads are matched on name + access AND filtered
+    /// to the move's scope subtree, so a same-named var in another function
+    /// never false-flags. Returns (var name, read span).
+    pub fn use_after_move_reads(&self) -> Vec<(String, Span)> {
+        let key = |p: &Point| (p.row, p.column);
+        let mut out = Vec::new();
+        for (name, move_span, move_scope) in &self.moved_from {
+            let scope_end = self.scope(*move_scope).span.end;
+            let region = Span { start: move_span.end, end: scope_end };
+            let cutoff = earliest_rebind_in(&self.flow_edges, name, region).unwrap_or(scope_end);
+            for r in &self.refs {
+                if r.target_name != *name || r.access != AccessKind::Read {
+                    continue;
+                }
+                let p = r.span.start;
+                // strictly after the move, strictly before the rebind cutoff
+                if key(&p) <= key(&move_span.end) || key(&p) >= key(&cutoff) {
+                    continue;
+                }
+                // same variable: the read must sit inside the move's scope
+                // subtree (the move scope is on the read's scope chain).
+                if scope_chain_of(&self.scopes, r.scope).contains(move_scope) {
+                    out.push((name.clone(), r.span));
+                }
+            }
+        }
+        out
     }
 
     /// Member accesses whose typed operator disagrees with their

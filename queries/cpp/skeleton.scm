@@ -262,6 +262,25 @@
 (for_range_loop
   declarator: (identifier) @flow.rebind)
 
+; a plain `x = rhs` reassignment rebinds x with the rhs value — mints a Whole
+; FlowEdge (like a declaration's init) so the moved-from region AND the
+; narrowing cutoff end at the reassignment, via the same edge-driven cutoff.
+(assignment_expression
+  left: (identifier) @flow.target
+  right: (_) @flow.source)
+
+; `std::move(x)` leaves x in a moved-from (valid-but-unspecified) state: a
+; subsequent READ of x before it is reassigned is a use-after-move bug.
+; Capture the moved var + the whole call span; the minter checks scope/name
+; against std/move (the driver has no query predicates). The moved-from region
+; runs from the call to the first @flow rebind of x (or scope end) — the same
+; cutoff the narrowing tier uses (`earliest_rebind_in`).
+(call_expression
+  function: (qualified_identifier
+    scope: (namespace_identifier) @move.scope
+    name: (identifier) @move.name)
+  arguments: (argument_list (identifier) @move.var)) @move.call
+
 ; `if (dynamic_cast<Derived*>(b)) { b->... }` narrows b to Derived INSIDE the
 ; block — the cpp analog of python `isinstance`. The pack's narrow_guard maps
 ; `dynamic_cast` + the template type to the refinement; core scopes it to

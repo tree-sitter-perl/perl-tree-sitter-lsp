@@ -1221,6 +1221,31 @@ if isinstance(x, Foo):
 }
 
 #[test]
+fn cpp_use_after_move_flags_read_before_reassign() {
+    // `std::move(x)` leaves x moved-from: the row-3 read is a bug; the row-5
+    // read is fine because `x = other()` reassigns it (the FlowEdge rebind
+    // ends the moved-from region, same cutoff as narrowing).
+    let src = "\
+void f() {
+  Widget x;
+  sink(std::move(x));
+  x.use();
+  x = other();
+  x.use();
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let diags = crate::symbols::pack_use_after_move_diagnostics(&fa);
+    assert_eq!(diags.len(), 1, "exactly one use-after-move: {diags:?}");
+    // the flagged read is the row-3 `x.use()` receiver, not the row-5 one.
+    assert_eq!(diags[0].range.start.line, 3, "row-3 read flagged: {diags:?}");
+    assert!(
+        diags.iter().all(|d| d.range.start.line != 5),
+        "row-5 read (post-reassign) is clean: {diags:?}",
+    );
+}
+
+#[test]
 fn cpp_dynamic_cast_guard_narrows() {
     // `if (dynamic_cast<Derived*>(b))` refines b to Derived inside the block —
     // the cpp analog of python isinstance, via the now-wired narrow_guard.

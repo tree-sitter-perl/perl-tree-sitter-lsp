@@ -3331,6 +3331,33 @@ pub fn pack_member_op_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// Mode C: use-after-move. One WARNING per `use_after_move_reads()` read —
+/// a variable read after a `std::move` of it, before any reassignment. The
+/// region + cutoff logic lives on `FileAnalysis` (the edge-driven moved-from
+/// window); this is the thin LSP projection.
+pub fn pack_use_after_move_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
+    analysis
+        .use_after_move_reads()
+        .into_iter()
+        .map(|(name, span)| Diagnostic {
+            range: span_to_range(span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("use-after-move".into())),
+            source: Some("perl-lsp".into()),
+            message: format!("use of `{name}` after `std::move` (moved-from state)"),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Every pack-language (non-Perl) diagnostic for an analysis, concatenated.
+/// One seam so a backend dispatch never enumerates the individual checks.
+pub fn pack_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut diags = pack_member_op_diagnostics(analysis);
+    diags.extend(pack_use_after_move_diagnostics(analysis));
+    diags
+}
+
 pub fn code_actions(
     diagnostics: &[Diagnostic],
     analysis: &FileAnalysis,

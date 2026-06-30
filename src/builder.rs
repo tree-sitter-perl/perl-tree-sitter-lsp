@@ -572,6 +572,8 @@ fn build_with_plugins_inner(
         plugin_loads: b.plugin_loads,
         loader_config_params: b.loader_config_params,
         flow_edges: b.flow_edges,
+        // use-after-move is a cpp-pack fact (`std::move`); Perl mints none.
+        moved_from: Vec::new(),
     });
     // Finalize: run the legacy text-based MCB resolver as a fallback.
     // For every assignment the unified typer (run before

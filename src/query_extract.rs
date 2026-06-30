@@ -97,6 +97,10 @@ pub struct SkeletonAnalysis {
     /// extraction). Lowered to type witnesses here; carried onto the FA as the
     /// provenance tier.
     pub flow_edges: Vec<crate::file_analysis::FlowEdge>,
+    /// `std::move(x)` sites: (moved var name, move-call span, enclosing scope).
+    /// A read of the var after the call and before its next rebind is a
+    /// use-after-move bug (`FileAnalysis::use_after_move_reads`).
+    pub moved_from: Vec<(String, crate::file_analysis::Span, crate::file_analysis::ScopeId)>,
 }
 
 impl SkeletonAnalysis {
@@ -368,6 +372,7 @@ impl SkeletonAnalysis {
             witnesses: bag,
             package_parents,
             flow_edges: std::mem::take(&mut self.flow_edges),
+            moved_from: std::mem::take(&mut self.moved_from),
             ..Default::default()
         });
         // Pack-declared receiver names ride the FA so core's member /
@@ -1018,6 +1023,13 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // guarded-block region, block scope).
     let mut pending_narrow: Vec<(String, crate::file_analysis::InferredType, Span, ScopeId)> =
         Vec::new();
+    // `std::move(x)` halves, joined per match: the qualifier (`std`) + name
+    // (`move`) verify the call IS std::move (no query predicates), the var is
+    // the moved subject, the call span the region start + enclosing scope.
+    let mut move_scope_txt: HashMap<usize, String> = HashMap::new();
+    let mut move_name_txt: HashMap<usize, String> = HashMap::new();
+    let mut move_var_txt: HashMap<usize, String> = HashMap::new();
+    let mut move_call: HashMap<usize, (Span, ScopeId)> = HashMap::new();
     // A context whose same-match `@scope` starts AFTER it (C++ namespace:
     // `@context` is on the name, `@scope` on the body `{`) must be
     // registered at the BODY depth, not the file depth — else it goes
@@ -1093,6 +1105,19 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             }
             "narrow.guard" => {
                 narrow_guard.insert(e.match_id, e.text.clone());
+            }
+            "move.scope" => {
+                move_scope_txt.insert(e.match_id, e.text.clone());
+            }
+            "move.name" => {
+                move_name_txt.insert(e.match_id, e.text.clone());
+            }
+            "move.var" => {
+                move_var_txt.insert(e.match_id, e.text.clone());
+            }
+            "move.call" => {
+                move_call
+                    .insert(e.match_id, (Span { start: e.start, end: e.end }, cur_scope));
             }
             cap if cap.starts_with("context.") => {
                 // If this match's `@scope` starts AFTER this context, the
@@ -1548,6 +1573,18 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             payload: crate::witnesses::WitnessPayload::InferredType(refined),
             span: Span { start: region.start, end },
         });
+    }
+    // ---- std::move sites → moved-from facts. The qualifier/name verify the
+    // call IS `std::move` here (no query predicates), so the diagnostic never
+    // sees the call shape — it reads the recorded var + span + scope.
+    for (mid, (span, scope)) in &move_call {
+        if move_scope_txt.get(mid).map(String::as_str) == Some("std")
+            && move_name_txt.get(mid).map(String::as_str) == Some("move")
+        {
+            if let Some(v) = move_var_txt.get(mid) {
+                out.moved_from.push(((pack.shape_name)("ref.var", v), *span, *scope));
+            }
+        }
     }
     Ok(out)
 }
