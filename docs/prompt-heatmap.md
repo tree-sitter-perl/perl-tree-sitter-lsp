@@ -128,6 +128,18 @@ graph cannot see:
 - **External callers** — anything outside the indexed workspace (and, without
   `--include-deps`, outside open+workspace files). Exported symbols are guarded
   for exactly this reason.
+- **Entrypoint-script free-subs** — a top-level `sub` in package `main` of an
+  executable script (`#!/usr/bin/perl`, no `package`) is flagged when nothing
+  calls it *within the static graph*, but a script is itself an entrypoint:
+  its subs may be exercised by the runtime flow, a test/spec harness, or
+  `\&main::foo` introspection. Proving these reachable is the job of a
+  **deferred entrypoint-analysis tier** (the same tier `scan_entrypoint_scripts`
+  /`file_analysis.rs`'s entrypoint-scan lint anticipate). Until it lands these
+  are **deliberately listed** rather than blanket-shielded — under-shielding a
+  script's own dead helpers is the honest direction, and `main`-script funcs
+  are already excluded from the dynamic-dispatch shield (above) by the same
+  reasoning. So a `main` package heavy with zero-fan-in subs (common in
+  spec/fixture scripts) is expected output, not a bug.
 
 Treat the dead list as a **review queue**, not a delete list.
 
