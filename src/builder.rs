@@ -556,6 +556,9 @@ fn build_with_plugins_inner(
         role_packages: b.role_packages,
         plugin_loads: b.plugin_loads,
         loader_config_params: b.loader_config_params,
+        // Perl has no operator-correctable member access (`->` is the one
+        // arrow; `.` is string concat). Pack languages fill this.
+        member_access_sites: Vec::new(),
     });
     // Finalize: run the legacy text-based MCB resolver as a fallback.
     // For every assignment the unified typer (run before

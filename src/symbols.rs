@@ -1100,16 +1100,32 @@ fn ref_type_snippet_completions(ty: &InferredType) -> Vec<CompletionItem> {
 /// type of the `.`/`->` receiver, resolved by the sentinel) as items. The
 /// tree work (sentinel reparse → receiver → type, incl. chains) happens in
 /// the backend; this is the tree-free class → members → items half.
+/// `op_fix = Some((operator_span, correct_operator))` attaches an
+/// `additionalTextEdit` to every item that swaps the typed `.`/`->` for the
+/// one the receiver's pointer depth requires (Mode A — accepting `width` on
+/// `p.` yields `p->width`). `None` leaves the items untouched (operator
+/// already correct, or DEEP receiver shown-only).
 pub fn member_completion_for_class(
     analysis: &FileAnalysis,
     class: &str,
     module_index: &dyn crate::file_analysis::CrossFileLookup,
+    op_fix: Option<(crate::file_analysis::Span, String)>,
 ) -> Option<Vec<CompletionItem>> {
     let candidates = analysis.complete_members_for_class(class, Some(module_index));
     if candidates.is_empty() {
         return None;
     }
-    Some(candidates.into_iter().map(candidate_to_completion_item).collect())
+    Some(
+        candidates
+            .into_iter()
+            .map(|mut c| {
+                if let Some((span, text)) = &op_fix {
+                    c.additional_edits.push((*span, text.clone()));
+                }
+                candidate_to_completion_item(c)
+            })
+            .collect(),
+    )
 }
 
 pub fn pack_hover_markdown(
@@ -3239,6 +3255,40 @@ fn find_use_insertion_position(
     }
 }
 
+/// Diagnostic code for a member-access whose operator disagrees with the
+/// receiver's pointer depth (`p.member` on a `Box* p`). The fix is a
+/// single-token swap; `code_actions` reads `data.operator` for the
+/// replacement text and `range` for where to write it.
+const MEMBER_OP_CODE: &str = "member-access-operator";
+
+/// Mode B: the operator-mismatch diagnostics for a pack language. One
+/// WARNING per `member_op_mismatches()` entry, each self-describing (range =
+/// the operator token, `data.operator` = the correct token) so the quick-fix
+/// needs no re-analysis. Gated to pack languages — Perl never produces these
+/// (its `member_access_sites` is empty, but gate anyway for clarity).
+pub fn pack_member_op_diagnostics(analysis: &FileAnalysis, language: &str) -> Vec<Diagnostic> {
+    if language == "perl" {
+        return Vec::new();
+    }
+    analysis
+        .member_op_mismatches()
+        .into_iter()
+        .map(|m| Diagnostic {
+            range: span_to_range(m.op_span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String(MEMBER_OP_CODE.into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "use `{}` here — the receiver's type requires it (you wrote `{}`)",
+                m.expected.as_str(),
+                m.typed.as_str(),
+            ),
+            data: Some(serde_json::json!({ "operator": m.expected.as_str() })),
+            ..Default::default()
+        })
+        .collect()
+}
+
 pub fn code_actions(
     diagnostics: &[Diagnostic],
     analysis: &FileAnalysis,
@@ -3247,6 +3297,23 @@ pub fn code_actions(
     let mut actions = Vec::new();
 
     for diag in diagnostics {
+        // Member-access operator swap: replace the operator token (the
+        // diagnostic's range) with the correct one (`data.operator`).
+        if matches!(&diag.code, Some(NumberOrString::String(s)) if s == MEMBER_OP_CODE) {
+            if let Some(op) = diag.data.as_ref().and_then(|d| d.get("operator")).and_then(|v| v.as_str()) {
+                let mut changes = HashMap::new();
+                changes.insert(uri.clone(), vec![TextEdit { range: diag.range, new_text: op.to_string() }]);
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Change to `{}`", op),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diag.clone()]),
+                    edit: Some(WorkspaceEdit { changes: Some(changes), ..Default::default() }),
+                    is_preferred: Some(true),
+                    ..Default::default()
+                }));
+            }
+            continue;
+        }
         let code_matches = matches!(
             &diag.code,
             Some(NumberOrString::String(s)) if s == "unresolved-function"

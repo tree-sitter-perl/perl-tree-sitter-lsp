@@ -1193,3 +1193,42 @@ fn cpp_reference_declared_var_types_to_referent() {
     );
 }
 
+#[test]
+fn cpp_member_op_mismatches_drive_off_deref_depth() {
+    use crate::file_analysis::MemberOp;
+    // p: Box* (wants ->) accessed with `.` → mismatch.
+    // b: Box   (wants .)  accessed with `->` → mismatch.
+    // pp: Box** (DEEP — `(*pp)->`) accessed with `.` → NO fix (show-only).
+    let src = "\
+struct Box { int w; };
+void f() {
+    Box* p;
+    Box b;
+    Box** pp;
+    p.w;
+    b->w;
+    pp.w;
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let sites = &fa.member_access_sites;
+    // p.w, b->w, pp.w all recorded (simple-variable receivers).
+    assert_eq!(sites.len(), 3, "three member-access sites: {sites:?}");
+
+    let mm = fa.member_op_mismatches();
+    assert_eq!(mm.len(), 2, "p and b mismatch; pp is DEEP/show-only: {mm:?}");
+
+    // p.w → expected Arrow, typed Dot
+    let p = mm.iter().find(|m| m.op_span.start.row == 5).expect("p.w mismatch");
+    assert_eq!(p.typed, MemberOp::Dot);
+    assert_eq!(p.expected, MemberOp::Arrow);
+
+    // b->w → expected Dot, typed Arrow
+    let b = mm.iter().find(|m| m.op_span.start.row == 6).expect("b->w mismatch");
+    assert_eq!(b.typed, MemberOp::Arrow);
+    assert_eq!(b.expected, MemberOp::Dot);
+
+    // pp.w (row 7) yields no mismatch — DEEP.
+    assert!(mm.iter().all(|m| m.op_span.start.row != 7), "pp is show-only");
+}
+

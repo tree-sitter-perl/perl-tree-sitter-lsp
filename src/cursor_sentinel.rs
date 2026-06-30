@@ -24,7 +24,9 @@
 //! Language config is a two-field table (rule #10): the member-access node
 //! kinds and the don't-splice-here set are the only facts that vary.
 
-use crate::file_analysis::{CrossFileLookup, FileAnalysis, InferredType, Span};
+use crate::file_analysis::{
+    expected_member_op, CrossFileLookup, FileAnalysis, InferredType, Span,
+};
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 /// The placeholder spliced at the cursor to complete a dangling member
@@ -216,17 +218,20 @@ fn receiver_of(member: Node, patched: &str, cursor: usize) -> Option<Receiver> {
     })
 }
 
+/// The `.`/`->` operator token of a member-access node (the anonymous
+/// child between the two named children). It lies entirely before the
+/// splice site, so its span is identical in patched and original source.
+fn operator_token<'a>(member: Node<'a>, patched: &str) -> Option<Node<'a>> {
+    let mut cur = member.walk();
+    let found = member.children(&mut cur).find(|c| {
+        !c.is_named() && matches!(c.utf8_text(patched.as_bytes()), Ok(".") | Ok("->"))
+    });
+    found
+}
+
 /// Detect `->` vs `.` by scanning the member node's anonymous children.
 fn member_uses_arrow(member: Node, patched: &str) -> bool {
-    let mut cur = member.walk();
-    for c in member.children(&mut cur) {
-        if !c.is_named() {
-            if c.utf8_text(patched.as_bytes()) == Ok("->") {
-                return true;
-            }
-        }
-    }
-    false
+    operator_token(member, patched).map(|t| t.utf8_text(patched.as_bytes()) == Ok("->")).unwrap_or(false)
 }
 
 /// Incremental variant: reuse a cached `old` tree of the unpatched
@@ -262,13 +267,21 @@ pub fn receiver_at_incremental(
     receiver_of(member, &patched, cursor)
 }
 
-/// Resolve the TYPE of the member-access receiver at the cursor (the chain
-/// left of the `.`/`->`), recursing through field accesses: `box.` → type
-/// of `box`; `box.inner.` → type of field `inner` on box's class;
-/// `a.b.c.` chases transitively. `None` when not a member access or the
-/// receiver doesn't type. The patched tree's receiver spans equal the
-/// original (free-anchor), so they line up with the bag's witnesses.
-pub fn receiver_type_at_incremental(
+/// The completion context at a dangling member access: the receiver's type
+/// (for listing members) plus, when the typed operator disagrees with the
+/// receiver's pointer depth, the single-level `.`↔`->` fix to swap it. One
+/// reparse serves both — completion pays it once per keystroke.
+///
+/// `op_fix = Some((span, text))` means "replace the operator token at `span`
+/// with `text`". `None` when the operator is already correct, the receiver
+/// isn't a simple variable, or the depth is DEEP (`Box**` → `(*pp)->`, an
+/// expression wrap we don't auto-apply — members still complete, show-only).
+pub struct MemberCompletionCtx {
+    pub receiver_type: Option<InferredType>,
+    pub op_fix: Option<(Span, String)>,
+}
+
+pub fn member_completion_ctx_incremental(
     parser: &mut Parser,
     cfg: &LangCfg,
     src: &str,
@@ -276,7 +289,7 @@ pub fn receiver_type_at_incremental(
     cursor: usize,
     analysis: &FileAnalysis,
     module_index: Option<&dyn CrossFileLookup>,
-) -> Option<InferredType> {
+) -> Option<MemberCompletionCtx> {
     if cursor_in_skip(old, src, cursor, cfg) {
         return None;
     }
@@ -295,7 +308,35 @@ pub fn receiver_type_at_incremental(
     let node = find_sentinel(tree.root_node(), &patched, cursor)?;
     let member = climb_to_member(node, cfg)?;
     let receiver = member.named_child(0)?;
-    resolve_node_type(receiver, cfg, &patched, analysis, module_index)
+    let receiver_type = resolve_node_type(receiver, cfg, &patched, analysis, module_index);
+    let op_fix = operator_fix(member, receiver, &patched, analysis);
+    Some(MemberCompletionCtx { receiver_type, op_fix })
+}
+
+/// The operator correction for a member access whose receiver is a simple
+/// variable. Drives entirely off the receiver's `deref_stack` (rule #10):
+/// the depth picks the expected operator, and we offer the swap only when
+/// it differs from what was typed AND a single token expresses it.
+fn operator_fix(
+    member: Node,
+    receiver: Node,
+    patched: &str,
+    analysis: &FileAnalysis,
+) -> Option<(Span, String)> {
+    if receiver.kind() != "identifier" {
+        return None; // only simple-variable receivers carry a resolvable stack
+    }
+    let name = receiver.utf8_text(patched.as_bytes()).ok()?;
+    let stack = analysis.var_deref_stack_at(name, receiver.start_position())?;
+    let expected = expected_member_op(stack)?; // None = DEEP → show-only
+    let op = operator_token(member, patched)?;
+    let typed_arrow = op.utf8_text(patched.as_bytes()) == Ok("->");
+    let expected_arrow = expected == crate::file_analysis::MemberOp::Arrow;
+    if typed_arrow == expected_arrow {
+        return None; // already correct
+    }
+    let span = Span { start: op.start_position(), end: op.end_position() };
+    Some((span, expected.as_str().to_string()))
 }
 
 /// Type a receiver node. A member-access node (`field_expression` /

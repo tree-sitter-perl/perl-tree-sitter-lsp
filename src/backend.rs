@@ -35,15 +35,21 @@ pub fn pack_completion(
                 pack.as_deref().map_or(module_index, |i| i);
             let cursor = crate::cursor_sentinel::point_to_byte(source, point);
             let mut parser = driver.make_parser();
-            if let Some(class) = crate::cursor_sentinel::receiver_type_at_incremental(
+            if let Some(ctx) = crate::cursor_sentinel::member_completion_ctx_incremental(
                 &mut parser, cfg, source, tree, cursor, analysis, Some(xidx),
-            )
-            .and_then(|ty| ty.class_name().map(|s| s.to_string()))
-            {
-                if let Some(items) =
-                    symbols::member_completion_for_class(analysis, &class, xidx)
+            ) {
+                if let Some(class) =
+                    ctx.receiver_type.and_then(|ty| ty.class_name().map(|s| s.to_string()))
                 {
-                    return items;
+                    // Mode A: the member items carry the operator-swap edit
+                    // (`p.` → `p->`) when the receiver's pointer depth wants
+                    // a different operator than was typed. The diagnostic
+                    // path (Mode B) is the universal fallback.
+                    if let Some(items) =
+                        symbols::member_completion_for_class(analysis, &class, xidx, ctx.op_fix)
+                    {
+                        return items;
+                    }
                 }
             }
         }
@@ -168,8 +174,12 @@ impl Backend {
                         .load(std::sync::atomic::Ordering::Relaxed),
                 };
                 files.for_each_open_mut(|uri, doc| {
-                    doc.analysis.enrich_imported_types_with_keys(Some(module_index.as_ref()));
-                    let diagnostics = symbols::collect_diagnostics(&doc.analysis, module_index, options);
+                    let diagnostics = if doc.language == "perl" {
+                        doc.analysis.enrich_imported_types_with_keys(Some(module_index.as_ref()));
+                        symbols::collect_diagnostics(&doc.analysis, module_index, options)
+                    } else {
+                        symbols::pack_member_op_diagnostics(&doc.analysis, &doc.language)
+                    };
                     pending.push((uri.clone(), diagnostics));
                 });
                 for (uri, diags) in pending {
@@ -203,12 +213,15 @@ impl Backend {
         self.enrich_analysis(uri);
         let options = self.diagnostic_options();
         let diagnostics = match self.files.get_open(uri) {
-            // pack languages ship NO diagnostics in v1 (no calibration →
-            // no false positives — the honesty discipline).
             Some(doc) if doc.language == "perl" => {
                 symbols::collect_diagnostics(&doc.analysis, &self.module_index, options)
             }
-            _ => vec![],
+            // Pack languages stay honest-silent EXCEPT the member-access
+            // operator-mismatch check, which is high-confidence (it fires
+            // only when a recorded site's typed operator disagrees with its
+            // receiver's known pointer depth — no calibration guesswork).
+            Some(doc) => symbols::pack_member_op_diagnostics(&doc.analysis, &doc.language),
+            None => vec![],
         };
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)

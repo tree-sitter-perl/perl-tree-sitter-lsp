@@ -83,6 +83,10 @@ pub struct SkeletonAnalysis {
     /// named is the method receiver, not a class member — its (wrongly
     /// sticky-tagged) class package is cleared in `into_file_analysis`.
     pub receiver_names: Vec<String>,
+    /// `receiver OP member` sites (simple-variable receivers) for the
+    /// member-access operator-DX consumer. Collected by a dedicated walk
+    /// over `pack.member_kinds`, not the skeleton query.
+    pub member_access_sites: Vec<crate::file_analysis::MemberAccessSite>,
 }
 
 impl SkeletonAnalysis {
@@ -158,6 +162,16 @@ impl SkeletonAnalysis {
                 if s.package.is_none() && s.scope == body {
                     s.package = Some(cname.clone());
                 }
+            }
+        }
+        if std::env::var("CPP_DUMP_MEMBERS").is_ok() {
+            for c in symbols.iter().filter(|s| matches!(s.kind, SymKind::Class)) {
+                let members: Vec<&str> = symbols
+                    .iter()
+                    .filter(|s| s.package.as_deref() == Some(c.name.as_str()))
+                    .map(|s| s.name.as_str())
+                    .collect();
+                eprintln!("CPP_DUMP_MEMBERS class '{}' members={:?}", c.name, members);
             }
         }
 
@@ -331,6 +345,7 @@ impl SkeletonAnalysis {
             refs,
             witnesses: bag,
             package_parents,
+            member_access_sites: std::mem::take(&mut self.member_access_sites),
             ..Default::default()
         });
         // Pack-declared receiver names ride the FA so core's member /
@@ -414,6 +429,13 @@ pub struct LangPack {
     /// (`type_qualifier` → `const`/`volatile`/`restrict`). Generic so new
     /// qualifiers + const-correctness diagnostics needn't touch core.
     pub nested_annot_kinds: &'static [&'static str],
+    /// Member-access node kinds (`receiver OP member`) — extraction records
+    /// each site (simple-variable receiver, operator token span, `->` vs
+    /// `.`) for the operator-DX consumer (`p.` on a `Box*` should be `->`).
+    /// The receiver is the first named child; the operator is the anonymous
+    /// child between the two named children. Empty = no member-access DX
+    /// (Perl, and packs whose member access isn't operator-correctable).
+    pub member_kinds: &'static [&'static str],
 }
 
 /// One effect of a command-dispatched statement.
@@ -457,6 +479,7 @@ pub fn perl_pack() -> LangPack {
         nested_peel: &[],
         nested_leaves: &[],
         nested_annot_kinds: &[],
+        member_kinds: &[],
     }
 }
 
@@ -496,6 +519,7 @@ pub fn python_pack() -> LangPack {
         nested_peel: &[],
         nested_leaves: &[],
         nested_annot_kinds: &[],
+        member_kinds: &[],
     }
 }
 
@@ -524,6 +548,7 @@ pub fn r_pack() -> LangPack {
         nested_peel: &[],
         nested_leaves: &[],
         nested_annot_kinds: &[],
+        member_kinds: &[],
     }
 }
 
@@ -565,6 +590,7 @@ pub fn cmake_pack() -> LangPack {
         nested_peel: &[],
         nested_leaves: &[],
         nested_annot_kinds: &[],
+        member_kinds: &[],
     }
 }
 
@@ -584,13 +610,23 @@ pub fn cpp_pack() -> LangPack {
                 "std::string" | "string" | "std::string_view" => Some(String),
                 "auto" | "void" => None,
                 t => {
-                    let typeish = !t.is_empty()
-                        && !t.contains(' ')
-                        && t.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
+                    // Elaborated type specifier `struct op` / `union u` /
+                    // `enum e` — the dominant C spelling (`struct op* o`).
+                    // The tag names the type; strip the keyword so it resolves
+                    // the same as the bare/typedef'd name.
+                    let tag = t
+                        .strip_prefix("struct ")
+                        .or_else(|| t.strip_prefix("union "))
+                        .or_else(|| t.strip_prefix("enum "))
+                        .unwrap_or(t)
+                        .trim();
+                    let typeish = !tag.is_empty()
+                        && !tag.contains(' ')
+                        && tag.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
                     // Strip the namespace qualifier — classes/members are
                     // keyed by the unqualified name (@context.class), so
                     // `geo::Circle` must type as `Circle` to resolve.
-                    typeish.then(|| ClassName(t.rsplit("::").next().unwrap_or(t).to_string()))
+                    typeish.then(|| ClassName(tag.rsplit("::").next().unwrap_or(tag).to_string()))
                 }
             }
         },
@@ -623,6 +659,9 @@ pub fn cpp_pack() -> LangPack {
         ],
         nested_leaves: &[("identifier", "def.local"), ("field_identifier", "def.var")],
         nested_annot_kinds: &["type_qualifier"],
+        // `box.m` and `box->m` both parse as field_expression — the one
+        // member-access shape, operator distinguished by the inner token.
+        member_kinds: &["field_expression"],
     }
 }
 
@@ -1297,7 +1336,63 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             });
         }
     }
+    collect_member_sites(tree.root_node(), pack, source, &mut out.member_access_sites);
     Ok(out)
+}
+
+/// Walk the whole tree recording `receiver OP member` sites for the
+/// operator-DX consumer. Only simple-variable receivers are kept — the
+/// shape whose `deref_stack` the diagnostic pass can resolve by name (a
+/// chained `a.b.c` receiver isn't a variable, so it self-skips). No-op for
+/// packs without `member_kinds`.
+fn collect_member_sites(
+    root: tree_sitter::Node,
+    pack: &LangPack,
+    source: &[u8],
+    out: &mut Vec<crate::file_analysis::MemberAccessSite>,
+) {
+    if pack.member_kinds.is_empty() {
+        return;
+    }
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if pack.member_kinds.contains(&node.kind()) {
+            if let Some(site) = member_site(node, source) {
+                out.push(site);
+            }
+        }
+        let mut cur = node.walk();
+        for ch in node.children(&mut cur) {
+            stack.push(ch);
+        }
+    }
+}
+
+/// One member-access node → its site, when the receiver is a simple
+/// identifier. The operator is the anonymous child whose text is `.`/`->`
+/// (reading what the user WROTE — the expected operator is decided later
+/// off the receiver's `deref_stack`, never off this token).
+fn member_site(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<crate::file_analysis::MemberAccessSite> {
+    use crate::file_analysis::{MemberAccessSite, Span};
+    let receiver = node.named_child(0)?;
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    let name = receiver.utf8_text(source).ok()?.to_string();
+    let mut cur = node.walk();
+    let op = node.children(&mut cur).find(|ch| {
+        !ch.is_named() && matches!(ch.utf8_text(source), Ok(".") | Ok("->"))
+    })?;
+    let arrow = op.utf8_text(source) == Ok("->");
+    Some(MemberAccessSite {
+        receiver: name,
+        receiver_at: receiver.start_position(),
+        op_span: Span { start: op.start_position(), end: op.end_position() },
+        arrow,
+    })
 }
 
 fn byte_range_of(events: &[Event], match_id: usize, cap: &str) -> Option<(usize, usize)> {

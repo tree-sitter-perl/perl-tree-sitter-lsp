@@ -479,6 +479,76 @@ impl DerefStep {
     }
 }
 
+/// The member-access operator a receiver requires, in the single-level
+/// `.`↔`->` regime. Computed purely from a receiver's `deref_stack` (rule
+/// #10 — the depth, not an operator-string branch, decides). A DEEP stack
+/// (`Box**` = `[Pointer, Pointer]`) wants `(*pp)->`, an expression WRAP not
+/// a token swap, so it has no `MemberOp` — `expected_member_op` returns
+/// `None` there and consumers leave the access untouched (show-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberOp {
+    Dot,
+    Arrow,
+}
+
+impl MemberOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemberOp::Dot => ".",
+            MemberOp::Arrow => "->",
+        }
+    }
+}
+
+/// The operator a receiver with this deref stack requires, when one
+/// single-level `.`↔`->` token swap can express it. `None` for a DEEP
+/// stack (≥2 levels: `Box**` needs `(*pp)->`, an expression wrap) — the
+/// caller shows members without an auto-fix. The OUTERMOST level (closest
+/// to the variable name) is the last element; in the single-level case
+/// that is also the only element.
+pub fn expected_member_op(stack: &[DerefStep]) -> Option<MemberOp> {
+    match stack {
+        // value, or a reference (auto-derefs) → `.`
+        [] => Some(MemberOp::Dot),
+        [one] => Some(match one.kind {
+            DerefKind::Pointer => MemberOp::Arrow,
+            DerefKind::Reference => MemberOp::Dot,
+        }),
+        _ => None,
+    }
+}
+
+/// A `receiver OP member` access site recorded at extraction (pack
+/// languages only — empty for Perl and every non-pack file). Tree-free
+/// downstream: the diagnostic pass resolves `receiver` → its symbol's
+/// `deref_stack` and compares the typed operator against
+/// `expected_member_op`. Only simple-variable receivers are recorded —
+/// the receiver whose `deref_stack` we can resolve by name. See
+/// `docs/adr/pointer-stack.md` (member-access DX consumer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberAccessSite {
+    /// Simple-variable receiver name (`p` in `p->m`).
+    pub receiver: String,
+    /// Receiver token start — anchors the in-scope symbol lookup.
+    #[serde(with = "PointDef")]
+    pub receiver_at: Point,
+    /// Span of the `.`/`->` operator token (the quick-fix / completion
+    /// edit replaces exactly this).
+    pub op_span: Span,
+    /// The operator as written: `->` (true) vs `.` (false).
+    pub arrow: bool,
+}
+
+/// A member-access whose typed operator disagrees with the operator its
+/// receiver's pointer depth requires. `op_span` covers the written
+/// operator token; replace it with `expected.as_str()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberOpMismatch {
+    pub op_span: Span,
+    pub typed: MemberOp,
+    pub expected: MemberOp,
+}
+
 impl Symbol {
     /// Bare variable/field name without the sigil. Uses the sigil stored
     /// in `detail` so we never re-derive it by text-stripping (which would
@@ -2413,6 +2483,12 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub loader_config_params: Vec<LoaderConfigParam>,
 
+    /// `receiver OP member` sites recorded at pack-language extraction,
+    /// for the member-access operator-DX consumer (`p.` on a `Box* p`
+    /// wants `->`). Empty for Perl and non-pack files.
+    #[serde(default)]
+    pub member_access_sites: Vec<MemberAccessSite>,
+
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
@@ -2479,6 +2555,7 @@ pub struct FileAnalysisParts {
     pub role_packages: HashSet<String>,
     pub plugin_loads: Vec<PluginLoadFact>,
     pub loader_config_params: Vec<LoaderConfigParam>,
+    pub member_access_sites: Vec<MemberAccessSite>,
 }
 
 /// "This file loads plugin `name`, passing the config value at
@@ -2626,6 +2703,7 @@ impl FileAnalysis {
             role_packages,
             plugin_loads,
             loader_config_params,
+            member_access_sites,
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
@@ -2664,6 +2742,7 @@ impl FileAnalysis {
             role_packages,
             plugin_loads,
             loader_config_params,
+            member_access_sites,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
@@ -3123,6 +3202,37 @@ impl FileAnalysis {
             }
         }
         None
+    }
+
+    /// The pointer/reference declarator stack of the in-scope variable
+    /// `name` at `point` — the receiver shape the member-access operator-DX
+    /// reads. `Some([])` is a known value (expects `.`); `None` means no
+    /// such variable resolved (don't offer a correction).
+    pub fn var_deref_stack_at(&self, name: &str, point: Point) -> Option<&[DerefStep]> {
+        self.resolve_variable(name, point).map(|s| s.deref_stack.as_slice())
+    }
+
+    /// Member accesses whose typed operator disagrees with their
+    /// receiver's pointer depth — the single-level `.`↔`->` mismatches.
+    /// Pure read over `member_access_sites` (recorded at extraction) joined
+    /// with each receiver's `deref_stack`; DEEP receivers (`Box**`) yield no
+    /// `MemberOp` and are skipped (show-only, no token-swap fix). The one
+    /// source both the diagnostic pass and any other consumer share.
+    pub fn member_op_mismatches(&self) -> Vec<MemberOpMismatch> {
+        let mut out = Vec::new();
+        for site in &self.member_access_sites {
+            let Some(stack) = self.var_deref_stack_at(&site.receiver, site.receiver_at) else {
+                continue;
+            };
+            let Some(expected) = expected_member_op(stack) else {
+                continue; // DEEP — needs a wrap, not a swap
+            };
+            let typed = if site.arrow { MemberOp::Arrow } else { MemberOp::Dot };
+            if typed != expected {
+                out.push(MemberOpMismatch { op_span: site.op_span, typed, expected });
+            }
+        }
+        out
     }
 
     /// Raw Variable+InferredType lookup — returns the latest in-scope
