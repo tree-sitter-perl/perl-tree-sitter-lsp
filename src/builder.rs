@@ -6410,6 +6410,8 @@ impl<'a> Builder<'a> {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
                         if vt.starts_with('%') {
                             inferred = Some(self.hash_literal_type(right));
+                        } else if vt.starts_with('@') {
+                            inferred = self.list_literal_type(right);
                         }
                     }
                 }
@@ -6724,6 +6726,21 @@ impl<'a> Builder<'a> {
     /// set is no longer exhaustive, so consumers can't treat unknown
     /// keys as misses. No literal keys at all → plain `HashRef`
     /// (back-compat: `{}` and fully-dynamic hashes keep today's type).
+    /// `(e1, e2, …)` in ARRAY context → `Sequence([t1, t2, …])`, each element
+    /// typed via its own Expr witness, so `my ($x,$y) = @arr` can `element_at`.
+    /// `None` if ANY element is unresolved (a holey Sequence mis-projects).
+    fn list_literal_type(&mut self, node: Node<'a>) -> Option<InferredType> {
+        let mut flat: Vec<Node<'a>> = Vec::new();
+        crate::cst::flatten_list(node, &mut flat);
+        let named: Vec<Node<'a>> = flat.into_iter().filter(|n| n.is_named()).collect();
+        let mut elems = Vec::with_capacity(named.len());
+        for child in named {
+            self.emit_expr_witness(child);
+            elems.push(self.bag_query_expr_span(node_to_span(child))?);
+        }
+        (!elems.is_empty()).then(|| InferredType::Sequence(elems))
+    }
+
     fn hash_literal_type(&mut self, node: Node<'a>) -> InferredType {
         // A spread occupies ONE list slot but flattens to an even count
         // at runtime, so pairing must skip it as a unit — `pair_nodes`'
@@ -6894,8 +6911,10 @@ impl<'a> Builder<'a> {
 
             // Variable — Edge to its Variable attachment. Registry
             // materialization routes through `query_variable_type`
-            // (scope-walking + framework-aware fold).
-            "scalar" => {
+            // (scope-walking + framework-aware fold). Arrays/hashes edge the
+            // same way (sigil kept), so `my ($x,$y) = @arr` can chase `@arr`
+            // to its `Sequence` and `element_at`.
+            "scalar" | "array" | "hash" => {
                 let name = node.utf8_text(self.source).ok()?;
                 Some(WitnessPayload::Edge(WitnessAttachment::Variable {
                     name: name.to_string(),

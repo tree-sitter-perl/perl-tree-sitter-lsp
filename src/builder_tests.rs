@@ -15206,3 +15206,21 @@ sub f {
         fa.flow_edges
     );
 }
+
+#[test]
+fn array_destructure_types_each_slot() {
+    // `my @arr=(…); my ($x,$y)=@arr` — the array types as a Sequence and each
+    // destructured slot projects `element_at`. (Was None before slice D.)
+    use crate::file_analysis::InferredType::{Numeric, Sequence};
+    let fa = build_fa("package T;
+sub f {
+  my @list = (1, 2, 3);
+  my ($t, $s) = @list;
+}
+1;
+");
+    let p = tree_sitter::Point::new(4, 0);
+    assert_eq!(fa.inferred_type_via_bag("@list", p), Some(Sequence(vec![Numeric, Numeric, Numeric])));
+    assert_eq!(fa.inferred_type_via_bag("$t", p), Some(Numeric));
+    assert_eq!(fa.inferred_type_via_bag("$s", p), Some(Numeric));
+}
