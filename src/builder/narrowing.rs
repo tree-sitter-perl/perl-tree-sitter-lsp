@@ -637,12 +637,7 @@ impl<'a> Builder<'a> {
     /// EDGE SET, not the CST. Language-agnostic: any LangPack feeding FlowEdges
     /// gets the cutoff for free (the seam the grammar scan couldn't cross).
     fn first_subject_write_via_edges(&self, var: &str, region: Span) -> Option<Point> {
-        self.flow_edges
-            .iter()
-            .filter(|fe| fe.target_name == var)
-            .map(|fe| fe.target_at)
-            .filter(|p| !point_lt(*p, region.start) && point_lt(*p, region.end))
-            .min_by_key(|p| (p.row, p.column))
+        crate::file_analysis::earliest_rebind_in(&self.flow_edges, var, region)
     }
 
     /// Post-walk: resolve every recognized narrowing's region cutoff against

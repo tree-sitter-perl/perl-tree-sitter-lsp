@@ -1154,6 +1154,40 @@ y = 1
 }
 
 #[test]
+fn python_narrowing_truncates_at_reassignment() {
+    // THE cross-language cutoff: `isinstance` narrows x to Foo, then a
+    // reassignment INSIDE the block rebinds it — x must stop being Foo after
+    // the rebind (the edge-driven cutoff, same as Perl). Pre-lift, the scoped
+    // witness leaked Foo to the whole block.
+    let src = "\
+class Foo:
+    def run(self):
+        pass
+x = maybe()
+if isinstance(x, Foo):
+    x.run()
+    x = other()
+    x.run()
+y = 1
+";
+    let mut parser = python_parser();
+    let tree = parser.parse(src, None).unwrap();
+    let skel = extract(&tree, src.as_bytes(), &python_pack()).unwrap();
+    let fa = skel.into_file_analysis();
+    use crate::file_analysis::InferredType;
+    assert_eq!(
+        fa.inferred_type_via_bag("x", tree_sitter::Point { row: 5, column: 4 }),
+        Some(InferredType::ClassName("Foo".into())),
+        "narrowed before the reassignment",
+    );
+    assert_ne!(
+        fa.inferred_type_via_bag("x", tree_sitter::Point { row: 7, column: 4 }),
+        Some(InferredType::ClassName("Foo".into())),
+        "reassignment rebinds x → narrowing truncated by the cross-language cutoff",
+    );
+}
+
+#[test]
 fn cpp_pointer_declared_vars_get_their_pointee_type() {
     // `T* p;` and the dynamic_cast condition-form both type the var to
     // the pointee class (pointer-ness dropped for navigation).

@@ -619,6 +619,24 @@ impl FlowEdge {
     }
 }
 
+/// The earliest FlowEdge that rebinds `var` within `region` — the
+/// LANGUAGE-AGNOSTIC narrowing cutoff. A rebind is a value flowing into the
+/// subject (a `@flow` edge), so this one truncation is shared by the Perl
+/// narrowing pass (`first_subject_write_via_edges`) and the query-engine
+/// (cpp/python) narrowing. `None` ⇒ no rebind in the region, narrowing runs to
+/// the region's end. The grammar scan it replaced lived in one language;
+/// reading the edge set, every LangPack feeding `@flow` gets the cutoff.
+pub fn earliest_rebind_in(flow_edges: &[FlowEdge], var: &str, region: Span) -> Option<Point> {
+    let key = |p: &Point| (p.row, p.column);
+    let (lo, hi) = (key(&region.start), key(&region.end));
+    flow_edges
+        .iter()
+        .filter(|fe| fe.target_name == var)
+        .map(|fe| fe.target_at)
+        .filter(|p| lo <= key(p) && key(p) < hi)
+        .min_by_key(key)
+}
+
 impl Symbol {
     /// Bare variable/field name without the sigil. Uses the sigil stored
     /// in `detail` so we never re-derive it by text-stripping (which would

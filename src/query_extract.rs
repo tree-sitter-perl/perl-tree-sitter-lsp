@@ -1000,6 +1000,11 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     let mut narrow_var: HashMap<usize, String> = HashMap::new();
     let mut narrow_type: HashMap<usize, String> = HashMap::new();
     let mut narrow_guard: HashMap<usize, String> = HashMap::new();
+    // Recognized narrowings deferred to after flow-edge minting, so the region
+    // cutoff can read the edges (`apply` below) — (subject, refined type, FULL
+    // guarded-block region, block scope).
+    let mut pending_narrow: Vec<(String, crate::file_analysis::InferredType, Span, ScopeId)> =
+        Vec::new();
     // A context whose same-match `@scope` starts AFTER it (C++ namespace:
     // `@context` is on the name, `@scope` on the body `{`) must be
     // registered at the BODY depth, not the file depth — else it goes
@@ -1054,16 +1059,16 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     narrow_guard.get(&e.match_id),
                 ) {
                     if let Some(refined) = (pack.narrow_guard)(guard, ty) {
-                        let span = Span { start: e.start, end: e.start };
-                        out.witnesses.push(crate::witnesses::Witness {
-                            attachment: crate::witnesses::WitnessAttachment::Variable {
-                                name: (pack.shape_name)("ref.var", var),
-                                scope: id,
-                            },
-                            source: crate::witnesses::WitnessSource::Builder("skeleton-narrow".into()),
-                            payload: crate::witnesses::WitnessPayload::InferredType(refined),
-                            span,
-                        });
+                        // Defer: the region cutoff (first rebind edge) needs the
+                        // FlowEdges, minted after this loop. Carry the FULL
+                        // guarded-block region [start, end]; the post-pass
+                        // truncates it at the earliest rebind.
+                        pending_narrow.push((
+                            (pack.shape_name)("ref.var", var),
+                            refined,
+                            Span { start: e.start, end: e.end },
+                            id,
+                        ));
                     }
                 }
             }
@@ -1496,6 +1501,26 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         if let Some(w) = fe.lower_to_witness() {
             out.witnesses.push(w);
         }
+    }
+    // Narrowing cutoffs (THE cross-language lift): truncate each guarded region
+    // at the first FlowEdge that rebinds the subject — the SAME edge-driven
+    // cutoff the Perl narrowing uses (`earliest_rebind_in`). Deferred to here so
+    // the edges exist. The witness gets a REAL region span [start, cutoff], so
+    // point-containment ends the narrowing at the rebind — the soundness Perl
+    // got from its cutoff, now generic. (cpp's `narrow_guard` is stubbed, so
+    // this fires for python today; any LangPack that narrows gets it free.)
+    for (name, refined, region, scope) in pending_narrow {
+        let end = crate::file_analysis::earliest_rebind_in(&out.flow_edges, &name, region)
+            .unwrap_or(region.end);
+        if (region.start.row, region.start.column) >= (end.row, end.column) {
+            continue; // rebound before the region even opens — nothing holds
+        }
+        out.witnesses.push(crate::witnesses::Witness {
+            attachment: crate::witnesses::WitnessAttachment::Variable { name, scope },
+            source: crate::witnesses::WitnessSource::Builder("skeleton-narrow".into()),
+            payload: crate::witnesses::WitnessPayload::InferredType(refined),
+            span: Span { start: region.start, end },
+        });
     }
     Ok(out)
 }
