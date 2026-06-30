@@ -3236,8 +3236,7 @@ impl<'a> Builder<'a> {
                 // tokens navigable by emitting a `FunctionCall` ref pinned to a
                 // package — the exporting module for a remote name (joins the
                 // source sub's rename), or the consuming package for a local
-                // alias (a self-contained local group). See
-                // `docs/rename-bidirectional-audit.md` #6.
+                // alias (a self-contained local group).
                 self.add_ref(
                     RefKind::FunctionCall { resolved_package: package },
                     span,
@@ -5391,7 +5390,7 @@ impl<'a> Builder<'a> {
                 // (the origin) and a string in the hashref (the local); drop
                 // both flat entries and replace with the renamed binding.
                 imported_symbols.retain(|s| s.local_name != remote && s.local_name != local);
-                // Two distinct rename identities (docs/rename-bidirectional-audit.md #6):
+                // Two distinct rename identities:
                 //   * the remote-name token IS the source sub — pin it to the
                 //     exporting module so renaming `Module::remote` rewrites it.
                 //   * the local alias is a binding in the CONSUMING package —
@@ -11597,35 +11596,19 @@ impl<'a> Builder<'a> {
                 _ => return,
             }
         }
-        if matches!(effective.kind(), "anonymous_hash_expression" | "parenthesized_expression")
-            && effective.named_child_count() == 1
-        {
-            if let Some(inner) = effective.named_child(0) {
-                if matches!(inner.kind(), "list_expression" | "anonymous_hash_expression") {
-                    effective = inner;
-                }
-            }
-        }
-        let named: Vec<Node<'a>> = (0..effective.named_child_count())
-            .filter_map(|i| effective.named_child(i))
-            .collect();
-        // Single-arg calls present the arg directly (no list_expression
-        // wrapper). One arg can't be a key/value pair.
-        if named.len() < 2
-            && effective.kind() != "list_expression"
-            && effective.kind() != "parenthesized_expression"
-        {
-            return;
-        }
-        for (idx, child) in named.iter().enumerate() {
-            if idx % 2 != 0 { continue; }
+        // Pair-walk via the shared `cst::pair_nodes`: Perl tucks the tail pairs
+        // of `a => 1, b => 2` into a right-nested `list_expression`, so manual
+        // even/odd iteration over the top-level children sees only the FIRST
+        // pair. `pair_nodes` flattens the nesting (and skips separators), so
+        // every key is walked. (CLAUDE.md: don't re-derive pair-walking.)
+        for (child, _value) in crate::cst::pair_nodes(effective) {
             if !matches!(
                 child.kind(),
                 "bareword" | "autoquoted_bareword" | "string_literal" | "interpolated_string_literal"
             ) {
                 continue;
             }
-            let Some((key, is_dynamic)) = self.extract_key_text(*child) else { continue };
+            let Some((key, is_dynamic)) = self.extract_key_text(child) else { continue };
             if is_dynamic { continue; }
             // Gate decides whether to emit + what owner to record.
             // Strict checks the local symbol table for a matching
@@ -11670,14 +11653,25 @@ impl<'a> Builder<'a> {
                 Gate::Open(owner) => Some(owner.clone()),
                 Gate::Deferred => None,
             };
-            let access = self.determine_access(*child);
+            let access = self.determine_access(child);
             // `scope_at_point` instead of `current_scope` so this
             // works both inside the walk (function-call args path)
             // and post-walk (method-call args path; scope_stack is
             // empty by then). Equivalent at walk-time because a
             // node's innermost containing scope IS what
             // current_scope would return.
-            let span = node_to_span(*child);
+            //
+            // A quoted key (`{ "name", 2 }`) must rename its CONTENT, not the
+            // whole literal — rewriting the quotes turns it into a bareword
+            // (`{ fullname, 2 }`), a `strict subs` error in a plain-comma list.
+            let span = if matches!(
+                child.kind(),
+                "string_literal" | "interpolated_string_literal"
+            ) {
+                self.string_content_span(child)
+            } else {
+                node_to_span(child)
+            };
             self.refs.push(Ref {
                 kind: RefKind::HashKeyAccess {
                     var_text: String::new(),

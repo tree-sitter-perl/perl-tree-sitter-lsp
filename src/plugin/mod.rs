@@ -425,7 +425,7 @@ pub enum EmitAction {
     /// name with `package = Some(exporting_module)` so it renames with the
     /// source sub, and a renaming alias's **local** name with `package =
     /// Some(consuming_package)` so it forms a self-contained local group that
-    /// never touches the exporter. See `docs/rename-bidirectional-audit.md` #6.
+    /// never touches the exporter.
     ImportRef {
         name: String,
         #[serde(default)]

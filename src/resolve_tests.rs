@@ -2799,7 +2799,7 @@ sub bump { my ($self) = @_; $self->{count}++; my $local = 1; return $local }
 /// An owned hash key resolves to a cross-file HashKeyOfClass target —
 /// A Moo internal slot (`$self->{size}`) is one spelling of the `size` attr,
 /// so it resolves to the attr's projection Group — the same group its `has`
-/// decl, ctor key, reader, and mapped accessors resolve to (finding #2). It
+/// decl, ctor key, reader, and mapped accessors resolve to. It
 /// is NOT a plain `HashKeyOfClass` rename: that would miss the accessor /
 /// ctor-key sites the group carries. The group walks cross-file via
 /// `group_rename_edits`.
@@ -3035,8 +3035,8 @@ fn moo_explicit_string_accessor_renames_its_defining_string() {
             (lines[l.span.start.row][l.span.start.column..l.span.end.column].to_string(), t.clone())
         })
         .collect();
-    // The defining strings rewrite to the affixed new name (the fix), and the
-    // call site stays consistent with them.
+    // The defining strings rewrite to the affixed new name, and the call site
+    // stays consistent with them.
     for want in [("has_size", "has_dim"), ("clear_size", "clear_dim")] {
         assert!(
             materialized.contains(&(want.0.to_string(), want.1.to_string())),
@@ -3117,7 +3117,7 @@ fn rename_name_guard_rejects_empty_and_whitespace() {
 /// Array/hash package globals rename the bare name tail only — qualified
 /// element/slice reads (`$Pkg::items[0]`, `$Pkg::map{k}`) span the whole
 /// `$Pkg::name`, so the rewrite must be anchored at the span end or it eats the
-/// sigil + `Pkg::` qualifier (which produced invalid Perl before the fix).
+/// sigil + `Pkg::` qualifier and produces invalid Perl.
 #[test]
 fn package_var_array_hash_globals_rename_name_tail_only() {
     use crate::module_index::ModuleIndex;
@@ -3210,7 +3210,7 @@ fn package_var_main_global_does_not_cross_scripts() {
 /// `OverrideScope` toggle: a method overridden in a child resolves to the
 /// whole override family under `Hierarchy` (the default IDE refactor) but only
 /// its own dispatch chain under `Dispatch`. Membership is edge-gated (`@ISA`),
-/// never name-matched. See `docs/rename-bidirectional-audit.md` #5.
+/// never name-matched.
 #[test]
 fn override_scope_hierarchy_unions_dispatch_is_precise() {
     use crate::module_index::ModuleIndex;
@@ -3260,7 +3260,7 @@ fn override_scope_hierarchy_unions_dispatch_is_precise() {
     );
 }
 
-/// Finding #6: renaming imports (`use Exp beta => { -as => 'rb' }`). Two
+/// Renaming imports (`use Exp beta => { -as => 'rb' }`). Two
 /// distinct identities: the REMOTE name `beta` is the source `Exp::beta`
 /// (renames together, across all consumers); the LOCAL alias `rb` is a
 /// binding in the CONSUMING package (the `-as` value + local calls) that
@@ -3311,7 +3311,7 @@ fn test_renaming_import_remote_joins_source_alias_stays_local() {
     assert!(alias_refs.len() >= 2, "alias group = `-as` value + call: {:?}", alias_refs);
 }
 
-/// Finding #2 over-reach: a hash key in a method call's args that isn't a column
+/// Over-reach: a hash key in a method call's args that isn't a column
 /// (or verb param) must NOT hijack the method. `ref_at` returns the method-call
 /// ref because its span covers the args, but only the method-name token renames
 /// the method — gated on `method_name_span`.
@@ -3329,7 +3329,7 @@ fn arg_key_does_not_hijack_enclosing_method() {
     );
 }
 
-/// Finding #2 feature: a DBIC column's single-hashref call args (`update`/`find`
+/// A DBIC column's single-hashref call args (`update`/`find`
 /// /`search` with one `{ col => ... }`) are column-keyed — the keys are
 /// `Class`-owned columns, not verb params — so renaming the column reaches them.
 #[test]
@@ -3427,6 +3427,199 @@ fn moo_attr_group_includes_cross_file_constructor_key() {
     );
 }
 
+/// A custom-named accessor that does NOT embed the attr (`predicate =>
+/// 'has_size'` for attr `x`) is an independent method — a cursor on it must
+/// rename IT, not the attr group (else the click silently renames a different
+/// token). Only an embedding name (`has_size` for `size`) reverse-maps.
+#[test]
+fn non_embedding_mapped_accessor_renames_itself_not_the_attr() {
+    let src = "package W;\nuse Moo;\nhas x => (is => 'rw', predicate => 'has_size');\n\
+        sub probe { my $self = shift; return $self->has_size; }\n1;\n";
+    let fa = parse(src);
+    let col = src.lines().nth(3).unwrap().find("has_size").unwrap();
+    let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 3, column: col }, None);
+    assert!(
+        matches!(&resolved, Some(ResolvedTarget::Target(t)) if t.name == "has_size"),
+        "cursor on the non-embedding `has_size` must rename has_size itself, not attr `x`: {resolved:?}",
+    );
+}
+
+/// Inheritance: renaming a base-class attr reaches a SUBCLASS construction
+/// (`Dog->new(name => …)` where `Dog extends Animal`). The base attr's ctor-key
+/// member `HashKeyOfSub{Animal,new}` matches the subclass ctor key across `@ISA`.
+#[test]
+fn inherited_attr_rename_reaches_subclass_constructor_key() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+    let store = FileStore::new();
+    let animal = PathBuf::from("/tmp/inh_animal.pm");
+    let dog = PathBuf::from("/tmp/inh_dog.pm");
+    let app = PathBuf::from("/tmp/inh_run.pl");
+    let animal_src = "package Animal;\nuse Moo;\nhas name => (is => 'rw');\n1;\n";
+    let dog_src = "package Dog;\nuse Moo;\nextends 'Animal';\n1;\n";
+    let app_src = "use Dog;\nmy $d = Dog->new(name => 'Rex');\nprint $d->name;\n";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(animal.clone(), Arc::new(parse(animal_src)));
+    idx.register_workspace_module(dog.clone(), Arc::new(parse(dog_src)));
+    store.insert_workspace(animal.clone(), parse(animal_src));
+    store.insert_workspace(dog.clone(), parse(dog_src));
+    store.insert_workspace(app.clone(), parse(app_src));
+    let animal_fa = store.workspace_raw().get(&animal).unwrap().value().clone();
+    let col = animal_src.lines().nth(2).unwrap().find("name").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&animal_fa, tree_sitter::Point { row: 2, column: col }, Some(&idx)).expect("attr resolves")
+    else {
+        panic!("expected a Moo attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, Some(&idx), &FileKey::Path(animal.clone()), &local_spans, &pinned_spans, &members, "X",
+    );
+    assert!(
+        edits.iter().any(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &app) && l.span.start.row == 1),
+        "base attr rename must reach the subclass `Dog->new(name => …)` ctor key: {edits:?}",
+    );
+}
+
+/// A Corinna `field` is per-class PRIVATE storage — NOT inherited like a Moo
+/// attr. Renaming a subclass's field (where an ancestor declares the same field
+/// name) must stay in the subclass: the inheritance bridge must not widen
+/// field-backed groups, and the reader is scoped precisely (not the family).
+#[test]
+fn corinna_field_subclass_does_not_bleed_to_ancestor() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+    let store = FileStore::new();
+    let base = PathBuf::from("/tmp/cor_base.pm");
+    let deriv = PathBuf::from("/tmp/cor_deriv.pm");
+    let base_src = "use v5.38;\nclass CBase { field $size :param :reader; method show { return $size; } }\n";
+    let deriv_src = "use v5.38;\nclass CDeriv :isa(CBase) { field $size :param :reader; method other { return $size; } }\n";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(base.clone(), Arc::new(parse(base_src)));
+    idx.register_workspace_module(deriv.clone(), Arc::new(parse(deriv_src)));
+    store.insert_workspace(base.clone(), parse(base_src));
+    store.insert_workspace(deriv.clone(), parse(deriv_src));
+    let deriv_fa = store.workspace_raw().get(&deriv).unwrap().value().clone();
+    let col = deriv_src.lines().nth(1).unwrap().find("size").unwrap();
+    let resolved = resolve_symbol(&deriv_fa, tree_sitter::Point { row: 1, column: col }, Some(&idx))
+        .expect("field resolves");
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+        panic!("expected a field Group, got {resolved:?}")
+    };
+    let edits = group_rename_edits(
+        &store, Some(&idx), &FileKey::Path(deriv.clone()), &local_spans, &pinned_spans, &members, "vol",
+    );
+    assert!(
+        edits.iter().all(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &deriv)),
+        "Corinna field rename must stay in the subclass, never touch the ancestor: {edits:?}",
+    );
+}
+
+/// An OVERRIDDEN attribute (subclass redeclares the base's `has name`) renames
+/// as ONE family under Hierarchy (the chosen scope) — from either class's decl
+/// the edit set is identical and spans both decls + both classes' ctor keys.
+/// Minting from the root-most declarer makes the two cursors symmetric.
+#[test]
+fn overridden_attr_renames_whole_family_symmetrically() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+    let store = FileStore::new();
+    let animal = PathBuf::from("/tmp/ov_animal.pm");
+    let dog = PathBuf::from("/tmp/ov_dog.pm");
+    let animal_src = "package Animal;\nuse Moo;\nhas name => (is => 'rw');\n1;\n";
+    let dog_src = "package Dog;\nuse Moo;\nextends 'Animal';\nhas name => (is => 'rw');\n1;\n";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(animal.clone(), Arc::new(parse(animal_src)));
+    idx.register_workspace_module(dog.clone(), Arc::new(parse(dog_src)));
+    store.insert_workspace(animal.clone(), parse(animal_src));
+    store.insert_workspace(dog.clone(), parse(dog_src));
+
+    let edits_from = |path: &PathBuf, src: &str, row: usize| {
+        let fa = store.workspace_raw().get(path).unwrap().value().clone();
+        let col = src.lines().nth(row).unwrap().find("name").unwrap();
+        let r = resolve_symbol(&fa, tree_sitter::Point { row, column: col }, Some(&idx)).unwrap();
+        let ResolvedTarget::Group { local_spans, pinned_spans, members } = r else {
+            panic!("expected Group, got {r:?}")
+        };
+        let mut got: Vec<String> = group_rename_edits(
+            &store, Some(&idx), &FileKey::Path(path.clone()), &local_spans, &pinned_spans, &members, "X",
+        )
+        .iter()
+        .map(|(l, _)| match &l.key {
+            FileKey::Path(p) => format!("{}:{}", p.file_name().unwrap().to_string_lossy(), l.span.start.row),
+            FileKey::Url(u) => format!("{u}:{}", l.span.start.row),
+        })
+        .collect();
+        got.sort();
+        got.dedup();
+        got
+    };
+    let from_animal = edits_from(&animal, animal_src, 2);
+    let from_dog = edits_from(&dog, dog_src, 3);
+    assert_eq!(from_animal, from_dog, "override rename is symmetric (family)");
+    assert!(
+        from_animal.iter().any(|s| s.starts_with("ov_animal.pm"))
+            && from_animal.iter().any(|s| s.starts_with("ov_dog.pm")),
+        "the family spans both class decls: {from_animal:?}",
+    );
+}
+
+/// A multi-key condition hashref links EVERY column key, not just the first.
+/// Perl right-nests the tail pairs of `{ a => 1, b => 2, c => 3 }`; walking only
+/// the top-level children would see only `a`. (`cst::pair_nodes` flattens it.)
+#[test]
+fn dbic_multi_key_hashref_links_all_columns() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/dbic_multikey.pm");
+    let src = "package U;\nuse base 'DBIx::Class::Core';\n\
+        __PACKAGE__->add_columns(qw/alpha beta gamma/);\n\
+        sub go { my $self = shift; $self->search({ alpha => 1, beta => 2, gamma => 3 }); }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    // Rename the MIDDLE column `beta` — it must reach the search arg key (row 3).
+    let col = src.lines().nth(2).unwrap().find("beta").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()), &local_spans, &pinned_spans, &members, "X",
+    );
+    assert!(
+        edits.iter().any(|(l, _)| l.span.start.row == 3),
+        "the 2nd-key `beta` search arg must link to the column: {edits:?}",
+    );
+}
+
+/// A method dispatched through a scalar (`my $m='poke'; $self->$m()`) is a
+/// reference to the method but NOT a literal name — rename must skip it (else it
+/// rewrites the `$m` variable and corrupts the dispatch), while references lists
+/// it. Same rewritable split as folded handlers, now for callables.
+#[test]
+fn folded_method_dispatch_site_is_non_rewritable() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/folded_dispatch.pm");
+    let src = "package D;\nsub poke { my $self = shift; return 1; }\n\
+        sub run { my $self = shift; my $m = 'poke'; return $self->$m(); }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 1, column: 4 }, None)
+        .expect("sub poke resolves");
+    let ResolvedTarget::Target(t) = resolved else { panic!("expected a Target, got {resolved:?}") };
+    let refs = refs_to(&store, None, &t, RoleMask::EDITABLE);
+    // The `$self->$m()` site (row 2) is present but frozen; the decl is rewritable.
+    let lines: Vec<&str> = src.lines().collect();
+    let folded = refs.iter().find(|r| {
+        lines[r.span.start.row][r.span.start.column..r.span.end.column].starts_with("$m")
+    });
+    let folded = folded.expect("the folded $m dispatch site is a reference");
+    assert!(!folded.rewritable, "the folded dispatch site must NOT be rewritten: {folded:?}");
+    assert!(
+        refs.iter().any(|r| r.rewritable),
+        "the `sub poke` decl must still be rewritable: {refs:?}",
+    );
+}
+
 /// Over-reach guard: a class that defines its OWN `sub <verb>` (shadowing a
 /// DBIC column-keyed verb name) is NOT column-keyed — the call dispatches to the
 /// user's method, whose hash arg isn't columns. Renaming the column must not
@@ -3516,7 +3709,7 @@ fn dbic_column_rename_reaches_cross_file_consumer_arg_key() {
     );
 }
 
-/// Finding #1: event (Handler) rename. A literal event-name site is rewritable
+/// Event (Handler) rename. A literal event-name site is rewritable
 /// and its span is the **inside-the-quotes** name (so rename keeps the quotes);
 /// a folded site — variable (`my $e='connect'; on($e)`) OR constant
 /// (`use constant EVT=>'connect'; on(EVT)`) — whose span IS that other
@@ -3572,7 +3765,7 @@ fn test_event_handler_refs_mark_folded_site_non_rewritable() {
     );
 }
 
-/// Finding #4: a DBIC column's accessor (`$row->name`) and its key uses
+/// A DBIC column's accessor (`$row->name`) and its key uses
 /// (`search({name=>…})`, `$row->{name}`) are one renameable unit. The
 /// synthesized accessor Method + the same-span `Class`-owned column HashKeyDef
 /// form an attr group whose `HashKeyOfClass` member catches the key uses
@@ -3606,7 +3799,7 @@ fn test_dbic_column_accessor_and_key_form_one_group() {
     );
 }
 
-/// Finding #2 (reverse direction): a consumer-side cursor on a name-mapped
+/// Reverse direction: a consumer-side cursor on a name-mapped
 /// accessor (`$w->has_size`) OR an internal slot (`$w->{size}`) resolves to
 /// the same cross-file attr group as the decl — so rename from any spelling
 /// rewrites every spelling. Before, the slot fell to a plain

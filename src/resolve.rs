@@ -111,16 +111,14 @@ impl TargetRef {
         TargetRef { name, kind, method_classes: Vec::new(), scope: OverrideScope::default() }
     }
 
-    /// Which targets rename through `refs_to` (cross-file, owner/scope-
-    /// structural) rather than the single-file `rename_at` fallback —
-    /// references walks *every* kind cross-file; rename is being brought into
-    /// line one kind at a time (see `docs/rename-bidirectional-audit.md`).
-    /// `HashKeyOfSub` joined once producer↔consumer owner identity was unified
-    /// (enrichment stamps the consumer access with the producer's package, and
-    /// the consumer-side completion stub is gone — the producer's real def is
-    /// the single source). Still single-file: `HashKeyOfClass` (Moo slots need
-    /// the projection-group arm — finding #2) and `Handler` (event names need
-    /// rename-ready spans — their span includes the surrounding quotes today).
+    /// Whether this target renames cross-file through `refs_to` (matched by
+    /// owner/scope structure across the workspace) vs. the single-file
+    /// `rename_at` fallback. Per-feature policy lives on the target (rule #10),
+    /// not inline in a handler. The kinds here key on a workspace-stable owner
+    /// (a package, a class, a sub, a package global, a sub-owned hash key, a
+    /// handler owner), so name + owner pins them in any file; a lexical or an
+    /// owner-less hash key can't be matched by name alone elsewhere and stays
+    /// single-file. References ignores this — it walks every kind cross-file.
     pub fn supports_cross_file_rename(&self) -> bool {
         matches!(
             self.kind,
@@ -226,6 +224,69 @@ impl MemberRename {
     }
 }
 
+/// Resolve an attribute-group spelling on `start_class` to the group minted from
+/// the class that DECLARES the attr — walking up the inheritance chain when
+/// `start_class` only inherits it. A subclass use of an inherited attr
+/// (`$dog->name`, `Dog->new(name => …)`, `$dog->{name}` where `Dog` inherits
+/// `name` from `Animal`) thus reaches the base's full group; the `class_isa`-
+/// widened ctor-key/slot members + the override-family accessor then span the
+/// whole subtree. `require_reader` gates the method-call entry (only an
+/// accessor-bearing group claims a `$x->attr` cursor).
+fn attr_group_via_ancestors(
+    start_class: &str,
+    bare: &str,
+    origin: &FileAnalysis,
+    idx: &dyn CrossFileLookup,
+    require_reader: bool,
+    scope: OverrideScope,
+) -> Option<ResolvedTarget> {
+    let proj = |c: &str| -> Option<crate::file_analysis::FieldProjections> {
+        let ok = |p: &crate::file_analysis::FieldProjections| !require_reader || p.has_reader;
+        origin
+            .field_projections_named(bare, c)
+            .filter(ok)
+            .or_else(|| {
+                idx.get_cached(c)
+                    .and_then(|cc| cc.analysis.field_projections_named(bare, c))
+                    .filter(ok)
+            })
+    };
+    // A `has`/column group is SHARED storage: under Hierarchy mint from the
+    // ROOT-most declarer so the `class_isa`-widened ctor-key/slot members span
+    // the whole subtree (an overriding subclass and the base resolve to one
+    // family group, both directions); under Dispatch, the nearest. But a Corinna
+    // `field` is per-class PRIVATE storage — never widen it, mint from the
+    // nearest declarer so a subclass's field doesn't capture an ancestor's.
+    let mut defining: Option<String> = None;
+    let mut nearest_field_backed = false;
+    origin.for_each_ancestor_class(start_class, Some(idx), |c| {
+        if let Some(p) = proj(c) {
+            if defining.is_none() {
+                nearest_field_backed = p.field_backed;
+            }
+            defining = Some(c.to_string());
+            if nearest_field_backed || scope == OverrideScope::Dispatch {
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    let defining = defining?;
+    // Mint from the defining class's analysis (origin file if it's local, else
+    // the indexed module — its decl/variable spans pin to the class file).
+    if let Some(p) = origin.field_projections_named(bare, &defining) {
+        if !require_reader || p.has_reader {
+            return Some(group_from_projections(p, origin, None, Some(idx)));
+        }
+    }
+    let cached = idx.get_cached(&defining)?;
+    let p = cached.analysis.field_projections_named(bare, &defining)?;
+    if require_reader && !p.has_reader {
+        return None;
+    }
+    Some(group_from_projections(p, &cached.analysis, Some(cached.path.clone()), Some(idx)))
+}
+
 /// Cursor → cross-file target. The single entry point for "what does this
 /// position refer to" — both LSP handlers (references, rename) and their CLI
 /// mirrors route here, so target identity can never diverge between them.
@@ -253,6 +314,15 @@ pub fn resolve_symbol_scoped(
     // the answer is the whole group (rename and references stay in
     // lockstep with the in-file `rename_at`/`find_references` union).
     if let Some(p) = analysis.field_projections_at(point) {
+        // A cursor on an OVERRIDING subclass's own decl should resolve to the
+        // same family group as the base under Hierarchy — bridge to the
+        // root-most declaring ancestor (no-op for a non-overridden attr).
+        if let Some(idx) = module_index {
+            if let Some(g) = attr_group_via_ancestors(&p.class, &p.bare, analysis, idx, false, scope)
+            {
+                return Some(g);
+            }
+        }
         return Some(group_from_projections(p, analysis, None, module_index));
     }
     // Consumer-side: the class lives elsewhere. The owner edge the
@@ -282,39 +352,20 @@ pub fn resolve_symbol_scoped(
                     },
                 };
                 if let Some(class) = class {
-                    if let Some(cached) = idx.get_cached(&class) {
-                        if let Some(p) = cached
-                            .analysis
-                            .field_projections_named(&r.target_name, &class)
-                        {
-                            return Some(group_from_projections(
-                                p,
-                                &cached.analysis,
-                                Some(cached.path.clone()),
-                                module_index,
-                            ));
-                        }
+                    if let Some(g) =
+                        attr_group_via_ancestors(&class, &r.target_name, analysis, idx, false, scope)
+                    {
+                        return Some(g);
                     }
                 }
             }
             RefKind::MethodCall { .. } => {
                 let bare = r.unqualified_target_name().to_string();
                 if let Some(class) = analysis.method_call_invocant_class(r, module_index) {
-                    if let Some(cached) = idx.get_cached(&class) {
-                        if let Some(p) =
-                            cached.analysis.field_projections_named(&bare, &class)
-                        {
-                            // Only an accessor-bearing group may claim a
-                            // method-call cursor.
-                            if p.has_reader {
-                                return Some(group_from_projections(
-                                    p,
-                                    &cached.analysis,
-                                    Some(cached.path.clone()),
-                                    module_index,
-                                ));
-                            }
-                        }
+                    // Only an accessor-bearing group may claim a method-call
+                    // cursor (`require_reader`).
+                    if let Some(g) = attr_group_via_ancestors(&class, &bare, analysis, idx, true, scope) {
+                        return Some(g);
                     }
                 }
             }
@@ -454,13 +505,22 @@ fn group_from_projections(
 ) -> ResolvedTarget {
     let mut members = Vec::new();
     if p.has_reader {
+        // A Corinna `field`'s reader is per-class (private storage), so scope it
+        // precisely (Dispatch) — never fan to an ancestor's same-named reader,
+        // which would rewrite that class's own private field decl and corrupt
+        // it. A `has`/column accessor IS shared down the hierarchy → family.
+        let reader_scope = if p.field_backed {
+            OverrideScope::Dispatch
+        } else {
+            OverrideScope::Hierarchy
+        };
         members.push(GroupMember {
             target: TargetRef::method(
                 p.bare.clone(),
                 p.class.clone(),
                 class_analysis,
                 module_index,
-                OverrideScope::Hierarchy,
+                reader_scope,
             ),
             rename: MemberRename::Bare,
         });
@@ -831,17 +891,18 @@ fn method_classes_for(
 
 /// A dispatch name that is actually spelled by *another* identifier, so the
 /// token at `span` is not the literal name and rename must not rewrite it
-/// (references still resolve through the fold). Two folds produce this:
-/// a variable (`$obj->on($evt)` — a `Variable`/`ContainerAccess` ref covers the
-/// span) and a constant (`use constant EVT => 'x'; $obj->on(EVT)` — a
-/// `FunctionCall` ref to the constant covers it). A literal name
-/// (`on('connect')`) sits at its string-content span, which no such ref covers.
-fn span_is_folded_name(analysis: &FileAnalysis, span: Span) -> bool {
+/// (references still resolve through the fold). A variable fold
+/// (`$obj->on($evt)`, `$self->$m()` — a `Variable`/`ContainerAccess` ref covers
+/// the span) always counts. A const fold (`$obj->on(EVT)` — a `FunctionCall`
+/// ref to the constant covers it) counts only when `include_calls` — for a
+/// `Sub`/`Method` target a coinciding `FunctionCall` is the callable's OWN call
+/// site (which MUST rename), not a fold; only handlers fold through a call.
+/// A literal name (`on('connect')`) sits at its string-content span, uncovered.
+fn span_is_folded_name(analysis: &FileAnalysis, span: Span, include_calls: bool) -> bool {
     analysis.refs.iter().any(|r| {
-        matches!(
-            r.kind,
-            RefKind::Variable | RefKind::ContainerAccess | RefKind::FunctionCall { .. }
-        ) && r.span == span
+        (matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess)
+            || (include_calls && matches!(r.kind, RefKind::FunctionCall { .. })))
+            && r.span == span
     })
 }
 
@@ -1075,12 +1136,21 @@ fn collect_from_analysis(
     let mut rename_chain_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
-    // Only handler (event) names can be folded from another identifier
-    // (`$obj->on($evt)` / `on(EVT)`); for every other target kind the span is a
-    // literal name token, always rewritable. Gating the overlap scan to
-    // handlers keeps it off the hot path.
-    let is_handler = matches!(target.kind, TargetKind::Handler { .. });
-    let rewritable_at = |span: Span| !(is_handler && span_is_folded_name(analysis, span));
+    // A callable/handler name can be FOLDED from another identifier: a variable
+    // (`$obj->on($evt)`, `$self->$m()`) or, for handlers, a constant
+    // (`on(EVT)`). The folded site is a *reference* to that variable/constant,
+    // not a literal name token — rename must skip it (references still list it),
+    // or it rewrites the variable/constant and corrupts the dispatch. A
+    // `FunctionCall` coincidence is a const-fold for a handler but a Sub's OWN
+    // call site otherwise, so only handlers fold through calls. Other kinds
+    // (Variable/Package/HashKey) have literal-name spans — always rewritable.
+    let (foldable, folds_through_calls) = match target.kind {
+        TargetKind::Handler { .. } => (true, true),
+        TargetKind::Sub { .. } | TargetKind::Method { .. } => (true, false),
+        _ => (false, false),
+    };
+    let rewritable_at =
+        |span: Span| !(foldable && span_is_folded_name(analysis, span, folds_through_calls));
 
     // Include declaration spans when this file defines the target.
     for sym in &analysis.symbols {
@@ -1187,25 +1257,40 @@ fn collect_from_analysis(
             (
                 TargetKind::HashKeyOfSub { package, name },
                 RefKind::HashKeyAccess { owner, .. },
-            ) => match owner {
-                Some(HashKeyOwner::Sub { package: op, name: on }) => {
-                    op == package && on == name
+            ) => {
+                // The owning-sub match, widened across inheritance for
+                // CONSTRUCTOR keys: a base attr's ctor key
+                // (`HashKeyOfSub{Animal, new}`) is also keyed by a SUBCLASS
+                // construction (`Dog->new(name => …)`, owner `Sub{Dog, new}`),
+                // since `name` is the inherited attr. So renaming a base attr
+                // reaches child constructions.
+                let sub_matches = |op: &Option<String>, on: &str| -> bool {
+                    if on != name.as_str() {
+                        return false;
+                    }
+                    op == package
+                        || (crate::conventions::is_constructor_name(on)
+                            && match (op.as_deref(), package.as_deref()) {
+                                (Some(child), Some(base)) => {
+                                    analysis.class_isa(child, base, module_index)
+                                }
+                                _ => false,
+                            })
+                };
+                match owner {
+                    Some(HashKeyOwner::Sub { package: op, name: on }) => sub_matches(op, on),
+                    // owner `None` (build gate blind) OR `Variable` (the var is
+                    // bound to an imported call enrichment didn't reach in this
+                    // unenriched workspace file) — re-derive cross-file, the same
+                    // lazy seam method dispatch + deferred owners use above. This
+                    // is what makes a producer-origin rename reach the consumer's
+                    // `$c->{key}` access without depending on open-doc enrichment.
+                    _ => analysis
+                        .deferred_hash_key_owner(r, module_index)
+                        .is_some_and(|o| {
+                            matches!(o, HashKeyOwner::Sub { package: op, name: on } if sub_matches(&op, &on))
+                        }),
                 }
-                // owner `None` (build gate blind) OR `Variable` (the var is
-                // bound to an imported call enrichment didn't reach in this
-                // unenriched workspace file) — re-derive cross-file, the same
-                // lazy seam method dispatch + deferred owners use above. This
-                // is what makes a producer-origin rename reach the consumer's
-                // `$c->{key}` access without depending on open-doc enrichment.
-                _ => analysis
-                    .deferred_hash_key_owner(r, module_index)
-                    .is_some_and(|o| {
-                        matches!(
-                            o,
-                            HashKeyOwner::Sub { package: op, name: on }
-                                if op == *package && on == *name
-                        )
-                    }),
             },
             (TargetKind::HashKeyOfClass(wanted), RefKind::HashKeyAccess { owner, .. }) => {
                 // `Class(wanted)` is the canonical shape for "this

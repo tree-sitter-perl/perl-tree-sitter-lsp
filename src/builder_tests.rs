@@ -9994,6 +9994,32 @@ print \"v=$version\\n\";
 /// cursor-on-key resolves to the `has`-emitted HashKeyDef
 /// instead of the broad MethodCall ref. Gated on a matching
 /// HashKeyDef existing — emission would otherwise shadow the
+/// A QUOTED call-arg key (`{ "name", 2 }`) emits its `HashKeyAccess` at the
+/// string CONTENT span, not the whole literal — so rename keeps the quotes
+/// (rewriting them yields a bareword, a `strict subs` error in a comma list).
+#[test]
+fn quoted_call_arg_key_span_is_content_not_quotes() {
+    let src = "package R;\n\
+        use base 'DBIx::Class::Core';\n\
+        __PACKAGE__->add_columns(qw/name/);\n\
+        sub b { my $s = shift; $s->search({ \"name\", 2 }); }\n1;\n";
+    let fa = build_fa(src);
+    let r = fa
+        .refs
+        .iter()
+        .find(|r| {
+            r.target_name == "name"
+                && matches!(r.kind, RefKind::HashKeyAccess { .. })
+                && r.span.start.row == 3
+        })
+        .expect("quoted key emits a HashKeyAccess on row 3");
+    assert_eq!(
+        r.span.end.column - r.span.start.column,
+        4,
+        "span covers the 4-char content `name`, not the 6-char `\"name\"`: {r:?}",
+    );
+}
+
 /// `class Foo { field $x :param }` `find_param_field`
 /// fallback. e2e `rename: 'name' constructor arg` was the
 /// surfacing failure.

@@ -2531,6 +2531,10 @@ pub struct FieldProjections {
     /// arg keys (`Sub{class, verb}`-owned) — joins the group. Distinct from
     /// `has_internal` (STRICT `Class` match, Moo/bless internal slots).
     pub has_class_key: bool,
+    /// Backed by a Corinna `field $x` lexical (vs a `has`/column pair). Field
+    /// storage is per-class PRIVATE — not inherited — so the inheritance bridge
+    /// must NOT widen a field-backed group to an ancestor's same-named field.
+    pub field_backed: bool,
     /// Origin-file variable spellings (decl + body uses), bare-adjusted.
     pub variable_spans: Vec<Span>,
     /// Plugin-declared, name-mapped members (`predicate => has_size`).
@@ -5406,7 +5410,13 @@ impl FileAnalysis {
     /// (`method == attr`) is the identity case the caller already handles.
     fn attr_for_mapped_accessor(&self, method: &str, class: &str) -> Option<String> {
         self.attr_projections.iter().find_map(|a| match &a.kind {
-            AttrProjectionKind::Accessor { method: m, .. }
+            // Only a name that EMBEDS the attr (`has_size` for `size`, affix
+            // `Some`) reverse-maps to the attr group — renaming the attr
+            // re-derives it. A custom name that does NOT embed the attr
+            // (`predicate => 'is_ready'` for `size`, affix `None`) is an
+            // independent method: a cursor on it must rename IT, not the attr
+            // (else the click renames a different token), so it doesn't map back.
+            AttrProjectionKind::Accessor { method: m, affix: Some(_) }
                 if a.class == class && m == method && a.attr != method =>
             {
                 Some(a.attr.clone())
@@ -5908,6 +5918,7 @@ impl FileAnalysis {
             has_reader: g.has_reader,
             has_internal,
             has_class_key,
+            field_backed: g.field_sym.is_some(),
             variable_spans,
             mapped,
         }
@@ -6790,7 +6801,7 @@ impl FileAnalysis {
     /// closure for the origin). Proper-ancestor traversal is
     /// `walk(class, INHERITS)`. `SUPER::` — parents only, never self —
     /// is the bare `walk` (see `resolve_super_method`).
-    fn for_each_ancestor_class(
+    pub fn for_each_ancestor_class(
         &self,
         class_name: &str,
         module_index: Option<&dyn CrossFileLookup>,
@@ -6869,8 +6880,8 @@ impl FileAnalysis {
     /// (topmost ancestor defining the method) plus every class that inherits or
     /// overrides it. The membership set for `OverrideScope::Hierarchy` rename:
     /// renaming any member rewrites them all, so an override never silently
-    /// desyncs from its base (the standard IDE refactor;
-    /// docs/rename-bidirectional-audit.md #5). Gathered over PROVEN inheritance
+    /// desyncs from its base (the standard IDE refactor). Gathered over PROVEN
+    /// inheritance
     /// edges only (`@ISA`/`use parent`/Moo via `GraphView`), NEVER name matches
     /// — two unrelated classes both defining `sub render {}` with no edge
     /// between them are not a family.

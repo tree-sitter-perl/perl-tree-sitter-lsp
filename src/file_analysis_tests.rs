@@ -476,7 +476,7 @@ fn test_phase5_dynamic_method_call_via_constant_folding() {
 /// access owner with the PRODUCER's package — no consumer-side synthetic
 /// stub is materialized; the producer's real HashKeyDef is the single
 /// source. rename / references / goto-def all route cross-file through
-/// that owner edge. See `docs/rename-bidirectional-audit.md`.
+/// that owner edge.
 #[test]
 fn test_phase5_consumer_side_cross_file_resolves_via_enrichment() {
     use crate::module_index::ModuleIndex;
