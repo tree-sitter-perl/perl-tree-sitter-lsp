@@ -47,6 +47,12 @@ pub struct LangCfg {
     /// `(expr)`, `*p` (deref), `&obj` (address-of) all reach the operand's
     /// members (pointer-/reference-ness is dropped for member resolution).
     pub wrapper_kinds: &'static [&'static str],
+    /// Call-expression node kinds (cpp `call_expression`, python `call`) — a
+    /// chained-receiver `f().attr` types through the call's inner member.
+    /// Declared so the resolver never hard-codes ONE grammar's call kind.
+    pub call_kinds: &'static [&'static str],
+    /// Simple-variable node kinds (the receiver leaf that types directly).
+    pub simple_var_kinds: &'static [&'static str],
 }
 
 pub const CPP: LangCfg = LangCfg {
@@ -55,12 +61,16 @@ pub const CPP: LangCfg = LangCfg {
     skip_kinds: &["string_literal", "char_literal", "raw_string_literal", "comment"],
     // `(*p).m`, `(&o)->m`: paren wrap + `*`/`&` are `pointer_expression`.
     wrapper_kinds: &["parenthesized_expression", "pointer_expression"],
+    call_kinds: &["call_expression"],
+    simple_var_kinds: &["identifier"],
 };
 
 pub const PYTHON: LangCfg = LangCfg {
     member_kinds: &["attribute"],
     skip_kinds: &["string", "string_content", "comment", "concatenated_string"],
     wrapper_kinds: &["parenthesized_expression"],
+    call_kinds: &["call"],
+    simple_var_kinds: &["identifier"],
 };
 
 /// Per-language sentinel config by driver id. `None` = no member-access
@@ -312,7 +322,7 @@ pub fn member_completion_ctx_incremental(
     let member = climb_to_member(node, cfg)?;
     let receiver = member.named_child(0)?;
     let receiver_type = resolve_node_type(receiver, cfg, &patched, analysis, module_index);
-    let op_fix = operator_fix(member, receiver, &patched, analysis);
+    let op_fix = operator_fix(member, receiver, &patched, analysis, cfg);
     Some(MemberCompletionCtx { receiver_type, op_fix })
 }
 
@@ -325,8 +335,9 @@ fn operator_fix(
     receiver: Node,
     patched: &str,
     analysis: &FileAnalysis,
+    cfg: &LangCfg,
 ) -> Option<(Span, String)> {
-    if receiver.kind() != "identifier" {
+    if !cfg.simple_var_kinds.contains(&receiver.kind()) {
         return None; // only simple-variable receivers carry a resolvable stack
     }
     let name = receiver.utf8_text(patched.as_bytes()).ok()?;
@@ -364,7 +375,7 @@ fn resolve_node_type(
     // a method CALL `recv.method(...)` — the method's return on the
     // receiver's class, resolved through MethodOnClass (inheritance +
     // cross-file flow through the same chase, no special-casing).
-    if node.kind() == "call_expression" {
+    if cfg.call_kinds.contains(&node.kind()) {
         let func = node.child_by_field_name("function")?;
         if cfg.member_kinds.contains(&func.kind()) {
             let recv = func.named_child(0)?;

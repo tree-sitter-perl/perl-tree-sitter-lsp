@@ -4643,30 +4643,32 @@ impl FileAnalysis {
         }
     }
 
-    /// The declared type of data field `field` on `class` (or an ancestor)
-    /// — a member's type for pack-language member-access chains (`a.b.`).
-    /// Finds the field symbol (package == the class) and reads its bag type.
+    /// The declared type of data field `field` on `class` (or an ancestor) —
+    /// a member's type for pack-language member-access COMPLETION chains
+    /// (`a.b.`, cursor-time, where no ref exists yet). Resolves through the
+    /// shared `resolve_method_in_ancestors` walk and reads the type from the
+    /// field's OWNING analysis — so a cross-file field's type resolves, not
+    /// just a local one.
     pub fn field_type_on_class(
         &self,
         class: &str,
         field: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<InferredType> {
-        let mut found = None;
-        self.for_each_ancestor_class(class, module_index, |c| {
-            if let Some(sym) = self.symbols.iter().find(|s| {
-                matches!(s.kind, SymKind::Variable | SymKind::Field)
-                    && s.name == field
-                    && s.package.as_deref() == Some(c)
-            }) {
-                found = self.inferred_type_via_bag(field, sym.span.end);
-                if found.is_some() {
-                    return std::ops::ControlFlow::Break(());
-                }
+        match self.resolve_method_in_ancestors(class, field, module_index)? {
+            MethodResolution::Local { sym_id, .. } => {
+                self.inferred_type_via_bag(field, self.symbol(sym_id).span.end)
             }
-            std::ops::ControlFlow::Continue(())
-        });
-        found
+            MethodResolution::CrossFile { class, .. } => {
+                let cached = module_index?.get_cached(&class)?;
+                let sym = cached.analysis.symbols.iter().find(|s| {
+                    matches!(s.kind, SymKind::Variable | SymKind::Field)
+                        && s.name == field
+                        && s.package.as_deref() == Some(class.as_str())
+                })?;
+                cached.analysis.inferred_type_via_bag(field, sym.span.end)
+            }
+        }
     }
 
     /// Recursively collect methods from a class and its ancestors, deduping by name.

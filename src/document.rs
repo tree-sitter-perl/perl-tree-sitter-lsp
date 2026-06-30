@@ -86,22 +86,6 @@ impl Document {
         }
     }
 
-    /// Re-run the pack analysis from the current text (the deferred,
-    /// debounced half of `update_text_only`). Returns the freshly built
-    /// analysis so the caller can do the heavy work OFF the document lock
-    /// (clone text → build → `apply_rebuilt`), keeping completion/hover
-    /// non-blocking during the rebuild.
-    pub fn rebuild_analysis(&mut self) {
-        if self.language == "perl" {
-            return;
-        }
-        let reg = crate::language_driver::LanguageRegistry::with_enabled();
-        if let Some(driver) = reg.for_id(self.language) {
-            self.analysis = driver.analyze_with_path(&self.text, self.path.as_deref());
-            self.stable_outline.update(&self.analysis, &self.text);
-        }
-    }
-
     /// Write back an analysis built off-lock (from a text snapshot) +
     /// refresh the outline. Pairs with a `spawn_blocking` rebuild.
     pub fn apply_rebuilt(&mut self, analysis: crate::file_analysis::FileAnalysis) {
@@ -110,16 +94,13 @@ impl Document {
     }
 
     pub fn update(&mut self, new_text: String) {
-        // Pack languages: full reparse through the driver (no incremental
-        // edit path yet). The Perl branch below is untouched.
+        // Pack languages: full reparse + analyze through the driver (no
+        // incremental edit path yet). The reparse/text-swap is exactly
+        // `update_text_only`; this just isn't debounced. Perl falls through.
         if self.language != "perl" {
+            self.update_text_only(new_text);
             let reg = crate::language_driver::LanguageRegistry::with_enabled();
             if let Some(driver) = reg.for_id(self.language) {
-                let mut parser = driver.make_parser();
-                if let Some(tree) = parser.parse(&new_text, None) {
-                    self.tree = tree;
-                }
-                self.text = new_text;
                 self.analysis = driver.analyze_with_path(&self.text, self.path.as_deref());
                 self.stable_outline.update(&self.analysis, &self.text);
             }
