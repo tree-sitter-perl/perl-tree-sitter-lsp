@@ -427,26 +427,15 @@ pub struct LangPack {
     /// semantics → the pack owns it (NOT core `conventions.rs`, which is
     /// Perl's `$self`/`$class`).
     pub receiver_names: &'static [&'static str],
-    /// Declarator node kinds that nest into a pointer/reference stack, each
-    /// mapped to the deref it contributes. A `@nested.target` capture on such
-    /// a chain is unravelled generically by `peel_nested` — the pack supplies
-    /// the grammar, core supplies the walk. Empty = no nesting (the capture
-    /// is then simply absent from the pack's query).
-    pub nested_peel: &'static [(&'static str, crate::file_analysis::DerefKind)],
-    /// Leaf node kinds a `nested_peel` chain bottoms out at, each mapped to
-    /// the `def.*` capture the synthetic leaf event mints — `identifier`→
-    /// `def.local`, `field_identifier`→`def.var` (so a pointer field still
-    /// outlines as a class member).
-    pub nested_leaves: &'static [(&'static str, &'static str)],
-    /// Per-level annotation node kinds collected onto each `DerefStep`
-    /// (`type_qualifier` → `const`/`volatile`/`restrict`). Generic so new
-    /// qualifiers + const-correctness diagnostics needn't touch core.
-    pub nested_annot_kinds: &'static [&'static str],
-    /// Transparent expression wrappers a member-access RECEIVER peels through
-    /// to its typed inner (`(*p)`, `(&o)`, `(p)` → `p`): pointer-/ref-ness is
-    /// dropped, so the invocant types via the inner's span. The build-time
-    /// twin of the cursor-completion peel.
-    pub recv_wrapper_kinds: &'static [&'static str],
+    /// The pointer/reference DECLARATOR peel: a `@nested.target` chain
+    /// flattened to its leaf + per-level deref stack — `Box**`, `char****`,
+    /// `Box* const&`. THE recursion S-queries can't express (unbounded depth);
+    /// the pack declares the grammar, the generic `peel` walks it.
+    pub nested_peel: PeelSpec,
+    /// The member-access RECEIVER peel: transparent expression wrappers
+    /// (`(*p)`, `(&o)`, `(p)` → `p`) dropped so the invocant types via the
+    /// inner. The SAME `peel`, no stack, any leaf.
+    pub recv_peel: PeelSpec,
     /// Member-access node kinds (`receiver OP member`) — extraction records
     /// each site (simple-variable receiver, operator token span, `->` vs
     /// `.`) for the operator-DX consumer (`p.` on a `Box*` should be `->`).
@@ -454,6 +443,27 @@ pub struct LangPack {
     /// child between the two named children. Empty = no member-access DX
     /// (Perl, and packs whose member access isn't operator-correctable).
     pub member_kinds: &'static [&'static str],
+}
+
+/// A declarative peel: descend a wrapper chain tree-sitter's fixed-depth
+/// S-expression queries cannot express, to the leaf, optionally accumulating a
+/// per-level deref stack. ONE combinator the pack parameterizes — `nested_peel`
+/// (declarators, stack, leaf→def) and `recv_peel` (expr wrappers, no stack, any
+/// leaf) are both instances of it. Empty `wrappers` = the capture is absent.
+#[derive(Clone, Copy)]
+pub struct PeelSpec {
+    /// Wrapper node kinds → the `DerefKind` each contributes (only consulted
+    /// when `record_stack`; a placeholder otherwise).
+    pub wrappers: &'static [(&'static str, crate::file_analysis::DerefKind)],
+    /// Per-level annotation node kinds (cv-qualifiers) collected onto a step.
+    pub annot_kinds: &'static [&'static str],
+    /// Leaf node kind → the `def.*` capture the synthetic leaf event mints
+    /// (`identifier`→`def.local`, `field_identifier`→`def.var`). EMPTY = accept
+    /// ANY leaf and mint no def (the receiver-peel case — the leaf is an
+    /// invocant, not a declaration).
+    pub leaf_to_def: &'static [(&'static str, &'static str)],
+    /// Accumulate the per-level `DerefStep` stack (pointer depth) vs descend only.
+    pub record_stack: bool,
 }
 
 /// One effect of a command-dispatched statement.
@@ -494,10 +504,8 @@ pub fn perl_pack() -> LangPack {
         narrow_guard: |_, _| None,
         trigger_chars: &["$", "@", "%", ">", ":", "{"],
         receiver_names: &[],
-        nested_peel: &[],
-        nested_leaves: &[],
-        nested_annot_kinds: &[],
-        recv_wrapper_kinds: &[],
+        nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
+        recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         member_kinds: &[],
     }
 }
@@ -535,10 +543,8 @@ pub fn python_pack() -> LangPack {
         narrow_guard: |guard, ty| (guard == "isinstance").then(|| InferredType::ClassName(ty.to_string())),
         trigger_chars: &["."],
         receiver_names: &["self", "cls"],
-        nested_peel: &[],
-        nested_leaves: &[],
-        nested_annot_kinds: &[],
-        recv_wrapper_kinds: &[],
+        nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
+        recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         member_kinds: &[],
     }
 }
@@ -565,10 +571,8 @@ pub fn r_pack() -> LangPack {
         narrow_guard: |_, _| None,
         trigger_chars: &["$", "@", ":"],
         receiver_names: &[],
-        nested_peel: &[],
-        nested_leaves: &[],
-        nested_annot_kinds: &[],
-        recv_wrapper_kinds: &[],
+        nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
+        recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         member_kinds: &[],
     }
 }
@@ -608,10 +612,8 @@ pub fn cmake_pack() -> LangPack {
         narrow_guard: |_, _| None,
         trigger_chars: &["{", "("],
         receiver_names: &[],
-        nested_peel: &[],
-        nested_leaves: &[],
-        nested_annot_kinds: &[],
-        recv_wrapper_kinds: &[],
+        nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
+        recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         member_kinds: &[],
     }
 }
@@ -675,13 +677,25 @@ pub fn cpp_pack() -> LangPack {
         narrow_guard: |_, _| None,
         trigger_chars: &[".", ">", ":"],
         receiver_names: &["this"],
-        nested_peel: &[
-            ("pointer_declarator", crate::file_analysis::DerefKind::Pointer),
-            ("reference_declarator", crate::file_analysis::DerefKind::Reference),
-        ],
-        nested_leaves: &[("identifier", "def.local"), ("field_identifier", "def.var")],
-        nested_annot_kinds: &["type_qualifier"],
-        recv_wrapper_kinds: &["parenthesized_expression", "pointer_expression"],
+        nested_peel: PeelSpec {
+            wrappers: &[
+                ("pointer_declarator", crate::file_analysis::DerefKind::Pointer),
+                ("reference_declarator", crate::file_analysis::DerefKind::Reference),
+            ],
+            annot_kinds: &["type_qualifier"],
+            leaf_to_def: &[("identifier", "def.local"), ("field_identifier", "def.var")],
+            record_stack: true,
+        },
+        // DerefKind placeholder — record_stack false, so it's never read.
+        recv_peel: PeelSpec {
+            wrappers: &[
+                ("parenthesized_expression", crate::file_analysis::DerefKind::Pointer),
+                ("pointer_expression", crate::file_analysis::DerefKind::Pointer),
+            ],
+            annot_kinds: &[],
+            leaf_to_def: &[],
+            record_stack: false,
+        },
         // `box.m` and `box->m` both parse as field_expression — the one
         // member-access shape, operator distinguished by the inner token.
         member_kinds: &["field_expression"],
@@ -716,63 +730,50 @@ struct Event {
     match_id: usize,
 }
 
-/// Peel transparent expression wrappers (`(*p)`, `(&o)`, `(p)`) off a
-/// member-access receiver to its typed inner. Pointer-/reference-ness is
-/// dropped for navigation, so the inner's type IS the receiver's. The pack
-/// declares `recv_wrapper_kinds`; core descends the first named child while
-/// the kind matches. Depth-capped against a pathological tree.
-fn peel_recv<'a>(mut node: tree_sitter::Node<'a>, pack: &LangPack) -> tree_sitter::Node<'a> {
-    for _ in 0..32 {
-        if !pack.recv_wrapper_kinds.contains(&node.kind()) {
-            break;
-        }
-        match node.named_child(0) {
-            Some(inner) => node = inner,
-            None => break,
-        }
-    }
-    node
-}
-
-/// Unravel a pointer/reference declarator chain (the `@nested.target`
-/// capture) to its leaf identifier + the per-level deref stack. The pack
-/// declares which node kinds nest (`nested_peel`), which kind is the leaf
-/// (`nested_leaves`), and which kinds are per-level annotations
-/// (`nested_annot_kinds`, e.g. `type_qualifier`) — core walks generically,
-/// branching on no grammar name of its own. Outermost level first, which is
-/// also left-to-right display order after the base type (`Box*&` →
-/// `[Pointer, Reference]`). Depth-capped against a pathological tree.
-fn peel_nested<'a>(
+/// Flatten a wrapper chain — the recursion tree-sitter's fixed-depth queries
+/// cannot express — to its leaf, recording a `DerefStep` per level when
+/// `spec.record_stack`. A non-empty `leaf_to_def` REQUIRES the leaf to match
+/// (returns its def capture); an empty one accepts ANY leaf and mints nothing
+/// (the receiver peel — the leaf is an invocant). Outermost level first
+/// (left-to-right display order, `Box*&` → `[Pointer, Reference]`). Depth-
+/// capped. The ONE peel: `nested_peel` and `recv_peel` are both this.
+fn peel<'a>(
     mut node: tree_sitter::Node<'a>,
-    pack: &LangPack,
+    spec: &PeelSpec,
     src: &[u8],
-) -> Option<(tree_sitter::Node<'a>, Vec<crate::file_analysis::DerefStep>, &'static str)> {
+) -> Option<(tree_sitter::Node<'a>, Vec<crate::file_analysis::DerefStep>, Option<&'static str>)> {
     use crate::file_analysis::DerefStep;
-    let is_leaf = |k: &str| pack.nested_leaves.iter().find(|(lk, _)| *lk == k);
+    let is_leaf = |k: &str| spec.leaf_to_def.iter().find(|(lk, _)| *lk == k);
     let mut stack = Vec::new();
     for _ in 0..32 {
-        if let Some((_, kind)) = pack.nested_peel.iter().find(|(k, _)| *k == node.kind()) {
+        if let Some((_, dk)) = spec.wrappers.iter().find(|(k, _)| *k == node.kind()) {
             let mut annotations = Vec::new();
             let mut inner = None;
             let mut cur = node.walk();
             for ch in node.children(&mut cur) {
-                if pack.nested_annot_kinds.contains(&ch.kind()) {
+                if spec.annot_kinds.contains(&ch.kind()) {
                     if let Ok(t) = ch.utf8_text(src) {
                         annotations.push(t.to_string());
                     }
-                } else if pack.nested_peel.iter().any(|(k, _)| *k == ch.kind())
-                    || is_leaf(ch.kind()).is_some()
+                } else if inner.is_none()
+                    && (spec.wrappers.iter().any(|(k, _)| *k == ch.kind())
+                        || is_leaf(ch.kind()).is_some()
+                        || (spec.leaf_to_def.is_empty() && ch.is_named()))
                 {
                     inner = Some(ch);
                 }
             }
-            stack.push(DerefStep { kind: *kind, annotations });
+            if spec.record_stack {
+                stack.push(DerefStep { kind: *dk, annotations });
+            }
             node = inner?;
+        } else if spec.leaf_to_def.is_empty() {
+            // receiver peel: the leaf is an invocant of any shape, no def minted.
+            return Some((node, stack, None));
         } else if let Some((_, def_cap)) = is_leaf(node.kind()) {
-            // The leaf kind decides the symbol the synthetic event mints —
             // `identifier`→`def.local` (param/local), `field_identifier`→
-            // `def.var` (a class member), so fields outline as members.
-            return Some((node, stack, def_cap));
+            // `def.var` (a class member), so a pointer field outlines as a member.
+            return Some((node, stack, Some(def_cap)));
         } else {
             return None;
         }
@@ -809,7 +810,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             // captured it directly — downstream join/symbol/witness paths are
             // unchanged, and arbitrary nesting works without enumerating it.
             if cap == "nested.target" {
-                if let Some((leaf, stack, def_cap)) = peel_nested(node, pack, source) {
+                if let Some((leaf, stack, Some(def_cap))) = peel(node, &pack.nested_peel, source) {
                     nested_stacks.insert(match_counter, stack);
                     let ltext = leaf.utf8_text(source).unwrap_or("").to_string();
                     for syn in ["flow.target", def_cap] {
@@ -831,7 +832,9 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             // node is live, so the minted MethodCall ref's invocant_span lands
             // on the inner expression `expr_type_at_span` already types.
             if cap == "member.recv" {
-                let inner = peel_recv(node, pack);
+                let inner = peel(node, &pack.recv_peel, source)
+                    .map(|(leaf, _, _)| leaf)
+                    .unwrap_or(node);
                 events.push(Event {
                     start_byte: inner.start_byte(),
                     end_byte: inner.end_byte(),

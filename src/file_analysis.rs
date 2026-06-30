@@ -485,7 +485,7 @@ impl DerefStep {
 /// (`Box**` = `[Pointer, Pointer]`) wants `(*pp)->`, an expression WRAP not
 /// a token swap, so it has no `MemberOp` — `expected_member_op` returns
 /// `None` there and consumers leave the access untouched (show-only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemberOp {
     Dot,
     Arrow,
