@@ -57,6 +57,12 @@ pub fn make_engine() -> Engine {
         let owner = HashKeyOwner::Class(class);
         to_dynamic(owner).unwrap_or(Dynamic::UNIT)
     });
+    // A plugin-owned column (DBIC / Class::Accessor) — distinct from `Class` so
+    // a `$row->{col}` deref never reaches it (see `HashKeyOwner::Bridged`).
+    engine.register_fn("owner_bridged", |class: String| {
+        let owner = HashKeyOwner::Bridged { class };
+        to_dynamic(owner).unwrap_or(Dynamic::UNIT)
+    });
 
     // `InferredType` convenience constructors — scripts can say
     // `type_class("Foo")` instead of nesting enum variants manually.
@@ -182,6 +188,7 @@ pub struct RhaiPlugin {
     app_surface_consumers: Vec<String>,
     role_makers: Vec<String>,
     column_keyed_verbs: Vec<String>,
+    fluent_verbs: Vec<String>,
     arg_name_verbs: Vec<String>,
     topic_route_dsl: Option<crate::plugin::TopicRouteDsl>,
     engine: Arc<Engine>,
@@ -391,6 +398,27 @@ impl RhaiPlugin {
             }
         }
 
+        // `fluent_verbs()` — verbs whose call type follows the invocant; same
+        // optional, fail-safe array-of-strings shape.
+        let mut fluent_verbs: Vec<String> = Vec::new();
+        if signatures.iter().any(|n| n == "fluent_verbs") {
+            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "fluent_verbs", ()) {
+                Ok(arr) => {
+                    for d in arr {
+                        match from_dynamic::<String>(&d) {
+                            Ok(s) => fluent_verbs.push(s),
+                            Err(e) => log::error!(
+                                "plugin `{}` fluent_verbs() bad entry: {}",
+                                id,
+                                e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => log::error!("plugin `{}` fluent_verbs() failed: {}", id, e),
+            }
+        }
+
         // `arg_name_verbs()` — call verbs wanting flat-arg-name
         // extraction; same optional, fail-safe array-of-strings shape.
         let mut arg_name_verbs: Vec<String> = Vec::new();
@@ -442,6 +470,7 @@ impl RhaiPlugin {
             app_surface_consumers,
             role_makers,
             column_keyed_verbs,
+            fluent_verbs,
             arg_name_verbs,
             topic_route_dsl,
             engine,
@@ -544,6 +573,10 @@ impl FrameworkPlugin for RhaiPlugin {
 
     fn column_keyed_verbs(&self) -> &[String] {
         &self.column_keyed_verbs
+    }
+
+    fn fluent_verbs(&self) -> &[String] {
+        &self.fluent_verbs
     }
 
     fn arg_name_verbs(&self) -> &[String] {

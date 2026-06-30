@@ -11196,22 +11196,36 @@ impl<'a> Builder<'a> {
     /// (variable, computed) means the row class is dynamic and
     /// we don't claim.
     fn extract_resultset_parametric(&self, node: Node<'a>) -> Option<InferredType> {
+        use crate::file_analysis::ParametricType;
         if node.kind() != "method_call_expression" {
             return None;
         }
         let method = node.child_by_field_name("method")?;
-        if method.utf8_text(self.source).ok() != Some("resultset") {
+        let mtext = method.utf8_text(self.source).ok()?;
+        // `recv->resultset('Foo')` — row class from the string arg.
+        if mtext == "resultset" {
+            let args = node.child_by_field_name("arguments")?;
+            let row_class = self.first_string_or_constfold_arg(args)?;
+            let base = self
+                .discover_resultset_class(&row_class)
+                .unwrap_or_else(|| "DBIx::Class::ResultSet".to_string());
+            return Some(InferredType::Parametric(ParametricType::ResultSet { base, row: row_class }));
+        }
+        // A plugin-declared fluent verb (`$rs->search`): the call returns the
+        // invocant's type UNCHANGED, so it only fires on an actual resultset.
+        // DBIC has no `Class->search` — search/find live on the resultset, which
+        // only comes from `$schema->resultset('X')` (typed above); a Result class
+        // or row invocant gets no typing. The verb list is the plugin's (#10/#8).
+        if self.plugins.fluent_verbs().any(|v| v == mtext) {
+            let invocant = node.child_by_field_name("invocant")?;
+            if let Some(ty @ InferredType::Parametric(ParametricType::ResultSet { .. })) =
+                self.invocant_type_at_node(invocant)
+            {
+                return Some(ty);
+            }
             return None;
         }
-        let args = node.child_by_field_name("arguments")?;
-        let row_class = self.first_string_or_constfold_arg(args)?;
-        let base = self
-            .discover_resultset_class(&row_class)
-            .unwrap_or_else(|| "DBIx::Class::ResultSet".to_string());
-        Some(InferredType::Parametric(crate::file_analysis::ParametricType::ResultSet {
-            base,
-            row: row_class,
-        }))
+        None
     }
 
     /// Push `ReturnExpr` declarations on `MethodOnClass{base, m}`
@@ -11691,7 +11705,7 @@ impl<'a> Builder<'a> {
                         HashKeyOwner::Sub { package: Some(c), .. } => c.clone(),
                         _ => continue,
                     };
-                    let col = HashKeyOwner::Class(class);
+                    let col = HashKeyOwner::Bridged { class };
                     if self.has_hash_key_def(&key, &col) {
                         Some(col)
                     } else if self.has_hash_key_def(&key, sub_owner) {

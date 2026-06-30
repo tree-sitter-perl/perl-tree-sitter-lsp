@@ -985,7 +985,7 @@ impl ParametricType {
             ParametricType::ResultSet { row, .. } => match method {
                 "search" | "search_rs" | "find" | "find_or_new" | "find_or_create"
                 | "update_or_create" | "create" | "update" | "populate" | "new_result" => {
-                    Some(HashKeyOwner::Class(row.clone()))
+                    Some(HashKeyOwner::Bridged { class: row.clone() })
                 }
                 _ => None,
             },
@@ -1692,6 +1692,16 @@ impl<T> ReceiverGated<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HashKeyOwner {
     Class(String),
+    /// A plugin-owned COLUMN namespace bridged to a class (DBIC /
+    /// `Class::Accessor`): a named field addressable in query-condition args
+    /// (`$rs->search({ col => … })`) and via its accessor (`$row->col`), but
+    /// NOT a literal hash slot of the object — `$row->{col}` is undef in DBIC
+    /// (columns live behind `_column_data`). Deliberately distinct from
+    /// `Class` (real instance hash keys: Moo `InternalKey` slots, bless keys),
+    /// so a generic `$obj->{key}` deref (a `Class` lookup) never reaches a
+    /// column. Rule #8: plugin-synthesized content lives in its own namespace,
+    /// not masquerading as the class's own keys.
+    Bridged { class: String },
     Variable { name: String, def_scope: ScopeId },
     /// Hash keys from a sub's return value: `sub get_config { return { host => 1 } }`.
     /// `package` is the enclosing Perl package at the sub's declaration site
@@ -5434,17 +5444,30 @@ impl FileAnalysis {
                 _ => return None,
             },
         };
-        // The owner names the class two ways: a constructor key
-        // (`Sub{class, new}` — `Foo->new(size => …)`) or an internal slot
-        // (`Class(class)` — `$self->{size}` / `$obj->{size}`). Both are
-        // spellings of the same attr; resolve each to the one group.
+        // The owner names the class: a constructor key (`Sub{class,new}` —
+        // `Foo->new(size => …)`), a bridged condition-arg (`Bridged` — DBIC
+        // `search({col})`), or an internal slot (`Class` — `$self->{size}`).
+        // A `Class`-owner deref reaches the attr ONLY if it's a real internal
+        // slot (Moo/bless `InternalKey`); a bridged column isn't a hash slot, so
+        // `$row->{col}` (a `Class` lookup) resolves to nothing here.
         let class = match &owner {
             HashKeyOwner::Sub { package: Some(c), name }
                 if crate::conventions::is_constructor_name(name) =>
             {
                 c.clone()
             }
-            HashKeyOwner::Class(c) => c.clone(),
+            HashKeyOwner::Bridged { class: c } => c.clone(),
+            HashKeyOwner::Class(c) => {
+                let has_internal = self.attr_projections.iter().any(|a| {
+                    a.class == *c
+                        && a.attr == key
+                        && matches!(a.kind, AttrProjectionKind::InternalKey)
+                });
+                if !has_internal {
+                    return None;
+                }
+                c.clone()
+            }
             _ => return None,
         };
         self.attr_group_for(&key, &class)
@@ -5539,7 +5562,7 @@ impl FileAnalysis {
                 && s.selection_span == accessor.selection_span
                 && matches!(
                     &s.detail,
-                    SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(c), .. } if c == class
+                    SymbolDetail::HashKeyDef { owner: HashKeyOwner::Bridged { class: c }, .. } if c == class
                 )
         });
         if !paired {
@@ -5801,7 +5824,7 @@ impl FileAnalysis {
                                 .is_some_and(|p| p.has_class_key)
                     });
                     if is_column {
-                        return Some(HashKeyOwner::Class(class));
+                        return Some(HashKeyOwner::Bridged { class });
                     }
                 }
             }
@@ -5948,15 +5971,17 @@ impl FileAnalysis {
                 && a.attr == g.bare
                 && matches!(a.kind, AttrProjectionKind::InternalKey)
         });
-        // A `Class`-owned HashKeyDef for this attr (DBIC column / Class::Accessor)
-        // — its key uses (`$row->{attr}`, `search({attr=>…})`) are reached
-        // `found_by`-style, so the group needs a `HashKeyOfClass` member.
+        // A `Column`-owned HashKeyDef for this attr (DBIC column / Class::Accessor)
+        // — its key uses are the condition args (`search({attr=>…})`), reached via
+        // the `Column` owner; the group needs a `HashKeyOfClass` member for them.
+        // NOT `$row->{attr}` derefs — a column isn't a hash slot (that's why it's
+        // `Column`, not `Class`), so a deref never joins.
         let has_class_key = self.symbols.iter().any(|s| {
             matches!(s.kind, SymKind::HashKeyDef)
                 && s.name == g.bare
                 && matches!(
                     &s.detail,
-                    SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(c), .. } if *c == g.class
+                    SymbolDetail::HashKeyDef { owner: HashKeyOwner::Bridged { class: c }, .. } if *c == g.class
                 )
         });
         FieldProjections {
@@ -8411,6 +8436,9 @@ impl FileAnalysis {
 
             let detail = match owner {
                 HashKeyOwner::Class(name) => format!("{}->{{{}}}", name, def.name),
+                // A column is reached via its accessor / condition args, not a
+                // hash deref — show the accessor form.
+                HashKeyOwner::Bridged { class } => format!("{}->{}", class, def.name),
                 HashKeyOwner::Variable { name, .. } => format!("{}{{{}}}", name, def.name),
                 HashKeyOwner::Sub { name, .. } => format!("{}()->{{{}}}", name, def.name),
             };
@@ -9013,7 +9041,9 @@ impl FileAnalysis {
                             return Some(owner.clone());
                         }
                     }
-                    HashKeyOwner::Class(_) | HashKeyOwner::Sub { .. } => {}
+                    HashKeyOwner::Class(_)
+                    | HashKeyOwner::Bridged { .. }
+                    | HashKeyOwner::Sub { .. } => {}
                 }
             }
         }

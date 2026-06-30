@@ -238,10 +238,13 @@ fn attr_group_via_ancestors(
     origin: &FileAnalysis,
     idx: &dyn CrossFileLookup,
     require_reader: bool,
+    require_internal: bool,
     scope: OverrideScope,
 ) -> Option<ResolvedTarget> {
     let proj = |c: &str| -> Option<crate::file_analysis::FieldProjections> {
-        let ok = |p: &crate::file_analysis::FieldProjections| !require_reader || p.has_reader;
+        let ok = |p: &crate::file_analysis::FieldProjections| {
+            (!require_reader || p.has_reader) && (!require_internal || p.has_internal)
+        };
         origin
             .field_projections_named(bare, c)
             .filter(ok)
@@ -274,14 +277,17 @@ fn attr_group_via_ancestors(
     let defining = defining?;
     // Mint from the defining class's analysis (origin file if it's local, else
     // the indexed module — its decl/variable spans pin to the class file).
+    let ok = |p: &crate::file_analysis::FieldProjections| {
+        (!require_reader || p.has_reader) && (!require_internal || p.has_internal)
+    };
     if let Some(p) = origin.field_projections_named(bare, &defining) {
-        if !require_reader || p.has_reader {
+        if ok(&p) {
             return Some(group_from_projections(p, origin, None, Some(idx)));
         }
     }
     let cached = idx.get_cached(&defining)?;
     let p = cached.analysis.field_projections_named(bare, &defining)?;
-    if require_reader && !p.has_reader {
+    if !ok(&p) {
         return None;
     }
     Some(group_from_projections(p, &cached.analysis, Some(cached.path.clone()), Some(idx)))
@@ -318,7 +324,8 @@ pub fn resolve_symbol_scoped(
         // same family group as the base under Hierarchy — bridge to the
         // root-most declaring ancestor (no-op for a non-overridden attr).
         if let Some(idx) = module_index {
-            if let Some(g) = attr_group_via_ancestors(&p.class, &p.bare, analysis, idx, false, scope)
+            if let Some(g) =
+                attr_group_via_ancestors(&p.class, &p.bare, analysis, idx, false, false, scope)
             {
                 return Some(g);
             }
@@ -335,26 +342,31 @@ pub fn resolve_symbol_scoped(
         use crate::file_analysis::HashKeyOwner;
         match &r.kind {
             RefKind::HashKeyAccess { owner, .. } => {
-                // The owning class lives elsewhere; reach it so a consumer-side
-                // cursor on `$obj->{attr}` (internal slot, `Class` owner) or a
-                // deferred constructor key (`owner: None`) resolves to the same
-                // projection group the class file mints.
-                let class = match owner {
-                    Some(HashKeyOwner::Class(c)) => Some(c.clone()),
+                // Reach the owning class's group from a consumer-side cursor. The
+                // `bool` is `require_internal`: a `$obj->{attr}` deref carries a
+                // generic `Class` lookup and is a real reference ONLY to an
+                // internal-slot attr (Moo/bless `InternalKey`) — a bridged key
+                // (DBIC column) isn't a hash slot, so a deref onto one resolves to
+                // nothing. A bridged condition-arg (`search({col})`) resolves to
+                // the column group with no slot requirement.
+                let target: Option<(String, bool)> = match owner {
+                    Some(HashKeyOwner::Bridged { class: c }) => Some((c.clone(), false)),
+                    Some(HashKeyOwner::Class(c)) => Some((c.clone(), true)),
                     _ => match analysis.deferred_hash_key_owner(r, module_index) {
                         Some(HashKeyOwner::Sub { package: Some(c), name })
                             if crate::conventions::is_constructor_name(&name) =>
                         {
-                            Some(c)
+                            Some((c, false))
                         }
-                        Some(HashKeyOwner::Class(c)) => Some(c),
+                        Some(HashKeyOwner::Bridged { class: c }) => Some((c, false)),
+                        Some(HashKeyOwner::Class(c)) => Some((c, true)),
                         _ => None,
                     },
                 };
-                if let Some(class) = class {
-                    if let Some(g) =
-                        attr_group_via_ancestors(&class, &r.target_name, analysis, idx, false, scope)
-                    {
+                if let Some((class, require_internal)) = target {
+                    if let Some(g) = attr_group_via_ancestors(
+                        &class, &r.target_name, analysis, idx, false, require_internal, scope,
+                    ) {
                         return Some(g);
                     }
                 }
@@ -364,7 +376,9 @@ pub fn resolve_symbol_scoped(
                 if let Some(class) = analysis.method_call_invocant_class(r, module_index) {
                     // Only an accessor-bearing group may claim a method-call
                     // cursor (`require_reader`).
-                    if let Some(g) = attr_group_via_ancestors(&class, &bare, analysis, idx, true, scope) {
+                    if let Some(g) =
+                        attr_group_via_ancestors(&class, &bare, analysis, idx, true, false, scope)
+                    {
                         return Some(g);
                     }
                 }
@@ -409,12 +423,16 @@ pub fn resolve_symbol_scoped(
             Some(HashKeyOwner::Sub { package, name: sub_name }) => ResolvedTarget::Target(
                 TargetRef::new(name, TargetKind::HashKeyOfSub { package, name: sub_name }),
             ),
-            Some(HashKeyOwner::Class(class)) => {
-                ResolvedTarget::Target(TargetRef::new(name, TargetKind::HashKeyOfClass(class)))
+            // A bridged key (DBIC column condition-arg / accessor): the fallback
+            // when no field-group path caught it (e.g. single-file, no index).
+            Some(HashKeyOwner::Bridged { class }) => {
+                ResolvedTarget::Target(TargetRef::new(name, TargetKind::HashKeyOfBridged(class)))
             }
-            // Variable-owned (a lexical `my %h` key) or unresolved — single-file
-            // by definition; the `Local` `rename_at`/`find_references` path
-            // collects the `my %h` key's accesses + literal def in-scope.
+            // `Class` here is a `$obj->{key}` deref onto a real hash slot. If a
+            // field group (Moo/bless `InternalKey`) didn't already claim it, it's
+            // a plain deref — single-file. A bridged key is NEVER a `Class` owner,
+            // so a deref can't reach one. Variable-owned (lexical `my %h`) and
+            // unresolved fall here too; the `Local` path handles all three.
             _ => ResolvedTarget::Local,
         },
         kind => ResolvedTarget::Target(
@@ -451,7 +469,7 @@ pub enum TargetKind {
     /// matches `HashKeyOwner::Sub { package, name }` by structural equality.
     HashKeyOfSub { package: Option<String>, name: String },
     /// A hash key owned by a class (Moo `has` slots, DBIC columns on a Result class).
-    HashKeyOfClass(String),
+    HashKeyOfBridged(String),
     /// An attr's internal hash slot (`$self->{attr}` — or any
     /// `$obj->{attr}` poke; Perl culture is promiscuous about reaching
     /// into the hashref). STRICT `HashKeyOwner::Class` matching, never
@@ -549,13 +567,13 @@ fn group_from_projections(
         });
     }
     if p.has_class_key {
-        // `Class`-backed attr (DBIC column): a `HashKeyOfClass` member catches
-        // every `attr`-named key use `found_by`-style — direct deref plus
-        // search/find/update arg keys owned `Sub{class, verb}`.
+        // `Bridged`-backed attr (DBIC column): a `HashKeyOfBridged` member catches
+        // the column's condition-arg keys (`search`/`find`/`update`), owned by the
+        // `Bridged` namespace — NOT a `$row->{col}` deref (a column isn't a slot).
         members.push(GroupMember {
             target: TargetRef::new(
                 p.bare.clone(),
-                TargetKind::HashKeyOfClass(p.class.clone()),
+                TargetKind::HashKeyOfBridged(p.class.clone()),
             ),
             rename: MemberRename::Bare,
         });
@@ -967,9 +985,9 @@ fn symbol_defines_target(sym: &crate::file_analysis::Symbol, target: &TargetRef)
                 ..
             } if op == package && on == name
         ),
-        TargetKind::HashKeyOfClass(wanted) => matches!(
+        TargetKind::HashKeyOfBridged(wanted) => matches!(
             &sym.detail,
-            SymbolDetail::HashKeyDef { owner: HashKeyOwner::Class(n), .. } if n == wanted
+            SymbolDetail::HashKeyDef { owner: HashKeyOwner::Bridged { class: n }, .. } if n == wanted
         ),
         // The slot's def is the group decl (the Method/HashKeyDef pair
         // already collect it) — internal-key members contribute access
@@ -1294,23 +1312,15 @@ fn collect_from_analysis(
                         }),
                 }
             },
-            (TargetKind::HashKeyOfClass(wanted), RefKind::HashKeyAccess { owner, .. }) => {
-                // `Class(wanted)` is the canonical shape for "this
-                // class's keys"; a `Sub { package: wanted, .. }`-
-                // owned access (constructor / search-arg /
-                // accessor) is *also* a hash-key access against
-                // `wanted`. Use `found_by` to admit both — same
-                // rule the in-file `hash_key_defs_for_owner`
-                // dispatcher uses, so cross-file `refs_to` and
-                // local find_definition agree on the set.
-                let target_owner = HashKeyOwner::Class(wanted.clone());
+            (TargetKind::HashKeyOfBridged(wanted), RefKind::HashKeyAccess { owner, .. }) => {
+                // A DBIC/Class::Accessor column. Its key uses are the
+                // condition args (`$rs->search({ col => … })`), owned by the
+                // `Column` namespace — NOT `$row->{col}` derefs, which carry a
+                // `Class` lookup and so never match here (a column isn't a hash
+                // slot). The owner-`None` case is the cross-file deferred arg key.
+                let target_owner = HashKeyOwner::Bridged { class: wanted.clone() };
                 match owner {
                     Some(o) => o.found_by(&target_owner),
-                    // owner `None` — a deferred column-keyed arg key in an
-                    // unenriched consumer (`$rs->search({ col => … })` with the
-                    // class cross-file). Re-derive cross-file, the same lazy seam
-                    // the `HashKeyOfSub` arm above uses, so a column rename
-                    // reaches consumer arg keys without open-doc enrichment.
                     None => analysis
                         .deferred_hash_key_owner(r, module_index)
                         .is_some_and(|o| o.found_by(&target_owner)),

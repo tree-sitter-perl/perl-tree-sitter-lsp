@@ -2874,6 +2874,17 @@ pub fn collect_diagnostics(
     // skips reassigned/escaped vars (the trust-gate stand-in for the
     // unmodeled lattice widenings — docs/adr/structural-shapes.md).
     // HINT severity, per the quiet-by-design diagnostics convention.
+    //
+    // TODO(dbic-row-deref): warn on `$row->{col}` where `$row` is typed to a
+    // DBIC Result class and `col` is one of its `Bridged` columns — a column
+    // isn't a hash slot, so the deref is `undef` (the user meant `$row->name`).
+    // The detection is here: invocant type → class → `field_projections_named`
+    // has a bridged column for the key. GATE on NOT being a HashRefInflator row:
+    // `$rs->result_class('DBIx::Class::ResultClass::HashRefInflator')` (or the
+    // `{ result_class => … }` search attr) makes `find`/`search` return plain
+    // hashrefs where `$row->{col}` IS valid — we don't track that result-class
+    // override yet, so emitting the warning now would false-positive on it.
+    // Needs that machinery first.
     use crate::file_analysis::InferredType;
     for r in &analysis.refs {
         let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };

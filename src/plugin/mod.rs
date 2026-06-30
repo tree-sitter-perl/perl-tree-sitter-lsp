@@ -938,6 +938,15 @@ pub trait FrameworkPlugin: Send + Sync {
         &[]
     }
 
+    /// Fluent verbs — a call that returns the invocant's type unchanged (DBIC
+    /// `search`/`search_rs` on a resultset → a same-row resultset). Only fires on
+    /// an actual resultset invocant; the chain composes through the existing
+    /// `RowOf`/`find` projections (`$rs->find` → row → `$row->col`). The plugin
+    /// owns its verb list. Default empty.
+    fn fluent_verbs(&self) -> &[String] {
+        &[]
+    }
+
     /// A topic-scoped route DSL this plugin owns (the
     /// Mojolicious::Lite shape): file-level route verbs whose implicit
     /// base a [`EmitAction::SetRouteBase`] emission sets and a scope
@@ -1268,6 +1277,13 @@ impl PluginRegistry {
         self.plugins
             .iter()
             .flat_map(|p| p.column_keyed_verbs().iter().map(|s| s.as_str()))
+    }
+
+    /// Union of fluent verbs (call type follows the invocant) across the registry.
+    pub fn fluent_verbs<'a>(&'a self) -> impl Iterator<Item = &'a str> + 'a {
+        self.plugins
+            .iter()
+            .flat_map(|p| p.fluent_verbs().iter().map(|s| s.as_str()))
     }
 
     /// Fold a constraint constructor → its inner type, asking the plugin(s)

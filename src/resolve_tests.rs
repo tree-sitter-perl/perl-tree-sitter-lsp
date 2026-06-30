@@ -2796,11 +2796,11 @@ sub bump { my ($self) = @_; $self->{count}++; my $local = 1; return $local }
     );
 }
 
-/// An owned hash key resolves to a cross-file HashKeyOfClass target —
+/// An owned hash key resolves to a cross-file HashKeyOfBridged target —
 /// A Moo internal slot (`$self->{size}`) is one spelling of the `size` attr,
 /// so it resolves to the attr's projection Group — the same group its `has`
 /// decl, ctor key, reader, and mapped accessors resolve to. It
-/// is NOT a plain `HashKeyOfClass` rename: that would miss the accessor /
+/// is NOT a plain `HashKeyOfBridged` rename: that would miss the accessor /
 /// ctor-key sites the group carries. The group walks cross-file via
 /// `group_rename_edits`.
 #[test]
@@ -3392,6 +3392,87 @@ fn dbic_column_rename_multiarg_search_excludes_attrs_hash() {
     );
 }
 
+/// Fluent-verb chain off the VALID DBIC entry: `my $rs = $schema->resultset('User')`
+/// types `$rs` to a `ResultSet<User>`; `$rs->search({col})` carries it (fluent),
+/// `$rs->find({col})` joins the column key, and `my $u = $rs->find; $u->col`
+/// (find→row→accessor through `RowOf`) does too. Renaming a column rewrites the
+/// whole chain. `Class->search` is NOT valid DBIC (search lives on the resultset,
+/// which only comes from the schema) and is deliberately not typed.
+#[test]
+fn dbic_column_rename_reaches_fluent_resultset_chain() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/dbic_fluent.pm");
+    let src = "package User;\nuse base 'DBIx::Class::Core';\n\
+        __PACKAGE__->add_columns(qw/id name/);\n\
+        sub go { my ($self, $schema) = @_; my $rs = $schema->resultset('User'); my $f = $rs->search({ name => 1 }); my $u = $rs->find({ name => 2 }); return $u->name; }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    let col = src.lines().nth(2).unwrap().find("name").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()), &local_spans, &pinned_spans, &members, "RENAMED",
+    );
+    let lines: Vec<&str> = src.lines().collect();
+    for (l, _) in &edits {
+        let s = &lines[l.span.start.row][l.span.start.column..l.span.end.column];
+        assert_eq!(s, "name", "every edit hits a `name` token: {edits:?}");
+    }
+    // Row 3: the `search` arg key, the `$rs->find` arg key, AND the `$u->name`
+    // accessor — all three resultset-chain sites join the column.
+    assert!(
+        edits.iter().filter(|(l, _)| l.span.start.row == 3).count() >= 3,
+        "search arg + $rs->find arg + $u->name accessor all join: {edits:?}",
+    );
+}
+
+/// A DBIC column is a `Bridged` key, not a hash slot. Renaming the column from
+/// any spelling rewrites the accessor + the condition-arg keys but NEVER a
+/// `$row->{col}` deref (undef in DBIC). And a cursor ON the deref doesn't resolve
+/// to the column group — it's not a column reference at all.
+#[test]
+fn dbic_column_rename_excludes_row_hashref_deref() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/dbic_deref.pm");
+    let src = "package User;\n\
+use base 'DBIx::Class::Core';\n\
+__PACKAGE__->add_columns(qw/id name/);\n\
+sub go {\n\
+    my ($self, $schema) = @_;\n\
+    my $rs = $schema->resultset('User');\n\
+    my $row = $rs->find({ name => 1 });\n\
+    my $bad = $row->{name};\n\
+    return $row->name;\n\
+}\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    let col = src.lines().nth(2).unwrap().find("name").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()), &local_spans, &pinned_spans, &members, "X",
+    );
+    let rows: std::collections::BTreeSet<usize> = edits.iter().map(|(l, _)| l.span.start.row).collect();
+    // def (2), find-condition arg (6), accessor (8) — NOT the `$row->{name}`
+    // deref (7): a column isn't a hash slot.
+    assert_eq!(rows, [2, 6, 8].into_iter().collect(), "deref row 7 excluded: {edits:?}");
+    // A cursor on the `$row->{name}` deref is NOT the column group.
+    let deref_col = src.lines().nth(7).unwrap().find("name").unwrap();
+    assert!(
+        !matches!(
+            resolve_symbol(&fa, tree_sitter::Point { row: 7, column: deref_col }, None),
+            Some(ResolvedTarget::Group { .. })
+        ),
+        "cursor on the $row->{{name}} deref must not resolve to the column",
+    );
+}
+
 /// A Moo `has name` attribute's group includes the cross-file CONSTRUCTOR-arg
 /// key (`Widget->new(name => …)`), owned `Sub{class,new}` — so renaming the
 /// attribute reaches the ctor key, and a cursor on the ctor key renames the
@@ -3768,10 +3849,10 @@ fn test_event_handler_refs_mark_folded_site_non_rewritable() {
 /// A DBIC column's accessor (`$row->name`) and its key uses
 /// (`search({name=>…})`, `$row->{name}`) are one renameable unit. The
 /// synthesized accessor Method + the same-span `Class`-owned column HashKeyDef
-/// form an attr group whose `HashKeyOfClass` member catches the key uses
+/// form an attr group whose `HashKeyOfBridged` member catches the key uses
 /// (`found_by` reaches the `Sub{class, verb}`-owned search args), so rename
 /// from either face rewrites both. Before, accessor → `Method` and column key
-/// → `HashKeyOfClass` were disjoint.
+/// → `HashKeyOfBridged` were disjoint.
 #[test]
 fn test_dbic_column_accessor_and_key_form_one_group() {
     let fa = parse(
@@ -3793,8 +3874,8 @@ fn test_dbic_column_accessor_and_key_form_one_group() {
         members,
     );
     assert!(
-        members.iter().any(|m| matches!(m.target.kind, TargetKind::HashKeyOfClass(_))),
-        "group carries the HashKeyOfClass member (search/deref keys): {:?}",
+        members.iter().any(|m| matches!(m.target.kind, TargetKind::HashKeyOfBridged(_))),
+        "group carries the HashKeyOfBridged member (search/deref keys): {:?}",
         members,
     );
 }
@@ -3803,7 +3884,7 @@ fn test_dbic_column_accessor_and_key_form_one_group() {
 /// accessor (`$w->has_size`) OR an internal slot (`$w->{size}`) resolves to
 /// the same cross-file attr group as the decl — so rename from any spelling
 /// rewrites every spelling. Before, the slot fell to a plain
-/// `HashKeyOfClass` (single-file, missed the accessors) and the mapped
+/// `HashKeyOfBridged` (single-file, missed the accessors) and the mapped
 /// accessor only matched itself + the decl.
 #[test]
 fn test_consumer_mapped_accessor_and_slot_resolve_to_attr_group_cross_file() {
