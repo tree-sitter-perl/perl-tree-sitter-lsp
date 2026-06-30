@@ -595,10 +595,11 @@ impl LanguageServer for Backend {
         let point = symbols::position_to_point(params.position);
         // Only offer a rename box where `rename` would actually produce edits.
         // Accepting on any `symbol_at`/`ref_at` hit is a UX trap: positions like
-        // `@_`, a lexical hash key, or an ownerless constructor key resolve to
-        // nothing renameable, so the user gets a box that silently no-ops. Mirror
-        // the rename handler's branching, probing the single-file path for the
-        // kinds it routes there.
+        // `@_` or an ownerless constructor key resolve to nothing renameable, so
+        // the user gets a box that silently no-ops. Mirror the rename handler's
+        // branching, probing the single-file `rename_at` for the kinds it routes
+        // there — which is why this gate tracks new single-file renameables (a
+        // lexical hash key) automatically, with no change here.
         let renameable = match resolve_symbol_scoped(
             &doc.analysis,
             point,

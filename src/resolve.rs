@@ -412,7 +412,9 @@ pub fn resolve_symbol_scoped(
             Some(HashKeyOwner::Class(class)) => {
                 ResolvedTarget::Target(TargetRef::new(name, TargetKind::HashKeyOfClass(class)))
             }
-            // Lexical-variable-owned or unresolved — scope-local by definition.
+            // Variable-owned (a lexical `my %h` key) or unresolved — single-file
+            // by definition; the `Local` `rename_at`/`find_references` path
+            // collects the `my %h` key's accesses + literal def in-scope.
             _ => ResolvedTarget::Local,
         },
         kind => ResolvedTarget::Target(
