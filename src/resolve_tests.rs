@@ -4071,3 +4071,19 @@ fn test_implementations_of_role_requires_fans_out_to_composers() {
     let pkg_target = TargetRef::new("My::Role".to_string(), TargetKind::Package);
     assert!(implementations_of(&origin, Some(&idx), &pkg_target).is_empty());
 }
+
+/// `initializationOptions.rename` deserializes via the `RenameOptions` serde
+/// schema (the struct IS the schema) — the LSP path no longer hand-parses the
+/// `overrideScope` string. Absent key → default Hierarchy; a bad value is an
+/// `Err` the handler swallows, leaving the default in place.
+#[test]
+fn rename_options_deserialize_from_init_json() {
+    use crate::resolve::{OverrideScope, RenameOptions};
+    let scope = |v: serde_json::Value| {
+        serde_json::from_value::<RenameOptions>(v).map(|r| r.override_scope)
+    };
+    assert_eq!(scope(serde_json::json!({"overrideScope": "dispatch"})).unwrap(), OverrideScope::Dispatch);
+    assert_eq!(scope(serde_json::json!({"overrideScope": "hierarchy"})).unwrap(), OverrideScope::Hierarchy);
+    assert_eq!(scope(serde_json::json!({})).unwrap(), OverrideScope::Hierarchy);
+    assert!(scope(serde_json::json!({"overrideScope": "bogus"})).is_err());
+}

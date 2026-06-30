@@ -42,7 +42,8 @@ bitflags::bitflags! {
 /// * `Dispatch` — precise: only the cursor's own definition + the call sites
 ///   that dispatch to *that* definition (incl. `SUPER::` calls targeting it),
 ///   leaving sibling overrides untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OverrideScope {
     #[default]
     Hierarchy,
@@ -50,14 +51,24 @@ pub enum OverrideScope {
 }
 
 impl OverrideScope {
-    /// Parse the `initializationOptions.rename.overrideScope` string; anything
-    /// unrecognized (or absent) is the default `Hierarchy`.
+    /// Parse the override-scope string for the CLI (`--rename … <scope>`);
+    /// anything unrecognized (or absent) is the default `Hierarchy`. The LSP
+    /// path deserializes `RenameOptions` straight from JSON instead.
     pub fn from_option(s: &str) -> Self {
         match s {
             "dispatch" => OverrideScope::Dispatch,
             _ => OverrideScope::Hierarchy,
         }
     }
+}
+
+/// `initializationOptions.rename` — the rename sub-object as a serde schema (the
+/// struct IS the schema: camelCase keys, absent ones default). Mirrors
+/// `symbols::DiagnosticOptions`; a malformed value leaves the defaults in place.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RenameOptions {
+    pub override_scope: OverrideScope,
 }
 
 /// Identifies what we're collecting references to.

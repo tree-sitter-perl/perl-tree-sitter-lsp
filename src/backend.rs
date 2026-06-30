@@ -20,10 +20,10 @@ pub struct Backend {
     /// so readers lock only to copy it out — never across an await. All
     /// default off; the always-on hints ignore these.
     diag_options: Arc<std::sync::Mutex<symbols::DiagnosticOptions>>,
-    /// `initializationOptions.rename.overrideScope`: when set to `"dispatch"`,
-    /// method-override references/rename use the precise dispatch scope instead
-    /// of the default whole-hierarchy family. Set once at init.
-    dispatch_override: Arc<std::sync::atomic::AtomicBool>,
+    /// `initializationOptions.rename` options (the serde `RenameOptions` schema,
+    /// same pattern as `diag_options`). `overrideScope = "dispatch"` picks the
+    /// precise method-override scope; default is the whole-hierarchy family.
+    rename_options: Arc<std::sync::Mutex<crate::resolve::RenameOptions>>,
 }
 
 impl Backend {
@@ -33,11 +33,7 @@ impl Backend {
 
     /// The configured method-override fan-out scope for references + rename.
     fn override_scope(&self) -> crate::resolve::OverrideScope {
-        if self.dispatch_override.load(std::sync::atomic::Ordering::Relaxed) {
-            crate::resolve::OverrideScope::Dispatch
-        } else {
-            crate::resolve::OverrideScope::Hierarchy
-        }
+        self.rename_options.lock().unwrap().override_scope
     }
 }
 
@@ -94,7 +90,7 @@ impl Backend {
             client,
             files,
             diag_options,
-            dispatch_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rename_options: Arc::new(std::sync::Mutex::new(crate::resolve::RenameOptions::default())),
         }
     }
 
@@ -260,18 +256,19 @@ impl LanguageServer for Backend {
                 *self.diag_options.lock().unwrap() = parsed;
             }
         }
-        // `{ "rename": { "overrideScope": "dispatch" } }` opts into the precise
-        // method-override scope; absent / "hierarchy" = the default whole-family
-        // refactor. (Separate from `diagnostics` — a rename concern.)
-        if let Some(opts) = &params.initialization_options {
-            let dispatch = opts
-                .get("rename")
-                .and_then(|r| r.get("overrideScope"))
-                .and_then(|v| v.as_str())
-                .map(|s| matches!(crate::resolve::OverrideScope::from_option(s), crate::resolve::OverrideScope::Dispatch))
-                .unwrap_or(false);
-            self.dispatch_override
-                .store(dispatch, std::sync::atomic::Ordering::Relaxed);
+        // The `rename` sub-object deserializes into `RenameOptions` the same way
+        // (`{ "rename": { "overrideScope": "dispatch" } }`); absent / malformed
+        // leaves the default whole-hierarchy scope.
+        if let Some(rename) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("rename"))
+        {
+            if let Ok(parsed) =
+                serde_json::from_value::<crate::resolve::RenameOptions>(rename.clone())
+            {
+                *self.rename_options.lock().unwrap() = parsed;
+            }
         }
 
         Ok(InitializeResult {

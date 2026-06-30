@@ -219,13 +219,25 @@ Editor-agnostic settings, passed to the server via LSP `initializationOptions`
 | Option | Default | Description |
 |--------|---------|-------------|
 | `rename.overrideScope` | `"hierarchy"` | How a method that participates in an inheritance hierarchy is scoped for rename (and the references that share its resolution). `"hierarchy"` is the standard IDE refactor: rename the whole override family — the base declaration, every override, and all call sites that dispatch into it. `"dispatch"` is the precise mode: rename only the cursor's own definition plus the call sites that dispatch to *that* definition (including `SUPER::` calls that target it), leaving sibling overrides untouched. Scope is gathered over proven `@ISA`/`use parent`/role edges, never name matches. |
-| `diagnostics.unresolvedDispatch` | `false` | Enables the `unresolved-dispatch` diagnostic — flags string-dispatched calls (Mojo events, etc.) whose handler can't be resolved. A QA / plugin-author channel; off by default. |
+| `diagnostics.unresolvedDispatch` | `false` | Enables the `unresolved-dispatch` diagnostic — flags string-dispatched calls (Mojo events, etc.) whose handler can't be resolved. A QA / plugin-author channel. |
+| `diagnostics.optionalDeref` | `false` | `optional-deref` (D2) — a method/key/index deref on a receiver that's `Optional<T>` at an unguarded point (the strictNullChecks analog). Comes with a guard-insertion quick-fix. "May be undef", so opt-in. |
+| `diagnostics.redundantGuard` | `false` | `redundant-guard` / `contradictory-guard` (D3/D4) — a `defined`/`isa` guard whose outcome is constant given the subject's already-known type. Needs confident prior types + MRO relatedness, so it earns trust before default-on. |
+| `diagnostics.derefShape` | `false` | `deref-shape-mismatch` (D6) — a deref whose form demands one container rep while a `ref … eq` guard proved another (`$x->{k}` on an array/code ref, etc.) — a guaranteed runtime die. Guard-narrowed reps only. |
+| `diagnostics.unresolvedMethodCrossFile` | `false` | Extends `unresolved-method` (D8) past locally-defined classes to any cross-file-resolvable class with a complete ancestor chain. Cross-file classes carry codegen/XS methods the static walker can't see, so it's opt-in. |
+
+The provably-`undef` deref lint (D1) is always on — it's a definite bug, not a
+lint that needs trust. All the toggles above default off; flip them per project
+as each earns its keep. (CLI batch mode mirrors them as `--optional-deref` etc.,
+see `--help`.)
 
 Example (Neovim `lspconfig`):
 
 ```lua
 require('lspconfig').perl_lsp.setup({
-  init_options = { rename = { overrideScope = 'dispatch' } },
+  init_options = {
+    rename = { overrideScope = 'dispatch' },
+    diagnostics = { optionalDeref = true, derefShape = true },
+  },
 })
 ```
 
