@@ -4848,6 +4848,13 @@ impl FileAnalysis {
         if let Some(g) = self.field_group_at(point) {
             return self.field_group_spans(&g);
         }
+        // A lexical hash key (`my %opts = (k => …); $opts{k}`): every same-key
+        // access on the same `my %h` — keyed by the variable's `def_scope`, so a
+        // shadowing `%h` in an inner block stays its own set — is one renameable
+        // unit, single-file (no owner reaches another file).
+        if let Some(spans) = self.lexical_hash_key_refs(point) {
+            return spans;
+        }
         if let Some((target_id, include_decl)) = self.resolve_target_at(point, module_index) {
             let mut results = self.collect_refs_for_target(target_id, include_decl, module_index);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
@@ -4856,6 +4863,47 @@ impl FileAnalysis {
         } else {
             Vec::new()
         }
+    }
+
+    /// Spans of a lexical hash key under the cursor — every `$h{key}` access
+    /// (read or write) on the same `my %h`, plus the literal key in the
+    /// declaration. `None` when the cursor isn't on a `Variable`-owned hash key.
+    /// Matched on the owner's `def_scope` (the `%h` declaration) so an unrelated
+    /// or shadowing same-named hash never bleeds in. Single-file by nature — a
+    /// `my` lexical is unreachable from another file.
+    fn lexical_hash_key_refs(&self, point: Point) -> Option<Vec<Span>> {
+        let r = self.ref_at(point)?;
+        if !matches!(r.kind, RefKind::HashKeyAccess { .. }) {
+            return None;
+        }
+        let HashKeyOwner::Variable { name: var, def_scope } = self.hash_key_owner_at(point)? else {
+            return None;
+        };
+        // The owner identifies the variable by (bare name, def_scope): the
+        // sigil-stripped name distinguishes two hashes declared in the SAME
+        // scope (`my %a` vs `my %b`), and `def_scope` distinguishes a shadowing
+        // `%h` in an inner block. Key + that pair pins exactly this hash's key.
+        let bare = |n: &str| n.trim_start_matches(['$', '@', '%']).to_string();
+        let want = bare(&var);
+        let key = r.target_name.as_str();
+        let mut spans: Vec<Span> = self
+            .refs
+            .iter()
+            .filter(|o| {
+                o.target_name == key
+                    && matches!(
+                        &o.kind,
+                        RefKind::HashKeyAccess {
+                            owner: Some(HashKeyOwner::Variable { name: on, def_scope: ds }),
+                            ..
+                        } if *ds == def_scope && bare(on) == want
+                    )
+            })
+            .map(|o| o.span)
+            .collect();
+        spans.sort_by_key(|s| (s.start.row, s.start.column));
+        spans.dedup();
+        Some(spans)
     }
 
     /// Document highlights: like references but with read/write annotation.

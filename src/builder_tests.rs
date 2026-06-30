@@ -9994,6 +9994,35 @@ print \"v=$version\\n\";
 /// cursor-on-key resolves to the `has`-emitted HashKeyDef
 /// instead of the broad MethodCall ref. Gated on a matching
 /// HashKeyDef existing — emission would otherwise shadow the
+/// A lexical hash key (`my %h = (k => …); $h{k}`) is one renameable unit: the
+/// literal def, every `$h{k}` access AND write rewrite together — single-file,
+/// scoped to the `%h` declaration. A different hash's same-named key (`%other`,
+/// or a shadowing `%h`) is NOT touched.
+#[test]
+fn lexical_hash_key_renames_literal_and_accesses_in_scope() {
+    let fa = build_fa(
+        "my %opts = (timeout => 30, retries => 3);\n\
+         my %other = (timeout => 9);\n\
+         my $t = $opts{timeout};\n\
+         $opts{timeout} = 60;\n\
+         print $other{timeout};\n",
+    );
+    // Cursor on the `$opts{timeout}` access (row 2).
+    let col = "my $t = $opts{".len();
+    let edits = fa.rename_at(tree_sitter::Point { row: 2, column: col }, "DELAY").expect("renameable");
+    let rows: std::collections::BTreeSet<usize> = edits.iter().map(|(s, _)| s.start.row).collect();
+    // %opts literal (0), access (2), write (3) — NOT %opts's `retries`, NOT %other (1, 4).
+    assert_eq!(
+        rows,
+        [0, 2, 3].into_iter().collect(),
+        "literal + access + write of %opts.timeout only: {edits:?}",
+    );
+    assert!(
+        edits.iter().all(|(_, t)| t == "DELAY"),
+        "every edit writes the new key name",
+    );
+}
+
 /// A QUOTED call-arg key (`{ "name", 2 }`) emits its `HashKeyAccess` at the
 /// string CONTENT span, not the whole literal — so rename keeps the quotes
 /// (rewriting them yields a bareword, a `strict subs` error in a comma list).

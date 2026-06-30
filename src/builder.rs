@@ -4680,6 +4680,30 @@ impl<'a> Builder<'a> {
                 AccessKind::Declaration,
             );
 
+            // `my %h = (k => v, …)`: emit the literal keys as hash-key accesses
+            // on the variable, so a lexical hash-key rename rewrites the def too
+            // — not just the `$h{k}` accesses (else the hash would still define
+            // the old key and the renamed reads would miss).
+            // `child_by_field_name("right")` returns the `(` token here, so find
+            // the RHS by named child instead (the non-`left` list/hash).
+            if sigil == '%' {
+                if let Some(rhs) = node.parent().filter(|p| p.kind() == "assignment_expression").and_then(|p| {
+                    (0..p.named_child_count())
+                        .filter_map(|i| p.named_child(i))
+                        .find(|c| {
+                            c.id() != node.id()
+                                && matches!(
+                                    c.kind(),
+                                    "list_expression"
+                                        | "anonymous_hash_expression"
+                                        | "parenthesized_expression"
+                                )
+                        })
+                }) {
+                    self.emit_lexical_hash_literal_keys(name, rhs);
+                }
+            }
+
             // Synthesize accessor methods for `field $x :reader` / `:writer`
             if decl_kind == DeclKind::Field {
                 let bare_name = &name[1..]; // strip sigil
@@ -11561,6 +11585,39 @@ impl<'a> Builder<'a> {
     /// Foo { field $x :param }` — Point->new(x => 3, …) needs the
     /// MethodCall ref's `find_param_field` fallback in
     /// `find_definition`).
+    /// Emit `HashKeyAccess` refs for the keys of a `my %h = (k => …)` literal,
+    /// keyed by the hash variable (`var_text = %h`, `owner: None`). The post-walk
+    /// owner fixup resolves them to `Variable{%h, def_scope}` — the same owner
+    /// the `$h{k}` accesses get — so they group with the accesses for rename.
+    fn emit_lexical_hash_literal_keys(&mut self, hash_name: &str, rhs: Node<'a>) {
+        for (key_node, _value) in crate::cst::pair_nodes(rhs) {
+            if !matches!(
+                key_node.kind(),
+                "bareword" | "autoquoted_bareword" | "string_literal" | "interpolated_string_literal"
+            ) {
+                continue;
+            }
+            let Some((key, is_dynamic)) = self.extract_key_text(key_node) else { continue };
+            if is_dynamic {
+                continue;
+            }
+            let span = if matches!(key_node.kind(), "string_literal" | "interpolated_string_literal") {
+                self.string_content_span(key_node)
+            } else {
+                node_to_span(key_node)
+            };
+            self.refs.push(Ref {
+                kind: RefKind::HashKeyAccess { var_text: hash_name.to_string(), owner: None },
+                span,
+                scope: self.scope_at_point(span.start),
+                target_name: key,
+                access: AccessKind::Write,
+                resolves_to: None,
+                resolved_method_target: None,
+            });
+        }
+    }
+
     fn emit_call_arg_key_accesses(&mut self, args_node: Node<'a>, gate: Gate) {
         // Unwrap one level into a hash literal / paren wrapper —
         // search's `{KEY=>...}` is `anonymous_hash_expression`
