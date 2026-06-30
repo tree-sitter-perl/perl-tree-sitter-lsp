@@ -7,16 +7,22 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_perl-lsp");
 
-fn run_heatmap(root: &std::path::Path) -> serde_json::Value {
+fn run_heatmap_raw(root: &std::path::Path, extra: &[&str]) -> String {
     let mut cache = root.to_path_buf();
     cache.push(".test-cache");
+    let mut args = vec!["--heatmap", root.to_str().unwrap()];
+    args.extend_from_slice(extra);
     let out = Command::new(BIN)
-        .args(["--heatmap", root.to_str().unwrap()])
+        .args(&args)
         .current_dir(root)
         .env("XDG_CACHE_HOME", &cache)
         .output()
         .expect("run perl-lsp --heatmap");
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    String::from_utf8(out.stdout).expect("utf8 stdout")
+}
+
+fn run_heatmap(root: &std::path::Path) -> serde_json::Value {
+    let stdout = run_heatmap_raw(root, &[]);
     serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("heatmap JSON parse ({e}): {stdout}"))
 }
@@ -98,6 +104,50 @@ fn fan_in_counts_and_unreferenced_subs_flagged() {
         .map(|d| d["name"].as_str().unwrap())
         .collect();
     assert_eq!(dead, vec!["orphan_helper"], "exactly one dead candidate");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn html_view_is_self_contained_and_embeds_the_report() {
+    let dir = std::env::temp_dir().join(format!("perl-lsp-heatmap-html-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("script.pl"),
+        "sub used { return 1; }\n\
+         sub orphan_helper { return 42; }\n\
+         used();\n",
+    )
+    .unwrap();
+
+    let html = run_heatmap_raw(&dir, &["--html"]);
+    assert!(html.starts_with("<!DOCTYPE html>"), "must be an HTML document");
+
+    // Self-contained: no remote assets to fetch. (`http://www.w3.org/2000/svg`
+    // appears as the SVG createElementNS namespace — that is not a fetch.)
+    for needle in ["<link", "src=\"http", "href=\"http", "@import", "url(http"] {
+        assert!(!html.contains(needle), "viewer must not reference external asset ({needle})");
+    }
+
+    // The same report rides inside the page as embedded JSON, and the data
+    // blob never closes the script element early.
+    let open = "<script id=\"report\" type=\"application/json\">";
+    let start = html.find(open).expect("embedded report script") + open.len();
+    let end = start + html[start..].find("</script>").expect("report script close");
+    let blob = &html[start..end];
+    assert!(!blob.contains("</script"), "data must not break out of the script tag");
+    let report: serde_json::Value =
+        serde_json::from_str(blob).unwrap_or_else(|e| panic!("embedded JSON parse ({e}): {blob}"));
+
+    assert_eq!(report["schema"].as_str(), Some("perl-lsp.heatmap.v1"));
+    let names: Vec<&str> = report["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"orphan_helper") && names.contains(&"used"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

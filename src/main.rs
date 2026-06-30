@@ -183,9 +183,10 @@ fn print_usage() {
     eprintln!("  perl-lsp --batch <root>                                Stream JSONL queries (one startup, many)");
     eprintln!();
     eprintln!("INSIGHT:");
-    eprintln!("  perl-lsp --heatmap <root> [--csv] [--include-deps] [--all]");
+    eprintln!("  perl-lsp --heatmap <root> [--csv|--html] [--include-deps] [--all]");
     eprintln!("                                                         Per-symbol usage (fan-in/fan-out)");
-    eprintln!("                                                         + unreferenced-symbol candidates (JSON/CSV)");
+    eprintln!("                                                         + unreferenced-symbol candidates");
+    eprintln!("                                                         (JSON default; --csv / --html viewer)");
     eprintln!();
     eprintln!("PLUGIN AUTHORING:");
     eprintln!("  perl-lsp --plugin-check <file.rhai>                    Lint a Rhai plugin");
@@ -1510,7 +1511,7 @@ fn cli_workspace_symbol(root: &str, query: &str) {
     print_run_one(&ws, &idx, &req);
 }
 
-/// --heatmap <root> [--csv] [--include-deps] [--all] — Code-usage heatmap.
+/// --heatmap <root> [--csv|--html] [--include-deps] [--all] — Code-usage heatmap.
 ///
 /// Emits per-symbol USAGE metrics computed over the EXISTING cross-file
 /// reference graph (the same `refs_to` machinery references/rename use) — it
@@ -1536,6 +1537,7 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     use std::collections::HashSet;
 
     let csv = opts.iter().any(|a| a == "--csv");
+    let html = opts.iter().any(|a| a == "--html");
     let include_deps = opts.iter().any(|a| a == "--include-deps");
     // By default only candidate-eligible kinds (subs/methods/packages with a
     // body) are listed; `--all` keeps every counted symbol in `symbols`.
@@ -1720,8 +1722,40 @@ fn cli_heatmap(root: &str, opts: &[String]) {
         "symbols": symbol_rows,
         "dead_code_candidates": dead_rows,
     });
+
+    // `--html` wraps the SAME report in a self-contained, offline viewer
+    // (treemap heat + fan-in/fan-out butterfly). No external assets: the
+    // report JSON is embedded so the file opens straight off disk.
+    if html {
+        println!("{}", heatmap_html(&out));
+        return;
+    }
+
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
 }
+
+/// Render a `--heatmap` report as a single self-contained HTML document.
+///
+/// The whole report is embedded as a `<script type="application/json">`
+/// blob and drawn client-side with dependency-free SVG — no CDN, no build
+/// step, opens with a `file://` URL. Two views over the same `symbols[]`:
+/// a squarified treemap (tile area = fan_in+1, color = fan_in heat,
+/// dead-code candidates outlined) and a back-to-back fan-in/fan-out
+/// butterfly of the hottest symbols.
+fn heatmap_html(report: &serde_json::Value) -> String {
+    // The report carries file paths (attacker-adjacent text), so escape every
+    // `<` to its JSON unicode form: that makes a stray `</script>` impossible
+    // regardless of content, and `JSON.parse` restores the `<` client-side.
+    let data = serde_json::to_string(report)
+        .unwrap_or_else(|_| "{}".to_string())
+        .replace('<', "\\u003c");
+    HEATMAP_HTML_TEMPLATE.replace("__HEATMAP_DATA__", &data)
+}
+
+/// Self-contained viewer template; `__HEATMAP_DATA__` is replaced with the
+/// embedded report JSON. Kept as one literal so the asset travels with the
+/// binary (no runtime file lookup, no build-time bundling).
+const HEATMAP_HTML_TEMPLATE: &str = include_str!("heatmap.html");
 
 /// Minimal RFC-4180 CSV field escaping: quote when the value contains a
 /// comma, quote, or newline; double embedded quotes.

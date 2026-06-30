@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>perl-lsp — usage heatmap</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c222b; --edge: #2a313c;
+    --fg: #e6edf3; --muted: #8b97a7; --accent: #58a6ff;
+    --dead: #e0843b; --dead-fill: #3a2b22;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  code, .mono { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  a { color: var(--accent); }
+  header { padding: 18px 22px 10px; border-bottom: 1px solid var(--edge); }
+  h1 { font-size: 18px; margin: 0 0 2px; font-weight: 650; }
+  h1 .v { color: var(--muted); font-weight: 400; font-size: 13px; }
+  .root { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .stats { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .chip { background: var(--panel); border: 1px solid var(--edge); border-radius: 8px;
+    padding: 6px 11px; display: flex; align-items: baseline; gap: 7px; }
+  .chip b { font-size: 17px; font-weight: 650; }
+  .chip span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .chip.warn b { color: var(--dead); }
+  .note { margin-top: 12px; font-size: 11.5px; color: var(--muted); max-width: 110ch; }
+  .note b { color: #c9d4e0; font-weight: 600; }
+
+  .toolbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 12px 22px; border-bottom: 1px solid var(--edge); position: sticky; top: 0;
+    background: var(--bg); z-index: 5; }
+  .tabs { display: flex; gap: 4px; }
+  .tab { background: var(--panel); border: 1px solid var(--edge); color: var(--muted);
+    padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: #08111f; font-weight: 600; }
+  .search { flex: 1; min-width: 180px; max-width: 360px; }
+  .search input { width: 100%; background: var(--panel); border: 1px solid var(--edge);
+    color: var(--fg); border-radius: 8px; padding: 7px 11px; font-size: 13px; }
+  .legend { display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--muted); }
+  .grad { width: 130px; height: 12px; border-radius: 3px;
+    background: linear-gradient(90deg,#20304f,#3f6fb0,#f5c542,#ff4d4d); border: 1px solid var(--edge); }
+  .legend .deadkey { width: 14px; height: 14px; border-radius: 3px;
+    background: var(--dead-fill); border: 1.5px dashed var(--dead); }
+
+  main { padding: 16px 22px 40px; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  #treemap { width: 100%; height: 72vh; min-height: 420px; background: var(--panel);
+    border: 1px solid var(--edge); border-radius: 10px; overflow: hidden; }
+  #treemap svg { display: block; }
+  .pkg-label { fill: var(--muted); font-size: 10px; font-family: ui-monospace, monospace;
+    pointer-events: none; }
+  .tile { stroke: #0e1116; stroke-width: .6; cursor: pointer; transition: opacity .12s; }
+  .tile.dead { stroke: var(--dead); stroke-width: 1.4; stroke-dasharray: 2.5 2; }
+  .tile-label { fill: #f2f6fb; font-size: 9.5px; pointer-events: none;
+    font-family: ui-monospace, monospace; paint-order: stroke; stroke: #0008; stroke-width: 2px; }
+  .dim { opacity: .1 !important; }
+
+  .tooltip { position: fixed; pointer-events: none; z-index: 50; max-width: 320px;
+    background: #0b0e13; border: 1px solid var(--edge); border-radius: 8px; padding: 9px 11px;
+    font-size: 12px; box-shadow: 0 8px 28px #000a; display: none; }
+  .tooltip .nm { font-weight: 650; font-family: ui-monospace, monospace; word-break: break-all; }
+  .tooltip .row { color: var(--muted); margin-top: 2px; }
+  .tooltip .row b { color: var(--fg); font-weight: 600; }
+  .tooltip .deadtag { color: var(--dead); font-weight: 600; }
+  .tooltip .path { color: var(--muted); margin-top: 5px; font-family: ui-monospace, monospace;
+    font-size: 11px; word-break: break-all; }
+
+  /* butterfly */
+  .bfly { display: grid; grid-template-columns: 1fr 220px 1fr; gap: 2px 12px; align-items: center;
+    max-width: 1100px; }
+  .bfly .hd { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+    padding-bottom: 6px; border-bottom: 1px solid var(--edge); margin-bottom: 6px; }
+  .bfly .hd.l { text-align: right; } .bfly .hd.c { text-align: center; }
+  .bfly .barwrap { display: flex; height: 18px; align-items: center; }
+  .bfly .barwrap.l { justify-content: flex-end; }
+  .bar { height: 13px; border-radius: 3px; min-width: 2px; }
+  .bar.in { background: linear-gradient(90deg,#f5c542,#ff4d4d); }
+  .bar.out { background: linear-gradient(90deg,#3f6fb0,#58a6ff); }
+  .barval { font-size: 11px; color: var(--muted); padding: 0 6px; min-width: 22px; }
+  .barval.l { text-align: left; } .barval.r { text-align: right; }
+  .bfly .name { text-align: center; font-family: ui-monospace, monospace; font-size: 12px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bfly .name small { color: var(--muted); }
+  .bfly .name.dead { color: var(--dead); }
+
+  /* dead table */
+  table { border-collapse: collapse; width: 100%; max-width: 1100px; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--edge); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .04em; position: sticky; top: 56px; background: var(--bg); cursor: pointer; }
+  tbody tr:hover { background: var(--panel2); }
+  td.mono { font-family: ui-monospace, monospace; }
+  td.num { text-align: right; }
+  .empty { color: var(--muted); padding: 30px; text-align: center; }
+  .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+    background: var(--accent); color: #08111f; font-weight: 600; padding: 9px 16px; border-radius: 8px;
+    font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 60; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>perl-lsp usage heatmap <span class="v" id="schema"></span></h1>
+  <div class="root mono" id="root"></div>
+  <div class="stats" id="stats"></div>
+  <div class="note" id="note"></div>
+</header>
+
+<div class="toolbar">
+  <div class="tabs">
+    <button class="tab active" data-view="treemap">Treemap</button>
+    <button class="tab" data-view="butterfly">Butterfly</button>
+    <button class="tab" data-view="dead">Dead code</button>
+  </div>
+  <div class="search"><input id="q" type="search" placeholder="filter by name or package…" autocomplete="off"></div>
+  <div class="legend">
+    <span>fan-in</span><div class="grad"></div><span>cold→hot</span>
+    <span style="margin-left:8px;display:inline-flex;align-items:center;gap:6px"><span class="deadkey"></span>dead candidate</span>
+  </div>
+</div>
+
+<main>
+  <div class="view active" data-view="treemap"><div id="treemap"></div></div>
+  <div class="view" data-view="butterfly"><div id="butterfly"></div></div>
+  <div class="view" data-view="dead"><div id="dead"></div></div>
+</main>
+
+<div class="tooltip" id="tip"></div>
+<div class="toast" id="toast"></div>
+
+<script id="report" type="application/json">__HEATMAP_DATA__</script>
+<script>
+"use strict";
+const REPORT = JSON.parse(document.getElementById("report").textContent);
+const SYMBOLS = REPORT.symbols || [];
+const DEAD = REPORT.dead_code_candidates || [];
+const MAX_FAN_IN = Math.max(1, ...SYMBOLS.map(s => s.fan_in || 0));
+const MAX_FAN_OUT = Math.max(1, ...SYMBOLS.map(s => s.fan_out || 0));
+const $ = id => document.getElementById(id);
+
+// ---- header ----------------------------------------------------------------
+$("schema").textContent = REPORT.schema ? "· " + REPORT.schema : "";
+$("root").textContent = REPORT.root || "";
+function chip(value, label, warn) {
+  return `<div class="chip${warn ? " warn" : ""}"><b>${value}</b><span>${label}</span></div>`;
+}
+$("stats").innerHTML = [
+  chip(REPORT.files_indexed ?? "?", "files"),
+  chip((REPORT.summary && REPORT.summary.symbols_reported) ?? SYMBOLS.length, "symbols"),
+  chip(DEAD.length, "dead candidates", DEAD.length > 0),
+  chip(REPORT.dynamic_dispatch_sites ?? 0, "dynamic dispatch"),
+  chip(REPORT.include_deps ? "deps" : "editable", "scope"),
+].join("");
+$("note").innerHTML =
+  (REPORT.label ? "<b>Note:</b> " + esc(REPORT.label) + "<br>" : "") +
+  (REPORT.soundness ? "<b>Soundness:</b> " + esc(REPORT.soundness) : "");
+
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+// ---- color -----------------------------------------------------------------
+// Sequential cold→hot, matching the legend gradient stops.
+const STOPS = [[32,48,79],[63,111,176],[245,197,66],[255,77,77]];
+function heat(t) {
+  t = Math.max(0, Math.min(1, t));
+  const seg = t * (STOPS.length - 1), i = Math.min(STOPS.length - 2, Math.floor(seg)), f = seg - i;
+  const a = STOPS[i], b = STOPS[i + 1];
+  const m = j => Math.round(a[j] + (b[j] - a[j]) * f);
+  return `rgb(${m(0)},${m(1)},${m(2)})`;
+}
+// Perceptual lift so a 0..5 range still spreads across the ramp.
+const heatT = fanIn => Math.sqrt((fanIn || 0) / MAX_FAN_IN);
+
+// ---- squarified treemap ----------------------------------------------------
+// Bruls/Huizing/van Wijk: greedily grow a row while it improves the worst
+// aspect ratio, then flush it against the shorter side of the remaining rect.
+function squarify(items, x, y, w, h) {
+  const out = [];
+  const total = items.reduce((s, it) => s + it.value, 0);
+  if (total <= 0 || w <= 0 || h <= 0) return out;
+  const nodes = items.map(it => ({ item: it, area: (it.value / total) * w * h }));
+  const worst = (row, side) => {
+    const sum = row.reduce((s, d) => s + d.area, 0);
+    const mx = Math.max(...row.map(d => d.area)), mn = Math.min(...row.map(d => d.area));
+    const s2 = sum * sum, l2 = side * side;
+    return Math.max((l2 * mx) / s2, s2 / (l2 * mn));
+  };
+  const flush = (row, r) => {
+    const sum = row.reduce((s, d) => s + d.area, 0);
+    if (r.w >= r.h) {
+      const cw = sum / r.h; let cy = r.y;
+      for (const d of row) { const ch = d.area / cw; out.push({ ...d.item, x: r.x, y: cy, w: cw, h: ch }); cy += ch; }
+      return { x: r.x + cw, y: r.y, w: r.w - cw, h: r.h };
+    } else {
+      const ch = sum / r.w; let cx = r.x;
+      for (const d of row) { const cw = d.area / ch; out.push({ ...d.item, x: cx, y: r.y, w: cw, h: ch }); cx += cw; }
+      return { x: r.x, y: r.y + ch, w: r.w, h: r.h - ch };
+    }
+  };
+  let rect = { x, y, w, h }, row = [], i = 0;
+  while (i < nodes.length) {
+    const node = nodes[i], side = Math.min(rect.w, rect.h);
+    if (row.length === 0 || worst([...row, node], side) <= worst(row, side)) { row.push(node); i++; }
+    else { rect = flush(row, rect); row = []; }
+  }
+  if (row.length) flush(row, rect);
+  return out;
+}
+
+function groupByPackage(symbols) {
+  const map = new Map();
+  for (const s of symbols) {
+    const pkg = s.package || "(main)";
+    if (!map.has(pkg)) map.set(pkg, []);
+    map.get(pkg).push(s);
+  }
+  // value = fan_in + 1 so zero-fan-in symbols still occupy a cell.
+  const groups = [...map.entries()].map(([pkg, syms]) => ({
+    pkg, syms, value: syms.reduce((a, s) => a + (s.fan_in || 0) + 1, 0),
+  }));
+  groups.sort((a, b) => b.value - a.value);
+  return groups;
+}
+
+const HEADER_H = 14;
+function renderTreemap() {
+  const host = $("treemap");
+  host.innerHTML = "";
+  const W = host.clientWidth, H = host.clientHeight;
+  if (!SYMBOLS.length) { host.innerHTML = '<div class="empty">No symbols to display.</div>'; return; }
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+  const groups = groupByPackage(SYMBOLS);
+  const cells = squarify(groups.map(g => ({ ...g, value: g.value })), 1, 1, W - 2, H - 2);
+  for (const cell of cells) {
+    const g = document.createElementNS(svg.namespaceURI, "g");
+    // package frame + label
+    const frame = rect(cell.x, cell.y, cell.w, cell.h, "none");
+    frame.setAttribute("stroke", "#2a313c"); frame.setAttribute("stroke-width", "1");
+    g.appendChild(frame);
+    const showHdr = cell.w > 46 && cell.h > HEADER_H + 8;
+    if (showHdr) {
+      const t = text(cell.x + 4, cell.y + 10, clip(cell.pkg, cell.w - 8), "pkg-label");
+      g.appendChild(t);
+    }
+    const innerY = cell.y + (showHdr ? HEADER_H : 1);
+    const innerH = cell.h - (showHdr ? HEADER_H : 1) - 1;
+    const symItems = cell.syms.map(s => ({ sym: s, value: (s.fan_in || 0) + 1 }));
+    const tiles = squarify(symItems, cell.x + 1, innerY, cell.w - 2, innerH);
+    for (const tl of tiles) {
+      const s = tl.sym;
+      const r = rect(tl.x, tl.y, Math.max(0, tl.w), Math.max(0, tl.h),
+        s.dead_code_candidate ? "var(--dead-fill)" : heat(heatT(s.fan_in)));
+      r.setAttribute("class", "tile" + (s.dead_code_candidate ? " dead" : ""));
+      r.__sym = s;
+      g.appendChild(r);
+      if (tl.w > 34 && tl.h > 13) g.appendChild(text(tl.x + 3, tl.y + 11, clip(s.name, tl.w - 6), "tile-label"));
+    }
+    svg.appendChild(g);
+  }
+  host.appendChild(svg);
+  applyFilter();
+}
+
+function rect(x, y, w, h, fill) {
+  const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  r.setAttribute("x", x); r.setAttribute("y", y); r.setAttribute("width", w); r.setAttribute("height", h);
+  r.setAttribute("fill", fill); return r;
+}
+function text(x, y, str, cls) {
+  const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  t.setAttribute("x", x); t.setAttribute("y", y); t.setAttribute("class", cls); t.textContent = str; return t;
+}
+function clip(s, px) { const max = Math.floor(px / 6.0); return s.length > max ? s.slice(0, Math.max(1, max - 1)) + "…" : s; }
+
+// ---- butterfly -------------------------------------------------------------
+function renderButterfly() {
+  const host = $("butterfly");
+  const ranked = SYMBOLS
+    .filter(s => (s.fan_in || 0) + (s.fan_out || 0) > 0)
+    .sort((a, b) => ((b.fan_in || 0) + (b.fan_out || 0)) - ((a.fan_in || 0) + (a.fan_out || 0)))
+    .slice(0, 45);
+  if (!ranked.length) { host.innerHTML = '<div class="empty">No referenced symbols to chart.</div>'; return; }
+  let html = '<div class="bfly"><div class="hd l">← fan-in (callers)</div><div class="hd c">symbol</div><div class="hd">fan-out (callees) →</div>';
+  for (const s of ranked) {
+    const inPct = ((s.fan_in || 0) / MAX_FAN_IN) * 100;
+    const outPct = ((s.fan_out || 0) / MAX_FAN_OUT) * 100;
+    const dead = s.dead_code_candidate ? " dead" : "";
+    html += `<div class="barwrap l" data-key="${attr(filterKey(s))}"><span class="barval r">${s.fan_in || 0}</span><div class="bar in" style="width:${inPct}%"></div></div>`;
+    html += `<div class="name${dead}" data-key="${attr(filterKey(s))}" title="${attr(s.package || "")}">${esc(s.name)}<br><small>${esc(s.package || "")}</small></div>`;
+    html += `<div class="barwrap" data-key="${attr(filterKey(s))}"><div class="bar out" style="width:${outPct}%"></div><span class="barval l">${s.fan_out == null ? "·" : s.fan_out}</span></div>`;
+  }
+  html += "</div>";
+  host.innerHTML = html;
+  applyFilter();
+}
+
+// ---- dead table ------------------------------------------------------------
+let deadSort = { key: "fan_out", dir: -1 };
+function renderDead() {
+  const host = $("dead");
+  if (!DEAD.length) { host.innerHTML = '<div class="empty">No dead-code candidates — every symbol is referenced or guarded. 🎉</div>'; return; }
+  const rows = DEAD.slice().sort((a, b) => {
+    const k = deadSort.key;
+    let av = a[k], bv = b[k];
+    if (typeof av === "string") return deadSort.dir * av.localeCompare(bv);
+    return deadSort.dir * (((av ?? 0)) - ((bv ?? 0)));
+  });
+  const head = (k, lbl, cls = "") =>
+    `<th data-k="${k}" class="${cls}">${lbl}${deadSort.key === k ? (deadSort.dir < 0 ? " ▾" : " ▴") : ""}</th>`;
+  let html = `<p style="color:var(--muted);font-size:12px;max-width:90ch">A <b>review queue</b>, not a delete list — unreferenced symbols that no reachability guard shielded. Click a row to copy its <code>file:line</code>.</p><table><thead><tr>` +
+    head("name", "Symbol") + head("kind", "Kind") + head("package", "Package") + head("fan_out", "Fan-out", "num") + `<th>Location</th></tr></thead><tbody>`;
+  for (const s of rows) {
+    html += `<tr data-loc="${attr((s.file || "") + ":" + s.line + ":" + s.col)}">` +
+      `<td class="mono">${esc(s.name)}</td><td>${esc(s.kind)}</td><td class="mono">${esc(s.package || "")}</td>` +
+      `<td class="num">${s.fan_out == null ? "·" : s.fan_out}</td>` +
+      `<td class="mono" style="color:var(--muted)">${esc(shortFile(s.file))}:${s.line}</td></tr>`;
+  }
+  html += "</tbody></table>";
+  host.innerHTML = html;
+  host.querySelectorAll("th[data-k]").forEach(th => th.onclick = () => {
+    const k = th.dataset.k;
+    if (deadSort.key === k) deadSort.dir *= -1; else deadSort = { key: k, dir: k === "fan_out" ? -1 : 1 };
+    renderDead();
+  });
+  host.querySelectorAll("tr[data-loc]").forEach(tr => tr.onclick = () => copy(tr.dataset.loc));
+}
+function shortFile(f) { if (!f) return ""; const root = REPORT.root || ""; return f.startsWith(root) ? f.slice(root.length).replace(/^\//, "") : f.split("/").slice(-2).join("/"); }
+
+// ---- filter / interaction --------------------------------------------------
+function attr(s) { return String(s).replace(/"/g, "&quot;"); }
+function filterKey(s) { return ((s.name || "") + " " + (s.package || "")).toLowerCase(); }
+let query = "";
+function applyFilter() {
+  const q = query.trim().toLowerCase();
+  document.querySelectorAll("#treemap .tile").forEach(t => {
+    const s = t.__sym; t.classList.toggle("dim", !!q && !filterKey(s).includes(q));
+  });
+  document.querySelectorAll("#butterfly [data-key]").forEach(el => {
+    el.classList.toggle("dim", !!q && !el.dataset.key.includes(q));
+  });
+}
+$("q").addEventListener("input", e => { query = e.target.value; applyFilter(); });
+
+// tooltip (delegated, treemap only)
+const tip = $("tip");
+$("treemap").addEventListener("mousemove", e => {
+  const t = e.target.closest(".tile");
+  if (!t || !t.__sym) { tip.style.display = "none"; return; }
+  const s = t.__sym;
+  tip.innerHTML =
+    `<div class="nm">${esc(s.name)}</div>` +
+    `<div class="row"><b>${esc(s.kind)}</b> in <b>${esc(s.package || "?")}</b></div>` +
+    `<div class="row">fan-in <b>${s.fan_in}</b> · fan-out <b>${s.fan_out == null ? "·" : s.fan_out}</b>` +
+    (s.exported ? " · <b>exported</b>" : "") + `</div>` +
+    (s.dead_code_candidate ? `<div class="row deadtag">⚠ dead-code candidate</div>`
+      : s.reachable_guard ? `<div class="row">guard: <b>${esc(s.reachable_guard)}</b></div>` : "") +
+    `<div class="path">${esc(shortFile(s.file))}:${s.line}:${s.col}</div>`;
+  tip.style.display = "block";
+  const pad = 14, tw = tip.offsetWidth, th = tip.offsetHeight;
+  let x = e.clientX + pad, y = e.clientY + pad;
+  if (x + tw > innerWidth) x = e.clientX - tw - pad;
+  if (y + th > innerHeight) y = e.clientY - th - pad;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+});
+$("treemap").addEventListener("mouseleave", () => tip.style.display = "none");
+$("treemap").addEventListener("click", e => {
+  const t = e.target.closest(".tile"); if (!t || !t.__sym) return;
+  const s = t.__sym; copy(`${s.file}:${s.line}:${s.col}`);
+});
+
+const toast = $("toast");
+let toastT;
+function copy(str) {
+  const done = () => { toast.textContent = "copied " + shortFile(str); toast.classList.add("show");
+    clearTimeout(toastT); toastT = setTimeout(() => toast.classList.remove("show"), 1400); };
+  if (navigator.clipboard) navigator.clipboard.writeText(str).then(done, done); else done();
+}
+
+// ---- tabs / resize ---------------------------------------------------------
+let current = "treemap";
+const renderers = { treemap: renderTreemap, butterfly: renderButterfly, dead: renderDead };
+document.querySelectorAll(".tab").forEach(tab => tab.onclick = () => {
+  current = tab.dataset.view;
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t === tab));
+  document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.dataset.view === current));
+  renderers[current]();
+});
+
+let rt;
+addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { if (current === "treemap") renderTreemap(); }, 150); });
+
+renderTreemap();
+</script>
+</body>
+</html>

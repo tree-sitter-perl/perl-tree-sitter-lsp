@@ -12,13 +12,16 @@ sidesteps the compliance / tool-qualification apparatus a MISRA checker carries.
 ## Invocation
 
 ```
-perl-lsp --heatmap <root> [--csv] [--include-deps] [--all]
+perl-lsp --heatmap <root> [--csv|--html] [--include-deps] [--all]
 ```
 
 - `<root>` — workspace root; runs `cli_full_startup(root)` ("act like the LSP
   just started": workspace index + @INC resolve + SQLite warm).
 - `--csv` — emit CSV instead of JSON (both are always ingestible; SARIF is the
   gold interchange format but is deferred — see "What's next").
+- `--html` — emit a self-contained, offline HTML viewer over the same report
+  (see "Visualization" below). Mutually exclusive with `--csv`; if both are
+  passed, `--csv` wins (it returns first).
 - `--include-deps` — also count references found in cached `@INC` dependency
   modules (default: open + workspace files only).
 - `--all` — keep every counted symbol in the `symbols` array; by default the
@@ -149,8 +152,38 @@ Treat the dead list as a **review queue**, not a delete list.
 - **Fan-out depth / transitive reach** — current fan-out is one hop, intra-file.
   A transitive callee count needs the cross-file call graph walked (the
   `GraphView` seam already exists for inheritance/bridges).
-- **Visualization** — the JSON is shaped for a butterfly/treemap front-end;
-  a small HTML viewer over `symbols[]` would land the DX story.
 - **Precision split for fan-in** — optionally separate call-site fan-in from
   declaration-adjacent mentions (import/export lists) once `RefLocation`
   carries its `RefKind`.
+
+## Visualization (`--html`)
+
+`--heatmap <root> --html` renders the *same* report (no new computation —
+`heatmap_html()` just wraps the JSON value the JSON/CSV paths share) as one
+self-contained HTML document on stdout:
+
+```
+perl-lsp --heatmap <root> --html 2>/dev/null > heatmap.html && open heatmap.html
+```
+
+Why this shape:
+
+- **Self-contained, offline.** The template `src/heatmap.html` is compiled in
+  via `include_str!` and the report JSON is inlined into a
+  `<script type="application/json">` blob, so the file opens off a `file://`
+  URL with no server, no CDN, no build step. The embed replaces every `<`
+  with its JSON unicode escape so a hostile path can't close the script
+  element early; it round-trips back to `<` through `JSON.parse`. Drawing
+  is dependency-free SVG.
+- **Three views over `symbols[]`, one dataset:**
+  - **Treemap** — squarified (Bruls/Huizing/van Wijk), grouped by package;
+    tile area is `fan_in + 1` (so zero-fan-in symbols still occupy a cell),
+    color is a `sqrt`-lifted fan-in heat ramp, dead-code candidates get a
+    dashed-amber outline. Hover for detail; click copies `file:line:col`.
+  - **Butterfly** — back-to-back fan-in (callers) / fan-out (callees) bars
+    for the hottest symbols, the classic "who calls / who do I call" read.
+  - **Dead code** — the candidate queue as a sortable table, framed as a
+    *review queue, not a delete list* (carrying the same honest labelling).
+- **Carries the soundness story.** The `label` / `soundness` strings and the
+  `dynamic_dispatch_sites` count render in the header, so the viewer can't be
+  mistaken for a sound dead-code prover.
