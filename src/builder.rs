@@ -9279,7 +9279,15 @@ impl<'a> Builder<'a> {
                         attr_names.push((text.to_string(), node_to_span(*child)));
                     }
                 }
-                "array_ref_expression" | "anonymous_array_expression" => {
+                // Literal arrayref (`has ['a','b']`) or a ref to a constant
+                // array (`has \@attrs` where `my @attrs = qw/.../`) flatten
+                // through the constant-fold seam: `extract_array_attr_names`
+                // → `string_list` resolves `\@attrs` against the constant table.
+                // NOT a bare `has @attrs` — that SPLATS the array into the call
+                // (`has 'a', 'b', is => …`), a different declaration entirely,
+                // so the `array` node is intentionally excluded. A non-constant
+                // arrayref folds to nothing and stays unclaimed.
+                "anonymous_array_expression" | "refgen_expression" => {
                     self.extract_array_attr_names(*child, &mut attr_names);
                 }
                 _ => {}
@@ -9698,7 +9706,15 @@ impl<'a> Builder<'a> {
                         attr_names.push((text.to_string(), node_to_span(*child)));
                     }
                 }
-                "array_ref_expression" | "anonymous_array_expression" => {
+                // Literal arrayref (`has ['a','b']`) or a ref to a constant
+                // array (`has \@attrs` where `my @attrs = qw/.../`) flatten
+                // through the constant-fold seam: `extract_array_attr_names`
+                // → `string_list` resolves `\@attrs` against the constant table.
+                // NOT a bare `has @attrs` — that SPLATS the array into the call
+                // (`has 'a', 'b', is => …`), a different declaration entirely,
+                // so the `array` node is intentionally excluded. A non-constant
+                // arrayref folds to nothing and stays unclaimed.
+                "anonymous_array_expression" | "refgen_expression" => {
                     self.extract_array_attr_names(*child, &mut attr_names);
                 }
                 _ => {}
