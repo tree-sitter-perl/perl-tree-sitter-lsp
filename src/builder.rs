@@ -1143,7 +1143,7 @@ fn parse_instance_of(isa: &str) -> Option<String> {
         return None;
     }
     let args = call.child_by_field_name("arguments")?;
-    if args.kind() != "anonymous_array_expression" && args.kind() != "array_ref_expression" {
+    if args.kind() != "anonymous_array_expression" {
         return None;
     }
     for i in 0..args.named_child_count() {
@@ -9330,7 +9330,7 @@ impl<'a> Builder<'a> {
         // CST: ambiguous_function_call_expression
         //   function: "has"
         //   arguments: list_expression
-        //     [0] string_literal 'name' | array_ref_expression [qw(a b)]
+        //     [0] string_literal 'name' | anonymous_array_expression [qw(a b)]
         //     [1] list_expression (is => 'ro', isa => 'Str')   -- options (Moo/Moose)
         //          OR absent (Mojo::Base: has 'name' or has 'name' => 'default')
         let mut attr_names: Vec<(String, Span)> = Vec::new();
@@ -9374,7 +9374,15 @@ impl<'a> Builder<'a> {
                         attr_names.push((text.to_string(), node_to_span(*child)));
                     }
                 }
-                "array_ref_expression" | "anonymous_array_expression" => {
+                // Literal arrayref (`has ['a','b']`) or a ref to a constant
+                // array (`has \@attrs` where `my @attrs = qw/.../`) flatten
+                // through the constant-fold seam: `extract_array_attr_names`
+                // → `string_list` resolves `\@attrs` against the constant table.
+                // NOT a bare `has @attrs` — that SPLATS the array into the call
+                // (`has 'a', 'b', is => …`), a different declaration entirely,
+                // so the `array` node is intentionally excluded. A non-constant
+                // arrayref folds to nothing and stays unclaimed.
+                "anonymous_array_expression" | "refgen_expression" => {
                     self.extract_array_attr_names(*child, &mut attr_names);
                 }
                 _ => {}
@@ -9793,7 +9801,15 @@ impl<'a> Builder<'a> {
                         attr_names.push((text.to_string(), node_to_span(*child)));
                     }
                 }
-                "array_ref_expression" | "anonymous_array_expression" => {
+                // Literal arrayref (`has ['a','b']`) or a ref to a constant
+                // array (`has \@attrs` where `my @attrs = qw/.../`) flatten
+                // through the constant-fold seam: `extract_array_attr_names`
+                // → `string_list` resolves `\@attrs` against the constant table.
+                // NOT a bare `has @attrs` — that SPLATS the array into the call
+                // (`has 'a', 'b', is => …`), a different declaration entirely,
+                // so the `array` node is intentionally excluded. A non-constant
+                // arrayref folds to nothing and stays unclaimed.
+                "anonymous_array_expression" | "refgen_expression" => {
                     self.extract_array_attr_names(*child, &mut attr_names);
                 }
                 _ => {}
@@ -9877,7 +9893,7 @@ impl<'a> Builder<'a> {
                 }
                 plugin::ValueShape::HashPairs(pairs)
             }
-            "array_ref_expression" | "anonymous_array_expression" => {
+            "anonymous_array_expression" => {
                 plugin::ValueShape::ArrayItems(
                     self.extract_string_list(node).into_iter().map(|(s, _)| s).collect(),
                 )
@@ -10018,7 +10034,7 @@ impl<'a> Builder<'a> {
         for i in 0..args.named_child_count() {
             let Some(child) = args.named_child(i) else { continue };
             match child.kind() {
-                "anonymous_array_expression" | "array_ref_expression" => {
+                "anonymous_array_expression" => {
                     for j in 0..child.named_child_count() {
                         if let Some(el) = child.named_child(j) {
                             params.push(self.constraint_param_for(el));
@@ -10842,7 +10858,7 @@ impl<'a> Builder<'a> {
                         names.push((text.to_string(), node_to_span(*child)));
                     }
                 }
-                "quoted_word_list" | "array_ref_expression" | "anonymous_array_expression" => {
+                "quoted_word_list" | "anonymous_array_expression" => {
                     self.extract_array_attr_names(*child, &mut names);
                 }
                 _ => {}

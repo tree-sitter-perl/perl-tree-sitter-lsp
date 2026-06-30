@@ -296,6 +296,65 @@ pub(crate) fn canonical_var_name<'a>(node: Node<'a>, src: &'a [u8]) -> Option<St
     Some(format!("{}{}", sigil, vn.text(src)?))
 }
 
+/// Does `node` introduce a fresh binding of the scalar named `var` (sigiled,
+/// e.g. `"$x"`)? The single source of truth for "what rebinds a scalar in
+/// Perl" — flow-narrowing ends a narrowed region at the rebind by scanning
+/// for this. Covers every binding shape so none silently leaks a stale
+/// `Undef`: `$x = …`, `my`/`our`/`state $x` (incl. list `my ($x, …)`),
+/// `local $x`, list-assignment `($x, …) = …`, and `for`/`foreach [my] $x (…)`.
+/// Element/key *reads* (`$h{$x} = …`) are NOT bindings — the lvalue walk
+/// descends only through binding containers, never into a subscript or key.
+/// Lvalue subs (`substr($x,…) = …`) are deliberately excluded: which arg, if
+/// any, a function assigns through is per-function and unknowable, so treating
+/// every scalar arg as bound would falsely truncate narrowings on the read
+/// args (`$off`/`$len` in `substr($x, $off, $len) = …`).
+pub(crate) fn rebinds_scalar<'a>(node: Node<'a>, var: &str, src: &'a [u8]) -> bool {
+    match node.kind() {
+        // First named child is the LHS. NOT `child_by_field_name("left")` —
+        // that returns None when the LHS is parenthesized (list-assignment
+        // `($x, …) = …`), the same paren quirk the grammar has on the `right`
+        // field.
+        "assignment_expression" => node
+            .named()
+            .next()
+            .is_some_and(|l| lvalue_binds_scalar(l, var, src)),
+        // Bare redeclare (`my $x;`, no initializer) shadows the binding.
+        "variable_declaration" => lvalue_binds_scalar(node, var, src),
+        // The loop variable is freshly aliased to each element per iteration.
+        "for_statement" | "foreach_statement" => for_loop_variable(node)
+            .and_then(|v| canonical_var_name(v, src))
+            .as_deref()
+            == Some(var),
+        _ => false,
+    }
+}
+
+/// The loop variable of a `for`/`foreach`, if it binds a scalar. `for $x (…)`
+/// / `foreach my $x (…)` expose it on the `variable` field; some grammars
+/// nest it under an `iterator` → `variable_declaration`.
+fn for_loop_variable<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    if let Some(v) = node.child_by_field_name("variable") {
+        return Some(v);
+    }
+    let it = node.child_by_field_name("iterator")?;
+    it.child_by_field_name("variable").or(Some(it))
+}
+
+/// A scalar named `var` in lvalue (binding) position within `node`. Descends
+/// only through pure binding containers — paren/list groups and `my`/`local`
+/// declarations — so it matches the bound scalar(s) but never a container/key
+/// scalar in an element access (nor a read arg of an lvalue sub).
+fn lvalue_binds_scalar<'a>(node: Node<'a>, var: &str, src: &'a [u8]) -> bool {
+    match node.kind() {
+        "scalar" => canonical_var_name(node, src).as_deref() == Some(var),
+        "list_expression"
+        | "parenthesized_expression"
+        | "localization_expression"
+        | "variable_declaration" => node.named().any(|c| lvalue_binds_scalar(c, var, src)),
+        _ => false,
+    }
+}
+
 /// Canonical variable name for a container access: `$foo[0]` reads `@foo`,
 /// `$foo{k}` reads `%foo`, `@foo{...}` slices `%foo`. Resolves the access
 /// node + its parent's shape to the *declared* variable's sigil + bare name.

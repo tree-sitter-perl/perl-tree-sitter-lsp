@@ -3698,6 +3698,37 @@ has [qw(foo bar)] => (is => 'ro');
 }
 
 #[test]
+fn test_moo_has_constant_array_ref() {
+    // `has \@names` (a ref to a constant array) folds the array's elements
+    // through the same accessor synthesis as the literal-arrayref form. A
+    // bare `has @names` SPLATS the array into the call (`has 'a','b', is=>…`)
+    // — a different declaration — so it is NOT folded; nor is a non-constant
+    // array.
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+my @attrs = qw(client_id client_secret);
+my @more  = ('refresh_token', 'profile_id');
+has \\@attrs, is => 'ro';
+has @more,    is => 'ro';
+has @runtime, is => 'ro';
+",
+    );
+    let accessor = |name: &str| {
+        fa.symbols
+            .iter()
+            .filter(|s| s.name == name && s.kind == SymKind::Method)
+            .count()
+    };
+    assert_eq!(accessor("client_id"), 1, "fold \\@attrs → client_id");
+    assert_eq!(accessor("client_secret"), 1, "fold \\@attrs → client_secret");
+    assert_eq!(accessor("refresh_token"), 0, "bare `has @more` splats — not a multi-attr decl, not folded");
+    assert_eq!(accessor("profile_id"), 0, "bare `has @more` splats — not a multi-attr decl, not folded");
+    assert_eq!(accessor("runtime"), 0, "non-constant array stays unclaimed");
+}
+
+#[test]
 fn test_moo_has_bare_no_accessor() {
     let fa = build_fa(
         "

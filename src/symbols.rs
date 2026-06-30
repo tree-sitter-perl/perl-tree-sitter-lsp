@@ -2970,6 +2970,13 @@ pub fn collect_diagnostics(
             continue;
         }
 
+        // A class with `AUTOLOAD` anywhere in its MRO answers ANY method name at
+        // runtime, so the static `sub` set isn't its real surface — stay silent
+        // (the role-contracts diagnostic uses the same skip, file_analysis.rs).
+        if analysis.resolve_method_in_ancestors(&class_name, "AUTOLOAD", Some(module_index)).is_some() {
+            continue;
+        }
+
         // Honest-silent on an incomplete ISA chain: if `class_name` (or any
         // resolvable ancestor) names a parent we can't resolve in the
         // workspace or @INC, the method might be inherited from there. One
