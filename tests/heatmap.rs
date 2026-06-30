@@ -109,6 +109,50 @@ fn fan_in_counts_and_unreferenced_subs_flagged() {
 }
 
 #[test]
+fn arity_variant_accessors_count_once_and_dsl_imports_are_hidden() {
+    // A Mojo::Base `rw` accessor is synthesized as a getter + a fluent writer
+    // sharing the same name/span (arity-discriminated for type inference); the
+    // writer carries `hide_in_outline`. The heatmap is a symbol-listing view,
+    // so it must fold the twin away — one logical method, one row — and must
+    // not list the DSL keywords `use Mojolicious::Lite` injects (`app`, etc.).
+    let dir = std::env::temp_dir().join(format!("perl-lsp-heatmap-arity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("widget.pl"),
+        "package Widget;\n\
+         use Mojo::Base -base;\n\
+         has 'color';\n\
+         1;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.pl"),
+        "use Mojolicious::Lite;\n\
+         get '/' => sub { shift->render(text => 'hi') };\n",
+    )
+    .unwrap();
+
+    let report = run_heatmap(&dir);
+    let syms = report["symbols"].as_array().unwrap();
+
+    let colors: Vec<_> = syms
+        .iter()
+        .filter(|s| s["name"].as_str() == Some("color") && s["package"].as_str() == Some("Widget"))
+        .collect();
+    assert_eq!(
+        colors.len(),
+        1,
+        "the rw accessor's getter+writer twin must collapse to one row: {colors:?}"
+    );
+
+    assert!(
+        !syms.iter().any(|s| s["name"].as_str() == Some("app")),
+        "Mojolicious::Lite DSL imports must not be listed as symbols: {syms:?}"
+    );
+}
+
+#[test]
 fn html_view_is_self_contained_and_embeds_the_report() {
     let dir = std::env::temp_dir().join(format!("perl-lsp-heatmap-html-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

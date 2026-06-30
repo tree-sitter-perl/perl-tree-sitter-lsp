@@ -1002,12 +1002,7 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
             | file_analysis::SymKind::Variable | file_analysis::SymKind::Handler => {}
             _ => continue,
         }
-        let hidden = match &sym.detail {
-            file_analysis::SymbolDetail::Sub { hide_in_outline, .. } => *hide_in_outline,
-            file_analysis::SymbolDetail::Handler { hide_in_outline, .. } => *hide_in_outline,
-            _ => false,
-        };
-        if hidden { continue; }
+        if sym.hidden_in_outline() { continue; }
         if sym.kind == file_analysis::SymKind::Variable && analysis.scope_within_sub_body(sym.scope) {
             continue;
         }
@@ -1583,6 +1578,13 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     for (path, analysis) in &entries {
         let path_str = path.display().to_string();
         for sym in &analysis.symbols {
+            // Fold arity-variant accessor twins / DSL-import infrastructure
+            // into their listed primary — same contract the outline honors.
+            // A fluent `rw` writer shares its getter's name/span/fan-in, so
+            // listing it would double-count one logical method.
+            if sym.hidden_in_outline() {
+                continue;
+            }
             let Some(target) = resolve::TargetRef::for_symbol(sym, analysis, Some(&idx)) else {
                 continue;
             };

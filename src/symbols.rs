@@ -159,10 +159,10 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
     // Lexical subs likewise: document symbols show them (in-file
     // structure), workspace search does not (not addressable outside
     // their block).
-    match &sym.detail {
-        crate::file_analysis::SymbolDetail::Sub { hide_in_outline: true, .. }
-        | crate::file_analysis::SymbolDetail::Sub { lexical: true, .. } => return None,
-        _ => {}
+    if sym.hidden_in_outline()
+        || matches!(&sym.detail, crate::file_analysis::SymbolDetail::Sub { lexical: true, .. })
+    {
+        return None;
     }
     Some(SymbolInformation {
         name: sym.name.clone(),

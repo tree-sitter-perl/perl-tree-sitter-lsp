@@ -440,6 +440,22 @@ impl Symbol {
             _ => &self.name,
         }
     }
+
+    /// True when this symbol is a presentation duplicate that symbol-listing
+    /// views should fold away — set by plugins on DSL-import infrastructure
+    /// and by accessor synthesis on the arity-variant twin (e.g. the fluent
+    /// `rw` writer that shares its getter's name/span). The getter/primary
+    /// carries the listing; the hidden twin exists only so arity-discriminated
+    /// type inference can answer both `$o->attr` and `$o->attr($v)`. Every
+    /// view that enumerates symbols for humans (outline, workspace-symbol,
+    /// usage heatmap) asks the symbol this rather than re-matching the detail.
+    pub fn hidden_in_outline(&self) -> bool {
+        matches!(
+            &self.detail,
+            SymbolDetail::Sub { hide_in_outline: true, .. }
+                | SymbolDetail::Handler { hide_in_outline: true, .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -7432,12 +7448,7 @@ impl FileAnalysis {
             // Per-symbol opt-out. Plugins mark DSL imports / internal
             // infrastructure so the outline stays focused on real
             // user-visible structure.
-            let hidden = match &sym.detail {
-                SymbolDetail::Sub { hide_in_outline, .. } => *hide_in_outline,
-                SymbolDetail::Handler { hide_in_outline, .. } => *hide_in_outline,
-                _ => false,
-            };
-            if hidden { continue; }
+            if sym.hidden_in_outline() { continue; }
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) && sym.namespace.is_framework() {
                 let key = (
                     sym.kind,
