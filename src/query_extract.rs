@@ -440,7 +440,6 @@ pub struct LangPack {
     /// Member-access node kinds (`receiver OP member`) — extraction records
     /// each site (simple-variable receiver, operator token span, `->` vs
     /// `.`) for the operator-DX consumer (`p.` on a `Box*` should be `->`).
-    /// The receiver is the first named child; the operator is the anonymous
     /// The member operator's grammar token KIND → the `MemberOp` it means
     /// (`"->"`→Arrow, `"."`→Dot). The `operator:` field of a member access is
     /// captured as `@member.op`; the engine maps its `kind()` through this
@@ -449,8 +448,18 @@ pub struct LangPack {
     pub op_map: &'static [(&'static str, crate::file_analysis::MemberOp)],
     /// Simple-variable node kinds (`identifier`). op-DX fires ONLY when the
     /// IMMEDIATE member-access receiver is one — the receiver whose
-    /// `deref_stack` resolves by name to decide the expected operator.
+    /// `deref_stack` resolves by name to decide the expected operator. Also the
+    /// cursor-completion "is this receiver a bare variable" test.
     pub simple_var_kinds: &'static [&'static str],
+    /// Member-access node kinds (`field_expression` / `attribute`): a `recv.m`
+    /// the cursor-completion path climbs to + types the receiver of. Empty =
+    /// no member-access completion (Perl uses `cursor_context`).
+    pub member_kinds: &'static [&'static str],
+    /// Node kinds the sentinel must NOT splice into (string/char/comment).
+    pub skip_kinds: &'static [&'static str],
+    /// Call-expression node kinds (`call_expression`/`call`) — a chained
+    /// receiver `f().attr` types through the call's inner member.
+    pub call_kinds: &'static [&'static str],
 }
 
 /// A declarative peel: descend a wrapper chain tree-sitter's fixed-depth
@@ -516,6 +525,9 @@ pub fn perl_pack() -> LangPack {
         recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         op_map: &[],
         simple_var_kinds: &[],
+        member_kinds: &[],
+        skip_kinds: &[],
+        call_kinds: &[],
     }
 }
 
@@ -553,9 +565,18 @@ pub fn python_pack() -> LangPack {
         trigger_chars: &["."],
         receiver_names: &["self", "cls"],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
-        recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
+        recv_peel: PeelSpec {
+            wrappers: &[("parenthesized_expression", crate::file_analysis::DerefKind::Pointer)],
+            annot_kinds: &[],
+            leaf_to_def: &[],
+            record_stack: false,
+        },
+        // Python has one member operator (`.`), so no op-DX (op_map empty).
         op_map: &[],
-        simple_var_kinds: &[],
+        simple_var_kinds: &["identifier"],
+        member_kinds: &["attribute"],
+        skip_kinds: &["string", "string_content", "comment", "concatenated_string"],
+        call_kinds: &["call"],
     }
 }
 
@@ -585,6 +606,9 @@ pub fn r_pack() -> LangPack {
         recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         op_map: &[],
         simple_var_kinds: &[],
+        member_kinds: &[],
+        skip_kinds: &[],
+        call_kinds: &[],
     }
 }
 
@@ -627,6 +651,9 @@ pub fn cmake_pack() -> LangPack {
         recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         op_map: &[],
         simple_var_kinds: &[],
+        member_kinds: &[],
+        skip_kinds: &[],
+        call_kinds: &[],
     }
 }
 
@@ -713,6 +740,9 @@ pub fn cpp_pack() -> LangPack {
             (".", crate::file_analysis::MemberOp::Dot),
         ],
         simple_var_kinds: &["identifier"],
+        member_kinds: &["field_expression"],
+        skip_kinds: &["string_literal", "char_literal", "raw_string_literal", "comment"],
+        call_kinds: &["call_expression"],
     }
 }
 

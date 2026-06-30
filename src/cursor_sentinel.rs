@@ -34,55 +34,6 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 /// grammar and vanishingly unlikely to collide with real source.
 pub const SENTINEL: &str = "__CURSOR__";
 
-/// Per-language facts the sentinel walk needs. Everything else is
-/// grammar-agnostic. `member_kinds` are the node kinds that model
-/// `receiver OP member`; in all our grammars the receiver is the first
-/// named child (`receiver_first`), so we don't hard-code field names.
-#[derive(Clone, Copy)]
-pub struct LangCfg {
-    pub member_kinds: &'static [&'static str],
-    /// Node kinds we must NOT splice into (string/char/comment).
-    pub skip_kinds: &'static [&'static str],
-    /// Transparent wrappers a receiver peels through to the same CLASS:
-    /// `(expr)`, `*p` (deref), `&obj` (address-of) all reach the operand's
-    /// members (pointer-/reference-ness is dropped for member resolution).
-    pub wrapper_kinds: &'static [&'static str],
-    /// Call-expression node kinds (cpp `call_expression`, python `call`) — a
-    /// chained-receiver `f().attr` types through the call's inner member.
-    /// Declared so the resolver never hard-codes ONE grammar's call kind.
-    pub call_kinds: &'static [&'static str],
-    /// Simple-variable node kinds (the receiver leaf that types directly).
-    pub simple_var_kinds: &'static [&'static str],
-}
-
-pub const CPP: LangCfg = LangCfg {
-    // `box.m` and `box->m` both parse as field_expression.
-    member_kinds: &["field_expression"],
-    skip_kinds: &["string_literal", "char_literal", "raw_string_literal", "comment"],
-    // `(*p).m`, `(&o)->m`: paren wrap + `*`/`&` are `pointer_expression`.
-    wrapper_kinds: &["parenthesized_expression", "pointer_expression"],
-    call_kinds: &["call_expression"],
-    simple_var_kinds: &["identifier"],
-};
-
-pub const PYTHON: LangCfg = LangCfg {
-    member_kinds: &["attribute"],
-    skip_kinds: &["string", "string_content", "comment", "concatenated_string"],
-    wrapper_kinds: &["parenthesized_expression"],
-    call_kinds: &["call"],
-    simple_var_kinds: &["identifier"],
-};
-
-/// Per-language sentinel config by driver id. `None` = no member-access
-/// cursor context for this language (in-scope completion only).
-pub fn lang_cfg(language: &str) -> Option<&'static LangCfg> {
-    match language {
-        "cpp" => Some(&CPP),
-        "python" => Some(&PYTHON),
-        _ => None,
-    }
-}
-
 /// Byte offset of a `Point` in `src` (Point.column is a byte offset
 /// within its row). The inverse of `byte_to_point`.
 pub fn point_to_byte(src: &str, point: Point) -> usize {
@@ -129,7 +80,7 @@ pub fn patch(src: &str, cursor: usize) -> String {
 
 /// True when `cursor` lands inside a string/char/comment in the ORIGINAL
 /// parse — splicing there would be a no-op at best, corruption at worst.
-fn cursor_in_skip(orig: &Tree, src: &str, cursor: usize, cfg: &LangCfg) -> bool {
+fn cursor_in_skip(orig: &Tree, src: &str, cursor: usize, cfg: &crate::query_extract::LangPack) -> bool {
     // Probe one byte back: at `box.` the cursor is past the `.`, but a
     // cursor that is literally inside `"foo`| sits within the string.
     let probe = cursor.saturating_sub(1).min(src.len().saturating_sub(1));
@@ -157,7 +108,7 @@ fn cursor_in_skip(orig: &Tree, src: &str, cursor: usize, cfg: &LangCfg) -> bool 
 /// the per-language node vocabulary.
 pub fn receiver_at(
     parser: &mut Parser,
-    cfg: &LangCfg,
+    cfg: &crate::query_extract::LangPack,
     src: &str,
     cursor: usize,
 ) -> Option<Receiver> {
@@ -201,7 +152,7 @@ fn find_sentinel<'a>(root: Node<'a>, patched: &str, cursor: usize) -> Option<Nod
 }
 
 /// Walk up from the sentinel to the member-access node that owns it.
-fn climb_to_member<'a>(node: Node<'a>, cfg: &LangCfg) -> Option<Node<'a>> {
+fn climb_to_member<'a>(node: Node<'a>, cfg: &crate::query_extract::LangPack) -> Option<Node<'a>> {
     let mut n = node;
     for _ in 0..6 {
         let parent = n.parent()?;
@@ -255,7 +206,7 @@ fn member_uses_arrow(member: Node, patched: &str) -> bool {
 /// `document.rs` keeps it). Same recovery, a fraction of the work.
 pub fn receiver_at_incremental(
     parser: &mut Parser,
-    cfg: &LangCfg,
+    cfg: &crate::query_extract::LangPack,
     src: &str,
     old: &Tree,
     cursor: usize,
@@ -296,7 +247,7 @@ pub struct MemberCompletionCtx {
 
 pub fn member_completion_ctx_incremental(
     parser: &mut Parser,
-    cfg: &LangCfg,
+    cfg: &crate::query_extract::LangPack,
     src: &str,
     old: &Tree,
     cursor: usize,
@@ -335,7 +286,7 @@ fn operator_fix(
     receiver: Node,
     patched: &str,
     analysis: &FileAnalysis,
-    cfg: &LangCfg,
+    cfg: &crate::query_extract::LangPack,
 ) -> Option<(Span, String)> {
     if !cfg.simple_var_kinds.contains(&receiver.kind()) {
         return None; // only simple-variable receivers carry a resolvable stack
@@ -359,7 +310,7 @@ fn operator_fix(
 /// span through the bag (`expr_type_at_span`).
 fn resolve_node_type(
     node: Node,
-    cfg: &LangCfg,
+    cfg: &crate::query_extract::LangPack,
     src: &str,
     analysis: &FileAnalysis,
     module_index: Option<&dyn CrossFileLookup>,
@@ -391,7 +342,7 @@ fn resolve_node_type(
     // Transparent wrappers — `(expr)`, `*p`, `&obj` — denote the same class
     // as their operand (pointer-/reference-ness dropped). Peel and recurse so
     // `(*p).m` / `(&o)->m` reach the members `p->m` does.
-    if cfg.wrapper_kinds.contains(&node.kind()) {
+    if cfg.recv_peel.wrappers.iter().any(|(k, _)| *k == node.kind()) {
         return resolve_node_type(node.named_child(0)?, cfg, src, analysis, module_index);
     }
     let span = Span { start: node.start_position(), end: node.end_position() };

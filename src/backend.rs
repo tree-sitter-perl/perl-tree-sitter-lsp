@@ -23,10 +23,12 @@ pub fn pack_completion(
     path: Option<&std::path::Path>,
     module_index: &ModuleIndex,
 ) -> Vec<CompletionItem> {
-    if let Some(cfg) = crate::cursor_sentinel::lang_cfg(language) {
-        if let Some(driver) =
-            crate::language_driver::LanguageRegistry::with_enabled().for_id(language)
-        {
+    if let Some(driver) =
+        crate::language_driver::LanguageRegistry::with_enabled().for_id(language)
+    {
+        // ONE lookup: the driver carries the LangPack (the cursor path's
+        // config), `None` for native Perl. No parallel `lang_cfg` registry.
+        if let Some(lang_pack) = driver.lang_pack() {
             // Cross-file resolves against THIS language's sub-index (its
             // own cache — no cross-language overlap), falling back to the
             // hub when none is attached.
@@ -36,7 +38,7 @@ pub fn pack_completion(
             let cursor = crate::cursor_sentinel::point_to_byte(source, point);
             let mut parser = driver.make_parser();
             if let Some(ctx) = crate::cursor_sentinel::member_completion_ctx_incremental(
-                &mut parser, cfg, source, tree, cursor, analysis, Some(xidx),
+                &mut parser, &lang_pack, source, tree, cursor, analysis, Some(xidx),
             ) {
                 if let Some(class) =
                     ctx.receiver_type.and_then(|ty| ty.class_name().map(|s| s.to_string()))

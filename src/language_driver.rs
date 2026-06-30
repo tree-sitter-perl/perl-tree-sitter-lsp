@@ -43,6 +43,14 @@ pub trait LanguageDriver: Send + Sync {
     /// unions them into the LSP `completionProvider` slot, so the client
     /// auto-fires completion (e.g. on `.`/`->`) for the right files.
     fn trigger_chars(&self) -> &[&'static str];
+    /// The language's `LangPack` — the ONE per-language config (grammar facts
+    /// the query engine AND the cursor-completion path both read). `None` for
+    /// the native Perl path (it uses `cursor_context`, not the pack). Lets a
+    /// caller reach the pack through the single `for_id` lookup, no parallel
+    /// `lang_cfg` registry.
+    fn lang_pack(&self) -> Option<crate::query_extract::LangPack> {
+        None
+    }
 }
 
 /// Perl — the reference driver. Wraps the production builder; behaviour
@@ -159,6 +167,9 @@ impl LanguageDriver for PackDriver {
     }
     fn module_paths(&self, module: &str) -> Vec<String> {
         ((self.pack)().module_paths)(module)
+    }
+    fn lang_pack(&self) -> Option<crate::query_extract::LangPack> {
+        Some((self.pack)())
     }
     fn trigger_chars(&self) -> &[&'static str] {
         (self.pack)().trigger_chars
