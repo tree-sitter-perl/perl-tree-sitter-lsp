@@ -38,8 +38,16 @@ ARC 3  Perl-on-query-engine migration (builder.rs shrink) 🔵 fused with ARC 2
        the forcing function — each Flow slice ports a builder shape
        off hand-written CST walking onto declarative `.scm` capture
 
-ARC 4  cpp residual cleanups .......................... ⬜ DEFERRED
-       layering teeth, `==perl`→capabilities, go-live checklist
+ARC 4  cpp LSP experience (was "residual cleanups") .. ⬜ NEXT
+       TWO layers — see docs/cpp-lsp-experience-research.md:
+       (a) PLUMBING: `==perl`→capabilities (un-gate diagnostics
+           `backend.rs:198`, file-watch globs `backend.rs:601`) — cpp
+           can't SHOW a diagnostic until this lands. Prerequisite.
+       (b) DIFFERENTIATORS (flow-aware, where we beat clangd): optional/
+           variant/null narrowing in hover+inlay, use-after-move
+           diagnostic — both consume the narrowing/value-flow tier.
+       Honest line: full overload-resolution lattice / template
+       instantiation / ADL are compiler-grade, OUT of reach (no frontend).
 
 ARC 5  SHIP cpp ...................................... ⬜ THE GOAL
 ```
