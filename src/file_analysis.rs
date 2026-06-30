@@ -842,6 +842,13 @@ pub struct Ref {
     /// name-only fallback (that re-introduces the `->new` over-collect).
     #[serde(default)]
     pub resolved_method_target: Option<MethodTarget>,
+    /// Provenance for a call whose name was constant-folded from a variable
+    /// (`my $m = 'process'; $self->$m()`): the source string literal's
+    /// content span. The call-site token (`$m`) is a non-rewritable variable
+    /// read, so rename can't rewrite it — it follows this edge to rewrite the
+    /// literal `'process'` instead (rule #9). `None` for non-folded refs.
+    #[serde(default)]
+    pub folded_from: Option<Span>,
 }
 
 /// Split a possibly-qualified name into `(Option<package>, basename)`.

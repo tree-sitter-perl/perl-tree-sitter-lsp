@@ -1361,6 +1361,17 @@ fn collect_from_analysis(
                 access: r.access,
                 rewritable: rewritable_at(span),
             });
+            // A call folded from a variable (`my $m = 'process'; $self->$m()`)
+            // has a non-rewritable name token above; the rewrite belongs on the
+            // source string literal the fold came from (rule #9).
+            if let Some(src) = r.folded_from {
+                out.push(RefLocation {
+                    key: key.clone(),
+                    span: src,
+                    access: r.access,
+                    rewritable: rewritable_at(src),
+                });
+            }
         }
     }
 

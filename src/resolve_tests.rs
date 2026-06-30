@@ -3701,6 +3701,42 @@ fn folded_method_dispatch_site_is_non_rewritable() {
     );
 }
 
+/// Const-fold rename provenance (`Ref.folded_from`): renaming the method
+/// `poke` rewrites the SOURCE string literal `my $m = 'poke'` — the folded
+/// call site `$self->$m()` is a non-rewritable variable read, so the literal
+/// is where the new name has to land (else the rename silently drops the
+/// dispatch's only spelling of the name).
+#[test]
+fn folded_method_dispatch_rewrites_source_literal() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/folded_source.pm");
+    let src = "package D;\nsub poke { my $self = shift; return 1; }\n\
+        sub run { my $self = shift; my $m = 'poke'; return $self->$m(); }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 1, column: 4 }, None)
+        .expect("sub poke resolves");
+    let ResolvedTarget::Target(t) = resolved else { panic!("expected a Target, got {resolved:?}") };
+    let refs = refs_to(&store, None, &t, RoleMask::EDITABLE);
+    let lines: Vec<&str> = src.lines().collect();
+    let span_text = |r: &RefLocation| &lines[r.span.start.row][r.span.start.column..r.span.end.column];
+    // The source literal `'poke'` (row 2) must be a rewritable edit covering
+    // exactly the inside-the-quotes name, distinct from the `$m` call token.
+    let source_edit = refs.iter().find(|r| {
+        r.span.start.row == 2 && r.rewritable && span_text(r) == "poke"
+    });
+    assert!(
+        source_edit.is_some(),
+        "renaming `poke` must rewrite the source literal `'poke'` on row 2: {refs:?}",
+    );
+    // The folded `$self->$m()` site stays frozen (renaming it corrupts `$m`).
+    let folded = refs.iter().find(|r| span_text(r).starts_with("$m"));
+    assert!(
+        folded.is_some_and(|r| !r.rewritable),
+        "the folded `$m` dispatch site must NOT be rewritten: {refs:?}",
+    );
+}
+
 /// Over-reach guard: a class that defines its OWN `sub <verb>` (shadowing a
 /// DBIC column-keyed verb name) is NOT column-keyed — the call dispatches to the
 /// user's method, whose hash arg isn't columns. Renaming the column must not

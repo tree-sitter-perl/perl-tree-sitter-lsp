@@ -289,6 +289,7 @@ impl SkeletonAnalysis {
                     access: crate::file_analysis::AccessKind::Read,
                     resolves_to: Some(did),
                     resolved_method_target: None,
+                    folded_from: None,
                 });
             }
         }
@@ -315,6 +316,7 @@ impl SkeletonAnalysis {
                     access: crate::file_analysis::AccessKind::Read,
                     resolves_to: Some(did),
                     resolved_method_target: None,
+                    folded_from: None,
                 });
             }
         }
@@ -349,6 +351,7 @@ impl SkeletonAnalysis {
                     access: crate::file_analysis::AccessKind::Read,
                     resolves_to: None,
                     resolved_method_target: None,
+                    folded_from: None,
                 })
             })
             .collect();

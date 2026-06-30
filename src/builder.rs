@@ -241,6 +241,7 @@ fn build_with_plugins_inner(
         framework_modes: std::collections::HashMap::new(),
         framework_imports: std::collections::HashSet::new(),
         constant_strings: std::collections::HashMap::new(),
+        constant_string_source: std::collections::HashMap::new(),
         declared_constants: std::collections::HashMap::new(),
         export_member_sites: Vec::new(),
         export: Vec::new(),
@@ -1376,6 +1377,13 @@ struct Builder<'a> {
     /// Known compile-time string values, accumulated during the walk.
     /// Keyed by variable/constant name (e.g. "@COMMON", "BASE_CLASS", "$PREFIX").
     constant_strings: std::collections::HashMap<String, Vec<String>>,
+    /// Rename provenance for the const-fold path: for a scalar bound directly
+    /// from a single string literal (`my $m = 'process'`), the literal's
+    /// content span. A call folded through that scalar (`$self->$m()`) stamps
+    /// it as `Ref.folded_from` so rename rewrites the source literal, not the
+    /// `$m` variable read (rule #9). Only the direct single-literal binding is
+    /// recorded — chained / multi-value folds carry no single source span.
+    constant_string_source: std::collections::HashMap<String, Span>,
     /// Names declared via `use constant` (NAME and block forms), per the
     /// enclosing package. A standalone bareword whose text is in this set is
     /// a usage of the constant sub, so it earns a `FunctionCall` ref back to
@@ -2099,6 +2107,7 @@ impl<'a> Builder<'a> {
             access,
             resolves_to: None,
             resolved_method_target: None,
+            folded_from: None,
         });
     }
 
@@ -3299,6 +3308,7 @@ impl<'a> Builder<'a> {
                     access,
                     resolves_to: None,
                     resolved_method_target: None,
+                    folded_from: None,
                 });
             }
             plugin::EmitAction::Handler {
@@ -3377,6 +3387,7 @@ impl<'a> Builder<'a> {
                     access: AccessKind::Read,
                     resolves_to: None,
                     resolved_method_target: None,
+                    folded_from: None,
                 });
                 if let Some(c) = invocant_class {
                     self.method_call_invocant.insert(ref_idx, c);
@@ -3403,6 +3414,7 @@ impl<'a> Builder<'a> {
                         access: AccessKind::Read,
                         resolves_to: None,
                         resolved_method_target: None,
+                        folded_from: None,
                     });
                 }
             }
@@ -6438,6 +6450,8 @@ impl<'a> Builder<'a> {
                             // Plain string literal
                             if let Some(text) = self.extract_string_content(right) {
                                 self.constant_strings.insert(var.to_string(), vec![text]);
+                                self.constant_string_source
+                                    .insert(var.to_string(), self.string_content_span(right));
                             }
                         }
                     }
@@ -8435,6 +8449,7 @@ impl<'a> Builder<'a> {
                 access: AccessKind::Read,
                 resolves_to: None,
                 resolved_method_target: None,
+                folded_from: None,
             });
         }
     }
@@ -8556,6 +8571,7 @@ impl<'a> Builder<'a> {
                                 access: AccessKind::Read,
                                 resolves_to: None,
                                 resolved_method_target: None,
+                                folded_from: None,
                             });
                         }
                     }
@@ -8592,6 +8608,7 @@ impl<'a> Builder<'a> {
                                     access: AccessKind::Read,
                                     resolves_to: None,
                                     resolved_method_target: None,
+                                    folded_from: None,
                                 });
                             }
                         }
@@ -8609,6 +8626,7 @@ impl<'a> Builder<'a> {
                                 access: AccessKind::Read,
                                 resolves_to: None,
                                 resolved_method_target: None,
+                                folded_from: None,
                             });
                         }
                     }
@@ -10659,6 +10677,12 @@ impl<'a> Builder<'a> {
             // Dynamic method dispatch: $self->$method() — resolve $method if known
             if name.starts_with('$') {
                 if let Some(resolved) = self.resolve_constant_strings(name, 0) {
+                    // The call token is the `$m` read, not a name literal — its
+                    // rewrite target is the source string the fold came from. Only
+                    // a single-literal binding has one unambiguous source span.
+                    let folded_src = (resolved.len() == 1)
+                        .then(|| self.constant_string_source.get(name).copied())
+                        .flatten();
                     for rname in resolved {
                         let idx = self.refs.len();
                         self.add_ref(
@@ -10672,6 +10696,7 @@ impl<'a> Builder<'a> {
                             rname,
                             AccessKind::Read,
                         );
+                        self.refs[idx].folded_from = folded_src;
                         if let Some(c) = invocant_class.clone() {
                             self.method_call_invocant.insert(idx, c);
                         }
@@ -11931,6 +11956,7 @@ impl<'a> Builder<'a> {
                 access: AccessKind::Write,
                 resolves_to: None,
                 resolved_method_target: None,
+                folded_from: None,
             });
         }
     }
@@ -12057,6 +12083,7 @@ impl<'a> Builder<'a> {
                 access,
                 resolves_to: None,
                 resolved_method_target: None,
+                folded_from: None,
             });
         }
     }
@@ -13210,6 +13237,7 @@ impl<'a> Builder<'a> {
                 access,
                 resolves_to: None,
                 resolved_method_target: None,
+                folded_from: None,
             });
         }
     }

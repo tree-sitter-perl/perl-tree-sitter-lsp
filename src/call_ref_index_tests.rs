@@ -326,6 +326,7 @@ fn equal_span_first_write_wins() {
             access: AccessKind::Read,
             resolves_to: None,
             resolved_method_target: None,
+            folded_from: None,
         },
         Ref {
             kind: RefKind::MethodCall {
@@ -346,6 +347,7 @@ fn equal_span_first_write_wins() {
             access: AccessKind::Read,
             resolves_to: None,
             resolved_method_target: None,
+            folded_from: None,
         },
     ];
 
