@@ -109,3 +109,11 @@ the false positive.
   `defined` predicates; a `ref($x) eq 'HASH'` guard on an
   already-hash-shaped subject is recognized but not yet folded to a
   verdict. Same shape as the class case, on `RepKind` instead of MRO.
+- **DBIC column hash-deref (`$row->{col}`).** `$row->{col}` where `$row` is
+  a DBIC Result class and `col` is one of its `Bridged` columns — a column
+  isn't a hash slot, so the deref is `undef` (the author meant `$row->col`).
+  Same thesis (ask the invocant type; the row answers "my columns aren't
+  slots"); the detection seam is TODO-marked in `collect_diagnostics`.
+  **Blocked on HashRefInflator tracking**: with a `HashRefInflator` result
+  class, find/search return plain hashrefs where `$row->{col}` IS valid, and
+  we don't model that override yet — so the warning must gate on NOT-HRI first.

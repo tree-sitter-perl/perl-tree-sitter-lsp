@@ -8,9 +8,9 @@
 //! - `=>` is a comma that autoquotes its LHS — pair walking
 //!   ([`pair_nodes`]) is separator-agnostic by construction, so the
 //!   plain-comma spelling can't be silently dropped.
-//! - tree-sitter-perl nests pair tails right-associatively (`a => 1, b => 2`
-//!   parses as `a, 1, (b, 2)`) — [`flatten_list`] splices the trailing
-//!   wrapper so a linear scan sees every pair.
+//! - a plain comma list is flat (tree-sitter-perl ≥1.1.4), but EXPLICIT parens
+//!   still nest a sub-list (`a => (b => c)` → `a, (b, c)`) — [`flatten_list`]
+//!   splices the wrapper so a linear scan sees every pair.
 //! - call arguments may arrive as a bare node or a `list_expression` /
 //!   `parenthesized_expression` — [`call_args`] always yields the flat
 //!   positional sequence.
@@ -178,13 +178,12 @@ pub(crate) fn call_args<'a>(call_node: Node<'a>) -> Vec<Node<'a>> {
 }
 
 /// Flatten a pair-list container's children into one token stream, splicing
-/// EVERY nested `list_expression` / `parenthesized_expression` inline.
-/// `a => 1, b => 2` parses with its tail pairs tucked into a right-associative
-/// trailing `list_expression`, and explicit parens (`a => (b => c)`) add more
-/// nesting — but both constructs are pure *grouping* in Perl: a bare list
-/// always flattens into its surroundings (`key => (a, b)` IS `key, a, b`; the
-/// grouped-value spelling is the ref `[a, b]`). So we descend them wherever
-/// they appear, not just trailing, yielding the flat sibling sequence a
+/// EVERY nested `list_expression` / `parenthesized_expression` inline. A plain
+/// comma list is already flat (tree-sitter-perl ≥1.1.4), but explicit parens
+/// (`a => (b => c)`) still nest a sub-list — and that's pure *grouping* in Perl:
+/// a bare list always flattens into its surroundings (`key => (a, b)` IS
+/// `key, a, b`; the grouped-value spelling is the ref `[a, b]`). So we descend
+/// nested groups wherever they appear, yielding the flat sibling sequence a
 /// single linear scan can pair over. Ref literals (`[...]`, `{...}`) are NOT
 /// groups and stay whole.
 pub(crate) fn flatten_list<'a>(list: Node<'a>, out: &mut Vec<Node<'a>>) {

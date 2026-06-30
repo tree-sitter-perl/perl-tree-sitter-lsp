@@ -13,7 +13,10 @@ The motivation: scope plugin-synthesized dispatch to the right
 *instance* so the LSP doesn't merge across co-resident objects —
 `$a->enqueue('tb')` shouldn't reach `$b`'s task; `$app->minion` and
 `$app->other_minion` are different queues; two Mojo::Lite apps in one
-workspace shouldn't see each other's helpers.
+workspace shouldn't see each other's helpers. That last case shares its
+root with `main::`-global scoping — both need to know which *program* a
+file belongs to (`docs/prompt-entrypoint-analysis.md`); instance brands
+are the per-object refinement on top of that file→program assignment.
 
 **A spike was built and then closed (PRs #65/#66, branches
 `branded-edges` / `branded-edges-accessor`, kept for reference).** It is

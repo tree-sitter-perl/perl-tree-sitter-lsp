@@ -5,16 +5,17 @@
 //     __PACKAGE__->has_many(comments => 'Schema::Result::Comment', 'post_id');
 //     __PACKAGE__->belongs_to(author => 'Schema::Result::User');
 //
-// A column installs an accessor + a HashKeyDef (so `$rs->search({ name => ... })`
-// and `$row->{name}` resolve it). A relationship installs an accessor whose
-// return names the related shape: has_many / many_to_many → a ResultSet,
-// belongs_to / has_one / might_have → the row class.
+// A column installs an accessor + a `Bridged` HashKeyDef, so `$row->name` and
+// the condition args `$rs->search({ name => ... })` resolve it — but NOT
+// `$row->{name}`: a column isn't a hash slot (it's undef in DBIC). A
+// relationship installs an accessor whose return names the related shape:
+// has_many / many_to_many → a ResultSet, belongs_to / has_one / might_have → row.
 //
 // Core feeds the flat arg names in `ctx.arg_names`; this plugin owns the verb
 // vocabulary. `ClassIsa("DBIx::Class")` scopes synthesis to result classes at
 // any depth. `load_components` parent registration stays core (generic mixin
-// machinery). Parametric ResultSet typing (per-method `find` → row) is
-// follow-up; accessor + plain typed return is the load-bearing 80%.
+// machinery). `fluent_verbs` carry a resultset through `$rs->search`, so
+// `RowOf`/`find` compose a `$rs->find->col` chain; relationship typing is plain.
 
 fn id() { "dbic" }
 
@@ -28,6 +29,27 @@ fn arg_name_verbs() {
      "belongs_to", "has_one", "might_have"]
 }
 
+// Resultset/row verbs whose FIRST hashref arg is keyed by COLUMN names — the
+// `\%cond` of `search(\%cond, \%attrs)`, the `\%cols` of `create`/`update`.
+// Core links those keys to the class's columns (so renaming a column rewrites
+// them) and, crucially, walks ONLY the first hashref: the trailing `\%attrs`
+// hash (`order_by`/`rows`/`group_by`/…) is NOT column-keyed and stays out.
+// Owning the verb list here (not in core) keeps core from hardcoding DBIC's API.
+fn column_keyed_verbs() {
+    ["search", "search_rs", "find", "find_or_create", "find_or_new",
+     "update", "update_or_create", "create", "new", "count", "single"]
+}
+
+// Fluent verbs — the call returns the invocant's type UNCHANGED, so they only
+// apply to an actual resultset (`$rs->search` → a same-row resultset). DBIC has
+// no `Class->search`: search/find live on the resultset, which only comes from
+// `$schema->resultset('X')` (typed separately). Core re-publishes the invocant's
+// `Parametric(ResultSet{row})`; `RowOf`/`find` then compose the rest (`$rs->find`
+// → a row). Verb→return-shape is DBIC's, so it lives here.
+fn fluent_verbs() {
+    ["search", "search_rs"]
+}
+
 fn is_resultset_rel(verb) {
     verb == "has_many" || verb == "many_to_many"
 }
@@ -36,8 +58,8 @@ fn is_row_rel(verb) {
     verb == "belongs_to" || verb == "has_one" || verb == "might_have"
 }
 
-// A column accessor: a get/set Method plus the HashKeyDef owned by the
-// result class (constructor / search / direct-deref key resolution).
+// A column accessor: a get/set Method plus a `Bridged` HashKeyDef (resolves the
+// search-condition / constructor arg keys — never a `$row->{col}` deref).
 fn column_actions(name, span, pkg) {
     let out = [];
     out += #{
@@ -59,7 +81,9 @@ fn column_actions(name, span, pkg) {
         out += #{
             HashKeyDef: #{
                 name: name,
-                owner: #{ Class: pkg },
+                // A column lives in its own owner namespace, NOT as a `$row->{col}`
+                // hash slot (undef in DBIC) — `owner_bridged`, not `Class`.
+                owner: owner_bridged(pkg),
                 span: span,
                 selection_span: span,
             }

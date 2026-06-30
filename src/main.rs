@@ -775,7 +775,7 @@ fn run_one(
             analysis.enrich_imported_types_with_keys(Some(idx));
             let file_path = std::path::Path::new(file).canonicalize()
                 .unwrap_or_else(|_| std::path::PathBuf::from(file));
-            let resolved = resolve::resolve_symbol(&analysis, point, Some(idx));
+            let resolved = resolve::resolve_symbol_scoped(&analysis, point, Some(idx), override_scope_from_env());
             let mut sources = SourceCache::new();
             let mut results = Vec::new();
             match resolved {
@@ -1052,6 +1052,17 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
     serde_json::to_string_pretty(&results).unwrap()
 }
 
+/// The override-fan-out scope for CLI references/rename, from
+/// `PERL_LSP_RENAME_SCOPE` (`hierarchy` | `dispatch`). Mirrors the LSP
+/// `initializationOptions.rename.overrideScope`; absent = the `hierarchy`
+/// default. Lets the gold harness exercise both modes per row.
+fn override_scope_from_env() -> resolve::OverrideScope {
+    std::env::var("PERL_LSP_RENAME_SCOPE")
+        .ok()
+        .map(|s| resolve::OverrideScope::from_option(&s))
+        .unwrap_or_default()
+}
+
 /// Cross-file rename edit-set as the pretty-JSON object string (shared by
 /// `cli_rename` and `run_one`). `file` is the originating file; `point` the cursor.
 fn run_rename(
@@ -1062,11 +1073,14 @@ fn run_rename(
     new_name: &str,
 ) -> Result<String, String> {
     use std::collections::HashMap;
+    if !resolve::is_valid_rename_name(new_name) {
+        return Err("rename: the new name must not be empty or whitespace".to_string());
+    }
     let file_path = std::path::Path::new(file).canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(file));
     let (_s, _t, mut analysis) = parse_file(file);
     analysis.enrich_imported_types_with_keys(Some(idx));
-    let resolved = resolve::resolve_symbol(&analysis, point, Some(idx))
+    let resolved = resolve::resolve_symbol_scoped(&analysis, point, Some(idx), override_scope_from_env())
         .ok_or_else(|| format!("Nothing renameable at {}:{}", point.row, point.column))?;
     let mut all_edits: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     let (locations, replacement) = match resolved {
@@ -1107,6 +1121,11 @@ fn run_rename(
         }
     };
     for loc in locations {
+        // A non-rewritable site (a const-folded event name spelled by a
+        // variable) is a reference, not a renameable literal — skip it.
+        if !loc.rewritable {
+            continue;
+        }
         let path = match &loc.key {
             file_store::FileKey::Path(p) => p.display().to_string(),
             file_store::FileKey::Url(u) => u.to_file_path()

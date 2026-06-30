@@ -51,10 +51,18 @@ fn resolve_event(ctx) {
     }
     if owner_class == () { return (); }
 
+    // Prefer the string-content span (inside the quotes) so rename rewrites
+    // just `connect`, not `'connect'` (a bareword replacement would strip the
+    // quotes). A const-folded name (`$evt`) has no content span; its arg span
+    // is the variable token — `refs_to` flags that site non-rewritable so
+    // rename skips it (no literal to rewrite) while references still sees it.
+    let nspan = args[0].content_span;
+    if nspan == () { nspan = args[0].span; }
+
     #{
         name: name,
         owner: #{ Class: owner_class },
-        name_span: args[0].span,
+        name_span: nspan,
     }
 }
 

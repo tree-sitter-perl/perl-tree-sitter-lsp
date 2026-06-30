@@ -5377,7 +5377,7 @@ sub run {
                 owner: HandlerOwner::Class("Producer".to_string()),
                 name: "ready".to_string(),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -9385,7 +9385,7 @@ $minion->enqueue(task_x => ['arg'] => { });
     }
 
     // Completion path surfaces the plugin's HashKeyDefs.
-    let candidates = fa.complete_hash_keys_for_sub("enqueue", cursor);
+    let candidates = fa.complete_hash_keys_for_sub("enqueue", cursor, None);
     let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
     for expected in &["priority", "queue", "delay", "attempts"] {
         assert!(
@@ -9994,6 +9994,82 @@ print \"v=$version\\n\";
 /// cursor-on-key resolves to the `has`-emitted HashKeyDef
 /// instead of the broad MethodCall ref. Gated on a matching
 /// HashKeyDef existing — emission would otherwise shadow the
+/// A lexical hash key (`my %h = (k => …); $h{k}`) is one renameable unit: the
+/// literal def, every `$h{k}` access AND write rewrite together — single-file,
+/// scoped to the `%h` declaration. A different hash's same-named key (`%other`,
+/// or a shadowing `%h`) is NOT touched.
+#[test]
+fn lexical_hash_key_renames_literal_and_accesses_in_scope() {
+    let fa = build_fa(
+        "my %opts = (timeout => 30, retries => 3);\n\
+         my %other = (timeout => 9);\n\
+         my $t = $opts{timeout};\n\
+         $opts{timeout} = 60;\n\
+         print $other{timeout};\n",
+    );
+    // Cursor on the `$opts{timeout}` access (row 2).
+    let col = "my $t = $opts{".len();
+    let edits = fa.rename_at(tree_sitter::Point { row: 2, column: col }, "DELAY").expect("renameable");
+    let rows: std::collections::BTreeSet<usize> = edits.iter().map(|(s, _)| s.start.row).collect();
+    // %opts literal (0), access (2), write (3) — NOT %opts's `retries`, NOT %other (1, 4).
+    assert_eq!(
+        rows,
+        [0, 2, 3].into_iter().collect(),
+        "literal + access + write of %opts.timeout only: {edits:?}",
+    );
+    assert!(
+        edits.iter().all(|(_, t)| t == "DELAY"),
+        "every edit writes the new key name",
+    );
+}
+
+/// A lexical hashref scalar (`my $h = { k => … }; $h->{k}`) gets the same
+/// renameable-unit treatment as `my %h`: the literal def + every `$h->{k}`
+/// deref rename together, scoped to the `my $h` declaration. (`$h = {…}` takes a
+/// hashref; `%h = {…}` would be an uneven-list bug and emits nothing — the RHS
+/// shape is sigil-keyed.)
+#[test]
+fn lexical_hashref_scalar_renames_literal_and_derefs() {
+    let src = "my $cfg = { host => 'h', port => 8080 };\n\
+my $h = $cfg->{host};\n\
+print $cfg->{host};\n";
+    let fa = build_fa(src);
+    let col = src.lines().nth(1).unwrap().find("host").unwrap();
+    let edits = fa
+        .rename_at(tree_sitter::Point { row: 1, column: col }, "HOST")
+        .expect("renameable");
+    let rows: std::collections::BTreeSet<usize> = edits.iter().map(|(s, _)| s.start.row).collect();
+    // literal def (0) + both `$cfg->{host}` derefs (1, 2); `port` untouched.
+    assert_eq!(rows, [0, 1, 2].into_iter().collect(), "literal + 2 derefs: {edits:?}");
+    assert!(edits.iter().all(|(_, t)| t == "HOST"), "every edit writes the new key");
+}
+
+/// A QUOTED call-arg key (`{ "name", 2 }`) emits its `HashKeyAccess` at the
+/// string CONTENT span, not the whole literal — so rename keeps the quotes
+/// (rewriting them yields a bareword, a `strict subs` error in a comma list).
+#[test]
+fn quoted_call_arg_key_span_is_content_not_quotes() {
+    let src = "package R;\n\
+        use base 'DBIx::Class::Core';\n\
+        __PACKAGE__->add_columns(qw/name/);\n\
+        sub b { my $s = shift; $s->search({ \"name\", 2 }); }\n1;\n";
+    let fa = build_fa(src);
+    let r = fa
+        .refs
+        .iter()
+        .find(|r| {
+            r.target_name == "name"
+                && matches!(r.kind, RefKind::HashKeyAccess { .. })
+                && r.span.start.row == 3
+        })
+        .expect("quoted key emits a HashKeyAccess on row 3");
+    assert_eq!(
+        r.span.end.column - r.span.start.column,
+        4,
+        "span covers the 4-char content `name`, not the 6-char `\"name\"`: {r:?}",
+    );
+}
+
 /// `class Foo { field $x :param }` `find_param_field`
 /// fallback. e2e `rename: 'name' constructor arg` was the
 /// surfacing failure.
@@ -10729,7 +10805,7 @@ sub action {
     // so this stays a soft observation for the spike rather than a
     // hard assert. The load-bearing claim is the array hop, not the
     // FA-side hash-key API.
-    let keys = app_fa.complete_hash_keys_for_class("Some::User", Point::new(0, 0));
+    let keys = app_fa.complete_hash_keys_for_class("Some::User", Point::new(0, 0), None);
     let key_names: std::collections::HashSet<&str> =
         keys.iter().map(|c| c.label.as_str()).collect();
     let _ = key_names; // intentionally not asserted in the spike
@@ -11865,7 +11941,7 @@ fn sub_exporter_member_goto_def_and_references() {
             kind: TargetKind::Sub {
                 package: Some("My::Exp".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -12513,7 +12589,7 @@ sub go {
             &TargetRef {
                 name: name.to_string(),
                 kind: TargetKind::Sub { package: Some("Foo".to_string()) },
-                method_classes: Vec::new(),
+                method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
             },
             RoleMask::EDITABLE,
         );
@@ -12631,7 +12707,7 @@ sub go {
             &TargetRef {
                 name: name.to_string(),
                 kind: TargetKind::Sub { package: Some("Foo".to_string()) },
-                method_classes: Vec::new(),
+                method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
             },
             RoleMask::EDITABLE,
         );
@@ -13398,7 +13474,7 @@ sub retry {
             kind: TargetKind::Sub {
                 package: Some("QA::C".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );
@@ -13518,7 +13594,7 @@ sub opt_b { 'b' }
             kind: TargetKind::Sub {
                 package: Some("QA::E".to_string()),
             },
-            method_classes: Vec::new(),
+            method_classes: Vec::new(), scope: crate::resolve::OverrideScope::Dispatch,
         },
         RoleMask::EDITABLE,
     );

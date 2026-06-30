@@ -310,6 +310,24 @@
       "note": "fluent setter returns $self -> Mojo::URL."
     },
     {
+      "id": "hover-mojo-controller-url-for-narrowed",
+      "difficulty": "tricky",
+      "semantic_area": "type-inference",
+      "file": "Mojolicious/Controller.pm",
+      "line": 271,
+      "col": 4,
+      "expect": {
+        "all": [
+          "sub url_for {",
+          "package Mojolicious::Controller",
+          "returns: Mojo::URL"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "url_for (the Mojo helper) statically returns a definitive Mojo::URL. Three return arms: two `Mojo::URL->new(...)` constructors and an early `return $target` guarded by `blessed $target && $target->isa('Mojo::URL')`. The satisfying part is the guard narrowing: that arm contributes Mojo::URL (not $target's general `String`), so the multi-arm fold (return_arms reducer) sees all arms agree -> Mojo::URL. Without return-arm isa-narrowing the $target arm disagrees and the fold collapses to a garbage/None fallback. Locks in the narrowing -> no regression to pre-narrowing inference."
+    },
+    {
       "id": "hover-mojo-url-clone-via-new",
       "difficulty": "tricky",
       "semantic_area": "chain",

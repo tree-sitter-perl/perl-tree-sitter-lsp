@@ -20,11 +20,24 @@ pub struct Backend {
     /// so readers lock only to copy it out — never across an await. All
     /// default off; the always-on hints ignore these.
     diag_options: Arc<std::sync::Mutex<symbols::DiagnosticOptions>>,
+    /// `initializationOptions.rename.overrideScope`: when set to `"dispatch"`,
+    /// method-override references/rename use the precise dispatch scope instead
+    /// of the default whole-hierarchy family. Set once at init.
+    dispatch_override: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Backend {
     fn diagnostic_options(&self) -> symbols::DiagnosticOptions {
         *self.diag_options.lock().unwrap()
+    }
+
+    /// The configured method-override fan-out scope for references + rename.
+    fn override_scope(&self) -> crate::resolve::OverrideScope {
+        if self.dispatch_override.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::resolve::OverrideScope::Dispatch
+        } else {
+            crate::resolve::OverrideScope::Hierarchy
+        }
     }
 }
 
@@ -81,6 +94,7 @@ impl Backend {
             client,
             files,
             diag_options,
+            dispatch_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -162,6 +176,12 @@ fn locations_to_workspace_edit(
     let mut all_changes: std::collections::HashMap<Url, Vec<TextEdit>> =
         std::collections::HashMap::new();
     for loc in locations {
+        // Skip non-rewritable sites (a const-folded event name spelled by a
+        // variable): it's a reference, not a literal to rewrite. References
+        // (`refs_to_locations`) keeps it; only rename drops it.
+        if !loc.rewritable {
+            continue;
+        }
         if let Some(uri) = loc.to_url() {
             all_changes.entry(uri).or_default().push(TextEdit {
                 range: symbols::span_to_range(loc.span),
@@ -225,12 +245,10 @@ impl LanguageServer for Backend {
         crate::plugin::rhai_host::set_workspace_root(root);
 
         // Opt-in diagnostics from `initializationOptions.diagnostics`.
-        // `{ "diagnostics": { "unresolvedDispatch": true } }` enables the
-        // QA/plugin-author `unresolved-dispatch` channel; absent = off.
         // The `diagnostics` sub-object deserializes straight into
         // `DiagnosticOptions` (the struct is the schema — camelCase keys,
-        // absent ones default to false). A malformed value leaves the
-        // defaults in place rather than failing initialize.
+        // absent ones default to false, e.g. `unresolvedDispatch`). A malformed
+        // value leaves the defaults in place rather than failing initialize.
         if let Some(diag) = params
             .initialization_options
             .as_ref()
@@ -241,6 +259,19 @@ impl LanguageServer for Backend {
             {
                 *self.diag_options.lock().unwrap() = parsed;
             }
+        }
+        // `{ "rename": { "overrideScope": "dispatch" } }` opts into the precise
+        // method-override scope; absent / "hierarchy" = the default whole-family
+        // refactor. (Separate from `diagnostics` — a rename concern.)
+        if let Some(opts) = &params.initialization_options {
+            let dispatch = opts
+                .get("rename")
+                .and_then(|r| r.get("overrideScope"))
+                .and_then(|v| v.as_str())
+                .map(|s| matches!(crate::resolve::OverrideScope::from_option(s), crate::resolve::OverrideScope::Dispatch))
+                .unwrap_or(false);
+            self.dispatch_override
+                .store(dispatch, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(InitializeResult {
@@ -510,10 +541,10 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        use crate::resolve::{group_refs, refs_to, resolve_symbol, ResolvedTarget};
+        use crate::resolve::{group_refs, refs_to, resolve_symbol_scoped, ResolvedTarget};
 
         let point = symbols::position_to_point(pos);
-        let target = match resolve_symbol(&doc.analysis, point, Some(&*self.module_index)) {
+        let target = match resolve_symbol_scoped(&doc.analysis, point, Some(&*self.module_index), self.override_scope()) {
             Some(ResolvedTarget::Target(t)) => t,
             Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => {
                 let origin = FileKey::Url(uri.clone());
@@ -555,11 +586,33 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
+        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
         let doc = match self.files.get_open(&params.text_document.uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
         let point = symbols::position_to_point(params.position);
+        // Only offer a rename box where `rename` would actually produce edits.
+        // Accepting on any `symbol_at`/`ref_at` hit is a UX trap: positions like
+        // `@_` or an ownerless constructor key resolve to nothing renameable, so
+        // the user gets a box that silently no-ops. Mirror the rename handler's
+        // branching, probing the single-file `rename_at` for the kinds it routes
+        // there — which is why this gate tracks new single-file renameables (a
+        // lexical hash key) automatically, with no change here.
+        let renameable = match resolve_symbol_scoped(
+            &doc.analysis,
+            point,
+            Some(&*self.module_index),
+            self.override_scope(),
+        ) {
+            Some(ResolvedTarget::Target(t)) if t.supports_cross_file_rename() => true,
+            Some(ResolvedTarget::Group { .. }) => true,
+            Some(_) => doc.analysis.rename_at(point, "x").is_some_and(|e| !e.is_empty()),
+            None => false,
+        };
+        if !renameable {
+            return Ok(None);
+        }
         if let Some(sym) = doc.analysis.symbol_at(point) {
             return Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
                 range: symbols::span_to_range(sym.selection_span),
@@ -576,18 +629,23 @@ impl LanguageServer for Backend {
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        use crate::resolve::{resolve_symbol, ResolvedTarget};
+        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
 
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let new_name = &params.new_name;
+        if !crate::resolve::is_valid_rename_name(new_name) {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "rename: the new name must not be empty or whitespace",
+            ));
+        }
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
 
         let point = symbols::position_to_point(pos);
-        match resolve_symbol(&doc.analysis, point, Some(&*self.module_index)) {
+        match resolve_symbol_scoped(&doc.analysis, point, Some(&*self.module_index), self.override_scope()) {
             Some(ResolvedTarget::Target(target)) if target.supports_cross_file_rename() => {
                 drop(doc);
                 Ok(rename_via_refs_to(&self.files, Some(&*self.module_index), &target, new_name))
