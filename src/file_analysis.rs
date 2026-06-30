@@ -3636,8 +3636,8 @@ impl FileAnalysis {
         // load-bearing piece: a consumer's `$cfg->{host}` access must carry the
         // SAME owner the producer's `host` HashKeyDef does
         // (`Sub{Some("Cfg"), get_config}`), or cross-file rename/references
-        // never link the two. Dropping it to `None` (the old default) was a
-        // lossy projection of a package the index already knows.
+        // never link the two. `None` here is a lossy projection of a package
+        // the index already knows.
         let mut imported_hash_keys: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
         let mut imported_returns: HashMap<String, InferredType> = HashMap::new();
         if let Some(idx) = module_index {
@@ -5955,6 +5955,43 @@ impl FileAnalysis {
                 SymKind::HashKeyDef => Some(RenameKind::HashKey(sym.name.clone())),
                 _ => None,
             };
+        }
+        None
+    }
+
+    /// If the cursor sits on an `our` (package-global) variable — its decl, an
+    /// unqualified read that resolves to it, or a qualified `$Pkg::var` access
+    /// — return `(package, sigil-name)` (e.g. `("Cfg", "$debug")`). `None` for
+    /// lexical `my` vars (single-file) and non-variables. Drives the cross-file
+    /// `PackageVar` rename target: a package global is reachable everywhere as
+    /// `$Pkg::var`, so renaming it is a cross-file refactor, where a lexical
+    /// `my` stays the single-file `Local` path.
+    pub fn package_var_at(&self, point: Point) -> Option<(String, String)> {
+        // `$::x` / `$main::x` both name the `main` global; the `our` decl's
+        // package is "main", so normalize the empty (leading-`::`) spelling.
+        let norm = |p: &str| if p.is_empty() { "main".to_string() } else { p.to_string() };
+        if let Some(r) = self.ref_at(point) {
+            if matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) {
+                // Qualified `$Pkg::var` — the package is explicit in the token.
+                if let Some((pkg, name)) = r.qualified_var_target() {
+                    return Some((norm(pkg), name));
+                }
+                // Unqualified — a package var only if it resolves to an `our`.
+                let sym = r
+                    .resolves_to
+                    .map(|id| self.symbol(id))
+                    .or_else(|| self.resolve_variable(&r.target_name, point));
+                if let Some(s) = sym {
+                    if let SymbolDetail::Variable { decl_kind: DeclKind::Our, .. } = s.detail {
+                        return Some((norm(s.package.as_deref()?), s.name.clone()));
+                    }
+                }
+            }
+        }
+        if let Some(s) = self.symbol_at(point) {
+            if let SymbolDetail::Variable { decl_kind: DeclKind::Our, .. } = s.detail {
+                return Some((norm(s.package.as_deref()?), s.name.clone()));
+            }
         }
         None
     }
@@ -8289,9 +8326,9 @@ impl FileAnalysis {
 
     /// `(producer package, return-hash keys)` of an imported sub, resolved
     /// cross-file through the index. The producer's real `HashKeyDef`s are the
-    /// single source — enrichment no longer materializes a consumer-side stub,
-    /// so completion reads keys here and the deferred owner reads the package,
-    /// exactly as rename/references/goto-def reach them via the owner edge.
+    /// single source: completion reads keys here and the deferred owner reads
+    /// the package, exactly as rename/references/goto-def reach them via the
+    /// owner edge — no consumer-side stub is materialized.
     fn imported_sub_keys(
         &self,
         sub_name: &str,

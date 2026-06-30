@@ -202,8 +202,15 @@ fn on_function_call(ctx) {
             }
 
             // Resolve the method name: shorthand derives from the attr, an
-            // explicit string is used verbatim.
+            // explicit string is used verbatim. Anchor point matters for rename:
+            // an explicit string IS where the method name is written, so the
+            // method's decl span is that string — renaming the attr (when the
+            // name embeds it) then rewrites the defining string too, not just
+            // the call sites (else Moo keeps minting `has_size` while callers
+            // say `has_dim`). The `=> 1` derived name has no string; Moo
+            // regenerates it from the attr at runtime, so the attr span is right.
             let name = ();
+            let name_span = span;
             if is_shorthand(val) {
                 if kw == "predicate" { name = derive_name("has_", attr); }
                 else if kw == "clearer" { name = derive_name("clear_", attr); }
@@ -211,6 +218,8 @@ fn on_function_call(ctx) {
                 // writer/reader have no `=> 1` shorthand in Moo.
             } else if val.Str != () {
                 name = val.Str;
+                name_span = if opt.value_content_span != () { opt.value_content_span }
+                            else { opt.value_span };
             }
             if name == () { continue; }
 
@@ -219,7 +228,7 @@ fn on_function_call(ctx) {
             if kw == "writer" || kw == "accessor" {
                 params = [ #{ name: "$val", "default": (), is_slurpy: false, is_invocant: false } ];
             }
-            out += plain_method(name, span, params, attr);
+            out += plain_method(name, name_span, params, attr);
         }
     }
 

@@ -12033,7 +12033,13 @@ impl<'a> Builder<'a> {
                             if name != &ref_target { return false; }
                             if *decl_point > ref_span_start { return false; }
                             match gating_package {
-                                Some(decl_pkg) => use_pkg.as_deref() == Some(decl_pkg.as_str()),
+                                // A package-less script (no `package` stmt) puts
+                                // both the `our` decl and bare uses in the default
+                                // `main`, but `package_at_pos` yields `None` there
+                                // — so an absent enclosing package reads as `main`.
+                                Some(decl_pkg) => {
+                                    use_pkg.as_deref().unwrap_or("main") == decl_pkg.as_str()
+                                }
                                 None => true,
                             }
                         })

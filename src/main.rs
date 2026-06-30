@@ -1075,6 +1075,9 @@ fn run_rename(
     new_name: &str,
 ) -> Result<String, String> {
     use std::collections::HashMap;
+    if !resolve::is_valid_rename_name(new_name) {
+        return Err("rename: the new name must not be empty or whitespace".to_string());
+    }
     let file_path = std::path::Path::new(file).canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(file));
     let (_s, _t, mut analysis) = parse_file(file);

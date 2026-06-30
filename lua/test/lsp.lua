@@ -129,6 +129,12 @@ function M.rename(buf, line, col, new_name)
   return M.request(buf, "textDocument/rename", params)
 end
 
+--- prepareRename at (line, col). Returns the range+placeholder response, or
+--- nil when the server declines (the position isn't renameable).
+function M.prepare_rename(buf, line, col)
+  return M.request(buf, "textDocument/prepareRename", M.pos_params(buf, line, col))
+end
+
 --- Apply a WorkspaceEdit to the current buffer.
 function M.apply_workspace_edit(edit)
   vim.lsp.util.apply_workspace_edit(edit, "utf-16")

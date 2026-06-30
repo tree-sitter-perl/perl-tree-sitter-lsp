@@ -129,6 +129,7 @@ impl TargetRef {
                 | TargetKind::Package
                 | TargetKind::HashKeyOfSub { .. }
                 | TargetKind::Handler { .. }
+                | TargetKind::PackageVar { .. }
         )
     }
 
@@ -320,6 +321,37 @@ pub fn resolve_symbol_scoped(
             _ => {}
         }
     }
+    // An `our` package global is a cross-file rename (`$Pkg::var` reaches it
+    // from anywhere) — claim it before the lexical `Variable => Local` path.
+    if let Some((package, name)) = analysis.package_var_at(point) {
+        if package == "main" {
+            // `main` is the catch-all namespace every package-less entry script
+            // shares, so two *unrelated* scripts' `our $x` both land in
+            // `main::x`. Without program-boundary (entrypoint) analysis we can't
+            // tell those apart, so a cross-file fan-out would rename one script's
+            // global from another's. Stay file-local here (a real package fans
+            // out): collect this file's spellings (decl + bare reads + `$main::x`
+            // / `$::x`) as a flat group. Lift this once entrypoint analysis can
+            // group a program's files — the same gap as multi-app Mojo instance
+            // brands (docs/prompt-graph-walking.md).
+            let mut locs = Vec::new();
+            collect_package_var(&FileKey::Path(PathBuf::new()), analysis, &package, &name, &mut locs);
+            let mut spans: Vec<Span> = locs.into_iter().map(|l| l.span).collect();
+            // The decl token is both a symbol and a self-ref; dedup so a span
+            // isn't rewritten twice.
+            spans.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
+            spans.dedup();
+            return Some(ResolvedTarget::Group {
+                local_spans: spans,
+                pinned_spans: Vec::new(),
+                members: Vec::new(),
+            });
+        }
+        return Some(ResolvedTarget::Target(TargetRef::new(
+            name,
+            TargetKind::PackageVar { package },
+        )));
+    }
     Some(match analysis.rename_kind_at(point, module_index)? {
         RenameKind::Variable => ResolvedTarget::Local,
         RenameKind::HashKey(name) => match analysis.hash_key_owner_at(point) {
@@ -341,6 +373,13 @@ pub fn resolve_symbol_scoped(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
+    /// An `our` (package-global) variable. `package` is the declaring
+    /// package; `target.name` is the sigil-bearing name (`$debug`). Unlike a
+    /// lexical `my` (which stays `Local`/single-file), a package global is
+    /// reachable everywhere as `$Pkg::var`, so rename fans out cross-file:
+    /// matches the `our` decl, every qualified `$Pkg::var` access in any file,
+    /// and the declaring file's unqualified reads that resolve to it.
+    PackageVar { package: String },
     /// A sub defined in a specific package. `None` = the sub has
     /// no package context (top-level script). Matches `Sub`/`Method`
     /// symbols whose `package` field equals this, and `FunctionCall`
@@ -539,6 +578,16 @@ pub fn group_refs(
     });
     out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
     out
+}
+
+/// Reject a `newName` that would corrupt rather than rename: empty,
+/// whitespace, or just sigils (`$`/`@`/`%`). The LSP client normally validates
+/// the new name, but the server must not emit a token-*deleting* edit set when
+/// it doesn't — both rename entry points (LSP handler + CLI) gate on this.
+/// Keyword/identifier-shape validation stays the client's job; this is the
+/// safety floor against silent corruption.
+pub fn is_valid_rename_name(new_name: &str) -> bool {
+    !new_name.trim().trim_start_matches(['$', '@', '%']).trim().is_empty()
 }
 
 /// Rename edit set for a projection group: every span paired with ITS
@@ -780,13 +829,19 @@ fn method_classes_for(
     }
 }
 
-/// A name spelled by a variable at `span` — a `Variable`/`ContainerAccess`
-/// ref covers it exactly. The signal that a dispatch site is const-folded
-/// (`$obj->on($evt)`): its name span IS the `$evt` token, so rename must not
-/// rewrite it. Literal names never coincide with a variable ref.
-fn span_variable_spelled(analysis: &FileAnalysis, span: Span) -> bool {
+/// A dispatch name that is actually spelled by *another* identifier, so the
+/// token at `span` is not the literal name and rename must not rewrite it
+/// (references still resolve through the fold). Two folds produce this:
+/// a variable (`$obj->on($evt)` — a `Variable`/`ContainerAccess` ref covers the
+/// span) and a constant (`use constant EVT => 'x'; $obj->on(EVT)` — a
+/// `FunctionCall` ref to the constant covers it). A literal name
+/// (`on('connect')`) sits at its string-content span, which no such ref covers.
+fn span_is_folded_name(analysis: &FileAnalysis, span: Span) -> bool {
     analysis.refs.iter().any(|r| {
-        matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) && r.span == span
+        matches!(
+            r.kind,
+            RefKind::Variable | RefKind::ContainerAccess | RefKind::FunctionCall { .. }
+        ) && r.span == span
     })
 }
 
@@ -794,7 +849,7 @@ fn span_variable_spelled(analysis: &FileAnalysis, span: Span) -> bool {
 /// Shared by `collect_from_analysis` (to emit decl locations) and
 /// `mask_for_target` (to decide whether the def lives in editable space).
 fn symbol_defines_target(sym: &crate::file_analysis::Symbol, target: &TargetRef) -> bool {
-    use crate::file_analysis::{HashKeyOwner, SymbolDetail};
+    use crate::file_analysis::{DeclKind, HashKeyOwner, SymbolDetail};
     if sym.name != target.name {
         return false;
     }
@@ -804,6 +859,13 @@ fn symbol_defines_target(sym: &crate::file_analysis::Symbol, target: &TargetRef)
     // script sub); `Method { class }` is `Sub { package: Some(class) }`
     // with stricter intent.
     match &target.kind {
+        // The `our` decl in the named package (`our $debug` in `Cfg`). The
+        // sigil-bearing name is already matched by the `sym.name == target.name`
+        // gate above; `collect_package_var` owns the (sigil-narrowed) span.
+        TargetKind::PackageVar { package } => {
+            matches!(&sym.detail, SymbolDetail::Variable { decl_kind: DeclKind::Our, .. })
+                && sym.package.as_deref() == Some(package.as_str())
+        }
         TargetKind::Sub { package } => {
             // Exact scope, OR — under Hierarchy — any class in the override
             // family (so a base-`sub` rename also rewrites every override's
@@ -913,6 +975,82 @@ pub fn references_mask_for(
     }
 }
 
+/// Collect the rename/reference locations for an `our` package global in one
+/// file: the `our` decl, every qualified `$Pkg::var` access (its span is
+/// already the bare tail), and the file's unqualified reads that resolve to the
+/// decl. Decl + unqualified spans carry the sigil, so they're narrowed past it
+/// — the qualifier/sigil survives, only the name token is rewritten.
+fn collect_package_var(
+    key: &FileKey,
+    analysis: &FileAnalysis,
+    package: &str,
+    name: &str,
+    out: &mut Vec<RefLocation>,
+) {
+    use crate::file_analysis::{DeclKind, RefKind, SymbolDetail};
+    // Rewrite only the trailing name token, anchored at the span *end* so the
+    // sigil and any `Pkg::` qualifier survive — regardless of whether the ref
+    // span is the whole `$Pkg::name` (container/element/slice reads span
+    // sigil+qualifier+name) or already the bare tail (scalar reads, which the
+    // builder pre-narrows). Byte math: sigils are 1 byte, columns are bytes.
+    let sigil_len = name.chars().next().map_or(0, char::len_utf8);
+    let base_len = name.len() - sigil_len;
+    let tail = |s: Span| Span {
+        start: tree_sitter::Point::new(s.end.row, s.end.column.saturating_sub(base_len)),
+        end: s.end,
+    };
+    // `$::x` / `$main::x` / a `main`-package `our $x` all name the same global;
+    // `qualified_var_target` yields an empty package for the leading-`::`
+    // spelling, so normalize it to the `main` the decl carries.
+    fn norm(p: &str) -> &str {
+        if p.is_empty() { "main" } else { p }
+    }
+    let is_our_decl = |id: crate::file_analysis::SymbolId| {
+        let s = analysis.symbol(id);
+        matches!(&s.detail, SymbolDetail::Variable { decl_kind: DeclKind::Our, .. })
+            && s.package.as_deref() == Some(package)
+            && s.name == name
+    };
+    for sym in &analysis.symbols {
+        if matches!(&sym.detail, SymbolDetail::Variable { decl_kind: DeclKind::Our, .. })
+            && sym.package.as_deref() == Some(package)
+            && sym.name == name
+        {
+            out.push(RefLocation {
+                key: key.clone(),
+                span: tail(sym.selection_span),
+                access: AccessKind::Declaration,
+                rewritable: true,
+            });
+        }
+    }
+    for r in &analysis.refs {
+        if !matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) {
+            continue;
+        }
+        if let Some((qpkg, qname)) = r.qualified_var_target() {
+            // Qualified `$Pkg::var` (the sigil is canonicalized to the declared
+            // one, so `@arr` element reads `$Pkg::arr[0]` still match `@arr`).
+            if norm(qpkg) == package && qname == name {
+                out.push(RefLocation {
+                    key: key.clone(),
+                    span: tail(r.span),
+                    access: r.access,
+                    rewritable: true,
+                });
+            }
+        } else if r.target_name == name && r.resolves_to.is_some_and(is_our_decl) {
+            // Unqualified — only this package's `our` var (resolved in-file).
+            out.push(RefLocation {
+                key: key.clone(),
+                span: tail(r.span),
+                access: r.access,
+                rewritable: true,
+            });
+        }
+    }
+}
+
 fn collect_from_analysis(
     key: &FileKey,
     analysis: &FileAnalysis,
@@ -922,6 +1060,14 @@ fn collect_from_analysis(
 ) {
     use crate::file_analysis::HashKeyOwner;
 
+    // Package globals match by package + (qualified) name, not the callable
+    // scope machinery below — and their spans need sigil handling — so collect
+    // them on a dedicated path.
+    if let TargetKind::PackageVar { package } = &target.kind {
+        collect_package_var(key, analysis, package, &target.name, out);
+        return;
+    }
+
     // `name` is constant across all refs in this call (it is `target.name`), so
     // the only varying key is the invocant class. Cache chains keyed by class to
     // avoid an O(refs × ancestor_depth) DFS on large files with many same-method
@@ -929,12 +1075,12 @@ fn collect_from_analysis(
     let mut rename_chain_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
-    // Only handler (event) names can be spelled by a variable (const-folded
-    // `$obj->on($evt)`); for every other target kind the span is a literal name
-    // token, always rewritable. Gating the variable-overlap scan to handlers
-    // keeps it off the hot path.
+    // Only handler (event) names can be folded from another identifier
+    // (`$obj->on($evt)` / `on(EVT)`); for every other target kind the span is a
+    // literal name token, always rewritable. Gating the overlap scan to
+    // handlers keeps it off the hot path.
     let is_handler = matches!(target.kind, TargetKind::Handler { .. });
-    let rewritable_at = |span: Span| !(is_handler && span_variable_spelled(analysis, span));
+    let rewritable_at = |span: Span| !(is_handler && span_is_folded_name(analysis, span));
 
     // Include declaration spans when this file defines the target.
     for sym in &analysis.symbols {

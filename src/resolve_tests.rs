@@ -3005,6 +3005,208 @@ fn test_group_rename_rederives_mapped_members_cross_file() {
     );
 }
 
+/// Explicit-string accessor names (`predicate => 'has_size'`) define the method
+/// AT that string, so renaming the attr must rewrite the defining string too —
+/// not just the call sites — or Moo keeps minting `has_size` while callers say
+/// `has_dim` (non-compiling). The `=> 1` derived form has no string and is
+/// covered by `test_group_rename_rederives_mapped_members_cross_file`.
+#[test]
+fn moo_explicit_string_accessor_renames_its_defining_string() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/moo_str_widget.pm");
+    let src = "package Widget;\nuse Moo;\n\
+        has size => (is => 'rw', predicate => 'has_size', clearer => 'clear_size');\n\
+        sub area { my $self = shift; return $self->size if $self->has_size; }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    // Cursor on the `has size` attr token (row 2, col 4).
+    let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 2, column: 4 }, None)
+        .expect("attr decl resolves");
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+        panic!("expected Group, got {:?}", resolved);
+    };
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()), &local_spans, &pinned_spans, &members, "dim",
+    );
+    let lines: Vec<&str> = src.lines().collect();
+    let materialized: Vec<(String, String)> = edits
+        .iter()
+        .map(|(l, t)| {
+            (lines[l.span.start.row][l.span.start.column..l.span.end.column].to_string(), t.clone())
+        })
+        .collect();
+    // The defining strings rewrite to the affixed new name (the fix), and the
+    // call site stays consistent with them.
+    for want in [("has_size", "has_dim"), ("clear_size", "clear_dim")] {
+        assert!(
+            materialized.contains(&(want.0.to_string(), want.1.to_string())),
+            "defining string {:?} must rewrite to {:?}; got {:?}",
+            want.0, want.1, materialized,
+        );
+    }
+    // has_dim appears at least twice: the predicate defining string + the call.
+    assert!(
+        materialized.iter().filter(|(_, t)| t == "has_dim").count() >= 2,
+        "predicate string AND its call rename together; got {:?}",
+        materialized,
+    );
+}
+
+/// `our` package globals rename cross-file: `$Cfg::debug` is the same variable
+/// everywhere, so renaming the `our` decl reaches every qualified access in
+/// other files, and vice versa. A lexical `my` stays single-file (`Local`).
+#[test]
+fn package_var_our_renames_cross_file() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let lib = PathBuf::from("/tmp/pv_cfg.pm");
+    let app = PathBuf::from("/tmp/pv_app.pl");
+    let lib_src = "package Cfg;\nour $debug = 0;\nsub on { $debug = 1 }\n1;\n";
+    let app_src = "use Cfg;\nprint $Cfg::debug;\n$Cfg::debug = 5;\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(lib.clone(), Arc::new(parse(lib_src)));
+    store.insert_workspace(lib.clone(), parse(lib_src));
+    store.insert_workspace(app.clone(), parse(app_src));
+
+    let lib_fa = store.workspace_raw().get(&lib).unwrap().value().clone();
+
+    // Cursor on the `our $debug` decl resolves to a cross-file PackageVar.
+    let col = lib_src.lines().nth(1).unwrap().find("debug").unwrap();
+    let resolved = resolve_symbol(&lib_fa, tree_sitter::Point { row: 1, column: col }, Some(&idx))
+        .expect("our decl resolves");
+    let ResolvedTarget::Target(t) = resolved else { panic!("expected Target, got {:?}", resolved) };
+    assert!(
+        matches!(&t.kind, TargetKind::PackageVar { package } if package == "Cfg"),
+        "our var should resolve to PackageVar, got {:?}",
+        t.kind,
+    );
+    assert!(t.supports_cross_file_rename());
+
+    let refs = refs_to(&store, Some(&idx), &t, RoleMask::EDITABLE);
+    let hit = |p: &PathBuf| refs.iter().any(|r| matches!(&r.key, FileKey::Path(x) if x == p));
+    assert!(hit(&lib), "reaches the decl file. refs: {:?}", refs);
+    assert!(hit(&app), "reaches the cross-file $Cfg::debug accesses. refs: {:?}", refs);
+    // Both qualified accesses in app.pl + decl + unqualified in lib.
+    assert!(refs.len() >= 4, "decl + unqualified + 2 qualified accesses: {:?}", refs);
+
+    // A lexical `my` stays single-file (Local) — package globals only.
+    let my_fa = parse("my $x = 1;\nsub f { $x + 1 }\n");
+    assert!(
+        matches!(resolve_symbol(&my_fa, tree_sitter::Point { row: 0, column: 3 }, None), Some(ResolvedTarget::Local)),
+        "lexical my stays Local",
+    );
+}
+
+/// The rename name guard rejects corrupting (empty/whitespace/sigil-only)
+/// names so neither entry point emits a token-deleting edit set, while real
+/// names (sigil-bearing variable names included) pass.
+#[test]
+fn rename_name_guard_rejects_empty_and_whitespace() {
+    use crate::resolve::is_valid_rename_name;
+    for bad in ["", " ", "   ", "\t", "$", "@", "%", "$ ", "  @  "] {
+        assert!(!is_valid_rename_name(bad), "should reject {bad:?}");
+    }
+    for ok in ["dim", "foo_bar", "$scalar", "@list", "%map", "RENAMED"] {
+        assert!(is_valid_rename_name(ok), "should accept {ok:?}");
+    }
+}
+
+/// Array/hash package globals rename the bare name tail only — qualified
+/// element/slice reads (`$Pkg::items[0]`, `$Pkg::map{k}`) span the whole
+/// `$Pkg::name`, so the rewrite must be anchored at the span end or it eats the
+/// sigil + `Pkg::` qualifier (which produced invalid Perl before the fix).
+#[test]
+fn package_var_array_hash_globals_rename_name_tail_only() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let lib = PathBuf::from("/tmp/pvc_pkg.pm");
+    let app = PathBuf::from("/tmp/pvc_user.pl");
+    let lib_src = "package Pkg;\nour @items = (1, 2, 3);\nour %map = (a => 1);\n1;\n";
+    let app_src = "use Pkg;\nmy $f = $Pkg::items[0];\nmy @s = @Pkg::items[0, 1];\nmy $v = $Pkg::map{a};\n";
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(lib.clone(), Arc::new(parse(lib_src)));
+    store.insert_workspace(lib.clone(), parse(lib_src));
+    store.insert_workspace(app.clone(), parse(app_src));
+    let lib_fa = store.workspace_raw().get(&lib).unwrap().value().clone();
+
+    // Cursor on `our @items`.
+    let col = lib_src.lines().nth(1).unwrap().find("items").unwrap();
+    let ResolvedTarget::Target(t) =
+        resolve_symbol(&lib_fa, tree_sitter::Point { row: 1, column: col }, Some(&idx)).unwrap()
+    else {
+        panic!("our @items should resolve to a target")
+    };
+    let refs = refs_to(&store, Some(&idx), &t, RoleMask::EDITABLE);
+
+    // Every edit in user.pl must cover exactly `items` (the name tail), never
+    // starting on the `$`/`@` sigil or the `Pkg::` qualifier.
+    let app_edits: Vec<_> = refs
+        .iter()
+        .filter(|r| matches!(&r.key, FileKey::Path(p) if p == &app))
+        .collect();
+    assert_eq!(app_edits.len(), 2, "both element + slice accesses: {:?}", app_edits);
+    for e in &app_edits {
+        let line = app_src.lines().nth(e.span.start.row).unwrap();
+        let slice = &line[e.span.start.column..e.span.end.column];
+        assert_eq!(slice, "items", "rewrite only the name tail, got {slice:?} in {line:?}");
+    }
+}
+
+/// A `main` package global unifies its spellings *within its file* — decl, bare
+/// reads, `$main::x`, `$::x` all rename together — but stays FILE-LOCAL: `main`
+/// is the shared namespace of unrelated package-less scripts, so it resolves to
+/// a flat origin-file `Group`, not a cross-file `PackageVar` (which would sweep
+/// a different script's `main::x`). See the entrypoint-analysis note in resolve.
+#[test]
+fn package_var_main_global_is_file_local_group() {
+    let src = "our $gv = 1;\nprint $gv;\nsub f { return $gv + 1 }\nprint $main::gv;\nprint $::gv;\n";
+    let fa = parse(src);
+    let ResolvedTarget::Group { local_spans, members, .. } =
+        resolve_symbol(&fa, tree_sitter::Point { row: 0, column: 5 }, None).unwrap()
+    else {
+        panic!("a `main` global should resolve to a file-local Group, not a cross-file target")
+    };
+    assert!(members.is_empty(), "a flat package-var group has no projection members");
+    let mut rows: Vec<usize> = local_spans.iter().map(|s| s.start.row).collect();
+    rows.sort_unstable();
+    // decl(0) + bare $gv(1) + bare $gv in sub(2) + $main::gv(3) + $::gv(4).
+    assert_eq!(rows, vec![0, 1, 2, 3, 4], "every in-file spelling renames: {local_spans:?}");
+}
+
+/// Two unrelated package-less scripts both declare `our $config` (both in
+/// `main`). Renaming one must NOT rewrite the other — `main` globals are
+/// file-local until entrypoint analysis can prove two files are one program.
+#[test]
+fn package_var_main_global_does_not_cross_scripts() {
+    let store = FileStore::new();
+    let a = PathBuf::from("/tmp/pvm_a.pl");
+    let b = PathBuf::from("/tmp/pvm_b.pl");
+    let a_src = "our $config = 1;\nprint $config;\n";
+    store.insert_workspace(a.clone(), parse(a_src));
+    store.insert_workspace(b.clone(), parse("our $config = 2;\nprint $config;\n"));
+
+    let a_fa = store.workspace_raw().get(&a).unwrap().value().clone();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&a_fa, tree_sitter::Point { row: 0, column: 5 }, None).unwrap()
+    else {
+        panic!("main global should be a file-local Group")
+    };
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(a.clone()), &local_spans, &pinned_spans, &members, "settings",
+    );
+    assert!(
+        edits.iter().all(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &a)),
+        "rename must stay in a.pl, never touch b.pl: {edits:?}",
+    );
+    assert_eq!(edits.len(), 2, "a.pl decl + bare read only: {edits:?}");
+}
+
 /// `OverrideScope` toggle: a method overridden in a child resolves to the
 /// whole override family under `Hierarchy` (the default IDE refactor) but only
 /// its own dispatch chain under `Dispatch`. Membership is edge-gated (`@ISA`),
@@ -3109,22 +3311,26 @@ fn test_renaming_import_remote_joins_source_alias_stays_local() {
     assert!(alias_refs.len() >= 2, "alias group = `-as` value + call: {:?}", alias_refs);
 }
 
-/// Finding #1: event (Handler) rename. Literal event-name sites are
-/// rewritable (rename rewrites the inside-the-quotes name); a const-folded
-/// site (`my $e = 'connect'; $self->on($e)`) whose span IS the variable is a
-/// reference but NOT rewritable — references lists it, rename skips it (so it
-/// can't corrupt the variable). `refs_to` carries the distinction.
+/// Finding #1: event (Handler) rename. A literal event-name site is rewritable
+/// and its span is the **inside-the-quotes** name (so rename keeps the quotes);
+/// a folded site — variable (`my $e='connect'; on($e)`) OR constant
+/// (`use constant EVT=>'connect'; on(EVT)`) — whose span IS that other
+/// identifier is a reference but NOT rewritable (references lists it, rename
+/// skips it, so it can't corrupt the variable/constant). `refs_to` carries the
+/// distinction.
 #[test]
 fn test_event_handler_refs_mark_folded_site_non_rewritable() {
     let store = FileStore::new();
     let path = PathBuf::from("/tmp/ev_handler.pm");
     let src = "package App;\n\
          use parent 'Mojo::EventEmitter';\n\
+         use constant EVT => 'connect';\n\
          sub setup {\n\
          my $self = shift;\n\
          $self->on('connect', sub { 1 });\n\
          my $e = 'connect';\n\
          $self->on($e, sub { 1 });\n\
+         $self->on(EVT, sub { 1 });\n\
          $self->emit('connect');\n\
          }\n1;\n";
     store.insert_workspace(path.clone(), parse(src));
@@ -3140,19 +3346,24 @@ fn test_event_handler_refs_mark_folded_site_non_rewritable() {
     assert!(target.supports_cross_file_rename(), "Handler renames cross-file now");
 
     let refs = refs_to(&store, None, &target, RoleMask::EDITABLE);
-    let rewritable = refs.iter().filter(|r| r.rewritable).count();
-    let frozen = refs.iter().filter(|r| !r.rewritable).count();
-    // The folded `$e` site is a reference (present) but non-rewritable; the
-    // literal sites (two `on` + `emit`) are rewritable.
-    assert!(
-        frozen >= 1,
-        "the folded $e dispatch site must be present but non-rewritable; refs: {:?}",
-        refs,
-    );
-    assert!(
-        rewritable >= 2,
-        "literal event sites must be rewritable; refs: {:?}",
-        refs,
+    let lines: Vec<&str> = src.lines().collect();
+    let mut rewritable = 0;
+    let mut frozen = std::collections::BTreeSet::new();
+    for r in &refs {
+        let slice = &lines[r.span.start.row][r.span.start.column..r.span.end.column];
+        if r.rewritable {
+            // Quote-preservation: the rewrite is the bare name, never `'connect'`.
+            assert_eq!(slice, "connect", "rewritable site must be the inner name: {r:?}");
+            rewritable += 1;
+        } else {
+            frozen.insert(slice.to_string());
+        }
+    }
+    assert_eq!(rewritable, 2, "the two literal `'connect'` sites: {refs:?}");
+    assert_eq!(
+        frozen,
+        ["$e", "EVT"].iter().map(|s| s.to_string()).collect(),
+        "the variable AND constant folds are frozen (kept, not rewritten): {refs:?}",
     );
 }
 

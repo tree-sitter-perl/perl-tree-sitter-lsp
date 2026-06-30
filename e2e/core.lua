@@ -333,6 +333,20 @@ t.test("rename: $pi → $tau updates all occurrences", function()
   if t.ok(N, found_new, "new name $tau should appear after rename") then t.pass(N) end
 end)
 
+t.test("prepareRename: accepts a real name, declines @_", function()
+  local N = "prepareRename: accepts a real name, declines @_"
+  -- Accept: the $pi declaration is renameable.
+  local line, col = b.find_pos(buf, "my $pi = 3.14159")
+  if not t.ok(N, line, "couldn't find '$pi'") then return end
+  if not t.ok(N, lsp.prepare_rename(buf, line, col + 3),
+    "prepareRename should accept a real variable") then return end
+  -- Decline: @_ resolves to nothing renameable, so no rename box should pop.
+  local aline, acol = b.find_pos(buf, "= @_")
+  if not t.ok(N, aline, "couldn't find '@_'") then return end
+  if t.ok(N, lsp.prepare_rename(buf, aline, acol + 2) == nil,
+    "prepareRename should decline @_ (no silent no-op rename box)") then t.pass(N) end
+end)
+
 t.test("rename: host → hostname from deref access site", function()
   local N = "rename: host → hostname from deref access site"
   -- Cursor on "host" in $db_config->{host} — the access side has a HashKeyAccess ref

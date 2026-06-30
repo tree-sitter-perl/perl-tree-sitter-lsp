@@ -793,8 +793,8 @@ fn test_phase5_find_references_on_hash_key_def_without_tree() {
     // Cursor on the def returns the def itself + every access — the same
     // set an access-site cursor returns, so def↔access rename/references
     // stay symmetric (a hash-key def has no ref at its own token, so it
-    // must opt into `include_decl` explicitly). Previously this returned 0
-    // without a tree; phase 5 links access→def at build time.
+    // must opt into `include_decl` explicitly; the access→def link is made
+    // at build time, no tree needed here).
     let point = def_host.selection_span.start;
     let refs = fa.find_references(point, None);
     // The access at `$cfg->{host}` (row 3).

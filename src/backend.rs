@@ -587,11 +587,32 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
+        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
         let doc = match self.files.get_open(&params.text_document.uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
         let point = symbols::position_to_point(params.position);
+        // Only offer a rename box where `rename` would actually produce edits.
+        // Accepting on any `symbol_at`/`ref_at` hit is a UX trap: positions like
+        // `@_`, a lexical hash key, or an ownerless constructor key resolve to
+        // nothing renameable, so the user gets a box that silently no-ops. Mirror
+        // the rename handler's branching, probing the single-file path for the
+        // kinds it routes there.
+        let renameable = match resolve_symbol_scoped(
+            &doc.analysis,
+            point,
+            Some(&*self.module_index),
+            self.override_scope(),
+        ) {
+            Some(ResolvedTarget::Target(t)) if t.supports_cross_file_rename() => true,
+            Some(ResolvedTarget::Group { .. }) => true,
+            Some(_) => doc.analysis.rename_at(point, "x").is_some_and(|e| !e.is_empty()),
+            None => false,
+        };
+        if !renameable {
+            return Ok(None);
+        }
         if let Some(sym) = doc.analysis.symbol_at(point) {
             return Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
                 range: symbols::span_to_range(sym.selection_span),
@@ -613,6 +634,11 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let new_name = &params.new_name;
+        if !crate::resolve::is_valid_rename_name(new_name) {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "rename: the new name must not be empty or whitespace",
+            ));
+        }
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
