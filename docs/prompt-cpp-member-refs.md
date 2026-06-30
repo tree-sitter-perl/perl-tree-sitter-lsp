@@ -77,6 +77,34 @@ and the parallel stack DELETES.
   return) — `spawn_debounced_rebuild` builds off-lock via `spawn_blocking` +
   `apply_rebuilt`.
 
+## Status
+
+**Landed (verified 1080/0, cpp gold 214/0, Perl e2e 112/0, cpp e2e 112/0):**
+slices 1–4 (mint the MethodCall ref + `peel_recv` + `method_resolution_on_class`
+`Variable|Field` + delete `pack_member_at` / `member_def_site` / backend member
+fallbacks), hover via the ref, `Symbol::display_type` (hover + inlay — fixes the
+vanishing stars), the four ancestor-walks collapsed onto
+`resolve_method_in_ancestors`, the `field_type_on_class` cross-file bug, the
+Python `call_kinds`/`simple_var_kinds` rule-#10 fix, dead `rebuild_analysis`.
+
+**Residual — each a separate careful change, NOT a blocker on the above:**
+1. **Full `LangCfg`→`LangPack` fold.** The correctness (Python call kind) is
+   already fixed via `call_kinds`/`simple_var_kinds`. Merging `member_kinds`
+   is blocked on generalizing the cpp-grammar-coupled `member_access_sites`
+   op-DX walk to python's `attribute` node + an explicit `operator_correctable`
+   flag — else a naive merge risks a python op-DX regression. The cpp
+   `recv_wrapper_kinds` (LangPack) / `wrapper_kinds` (LangCfg) overlap dedups
+   in the same move.
+2. **Layering-test LSP-layer teeth.** Blocked on PRE-EXISTING Perl
+   `descendant_for_point_range` in symbols.rs (1472/1545/1832) — strict teeth
+   would force refactoring unrelated Perl first (else it's an allowlist).
+3. **`==perl`→capability methods.** Per-branch design (the 22 branches span
+   LSP handlers, CLI modes, caching — some fundamental, not capabilities); a
+   blanket `is_pack()` is a half-measure.
+4. **Macros (`OP_NULL`/`BASEOP`) as cross-file refs** → deletes
+   `pack_xfile_word_at` + its `#define`-line re-grep (rule-#10) + the symbols
+   cross-file `fs::read` (route through `CrossFileLookup`).
+
 ## Verification gates (every slice)
 default `1080/0`, cpp gold `214/0`, Perl e2e `112/0`, cpp e2e green. End state:
 goto-def / hover / references / rename on `o->op_type` AND `(*op_p)->op_type`
