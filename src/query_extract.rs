@@ -93,6 +93,10 @@ pub struct SkeletonAnalysis {
     /// named is the method receiver, not a class member — its (wrongly
     /// sticky-tagged) class package is cleared in `into_file_analysis`.
     pub receiver_names: Vec<String>,
+    /// Value-flow edges minted from `@flow` captures (`source → target`,
+    /// extraction). Lowered to type witnesses here; carried onto the FA as the
+    /// provenance tier.
+    pub flow_edges: Vec<crate::file_analysis::FlowEdge>,
 }
 
 impl SkeletonAnalysis {
@@ -360,6 +364,7 @@ impl SkeletonAnalysis {
             refs,
             witnesses: bag,
             package_parents,
+            flow_edges: std::mem::take(&mut self.flow_edges),
             ..Default::default()
         });
         // Pack-declared receiver names ride the FA so core's member /
@@ -1473,14 +1478,23 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 .map(|&(_, _, sp)| sp)
                 .filter(|sp| sp != src_span)
                 .unwrap_or(*src_span);
-            out.witnesses.push(crate::witnesses::Witness {
-                attachment: var,
-                source: crate::witnesses::WitnessSource::Builder("skeleton".into()),
-                payload: crate::witnesses::WitnessPayload::Edge(
-                    crate::witnesses::WitnessAttachment::Expr(target_span),
-                ),
-                span: Span { start: *at, end: *at },
+            // Mint a value-flow edge (cpp init is `Whole`); the witness is its
+            // lowering, so type inference sees the same `Variable → Edge(Expr)`
+            // it always did — now with the source span kept for provenance.
+            out.flow_edges.push(crate::file_analysis::FlowEdge {
+                target_name: name.clone(),
+                target_scope: *scope,
+                target_at: *at,
+                source: target_span,
+                extraction: crate::file_analysis::Extraction::Whole,
             });
+        }
+    }
+    // Lower the value-flow edges to type-tier witnesses (the bag is canonical
+    // for types; the edges are the provenance tier above it).
+    for fe in &out.flow_edges {
+        if let Some(w) = fe.lower_to_witness() {
+            out.witnesses.push(w);
         }
     }
     Ok(out)

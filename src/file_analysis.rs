@@ -528,6 +528,69 @@ pub struct MemberOpMismatch {
     pub expected: MemberOp,
 }
 
+/// How a value is taken out of its source when it flows to a target — the
+/// shape of the assignment. `Whole` is `$x = RHS`; the rest model list /
+/// destructuring / element / key binding. An OPEN ontology: Rust makes adding
+/// a variant + its lowering cheap, so it grows as the producers need it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Extraction {
+    /// The whole source value (`my $x = f()`, `T x = init`).
+    Whole,
+    /// The Nth element of a list/tuple source (`my ($a, $b) = LIST` → 0, 1).
+    Positional(usize),
+    /// The list tail from index N onward (a slurpy `@rest`/`%opts`).
+    Slurpy(usize),
+    /// The value at a literal key of the source (`my %h = (k => v)` keyed).
+    KeyOf(String),
+}
+
+/// A VALUE-FLOW EDGE: a value flows from a `source` expression to a `target`
+/// binding, taken via `extraction`. THE one concept every assignment/binding
+/// shape mints (cpp `@flow`, the Perl builder, the Perl port) and every
+/// flow-aware feature reads. It LOWERS to the type-tier witness (`Variable →
+/// Edge(Expr)`) so type inference is undisturbed, while keeping the `source`
+/// span + `extraction` that the witness discards — the provenance the
+/// narrowing / `folded_from` / instance-brand consumers need.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowEdge {
+    /// Target binding name (sigiled, as the bag keys variables).
+    pub target_name: String,
+    pub target_scope: ScopeId,
+    /// The target's site, for the lowered witness's span (temporal ordering).
+    #[serde(with = "PointDef")]
+    pub target_at: Point,
+    /// The source expression's span — resolved to a type at query time via
+    /// `expr_type_at_span`, and the value-provenance anchor.
+    pub source: Span,
+    pub extraction: Extraction,
+}
+
+impl FlowEdge {
+    /// Lower to the type-tier witness — the target's type flows from the
+    /// source expression. `Whole` is a direct `Variable → Edge(Expr(source))`;
+    /// the projecting extractions (Positional/Slurpy/KeyOf) await their
+    /// projected-edge lowering and return `None` for now (no type witness yet,
+    /// the FlowEdge itself still records the provenance).
+    pub fn lower_to_witness(&self) -> Option<crate::witnesses::Witness> {
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+        let payload = match self.extraction {
+            Extraction::Whole => {
+                WitnessPayload::Edge(WitnessAttachment::Expr(self.source))
+            }
+            _ => return None,
+        };
+        Some(Witness {
+            attachment: WitnessAttachment::Variable {
+                name: self.target_name.clone(),
+                scope: self.target_scope,
+            },
+            source: WitnessSource::Builder("flow".into()),
+            payload,
+            span: Span { start: self.target_at, end: self.target_at },
+        })
+    }
+}
+
 impl Symbol {
     /// Bare variable/field name without the sigil. Uses the sigil stored
     /// in `detail` so we never re-derive it by text-stripping (which would
@@ -2514,6 +2577,10 @@ pub struct FileAnalysis {
     /// config (the `from_loader_config` ParamType flavor).
     #[serde(default)]
     pub loader_config_params: Vec<LoaderConfigParam>,
+    /// Value-flow edges: every assignment/binding's `source → target` +
+    /// extraction. The general provenance tier above the type witness bag.
+    #[serde(default)]
+    pub flow_edges: Vec<FlowEdge>,
 
 
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
@@ -2583,6 +2650,7 @@ pub struct FileAnalysisParts {
     pub column_keyed_verbs: HashSet<String>,
     pub plugin_loads: Vec<PluginLoadFact>,
     pub loader_config_params: Vec<LoaderConfigParam>,
+    pub flow_edges: Vec<FlowEdge>,
 }
 
 /// "This file loads plugin `name`, passing the config value at
@@ -2741,6 +2809,7 @@ impl FileAnalysis {
             column_keyed_verbs,
             plugin_loads,
             loader_config_params,
+            flow_edges,
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
@@ -2780,6 +2849,7 @@ impl FileAnalysis {
             column_keyed_verbs,
             plugin_loads,
             loader_config_params,
+            flow_edges,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),

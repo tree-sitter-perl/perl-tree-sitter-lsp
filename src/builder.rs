@@ -557,6 +557,8 @@ fn build_with_plugins_inner(
         column_keyed_verbs: b.plugins.column_keyed_verbs().map(|s| s.to_string()).collect(),
         plugin_loads: b.plugin_loads,
         loader_config_params: b.loader_config_params,
+        // Stage 2 bridges the Perl assignment sites onto FlowEdges; empty here.
+        flow_edges: Vec::new(),
     });
     // Finalize: run the legacy text-based MCB resolver as a fallback.
     // For every assignment the unified typer (run before
