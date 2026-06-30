@@ -298,6 +298,60 @@ impl Backend {
         Some((ctx.receiver_type?.class_name()?.to_string(), field))
     }
 
+    /// A bare identifier at the cursor that names a CROSS-FILE top-level
+    /// symbol — a macro (`OP_NULL`, `BASEOP`), enum constant, global, or
+    /// type. Resolves off the RAW word, so it works even when the macro
+    /// expanded AWAY in the analysis (the token isn't a captured ref).
+    /// Returns (target uri, def span, the def's source line for hover).
+    fn pack_xfile_word_at(
+        &self,
+        doc: &crate::document::Document,
+        pos: Position,
+        idx: &dyn crate::file_analysis::CrossFileLookup,
+    ) -> Option<(Option<Url>, crate::file_analysis::Span, String)> {
+        let cursor =
+            crate::cursor_sentinel::point_to_byte(&doc.text, symbols::position_to_point(pos));
+        let bytes = doc.text.as_bytes();
+        let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut start = cursor;
+        while start > 0 && is_id(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = cursor;
+        while end < bytes.len() && is_id(bytes[end]) {
+            end += 1;
+        }
+        if start == end {
+            return None;
+        }
+        let word = &doc.text[start..end];
+        // Pick the best DEFINITION among same-named symbols (a `#define X` plus
+        // its raw usages): prefer the `#define` line, else the earliest.
+        let pick = |analysis: &crate::file_analysis::FileAnalysis, src: &str| {
+            let lines: Vec<&str> = src.lines().collect();
+            let line_of =
+                |s: &crate::file_analysis::Symbol| lines.get(s.selection_span.start.row).copied();
+            let cands: Vec<&crate::file_analysis::Symbol> =
+                analysis.symbols.iter().filter(|s| s.name == word).collect();
+            let sym = cands
+                .iter()
+                .find(|s| line_of(s).is_some_and(|l| l.trim_start().starts_with("#define")))
+                .or_else(|| cands.iter().min_by_key(|s| s.selection_span.start.row))
+                .copied()?;
+            Some((sym.selection_span, line_of(sym).map(|l| l.trim().to_string()).unwrap_or_default()))
+        };
+        // A macro defined in THIS file (`BASEOP` in op.h) — the usage isn't a
+        // captured ref, so find_definition missed it, but the def symbol is
+        // local. Fall back to the cross-file index for usages from elsewhere.
+        if let Some((span, line)) = pick(&doc.analysis, &doc.text) {
+            return Some((None, span, line));
+        }
+        let cached = idx.get_cached(word)?;
+        let text = std::fs::read_to_string(&cached.path).ok()?;
+        let (span, line) = pick(&cached.analysis, &text)?;
+        Some((Url::from_file_path(&cached.path).ok(), span, line))
+    }
+
     fn enrich_analysis(&self, uri: &Url) {
         if let Some(mut doc) = self.files.get_open_mut(uri) {
             // enrichment is Perl-flavored (imported-type/hash-key keys);
@@ -739,6 +793,14 @@ impl LanguageServer for Backend {
                     }
                 }
             }
+            // A macro / enum-constant / global usage (`OP_NULL`, `BASEOP`) —
+            // the raw word names a local-or-cross-file symbol.
+            if let Some((target, span, _)) = self.pack_xfile_word_at(&doc, pos, idx) {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: target.unwrap_or_else(|| uri.clone()),
+                    range: symbols::span_to_range(span),
+                })));
+            }
         }
         Ok(None)
     }
@@ -915,6 +977,19 @@ impl LanguageServer for Backend {
                         contents: HoverContents::Markup(MarkupContent {
                             kind: MarkupKind::Markdown,
                             value: format!("```{}\n{}\n```\n\n*field*", doc.language, line),
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+            // A macro / enum-constant / global (`OP_NULL`, `BASEOP`) — show
+            // its cross-file definition line.
+            if let Some((_, _, line)) = self.pack_xfile_word_at(&doc, pos, xidx) {
+                if !line.is_empty() {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format!("```{}\n{}\n```", doc.language, line),
                         }),
                         range: None,
                     }));
