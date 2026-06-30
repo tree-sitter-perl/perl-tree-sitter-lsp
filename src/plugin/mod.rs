@@ -928,6 +928,16 @@ pub trait FrameworkPlugin: Send + Sync {
         &[]
     }
 
+    /// Method verbs whose FIRST hashref arg is keyed by the receiver class's
+    /// COLUMN names (DBIC `search(\%cond, …)` / `create(\%cols)` etc.). Core
+    /// links those keys to the class's columns for rename/references and walks
+    /// only the first hashref (the trailing `\%attrs` hash isn't column-keyed).
+    /// The plugin owns its framework's verb list; core stays generic. Default
+    /// empty.
+    fn column_keyed_verbs(&self) -> &[String] {
+        &[]
+    }
+
     /// A topic-scoped route DSL this plugin owns (the
     /// Mojolicious::Lite shape): file-level route verbs whose implicit
     /// base a [`EmitAction::SetRouteBase`] emission sets and a scope
@@ -1250,6 +1260,14 @@ impl PluginRegistry {
         self.plugins
             .iter()
             .flat_map(|p| p.role_makers().iter().map(|s| s.as_str()))
+    }
+
+    /// Union of column-keyed call verbs across the registry — the verbs whose
+    /// first hashref arg is keyed by the receiver class's columns.
+    pub fn column_keyed_verbs<'a>(&'a self) -> impl Iterator<Item = &'a str> + 'a {
+        self.plugins
+            .iter()
+            .flat_map(|p| p.column_keyed_verbs().iter().map(|s| s.as_str()))
     }
 
     /// Fold a constraint constructor → its inner type, asking the plugin(s)

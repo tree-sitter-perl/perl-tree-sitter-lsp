@@ -181,6 +181,7 @@ pub struct RhaiPlugin {
     type_constraint_names: Vec<String>,
     app_surface_consumers: Vec<String>,
     role_makers: Vec<String>,
+    column_keyed_verbs: Vec<String>,
     arg_name_verbs: Vec<String>,
     topic_route_dsl: Option<crate::plugin::TopicRouteDsl>,
     engine: Arc<Engine>,
@@ -369,6 +370,27 @@ impl RhaiPlugin {
             }
         }
 
+        // `column_keyed_verbs()` — verbs whose first hashref arg is keyed by the
+        // receiver class's columns; same optional, fail-safe array-of-strings.
+        let mut column_keyed_verbs: Vec<String> = Vec::new();
+        if signatures.iter().any(|n| n == "column_keyed_verbs") {
+            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "column_keyed_verbs", ()) {
+                Ok(arr) => {
+                    for d in arr {
+                        match from_dynamic::<String>(&d) {
+                            Ok(s) => column_keyed_verbs.push(s),
+                            Err(e) => log::error!(
+                                "plugin `{}` column_keyed_verbs() bad entry: {}",
+                                id,
+                                e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => log::error!("plugin `{}` column_keyed_verbs() failed: {}", id, e),
+            }
+        }
+
         // `arg_name_verbs()` — call verbs wanting flat-arg-name
         // extraction; same optional, fail-safe array-of-strings shape.
         let mut arg_name_verbs: Vec<String> = Vec::new();
@@ -419,6 +441,7 @@ impl RhaiPlugin {
             type_constraint_names,
             app_surface_consumers,
             role_makers,
+            column_keyed_verbs,
             arg_name_verbs,
             topic_route_dsl,
             engine,
@@ -517,6 +540,10 @@ impl FrameworkPlugin for RhaiPlugin {
 
     fn role_makers(&self) -> &[String] {
         &self.role_makers
+    }
+
+    fn column_keyed_verbs(&self) -> &[String] {
+        &self.column_keyed_verbs
     }
 
     fn arg_name_verbs(&self) -> &[String] {

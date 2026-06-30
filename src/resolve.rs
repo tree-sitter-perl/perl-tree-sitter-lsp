@@ -1217,7 +1217,17 @@ fn collect_from_analysis(
                 // dispatcher uses, so cross-file `refs_to` and
                 // local find_definition agree on the set.
                 let target_owner = HashKeyOwner::Class(wanted.clone());
-                matches!(owner, Some(o) if o.found_by(&target_owner))
+                match owner {
+                    Some(o) => o.found_by(&target_owner),
+                    // owner `None` — a deferred column-keyed arg key in an
+                    // unenriched consumer (`$rs->search({ col => … })` with the
+                    // class cross-file). Re-derive cross-file, the same lazy seam
+                    // the `HashKeyOfSub` arm above uses, so a column rename
+                    // reaches consumer arg keys without open-doc enrichment.
+                    None => analysis
+                        .deferred_hash_key_owner(r, module_index)
+                        .is_some_and(|o| o.found_by(&target_owner)),
+                }
             }
             (TargetKind::InternalHashKey { class },
              RefKind::HashKeyAccess { owner, .. }) => {

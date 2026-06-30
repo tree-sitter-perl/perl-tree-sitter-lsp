@@ -3311,6 +3311,211 @@ fn test_renaming_import_remote_joins_source_alias_stays_local() {
     assert!(alias_refs.len() >= 2, "alias group = `-as` value + call: {:?}", alias_refs);
 }
 
+/// Finding #2 over-reach: a hash key in a method call's args that isn't a column
+/// (or verb param) must NOT hijack the method. `ref_at` returns the method-call
+/// ref because its span covers the args, but only the method-name token renames
+/// the method — gated on `method_name_span`.
+#[test]
+fn arg_key_does_not_hijack_enclosing_method() {
+    let src = "package U;\nuse base 'DBIx::Class::Core';\n\
+        __PACKAGE__->add_columns(qw/id/);\n\
+        sub go { my $self = shift; $self->search({ id => 1 }, { order_by => 'x' }); }\n1;\n";
+    let fa = parse(src);
+    let col = src.lines().nth(3).unwrap().find("order_by").unwrap();
+    let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 3, column: col }, None);
+    assert!(
+        !matches!(&resolved, Some(ResolvedTarget::Target(t)) if matches!(&t.kind, TargetKind::Method { .. })),
+        "a non-column arg key must never resolve to the enclosing method: {resolved:?}",
+    );
+}
+
+/// Finding #2 feature: a DBIC column's single-hashref call args (`update`/`find`
+/// /`search` with one `{ col => ... }`) are column-keyed — the keys are
+/// `Class`-owned columns, not verb params — so renaming the column reaches them.
+#[test]
+fn dbic_column_rename_reaches_single_arg_call_keys() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/dbic_argkey.pm");
+    let src = "package U;\nuse base 'DBIx::Class::Core';\n\
+        __PACKAGE__->add_columns(qw/id name/);\n\
+        sub go { my $self = shift; $self->update({ name => 1 }); return $self->find({ name => 2 }); }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    let col = src.lines().nth(2).unwrap().find("name").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()), &local_spans, &pinned_spans, &members, "RENAMED",
+    );
+    let rows: std::collections::BTreeSet<usize> = edits.iter().map(|(l, _)| l.span.start.row).collect();
+    // Column def (row 2) + the `update` and `find` arg keys (both row 3).
+    assert!(rows.contains(&2), "column def renames: {rows:?}");
+    assert!(rows.contains(&3), "single-arg update/find column keys join: {rows:?}");
+    assert!(
+        edits.iter().filter(|(l, _)| l.span.start.row == 3).count() >= 2,
+        "both the update and find arg keys: {edits:?}",
+    );
+}
+
+/// Multi-arg `search(\%cond, \%attrs)`: only the FIRST hashref (the column
+/// conditions) is column-keyed — the trailing `\%attrs` hash (`order_by`/…) is
+/// never walked, so renaming a column joins `\%cond` keys but never an attr.
+#[test]
+fn dbic_column_rename_multiarg_search_excludes_attrs_hash() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/dbic_multiarg.pm");
+    let src = "package U;\nuse base 'DBIx::Class::Core';\n\
+        __PACKAGE__->add_columns(qw/id name/);\n\
+        sub go { my $self = shift; $self->search({ name => 1 }, { order_by => 'id' }); }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    let col = src.lines().nth(2).unwrap().find("name").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()), &local_spans, &pinned_spans, &members, "X",
+    );
+    let lines: Vec<&str> = src.lines().collect();
+    for (l, _) in &edits {
+        let s = &lines[l.span.start.row][l.span.start.column..l.span.end.column];
+        assert_eq!(s, "name", "only `\\%cond` column keys rename, never `order_by`: {edits:?}");
+    }
+    assert!(
+        edits.iter().any(|(l, _)| l.span.start.row == 3),
+        "the search `\\%cond` column key joins the column: {edits:?}",
+    );
+}
+
+/// A Moo `has name` attribute's group includes the cross-file CONSTRUCTOR-arg
+/// key (`Widget->new(name => …)`), owned `Sub{class,new}` — so renaming the
+/// attribute reaches the ctor key, and a cursor on the ctor key renames the
+/// whole group (including itself). The DBIC column-keyed seam must not hijack
+/// the Moo ctor key to a `Class` owner (it's not a column).
+#[test]
+fn moo_attr_group_includes_cross_file_constructor_key() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+    let store = FileStore::new();
+    let lib = PathBuf::from("/tmp/moo_ctor_widget.pm");
+    let app = PathBuf::from("/tmp/moo_ctor_app.pl");
+    let lib_src = "package Widget;\nuse Moo;\nhas name => (is => 'rw');\nsub greet { my $self = shift; $self->name }\n1;\n";
+    let app_src = "use Widget;\nmy $w = Widget->new(name => 'bob');\nprint $w->name;\n";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(lib.clone(), Arc::new(parse(lib_src)));
+    store.insert_workspace(lib.clone(), parse(lib_src));
+    store.insert_workspace(app.clone(), parse(app_src));
+    let lib_fa = store.workspace_raw().get(&lib).unwrap().value().clone();
+    let col = lib_src.lines().nth(2).unwrap().find("name").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&lib_fa, tree_sitter::Point { row: 2, column: col }, Some(&idx)).expect("attr resolves")
+    else {
+        panic!("expected a Moo attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, Some(&idx), &FileKey::Path(lib.clone()), &local_spans, &pinned_spans, &members, "X",
+    );
+    // app.pl row 1 is the `Widget->new(name => …)` ctor key.
+    assert!(
+        edits.iter().any(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &app) && l.span.start.row == 1),
+        "attr rename must reach the cross-file constructor key: {edits:?}",
+    );
+}
+
+/// Over-reach guard: a class that defines its OWN `sub <verb>` (shadowing a
+/// DBIC column-keyed verb name) is NOT column-keyed — the call dispatches to the
+/// user's method, whose hash arg isn't columns. Renaming the column must not
+/// touch that custom method's `{ col => … }` arg key.
+#[test]
+fn dbic_custom_sub_shadowing_verb_is_not_column_keyed() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/dbic_shadow.pm");
+    let src = "package Tag;\nuse base 'DBIx::Class::Core';\n\
+        __PACKAGE__->add_columns(qw/id name/);\n\
+        sub create { my ($self, $args) = @_; return $args->{name}; }\n\
+        sub go { my $self = shift; $self->create({ name => 'x' }); }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    let col = src.lines().nth(2).unwrap().find("name").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()), &local_spans, &pinned_spans, &members, "X",
+    );
+    assert!(
+        edits.iter().all(|(l, _)| l.span.start.row != 4),
+        "custom `sub create`'s arg key (row 4) must NOT be column-keyed: {edits:?}",
+    );
+}
+
+/// Over-reach guard: column-keying narrows to POSITIONAL arg 0. A
+/// `search($cond, \%attrs)` (scalar cond) has no inline column keys — the
+/// trailing `\%attrs` hash must never be walked as if it were the conditions.
+#[test]
+fn dbic_scalar_cond_does_not_column_key_attrs_hash() {
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/dbic_scalarcond.pm");
+    let src = "package Row;\nuse base 'DBIx::Class::Core';\n\
+        __PACKAGE__->add_columns(qw/id name/);\n\
+        sub go { my ($self, $cond) = @_; $self->search($cond, { name => 'attrs' }); }\n1;\n";
+    store.insert_workspace(path.clone(), parse(src));
+    let fa = store.workspace_raw().get(&path).unwrap().value().clone();
+    let col = src.lines().nth(2).unwrap().find("name").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, None, &FileKey::Path(path.clone()), &local_spans, &pinned_spans, &members, "X",
+    );
+    assert!(
+        edits.iter().all(|(l, _)| l.span.start.row != 3),
+        "the `\\%attrs` hash key (row 3) must NOT be walked when cond is a scalar: {edits:?}",
+    );
+}
+
+/// Cross-file: a column rename reaches a consumer's `Class->search({ col => … })`
+/// arg key (columns defined in another file). The consumer emits the key with a
+/// deferred owner; the column-keyed-verb seam mints `Class` at query time so it
+/// joins the group, both directions.
+#[test]
+fn dbic_column_rename_reaches_cross_file_consumer_arg_key() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+    let store = FileStore::new();
+    let lib = PathBuf::from("/tmp/dbic_user.pm");
+    let app = PathBuf::from("/tmp/dbic_app.pl");
+    let lib_src = "package User;\nuse base 'DBIx::Class::Core';\n__PACKAGE__->add_columns(qw/id name/);\n1;\n";
+    let app_src = "use User;\nmy $rs = User->search({ name => 'x' });\n";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(lib.clone(), Arc::new(parse(lib_src)));
+    store.insert_workspace(lib.clone(), parse(lib_src));
+    store.insert_workspace(app.clone(), parse(app_src));
+    let lib_fa = store.workspace_raw().get(&lib).unwrap().value().clone();
+    let col = lib_src.lines().nth(2).unwrap().find("name").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&lib_fa, tree_sitter::Point { row: 2, column: col }, Some(&idx)).expect("column resolves")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, Some(&idx), &FileKey::Path(lib.clone()), &local_spans, &pinned_spans, &members, "X",
+    );
+    assert!(
+        edits.iter().any(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &app)),
+        "column rename reaches the cross-file `User->search({{ name }})` arg key: {edits:?}",
+    );
+}
+
 /// Finding #1: event (Handler) rename. A literal event-name site is rewritable
 /// and its span is the **inside-the-quotes** name (so rename keeps the quotes);
 /// a folded site — variable (`my $e='connect'; on($e)`) OR constant

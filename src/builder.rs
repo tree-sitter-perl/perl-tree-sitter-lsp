@@ -554,6 +554,7 @@ fn build_with_plugins_inner(
         contract_symbols: b.contract_symbols,
         dynamic_parent_packages: b.dynamic_parent_packages,
         role_packages: b.role_packages,
+        column_keyed_verbs: b.plugins.column_keyed_verbs().map(|s| s.to_string()).collect(),
         plugin_loads: b.plugin_loads,
         loader_config_params: b.loader_config_params,
     });
@@ -1651,6 +1652,13 @@ enum Gate {
     StrictOrDefer(HashKeyOwner),
     Open(HashKeyOwner),
     Deferred,
+    /// A plugin-declared column-keyed verb (DBIC `search`/`create`/…): walk only
+    /// the FIRST hashref arg (the `\%cond`/`\%cols`; the trailing `\%attrs` hash
+    /// is not column-keyed). A key that is a `Class` column of the receiver gets
+    /// the column owner; otherwise it falls back to the supplied `Sub{class,verb}`
+    /// owner (so a generic-named verb like `new` still binds Moo/Corinna ctor
+    /// keys). Carries the `Sub{class,verb}` owner.
+    ColumnKeyed(HashKeyOwner),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11562,6 +11570,33 @@ impl<'a> Builder<'a> {
         // pair list. Constructor-style args without the wrapper
         // pass through unchanged.
         let mut effective = args_node;
+        // A column-keyed verb's column hash is POSITIONALLY the first arg
+        // (`search(\%cond, \%attrs)` → `\%cond`; `create(\%cols)`). Narrow to it
+        // only when arg 0 is itself a hash literal — a scalar/arrayref cond
+        // (`search($cond, \%attrs)`) carries no inline keys, and the trailing
+        // `\%attrs` hash (`order_by`/`rows`/…) must never be mistaken for it
+        // (picking "first hash among args" would walk it).
+        if matches!(gate, Gate::ColumnKeyed(_)) {
+            let arg0 = if effective.kind() == "anonymous_hash_expression" {
+                Some(effective)
+            } else {
+                effective.named_child(0)
+            };
+            match arg0 {
+                // Hashref cond/cols (`search({…})`, `create({…})`): narrow to it.
+                Some(h) if h.kind() == "anonymous_hash_expression" => effective = h,
+                // Flat constructor pairs (`new(name => 1)`): arg 0 is a stringy
+                // key — walk the top-level pair list (effective unchanged).
+                Some(k) if matches!(
+                    k.kind(),
+                    "bareword" | "autoquoted_bareword" | "string_literal" | "interpolated_string_literal"
+                ) => {}
+                // A positional non-key first arg (`search($cond, \%attrs)`): the
+                // cond is a prebuilt ref with no inline keys, and the trailing
+                // `\%attrs` hash is not column-keyed. Walk nothing.
+                _ => return,
+            }
+        }
         if matches!(effective.kind(), "anonymous_hash_expression" | "parenthesized_expression")
             && effective.named_child_count() == 1
         {
@@ -11605,6 +11640,25 @@ impl<'a> Builder<'a> {
                 Gate::Strict(owner) => {
                     if !self.has_hash_key_def(&key, owner) { continue; }
                     Some(owner.clone())
+                }
+                Gate::ColumnKeyed(sub_owner) => {
+                    // First-hashref narrowing already happened in `effective`.
+                    // A key that's an actual column → the column owner; else fall
+                    // back to the `Sub{class,verb}` owner if the verb declares it
+                    // (Moo/Corinna ctor keys under a generic-named `new`); else
+                    // skip (so `order_by` and friends never latch on).
+                    let class = match sub_owner {
+                        HashKeyOwner::Sub { package: Some(c), .. } => c.clone(),
+                        _ => continue,
+                    };
+                    let col = HashKeyOwner::Class(class);
+                    if self.has_hash_key_def(&key, &col) {
+                        Some(col)
+                    } else if self.has_hash_key_def(&key, sub_owner) {
+                        Some(sub_owner.clone())
+                    } else {
+                        continue;
+                    }
                 }
                 Gate::StrictOrDefer(owner) => {
                     if self.has_hash_key_def(&key, owner) {
@@ -12563,7 +12617,12 @@ impl<'a> Builder<'a> {
             Strict(HashKeyOwner, Node<'a>),
             StrictOrDefer(HashKeyOwner, Node<'a>),
             Deferred(Node<'a>),
+            ColumnKeyed(HashKeyOwner, Node<'a>),
         }
+        // Plugin-declared verbs whose first hashref arg is column-keyed (owned
+        // so it doesn't borrow `self` across the `&mut self` emit loop below).
+        let column_keyed: std::collections::HashSet<String> =
+            self.plugins.column_keyed_verbs().map(|s| s.to_string()).collect();
         let mut pending: Vec<Path<'a>> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
             if !matches!(r.kind, RefKind::MethodCall { .. }) {
@@ -12598,10 +12657,26 @@ impl<'a> Builder<'a> {
                 let local_class = self.symbols.iter().any(|s| {
                     matches!(s.kind, SymKind::Package | SymKind::Class) && s.name == *cls
                 });
+                // A column-keyed verb (`search`/`create`/…) on a locally-defined
+                // class: link the first hashref's column keys to the class's
+                // columns. Cross-file (class elsewhere) stays `StrictOrDefer` —
+                // the deferred owner mints the column owner at query time.
                 let owner = HashKeyOwner::Sub {
                     package: Some(cls.clone()),
                     name: r.target_name.clone(),
                 };
+                // A class that defines its OWN `sub <verb>` has overridden DBIC's
+                // verb — the call dispatches to the user's method, whose hash arg
+                // is not column-keyed — so don't column-key it (fall to Strict).
+                let user_shadows_verb = self.symbols.iter().any(|s| {
+                    matches!(s.kind, SymKind::Sub | SymKind::Method)
+                        && s.name == r.target_name
+                        && s.package.as_deref() == Some(cls.as_str())
+                });
+                if local_class && !user_shadows_verb && column_keyed.contains(&r.target_name) {
+                    pending.push(Path::ColumnKeyed(owner, args));
+                    continue;
+                }
                 pending.push(if local_class {
                     Path::Strict(owner, args)
                 } else {
@@ -12637,6 +12712,9 @@ impl<'a> Builder<'a> {
                 }
                 Path::Deferred(args) => {
                     self.emit_call_arg_key_accesses(args, Gate::Deferred);
+                }
+                Path::ColumnKeyed(owner, args) => {
+                    self.emit_call_arg_key_accesses(args, Gate::ColumnKeyed(owner));
                 }
             }
         }

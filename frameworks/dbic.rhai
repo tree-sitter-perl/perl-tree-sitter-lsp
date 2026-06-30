@@ -28,6 +28,17 @@ fn arg_name_verbs() {
      "belongs_to", "has_one", "might_have"]
 }
 
+// Resultset/row verbs whose FIRST hashref arg is keyed by COLUMN names — the
+// `\%cond` of `search(\%cond, \%attrs)`, the `\%cols` of `create`/`update`.
+// Core links those keys to the class's columns (so renaming a column rewrites
+// them) and, crucially, walks ONLY the first hashref: the trailing `\%attrs`
+// hash (`order_by`/`rows`/`group_by`/…) is NOT column-keyed and stays out.
+// Owning the verb list here (not in core) keeps core from hardcoding DBIC's API.
+fn column_keyed_verbs() {
+    ["search", "search_rs", "find", "find_or_create", "find_or_new",
+     "update", "update_or_create", "create", "new", "count", "single"]
+}
+
 fn is_resultset_rel(verb) {
     verb == "has_many" || verb == "many_to_many"
 }

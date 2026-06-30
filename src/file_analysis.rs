@@ -2360,6 +2360,12 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub role_packages: HashSet<String>,
 
+    /// Method verbs whose first hashref arg is keyed by the receiver class's
+    /// columns (DBIC `search`/`create`/…). The plugin-declared verb set, baked
+    /// here so query-time owner resolution can mint the column owner cross-file.
+    #[serde(default)]
+    pub column_keyed_verbs: HashSet<String>,
+
     /// Caller-side loader facts: this file loads plugin `name` and
     /// passes the value at `config_span`. Joined at enrichment with
     /// the loaded module's `loader_config_params` markers.
@@ -2434,6 +2440,7 @@ pub struct FileAnalysisParts {
     pub contract_symbols: HashSet<SymbolId>,
     pub dynamic_parent_packages: HashSet<String>,
     pub role_packages: HashSet<String>,
+    pub column_keyed_verbs: HashSet<String>,
     pub plugin_loads: Vec<PluginLoadFact>,
     pub loader_config_params: Vec<LoaderConfigParam>,
 }
@@ -2587,6 +2594,7 @@ impl FileAnalysis {
             contract_symbols,
             dynamic_parent_packages,
             role_packages,
+            column_keyed_verbs,
             plugin_loads,
             loader_config_params,
         } = parts;
@@ -2624,6 +2632,7 @@ impl FileAnalysis {
             contract_symbols,
             dynamic_parent_packages,
             role_packages,
+            column_keyed_verbs,
             plugin_loads,
             loader_config_params,
             scope_starts: Vec::new(),
@@ -5687,9 +5696,9 @@ impl FileAnalysis {
         key_ref: &Ref,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<HashKeyOwner> {
-        // Inline method-chain receiver: `$obj->method->{key}` — the key
-        // belongs to `method`'s return value, owned `Sub{invocant_class, method}`.
-        if let Some(enclosing) = self
+        // Enclosing method call whose span covers this key (an arg key inside a
+        // call, or a `->{key}` deref of the call's return).
+        let enclosing_call = self
             .refs
             .iter()
             .filter(|c| {
@@ -5697,8 +5706,52 @@ impl FileAnalysis {
                     && contains_point(&c.span, key_ref.span.start)
                     && contains_point(&c.span, key_ref.span.end)
             })
-            .min_by_key(|c| span_size(&c.span))
-        {
+            .min_by_key(|c| span_size(&c.span));
+
+        // Column-keyed call arg (`$rs->search({ name => … })`, columns
+        // cross-file): the key is a COLUMN of the invocant class, not a key of
+        // the call's return — mint the column owner so it joins the column group.
+        // Checked before the return-deref case below, which would otherwise
+        // claim the same span as `Sub{class, verb}`. Gated on the key actually
+        // being a column of the class (so `order_by` etc. fall through).
+        if let (Some(enclosing), Some(idx)) = (enclosing_call, module_index) {
+            let verb = enclosing.unqualified_target_name();
+            if self.is_column_keyed_verb(verb) {
+                if let Some(class) = enclosing
+                    .resolved_method_target
+                    .as_ref()
+                    .map(|t| t.invocant_class().to_string())
+                    .or_else(|| self.method_call_invocant_class(enclosing, module_index))
+                {
+                    let is_column = idx.get_cached(&class).is_some_and(|c| {
+                        // A class defining its OWN `sub <verb>` overrode DBIC's
+                        // verb — the call isn't column-keyed (same gate as the
+                        // builder's `user_shadows_verb`).
+                        let shadows = c.analysis.symbols.iter().any(|s| {
+                            matches!(s.kind, SymKind::Sub | SymKind::Method)
+                                && s.name == verb
+                                && s.package.as_deref() == Some(class.as_str())
+                        });
+                        !shadows
+                            && c.analysis
+                                .field_projections_named(&key_ref.target_name, &class)
+                                // ONLY a real `Class`-owned column (DBIC /
+                                // Class::Accessor). A Moo/Corinna attr is also a
+                                // field projection but its ctor key is
+                                // `Sub{class,new}`-owned — leave it to the
+                                // return-deref case below, which mints that.
+                                .is_some_and(|p| p.has_class_key)
+                    });
+                    if is_column {
+                        return Some(HashKeyOwner::Class(class));
+                    }
+                }
+            }
+        }
+
+        // Inline method-chain receiver: `$obj->method->{key}` — the key
+        // belongs to `method`'s return value, owned `Sub{invocant_class, method}`.
+        if let Some(enclosing) = enclosing_call {
             if let Some(class) = enclosing
                 .resolved_method_target
                 .as_ref()
@@ -5888,17 +5941,24 @@ impl FileAnalysis {
                         package,
                     });
                 }
-                RefKind::MethodCall { .. } => {
-                    if let Some(class) = self.method_call_invocant_class(r, module_index) {
-                        // FQ `$o->Foo::Bar::m` renames the bare `m` tail; the
-                        // qualifier scopes the class (same as Function above).
-                        return Some(RenameKind::Method {
-                            name: r.unqualified_target_name().to_string(),
-                            class,
-                        });
+                RefKind::MethodCall { method_name_span, .. } => {
+                    // `ref_at` can return a MethodCall ref for a cursor anywhere
+                    // in the call — its span covers the args. But only the
+                    // method-name token renames the method: a hash key in the
+                    // args (`$rs->search({ order_by => 1 })`) that didn't resolve
+                    // to a column must NOT hijack `search`. Gate on the name span.
+                    if contains_point(method_name_span, point) {
+                        if let Some(class) = self.method_call_invocant_class(r, module_index) {
+                            // FQ `$o->Foo::Bar::m` renames the bare `m` tail; the
+                            // qualifier scopes the class (same as Function above).
+                            return Some(RenameKind::Method {
+                                name: r.unqualified_target_name().to_string(),
+                                class,
+                            });
+                        }
                     }
-                    // Invocant unresolvable — try symbol-at fallback
-                    // below; if that also has no class, bail rather
+                    // Invocant unresolvable (or cursor in args) — try symbol-at
+                    // fallback below; if that also has no class, bail rather
                     // than return a class-less Method rename.
                 }
                 RefKind::PackageRef => return Some(RenameKind::Package(r.target_name.clone())),
@@ -7098,6 +7158,13 @@ impl FileAnalysis {
     /// engines join via plugin declaration with no core change.
     pub fn is_role_package(&self, pkg: &str) -> bool {
         self.role_packages.contains(pkg)
+    }
+
+    /// Does `verb` take a column-keyed first hashref arg (DBIC `search`/`create`
+    /// /…)? Plugin-declared (`column_keyed_verbs()`), baked at build time — the
+    /// gate that links call-arg keys to the receiver class's columns.
+    pub fn is_column_keyed_verb(&self, verb: &str) -> bool {
+        self.column_keyed_verbs.contains(verb)
     }
 
     /// The composer-mismatch check (docs/adr/role-contracts.md): for
