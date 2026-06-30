@@ -66,6 +66,33 @@ first-class cpp feature, not a Perl quirk. Every tier we build should be
 spine, the bind shapes, the narrowing guards. If a tier only works for Perl,
 the seam isn't actually generic yet.
 
+### Cross-language narrowing/bind backlog (the generality steps)
+
+Current state (verified): the `narrow_guard` LangPack hook spans languages, but
+coverage is uneven, and the **rebind cutoff has no cross-language consumer yet**
+— it lives in the Perl builder (`first_subject_write`), not the query engine.
+
+| language | `@flow` assign/decl | bind shapes (rebind) | `narrow_guard` |
+|----------|---------------------|----------------------|----------------|
+| perl     | ✅                  | ✅ `my`/`local`/`foreach` → Rebind | ✅ defined/ref/blessed |
+| cpp      | ✅                  | ⬜ range-for, `std::move`-from     | ⬜ STUBBED (`\|_,_\| None`) — wire `dynamic_cast`/`if(opt)`/`holds_alternative` |
+| python   | ✅                  | ⬜ `for x in`, `x: T`, `del x`     | ✅ `isinstance` |
+
+The steps, in dependency order — DON'T mint cpp/python rebinds before there's a
+reader, or they're edges into a void:
+
+1. **Generic narrowing-cutoff (ARC 2/E):** lift `first_subject_write` off the
+   Perl CST scan onto a FlowEdge query (`earliest edge targeting $x in region`).
+   This is what makes rebinds *consumable* by any language — the cutoff becomes
+   language-agnostic the moment it reads edges instead of `cst::rebinds_scalar`.
+2. **Per-language bind captures** (once #1 lands): cpp range-for /
+   structured-binding / `std::move`; python `for`/annotation/`del` → `Rebind`
+   FlowEdges via each skeleton + the shared `query_extract` minter. (cpp `T x;`
+   is NOT a clear — it's a typed default-init via `@type.annot`.)
+3. **cpp `narrow_guard` wiring:** `dynamic_cast<T*>` → `T*`, `if(opt)` /
+   `has_value()` → engaged, `holds_alternative<T>`/`get_if<T>` → `T`. The hook
+   exists; cpp just returns `None` today.
+
 ## On-target discipline
 
 - ARC 2/3 (Flow spine + Perl-on-engine) **hardens the seam** — shared, cpp
