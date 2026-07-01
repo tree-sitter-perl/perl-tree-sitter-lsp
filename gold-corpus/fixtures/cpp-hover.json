@@ -39,7 +39,7 @@
       "lang": "cpp", "root": "gold-corpus/cpp-fixture",
       "file": "macro_field_type.cpp", "line": 2, "col": 18,
       "expect": { "all": ["unsigned short"], "none": [] },
-      "status": "xfail"
+      "status": "gold"
     }
   ]
 }

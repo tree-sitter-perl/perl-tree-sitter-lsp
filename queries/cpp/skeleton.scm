@@ -86,6 +86,21 @@
     declarator: (pointer_declarator
       declarator: (type_identifier) @def.class.name))) @def.class
 
+; ---- scalar / primitive / alias-chain typedefs → the alias EDGE. ----
+; `typedef unsigned short U16;`, `typedef uint32_t u32;`, `typedef V16 W16;`
+; — the underlying is a SCALAR (a struct/union/enum, bodied or bare tag,
+; aliases through @parent above, so it's excluded here). @alias.of carries
+; the underlying type TEXT, joined to @alias.name by match; the extractor
+; mints a `TypeName(alias) → <underlying>` witness so a declared `U16 x;`
+; chases the alias to its leaf type (`unsigned short`) for hover / typing.
+(type_definition
+  type: [(primitive_type) (sized_type_specifier) (type_identifier)] @alias.of
+  declarator: (type_identifier) @alias.name)
+; C++ `using U16 = unsigned short;` — same alias, `alias_declaration` shape.
+(alias_declaration
+  name: (type_identifier) @alias.name
+  type: (type_descriptor) @alias.of)
+
 ; typedef of a NAMED tag whose body is elsewhere: `typedef struct op OP;`
 ; (perl5's dominant idiom — `struct op` is defined in op.h, OP is the public
 ; name). OP is an ALIAS for the tag, so record the tag as OP's @parent: member

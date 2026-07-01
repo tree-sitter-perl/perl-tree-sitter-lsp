@@ -236,7 +236,16 @@ impl SkeletonAnalysis {
                     continue;
                 }
                 if let Some(ret) = &self.symbols[i].return_type {
-                    bag.push(mk(WA::Symbol(sym.id), WP::InferredType(ret.clone()), sym.span));
+                    // A class-shaped declared return edges into the alias graph
+                    // (it may be a typedef) instead of committing the spelling;
+                    // primitives are leaves. `TypeName` resolves the typedef or
+                    // falls back to the same `ClassName`, so struct returns are
+                    // unchanged and aliased returns now chase. (edges-not-values)
+                    let pay = match ret {
+                        InferredType::ClassName(cn) => WP::Edge(WA::TypeName(cn.clone())),
+                        other => WP::InferredType(other.clone()),
+                    };
+                    bag.push(mk(WA::Symbol(sym.id), pay, sym.span));
                 }
                 if matches!(sym.kind, SymKind::Method) {
                     if let Some(class) = &sym.package {
@@ -1044,9 +1053,19 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // Populated inside the main loop (a decl's scope is only known there); the
     // type-annot half is pre-collected here since it precedes the declarator.
     let mut annot_by_match: HashMap<usize, String> = HashMap::new();
+    // `@alias.name` (a typedef/using type alias) + `@alias.of` (its
+    // underlying type text), joined per match → `TypeName` alias witnesses.
+    let mut alias_name_by_match: HashMap<usize, String> = HashMap::new();
+    let mut alias_of_by_match: HashMap<usize, String> = HashMap::new();
     for e in &events {
         if e.cap == "type.annot" {
             annot_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "alias.name" {
+            alias_name_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "alias.of" {
+            alias_of_by_match.insert(e.match_id, e.text.clone());
         }
     }
     let mut annot_text_by_var: HashMap<(String, crate::file_analysis::ScopeId), String> =
@@ -1659,6 +1678,34 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         }
     }
 
+    // ---- typedef / using aliases → TypeName witnesses (the alias graph) ----
+    // `typedef unsigned short U16` / `using U16 = unsigned short` push
+    // `TypeName("U16") → <underlying>`: a primitive leaf stays an
+    // `InferredType`; a class-shaped underlying edges to `TypeName(that)` so
+    // an alias chain (`typedef V16 W16`) chases; an unrecognized leaf spelling
+    // (`unsigned short` — has a space) is `ClassName(text)` so hover shows the
+    // raw spelling. Struct/union/enum tag typedefs (`typedef struct op OP`)
+    // don't reach here — the skeleton's @parent edge already aliases them.
+    for (mid, alias) in &alias_name_by_match {
+        let Some(underlying) = alias_of_by_match.get(mid) else { continue };
+        let underlying = underlying.trim();
+        let payload = match (pack.annot_type)(underlying) {
+            Some(InferredType::ClassName(cn)) => crate::witnesses::WitnessPayload::Edge(
+                crate::witnesses::WitnessAttachment::TypeName(cn),
+            ),
+            Some(t) => crate::witnesses::WitnessPayload::InferredType(t),
+            None => crate::witnesses::WitnessPayload::InferredType(InferredType::ClassName(
+                underlying.to_string(),
+            )),
+        };
+        out.witnesses.push(crate::witnesses::Witness {
+            attachment: crate::witnesses::WitnessAttachment::TypeName(alias.clone()),
+            source: crate::witnesses::WitnessSource::Builder("skeleton-typedef".into()),
+            payload,
+            span: Span { start: Point { row: 0, column: 0 }, end: Point { row: 0, column: 0 } },
+        });
+    }
+
     // ---- join flow captures into Variable witnesses ----
     for (mid, (name, scope, at)) in &flow_targets {
         let var = crate::witnesses::WitnessAttachment::Variable {
@@ -1666,11 +1713,25 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             scope: *scope,
         };
         if let Some(annot) = annots.get(mid) {
-            if let Some(t) = (pack.annot_type)(annot) {
+            // A class-shaped declared type edges into the alias graph (it may
+            // be a typedef — `U16 x;` where `typedef unsigned short U16`);
+            // primitives stay leaves; `None` (auto/void) defers to the flow
+            // edge as before. `TypeName` chases the typedef or falls back to
+            // the same `ClassName`, so a plain struct/class is unchanged.
+            let payload = match (pack.annot_type)(annot) {
+                Some(InferredType::ClassName(cn)) => Some(
+                    crate::witnesses::WitnessPayload::Edge(
+                        crate::witnesses::WitnessAttachment::TypeName(cn),
+                    ),
+                ),
+                Some(t) => Some(crate::witnesses::WitnessPayload::InferredType(t)),
+                None => None,
+            };
+            if let Some(payload) = payload {
                 out.witnesses.push(crate::witnesses::Witness {
                     attachment: var.clone(),
                     source: crate::witnesses::WitnessSource::Builder("skeleton-annot".into()),
-                    payload: crate::witnesses::WitnessPayload::InferredType(t),
+                    payload,
                     span: Span { start: *at, end: *at },
                 });
             }
@@ -1763,3 +1824,7 @@ fn byte_range_of(events: &[Event], match_id: usize, cap: &str) -> Option<(usize,
 #[cfg(test)]
 #[path = "query_extract_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cpp_typedef_alias_tests.rs"]
+mod cpp_typedef_alias_tests;
