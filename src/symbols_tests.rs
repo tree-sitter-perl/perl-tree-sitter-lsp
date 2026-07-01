@@ -3233,12 +3233,12 @@ sub get { my $self = shift; return $self; }
 sub under { my $self = shift; return $self; }
 sub to { my $self = shift; return $self; }
 
-package alerts;
+package Alerts;
 sub list { my $c = shift; }
 sub get_alert { my $c = shift; }
 sub read_settings { my $c = shift; }
 
-package other;
+package Other;
 sub thing { my $c = shift; }
 
 package MyApp;
@@ -3258,31 +3258,38 @@ sub startup {
     let fa = parse_analysis(src);
     let idx = crate::module_index::ModuleIndex::new_for_test();
 
-    // Helper: the plugin-emitted MethodCallRef for a partial target —
-    // its invocant class IS the inherited controller, its target the
-    // action.
+    let _ = &idx;
+    // Helper: the plugin-emitted MethodCallRef for a partial target
+    // carries the inherited controller as its bridged TOKEN (not a frozen
+    // class — resolution to a class is the plugin's query-time job, which
+    // needs a populated index; brand inheritance is what's under test).
     let inherited = |action: &str| -> Option<String> {
         fa.refs.iter().find_map(|r| {
-            if let crate::file_analysis::RefKind::MethodCall { .. } = &r.kind {
+            if let crate::file_analysis::RefKind::MethodCall {
+                invocant: crate::conventions::Invocant::Bridged { token, .. },
+                ..
+            } = &r.kind
+            {
                 if r.target_name == action {
-                    return fa.method_call_invocant_class(r, Some(&idx));
+                    return Some(token.clone());
                 }
             }
             None
         })
     };
 
-    // Direct child: `$alerts_r->get('/')->to('#list')` inherits 'alerts'.
-    assert_eq!(inherited("list").as_deref(), Some("alerts"),
+    // Direct child: `$alerts_r->get('/')->to('#list')` inherits 'alerts',
+    // emitted camelized (`Alerts`) — the plugin applies the convention.
+    assert_eq!(inherited("list").as_deref(), Some("Alerts"),
         "partial '#list' must inherit the parent's 'alerts' controller");
     // Nested via `under`: `$crud` inherits 'alerts' from `$alerts_r`.
-    assert_eq!(inherited("get_alert").as_deref(), Some("alerts"),
+    assert_eq!(inherited("get_alert").as_deref(), Some("Alerts"),
         "partial '#get_alert' on $crud (under $alerts_r) inherits 'alerts'");
     // Two hops deep: `$crud->get('/settings')->to('#read_settings')`.
-    assert_eq!(inherited("read_settings").as_deref(), Some("alerts"),
+    assert_eq!(inherited("read_settings").as_deref(), Some("Alerts"),
         "nested partial '#read_settings' still inherits 'alerts'");
     // Sibling group re-brands; no leak from 'alerts'.
-    assert_eq!(inherited("thing").as_deref(), Some("other"),
+    assert_eq!(inherited("thing").as_deref(), Some("Other"),
         "sibling group's '#thing' inherits 'other', not 'alerts'");
 
     // The brand rides assignment + nesting: $alerts_r and $crud both

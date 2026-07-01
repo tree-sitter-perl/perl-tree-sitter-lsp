@@ -1716,46 +1716,10 @@ $dog->speak();
 }
 
 // ---- Mojolicious route controller-token → class ----
-
-/// Camelize matches `Mojo::Util::camelize` exactly (verified against
-/// the crm-vendored Mojo::Util source): `-` → `::`, `_` within a
-/// segment → `ucfirst lc` pieces concatenated, leading-uppercase token
-/// passes through unchanged.
-#[test]
-fn test_camelize_controller_matches_mojo_util() {
-    let cases = [
-        ("login", "Login"),
-        ("sales_reports", "SalesReports"),
-        ("integrations-ads_api", "Integrations::AdsApi"),
-        ("foo_bar-baz", "FooBar::Baz"),
-        ("users", "Users"),
-        // Already class-shaped: untouched (camelize's `/^[A-Z]/` gate).
-        ("FooBar", "FooBar"),
-        ("Foo::Bar", "Foo::Bar"),
-        // Mixed-case piece is lowercased first, then ucfirst'd.
-        ("sales_REPORTS", "SalesReports"),
-    ];
-    for (input, want) in cases {
-        assert_eq!(
-            camelize_controller(input),
-            want,
-            "camelize_controller({input:?})",
-        );
-    }
-}
-
-#[test]
-fn test_module_tail_matches() {
-    assert!(module_tail_matches("Clove::Controller::Login", "Login"));
-    assert!(module_tail_matches(
-        "App::Controller::Integrations::AdsApi",
-        "Integrations::AdsApi",
-    ));
-    assert!(module_tail_matches("Login", "Login"));
-    // Tail must align on a `::` boundary — not a substring.
-    assert!(!module_tail_matches("Clove::Controller::AdminLogin", "Login"));
-    assert!(!module_tail_matches("Clove::Controller::Logins", "Login"));
-}
+//
+// `camelize_controller` / `module_tail_matches` unit coverage moved with
+// the logic into `plugin::bridged_invocant` (the resolver is plugin-owned
+// now, not core). See that module's `#[cfg(test)] mod tests`.
 
 /// Cross-file pin: a route `->to('users#list')` (controller token
 /// `users`, lowercase, never a Perl package name on its own) resolves
@@ -1803,7 +1767,7 @@ fn test_route_controller_token_resolves_cross_file() {
         .iter()
         .find(|r| {
             r.target_name == "list"
-                && matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "users")
+                && matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Users")
         })
         .expect("plugin emits MethodCall {invocant: users, method: list} for ->to('users#list')");
 
@@ -1888,10 +1852,10 @@ fn test_partial_route_brand_composes_with_camelize_cross_file() {
             .iter()
             .find(|r| {
                 r.target_name == action
-                    && matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "alerts")
+                    && matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Alerts")
             })
             .unwrap_or_else(|| {
-                panic!("partial ->to('#{action}') should emit MethodCall {{invocant: alerts, method: {action}}}")
+                panic!("partial ->to('#{action}') should emit MethodCall {{invocant: Alerts (camelized), method: {action}}}")
             });
 
         let class = app.method_call_invocant_class(to_ref, Some(&idx));
@@ -1909,9 +1873,9 @@ fn test_partial_route_brand_composes_with_camelize_cross_file() {
         .iter()
         .find(|r| {
             r.target_name == "index"
-                && matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "billing")
+                && matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Billing")
         })
-        .expect("sibling group partial ->to('#index') should inherit `billing`");
+        .expect("sibling group partial ->to('#index') should inherit `billing` (camelized)");
     assert_eq!(
         app.method_call_invocant_class(index_ref, Some(&idx)).as_deref(),
         Some("Clove::Controller::Billing"),
@@ -1971,7 +1935,7 @@ fn test_route_controller_token_disambiguates_by_ownership() {
         .iter()
         .find(|r| {
             r.target_name == "monthly"
-                && matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "reports")
+                && matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Reports")
         })
         .expect("MethodCall for ->to('reports#monthly')");
 

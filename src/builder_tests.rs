@@ -820,7 +820,7 @@ fn test_method_call_ref() {
         .collect();
     assert_eq!(method_refs.len(), 1);
     if let RefKind::MethodCall { ref invocant, .. } = method_refs[0].kind {
-        assert_eq!(invocant, "$obj");
+        assert_eq!(invocant.text(), "$obj");
     }
 }
 
@@ -1695,7 +1695,7 @@ $h{it}->kid();
     // Spot-check the concrete answers so a mutual `None` regression
     // can't pass the agreement assert vacuously.
     let kid_on_scalar = fa.refs.iter().find(|r| {
-        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "$f")
+        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "$f")
             && r.target_name == "kid"
     });
     assert_eq!(
@@ -1704,7 +1704,7 @@ $h{it}->kid();
         "scalar invocant `$f->kid` should type as Foo, tree-free",
     );
     let kid_on_array = fa.refs.iter().find(|r| {
-        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.starts_with("$arr"))
+        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text().starts_with("$arr"))
             && r.target_name == "kid"
     });
     assert_eq!(
@@ -2651,7 +2651,7 @@ fn test_dunder_package_method_invocant() {
     match &method_ref.kind {
         RefKind::MethodCall { invocant, .. } => {
             assert_eq!(
-                invocant, "Foo",
+                invocant.text(), "Foo",
                 "invocant should be resolved from __PACKAGE__"
             );
         }
@@ -6073,7 +6073,7 @@ $r->get('/users')->to('Users#list');
     );
     let r = route_refs
         .iter()
-        .find(|r| matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users"))
+        .find(|r| matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Users"))
         .expect("MethodCall with invocant=Users");
 
     // Sanity: ref span covers the string literal so cursor anywhere
@@ -6099,7 +6099,7 @@ $r->get('/users')->to(controller => 'Users', action => 'list');
     let fa = build_fa(src);
 
     let has_ref = fa.refs.iter().any(|r| {
-        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Users")
             && r.target_name == "list"
     });
     assert!(
@@ -6579,7 +6579,7 @@ $app->routes->post('/users')->to(controller => 'Users', action => 'create');
         .refs
         .iter()
         .find(|r| {
-            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Users")
                 && r.target_name == "create"
         })
         .expect("route should emit MethodCall create@Users");
@@ -14432,7 +14432,7 @@ ${$ref}->other;
     let RefKind::MethodCall { ref invocant, .. } = thing.kind else {
         panic!("expected MethodCall, got {:?}", thing.kind);
     };
-    assert_eq!(invocant, "$sner");
+    assert_eq!(invocant.text(), "$sner");
     assert_eq!(
         fa.method_call_invocant_class(thing, None).as_deref(),
         Some("Foo"),
@@ -14447,7 +14447,7 @@ ${$ref}->other;
     let RefKind::MethodCall { ref invocant, .. } = other.kind else {
         panic!("expected MethodCall, got {:?}", other.kind);
     };
-    assert_eq!(invocant, "${$ref}", "deref block keeps raw text");
+    assert_eq!(invocant.text(), "${$ref}", "deref block keeps raw text");
 }
 
 /// `my $c = 'Counter'; $c->bump` — a scalar invocant holding a const-folded
@@ -14978,20 +14978,20 @@ get('/y')->to('#after_group');
             .unwrap_or_else(|| panic!("no MethodCall ref for {action}"))
     };
     assert!(
-        invocant_of("missing_fnsku").contains("notifications"),
-        "in-group partial inherits the group's under",
+        invocant_of("missing_fnsku").contains("Notifications"),
+        "in-group partial inherits the group's under (camelized)",
     );
     assert!(
-        invocant_of("after_group").contains("login"),
+        invocant_of("after_group").contains("Login"),
         "post-group partial inherits the OUTER under — the group frame popped",
     );
 }
 
-/// `plugin 'Thing'` emits a register-anchored MethodCall ref with the
-/// DECAMELIZED token ("WasLoaded" → "was_loaded"), so goto-def rides
-/// the same camelize+tail+ownership search as go-to-controller —
-/// namespace-agnostic (Mojolicious::Plugin::* and app-specific
-/// namespaces both land).
+/// `plugin 'Thing'` emits a register-anchored MethodCall ref whose
+/// bridged token is the plugin name camelized to a class key (already
+/// CamelCase here, so it passes through), resolved by `::`-tail +
+/// ownership of `register` — namespace-agnostic (Mojolicious::Plugin::*
+/// and app-specific namespaces both land).
 #[test]
 fn lite_plugin_name_emits_register_ref() {
     let src = "\
@@ -15014,8 +15014,8 @@ plugin 'Foo::BarBaz';
         })
         .collect();
     assert_eq!(invocants.len(), 2, "{:?}", invocants);
-    assert!(invocants[0].contains("was_loaded"), "{:?}", invocants);
-    assert!(invocants[1].contains("foo-bar_baz"), "{:?}", invocants);
+    assert!(invocants[0].contains("WasLoaded"), "{:?}", invocants);
+    assert!(invocants[1].contains("Foo::BarBaz"), "{:?}", invocants);
 }
 
 /// Framework-assigned Mojo attrs (`has [qw(app tx)]` with no default —

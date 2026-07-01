@@ -516,6 +516,15 @@ pub enum EmitAction {
         /// can extract it — e.g. the `"Users"` part of `"Users#list"`).
         #[serde(default)]
         invocant_span: Option<Span>,
+        /// When set, `invocant` is a class key this plugin already
+        /// transformed (a camelized Mojo controller name), not a Perl
+        /// receiver. The builder stores it as `Invocant::Bridged { plugin,
+        /// token, match_mode }` so the freeze pass never pins a guessed
+        /// class; core then resolves it generically by the declared match
+        /// mode (`"exact"` / `"tail"`). `None` = an ordinary receiver.
+        /// Tail is opt-in — the plugin must ask for it.
+        #[serde(default)]
+        bridged: Option<crate::conventions::BridgedMatch>,
     },
     /// Full control: emit an arbitrary Symbol.
     ///
@@ -1017,6 +1026,7 @@ pub trait FrameworkPlugin: Send + Sync {
     fn on_completion(&self, ctx: &CompletionQueryContext) -> Option<PluginCompletionAnswer> {
         None
     }
+
 }
 
 // ---- Query-hook types ----

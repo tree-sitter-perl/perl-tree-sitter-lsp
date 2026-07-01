@@ -387,6 +387,22 @@ pub fn find_definition(
             let method = r.unqualified_target_name();
             let class_name = analysis.method_call_invocant_class(r, Some(module_index));
             if let Some(ref cn) = class_name {
+                // The invocant resolved (e.g. a plugin-bridged route token
+                // → controller class) but the controller lives in THIS
+                // file: jump to the local method symbol. The build-time
+                // freeze normally serves same-file dispatch, but a bridged
+                // invocant is never frozen (its class needs the index), so
+                // re-resolve here.
+                if let Some(MethodResolution::Local { sym_id, .. }) =
+                    analysis.resolve_method_in_ancestors(cn, method, Some(module_index))
+                {
+                    if let Some(sym) = analysis.symbols.iter().find(|s| s.id == sym_id) {
+                        return Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: uri.clone(),
+                            range: span_to_range(sym.selection_span),
+                        }));
+                    }
+                }
                 if let Some(MethodResolution::CrossFile { ref class, ref def_module }) = analysis.resolve_method_in_ancestors(cn, method, Some(module_index)) {
                     // One path for both: a real inherited method lives in
                     // `class`'s own module; a plugin-bridged helper lives in
@@ -641,7 +657,7 @@ fn completion_items_native(
         for r in &refs {
             if let RefKind::MethodCall { invocant, .. } = &r.kind {
                 let early = mid_string_methodref_completions(
-                    analysis, module_index, invocant, source, point, r.span,
+                    analysis, module_index, invocant.text(), source, point, r.span,
                 );
                 if !early.is_empty() {
                     return early;
@@ -2672,7 +2688,12 @@ pub fn collect_diagnostics(
     ];
     for r in &analysis.refs {
         let (invocant, _invocant_span) = match &r.kind {
-            RefKind::MethodCall { invocant, invocant_span, .. } => (invocant, invocant_span),
+            // A plugin-bridged token is plugin-resolved, not a receiver we
+            // can flag as an unresolved method — skip it.
+            RefKind::MethodCall { invocant, invocant_span, .. } => match invocant.as_name() {
+                Some(n) => (n, invocant_span),
+                None => continue,
+            },
             _ => continue,
         };
         let method_name = &r.target_name;
@@ -2808,6 +2829,9 @@ pub fn collect_diagnostics(
         let mut seen: std::collections::HashSet<(String, String)> = Default::default();
         for r in &analysis.refs {
             let RefKind::MethodCall { invocant, .. } = &r.kind else { continue };
+            // Plugin-bridged tokens are resolved by their owning plugin,
+            // not a missing-plugin hint candidate.
+            let Some(invocant) = invocant.as_name() else { continue };
             let method_name = &r.target_name;
             if !matches!(MethodToken::parse(method_name), MethodToken::Bare(_)) {
                 continue;

@@ -748,7 +748,7 @@ pub enum RefKind {
     /// publishes Variable witnesses + chain-receiver `Expression`
     /// edge witnesses; the helper reads those at query time.
     MethodCall {
-        invocant: crate::conventions::InvocantName,
+        invocant: crate::conventions::Invocant,
         /// Span of the invocant node. Used by
         /// `method_call_invocant_class` to find an inner-receiver
         /// ref via `call_ref_by_start` (chain dispatch).
@@ -2706,7 +2706,14 @@ impl FileAnalysis {
         // `&mut self.refs[i]` while calling them.
         let mut stamped: Vec<(usize, Option<MethodTarget>)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
-            if !matches!(r.kind, RefKind::MethodCall { .. }) {
+            // A plugin-bridged invocant must NEVER freeze as a class:
+            // its resolution needs the index + the owning plugin, absent
+            // at build time. Leaving the edge `None` makes `refs_to` /
+            // goto-def re-consult the plugin at query time (with the
+            // index in hand) instead of trusting a guessed token.
+            if !matches!(r.kind, RefKind::MethodCall { .. })
+                || matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.is_bridged())
+            {
                 continue;
             }
             let target = self
@@ -6422,6 +6429,25 @@ impl FileAnalysis {
         let RefKind::MethodCall { invocant, invocant_span, .. } = &r.kind else {
             return None;
         };
+        // A plugin-bridged token is NOT a Perl receiver — the emitting
+        // plugin already applied its naming convention (e.g. camelized a
+        // Mojo controller key), leaving a plain class key. Resolution is
+        // then GENERIC: match the key to a class (exact, or by `::`-tail
+        // when the plugin dropped the namespace) that owns the action. No
+        // plugin consult, no framework strings. With no index (build-time
+        // stamp, isolated tests) this stays unresolved — which is exactly
+        // why the freeze pass never pins it.
+        let invocant = match invocant {
+            crate::conventions::Invocant::Bridged { token, match_mode, .. } => {
+                return self.resolve_bridged_class(
+                    token,
+                    *match_mode,
+                    r.unqualified_target_name(),
+                    module_index,
+                );
+            }
+            crate::conventions::Invocant::Name(n) => n,
+        };
         // A qualified method token names its dispatch class explicitly —
         // Perl ignores the invocant's class for the lookup, so the token
         // wins ahead of invocant resolution.
@@ -6572,91 +6598,71 @@ impl FileAnalysis {
             return Some(c);
         }
 
-        // Controller-token invocant. A bareword that is *not class-shaped*
-        // — doesn't begin uppercase — can never be a Perl package name;
-        // Mojo's own `camelize` early-returns on `/^[A-Z]/` for exactly
-        // this reason. Such a token is a route controller key:
-        // `->to('login#act')` emits `MethodCall { invocant: "login",
-        // method_name: "act" }`. Camelize per Mojo::Util and workspace-
-        // search for the controller class that owns the action. The
-        // discriminator is the leading-char case (structural, mirrors
-        // camelize's gate), not a route name-allowlist (rule #10).
-        if invocant
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_lowercase)
-        {
-            if let Some(cls) =
-                self.resolve_controller_token(invocant, &r.target_name, module_index)
-            {
-                return Some(cls);
-            }
-        }
-
         Some(invocant.to_string())
     }
 
-    /// Map a Mojolicious route controller token (`'login'`,
-    /// `'integrations-ads_api'`) to the controller class that owns
-    /// `action`. Camelizes the token (Mojo::Util `camelize`) then
-    /// searches the module index for a class whose name tail equals the
-    /// camelized token AND that defines (or inherits) `action`.
-    ///
-    /// Namespace-agnostic by design (rule #10): we do NOT hardcode
-    /// `*::Controller::*`. A workspace may have several controller roots
-    /// (`Clove::Controller`, `Billing::Controller`, …) sharing short
-    /// names; we disambiguate by "which candidate actually owns the
-    /// action." Among survivors we prefer the `*::Controller::<Camelized>`
-    /// shape (Mojo's default controller namespace) as a deterministic
-    /// tiebreak, but ownership is the gate.
-    fn resolve_controller_token(
+    /// Resolve a plugin-bridged invocant *class key* to the workspace class
+    /// that owns `action`. The key is already in class form — the emitting
+    /// plugin applied its own naming convention (e.g. camelized a Mojo
+    /// controller token) — so resolution here is GENERIC, never
+    /// framework-specific:
+    ///   * `Exact` — the key is the class name.
+    ///   * `Tail`  — the key is a `::`-tail (the plugin dropped the
+    ///     namespace); match any class whose tail equals it.
+    /// Candidates come from the origin file's own packages and the index;
+    /// ownership ("does this class actually resolve `action`?") is the gate.
+    /// When several own it, pick deterministically by name. When NONE do —
+    /// an incomplete action mid-completion, or a route to a not-yet-written
+    /// method — fall back to the matching candidates so the class still
+    /// resolves.
+    fn resolve_bridged_class(
         &self,
-        token: &str,
+        key: &str,
+        match_mode: crate::conventions::BridgedMatch,
         action: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<String> {
-        let camelized = camelize_controller(token);
-        if camelized.is_empty() {
-            return None;
-        }
-        let idx = module_index?;
-
-        // Primary candidates: modules whose own package defines a sub
-        // named `action` (reverse index, O(1)) and whose name tail is the
-        // camelized token. Widen to every tail-matching module when none
-        // define it locally, so a controller that *inherits* the action
-        // from a base still resolves.
-        let mut candidates: Vec<String> = idx
-            .modules_with_symbol(action)
-            .into_iter()
-            .filter(|m| module_tail_matches(m, &camelized))
+        use crate::conventions::BridgedMatch;
+        let matches = |class: &str| match match_mode {
+            BridgedMatch::Exact => class == key,
+            BridgedMatch::Tail => {
+                class == key || class.strip_suffix(key).is_some_and(|p| p.ends_with("::"))
+            }
+        };
+        let mut candidates: Vec<String> = self
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Package | SymKind::Class) && matches(&s.name))
+            .map(|s| s.name.clone())
             .collect();
-        if candidates.is_empty() {
+        if let Some(idx) = module_index {
+            for m in idx.modules_with_symbol(action) {
+                if matches(&m) {
+                    candidates.push(m);
+                }
+            }
             idx.for_each_cached(&mut |name, _| {
-                if module_tail_matches(name, &camelized) {
+                if matches(name) {
                     candidates.push(name.to_string());
                 }
             });
         }
         candidates.sort();
         candidates.dedup();
-
-        // Disambiguate by ownership: keep only classes that actually
-        // resolve `action` (locally / via ancestors / via bridges), then
-        // prefer the `*::Controller::<Camelized>` shape deterministically.
-        let mut owners: Vec<String> = candidates
-            .into_iter()
+        if candidates.is_empty() {
+            return None;
+        }
+        let owners: Vec<String> = candidates
+            .iter()
             .filter(|cls| {
-                self.resolve_method_in_ancestors(cls, action, Some(idx))
+                self.resolve_method_in_ancestors(cls, action, module_index)
                     .is_some()
             })
+            .cloned()
             .collect();
-        owners.sort_by(|a, b| {
-            is_controller_shaped(b)
-                .cmp(&is_controller_shaped(a))
-                .then_with(|| a.cmp(b))
-        });
-        owners.into_iter().next()
+        if owners.is_empty() { candidates } else { owners }
+            .into_iter()
+            .next()
     }
 
     /// Full `InferredType` of a `MethodCall` ref's invocant — same
@@ -6672,6 +6678,22 @@ impl FileAnalysis {
     ) -> Option<InferredType> {
         let RefKind::MethodCall { invocant, invocant_span, .. } = &r.kind else {
             return None;
+        };
+        // Plugin-bridged token: generic class-key resolution (same seam as
+        // `method_call_invocant_class`); a route controller key has no
+        // richer flavor than its class identity.
+        let invocant = match invocant {
+            crate::conventions::Invocant::Bridged { token, match_mode, .. } => {
+                return self
+                    .resolve_bridged_class(
+                        token,
+                        *match_mode,
+                        r.unqualified_target_name(),
+                        module_index,
+                    )
+                    .map(InferredType::ClassName);
+            }
+            crate::conventions::Invocant::Name(n) => n,
         };
         if invocant.is_empty() {
             return None;
@@ -9269,71 +9291,6 @@ fn span_size(span: &Span) -> usize {
         0
     };
     rows * 10000 + cols
-}
-
-/// Camelize a Mojolicious controller token to its class-name fragment,
-/// matching `Mojo::Util::camelize` exactly:
-///
-/// ```text
-/// return $str if $str =~ /^[A-Z]/;
-/// return join '::', map {
-///   join('', map { ucfirst lc } split /_/)
-/// } split /-/, $str;
-/// ```
-///
-/// `-` splits into `::` namespace segments; within a segment `_` splits
-/// into pieces each `ucfirst lc`'d (lowercase the whole piece, then
-/// uppercase the first char) and concatenated. A leading-uppercase token
-/// is already a class fragment and passes through unchanged.
-///
-/// `login` → `Login`, `sales_reports` → `SalesReports`,
-/// `integrations-ads_api` → `Integrations::AdsApi`.
-fn camelize_controller(token: &str) -> String {
-    if token.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-        return token.to_string();
-    }
-    token
-        .split('-')
-        .map(|segment| {
-            segment
-                .split('_')
-                .map(ucfirst_lc)
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .collect::<Vec<_>>()
-        .join("::")
-}
-
-/// Perl `ucfirst lc`: lowercase the whole string, then uppercase the
-/// first character. Empty input stays empty (so a stray `_` contributes
-/// nothing, as in Perl).
-fn ucfirst_lc(piece: &str) -> String {
-    let lower = piece.to_lowercase();
-    let mut chars = lower.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
-/// True when `module`'s `::`-delimited tail equals `camelized` — i.e.
-/// the camelized form is the trailing namespace segment(s) of the class.
-/// `Clove::Controller::Login` matches `Login`;
-/// `App::Controller::Integrations::AdsApi` matches `Integrations::AdsApi`.
-fn module_tail_matches(module: &str, camelized: &str) -> bool {
-    module == camelized
-        || module
-            .strip_suffix(camelized)
-            .is_some_and(|prefix| prefix.ends_with("::"))
-}
-
-/// True when a class name has a `::Controller::` segment — Mojo's default
-/// controller namespace convention. Used only as a deterministic tiebreak
-/// among candidates that already pass the ownership gate; never as a
-/// hardcoded namespace requirement.
-fn is_controller_shaped(class: &str) -> bool {
-    class.contains("::Controller::") || class.ends_with("::Controller")
 }
 
 /// Strip the implicit invocant param from a handler signature so hover

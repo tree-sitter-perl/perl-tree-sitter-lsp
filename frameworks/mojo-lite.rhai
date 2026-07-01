@@ -64,30 +64,26 @@ fn topic_route_dsl() {
 }
 
 
-// Mojo::Util decamelize: "FooBar" -> "foo_bar", "Foo::Bar" -> "foo-bar".
-// Plugin names arrive camelized; the core's controller-token search is
-// gated on lowercase-leading tokens (mirroring camelize's /^[A-Z]/
-// early-return), so emitting the decamelized form round-trips through
-// the exact same machinery Mojo's loader uses.
-fn decamelize(name) {
-    let out = "";
-    let parts = name.split("::");
-    let first_part = true;
-    for part in parts {
-        if !first_part { out += "-"; }
-        first_part = false;
-        let first = true;
-        for ch in part {
-            if ch >= 'A' && ch <= 'Z' {
-                if !first { out += "_"; }
-                out += ch.to_lower();
-            } else {
-                out += ch;
-            }
-            first = false;
+// Mojo's `Mojo::Util::camelize` (a plugin name `'foo_bar'` → class tail
+// `Foo_Bar`... actually `-`→`::`, `_`→CamelCase): the convention that maps
+// a `plugin 'X'` token to its class-name tail. Pure string work, owned
+// here; core resolves the resulting key generically by `::`-tail. Mojo
+// plugin names are already CamelCase, so this usually passes through.
+fn camelize(token) {
+    if token == "" { return ""; }
+    let first = token[0];
+    if first >= 'A' && first <= 'Z' { return token; }
+    let segs = [];
+    for dash_seg in token.split('-') {
+        let parts = [];
+        for piece in dash_seg.split('_') {
+            if piece == "" { continue; }
+            let lower = piece.to_lower();
+            parts.push(lower[0].to_upper().to_string() + lower.sub_string(1));
         }
+        segs.push(parts.reduce(|a, p| a + p, ""));
     }
-    out
+    segs.reduce(|a, s| if a == "" { s } else { a + "::" + s }, "")
 }
 
 fn on_use(ctx) {
@@ -207,9 +203,10 @@ fn on_function_call(ctx) {
                 out += #{
                     MethodCallRef: #{
                         method_name: "register",
-                        invocant: decamelize(name),
+                        invocant: camelize(name),
                         span: span,
                         invocant_span: (),
+                        bridged: "tail",
                     }
                 };
                 // "You loaded it" — make the resolver pull the plugin in

@@ -87,6 +87,95 @@ impl std::fmt::Display for InvocantName {
     }
 }
 
+/// A method-call invocant, structurally split by *who resolves it*.
+///
+/// The ordinary [`Name`](Invocant::Name) case is a receiver written in
+/// the source — a variable, class, `__PACKAGE__`, or positional `shift` /
+/// `$_[0]` — resolved by the model's own inference. The
+/// [`Bridged`](Invocant::Bridged) case is a *token* a plugin routed here
+/// that is NOT a Perl receiver expression (a Mojo route controller key:
+/// `->to('users#list')` carries `Bridged { plugin: "mojo-routes", token:
+/// "users" }`). It is deliberately a distinct variant — not a
+/// guessed-by-leading-case string — so:
+///   * the builder never freezes the raw token as a class
+///     (`resolved_method_target` stays `None` for it), and
+///   * the model asks the *owning plugin* to resolve it instead of
+///     encoding the plugin's algorithm in core (rule #10 + rule #8).
+///
+/// Mirrors the existing "Bridged" naming (`HashKeyOwner::Bridged`,
+/// `TargetKind::HashKeyOfBridged`): a thing whose identity is owned by a
+/// plugin, not a Perl class.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Invocant {
+    Name(InvocantName),
+    Bridged { plugin: String, token: String, match_mode: BridgedMatch },
+}
+
+/// How a [`Bridged`](Invocant::Bridged) token resolves to a class. Strict
+/// (exact name) by default; tail is **opt-in** for framework tokens that
+/// drop the namespace — a Mojo controller key camelizes to `Users` and
+/// resolves to any indexed `*::Users` that owns the action. The emitting
+/// plugin declares the mode; core never guesses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgedMatch {
+    /// The token is the exact fully-qualified class name.
+    #[default]
+    Exact,
+    /// The token is a `::`-tail; match any class whose tail equals it.
+    Tail,
+}
+
+impl Invocant {
+    /// Wrap an already-canonical receiver text (the producer owns the
+    /// claim — same contract as [`InvocantName::assume_canonical`]).
+    pub fn assume_canonical(s: impl Into<String>) -> Self {
+        Invocant::Name(InvocantName::assume_canonical(s))
+    }
+
+    /// A plugin-routed token: `plugin` names the emitting plugin (provenance),
+    /// `token` is the class key it already transformed (e.g. a camelized Mojo
+    /// controller name), and `match_mode` says how core matches it to a class.
+    pub fn bridged(
+        plugin: impl Into<String>,
+        token: impl Into<String>,
+        match_mode: BridgedMatch,
+    ) -> Self {
+        Invocant::Bridged { plugin: plugin.into(), token: token.into(), match_mode }
+    }
+
+    /// The ordinary receiver, or `None` when this is a plugin-bridged
+    /// token. Consumers that only handle real receivers (`$self->`,
+    /// `Class->`) bind through this and skip bridged tokens.
+    pub fn as_name(&self) -> Option<&InvocantName> {
+        match self {
+            Invocant::Name(n) => Some(n),
+            Invocant::Bridged { .. } => None,
+        }
+    }
+
+    pub fn is_bridged(&self) -> bool {
+        matches!(self, Invocant::Bridged { .. })
+    }
+
+    /// The raw text of the invocant — receiver text for `Name`, the token
+    /// for `Bridged`. A deliberate projection for peripheral string
+    /// consumers (completion display, dedup keys); resolution-bearing
+    /// callers match the variant instead.
+    pub fn text(&self) -> &str {
+        match self {
+            Invocant::Name(n) => n,
+            Invocant::Bridged { token, .. } => token,
+        }
+    }
+}
+
+impl Default for Invocant {
+    fn default() -> Self {
+        Invocant::Name(InvocantName::default())
+    }
+}
+
 /// The text of a method-call invocant, classified once. Consumers match
 /// the variant instead of re-deriving the shape with sigil/keyword string
 /// checks at each site.

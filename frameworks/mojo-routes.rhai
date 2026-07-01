@@ -17,6 +17,31 @@
 
 fn id() { "mojo-routes" }
 
+// Mojo's `Mojo::Util::camelize`, the convention that turns a route
+// controller TOKEN into a class-name tail: `-` segments become `::`,
+// `_` segments CamelCase (`ucfirst lc` each piece). `login` → `Login`,
+// `sales_reports` → `SalesReports`, `integrations-ads_api` →
+// `Integrations::AdsApi`. Already-CamelCase input passes through. This is
+// pure string work, so it lives here in the plugin that owns the
+// convention — core never camelizes; it just resolves the resulting
+// class key by `::`-tail (the bridge's `match: "tail"`).
+fn camelize(token) {
+    if token == "" { return ""; }
+    let first = token[0];
+    if first >= 'A' && first <= 'Z' { return token; }
+    let segs = [];
+    for dash_seg in token.split('-') {
+        let parts = [];
+        for piece in dash_seg.split('_') {
+            if piece == "" { continue; }
+            let lower = piece.to_lower();
+            parts.push(lower[0].to_upper().to_string() + lower.sub_string(1));
+        }
+        segs.push(parts.reduce(|a, p| a + p, ""));
+    }
+    segs.reduce(|a, s| if a == "" { s } else { a + "::" + s }, "")
+}
+
 fn triggers() {
     [
         #{ UsesModule: "Mojolicious::Lite" },
@@ -172,13 +197,20 @@ fn route_emissions(controller, action, span, current_package) {
     let items = [];
     if controller == "" || action == "" { return items; }
 
-    // (a) cross-file method reference
+    // (a) cross-file method reference. The controller is a route TOKEN
+    // (`'users'`, `'integrations-ads_api'`), not a Perl receiver. Apply
+    // Mojo's camelize convention HERE (the plugin owns it) to get the
+    // class-name tail, and mark it `bridged: "tail"` so core stores
+    // `Invocant::Bridged` (never frozen as a class) and resolves it
+    // generically by `::`-tail at query time. Tail is opt-in: the token
+    // drops the controller namespace, so an exact match wouldn't find it.
     items += #{
         MethodCallRef: #{
             method_name: action,
-            invocant: controller,
+            invocant: camelize(controller),
             span: span,
             invocant_span: (),
+            bridged: "tail",
         }
     };
 
@@ -290,33 +322,6 @@ fn inherited_controller(ctx) {
     ()
 }
 
-
-// Mojo::Util decamelize: "FooBar" -> "foo_bar", "Foo::Bar" -> "foo-bar".
-// Plugin names arrive camelized; the core's controller-token search is
-// gated on lowercase-leading tokens (mirroring camelize's /^[A-Z]/
-// early-return), so emitting the decamelized form round-trips through
-// the exact same machinery Mojo's loader uses.
-fn decamelize(name) {
-    let out = "";
-    let parts = name.split("::");
-    let first_part = true;
-    for part in parts {
-        if !first_part { out += "-"; }
-        first_part = false;
-        let first = true;
-        for ch in part {
-            if ch >= 'A' && ch <= 'Z' {
-                if !first { out += "_"; }
-                out += ch.to_lower();
-            } else {
-                out += ch;
-            }
-            first = false;
-        }
-    }
-    out
-}
-
 // Pull `controller`/`action` (+ the action's goto-def span) from a route
 // keyval tail. `start` is 1 to skip a leading `'ctrl#act'` target string,
 // 0 for the pure long form — Mojo lets stash pairs follow the target
@@ -360,9 +365,10 @@ fn on_method_call(ctx) {
                 out += #{
                     MethodCallRef: #{
                         method_name: "register",
-                        invocant: decamelize(name),
+                        invocant: camelize(name),
                         span: span,
                         invocant_span: (),
+                        bridged: "tail",
                     }
                 };
                 // "You loaded it" — same as the lite arm: record the
