@@ -31,21 +31,65 @@ already valid syntax.
 | object-like, marker | `#define FLAG` | flag symbol — refs/goto, no type |
 | function-like, expression | `#define MAX(a,b) …` | **global sub, implied return typing** |
 | function-like, delegation | `#define F(x) G(x)` | as above + **see-through value-witness** |
+| **member-block** | `#define BASEOP … op_type:9; …` (used in a struct body) | **role: a `package_parents` edge; blank the use** |
 | syntactic / statement / `##` | `do {…} while(0)` | **expand** (parse repair only) |
 
-### The load-bearing move: expansion policy flip
+### The classifier: usage position, not body-parse
 
-Flip the gather gate from **"expand if harmless"** (`parse_damage(after) <=
-before`) to **"expand only if it strictly *reduces* `parse_damage`"** — i.e.
-the gather's job narrows to **parse repair**. Everything that parses fine
-unexpanded (type / expression / function-like macros) stays in the tree and
-becomes a first-class symbol. A function-like macro left unexpanded already
-parses as a `call_expression`, so its call sites resolve through the **existing
-sub-return bag path** with no new reducer — a function-like macro *is* a
-package-global sub whose return type we infer from its body. Consequence: the
-splice count collapses to genuinely-broken sites only, and most `SpliceMap`
-span-remap bugs evaporate structurally. The existing `alias_only` fallback is
-the baby step of this instinct; this generalizes it.
+A macro body is an ambiguous token blob; its grammatical ROLE is fixed by
+**where it is used**, not by parsing the body in isolation. Use position is the
+classifier; the body-parse only supplies contents *once the role is known*:
+
+| use position | role |
+|---|---|
+| type position (`FOO x;`) | type macro → `TypeName` |
+| expression / call `FOO(args)` | value / function-like → sub-return |
+| standalone in a struct/class body (`FOO;`) | **member-block → role** |
+| statement position | syntactic → expand |
+
+Usage-driven and lazy: a never-used macro is just a navigable macro symbol
+until a use classifies it. Parked zero-usage fallback — *test-parse the body in
+each context, take the one that parses clean* — a real but ambiguous signal,
+heuristic not primary.
+
+### The load-bearing move: three expansion modes, keyed by role
+
+The gather no longer "expands if harmless." Each use is **leave / blank /
+expand** by its classified role:
+
+- **leave** — parses clean unexpanded (type → `type_identifier`, function-like →
+  `call_expression`). Zero splices; the macro is a first-class symbol/edge, and
+  a function-like macro *is* a package-global sub typed from its body.
+- **blank** — inline tokens would parse as a phantom, but the meaning is an edge
+  (member-block → role). Replace the use with whitespace so it parses clean
+  (`struct op { BASEOP };` → `struct op { };`); one splice; members come from
+  the role. **Blank is only in the transformed/parse view — the original source
+  keeps the token, so goto-def-on-`BASEOP` identity is untouched.**
+- **expand** — syntactic/statement macros that must be present for a clean parse
+  (`parse_damage` strictly decreases).
+
+The splice count collapses to blank+repair sites only; most `SpliceMap`
+span-remap bugs evaporate structurally. (`alias_only` was the baby step.)
+
+### Member-block macros = roles (the copypasta = inheritance)
+
+`#define BASEOP …fields…` pasted into every op struct is a **role** — the shape
+of a Perl `with`, already modeled as a `package_parents` edge. Mint **one**
+visible synthetic base per macro (a navigable, reusable symbol), members parsed
+from the body under the field-block role, taken from the **config-active
+variant** (reachability reuse). Add a parent edge per pasting struct
+(`struct op → BASEOP`). The *existing* ancestor walk then delivers everything —
+`o->op_type` resolution, completion, hover, and the **references splat**: every
+`->op_type` across every pasting struct converges on the one `BASEOP::op_type`
+def (op.h:55), which is both the copypasta anchor and the inheritance anchor.
+Roles all the way (rule #10) — even a one-member macro is a role, never a
+special-cased inline.
+
+**Edges handle the re-sourcing.** op_type's typing moves from expanded-field to
+role-member, but because the model is edges, the role member simply emits the
+same `TypeName` edge the expanded field did; the registry chase is agnostic to
+the emission site, so slice 2's hover leaf and the type chase keep working
+unchanged. The emission site is fungible; the edge is canonical.
 
 ### Config-variant = superposition, join over the flowing dimension
 
@@ -114,15 +158,18 @@ one pattern: **global set + reachability scope.**
   fix). The function-like *return-typing* slice waits on that verdict.
 - Slice order (independent slices first; the coupled pair last):
   1. **goto-def overhaul** — **LANDED** (959b388).
-  2. **provenance-leaf hover display** — recover the config-active variant's
-     concrete leaf (`unsigned short`) for hover while typing stays the
-     abstraction (`Numeric`). Independent, self-contained; owns the deferred
-     `op_type` xfail row (promotes it on landing).
-  3. **resolution visibility = include-closure scope** — the lie above; reuses
+  2. **provenance-leaf hover display** — **LANDED** (a6d8223). op_type hovers
+     the concrete leaf; typing stays the abstraction.
+  3. **member-block macros = roles** (the field-splat / copypasta-as-
+     inheritance) — classify member-block macros by struct-body usage, **blank**
+     the use (introduces the blank mode), mint the visible synthetic base +
+     parent edges, members from the config-active variant. Fixes `BASEOP`
+     field refs-splat / hover / goto-def. Independent, high user-pain value.
+  4. **resolution visibility = include-closure scope** — the lie above; reuses
      slice 1's reachability machinery. Correctness for vendored/monorepo name
      collisions. Independent of the expansion policy.
-  4. **function-like implied return typing + expansion policy flip** — COUPLED:
-     the "unexpanded macro parses as a `call_expression` → sub-return bag path"
-     mechanism only exists once expansion is parse-repair-only. So the flip and
-     the typing land together (biggest blast radius, last, after the
-     splice/gather work stabilizes).
+  5. **function-like implied return typing + full expansion policy flip** —
+     COUPLED: the "unexpanded macro parses as a `call_expression` → sub-return
+     bag path" mechanism only exists once expansion is parse-repair-only (the
+     full leave/blank/expand generalization of slice 3's blank). Biggest blast
+     radius, last, after the splice/gather work stabilizes.
