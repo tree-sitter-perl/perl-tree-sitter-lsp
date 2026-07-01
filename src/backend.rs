@@ -715,6 +715,33 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        // Pre-warm each pack language's skeleton-query compilation OFF the
+        // message loop, FIRST — before any `.await` that depends on the client
+        // answering (register_capability), so the warm-up starts even if the
+        // client is slow to respond. `Query::new` is a ~180ms one-time cost
+        // baked into the first pack file build; `did_open` runs that build
+        // synchronously before its own first `.await`, so without this warm-up
+        // it stalls the message loop and the goto-def request queued right
+        // behind the open waits the whole ~180ms (measured: first cpp goto-def
+        // 196ms, second 25ms, third 1ms). A tiny analyze forces the compile
+        // into the driver's `OnceLock`; Perl's query warms on its normal first
+        // build. Correctness-inert: it only populates the cache earlier.
+        tokio::task::spawn_blocking(|| {
+            let reg = crate::language_driver::LanguageRegistry::with_enabled();
+            for id in reg.languages() {
+                if id == "perl" {
+                    continue;
+                }
+                if let Some(driver) = reg.for_id(id) {
+                    // A non-trivial snippet so `parser.parse` yields a tree and
+                    // the analyze reaches `query_extract::extract` (which is
+                    // where `Query::new` fires); empty source can parse to
+                    // `None` and skip it, leaving the cache cold.
+                    let _ = driver.analyze_with_path("int _perl_lsp_warm;\n", None);
+                }
+            }
+        });
+
         self.client
             .log_message(MessageType::INFO, "perl-lsp initialized")
             .await;
