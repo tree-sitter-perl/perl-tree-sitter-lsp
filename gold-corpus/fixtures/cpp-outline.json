@@ -25,6 +25,25 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist-marker-macro-outline",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "marker_macro_outline.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Class\",\"line\":\"1\",\"name\":\"Real\""
+        ],
+        "none": [
+          "FMT_HEADER_ONLY"
+        ]
+      },
+      "status": "xfail"
     }
   ]
 }
