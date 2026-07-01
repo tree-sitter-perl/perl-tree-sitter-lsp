@@ -1801,12 +1801,15 @@ impl<'a> Builder<'a> {
     /// function start of Perl-on-the-query-engine. Provenance-only for now
     /// (no lowering): the shapes' types still come from the walk.
     fn mint_flow_edges_via_query(&mut self, tree: &'a Tree) {
+        use std::sync::OnceLock;
         use tree_sitter::{Query, QueryCursor, StreamingIterator};
         static FLOW_SCM: &str = include_str!("../queries/perl/flow.scm");
+        // `Query::new` is expensive and `build` runs per file; compile once.
+        static FLOW_QUERY: OnceLock<Option<Query>> = OnceLock::new();
         let lang = tree.language();
-        let query = match Query::new(&lang, FLOW_SCM) {
-            Ok(q) => q,
-            Err(_) => return,
+        let query = match FLOW_QUERY.get_or_init(|| Query::new(&lang, FLOW_SCM).ok()) {
+            Some(q) => q,
+            None => return,
         };
         let cap_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
         // Collect captures per match FIRST — the cursor borrows `self.source`,
@@ -1822,7 +1825,7 @@ impl<'a> Builder<'a> {
         let mut pending: Vec<FlowCaps> = Vec::new();
         {
             let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(&query, tree.root_node(), self.source);
+            let mut matches = cursor.matches(query, tree.root_node(), self.source);
             while let Some(m) = matches.next() {
                 let mut caps = FlowCaps {
                     lhs: None,

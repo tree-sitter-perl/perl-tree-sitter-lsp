@@ -25,7 +25,30 @@
 //! measured against the real builder by `query_extract_tests.rs`.
 
 use crate::file_analysis::{InferredType, Span};
-use tree_sitter::{Point, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Language, Point, Query, QueryCursor, StreamingIterator, Tree};
+
+/// Compile each pack's skeleton query exactly once and reuse it.
+///
+/// `Query::new` is expensive (~400ms for the Perl skeleton) and `extract`
+/// runs per file, so recompiling every call dominates the workload. A pack's
+/// `query_source` is a unique `&'static str`, so its pointer identity keys the
+/// compiled query — same pack, same query, one compilation. Leaking the boxed
+/// query is bounded (one per language pack) and gives the `&'static Query` the
+/// cache needs.
+fn cached_query(language: &Language, source: &'static str) -> Result<&'static Query, String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<usize, &'static Query>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = source.as_ptr() as usize;
+    if let Some(q) = cache.lock().unwrap().get(&key) {
+        return Ok(q);
+    }
+    let query = Query::new(language, source).map_err(|e| format!("query: {e}"))?;
+    let leaked: &'static Query = Box::leak(Box::new(query));
+    cache.lock().unwrap().insert(key, leaked);
+    Ok(leaked)
+}
 
 /// The skeleton's symbol row — deliberately stringly-kinded: the kind
 /// vocabulary comes from capture names, so the driver never enumerates
@@ -893,7 +916,7 @@ fn peel<'a>(
 
 pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAnalysis, String> {
     let language = tree.language();
-    let query = Query::new(&language, pack.query_source).map_err(|e| format!("query: {e}"))?;
+    let query = cached_query(&language, pack.query_source)?;
     let cap_names: Vec<String> = query
         .capture_names()
         .iter()
@@ -910,7 +933,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // Recorded at construction (the un-peeled node); gates op-DX at the mint.
     let mut member_simple: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    let mut matches = cursor.matches(query, tree.root_node(), source);
     let mut match_counter = 0usize;
     while let Some(m) = matches.next() {
         match_counter += 1;
