@@ -54,6 +54,25 @@
         "none": []
       },
       "status": "xfail"
+    },
+    {
+      "id": "cpp-member-block-field-refs-splat",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "member_block.cpp",
+      "line": 8,
+      "col": 22,
+      "expect": {
+        "all": [
+          "\"file\":\"member_block.cpp\",\"line\":\"3\"",
+          "\"file\":\"member_block.cpp\",\"line\":\"9\"",
+          "\"file\":\"member_block.cpp\",\"line\":\"10\""
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

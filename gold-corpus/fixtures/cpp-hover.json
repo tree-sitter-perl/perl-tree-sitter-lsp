@@ -3,66 +3,199 @@
   "rows": [
     {
       "id": "cpp-hover-free-function-signature",
-      "difficulty": "simple", "semantic_area": "cpp-multilang",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "sample.cpp", "line": 12, "col": 4,
-      "expect": { "all": ["int compute(int x)", "*function*"], "none": ["```perl"] },
+      "difficulty": "simple",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "sample.cpp",
+      "line": 12,
+      "col": 4,
+      "expect": {
+        "all": [
+          "int compute(int x)",
+          "*function*"
+        ],
+        "none": [
+          "```perl"
+        ]
+      },
       "status": "gold"
     },
     {
       "id": "cpp-hover-class",
-      "difficulty": "simple", "semantic_area": "cpp-multilang",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "sample.cpp", "line": 1, "col": 6,
-      "expect": { "all": ["class Shape", "*class*"], "none": [] },
+      "difficulty": "simple",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "sample.cpp",
+      "line": 1,
+      "col": 6,
+      "expect": {
+        "all": [
+          "class Shape",
+          "*class*"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
       "id": "cpp-hover-attribute-macro-exported",
-      "difficulty": "simple", "semantic_area": "cpp-multilang",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "attr_macro.cpp", "line": 3, "col": 20,
-      "expect": { "all": ["Q_CORE_EXPORT Gadget", "*class*", "*exported*"], "none": ["*deprecated*"] },
+      "difficulty": "simple",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "attr_macro.cpp",
+      "line": 3,
+      "col": 20,
+      "expect": {
+        "all": [
+          "Q_CORE_EXPORT Gadget",
+          "*class*",
+          "*exported*"
+        ],
+        "none": [
+          "*deprecated*"
+        ]
+      },
       "status": "gold"
     },
     {
       "id": "cpp-hover-unknown-macro-recovered-no-signal",
-      "difficulty": "simple", "semantic_area": "cpp-multilang",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "attr_macro.cpp", "line": 9, "col": 21,
-      "expect": { "all": ["Widget", "*class*"], "none": ["*exported*", "*deprecated*"] },
+      "difficulty": "simple",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "attr_macro.cpp",
+      "line": 9,
+      "col": 21,
+      "expect": {
+        "all": [
+          "Widget",
+          "*class*"
+        ],
+        "none": [
+          "*exported*",
+          "*deprecated*"
+        ]
+      },
       "status": "gold"
     },
     {
       "id": "cpp-hitlist-macro-field-type",
-      "difficulty": "hard", "semantic_area": "cpp-hitlist",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "macro_field_type.cpp", "line": 2, "col": 18,
-      "expect": { "all": ["unsigned short"], "none": [] },
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macro_field_type.cpp",
+      "line": 2,
+      "col": 18,
+      "expect": {
+        "all": [
+          "unsigned short"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
       "id": "cpp-hitlist-bitfield-typedef-field-type",
-      "difficulty": "hard", "semantic_area": "cpp-hitlist",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "bitfield_field.cpp", "line": 1, "col": 16,
-      "expect": { "all": ["op_type", "unsigned short"], "none": [] },
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "bitfield_field.cpp",
+      "line": 1,
+      "col": 16,
+      "expect": {
+        "all": [
+          "op_type",
+          "unsigned short"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
       "id": "cpp-hitlist-config-variant-macro-field-type",
-      "difficulty": "hard", "semantic_area": "cpp-hitlist",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "cfgvar_macro_field.cpp", "line": 7, "col": 28,
-      "expect": { "all": ["op_type", "unsigned short"], "none": ["PERL_BITFIELD16"] },
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "cfgvar_macro_field.cpp",
+      "line": 7,
+      "col": 28,
+      "expect": {
+        "all": [
+          "op_type",
+          "unsigned short"
+        ],
+        "none": [
+          "PERL_BITFIELD16"
+        ]
+      },
       "status": "gold"
     },
     {
       "id": "cpp-hitlist-crossfile-macro-member-field-type",
-      "difficulty": "hard", "semantic_area": "cpp-hitlist",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture/opmacro",
-      "file": "op.c", "line": 1, "col": 36,
-      "expect": { "all": ["op_type", "unsigned short"], "none": ["PERL_BITFIELD16", "U16TYPE"] },
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture/opmacro",
+      "file": "op.c",
+      "line": 1,
+      "col": 36,
+      "expect": {
+        "all": [
+          "op_type",
+          "unsigned short"
+        ],
+        "none": [
+          "PERL_BITFIELD16",
+          "U16TYPE"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-member-block-field-hover",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "member_block.cpp",
+      "line": 8,
+      "col": 22,
+      "expect": {
+        "all": [
+          "op_type",
+          "unsigned short"
+        ],
+        "none": [
+          "BASEOP",
+          "PERL_BITFIELD16"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-member-block-one-member-hover",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "member_block.cpp",
+      "line": 10,
+      "col": 22,
+      "expect": {
+        "all": [
+          "op_refcnt",
+          "unsigned short"
+        ],
+        "none": [
+          "REFCNT"
+        ]
+      },
       "status": "gold"
     },
     {

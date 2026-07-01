@@ -10,7 +10,12 @@
       "file": "sample.cpp",
       "line": 16,
       "col": 12,
-      "expect": { "all": ["sample.cpp:13:5"], "none": [] },
+      "expect": {
+        "all": [
+          "sample.cpp:13:5"
+        ],
+        "none": []
+      },
       "status": "gold"
     },
     {
@@ -22,8 +27,47 @@
       "file": "inc_nav.cpp",
       "line": 0,
       "col": 10,
-      "expect": { "all": ["incdep.h"], "none": [] },
+      "expect": {
+        "all": [
+          "incdep.h"
+        ],
+        "none": []
+      },
       "status": "xfail"
+    },
+    {
+      "id": "cpp-member-block-field-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "member_block.cpp",
+      "line": 8,
+      "col": 22,
+      "expect": {
+        "all": [
+          "member_block.cpp:3:32"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-member-block-base-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "member_block.cpp",
+      "line": 4,
+      "col": 14,
+      "expect": {
+        "all": [
+          "member_block.cpp:3:9"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

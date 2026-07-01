@@ -5644,6 +5644,25 @@ impl FileAnalysis {
             }
         }
 
+        // Member-access refs (cpp `o->field` / `o->method()`) dispatch through
+        // the frozen `resolved_method_target` edge, not `resolves_to`. Any
+        // MethodCall whose edge landed on this symbol — via the SAME
+        // ancestor walk goto-def uses — references it, whether the member is a
+        // method or a data field (`Variable`/`Field`). Inheritance-aware for
+        // free: every `->op_type` across every struct pasting a role macro
+        // froze onto the one `BASEOP::op_type` member, so they splat together.
+        for r in &self.refs {
+            if let (
+                RefKind::MethodCall { method_name_span, .. },
+                Some(MethodTarget::Local { sym_id, .. }),
+            ) = (&r.kind, &r.resolved_method_target)
+            {
+                if *sym_id == target_id {
+                    results.push((*method_name_span, r.access));
+                }
+            }
+        }
+
         // For hash key definitions, find all accesses with same owner + key name
         if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
             for r in &self.refs {

@@ -419,3 +419,64 @@ fn collect_macro_defs_recognizes_delegation() {
     assert_eq!(wrap.selection_span.start.row, 0);
     assert_eq!(wrap.selection_span.start.column, 8); // after "#define "
 }
+
+// ===== Member-block macros as roles =====
+
+#[test]
+fn member_block_macro_classified_blanked_and_minted() {
+    let mut p = cpp_parser();
+    // BASEOP is a field-block macro pasted STANDALONE into two structs; a
+    // one-member REFCNT proves roles-all-the-way. `PERL_BITFIELD16` types the
+    // key field (re-sourced `TypeName` edge).
+    let src = "\
+#define PERL_BITFIELD16 unsigned short
+#define BASEOP PERL_BITFIELD16 op_type:9; int op_flags;
+#define REFCNT int op_refcnt;
+struct op { BASEOP };
+struct unop { BASEOP int* op_first; };
+struct sv { REFCNT };
+";
+    let plan = crate::cpp_reparse::plan_member_blocks(&mut p, src);
+    assert!(!plan.is_empty(), "member-block macros should be detected");
+
+    // Blank mode: the use is whitespace in the parse view, so the structs parse
+    // clean — but the ORIGINAL still holds the token (identity preserved).
+    assert!(plan.blanked_source.contains("struct op {        };") || plan.blanked_source.contains("struct op {  "),
+        "BASEOP use blanked: {:?}", plan.blanked_source);
+    assert!(plan.blanked_source.contains("BASEOP") == false || !plan.blanked_source.contains("{ BASEOP"),
+        "no BASEOP use survives in the parse view");
+    assert_eq!(errors(parse(&mut p, &plan.blanked_source).root_node()), 0, "blanked source parses clean");
+
+    // Parent edges — the copypasta IS inheritance.
+    assert!(plan.edges.contains(&("op".to_string(), "BASEOP".to_string())));
+    assert!(plan.edges.contains(&("unop".to_string(), "BASEOP".to_string())));
+    assert!(plan.edges.contains(&("sv".to_string(), "REFCNT".to_string())));
+
+    // One synthetic base per macro, members parsed from the config-active body.
+    let baseop = plan.bases.iter().find(|b| b.macro_name == "BASEOP").expect("BASEOP base");
+    let names: Vec<&str> = baseop.members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["op_type", "op_flags"]);
+    let op_type = &baseop.members[0];
+    assert_eq!(op_type.type_text, "PERL_BITFIELD16");
+    // Positioned at the real `#define` body token (line 1, not the use sites).
+    assert_eq!(op_type.name_span.start.row, 1);
+
+    // Roles all the way: even a one-member macro is a role.
+    let refcnt = plan.bases.iter().find(|b| b.macro_name == "REFCNT").expect("REFCNT base");
+    assert_eq!(refcnt.members.len(), 1);
+    assert_eq!(refcnt.members[0].name, "op_refcnt");
+}
+
+#[test]
+fn non_member_block_macros_are_untouched() {
+    let mut p = cpp_parser();
+    // A value macro and a function-like macro are NOT member blocks — no plan.
+    let src = "\
+#define MAX 100
+#define MIN(a,b) ((a)<(b)?(a):(b))
+struct s { int x; };
+";
+    let plan = crate::cpp_reparse::plan_member_blocks(&mut p, src);
+    assert!(plan.is_empty(), "no member-block macros here");
+    assert_eq!(plan.blanked_source, src, "source unchanged");
+}
