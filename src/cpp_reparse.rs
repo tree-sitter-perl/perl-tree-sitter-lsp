@@ -31,6 +31,7 @@
 //! into the build pipeline; measured by `cpp_reparse_tests.rs`.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,26 +53,64 @@ struct Splice {
 /// `to_original(t)` collapses any byte inside a replacement to the
 /// splice site (per-region granularity), and otherwise subtracts the
 /// net length change of all earlier splices.
+///
+/// Both lookups run per extracted span in `remap_spans` (O(symbols)), so
+/// they must be sub-linear in the edit count. The edits partition the
+/// TRANSFORMED axis into ordered, disjoint regions — replacement
+/// `[ts_i, ts_i + nlen_i)` interleaved with pass-through gaps — so `ts`
+/// (the transformed start of each replacement) is non-decreasing and a
+/// binary search over it lands the containing region in O(log E). The
+/// prefix state each region needs (`ts`, the shift accumulated *after*
+/// each edit) is precomputed in `apply`; see `binary_search` for the
+/// exact correspondence to the former linear scan.
 #[derive(Debug, Default, Clone)]
 pub struct SpliceMap {
     /// (orig_start, orig_end, replacement_len), sorted by orig_start.
     edits: Vec<(usize, usize, usize)>,
+    /// `ts[i]` = transformed-axis start of edit `i`'s replacement
+    /// (`orig_start + shift_before_i`). Non-decreasing — the search key.
+    ts: Vec<usize>,
+    /// `shift_after[i]` = cumulative `nlen - (oe - os)` through edit `i`
+    /// inclusive (`trans = orig + shift`); the shift that applies in the
+    /// pass-through gap *after* edit `i`.
+    shift_after: Vec<isize>,
+}
+
+/// Where a transformed offset lands relative to the splice regions.
+enum Region {
+    /// Before every replacement, or in a pass-through gap: `orig = trans - shift`.
+    PassThrough(isize),
+    /// Inside edit `k`'s replacement — collapses to that macro-call site.
+    Inside(usize),
 }
 
 impl SpliceMap {
-    pub fn to_original(&self, transformed: usize) -> usize {
-        let mut shift: isize = 0; // trans = orig + shift
-        for &(os, oe, nlen) in &self.edits {
-            let ts = (os as isize + shift) as usize;
-            if transformed < ts {
-                return (transformed as isize - shift) as usize;
-            }
-            if transformed < ts + nlen {
-                return os; // inside the replacement → collapse to site
-            }
-            shift += nlen as isize - (oe - os) as isize;
+    /// Locate `transformed`'s region. `partition_point` returns the count
+    /// of edits whose replacement starts at or before `transformed`; the
+    /// last of them (`pp - 1`) is the only edit that can contain it
+    /// (regions are disjoint and ordered). `<=` with `pp - 1` also picks
+    /// the LATER of two edits sharing a `ts` — a zero-width replacement
+    /// followed by a real one — matching the linear scan's in-order
+    /// processing, where the empty region never claims a byte.
+    fn region(&self, transformed: usize) -> Region {
+        let pp = self.ts.partition_point(|&t| t <= transformed);
+        if pp == 0 {
+            return Region::PassThrough(0); // before every splice: shift is 0
         }
-        (transformed as isize - shift) as usize
+        let k = pp - 1;
+        let (_os, _oe, nlen) = self.edits[k];
+        if transformed < self.ts[k] + nlen {
+            Region::Inside(k)
+        } else {
+            Region::PassThrough(self.shift_after[k])
+        }
+    }
+
+    pub fn to_original(&self, transformed: usize) -> usize {
+        match self.region(transformed) {
+            Region::PassThrough(shift) => (transformed as isize - shift) as usize,
+            Region::Inside(k) => self.edits[k].0, // collapse to the call site
+        }
     }
 
     /// If `transformed` falls INSIDE a replacement (a macro expansion),
@@ -81,18 +120,10 @@ impl SpliceMap {
     /// point under `to_original`; callers use this to give it the call
     /// site's span instead, so goto-def/hover land on the macro call.
     pub fn replacement_at(&self, transformed: usize) -> Option<(usize, usize)> {
-        let mut shift: isize = 0;
-        for &(os, oe, nlen) in &self.edits {
-            let ts = (os as isize + shift) as usize;
-            if transformed < ts {
-                return None;
-            }
-            if transformed < ts + nlen {
-                return Some((os, oe));
-            }
-            shift += nlen as isize - (oe - os) as isize;
+        match self.region(transformed) {
+            Region::Inside(k) => Some((self.edits[k].0, self.edits[k].1)),
+            Region::PassThrough(_) => None,
         }
-        None
     }
 }
 
@@ -118,13 +149,30 @@ const EXCLUDE_QUERY: &str = r#"
 (preproc_include) @x
 "#;
 
+const INCLUDE_QUERY: &str = r#"
+(preproc_include path: (string_literal (string_content) @p))
+(preproc_include path: (system_lib_string) @s)
+"#;
+
+/// Compile-once cache for this pipeline's queries. Every tree here comes
+/// from the one `tree_sitter_cpp` grammar (the C/C++ driver), so a single
+/// `Query` per source is reused across every reparse instead of rebuilding
+/// the automaton per keystroke. `Query` is `Send + Sync`, so a static slot
+/// is safe.
+static MACRO_DEF_Q: OnceLock<Query> = OnceLock::new();
+static EXCLUDE_Q: OnceLock<Query> = OnceLock::new();
+static INCLUDE_Q: OnceLock<Query> = OnceLock::new();
+
+fn cached_query(slot: &'static OnceLock<Query>, lang: &tree_sitter::Language, src: &str) -> &'static Query {
+    slot.get_or_init(|| Query::new(lang, src).expect("cpp_reparse query"))
+}
+
 pub fn collect_macros(tree: &Tree, src: &[u8]) -> BTreeMap<String, Macro> {
-    let lang = tree.language();
-    let query = Query::new(&lang, MACRO_DEF_QUERY).expect("macro def query");
+    let query = cached_query(&MACRO_DEF_Q, &tree.language(), MACRO_DEF_QUERY);
     let names: Vec<&str> = query.capture_names().to_vec();
     let mut out = BTreeMap::new();
     let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(&query, tree.root_node(), src);
+    let mut it = cursor.matches(query, tree.root_node(), src);
     while let Some(m) = it.next() {
         let mut oname = None;
         let mut obody = None;
@@ -639,19 +687,11 @@ fn include_paths(src: &str, parser: &mut tree_sitter::Parser) -> Vec<String> {
 /// `<>`, and the walk-up resolver finds both (true system headers like
 /// `<vector>` simply don't resolve in the workspace, and are skipped).
 fn include_paths_tree(tree: &Tree, src: &str) -> Vec<String> {
-    let lang = tree.language();
-    let q = Query::new(
-        &lang,
-        r#"
-        (preproc_include path: (string_literal (string_content) @p))
-        (preproc_include path: (system_lib_string) @s)
-        "#,
-    )
-    .expect("include query");
+    let q = cached_query(&INCLUDE_Q, &tree.language(), INCLUDE_QUERY);
     let names = q.capture_names().to_vec();
     let mut out = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(&q, tree.root_node(), src.as_bytes());
+    let mut it = cursor.matches(q, tree.root_node(), src.as_bytes());
     while let Some(m) = it.next() {
         for c in m.captures {
             let Ok(t) = c.node.utf8_text(src.as_bytes()) else { continue };
@@ -716,6 +756,11 @@ fn preprocess_with_mode(
     let excludes = exclusion_spans(tree);
     let bytes = src.as_bytes();
     let mut splices: Vec<Splice> = Vec::new();
+    // `excludes` is sorted + disjoint and `start` only advances, so a
+    // single cursor over it decides membership in O(1) amortized: drop
+    // intervals that end at/before the current word, then the frontier
+    // interval is the only one that can contain it.
+    let mut ex = 0usize;
     let mut i = 0;
     while i < bytes.len() {
         if is_ident_byte(bytes[i]) && (i == 0 || !is_ident_byte(bytes[i - 1])) {
@@ -724,8 +769,11 @@ fn preprocess_with_mode(
                 i += 1;
             }
             let word = &src[start..i];
-            if excludes.iter().any(|&(s, e)| start >= s && start < e) {
-                continue;
+            while ex < excludes.len() && excludes[ex].1 <= start {
+                ex += 1;
+            }
+            if ex < excludes.len() && excludes[ex].0 <= start {
+                continue; // start ∈ [s, e) of the frontier exclude → skip
             }
             if let Some(m) = macros.get(word) {
                 match &m.params {
@@ -816,18 +864,31 @@ fn substitute(body: &str, params: &[String], args: &[String]) -> String {
     out
 }
 
+/// Byte ranges the expansion pass must not touch, returned SORTED and
+/// COALESCED into maximal disjoint intervals. Query captures arrive in
+/// document order but strings/comments nest inside preproc lines, so the
+/// raw spans overlap; merging their union lets the caller test membership
+/// with a single forward cursor (the words it tests only ever move
+/// rightward) instead of scanning every span per word.
 fn exclusion_spans(tree: &Tree) -> Vec<(usize, usize)> {
-    let lang = tree.language();
-    let query = Query::new(&lang, EXCLUDE_QUERY).expect("exclude query");
+    let query = cached_query(&EXCLUDE_Q, &tree.language(), EXCLUDE_QUERY);
     let mut spans = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(&query, tree.root_node(), b"" as &[u8]);
+    let mut it = cursor.matches(query, tree.root_node(), b"" as &[u8]);
     while let Some(m) = it.next() {
         for c in m.captures {
             spans.push((c.node.start_byte(), c.node.end_byte()));
         }
     }
-    spans
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (s, e) in spans {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
 }
 
 fn apply(src: &str, splices: &mut [Splice]) -> (String, SpliceMap) {
@@ -835,13 +896,23 @@ fn apply(src: &str, splices: &mut [Splice]) -> (String, SpliceMap) {
     let mut out = String::with_capacity(src.len());
     let mut map = SpliceMap::default();
     let mut prev = 0usize;
+    // `shift` tracks `trans = orig + shift` as each applied splice lands,
+    // so `ts`/`shift_after` (the binary-search index SpliceMap reads) are
+    // built here rather than re-derived on every lookup. Skipped overlaps
+    // never touch `shift`, so the index counts only applied edits — exactly
+    // what the former linear scan iterated.
+    let mut shift: isize = 0;
     for s in splices.iter() {
         if s.start < prev {
             continue; // overlapping (defensive) — skip
         }
         out.push_str(&src[prev..s.start]);
         out.push_str(&s.replacement);
-        map.edits.push((s.start, s.end, s.replacement.len()));
+        let nlen = s.replacement.len();
+        map.ts.push((s.start as isize + shift) as usize);
+        map.edits.push((s.start, s.end, nlen));
+        shift += nlen as isize - (s.end - s.start) as isize;
+        map.shift_after.push(shift);
         prev = s.end;
     }
     out.push_str(&src[prev..]);

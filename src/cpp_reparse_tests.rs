@@ -150,3 +150,87 @@ fn cpp_reparse_obstacle_delta_report() {
     }
     println!("----- totals: errors {rb} → {ra}; expected-symbol pool = {tot} -----\n");
 }
+
+// --- SpliceMap: binary search ≡ the former linear scan --------------------
+//
+// `to_original` / `replacement_at` map extracted spans back to user text;
+// a wrong result silently breaks goto-def/hover/rename for C/C++. These
+// reference impls ARE the old linear scan; the fuzz test asserts the
+// binary-search production path returns byte-identical results for every
+// transformed offset over randomized (incl. zero-width, adjacent) edits.
+
+fn ref_to_original(edits: &[(usize, usize, usize)], transformed: usize) -> usize {
+    let mut shift: isize = 0;
+    for &(os, oe, nlen) in edits {
+        let ts = (os as isize + shift) as usize;
+        if transformed < ts {
+            return (transformed as isize - shift) as usize;
+        }
+        if transformed < ts + nlen {
+            return os;
+        }
+        shift += nlen as isize - (oe - os) as isize;
+    }
+    (transformed as isize - shift) as usize
+}
+
+fn ref_replacement_at(edits: &[(usize, usize, usize)], transformed: usize) -> Option<(usize, usize)> {
+    let mut shift: isize = 0;
+    for &(os, oe, nlen) in edits {
+        let ts = (os as isize + shift) as usize;
+        if transformed < ts {
+            return None;
+        }
+        if transformed < ts + nlen {
+            return Some((os, oe));
+        }
+        shift += nlen as isize - (oe - os) as isize;
+    }
+    None
+}
+
+#[test]
+fn splicemap_binsearch_matches_linear_scan() {
+    // Deterministic LCG — no external rng dep.
+    let mut state: u64 = 0x9e3779b97f4a7c15;
+    let mut next = |bound: usize| {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) as usize % bound.max(1)
+    };
+
+    for _ in 0..4000 {
+        let src_len = 8 + next(40);
+        let src: String = std::iter::repeat('a').take(src_len).collect();
+        // Random sorted, disjoint splices. Adjacent (gap 0) + empty
+        // replacements are generated so the zero-width `ts`-tie path fires.
+        let mut splices: Vec<Splice> = Vec::new();
+        let mut cur = 0usize;
+        while cur < src_len {
+            let gap = next(3); // 0 → adjacent to the previous edit
+            let start = cur + gap;
+            if start >= src_len {
+                break;
+            }
+            let end = (start + next(4)).min(src_len); // width 0..3
+            let rep_len = next(4); // 0..3, incl. empty
+            let replacement: String = std::iter::repeat('X').take(rep_len).collect();
+            splices.push(Splice { start, end, replacement });
+            cur = end + 1;
+        }
+        let (out, map) = apply(&src, &mut splices);
+        for t in 0..=out.len() {
+            assert_eq!(
+                map.to_original(t),
+                ref_to_original(&map.edits, t),
+                "to_original mismatch at {t} for edits {:?}",
+                map.edits
+            );
+            assert_eq!(
+                map.replacement_at(t),
+                ref_replacement_at(&map.edits, t),
+                "replacement_at mismatch at {t} for edits {:?}",
+                map.edits
+            );
+        }
+    }
+}
