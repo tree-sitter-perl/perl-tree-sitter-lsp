@@ -436,13 +436,17 @@ pub fn find_definition(
     }
 
 
-    // Generic cross-file goto-def for a call that didn't resolve locally or
-    // via Perl imports. Pack languages register free functions + file-scope
-    // vars/macros by name (register_symbols), so look the name up in the
-    // cross-file index -> the file that declares/defines it -> that symbol.
+    // Generic cross-file goto-def for a call OR a bare value read that didn't
+    // resolve locally or via Perl imports. Pack languages register free
+    // functions + file-scope vars/macros/enum-constants by name
+    // (register_symbols), so look the name up in the cross-file index -> the
+    // file that declares/defines it -> that symbol. A `Variable` ref reaches
+    // here only when it had no local `resolves_to` (the local path above
+    // already returned for resolved ones), so this is the cross-file tail:
+    // `OP_SCOPE` used in op.c resolving to its enumerator def in opnames.h.
     // (Perl's cache is keyed by MODULE name, so a bare-name lookup no-ops.)
     if let Some(r) = analysis.ref_at(point) {
-        if matches!(r.kind, RefKind::FunctionCall { .. }) {
+        if matches!(r.kind, RefKind::FunctionCall { .. } | RefKind::Variable) {
             let name = r.unqualified_target_name();
             if let Some(cached) = module_index.get_cached(name) {
                 if let Some(sym) = cached.analysis.symbols.iter().find(|s| {

@@ -68,6 +68,23 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-definition-cross-file-enum-variant",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture/xenum",
+      "file": "use.c",
+      "line": 2,
+      "col": 16,
+      "expect": {
+        "all": [
+          "opcodes.h:3:5"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

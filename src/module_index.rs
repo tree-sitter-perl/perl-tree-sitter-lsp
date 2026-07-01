@@ -757,10 +757,13 @@ impl ModuleIndex {
         for sym in &analysis.symbols {
             // Classes/typedefs (types), free functions, and FILE-SCOPE
             // values (globals, object-like macros, enum constants). A
-            // file-scope value is an unpackaged Variable not nested in a
-            // function — locals (function-scoped) are excluded.
+            // file-scope value is a Variable whose scope is the file — locals
+            // (function-scoped) and struct/namespace members (their own
+            // body scope) are excluded by scope alone. A C enum constant
+            // leaks to file scope yet carries its parent enum as a *type*
+            // `package` (for hover); that annotation must NOT hide it from
+            // the by-name cross-file index, so key off scope, not package.
             let is_file_value = matches!(sym.kind, SymKind::Variable)
-                && sym.package.is_none()
                 && analysis
                     .scopes
                     .iter()

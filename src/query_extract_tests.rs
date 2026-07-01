@@ -1083,6 +1083,49 @@ fn cpp_cross_file_include_resolution_and_rename() {
 }
 
 #[test]
+fn cpp_cross_file_enum_variant_goto_def() {
+    // A bare enum-constant use (`OP_SCOPE`) resolves cross-file to its
+    // enumerator def, even though the enum-hover pass stamps the parent enum
+    // as the constant's `package` (a type annotation, for `RED: Color` hover).
+    // Two mechanisms cooperate: register_symbols keys file-scope values on
+    // File scope (not package absence), so the constant is findable by name;
+    // and the use mints an unresolved `Variable` ref that the query-time
+    // cross-file tail chases by that name.
+    use crate::file_analysis::RefKind;
+    let header = "enum opcode {\n    OP_NULL,\n    OP_SCOPE,\n};\n";
+    let header_fa = cpp_skel(header).into_file_analysis();
+    let op = header_fa.symbols.iter().find(|s| s.name == "OP_SCOPE").unwrap();
+    assert_eq!(op.package.as_deref(), Some("opcode"),
+        "enum constant carries its enum as the (type) package");
+
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let hpath = std::path::PathBuf::from("/fake/cpp/opcodes.h");
+    idx.register_symbols(hpath, std::sync::Arc::new(header_fa));
+    assert!(idx.get_cached("OP_SCOPE").is_some(),
+        "packaged file-scope enum constant is registered by name");
+
+    let use_src = "int is_scope(int t) {\n    return t == OP_SCOPE;\n}\n";
+    let use_fa = cpp_skel(use_src).into_file_analysis();
+    assert!(
+        use_fa.refs.iter().any(|r| matches!(r.kind, RefKind::Variable)
+            && r.target_name == "OP_SCOPE"
+            && r.resolves_to.is_none()),
+        "a use with no LOCAL decl still mints an unresolved Variable ref"
+    );
+
+    let uri = tower_lsp::lsp_types::Url::from_file_path("/fake/cpp/use.c").unwrap();
+    let pos = tower_lsp::lsp_types::Position { line: 1, character: 16 };
+    let resp = crate::symbols::find_definition(&use_fa, pos, &uri, &idx)
+        .expect("cross-file enum-variant goto-def resolves");
+    let loc = match resp {
+        tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(l) => l,
+        other => panic!("expected a single location, got {other:?}"),
+    };
+    assert!(loc.uri.path().ends_with("opcodes.h"), "lands in the header: {}", loc.uri);
+    assert_eq!(loc.range.start.line, 2, "lands on the OP_SCOPE enumerator (line 3)");
+}
+
+#[test]
 fn cmake_cross_file_function_rename_and_subdirectory_resolution() {
     let dir = std::env::temp_dir().join(format!("qx-cmake-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("src")).unwrap();

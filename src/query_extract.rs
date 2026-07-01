@@ -342,29 +342,36 @@ impl SkeletonAnalysis {
             Option<crate::file_analysis::ScopeId>,
         > = self.scopes.iter().map(|s| (s.id, s.parent)).collect();
         let mut local_refs: Vec<crate::file_analysis::Ref> = Vec::new();
+        // Reads that found no LOCAL decl — a Variable ref is still minted for
+        // each (below, once call/member spans are known) so query-time
+        // cross-file resolution can chase it by name (a file-scope value like
+        // a C enum constant or global is registered in the pack index; the use
+        // resolves the same way a bare call does). rule #7: the token gets a
+        // ref whether or not the def is local.
+        let mut unresolved_reads: Vec<(String, crate::file_analysis::ScopeId, Span)> = Vec::new();
         for (name, read_scope, read_span) in &self.var_reads {
-            let Some(cands) = defs_by_name.get(name) else { continue };
             let rp = (read_span.start.row, read_span.start.column);
-            let mut cur = Some(*read_scope);
-            let mut resolved: Option<SymbolId> = None;
-            while let Some(sc) = cur {
-                // nearest decl of this name in THIS scope level, declared at
-                // or before the read (latest-wins for redeclaration).
-                let mut best: Option<((usize, usize), SymbolId)> = None;
-                for (dscope, dspan, did) in cands {
-                    let dp = (dspan.start.row, dspan.start.column);
-                    if *dscope == sc && dp <= rp && best.is_none_or(|(bp, _)| dp > bp) {
-                        best = Some((dp, *did));
+            let resolved = defs_by_name.get(name).and_then(|cands| {
+                let mut cur = Some(*read_scope);
+                while let Some(sc) = cur {
+                    // nearest decl of this name in THIS scope level, declared at
+                    // or before the read (latest-wins for redeclaration).
+                    let mut best: Option<((usize, usize), SymbolId)> = None;
+                    for (dscope, dspan, did) in cands {
+                        let dp = (dspan.start.row, dspan.start.column);
+                        if *dscope == sc && dp <= rp && best.is_none_or(|(bp, _)| dp > bp) {
+                            best = Some((dp, *did));
+                        }
                     }
+                    if let Some((_, did)) = best {
+                        return Some(did);
+                    }
+                    cur = scope_parent.get(&sc).copied().flatten();
                 }
-                if let Some((_, did)) = best {
-                    resolved = Some(did);
-                    break;
-                }
-                cur = scope_parent.get(&sc).copied().flatten();
-            }
-            if let Some(did) = resolved {
-                local_refs.push(crate::file_analysis::Ref {
+                None
+            });
+            match resolved {
+                Some(did) => local_refs.push(crate::file_analysis::Ref {
                     kind: crate::file_analysis::RefKind::Variable,
                     span: *read_span,
                     scope: *read_scope,
@@ -373,7 +380,8 @@ impl SkeletonAnalysis {
                     resolves_to: Some(did),
                     resolved_method_target: None,
                     folded_from: None,
-                });
+                }),
+                None => unresolved_reads.push((name.clone(), *read_scope, *read_span)),
             }
         }
         // `goto LABEL` → the `LABEL:` def, function-wide: first matching
@@ -438,6 +446,36 @@ impl SkeletonAnalysis {
                 })
             })
             .collect();
+        // The `(identifier) @expr.read.var` catch-all also fires on a call's
+        // function-name (`foo` in `foo()`) and on a def's OWN name (`compute`
+        // in `int compute(...)`), neither of which is a bare value read — the
+        // first already carries a FunctionCall ref, the second IS the
+        // declaration. Don't shadow either with a stray unresolved Variable
+        // ref (it would displace the decl from references/highlight).
+        let claimed: std::collections::HashSet<(usize, usize)> = refs
+            .iter()
+            .map(|r| (r.span.start.row, r.span.start.column))
+            .chain(
+                symbols
+                    .iter()
+                    .map(|s| (s.selection_span.start.row, s.selection_span.start.column)),
+            )
+            .collect();
+        for (name, scope, span) in unresolved_reads {
+            if claimed.contains(&(span.start.row, span.start.column)) {
+                continue;
+            }
+            local_refs.push(crate::file_analysis::Ref {
+                kind: crate::file_analysis::RefKind::Variable,
+                span,
+                scope,
+                target_name: name,
+                access: crate::file_analysis::AccessKind::Read,
+                resolves_to: None,
+                resolved_method_target: None,
+                folded_from: None,
+            });
+        }
         refs.extend(local_refs);
         let mut package_parents: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
