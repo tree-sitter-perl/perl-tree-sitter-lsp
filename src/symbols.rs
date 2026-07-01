@@ -1168,7 +1168,9 @@ pub fn pack_hover_markdown(
         analysis.symbols.iter().find(|s| s.name == name)
     });
     if let Some(sym) = local {
-        return Some(render_symbol_hover(sym, source, &sym.span.start, language, analysis, point));
+        return Some(render_symbol_hover(
+            sym, source, &sym.span.start, language, analysis, point, module_index,
+        ));
     }
     // Cross-file: a call whose target isn't local — look the function up in
     // the cross-file index and render its signature from the defining file.
@@ -1193,7 +1195,9 @@ pub fn pack_hover_markdown(
         .find(|s| s.name == name && matches!(s.kind, FaSymKind::Sub))?;
     let text = std::fs::read_to_string(&cached.path).ok()?;
     let fname = cached.path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-    let mut out = render_symbol_hover(sym, &text, &sym.span.start, language, &cached.analysis, sym.span.start);
+    let mut out = render_symbol_hover(
+        sym, &text, &sym.span.start, language, &cached.analysis, sym.span.start, Some(midx),
+    );
     out.push_str(&format!("\n\n— `{}`", fname));
     Some(out)
 }
@@ -1209,9 +1213,10 @@ fn render_symbol_hover(
     language: &str,
     analysis: &FileAnalysis,
     type_point: Point,
+    module_index: Option<&dyn crate::file_analysis::CrossFileLookup>,
 ) -> String {
     if matches!(sym.kind, FaSymKind::Variable | FaSymKind::Field) {
-        if let Some(ty) = analysis.inferred_type_via_bag(&sym.name, type_point) {
+        if let Some(ty) = analysis.inferred_type_via_bag_ctx(&sym.name, type_point, module_index) {
             return format!(
                 "```{}\n{}: {}\n```\n\n*variable*",
                 language,

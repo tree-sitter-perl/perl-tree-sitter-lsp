@@ -4804,7 +4804,7 @@ impl FileAnalysis {
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<String> {
         let render = |analysis: &FileAnalysis, sym: &Symbol| match analysis
-            .inferred_type_via_bag(field, sym.span.end)
+            .inferred_type_via_bag_ctx(field, sym.span.end, module_index)
         {
             Some(ty) => format!("{}: {}", field, sym.display_type(&ty)),
             None => field.to_string(),

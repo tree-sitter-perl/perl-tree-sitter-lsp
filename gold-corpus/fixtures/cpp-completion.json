@@ -98,6 +98,23 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-completion-typedef-struct-receiver",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "typedef_struct_member.cpp",
+      "line": 2,
+      "col": 5,
+      "expect": {
+        "all": [
+          "field_f"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

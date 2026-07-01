@@ -93,6 +93,22 @@ pub enum WitnessAttachment {
     /// consumes this yet — `$obj->{h}->m()` typing through it is a later
     /// step.
     SlotType { class: String, key: String },
+    /// A named type alias — a C `typedef`/C++ `using`. "What does the type
+    /// spelling `name` resolve to?" A `typedef unsigned short U16` pushes
+    /// `TypeName("U16") → InferredType(ClassName("unsigned short"))`; a
+    /// `typedef U16 U16b` pushes `TypeName("U16b") → Edge(TypeName("U16"))`,
+    /// so the registry chases the alias graph like any other edge (cycles
+    /// broken by the shared visited set — `typedef struct sv SV` is
+    /// self-referential and must not loop). A declared type at a USE site
+    /// (`U16 x;`, `OP* p;`) edges here instead of committing a
+    /// `ClassName` value, so struct/primitive aliases resolve through the
+    /// same one graph. An unresolved `TypeName(n)` is terminal: it IS a
+    /// type named `n` (the `ClassName(n)` fallback in `query_rec_body`),
+    /// which keeps a plain struct tag or unknown class resolving to itself.
+    /// Cross-file: the alias name is a Class symbol in its defining file,
+    /// so `get_cached(name)` recurses into the header's bag (same shape as
+    /// the `MethodOnClass` bridge).
+    TypeName(String),
 }
 
 /// Index into `FileAnalysis::refs`.
@@ -1070,6 +1086,36 @@ impl WitnessReducer for MethodOnClassReducer {
     }
 }
 
+// Claims `TypeName(name)` carrying a plain `InferredType` — a typedef/using
+// alias's resolved underlying type. The typedef site pushes the leaf value
+// (`ClassName("unsigned short")`, `Numeric`) or an `Edge(TypeName(_))` for an
+// alias chain; the edge is materialized before this reducer sees the list, so
+// a chain resolves through the generic chase. Latest-wins. The terminal
+// `ClassName(name)` fallback (unresolved alias IS a type of that name) lives
+// in `query_rec_body`, not here — `reduce` only runs when a witness matched.
+
+pub struct TypeNameReducer;
+
+impl WitnessReducer for TypeNameReducer {
+    fn name(&self) -> &str {
+        "type_name"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::TypeName(_))
+            && matches!(w.payload, WitnessPayload::InferredType(_))
+    }
+
+    fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
+        for w in ws.iter().rev() {
+            if let WitnessPayload::InferredType(t) = &w.payload {
+                return ReducedValue::Type(t.clone());
+            }
+        }
+        ReducedValue::None
+    }
+}
+
 // ---- Plugin-override priority reducer ----
 //
 // Claims `Symbol(_)` attachments with an `InferredType` from a
@@ -1414,6 +1460,10 @@ impl ReducerRegistry {
         // MethodOnClass primary-fallback after ReturnExprReducer so
         // per-arity declarations win when one matches.
         r.register(Box::new(MethodOnClassReducer));
+        // TypeName is a disjoint attachment shape (typedef/using aliases),
+        // so order isn't load-bearing — grouped with the other class-keyed
+        // fallbacks. The `ClassName(name)` terminal lives in query_rec_body.
+        r.register(Box::new(TypeNameReducer));
         // Last — fallback for "this Symbol's stored return type".
         r.register(Box::new(SubReturnReducer));
         r
@@ -1696,6 +1746,44 @@ impl ReducerRegistry {
                     }
                 }
             }
+        }
+
+        // `TypeName(name)` the local bag couldn't answer: the typedef may
+        // live in another file (a header the alias name is a Class symbol
+        // in). `get_cached(name)` finds that file; recurse into its bag —
+        // hop (1) of the `MethodOnClass` fallback, same shared visited set.
+        // Failing that, an unresolved alias IS a type of that name: the
+        // one-alias-graph terminal (`ClassName(name)`), so a plain struct
+        // tag / unknown class / primitive spelling resolves to itself.
+        if let WitnessAttachment::TypeName(name) = q.attachment {
+            if let Some(ctx) = q.context {
+                if let Some(idx) = ctx.module_index {
+                    if let Some(cached) = idx.get_cached(name) {
+                        if !std::ptr::eq(bag, &cached.analysis.witnesses) {
+                            let cached_ctx = BagContext {
+                                scopes: &cached.analysis.scopes,
+                                package_framework: &cached.analysis.package_framework,
+                                module_index: Some(idx),
+                                package_parents: &cached.analysis.package_parents,
+                                app_surface_consumers: &cached.analysis.app_surface_consumers,
+                            };
+                            let sub_q = ReducerQuery {
+                                attachment: q.attachment,
+                                point: q.point,
+                                framework: q.framework,
+                                arity_hint: None,
+                                receiver: q.receiver.clone(),
+                                context: Some(&cached_ctx),
+                            };
+                            let v = self.query_rec(&cached.analysis.witnesses, &sub_q, state);
+                            if *v != ReducedValue::None {
+                                return (*v).clone();
+                            }
+                        }
+                    }
+                }
+            }
+            return ReducedValue::Type(InferredType::ClassName(name.clone()));
         }
 
         ReducedValue::None
