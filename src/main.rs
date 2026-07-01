@@ -163,6 +163,20 @@ async fn main() {
             }
             return;
         }
+        // A `--flag` first arg that matched no CLI arm above is a malformed or
+        // unknown invocation (usually a valid flag with the wrong argument
+        // count). Refuse to fall through to the LSP server — doing so silently
+        // starts a stdio server that hangs forever waiting for a client that
+        // will never come (the leak that reaped a `--definition` missing its
+        // <root>). Error loudly and exit instead.
+        Some(flag) if flag.starts_with("--") => {
+            eprintln!(
+                "perl-lsp: unrecognized or malformed CLI invocation: `{}`",
+                args.join(" ")
+            );
+            eprintln!("(a valid flag with the wrong argument count lands here; run `perl-lsp` with no args for the LSP server)");
+            std::process::exit(2);
+        }
         _ => {}
     }
 
