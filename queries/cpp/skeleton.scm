@@ -294,3 +294,24 @@
           (type_descriptor type: (type_identifier) @narrow.type)))
       arguments: (argument_list (identifier) @narrow.var)))
   consequence: (compound_statement) @scope)
+
+; `std::optional<T>` engaged-state narrowing. Guard-testing an optional as
+; engaged proves it HOLDS a T inside the block, so `opt->m` / `*opt` resolve on
+; T there. No type token rides these guards (unlike dynamic_cast) — the pack's
+; narrow_guard reads the subject's DECLARED type (std::optional<T>) and peels T,
+; so the refinement keys on the type being optional, not on the guard name (a
+; bare `if (ptr)` over a non-optional declares no inner type → no narrowing).
+; Two clean engagement shapes: bare truthiness `if (opt)` (no @narrow.guard),
+; and `if (opt.has_value())` (guard token gates the method — an arbitrary
+; `opt.foo()` won't narrow). `!= std::nullopt` needs both operator + operand
+; checks the one-token hook can't express, so it's left out.
+(if_statement
+  condition: (condition_clause value: (identifier) @narrow.var)
+  consequence: (compound_statement) @scope)
+(if_statement
+  condition: (condition_clause
+    value: (call_expression
+      function: (field_expression
+        argument: (identifier) @narrow.var
+        field: (field_identifier) @narrow.guard)))
+  consequence: (compound_statement) @scope)
