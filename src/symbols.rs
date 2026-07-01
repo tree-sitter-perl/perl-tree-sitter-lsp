@@ -177,6 +177,105 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
     })
 }
 
+/// Reverse domain bridge: given the cursor is on an enum (its def) or one of
+/// its enumerators, the field-slot sites across the project whose recovered
+/// domain is that enum — the backward half of the gd/gr symmetry (a find-refs
+/// on `enum opcode` surfaces the `op_type` uses). Scans the cached modules'
+/// stored `domain_sites` (a targeted lookup keyed on the enum, not a witness
+/// sweep). `(path, slot_span)` per site.
+pub fn domain_backrefs(
+    analysis: &FileAnalysis,
+    point: Point,
+    module_index: &dyn CrossFileLookup,
+) -> Vec<(std::path::PathBuf, crate::file_analysis::Span)> {
+    use crate::file_analysis::SymKind;
+    let target = analysis
+        .symbol_at(point)
+        .and_then(|sym| match sym.kind {
+            // The enum def itself.
+            SymKind::Class => Some(sym.name.clone()),
+            // An enumerator def carries its enum as its package.
+            SymKind::Variable | SymKind::Field => sym.package.clone(),
+            _ => None,
+        })
+        .or_else(|| {
+            // A USE of an enumerator (resolves cross-file to its enum).
+            analysis.ref_at(point).and_then(|r| {
+                analysis.resolve_enumerator_enum(r.unqualified_target_name(), Some(module_index))
+            })
+        });
+    let Some(enum_name) = target else { return Vec::new() };
+    let mut out: Vec<(std::path::PathBuf, crate::file_analysis::Span)> = Vec::new();
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    module_index.for_each_cached(&mut |_n, cached| {
+        if !seen.insert(cached.path.clone()) {
+            return;
+        }
+        for span in cached.analysis.field_sites_for_enum(&enum_name, Some(module_index)) {
+            out.push((cached.path.clone(), span));
+        }
+    });
+    out
+}
+
+/// The def location of a data field `field` on `class` (or an ancestor) —
+/// local Symbol or a cross-file member — the SAME resolution the member
+/// goto-def branch produces. Shared with the domain bridge so the field's
+/// own decl stays the primary target while the enum is offered alongside.
+fn member_field_def_location(
+    analysis: &FileAnalysis,
+    class: &str,
+    field: &str,
+    uri: &Url,
+    module_index: &dyn CrossFileLookup,
+) -> Option<Location> {
+    use crate::file_analysis::{MethodResolution, SymKind};
+    match analysis.resolve_method_in_ancestors(class, field, Some(module_index))? {
+        MethodResolution::Local { sym_id, .. } => Some(Location {
+            uri: uri.clone(),
+            range: span_to_range(analysis.symbol(sym_id).selection_span),
+        }),
+        MethodResolution::CrossFile { class, def_module } => {
+            let module = def_module.as_deref().unwrap_or(&class);
+            let cached = module_index.get_cached(module)?;
+            let sym = cached.analysis.symbols.iter().find(|s| {
+                matches!(s.kind, SymKind::Variable | SymKind::Field)
+                    && s.name == field
+                    && s.package.as_deref() == Some(class.as_str())
+            })?;
+            let uri = Url::from_file_path(&cached.path).ok()?;
+            Some(Location { uri, range: span_to_range(sym.selection_span) })
+        }
+    }
+}
+
+/// The def location of a named type (a Class symbol — enum/struct/typedef),
+/// local first, then cross-file by name. Used by the domain bridge to offer
+/// the enum def alongside a domain-typed field.
+fn type_def_location(
+    analysis: &FileAnalysis,
+    type_name: &str,
+    uri: &Url,
+    module_index: &dyn CrossFileLookup,
+) -> Option<Location> {
+    use crate::file_analysis::SymKind;
+    if let Some(sym) = analysis
+        .symbols
+        .iter()
+        .find(|s| s.name == type_name && matches!(s.kind, SymKind::Class))
+    {
+        return Some(Location { uri: uri.clone(), range: span_to_range(sym.selection_span) });
+    }
+    let cached = module_index.get_cached(type_name)?;
+    let sym = cached
+        .analysis
+        .symbols
+        .iter()
+        .find(|s| s.name == type_name && matches!(s.kind, SymKind::Class))?;
+    let uri = Url::from_file_path(&cached.path).ok()?;
+    Some(Location { uri, range: span_to_range(sym.selection_span) })
+}
+
 pub fn find_definition(
     analysis: &FileAnalysis,
     pos: Position,
@@ -195,6 +294,35 @@ pub fn find_definition(
     if let Some(applied) = analysis.dispatch_at(point, Some(module_index)) {
         if let Some(resp) = dispatch_handler_locations(&applied.owner, &applied.name, module_index) {
             return Some(resp);
+        }
+    }
+
+    // Forward domain bridge: goto-def on a domain-typed field slot offers the
+    // DOMAIN enum's def IN ADDITION to the field decl (`op_type` → both its
+    // `PERL_BITFIELD16 op_type` decl AND `enum opcode`). The field decl stays
+    // FIRST (the primary); the enum is an extra offer. Runs before the local /
+    // member resolution below so it augments a same-file field too.
+    if let Some(r) = analysis.ref_at(point) {
+        if matches!(r.kind, RefKind::MethodCall { .. }) {
+            if let Some(cn) = analysis.method_call_invocant_class(r, Some(module_index)) {
+                let field = r.unqualified_target_name();
+                if let Some(dom) = analysis.field_domain(&cn, field, Some(module_index)) {
+                    let mut locs: Vec<Location> = Vec::new();
+                    if let Some(fl) =
+                        member_field_def_location(analysis, &cn, field, uri, module_index)
+                    {
+                        locs.push(fl);
+                    }
+                    if let Some(el) = type_def_location(analysis, &dom.domain, uri, module_index) {
+                        if !locs.contains(&el) {
+                            locs.push(el);
+                        }
+                    }
+                    if !locs.is_empty() {
+                        return Some(GotoDefinitionResponse::Array(locs));
+                    }
+                }
+            }
         }
     }
 
@@ -1428,10 +1556,26 @@ pub fn pack_hover_markdown(
                 // The member's declared type may be a config-variant macro whose
                 // flow type is the join abstraction (`Numeric`); display the
                 // concrete leaf from the config-active variant's alias chain.
-                if let Some(leaf) = analysis
+                let storage_leaf = analysis
                     .member_type_spelling(&cn, field, Some(midx))
-                    .and_then(|sp| config_variant_leaf_display(analysis, &sp, midx))
-                {
+                    .and_then(|sp| config_variant_leaf_display(analysis, &sp, midx));
+                // Domain typing: the slot's storage type (`uint16_t`) discards
+                // its DOMAIN (`opcode`), recoverable from usage. When the
+                // usage-fold recovers one, it headlines with the storage leaf
+                // as a drill-down: `op_type: opcode (stored as uint16_t)`. The
+                // domain never overrides storage for correctness — a human
+                // surface only.
+                if let Some(dom) = analysis.field_domain(&cn, field, Some(midx)) {
+                    let stored = storage_leaf
+                        .clone()
+                        .map(|s| format!(" *(stored as `{}`)*", s))
+                        .unwrap_or_default();
+                    return Some(format!(
+                        "```{}\n{}: {}\n```\n\n*field*{}",
+                        language, field, dom.domain, stored
+                    ));
+                }
+                if let Some(leaf) = storage_leaf {
                     return Some(format!("```{}\n{}: {}\n```\n\n*field*", language, field, leaf));
                 }
                 if let Some(h) = analysis.member_hover(&cn, field, Some(midx)) {

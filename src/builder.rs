@@ -574,6 +574,8 @@ fn build_with_plugins_inner(
         flow_edges: b.flow_edges,
         // use-after-move is a cpp-pack fact (`std::move`); Perl mints none.
         moved_from: Vec::new(),
+        // domain-typing sites are a pack-language fact; Perl mints none here.
+        domain_sites: Vec::new(),
     });
     // Finalize: run the legacy text-based MCB resolver as a fallback.
     // For every assignment the unified typer (run before

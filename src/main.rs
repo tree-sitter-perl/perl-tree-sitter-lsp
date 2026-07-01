@@ -1075,19 +1075,31 @@ fn run_one(
             let idx_for_find: &module_index::ModuleIndex = pack.as_deref().unwrap_or(idx);
             if let Some(resp) = symbols::find_definition(&analysis, pos, &uri, idx_for_find) {
                 use tower_lsp::lsp_types::GotoDefinitionResponse;
-                let first = match resp {
-                    GotoDefinitionResponse::Scalar(loc) => Some(loc),
-                    GotoDefinitionResponse::Array(v) => v.into_iter().next(),
-                    GotoDefinitionResponse::Link(v) => v.into_iter().next().map(|l| {
-                        tower_lsp::lsp_types::Location { uri: l.target_uri, range: l.target_range }
-                    }),
+                // Print EVERY offered location (one per line), ranked as
+                // returned: a plain goto-def yields one; a domain-typed field
+                // yields the field decl FIRST then its domain enum def.
+                let locs: Vec<tower_lsp::lsp_types::Location> = match resp {
+                    GotoDefinitionResponse::Scalar(loc) => vec![loc],
+                    GotoDefinitionResponse::Array(v) => v,
+                    GotoDefinitionResponse::Link(v) => v
+                        .into_iter()
+                        .map(|l| tower_lsp::lsp_types::Location {
+                            uri: l.target_uri,
+                            range: l.target_range,
+                        })
+                        .collect(),
                 };
-                if let Some(loc) = first {
-                    let path = loc.uri.to_file_path().map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| loc.uri.to_string());
-                    let (line, col) = SourceCache::new().display(
-                        &path, loc.range.start.line as usize, loc.range.start.character as usize);
-                    return Ok(format!("{}:{}:{}", path, line, col));
+                if !locs.is_empty() {
+                    let mut sources = SourceCache::new();
+                    let mut lines = Vec::new();
+                    for loc in locs {
+                        let path = loc.uri.to_file_path().map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| loc.uri.to_string());
+                        let (line, col) = sources.display(
+                            &path, loc.range.start.line as usize, loc.range.start.character as usize);
+                        lines.push(format!("{}:{}:{}", path, line, col));
+                    }
+                    return Ok(lines.join("\n"));
                 }
             }
             Err(format!("No definition found at {}:{}", req.line, req.col))
@@ -1101,6 +1113,22 @@ fn run_one(
             let resolved = resolve::resolve_symbol_scoped(&analysis, point, Some(idx), override_scope_from_env());
             let mut sources = SourceCache::new();
             let mut results = Vec::new();
+            // Reverse domain bridge: a find-refs on an enum (or an enumerator)
+            // surfaces the field-slot sites whose domain is that enum. Uses the
+            // pack index (op_type sites live in pack-language files).
+            {
+                let reg = language_driver::LanguageRegistry::with_enabled();
+                let pack = reg.for_path(std::path::Path::new(file))
+                    .map(|d| d.id()).filter(|id| *id != "perl")
+                    .and_then(|lang| idx.pack_index(lang));
+                if let Some(pidx) = pack.as_deref() {
+                    for (path, span) in symbols::domain_backrefs(&analysis, point, pidx) {
+                        let ps = path.display().to_string();
+                        let (line, col) = sources.display(&ps, span.start.row, span.start.column);
+                        results.push(serde_json::json!({"file": ps, "line": line, "col": col}));
+                    }
+                }
+            }
             match resolved {
                 Some(resolve::ResolvedTarget::Local) | None => {
                     let path_str = file_path.display().to_string();

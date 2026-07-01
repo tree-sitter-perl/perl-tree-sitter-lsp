@@ -73,6 +73,25 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-references-domain-typing-enum-surfaces-field-sites",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_enum.c",
+      "line": 3,
+      "col": 5,
+      "expect": {
+        "all": [
+          "\"file\":\"domain_enum.c\",\"line\":\"7\"",
+          "\"file\":\"domain_enum.c\",\"line\":\"10\"",
+          "\"file\":\"domain_enum.c\",\"line\":\"11\""
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

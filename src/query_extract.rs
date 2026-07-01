@@ -124,6 +124,11 @@ pub struct SkeletonAnalysis {
     /// A read of the var after the call and before its next rebind is a
     /// use-after-move bug (`FileAnalysis::use_after_move_reads`).
     pub moved_from: Vec<(String, crate::file_analysis::Span, crate::file_analysis::ScopeId)>,
+    /// Domain-typing sites: a `@domain.slot` field access compared/assigned
+    /// against a `@domain.value` token. Raw (value's enum resolves cross-file
+    /// at query time); folds onto `Field{owner, name}` for the int-used-as-enum
+    /// domain (`op_type` → `opcode`).
+    pub domain_sites: Vec<crate::file_analysis::DomainSite>,
 }
 
 impl SkeletonAnalysis {
@@ -490,6 +495,7 @@ impl SkeletonAnalysis {
             package_parents,
             flow_edges: std::mem::take(&mut self.flow_edges),
             moved_from: std::mem::take(&mut self.moved_from),
+            domain_sites: std::mem::take(&mut self.domain_sites),
             ..Default::default()
         });
         // Pack-declared receiver names ride the FA so core's member /
@@ -1148,9 +1154,16 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // TypeName witnesses for).
     let mut macro_alias_name_by_match: HashMap<usize, String> = HashMap::new();
     let mut macro_alias_of_by_match: HashMap<usize, String> = HashMap::new();
+    // `@domain.value` — the enum-valued operand a field slot is compared/
+    // assigned against. Joined to its `@domain.slot` by match_id (the slot
+    // event pushes the site); the value's own enum resolves cross-file later.
+    let mut domain_value_by_match: HashMap<usize, String> = HashMap::new();
     for e in &events {
         if e.cap == "type.annot" {
             annot_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "domain.value" {
+            domain_value_by_match.insert(e.match_id, e.text.clone());
         }
         if e.cap == "alias.name" {
             alias_name_by_match.insert(e.match_id, e.text.clone());
@@ -1563,6 +1576,19 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             }
             "type.annot" => {
                 annots.insert(e.match_id, e.text.clone());
+            }
+            "domain.slot" => {
+                // A field slot used against a typed value — one domain-typing
+                // site. The value is joined by match_id; its enum resolves
+                // cross-file at query time. The span is the SLOT's, so a
+                // find-references on the enum surfaces the field's own uses.
+                if let Some(value) = domain_value_by_match.get(&e.match_id) {
+                    out.domain_sites.push(crate::file_analysis::DomainSite {
+                        slot: (pack.shape_name)("ref.member", &e.text),
+                        value: value.clone(),
+                        slot_span: Span { start: e.start, end: e.end },
+                    });
+                }
             }
             "expr.shape" => {
                 shape_spans.push((e.start_byte, e.end_byte, Span { start: e.start, end: e.end }));

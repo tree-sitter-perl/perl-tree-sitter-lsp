@@ -85,6 +85,24 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-definition-domain-typing-op-type-offers-enum",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_enum.c",
+      "line": 6,
+      "col": 14,
+      "expect": {
+        "all": [
+          "domain_enum.c:5:29",
+          "domain_enum.c:4:6"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

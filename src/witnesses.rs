@@ -109,6 +109,19 @@ pub enum WitnessAttachment {
     /// so `get_cached(name)` recurses into the header's bag (same shape as
     /// the `MethodOnClass` bridge).
     TypeName(String),
+    /// A storage slot — a named field DECLARATION — keyed
+    /// **language-generically** by `{owner, name}` (a C struct member, a
+    /// Corinna `field`, a Moo `has`; NOT `{struct, name}`). Distinct from
+    /// the bag's local subjects (`Variable{name,scope}`, `Expr{span}`):
+    /// every access to the slot, in any scope/file, folds onto the SAME
+    /// `Field` subject — project-wide gathering. `DomainCompare` witnesses
+    /// on this attachment carry the enum a use compares/assigns the slot
+    /// against; `DomainCoherenceFold` folds them into the slot's DOMAIN
+    /// type (`op_type: uint16_t` storage → `opcode` domain). The domain is
+    /// a defeasible refinement for human surfaces; it never changes the
+    /// storage type that flows. Kept at the END for bincode variant-index
+    /// stability (bump `EXTRACT_VERSION`).
+    Field { owner: String, name: String },
 }
 
 /// Index into `FileAnalysis::refs`.
@@ -217,6 +230,15 @@ pub enum WitnessPayload {
         base: WitnessAttachment,
         step: ProjectionStep,
     },
+    /// **Domain evidence** for a `Field` slot: a single use-site where the
+    /// slot interacts with a typed value from `enum_type` (a comparison
+    /// `slot == E`, an assignment `slot = E`, a `switch(slot){case E}`, a
+    /// typed-arg position). `enum_type` is the value operand's domain — an
+    /// enumerator carries its `enum`, resolved (cross-file) before the
+    /// witness is pushed. `DomainCoherenceFold` counts these across every
+    /// site: mostly-agree → that domain, truly-mixed → none. Kept at the
+    /// END for bincode variant-index stability (bump `EXTRACT_VERSION`).
+    DomainCompare { enum_type: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1116,6 +1138,81 @@ impl WitnessReducer for TypeNameReducer {
     }
 }
 
+// ---- Domain-coherence fold (int-used-as-enum) ----
+//
+// Claims `Field{owner, name}` carrying `DomainCompare{enum_type}` — the
+// per-site evidence that a storage slot is *used as* a value of some enum.
+// Folds every site project-wide: a slot mostly compared/assigned against
+// one enum HAS that enum as its domain; a truly-mixed slot has none. The
+// `FrameworkAwareTypeFold` pattern retargeted (observations → a folded
+// verdict), here as a majority vote. Deterministic: counts collect into a
+// `BTreeMap` (sorted keys) and ties break by enum name ascending, so the
+// verdict never depends on witness-push order or HashMap iteration.
+//
+// The domain is defeasible — it refines the human surfaces (hover / the
+// navigation bridge), never the storage type that flows. Nothing on the
+// flow axis (Variable/Expr/Symbol/MethodOnClass) queries `Field`, so
+// returning the domain as a `ClassName` here can't leak into flow typing.
+
+pub struct DomainCoherenceFold;
+
+impl WitnessReducer for DomainCoherenceFold {
+    fn name(&self) -> &str {
+        "domain_coherence_fold"
+    }
+
+    fn claims(&self, w: &Witness) -> bool {
+        matches!(w.attachment, WitnessAttachment::Field { .. })
+            && matches!(w.payload, WitnessPayload::DomainCompare { .. })
+    }
+
+    fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
+        match domain_coherence(ws) {
+            Some((domain, _count, _total)) => {
+                ReducedValue::Type(InferredType::ClassName(domain))
+            }
+            None => ReducedValue::None,
+        }
+    }
+}
+
+/// The coherence vote over `DomainCompare` witnesses: the dominant enum,
+/// its site count, and the total, when the dominant share is a strict
+/// majority over ≥2 sites; else `None`. Deterministic (sorted counts,
+/// name-ascending tie-break). Shared by the reducer and the query method
+/// (which reports `confidence = count / total`).
+pub fn domain_coherence(ws: &[&Witness]) -> Option<(String, usize, usize)> {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for w in ws {
+        if let WitnessPayload::DomainCompare { enum_type } = &w.payload {
+            *counts.entry(enum_type.clone()).or_default() += 1;
+        }
+    }
+    let total: usize = counts.values().sum();
+    if total < 2 {
+        return None;
+    }
+    // Dominant enum: BTreeMap iterates keys ascending, and we keep the
+    // incumbent on ties (`v <= best`), so the smallest-named enum wins a
+    // tie — a stable, source-order-independent choice.
+    let mut best: Option<(&String, usize)> = None;
+    for (k, v) in &counts {
+        if best.is_none_or(|(_, bv)| *v > bv) {
+            best = Some((k, *v));
+        }
+    }
+    let (dom, dom_count) = best?;
+    // Mostly-agree: a strict majority. The spike measured ~99.9% coherence
+    // on real op_type, so any threshold in (0.5, 0.99) fires cleanly;
+    // majority is the simplest defensible line.
+    if dom_count * 2 > total {
+        Some((dom.clone(), dom_count, total))
+    } else {
+        None
+    }
+}
+
 // ---- Plugin-override priority reducer ----
 //
 // Claims `Symbol(_)` attachments with an `InferredType` from a
@@ -1464,6 +1561,10 @@ impl ReducerRegistry {
         // so order isn't load-bearing — grouped with the other class-keyed
         // fallbacks. The `ClassName(name)` terminal lives in query_rec_body.
         r.register(Box::new(TypeNameReducer));
+        // DomainCoherenceFold claims the disjoint `Field{..}` shape (the
+        // int-used-as-enum domain vote) — no overlap with any flow-axis
+        // reducer, so order isn't load-bearing.
+        r.register(Box::new(DomainCoherenceFold));
         // Last — fallback for "this Symbol's stored return type".
         r.register(Box::new(SubReturnReducer));
         r

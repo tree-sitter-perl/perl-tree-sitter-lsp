@@ -1631,3 +1631,54 @@ struct S {
         "operator[]'s move is scoped to its own body — no leak to sibling b(): {diags:?}",
     );
 }
+
+// ---- Domain typing (int-used-as-enum): a storage slot's DOMAIN recovered
+// from usage. `op_type` is stored `uint16_t` but always compared against
+// `enum opcode` values — the sites fold onto the language-generic
+// `Field{owner, name}` subject via `DomainCoherenceFold`. ----
+
+#[test]
+fn cpp_domain_typing_field_folds_to_enum() {
+    let src = "\
+enum opcode { OP_NULL, OP_CONST, OP_SCOPE };
+struct op { enum opcode op_type; };
+void a(struct op* o) { if (o->op_type == OP_CONST) { } }
+void b(struct op* o) { if (o->op_type == OP_SCOPE) { } }
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    // Both comparison sites captured as raw domain evidence.
+    assert_eq!(fa.domain_sites.len(), 2, "sites: {:?}", fa.domain_sites);
+    // The slot's usage-recovered domain is the enum, folded over ≥2 functions,
+    // owner resolved to the declaring struct.
+    let dom = fa
+        .field_domain_for_owner("op", "op_type", None)
+        .expect("op_type has a recovered domain");
+    assert_eq!(dom.domain, "opcode");
+    assert!(dom.confidence > 0.99, "coherent: {}", dom.confidence);
+    // Same answer through the ancestor-walked owner (the hover/goto-def path).
+    assert_eq!(
+        fa.field_domain("op", "op_type", None).map(|d| d.domain),
+        Some("opcode".to_string()),
+    );
+    // Reverse bridge: the enum surfaces the field's sites (gd/gr symmetry).
+    assert_eq!(fa.field_sites_for_enum("opcode", None).len(), 2);
+    // An unrelated enum surfaces nothing.
+    assert!(fa.field_sites_for_enum("nonesuch", None).is_empty());
+}
+
+#[test]
+fn cpp_domain_typing_mixed_slot_stays_none() {
+    // A slot compared mostly against non-enum values (raw ints) has no
+    // coherent domain — the majority vote refuses to commit.
+    let src = "\
+enum opcode { OP_NULL, OP_CONST };
+struct op { int op_type; };
+void a(struct op* o) { if (o->op_type == 0) { } }
+void b(struct op* o) { if (o->op_type == 1) { } }
+void c(struct op* o) { if (o->op_type == OP_CONST) { } }
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    // The `== 0` / `== 1` operands are number literals, not enumerators, so
+    // only one site resolves to an enum — below the majority.
+    assert_eq!(fa.field_domain_for_owner("op", "op_type", None), None);
+}

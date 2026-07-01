@@ -2672,6 +2672,16 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub macro_defs: Vec<MacroDef>,
 
+    /// Raw domain-typing sites: each `slot`-field access that interacts
+    /// with a `value` token (`slot == V`, `slot = V`) at `slot_span`. The
+    /// value's enum is resolved cross-file at query time (an enumerator
+    /// carries its `enum`), then the sites fold onto the language-generic
+    /// `Field{owner, name}` subject via `DomainCoherenceFold`. Stored raw
+    /// (not pre-resolved) because both the slot owner AND the value's enum
+    /// are cross-file for the perl5 `op_type`/`opcode` case — resolution
+    /// belongs where the module index is in hand. Pack-language only.
+    #[serde(default)]
+    pub domain_sites: Vec<DomainSite>,
 
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
@@ -2742,6 +2752,30 @@ pub struct FileAnalysisParts {
     pub loader_config_params: Vec<LoaderConfigParam>,
     pub flow_edges: Vec<FlowEdge>,
     pub moved_from: Vec<(String, Span, ScopeId)>,
+    pub domain_sites: Vec<DomainSite>,
+}
+
+/// One domain-typing use-site: the `slot` field was compared/assigned
+/// against `value` at `slot_span`. `value`'s enum resolves cross-file at
+/// query time — an enumerator carries its `enum` (the enum-container
+/// work). Language-generic evidence: a Perl field source (queue #3) mints
+/// the same rows off its own accesses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainSite {
+    pub slot: String,
+    pub value: String,
+    pub slot_span: Span,
+}
+
+/// A slot's resolved domain: the enum it is *used as*, with the storage
+/// type it is *stored as* underneath. The domain is a defeasible
+/// refinement for human surfaces; storage is what flows. `confidence` is
+/// the dominant enum's share of the coherence vote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NominalDomain {
+    pub domain: String,
+    pub storage: Option<String>,
+    pub confidence: f32,
 }
 
 /// "This file loads plugin `name`, passing the config value at
@@ -2902,6 +2936,7 @@ impl FileAnalysis {
             loader_config_params,
             flow_edges,
             moved_from,
+            domain_sites,
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
@@ -2943,6 +2978,7 @@ impl FileAnalysis {
             loader_config_params,
             flow_edges,
             moved_from,
+            domain_sites,
             // Populated by the pack driver post-construction (macro identity lane).
             macro_defs: Vec::new(),
             scope_starts: Vec::new(),
@@ -4919,6 +4955,129 @@ impl FileAnalysis {
                 cached.analysis.type_name_edge_of(&sym.name, sym.scope)
             }
         }
+    }
+
+    /// Resolve a value token (an enumerator USE) to its enum. An enumerator
+    /// carries its enum as its symbol `package` (the enum-container work):
+    /// `OP_SCOPE` → `opcode`. Local first, then cross-file by name
+    /// (`get_cached(value)` finds the header that declares it — `op_type ==
+    /// OP_SCOPE` in op.c resolves through opnames.h). `None` when `value` is
+    /// not a packaged file-scope symbol (a plain int / local), so a
+    /// non-enum comparison drops out of the domain fold.
+    pub(crate) fn resolve_enumerator_enum(
+        &self,
+        value: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<String> {
+        let packaged = |a: &FileAnalysis| {
+            a.symbols
+                .iter()
+                .find(|s| {
+                    s.name == value
+                        && matches!(s.kind, SymKind::Variable | SymKind::Field)
+                        && s.package.is_some()
+                })
+                .and_then(|s| s.package.clone())
+        };
+        if let Some(p) = packaged(self) {
+            return Some(p);
+        }
+        let cached = module_index?.get_cached(value)?;
+        packaged(&cached.analysis)
+    }
+
+    /// The DOMAIN of a data field on `class` — the enum it is *used as*,
+    /// recovered from usage (`slot == OP_CONST`, `slot = OP_FREED`, …). The
+    /// owner is the DECLARING class (`op_type` → `BASEOP`), found via the
+    /// same `resolve_method_in_ancestors` walk hover/goto-def use, so every
+    /// access — whatever the receiver's concrete struct — folds onto ONE
+    /// `Field{owner, name}` subject. `storage` is left `None` here; the
+    /// hover site composes it from its own storage-leaf display (keeps the
+    /// LSP-layer alias/config-variant logic out of the model).
+    pub fn field_domain(
+        &self,
+        class: &str,
+        field: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<NominalDomain> {
+        let owner = match self.resolve_method_in_ancestors(class, field, module_index)? {
+            MethodResolution::Local { class, .. } | MethodResolution::CrossFile { class, .. } => {
+                class
+            }
+        };
+        self.field_domain_for_owner(&owner, field, module_index)
+    }
+
+    /// Fold this file's domain sites for `field` onto `Field{owner, name}`
+    /// and query `DomainCoherenceFold`. The witnesses are built into a
+    /// scratch bag at query time because a site's enum resolves cross-file
+    /// (the module index is only in hand here); the fold + majority rule
+    /// live in the reducer (`witnesses::domain_coherence`).
+    pub fn field_domain_for_owner(
+        &self,
+        owner: &str,
+        field: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<NominalDomain> {
+        use crate::witnesses::{
+            domain_coherence, ReducedValue, ReducerQuery, ReducerRegistry, Witness,
+            WitnessAttachment, WitnessBag, WitnessPayload, WitnessSource,
+        };
+        let att = WitnessAttachment::Field { owner: owner.to_string(), name: field.to_string() };
+        let mut bag = WitnessBag::new();
+        for site in &self.domain_sites {
+            if site.slot != field {
+                continue;
+            }
+            let Some(enum_name) = self.resolve_enumerator_enum(&site.value, module_index) else {
+                continue;
+            };
+            bag.push(Witness {
+                attachment: att.clone(),
+                source: WitnessSource::Builder("field_domain".into()),
+                payload: WitnessPayload::DomainCompare { enum_type: enum_name },
+                span: site.slot_span,
+            });
+        }
+        let reg = ReducerRegistry::with_defaults();
+        let ctx = self.bag_context(module_index);
+        let q = ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: crate::witnesses::FrameworkFact::Plain,
+            arity_hint: None,
+            receiver: None,
+            context: Some(&ctx),
+        };
+        let domain = match reg.query(&bag, &q) {
+            ReducedValue::Type(InferredType::ClassName(d)) => d,
+            _ => return None,
+        };
+        // Confidence = dominant share, recomputed from the same witnesses the
+        // reducer folded (the coherence helper reports it deterministically).
+        let ws: Vec<&Witness> = bag.all().iter().collect();
+        let confidence = domain_coherence(&ws)
+            .map(|(_, count, total)| count as f32 / total as f32)
+            .unwrap_or(0.0);
+        Some(NominalDomain { domain, storage: None, confidence })
+    }
+
+    /// Reverse bridge: the slot spans in THIS file whose domain value
+    /// resolves to `enum_name` — what a find-references on `enum_name` (or
+    /// one of its enumerators) surfaces backward. A targeted scan of the
+    /// stored domain sites, not a full witness sweep.
+    pub fn field_sites_for_enum(
+        &self,
+        enum_name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<Span> {
+        self.domain_sites
+            .iter()
+            .filter(|s| {
+                self.resolve_enumerator_enum(&s.value, module_index).as_deref() == Some(enum_name)
+            })
+            .map(|s| s.slot_span)
+            .collect()
     }
 
     /// The `TypeName(n)` a `Variable{name, scope}` declared type edges to, read

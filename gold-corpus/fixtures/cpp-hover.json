@@ -200,10 +200,42 @@
     },
     {
       "id": "cpp-hover-enumerator-shows-parent-enum",
-      "difficulty": "simple", "semantic_area": "cpp-multilang",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "cenum.c", "line": 1, "col": 5,
-      "expect": { "all": ["RED: Color", "*variable*"], "none": ["```perl"] },
+      "difficulty": "simple",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "cenum.c",
+      "line": 1,
+      "col": 5,
+      "expect": {
+        "all": [
+          "RED: Color",
+          "*variable*"
+        ],
+        "none": [
+          "```perl"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hover-domain-typing-op-type-headlines-enum",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_enum.c",
+      "line": 6,
+      "col": 14,
+      "expect": {
+        "all": [
+          "op_type: opcode",
+          "*field*"
+        ],
+        "none": [
+          "```perl"
+        ]
+      },
       "status": "gold"
     }
   ]
