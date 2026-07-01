@@ -730,7 +730,7 @@ fn completion_items_native(
         for r in &refs {
             if let RefKind::MethodCall { invocant, .. } = &r.kind {
                 let early = mid_string_methodref_completions(
-                    analysis, module_index, invocant, source, point, r.span,
+                    analysis, module_index, invocant.text(), source, point, r.span,
                 );
                 if !early.is_empty() {
                     return early;
@@ -2919,7 +2919,12 @@ pub fn collect_diagnostics(
     ];
     for r in &analysis.refs {
         let (invocant, _invocant_span) = match &r.kind {
-            RefKind::MethodCall { invocant, invocant_span, .. } => (invocant, invocant_span),
+            // A plugin-bridged token is plugin-resolved, not a receiver we
+            // can flag as an unresolved method — skip it.
+            RefKind::MethodCall { invocant, invocant_span, .. } => match invocant.as_name() {
+                Some(n) => (n, invocant_span),
+                None => continue,
+            },
             _ => continue,
         };
         let method_name = &r.target_name;
@@ -3055,6 +3060,9 @@ pub fn collect_diagnostics(
         let mut seen: std::collections::HashSet<(String, String)> = Default::default();
         for r in &analysis.refs {
             let RefKind::MethodCall { invocant, .. } = &r.kind else { continue };
+            // Plugin-bridged tokens are resolved by their owning plugin,
+            // not a missing-plugin hint candidate.
+            let Some(invocant) = invocant.as_name() else { continue };
             let method_name = &r.target_name;
             if !matches!(MethodToken::parse(method_name), MethodToken::Bare(_)) {
                 continue;

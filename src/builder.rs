@@ -3352,15 +3352,22 @@ impl<'a> Builder<'a> {
                     config_span,
                 });
             }
-            plugin::EmitAction::MethodCallRef { method_name, invocant, span, invocant_span } => {
+            plugin::EmitAction::MethodCallRef { method_name, invocant, span, invocant_span, bridged } => {
                 // Standard MethodCall ref — gd/gr/hover/rename route to
                 // the usual resolution path (inheritance walk + module
                 // index + type inference). The plugin's job is just
                 // "there's a call to method X on invocant Y here".
-                // Plugins declare `invocant` as the intended receiver
-                // class (e.g. route plugin uses "Users" for `->to('Users#list')`);
-                // treat that as the resolved class unless it's a sigil-shape.
-                let invocant_class = if invocant.is_empty()
+                //
+                // `bridged`: when Some(mode), the invocant is a class key the
+                // emitting plugin already transformed (a camelized Mojo
+                // controller name), not a Perl receiver. It becomes
+                // `Invocant::Bridged` so the freeze pass never pins it and
+                // core resolves it generically by the declared match mode.
+                // A non-bridged invocant is the intended receiver class /
+                // canonical variable, treated as the resolved class unless
+                // it's a sigil-shape.
+                let invocant_class = if bridged.is_some()
+                    || invocant.is_empty()
                     || invocant.starts_with('$')
                     || invocant.starts_with('@')
                     || invocant.starts_with('%')
@@ -3376,12 +3383,16 @@ impl<'a> Builder<'a> {
                 )) {
                     return;
                 }
+                let invocant = match bridged {
+                    Some(match_mode) => {
+                        crate::conventions::Invocant::bridged(plugin_id.clone(), invocant, match_mode)
+                    }
+                    None => crate::conventions::Invocant::assume_canonical(invocant),
+                };
                 let ref_idx = self.refs.len();
                 self.refs.push(Ref {
                     kind: RefKind::MethodCall {
-                        // The plugin asserts its receiver text (a literal
-                        // class like "Users", or a canonical `$self`).
-                        invocant: crate::conventions::InvocantName::assume_canonical(invocant),
+                        invocant,
                         invocant_span,
                         method_name_span: span,
                         member_op: None,
@@ -8591,7 +8602,7 @@ impl<'a> Builder<'a> {
                             if name.chars().next().map_or(false, |c| c == '_' || c.is_alphabetic()) {
                                 self.refs.push(Ref {
                                     kind: RefKind::MethodCall {
-                                        invocant: crate::conventions::InvocantName::assume_canonical(
+                                        invocant: crate::conventions::Invocant::assume_canonical(
                                             invocant
                                                 .and_then(|i| {
                                                     crate::cst::canonical_var_name(i, &bytes)
@@ -10649,11 +10660,11 @@ impl<'a> Builder<'a> {
             // canonical producer for ref invocants — varname spelling
             // normalized above, package token resolved here.
             if crate::conventions::is_current_package_token(s) {
-                crate::conventions::InvocantName::assume_canonical(
+                crate::conventions::Invocant::assume_canonical(
                     self.current_package.clone().unwrap_or_else(|| s.to_string()),
                 )
             } else {
-                crate::conventions::InvocantName::assume_canonical(s)
+                crate::conventions::Invocant::assume_canonical(s)
             }
         });
         // Stored even when walk-time can't resolve the class — PostFold's

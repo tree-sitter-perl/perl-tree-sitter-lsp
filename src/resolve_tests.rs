@@ -1075,6 +1075,9 @@ $app->helper('users.create' => sub ($c, $name, $email) {});
 
 my $r = app->routes;
 $r->post('/users')->to(controller => 'Users', action => 'create');
+
+package Users;
+sub create { }
 "#;
     let mut parser = Parser::new();
     parser
@@ -1082,6 +1085,10 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
         .unwrap();
     let tree = parser.parse(src, None).unwrap();
     let fa = crate::builder::build(&tree, src.as_bytes());
+    // The route controller `'Users'` is a plugin-bridged token resolved at
+    // query time; an (empty) index hands `find_highlights` the plugin
+    // resolver, which finds the local `package Users` owning `create`.
+    let idx = crate::module_index::ModuleIndex::new_for_test();
 
     // Lines (0-indexed; file starts with a blank row 0):
     //   row 6 — `$app->helper('users.create' => sub ...);`
@@ -1104,7 +1111,7 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
         row: line_helper,
         column: helper_col + 2,
     };
-    let helper_highlights = fa.find_highlights(helper_pt, None);
+    let helper_highlights = fa.find_highlights(helper_pt, Some(&idx));
     let helper_rows: Vec<usize> = helper_highlights.iter().map(|(s, _)| s.start.row).collect();
     assert!(
         helper_rows.contains(&line_helper),
@@ -1124,7 +1131,7 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
         row: line_route,
         column: route_col + 2,
     };
-    let route_highlights = fa.find_highlights(route_pt, None);
+    let route_highlights = fa.find_highlights(route_pt, Some(&idx));
     let route_rows: Vec<usize> = route_highlights.iter().map(|(s, _)| s.start.row).collect();
     assert!(
         route_rows.contains(&line_route),
@@ -1195,6 +1202,16 @@ $u->create(name => 'alice');
     let f3 = parse_build(f3_src);
     store.insert_workspace(PathBuf::from("/tmp/consumer.pm"), f3);
 
+    // The route controller `'Users'` is a plugin-bridged token; resolving
+    // it to the `Users` class is a query-time job that needs the index
+    // (the build-time freeze is intentionally skipped for bridged
+    // invocants), so register `Users` and thread the index through.
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    idx.register_workspace_module(
+        PathBuf::from("/tmp/users.pm"),
+        std::sync::Arc::new(parse_build(f2_src)),
+    );
+
     // Probe: cursor on the route's 'create' action string in f1.
     let mut parser = Parser::new();
     parser
@@ -1211,7 +1228,7 @@ $u->create(name => 'alice');
         column: create_col + 2,
     };
 
-    let kind = f1_fa.rename_kind_at(cursor, None);
+    let kind = f1_fa.rename_kind_at(cursor, Some(&idx));
     let target = match kind {
         Some(RenameKind::Method { name, class }) => TargetRef {
             name,
@@ -1225,7 +1242,7 @@ $u->create(name => 'alice');
         assert_eq!(class, "Users", "target class should be Users");
     }
 
-    let refs = refs_to(&store, None, &target, RoleMask::EDITABLE);
+    let refs = refs_to(&store, Some(&idx), &target, RoleMask::EDITABLE);
 
     // Collect (file-basename, row) for clarity.
     let hits: Vec<(String, usize)> = refs

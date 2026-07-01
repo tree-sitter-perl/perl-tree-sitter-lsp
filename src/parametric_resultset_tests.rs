@@ -413,7 +413,7 @@ my $name = $schema->resultset('Schema::Result::Users')->find(1)->name;
         .refs
         .iter()
         .find(|r| matches!(&r.kind, RefKind::MethodCall { invocant, .. }
-            if invocant.ends_with("->find(1)"))
+            if invocant.text().ends_with("->find(1)"))
             && r.target_name == "name")
         .expect("trailing ->name MethodCall ref");
     assert!(

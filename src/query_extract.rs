@@ -371,7 +371,7 @@ impl SkeletonAnalysis {
                     "member" => {
                         let (inv_span, inv_text) = r.invocant.clone()?;
                         RefKind::MethodCall {
-                            invocant: crate::conventions::InvocantName::assume_canonical(inv_text),
+                            invocant: crate::conventions::Invocant::assume_canonical(inv_text),
                             invocant_span: Some(inv_span),
                             method_name_span: Span { start: r.start, end: r.end },
                             member_op: r.member_op,

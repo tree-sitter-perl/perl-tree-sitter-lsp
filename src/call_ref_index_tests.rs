@@ -309,7 +309,7 @@ fn equal_span_first_write_wins() {
     let refs = vec![
         Ref {
             kind: RefKind::MethodCall {
-                invocant: crate::conventions::InvocantName::assume_canonical("$a"),
+                invocant: crate::conventions::Invocant::assume_canonical("$a"),
                 invocant_span: Some(Span {
                     start: Point::new(0, 0),
                     end: Point::new(0, 2),
@@ -330,7 +330,7 @@ fn equal_span_first_write_wins() {
         },
         Ref {
             kind: RefKind::MethodCall {
-                invocant: crate::conventions::InvocantName::assume_canonical("$b"),
+                invocant: crate::conventions::Invocant::assume_canonical("$b"),
                 invocant_span: Some(Span {
                     start: Point::new(0, 0),
                     end: Point::new(0, 2),
