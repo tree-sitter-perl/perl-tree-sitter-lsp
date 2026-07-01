@@ -108,18 +108,19 @@ pub struct PackDriver {
         fn(
             &mut tree_sitter::Parser,
             &str,
-            &std::collections::BTreeMap<String, crate::cpp_reparse::Macro>,
+            &crate::cpp_reparse::PreExpandedExternal,
         ) -> (String, crate::cpp_reparse::SpliceMap, Vec<(String, String)>),
     >,
     /// Path-aware cross-file macro gather (C++ #include resolution). Given
-    /// the file path + source, returns macros from #included headers to
-    /// seed `transform`. `None` = no cross-file macros.
+    /// the file path + source, returns the pre-expanded external macro table
+    /// (mutually-expanded once, cached by include-set) that seeds `transform`.
+    /// `None` = no cross-file macros.
     gather_macros: Option<
         fn(
             &Path,
             &str,
             &mut tree_sitter::Parser,
-        ) -> std::sync::Arc<std::collections::BTreeMap<String, crate::cpp_reparse::Macro>>,
+        ) -> std::sync::Arc<crate::cpp_reparse::PreExpandedExternal>,
     >,
 }
 
@@ -145,11 +146,13 @@ impl LanguageDriver for PackDriver {
         // Cross-file macros from #included headers (C++), so a macro
         // #defined elsewhere (SPDLOG_NAMESPACE_BEGIN) expands here.
         let external = match (self.gather_macros, path) {
-            (Some(g), Some(p)) => g(p, source, &mut parser),
-            _ => std::sync::Arc::new(std::collections::BTreeMap::new()),
+            (Some(g), Some(p)) => {
+                crate::timings::phase("cpp.gather", || g(p, source, &mut parser))
+            }
+            _ => std::sync::Arc::new(crate::cpp_reparse::PreExpandedExternal::empty()),
         };
         let (src, map, recovered) = match self.transform {
-            Some(t) => t(&mut parser, source, &external),
+            Some(t) => crate::timings::phase("cpp.transform", || t(&mut parser, source, &external)),
             None => (source.to_string(), crate::cpp_reparse::SpliceMap::default(), Vec::new()),
         };
         let Some(tree) = parser.parse(&src, None) else { return FileAnalysis::new(Default::default()) };
@@ -193,7 +196,7 @@ fn cpp_driver() -> PackDriver {
         // reparse past the preprocessor before extraction; the anchor map
         // carries the recovered spans back to the original coordinates.
         transform: Some(crate::cpp_reparse::preprocess_validated_with),
-        gather_macros: Some(crate::cpp_reparse::included_macros),
+        gather_macros: Some(crate::cpp_reparse::included_macros_pre_expanded),
     }
 }
 

@@ -318,7 +318,19 @@ fn cli_lang_analyze(file: &str) {
         eprintln!("cannot read {file}");
         std::process::exit(1);
     };
-    let fa = driver.analyze_with_path(&src, Some(std::path::Path::new(path)));
+    // `PERL_LSP_BENCH_ITERS=N` re-analyzes N times in-process — the 2nd+ runs
+    // are WARM (macro tables cached), which is where the per-analyze macro-
+    // expansion cost shows. Combine with `PERL_LSP_PHASE_TIMING=1` for the
+    // gather/expand breakdown. Default 1 (single cold analyze).
+    let iters: usize = std::env::var("PERL_LSP_BENCH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    let mut fa = driver.analyze_with_path(&src, Some(std::path::Path::new(path)));
+    for _ in 1..iters {
+        fa = driver.analyze_with_path(&src, Some(std::path::Path::new(path)));
+    }
     println!("# {file} [{}] — {} symbols", driver.id(), fa.symbols.len());
     for s in &fa.symbols {
         let pkg = s.package.as_deref().unwrap_or("");

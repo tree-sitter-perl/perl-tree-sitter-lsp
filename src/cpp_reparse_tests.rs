@@ -101,6 +101,65 @@ fn function_macro_expands_to_member_declarations() {
     assert!(names.contains(&"MyObj".to_string()), "class still present: {names:?}");
 }
 
+/// The load-bearing invariant of the two-tier own/external split: the fast
+/// path (locals fixpointed over a cached, pre-expanded external table) and the
+/// slow path (the old single-tier merge+fixpoint) produce BYTE-IDENTICAL
+/// expansion. Exercised on a macro-heavy mix that hits every tricky case the
+/// split must preserve: external-referencing-external, external-referencing-
+/// local, and a local `#define` shadowing an external one.
+#[test]
+fn two_tier_matches_single_tier_expansion() {
+    let mut p = cpp_parser();
+
+    // EXTERNAL macros (as if gathered from #included headers).
+    let mut ext = std::collections::BTreeMap::new();
+    let mut def = |m: &mut std::collections::BTreeMap<String, Macro>, n: &str, params: Option<&[&str]>, body: &str| {
+        m.insert(
+            n.to_string(),
+            Macro {
+                params: params.map(|ps| ps.iter().map(|s| s.to_string()).collect()),
+                body: body.to_string(),
+            },
+        );
+    };
+    // external → external (mutual expansion, baked once in the cache)
+    def(&mut ext, "API", None, "EXPORTED");
+    def(&mut ext, "EXPORTED", None, "__attribute__((visibility(\"default\")))");
+    def(&mut ext, "WRAP", Some(&["x"]), "API x");
+    // external body that NAMES a local macro (LOCAL_TAG) — forces the slow path
+    def(&mut ext, "TAGGED", None, "LOCAL_TAG int");
+    // a name the file will SHADOW with its own #define
+    def(&mut ext, "MAXLEN", None, "256");
+
+    let external = PreExpandedExternal::from_raw(std::sync::Arc::new(ext));
+
+    let cases = [
+        // clean split: only external-referencing-external, no interaction
+        "class API Widget { void draw(); };\nint sz = MAXN;\n#define MAXN 8\nWRAP(class) Gadget {};\n",
+        // external body references a local macro → slow path must engage
+        "#define LOCAL_TAG const\nTAGGED foo;\nclass API Thing { void go(); };\n",
+        // local shadows an external name → slow path must engage
+        "#define MAXLEN 16\nint buf[MAXLEN];\nclass API Box { void run(); };\n",
+        // both interactions at once
+        "#define LOCAL_TAG volatile\n#define MAXLEN 32\nTAGGED n = MAXLEN;\nclass API Q {};\n",
+    ];
+
+    for src in cases {
+        let tree = parse(&mut p, src);
+        // args: (…, alias_only, force_slow). Full mode both; the last flag
+        // toggles fast two-tier vs the old single-tier merge.
+        let (fast, fmap) = preprocess_with_mode_inner(&tree, src, &external, false, false);
+        let (slow, smap) = preprocess_with_mode_inner(&tree, src, &external, false, true);
+        assert_eq!(fast, slow, "expansion drift (full) on:\n{src}\nfast:\n{fast}\nslow:\n{slow}");
+        assert_eq!(fmap.edits_for_test(), smap.edits_for_test(), "splice-map drift on:\n{src}");
+
+        // alias-only mode (the parse-damage fallback) must also agree.
+        let (fa, _) = preprocess_with_mode_inner(&tree, src, &external, true, false);
+        let (sa, _) = preprocess_with_mode_inner(&tree, src, &external, true, true);
+        assert_eq!(fa, sa, "alias-only expansion drift on:\n{src}");
+    }
+}
+
 #[test]
 fn no_macros_is_identity() {
     let mut p = cpp_parser();

@@ -85,6 +85,11 @@ enum Region {
 }
 
 impl SpliceMap {
+    #[cfg(test)]
+    pub(crate) fn edits_for_test(&self) -> &[(usize, usize, usize)] {
+        &self.edits
+    }
+
     /// Locate `transformed`'s region. `partition_point` returns the count
     /// of edits whose replacement starts at or before `transformed`; the
     /// last of them (`pp - 1`) is the only edit that can contain it
@@ -392,7 +397,7 @@ pub fn preprocess_validated(parser: &mut tree_sitter::Parser, src: &str) -> (Str
 pub fn preprocess_validated_with(
     parser: &mut tree_sitter::Parser,
     src: &str,
-    external: &BTreeMap<String, Macro>,
+    external: &PreExpandedExternal,
 ) -> (String, SpliceMap, Vec<(String, String)>) {
     // Blank unresolved declarator-position macros first (length-preserving,
     // unconditional — recovers `class Q_CORE_EXPORT Foo` even when the macro
@@ -566,6 +571,128 @@ pub fn included_macros(
     arc
 }
 
+/// One pre-expanded variant of the external table + the identifiers its bodies
+/// name. `table` is `pre_expand_bodies`d once; `body_idents` (every identifier
+/// in a `table` body) drives the clean-split test — a file-local name in this
+/// set means an external expansion would depend on it, so the split can't bake
+/// it and the analyze falls to the slow single-tier path.
+#[derive(Default)]
+struct ExpandedVariant {
+    table: MacroTable,
+    body_idents: std::collections::HashSet<String>,
+}
+
+impl ExpandedVariant {
+    fn of(macros: &MacroTable) -> Self {
+        let table = pre_expand_bodies(macros);
+        let body_idents = body_identifiers(&table);
+        ExpandedVariant { table, body_idents }
+    }
+}
+
+/// The EXTERNAL macro table (from the `#include` closure), mutually pre-expanded
+/// ONCE per include-set and cached. External-referencing-external object refs
+/// are baked into the variants, so the per-analyze transform never re-fixpoints
+/// the huge external set (perl.h ≈ 2000 macros) — it fixpoints only the
+/// file-LOCAL macros and resolves external names by lookup here. `raw` is
+/// retained for the byte-identical slow fallback, whose single-tier merge +
+/// fixpoint needs the un-pre-expanded external bodies.
+#[derive(Default)]
+pub struct PreExpandedExternal {
+    raw: std::sync::Arc<MacroTable>,
+    /// Full mutual pre-expansion (the `preprocess_with` path).
+    full: ExpandedVariant,
+    /// Identifier-alias subset only (the parse-damage `alias_only` fallback):
+    /// `is_identifier_alias`-retained BEFORE expansion, matching the old
+    /// merge-then-retain-then-fixpoint order.
+    alias: ExpandedVariant,
+}
+
+impl PreExpandedExternal {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    fn from_raw(raw: std::sync::Arc<MacroTable>) -> Self {
+        // This mutual pre-expansion is the O(external) work the two-tier split
+        // hoists out of every analyze — paid ONCE per include-set here, then
+        // reused warm. Labelled so `PERL_LSP_PHASE_TIMING` shows the per-analyze
+        // cost it eliminates.
+        let (full, alias) = crate::timings::phase("cpp.external_preexpand", || {
+            let full = ExpandedVariant::of(&raw);
+            let mut alias_src = (*raw).clone();
+            alias_src.retain(|_, m| is_identifier_alias(m));
+            (full, ExpandedVariant::of(&alias_src))
+        });
+        PreExpandedExternal { raw, full, alias }
+    }
+
+    fn variant(&self, alias_only: bool) -> &ExpandedVariant {
+        if alias_only {
+            &self.alias
+        } else {
+            &self.full
+        }
+    }
+}
+
+/// Every identifier token appearing in any macro body — the reference
+/// candidates. Used to detect an external body that (transitively, since
+/// `expanded` bodies are already baked) names a file-local macro.
+fn body_identifiers(macros: &MacroTable) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for m in macros.values() {
+        let bytes = m.body.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if is_ident_byte(bytes[i]) && (i == 0 || !is_ident_byte(bytes[i - 1])) {
+                let s = i;
+                while i < bytes.len() && is_ident_byte(bytes[i]) {
+                    i += 1;
+                }
+                out.insert(m.body[s..i].to_string());
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+type PreExpandedCache =
+    std::collections::HashMap<std::path::PathBuf, (u64, std::sync::Arc<PreExpandedExternal>)>;
+
+fn pre_expanded_cache() -> &'static std::sync::Mutex<PreExpandedCache> {
+    static C: std::sync::OnceLock<std::sync::Mutex<PreExpandedCache>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(PreExpandedCache::new()))
+}
+
+/// `included_macros` plus the one-time mutual pre-expansion of the external
+/// table, cached by the same (file, include-set) key. Warm analyzes reuse the
+/// pre-expanded table for free — the transform then only fixpoints file-local
+/// macros. This is the driver's `gather_macros` hook.
+pub fn included_macros_pre_expanded(
+    file_path: &std::path::Path,
+    src: &str,
+    parser: &mut tree_sitter::Parser,
+) -> std::sync::Arc<PreExpandedExternal> {
+    let key = file_path.to_path_buf();
+    let inc_hash = include_set_hash(src);
+    if let Ok(cache) = pre_expanded_cache().lock() {
+        if let Some((h, pe)) = cache.get(&key) {
+            if *h == inc_hash {
+                return pe.clone();
+            }
+        }
+    }
+    let raw = included_macros(file_path, src, parser);
+    let pe = std::sync::Arc::new(PreExpandedExternal::from_raw(raw));
+    if let Ok(mut cache) = pre_expanded_cache().lock() {
+        cache.insert(key, (inc_hash, pe.clone()));
+    }
+    pe
+}
+
 fn gather_included_macros(
     file_path: &std::path::Path,
     src: &str,
@@ -708,7 +835,7 @@ fn include_paths_tree(tree: &Tree, src: &str) -> Vec<String> {
 /// The transform: expand macro invocations in `src`, returning the
 /// rewritten source and the anchor map. Single source-level pass.
 pub fn preprocess(tree: &Tree, src: &str) -> (String, SpliceMap) {
-    preprocess_with(tree, src, &BTreeMap::new())
+    preprocess_with(tree, src, &PreExpandedExternal::empty())
 }
 
 /// `preprocess` plus EXTERNAL macros (gathered from #included headers via
@@ -728,9 +855,146 @@ fn is_identifier_alias(m: &Macro) -> bool {
 pub fn preprocess_with(
     tree: &Tree,
     src: &str,
-    external: &BTreeMap<String, Macro>,
+    external: &PreExpandedExternal,
 ) -> (String, SpliceMap) {
     preprocess_with_mode(tree, src, external, false)
+}
+
+/// The two-tier macro view the source-splice pass queries: file-LOCAL
+/// macros (fixpointed per analyze) layered over the cached, pre-expanded
+/// EXTERNAL table (external-referencing-external already baked). Local wins on
+/// a name conflict. On the slow fallback, `local` holds the full merged +
+/// fixpointed map and `external` is empty — a single-tier lookup.
+struct EffectiveMacros<'a> {
+    local: BTreeMap<String, Macro>,
+    external: &'a BTreeMap<String, Macro>,
+}
+
+impl EffectiveMacros<'_> {
+    fn get(&self, name: &str) -> Option<&Macro> {
+        self.local.get(name).or_else(|| self.external.get(name))
+    }
+    fn is_empty(&self) -> bool {
+        self.local.is_empty() && self.external.is_empty()
+    }
+}
+
+fn empty_table() -> &'static BTreeMap<String, Macro> {
+    static E: std::sync::OnceLock<BTreeMap<String, Macro>> = std::sync::OnceLock::new();
+    E.get_or_init(BTreeMap::new)
+}
+
+fn force_slow_path() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PERL_LSP_CPP_NO_FASTPATH").is_some())
+}
+
+/// Build the macro view for one analyze. FAST path (the common case): the file
+/// LOCAL macros are the only set fixpointed here; external names resolve by
+/// lookup into the cached, already-expanded `external.expanded`. SLOW path
+/// (a local shadows an external name, or an external body references a local
+/// name — both cheap to detect against the cached `body_idents`): merge the
+/// raw external set with the locals and fixpoint the whole thing, exactly as a
+/// single-tier expansion would — byte-identical, at the old cost.
+fn build_effective_macros<'a>(
+    tree: &Tree,
+    src: &str,
+    external: &'a PreExpandedExternal,
+    alias_only: bool,
+    force_slow: bool,
+) -> EffectiveMacros<'a> {
+    let local_all = collect_macros(tree, src.as_bytes());
+    let ext = external.variant(alias_only);
+    // Conservative clean-split test (ALL local names, pre-retain): if any local
+    // name collides with an external def, or is named by any external body, the
+    // two tiers interact and the split can't stay byte-identical → slow path.
+    let clean = !force_slow
+        && local_all
+            .keys()
+            .all(|k| !ext.table.contains_key(k) && !ext.body_idents.contains(k));
+    if clean {
+        let mut local = local_all;
+        if alias_only {
+            local.retain(|_, m| is_identifier_alias(m));
+        }
+        let local = pre_expand_local(local, &ext.table);
+        EffectiveMacros { local, external: &ext.table }
+    } else {
+        let mut merged = local_all;
+        for (k, v) in external.raw.iter() {
+            merged.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if alias_only {
+            merged.retain(|_, m| is_identifier_alias(m));
+        }
+        EffectiveMacros { local: pre_expand_bodies(&merged), external: empty_table() }
+    }
+}
+
+/// Fixpoint-expand only the LOCAL macro bodies (depth-capped, blue-painted),
+/// resolving object-like references to file-local names among `local` and to
+/// external names via the already-expanded (terminal) `external` table. The
+/// external tier is never re-fixpointed or cloned — the whole point.
+fn pre_expand_local(
+    local: BTreeMap<String, Macro>,
+    external: &BTreeMap<String, Macro>,
+) -> BTreeMap<String, Macro> {
+    let mut out = local;
+    for _ in 0..8 {
+        let mut changed = false;
+        let snapshot = out.clone();
+        for (name, m) in out.iter_mut() {
+            let expanded = expand_text_layered(&m.body, &snapshot, external, Some(name));
+            if expanded != m.body {
+                m.body = expanded;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    out
+}
+
+/// `expand_text` over two tiers: an object-like reference resolves against
+/// `primary` first (the fixpointing local snapshot), then `secondary` (the
+/// terminal external table). Blue-paints `exclude` (a macro isn't re-expanded
+/// in its own body).
+fn expand_text_layered(
+    text: &str,
+    primary: &BTreeMap<String, Macro>,
+    secondary: &BTreeMap<String, Macro>,
+    exclude: Option<&str>,
+) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if out.len() > MAX_BODY_LEN {
+            return out;
+        }
+        if is_ident_byte(bytes[i]) && (i == 0 || !is_ident_byte(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &text[start..i];
+            let m = if Some(word) == exclude {
+                None
+            } else {
+                primary.get(word).or_else(|| secondary.get(word))
+            };
+            match m {
+                Some(m) if m.params.is_none() => out.push_str(&m.body),
+                _ => out.push_str(word),
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// `alias_only` restricts expansion to identifier-alias macros (the
@@ -739,18 +1003,26 @@ pub fn preprocess_with(
 fn preprocess_with_mode(
     tree: &Tree,
     src: &str,
-    external: &BTreeMap<String, Macro>,
+    external: &PreExpandedExternal,
     alias_only: bool,
 ) -> (String, SpliceMap) {
-    let mut macros = collect_macros(tree, src.as_bytes());
-    for (k, v) in external {
-        macros.entry(k.clone()).or_insert_with(|| v.clone());
-    }
-    if alias_only {
-        macros.retain(|_, m| is_identifier_alias(m));
-    }
-    let macros = pre_expand_bodies(&macros);
-    if macros.is_empty() {
+    preprocess_with_mode_inner(tree, src, external, alias_only, force_slow_path())
+}
+
+/// The splice pass proper, `force_slow` explicit (env-gate read at the public
+/// boundary) so the differential test can drive the fast and slow tiers on the
+/// same input and assert byte-identical output.
+fn preprocess_with_mode_inner(
+    tree: &Tree,
+    src: &str,
+    external: &PreExpandedExternal,
+    alias_only: bool,
+    force_slow: bool,
+) -> (String, SpliceMap) {
+    let eff = crate::timings::phase("cpp.macro_expand", || {
+        build_effective_macros(tree, src, external, alias_only, force_slow)
+    });
+    if eff.is_empty() {
         return (src.to_string(), SpliceMap::default());
     }
     let excludes = exclusion_spans(tree);
@@ -775,7 +1047,7 @@ fn preprocess_with_mode(
             if ex < excludes.len() && excludes[ex].0 <= start {
                 continue; // start ∈ [s, e) of the frontier exclude → skip
             }
-            if let Some(m) = macros.get(word) {
+            if let Some(m) = eff.get(word) {
                 match &m.params {
                     None => splices.push(Splice {
                         start,
