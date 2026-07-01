@@ -350,6 +350,63 @@ impl Backend {
     }
 
 
+    /// Warm the cross-file macro gather for a freshly-opened pack file OFF the
+    /// open path, then re-analyze + re-publish (the async-refresh). `did_open`
+    /// runs the first analyze in cached-only mode (instant, degraded — no cold
+    /// gather), so hover/goto-def are live immediately; this task pays the cold
+    /// gather in the background (like the workspace index) and refreshes the
+    /// document when it lands. A no-op-fast on a warm gather (the analyze just
+    /// re-runs against the cache). Perl needs no gather and is skipped.
+    fn spawn_pack_gather_refresh(&self, uri: Url) {
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let Some((text, path, language)) = files
+                .get_open(&uri)
+                .filter(|d| d.language != "perl")
+                .map(|d| (d.text.clone(), d.path.clone(), d.language))
+            else {
+                return;
+            };
+            let snapshot = text.clone();
+            // Full analyze (cold gather allowed — this thread has cached-only OFF)
+            // on a blocking thread so the ~1.5s gather never stalls the executor.
+            let analysis = tokio::task::spawn_blocking(move || {
+                crate::language_driver::LanguageRegistry::with_enabled()
+                    .for_id(language)
+                    .map(|d| d.analyze_with_path(&text, path.as_deref()))
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(analysis) = analysis else { return };
+            // A keystroke may have landed while we gathered; the debounced
+            // rebuild owns the newer text, so don't clobber it with this stale
+            // build (self-heals either way, but avoids a diagnostics flicker).
+            if files.get_open(&uri).map(|d| d.text != snapshot).unwrap_or(true) {
+                return;
+            }
+            for imp in &analysis.imports {
+                module_index.request_resolve(&imp.module_name);
+            }
+            for parents in analysis.package_parents.values() {
+                for parent in parents {
+                    module_index.request_resolve(parent);
+                }
+            }
+            if let Some(mut doc) = files.get_open_mut(&uri) {
+                doc.apply_rebuilt(analysis);
+            }
+            let diags = files
+                .get_open(&uri)
+                .map(|doc| symbols::pack_diagnostics(&doc.analysis));
+            if let Some(diags) = diags {
+                client.publish_diagnostics(uri, diags, None).await;
+            }
+        });
+    }
+
     /// A bare identifier at the cursor that names a CROSS-FILE top-level
     /// symbol — a macro (`OP_NULL`, `BASEOP`), enum constant, global, or
     /// type. Resolves off the RAW word, so it works even when the macro
@@ -689,11 +746,22 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
-        if self.files.open(uri.clone(), text) {
+        // Run the on-open analyze in cached-only mode: a C++ file's cross-file
+        // macro gather is served from cache if warm, else SKIPPED (degraded, no
+        // ~1.5s cold gather blocking the open). `files.open` builds the document
+        // synchronously on this thread, so the thread-local applies exactly to it.
+        crate::cpp_reparse::set_gather_cached_only(true);
+        let opened = self.files.open(uri.clone(), text);
+        crate::cpp_reparse::set_gather_cached_only(false);
+        let mut needs_gather_refresh = false;
+        if opened {
             if let Some(doc) = self.files.get_open(&uri) {
                 // Lazily index this file's language family (once) — the reason a
                 // C++ open no longer waits on the perl tree.
                 self.ensure_workspace_indexed(&doc.language);
+                // A pack file's first analyze was cached-only; warm the gather
+                // and re-analyze in the background so full cross-file macros land.
+                needs_gather_refresh = doc.language != "perl";
                 // Enqueue imports for background resolution (non-blocking).
                 for imp in &doc.analysis.imports {
                     self.module_index.request_resolve(&imp.module_name);
@@ -707,6 +775,9 @@ impl LanguageServer for Backend {
             }
         }
         self.publish_diagnostics(&uri).await;
+        if needs_gather_refresh {
+            self.spawn_pack_gather_refresh(uri);
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {

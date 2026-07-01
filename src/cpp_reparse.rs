@@ -538,18 +538,48 @@ fn save_persisted(
     }
 }
 
+thread_local! {
+    /// When set on the current thread, `included_macros*` skip the cold gather.
+    static GATHER_CACHED_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// When set on the current thread, `included_macros*` return whatever's cached
+/// (in-mem or on-disk) but SKIP the cold gather — yielding an empty external
+/// set (degraded) instead of blocking. `did_open` sets this so the first
+/// analyze of a macro-heavy file is instant; a background task then runs the
+/// real gather and re-analyzes (the async-refresh path).
+pub fn set_gather_cached_only(v: bool) {
+    GATHER_CACHED_ONLY.with(|c| c.set(v));
+}
+fn gather_cached_only() -> bool {
+    GATHER_CACHED_ONLY.with(|c| c.get())
+}
+
 pub fn included_macros(
     file_path: &std::path::Path,
     src: &str,
     parser: &mut tree_sitter::Parser,
 ) -> std::sync::Arc<MacroTable> {
+    included_macros_inner(file_path, src, parser, true)
+        .unwrap_or_else(|| std::sync::Arc::new(MacroTable::new()))
+}
+
+/// The three-tier lookup. `allow_cold=false` (the on-open path) stops after the
+/// two cache tiers, returning `None` rather than paying the cold gather — the
+/// caller degrades to an empty external set and lets a background task warm it.
+fn included_macros_inner(
+    file_path: &std::path::Path,
+    src: &str,
+    parser: &mut tree_sitter::Parser,
+    allow_cold: bool,
+) -> Option<std::sync::Arc<MacroTable>> {
     let key = file_path.to_path_buf();
     let inc_hash = include_set_hash(src);
     // 1. in-memory (this session)
     if let Ok(cache) = macro_table_cache().lock() {
         if let Some((h, m)) = cache.get(&key) {
             if *h == inc_hash {
-                return m.clone();
+                return Some(m.clone());
             }
         }
     }
@@ -559,7 +589,10 @@ pub fn included_macros(
         if let Ok(mut cache) = macro_table_cache().lock() {
             cache.insert(key, (inc_hash, arc.clone()));
         }
-        return arc;
+        return Some(arc);
+    }
+    if !allow_cold {
+        return None; // on-open: don't block on the cold gather
     }
     // 3. gather cold, then warm both tiers
     let (table, headers) = gather_included_macros(file_path, src, parser);
@@ -568,7 +601,7 @@ pub fn included_macros(
     if let Ok(mut cache) = macro_table_cache().lock() {
         cache.insert(key, (inc_hash, arc.clone()));
     }
-    arc
+    Some(arc)
 }
 
 /// One pre-expanded variant of the external table + the identifiers its bodies
@@ -685,7 +718,13 @@ pub fn included_macros_pre_expanded(
             }
         }
     }
-    let raw = included_macros(file_path, src, parser);
+    // In cached-only mode (on-open), a raw-table miss yields an EMPTY external
+    // set that is deliberately NOT cached — so the background gather's real
+    // table lands cleanly once it warms and this file is re-analyzed.
+    let raw = match included_macros_inner(file_path, src, parser, !gather_cached_only()) {
+        Some(raw) => raw,
+        None => return std::sync::Arc::new(PreExpandedExternal::empty()),
+    };
     let pe = std::sync::Arc::new(PreExpandedExternal::from_raw(raw));
     if let Ok(mut cache) = pre_expanded_cache().lock() {
         cache.insert(key, (inc_hash, pe.clone()));
@@ -693,45 +732,92 @@ pub fn included_macros_pre_expanded(
     pe
 }
 
+thread_local! {
+    /// Each Rayon worker keeps its own `Parser` — tree-sitter parsers aren't
+    /// `Sync`, so the parallel frontier can't share one. Created once per thread.
+    static POOL_PARSER: std::cell::RefCell<Option<tree_sitter::Parser>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with this thread's pooled parser for `lang`.
+fn with_pooled_parser<T>(
+    lang: &tree_sitter::Language,
+    f: impl FnOnce(&mut tree_sitter::Parser) -> T,
+) -> T {
+    POOL_PARSER.with(|slot| {
+        let mut b = slot.borrow_mut();
+        if b.is_none() {
+            let mut p = tree_sitter::Parser::new();
+            p.set_language(lang).expect("cpp grammar for pooled parser");
+            *b = Some(p);
+        }
+        f(b.as_mut().expect("pooled parser present"))
+    })
+}
+
+/// Walk the `#include` closure and collect every reachable header's macros.
+///
+/// Parallel + memoized: each BFS LEVEL's headers are parsed concurrently (Rayon,
+/// one pooled `Parser` per worker); `header_info` memoizes by `(path, mtime)` so
+/// a header shared across the closure — or across FILES (op.c and sv.c share
+/// ~90% of perl5's tree) — is parsed exactly once. There is no header cap: the
+/// `seen` set alone bounds the walk (cycles + re-visits), and the memoize bounds
+/// the cost, so op.c's full closure is collected instead of truncated.
+///
+/// BREADTH-first, first-wins: the file's DIRECT includes are merged before
+/// theirs, so the closest (most relevant) header's definition of a name wins —
+/// the abseil `mutex.h`-vs-`thread_annotations.h` invariant. Determinism under
+/// parallelism: a level is canonicalized + deduped SERIALLY in queue order, and
+/// the parsed results are merged (and their children enqueued) in that same
+/// order, so the macro table is byte-identical to the old single-queue BFS.
 fn gather_included_macros(
     file_path: &std::path::Path,
     src: &str,
     parser: &mut tree_sitter::Parser,
 ) -> (BTreeMap<String, Macro>, Vec<(std::path::PathBuf, i64)>) {
+    use rayon::prelude::*;
     let mut macros = BTreeMap::new();
     let mut headers: Vec<(std::path::PathBuf, i64)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     if let Ok(p) = file_path.canonicalize() {
         seen.insert(p);
     }
-    // BREADTH-first: the file's DIRECT includes first, then theirs — the
-    // closest (most relevant) headers win the budget. Depth-first let a
-    // deep early include starve a direct sibling (abseil: mutex.h's tree
-    // exhausted the cap before reaching thread_annotations.h's
-    // ABSL_GUARDED_BY, so member declarations stayed corrupt).
-    let mut queue: std::collections::VecDeque<std::path::PathBuf> = include_paths(src, parser)
+    let Some(lang) = parser.language().map(|l| (*l).clone()) else {
+        return (macros, headers);
+    };
+    let mut frontier: Vec<std::path::PathBuf> = include_paths(src, parser)
         .iter()
         .filter_map(|inc| resolve_include(file_path, inc))
         .collect();
-    while let Some(path) = queue.pop_front() {
-        if seen.len() > 1000 {
-            break;
-        }
-        let Ok(canon) = path.canonicalize() else { continue };
-        if !seen.insert(canon.clone()) {
-            continue;
-        }
-        let info = header_info(&canon, parser);
-        let Some(info) = info else { continue };
-        headers.push((canon.clone(), mtime_secs(&canon)));
-        for (k, v) in &info.macros {
-            macros.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-        for inc in &info.includes {
-            if let Some(next) = resolve_include(&canon, inc) {
-                queue.push_back(next);
+    while !frontier.is_empty() {
+        // Canonicalize + dedup this level in queue order (cheap stat) so the
+        // parallel parse below can't perturb the first-wins merge order.
+        let mut level: Vec<std::path::PathBuf> = Vec::with_capacity(frontier.len());
+        for path in frontier.drain(..) {
+            let Ok(canon) = path.canonicalize() else { continue };
+            if seen.insert(canon.clone()) {
+                level.push(canon);
             }
         }
+        // header_info is pure per header → parse the level concurrently.
+        let infos: Vec<Option<std::sync::Arc<CachedHeader>>> = level
+            .par_iter()
+            .map(|canon| with_pooled_parser(&lang, |p| header_info(canon, p)))
+            .collect();
+        let mut next: Vec<std::path::PathBuf> = Vec::new();
+        for (canon, info) in level.iter().zip(infos) {
+            let Some(info) = info else { continue };
+            headers.push((canon.clone(), mtime_secs(canon)));
+            for (k, v) in &info.macros {
+                macros.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for inc in &info.includes {
+                if let Some(nx) = resolve_include(canon, inc) {
+                    next.push(nx);
+                }
+            }
+        }
+        frontier = next;
     }
     (macros, headers)
 }
@@ -789,17 +875,56 @@ fn header_cache() -> &'static std::sync::Mutex<HeaderCache> {
     C.get_or_init(|| std::sync::Mutex::new(HeaderCache::new()))
 }
 
-/// Resolve a quoted include like `spdlog/common.h` to a real path: walk up
-/// from the file's dir, first ancestor `R` where `R/<inc>` exists wins.
+/// The default C/C++ toolchain's discovered surface (system include roots +
+/// predefined macros), probed once via the compiler and cached process-globally
+/// (`OnceLock`). `None` when no compiler is on PATH — include resolution then
+/// degrades to workspace-only (today's behavior). Probed as C++ so `include_dirs`
+/// is the SUPERSET that also resolves the C system headers (`<sys/mman.h>`);
+/// `predefined_macros` rides along for the `#if`-eval consumer.
+pub fn toolchain_info() -> Option<&'static crate::cpp_toolchain::ToolchainInfo> {
+    static INFO: std::sync::OnceLock<Option<crate::cpp_toolchain::ToolchainInfo>> =
+        std::sync::OnceLock::new();
+    INFO.get_or_init(|| {
+        crate::cpp_toolchain::default_compiler(crate::cpp_toolchain::Lang::Cpp)
+            .and_then(|c| crate::cpp_toolchain::probe(&c, None))
+    })
+    .as_ref()
+}
+
+/// System/stdlib include roots, in compiler search order — the `<...>` fallback
+/// for headers no workspace ancestor holds (`<sys/mman.h>`). Empty when no
+/// compiler was found.
+fn system_include_dirs() -> &'static [std::path::PathBuf] {
+    static DIRS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| toolchain_info().map(|t| t.include_dirs.clone()).unwrap_or_default())
+}
+
+/// Resolve an include like `spdlog/common.h` or `<sys/mman.h>` to a real path.
+/// Workspace-first: walk up from the file's dir, first ancestor `R` where
+/// `R/<inc>` exists wins (project/relative headers, quoted or angle-bracket).
+/// Only when no ancestor has it do the toolchain's system roots answer — so a
+/// system `<sys/mman.h>` resolves (its subtree was silently lost before), while
+/// a project header still shadows a same-named system one.
 fn resolve_include(file_path: &std::path::Path, inc: &str) -> Option<std::path::PathBuf> {
-    let mut dir = file_path.parent()?;
-    loop {
-        let cand = dir.join(inc);
+    if let Some(mut dir) = file_path.parent() {
+        loop {
+            let cand = dir.join(inc);
+            if cand.is_file() {
+                return Some(cand);
+            }
+            match dir.parent() {
+                Some(p) => dir = p,
+                None => break,
+            }
+        }
+    }
+    for root in system_include_dirs() {
+        let cand = root.join(inc);
         if cand.is_file() {
             return Some(cand);
         }
-        dir = dir.parent()?;
     }
+    None
 }
 
 fn include_paths(src: &str, parser: &mut tree_sitter::Parser) -> Vec<String> {
