@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>perl-lsp — usage heatmap</title>
+<title>perl-lsp usage heatmap</title>
 <style>
   :root {
     --bg: #0e1116; --panel: #161b22; --panel2: #1c222b; --edge: #2a313c;
@@ -311,7 +311,7 @@ function renderButterfly() {
 let deadSort = { key: "fan_out", dir: -1 };
 function renderDead() {
   const host = $("dead");
-  if (!DEAD.length) { host.innerHTML = '<div class="empty">No dead-code candidates — every symbol is referenced or guarded. 🎉</div>'; return; }
+  if (!DEAD.length) { host.innerHTML = '<div class="empty">No dead-code candidates. Every symbol is referenced or guarded.</div>'; return; }
   const rows = DEAD.slice().sort((a, b) => {
     const k = deadSort.key;
     let av = a[k], bv = b[k];
@@ -320,7 +320,7 @@ function renderDead() {
   });
   const head = (k, lbl, cls = "") =>
     `<th data-k="${k}" class="${cls}">${lbl}${deadSort.key === k ? (deadSort.dir < 0 ? " ▾" : " ▴") : ""}</th>`;
-  let html = `<p style="color:var(--muted);font-size:12px;max-width:90ch">A <b>review queue</b>, not a delete list — unreferenced symbols that no reachability guard shielded. Click a row to copy its <code>file:line</code>.</p><table><thead><tr>` +
+  let html = `<p style="color:var(--muted);font-size:12px;max-width:90ch">A <b>review queue</b> of unreferenced symbols no reachability guard shielded. Review each before removing. Click a row to copy its <code>file:line</code>.</p><table><thead><tr>` +
     head("name", "Symbol") + head("kind", "Kind") + head("package", "Package") + head("fan_out", "Fan-out", "num") + `<th>Location</th></tr></thead><tbody>`;
   for (const s of rows) {
     html += `<tr data-loc="${attr((s.file || "") + ":" + s.line + ":" + s.col)}">` +

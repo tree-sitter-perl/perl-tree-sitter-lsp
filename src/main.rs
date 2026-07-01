@@ -1711,8 +1711,8 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     let out = serde_json::json!({
         "schema": "perl-lsp.heatmap.v1",
         "kind": "usage-heatmap",
-        "label": "dead_code_candidate = UNREFERENCED SYMBOL (reachability heuristic); NOT MISRA C:2012 Rule 2.2 dead code, which is undecidable",
-        "soundness": "over-approximate reachability: exported symbols, constructors, framework-synthesized members, packages, and (when dynamic_dispatch_sites > 0) all methods are treated as reachable and never flagged",
+        "label": "dead_code_candidate: a symbol with no references found. Confirm it's unused before removing.",
+        "soundness": "Flagging errs toward reachable, so it never flags exported symbols, constructors, framework-synthesized members, packages, or (when the workspace uses dynamic dispatch) any method.",
         "root": root,
         "files_indexed": entries.len(),
         "dynamic_dispatch_sites": dynamic_dispatch_sites,
