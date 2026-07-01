@@ -2182,3 +2182,116 @@ fn loader_config_types_register_conf_cross_file() {
     }
 }
 
+
+// ---- Field{owner, name}: one subject, source-agnostic across flavors ----
+//
+// Every Perl field flavor (Moo `has`, classic `$self->{k}` hash slot, Corinna
+// `field`) and every access form (accessor call, hash-slot deref, field var)
+// projects onto the SAME language-generic `Field{owner, name}` bag primitive a
+// C struct member uses — resolved via `field_subject_of_ref`, which dispatches
+// on the access SHAPE, never the field flavor (rule #10). These lock the
+// convergence the refs-splat relies on.
+
+use crate::witnesses::WitnessAttachment;
+
+fn field_subject_named(fa: &FileAnalysis, name: &str, kind_is_hash: Option<bool>) -> Vec<WitnessAttachment> {
+    fa.refs
+        .iter()
+        .filter(|r| match kind_is_hash {
+            Some(true) => matches!(r.kind, RefKind::HashKeyAccess { .. }),
+            Some(false) => matches!(r.kind, RefKind::MethodCall { .. }),
+            None => true,
+        })
+        .filter_map(|r| fa.field_subject_of_ref(r, None))
+        .filter(|att| matches!(att, WitnessAttachment::Field { name: n, .. } if n == name))
+        .collect()
+}
+
+#[test]
+fn field_subject_moo_accessor_and_hashslot_are_one_subject() {
+    // A Moo attr accessed as BOTH `$self->status` (accessor) and
+    // `$self->{status}` (internal slot) is one subject.
+    let src = "\
+package Widget;
+use Moo;
+has 'status' => (is => 'rw');
+sub open_it { my $self = shift; $self->{status} = 'open'; return $self->status; }
+sub check   { my $self = shift; return $self->status eq 'ready'; }
+1;
+";
+    let fa = build_fa_from_source(src);
+    let want = WitnessAttachment::Field { owner: "Widget".into(), name: "status".into() };
+
+    let acc = field_subject_named(&fa, "status", Some(false));
+    let hash = field_subject_named(&fa, "status", Some(true));
+    assert!(!acc.is_empty(), "expected accessor-call refs for status");
+    assert!(!hash.is_empty(), "expected hash-slot refs for status");
+    for s in acc.iter().chain(hash.iter()) {
+        assert_eq!(*s, want, "every status access folds onto the one Field subject");
+    }
+}
+
+#[test]
+fn field_subject_classic_hashkey_converges() {
+    // No framework: `$self->{count}` across methods is still one Field subject
+    // (owner = the access class, no accessor to climb through).
+    let src = "\
+package Counter;
+sub new  { my $class = shift; return bless { count => 0 }, $class; }
+sub incr { my $self = shift; $self->{count}++; return $self; }
+sub value { my $self = shift; return $self->{count}; }
+1;
+";
+    let fa = build_fa_from_source(src);
+    let want = WitnessAttachment::Field { owner: "Counter".into(), name: "count".into() };
+    let subs = field_subject_named(&fa, "count", Some(true));
+    assert!(subs.len() >= 2, "expected >=2 count hash accesses, got {}", subs.len());
+    for s in &subs {
+        assert_eq!(*s, want);
+    }
+}
+
+#[test]
+fn field_subject_corinna_field_converges() {
+    let src = "\
+use v5.38;
+use experimental 'class';
+class Point {
+    field $x :param :reader = 0;
+    method shift_x { $x = $x + 1; return $x; }
+    method describe { return \"x=$x\"; }
+}
+";
+    let fa = build_fa_from_source(src);
+    let want = WitnessAttachment::Field { owner: "Point".into(), name: "x".into() };
+    let subs = field_subject_named(&fa, "x", None);
+    assert!(!subs.is_empty(), "expected Corinna field-var uses to route to a subject");
+    for s in &subs {
+        assert_eq!(*s, want, "Corinna field uses fold onto one per-class subject");
+    }
+}
+
+#[test]
+fn field_subject_cross_class_converges_on_parent_owner() {
+    // A Moo attr declared on a parent, used in a child (both spellings), folds
+    // onto the PARENT's subject — the same ancestor walk the C roles used.
+    let src = "\
+package Animal;
+use Moo;
+has 'name' => (is => 'rw');
+sub greet { my $self = shift; return $self->name; }
+package Dog;
+use Moo;
+extends 'Animal';
+sub bark { my $self = shift; return $self->name; }
+sub tag  { my $self = shift; return $self->{name}; }
+1;
+";
+    let fa = build_fa_from_source(src);
+    let want = WitnessAttachment::Field { owner: "Animal".into(), name: "name".into() };
+    let subs = field_subject_named(&fa, "name", None);
+    assert!(subs.len() >= 3, "expected parent+child accesses, got {}", subs.len());
+    for s in &subs {
+        assert_eq!(*s, want, "inherited field converges on the declaring parent subject");
+    }
+}

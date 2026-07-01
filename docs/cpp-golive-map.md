@@ -23,13 +23,23 @@ The macro arc is **DONE** (goto-def / hover / typing / roles; real op.c `op_type
    `Field{owner, name}`** attachment (the project-wide fold onto a storage slot)
    + `DomainCompare` witness + the free navigation bridge; C emission first.
    Design: the domain spike (`docs/prompt-domain-typing.md`).
-3. **unified field-slot primitive** (C + Perl fields, core + plugin) — wire the
-   Perl *sources* onto the same `Field{owner, name}` subject: Corinna `field`,
-   the existing `HashKey{Def,Access,Owner}` machinery, Moo/Moose `has`, DBIC/Mojo
-   columns. Same fold, per-flavor emission (Perl access is varied + dynamic —
-   the labor is routing accesses, not the primitive). Unlocks refs-splat +
-   domain typing + cross-class field analysis for Perl fields, source-agnostic
-   (rule #10 — a Corinna field and a Moo attr are one subject downstream).
+3. **unified field-slot primitive** (C + Perl fields, core + plugin) — ✅ refs
+   + subject landed; domain typing DEFERRED. `FileAnalysis::field_subject`
+   mints the canonical `Field{owner, name}` subject for any Perl field access
+   (owner = declaring class via the `resolve_method_in_ancestors` ancestor
+   walk); `field_subject_of_ref` routes every access SHAPE (accessor call,
+   `$self->{k}` hash-slot deref, Corinna field variable) onto it, never
+   branching on flavor (rule #10). Refs-splat was already source-agnostic via
+   the `AttrProjection`/`Group` machinery (`docs/adr/field-projections.md`) —
+   the same `(class, attr)` identity — and now shares the `Field` primitive
+   with C; a gold references row (`ref-mojo-path-charset-field-both-forms`)
+   locks the dual-form convergence. **Deferred:** Perl *domain* typing (emit
+   `DomainCompare` at Perl comparison/assignment sites) — Perl has no C-style
+   enum grouping, so `resolve_enumerator_enum`'s "value → named enum" hop has
+   no natural Perl analog (`use constant OPEN => …; use constant CLOSED => …`
+   are independent subs with no shared domain name). Wants a synthetic
+   Perl-constant-group / `Type::Tiny` enum domain first — a separate chunk,
+   and it changes the serialized `domain_sites` shape (EXTRACT_VERSION bump).
 4. **include-closure visibility** (ADR slice 4) — `C = Perl, everything exported`:
    scope cross-file resolution by include-reachability (make cpp a `module_index`
    consumer) + the cheap `#include`-goto-def sub-win.

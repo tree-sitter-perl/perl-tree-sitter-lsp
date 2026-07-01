@@ -414,6 +414,25 @@
       },
       "status": "gold",
       "note": "refs from sub _load_module find its in-file call site."
+    },
+    {
+      "id": "ref-mojo-path-charset-field-both-forms",
+      "difficulty": "tricky",
+      "semantic_area": "oo-field",
+      "file": "Mojo/Path.pm",
+      "line": 6,
+      "col": 4,
+      "expect": {
+        "all": [
+          "\"col\":\"5\",\"file\":\"Path.pm\",\"line\":\"7\"",
+          "\"col\":\"22\",\"file\":\"Path.pm\",\"line\":\"26\"",
+          "\"col\":\"24\",\"file\":\"Path.pm\",\"line\":\"84\"",
+          "\"col\":\"26\",\"file\":\"Path.pm\",\"line\":\"106\""
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "one field subject, source-agnostic: refs on `has charset` splat over BOTH the `$self->{charset}` hash-slot derefs (line 26) AND the `$self->charset` accessor calls (lines 84, 106). Guards the Field{owner,name} bridge — the consumer never branches on hash-key vs accessor flavor."
     }
   ]
 }

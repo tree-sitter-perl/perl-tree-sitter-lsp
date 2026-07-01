@@ -4986,24 +4986,102 @@ impl FileAnalysis {
         packaged(&cached.analysis)
     }
 
+    /// The canonical, language-generic `Field{owner, name}` subject for a
+    /// field access `(class, name)` — the SAME bag primitive a C struct
+    /// member folds onto (`witnesses::WitnessAttachment::Field`). This is the
+    /// ONE place a field's project-wide identity is minted; every Perl field
+    /// flavor (Moo/Moose `has`, Corinna `field`, classic `$self->{k}` hash
+    /// slots, DBIC/Mojo columns) and the C struct member all route here, so
+    /// downstream (domain fold, cross-class analysis) is source-agnostic —
+    /// the consumer asks the subject, never the flavor (rule #10).
+    ///
+    /// `owner` is the DECLARING class: the `resolve_method_in_ancestors` walk
+    /// (the one hover/goto-def use) climbs to the class whose accessor backs
+    /// the slot, so an inherited/role field accessed on any receiver converges
+    /// on one subject (a child's `$self->{name}` and the parent's `has 'name'`
+    /// are the same `Field`). A classic hash slot with no accessor doesn't
+    /// resolve through method lookup — it isn't inherited that way — so the
+    /// owner falls back to the access class (its own per-class storage).
+    pub fn field_subject(
+        &self,
+        class: &str,
+        name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> crate::witnesses::WitnessAttachment {
+        let owner = match self.resolve_method_in_ancestors(class, name, module_index) {
+            Some(MethodResolution::Local { class, .. })
+            | Some(MethodResolution::CrossFile { class, .. }) => class,
+            None => class.to_string(),
+        };
+        crate::witnesses::WitnessAttachment::Field { owner, name: name.to_string() }
+    }
+
+    /// Route a field ACCESS ref — in any of Perl's varied forms — onto its
+    /// shared `Field{owner, name}` subject. The dispatch is on the access
+    /// SHAPE (accessor call / hash-slot deref / Corinna field variable) to
+    /// recover the owning class + slot name; identity minting is delegated to
+    /// `field_subject`, so the field's FLAVOR never enters here. This is the
+    /// projection every source-agnostic field consumer calls to fold a use
+    /// onto the one subject (the Perl analog of the C domain-site routing).
+    pub fn field_subject_of_ref(
+        &self,
+        r: &Ref,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<crate::witnesses::WitnessAttachment> {
+        let (class, name) = match &r.kind {
+            RefKind::MethodCall { .. } => {
+                let class = self.method_call_invocant_class(r, module_index)?;
+                (class, r.unqualified_target_name().to_string())
+            }
+            RefKind::HashKeyAccess { owner, .. } => {
+                let class = match owner {
+                    Some(HashKeyOwner::Class(c)) | Some(HashKeyOwner::Bridged { class: c }) => {
+                        c.clone()
+                    }
+                    _ => match self.deferred_hash_key_owner(r, module_index)? {
+                        HashKeyOwner::Class(c) | HashKeyOwner::Bridged { class: c } => c,
+                        HashKeyOwner::Sub { package: Some(c), name }
+                            if crate::conventions::is_constructor_name(&name) =>
+                        {
+                            c
+                        }
+                        _ => return None,
+                    },
+                };
+                (class, r.target_name.clone())
+            }
+            RefKind::Variable => {
+                // Corinna `field $x` use: the ref resolves to a Field symbol
+                // whose package IS the declaring class (fields are per-class).
+                let sym = self.symbol(r.resolves_to?);
+                if !matches!(sym.kind, SymKind::Field) {
+                    return None;
+                }
+                let bare = sym.name.trim_start_matches(['$', '@', '%']);
+                (sym.package.clone()?, bare.to_string())
+            }
+            _ => return None,
+        };
+        Some(self.field_subject(&class, &name, module_index))
+    }
+
     /// The DOMAIN of a data field on `class` — the enum it is *used as*,
-    /// recovered from usage (`slot == OP_CONST`, `slot = OP_FREED`, …). The
-    /// owner is the DECLARING class (`op_type` → `BASEOP`), found via the
-    /// same `resolve_method_in_ancestors` walk hover/goto-def use, so every
-    /// access — whatever the receiver's concrete struct — folds onto ONE
-    /// `Field{owner, name}` subject. `storage` is left `None` here; the
-    /// hover site composes it from its own storage-leaf display (keeps the
-    /// LSP-layer alias/config-variant logic out of the model).
+    /// recovered from usage (`slot == OP_CONST`, `slot = OP_FREED`, …).
+    /// Keyed by the canonical `field_subject` (declaring-class owner), so
+    /// every access — whatever the receiver's concrete struct — folds onto
+    /// ONE subject. `storage` is left `None` here; the hover site composes it
+    /// from its own storage-leaf display (keeps the LSP-layer
+    /// alias/config-variant logic out of the model).
     pub fn field_domain(
         &self,
         class: &str,
         field: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<NominalDomain> {
-        let owner = match self.resolve_method_in_ancestors(class, field, module_index)? {
-            MethodResolution::Local { class, .. } | MethodResolution::CrossFile { class, .. } => {
-                class
-            }
+        let crate::witnesses::WitnessAttachment::Field { owner, .. } =
+            self.field_subject(class, field, module_index)
+        else {
+            return None;
         };
         self.field_domain_for_owner(&owner, field, module_index)
     }

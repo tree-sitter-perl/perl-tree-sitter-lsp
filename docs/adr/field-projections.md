@@ -1,5 +1,15 @@
 # ADR: Field projections — one decl, every spelling, one rename group
 
+> **Shared identity with C:** `AttrProjection { class, attr }` IS the Perl
+> realization of the language-generic `WitnessAttachment::Field { owner, name }`
+> bag primitive (the C struct-member domain subject) — same `(owner, name)`
+> shape. `FileAnalysis::field_subject(class, name)` mints that canonical subject
+> for any Perl field (owner = declaring class via the ancestor walk);
+> `field_subject_of_ref` routes any access shape (accessor call / `$self->{k}` /
+> Corinna field var) onto it without seeing the flavor. The refs-splat below and
+> the C domain fold are two consumers of the ONE subject. Perl *domain* typing on
+> that subject is deferred — see `docs/cpp-golive-map.md` item 3.
+
 A framework field declaration is ONE name spelled several ways. Moo:
 `has size` ↔ accessor `$w->size` ↔ ctor key `Widget->new(size => …)` ↔
 internal `$self->{size}`. Corinna: `field $x :param :reader` ↔ ctor key
