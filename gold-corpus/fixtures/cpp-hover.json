@@ -64,6 +64,14 @@
       "file": "op.c", "line": 1, "col": 36,
       "expect": { "all": ["op_type", "unsigned short"], "none": ["PERL_BITFIELD16", "U16TYPE"] },
       "status": "gold"
+    },
+    {
+      "id": "cpp-hover-enumerator-shows-parent-enum",
+      "difficulty": "simple", "semantic_area": "cpp-multilang",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "cenum.c", "line": 1, "col": 5,
+      "expect": { "all": ["RED: Color", "*variable*"], "none": ["```perl"] },
+      "status": "gold"
     }
   ]
 }

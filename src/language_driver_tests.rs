@@ -93,3 +93,30 @@ fn cpp_adds_dot_trigger() {
     assert!(tc.iter().any(|s| s == "."), "cpp build should add '.' trigger: {tc:?}");
 }
 
+#[cfg(feature = "cpp")]
+#[test]
+fn cpp_enumerator_carries_parent_enum_as_container_and_type() {
+    use crate::file_analysis::InferredType;
+    // Hovering an enum member surfaces its enum, the same `name: type` way a
+    // struct field renders: `RED: Color`. Wired as the enumerator's container
+    // (package) + type (ClassName of the enum).
+    let fa = cpp_driver().analyze("enum Color { RED, GREEN };\n");
+    let red = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "RED")
+        .unwrap_or_else(|| panic!("RED enumerator: {:?}",
+            fa.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()));
+    assert_eq!(red.package.as_deref(), Some("Color"),
+        "enum member's container is its enum");
+    assert_eq!(
+        fa.inferred_type_via_bag("RED", red.span.start),
+        Some(InferredType::ClassName("Color".to_string())),
+        "enum member's type is its enum, so hover renders `RED: Color`"
+    );
+    // A bare `enum` (no @scope) keeps members in the enclosing scope, so a
+    // later bare read of RED still resolves to this def.
+    assert_eq!(red.scope, crate::file_analysis::ScopeId(0),
+        "enumerators leak into the enclosing (file) scope");
+}
+

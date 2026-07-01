@@ -81,7 +81,13 @@
   type: (enum_specifier)
   declarator: (type_identifier) @def.class.name) @def.class
 ; enum CONSTANTS (RED, GREEN) — named values, findable + completable.
-(enumerator name: (identifier) @def.var.name) @def.var
+; @def.enumerator (not @def.var) marks them so the extractor can tag each
+; with its parent enum (span-contained): `enum Color { RED }` → RED's
+; container + type is `Color`, so hover renders `RED: Color` the same
+; `name: type` way a struct field does. They stay in the ENCLOSING scope
+; (C enumerators leak out of the enum body — no @scope), so a bare
+; `x = RED` still resolves to the enumerator.
+(enumerator name: (identifier) @def.enumerator.name) @def.enumerator
 ; scalar / function-pointer typedefs: `typedef uint32_t u32;`,
 ; `typedef void (*CB)(int);` — the named alias is a findable type. (The
 ; struct/union/enum forms above already matched with a @scope; the

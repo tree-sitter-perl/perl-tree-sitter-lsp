@@ -202,6 +202,53 @@ impl SkeletonAnalysis {
             }
         }
 
+        // Enum members carry their parent enum as BOTH container (package)
+        // and type: `enum Color { RED }` → RED's package + type is `Color`,
+        // so hover renders `RED: Color` the same `name: type` way a struct
+        // field does. The enum is the smallest Class whose span contains the
+        // enumerator (span-, not scope-contained: C enumerators leak into the
+        // enclosing scope, so they stay there — the query mints no @scope for
+        // the enum body — and a bare `x = RED` still resolves).
+        {
+            use crate::witnesses::{Witness, WitnessAttachment as WA, WitnessPayload as WP, WitnessSource};
+            let class_spans: Vec<(Span, String)> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, SymKind::Class))
+                .map(|s| (s.span, s.name.clone()))
+                .collect();
+            let contains = |o: &Span, i: &Span| {
+                (o.start.row, o.start.column) <= (i.start.row, i.start.column)
+                    && (i.end.row, i.end.column) <= (o.end.row, o.end.column)
+            };
+            for idx in 0..symbols.len() {
+                if self.symbols[idx].kind != "enumerator" {
+                    continue;
+                }
+                let esp = symbols[idx].span;
+                // Innermost containing Class = the parent enum (latest start).
+                let Some(enum_name) = class_spans
+                    .iter()
+                    .filter(|(cs, _)| contains(cs, &esp))
+                    .max_by_key(|(cs, _)| (cs.start.row, cs.start.column))
+                    .map(|(_, n)| n.clone())
+                else {
+                    continue;
+                };
+                // The enum is the tightest container, tighter than any
+                // enclosing namespace the sticky context may have tagged.
+                symbols[idx].package = Some(enum_name.clone());
+                bag.push(Witness {
+                    attachment: WA::Variable {
+                        name: symbols[idx].name.clone(),
+                        scope: symbols[idx].scope,
+                    },
+                    source: WitnessSource::Builder("cpp_enumerator".into()),
+                    payload: WP::InferredType(InferredType::ClassName(enum_name)),
+                    span: esp,
+                });
+            }
+        }
+
         // A function whose owning package is a CLASS is a method. Covers
         // template members, which tree-sitter parses as a plain
         // `declaration` (identifier, not field_identifier) so they classify
