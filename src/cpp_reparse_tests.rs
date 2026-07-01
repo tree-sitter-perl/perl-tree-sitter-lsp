@@ -119,6 +119,8 @@ fn two_tier_matches_single_tier_expansion() {
             Macro {
                 params: params.map(|ps| ps.iter().map(|s| s.to_string()).collect()),
                 body: body.to_string(),
+                guards: Vec::new(),
+                def_line: 0,
             },
         );
     };
@@ -246,6 +248,98 @@ fn ref_replacement_at(edits: &[(usize, usize, usize)], transformed: usize) -> Op
         shift += nlen as isize - (oe - os) as isize;
     }
     None
+}
+
+/// The PERL_BITFIELD16 shape: three config-variant `#define`s under
+/// `#ifdef` / `#if defined` / `#else`. Every variant is modeled with its
+/// guard trail — nothing collapses to the collection-order winner.
+#[test]
+fn collect_macro_variants_captures_guard_trails() {
+    let mut p = cpp_parser();
+    let src = "\
+#ifdef WIN32
+#define M U16
+#endif
+#if defined(HAS_NON_INT_BITFIELDS)
+#define M U16
+#else
+#define M unsigned
+#endif
+struct s { M x:9; };
+";
+    let tree = parse(&mut p, src);
+    let variants = collect_macro_variants(&tree, src.as_bytes());
+    let m = variants.get("M").expect("M has variants");
+    assert_eq!(m.len(), 3, "all three config variants modeled, none pruned");
+
+    let by_line: std::collections::HashMap<usize, &Macro> =
+        m.iter().map(|v| (v.def_line, v)).collect();
+    // win32 variant — guarded by the #ifdef.
+    assert_eq!(by_line[&1].guards, vec!["defined(WIN32)".to_string()]);
+    assert_eq!(by_line[&1].body, "U16");
+    // the `#if defined(...)` then-branch.
+    assert_eq!(by_line[&4].guards, vec!["defined(HAS_NON_INT_BITFIELDS)".to_string()]);
+    // the `#else` branch — the condition is NEGATED.
+    assert_eq!(by_line[&6].guards, vec!["!defined(HAS_NON_INT_BITFIELDS)".to_string()]);
+    assert_eq!(by_line[&6].body, "unsigned");
+}
+
+/// End-to-end reachability + join over the captured variants: WIN32 absent →
+/// its variant is UNREACHABLE-labeled (not dropped); the HAS knob's two
+/// branches are UNKNOWN; the body join types the macro as an integer.
+#[test]
+fn variant_model_ranks_and_joins() {
+    use crate::cpp_macro_model::{KnownConfig, MacroSite, MacroVariant, MacroVariants, Reachability};
+    let mut p = cpp_parser();
+    // Primitive bodies so the REAL cpp_pack annot_type types every variant
+    // (a typedef'd integer alias like `U16` needs typedef resolution — a
+    // documented residual; the join model itself is body-agnostic).
+    let src = "\
+#ifdef WIN32
+#define M short
+#endif
+#if defined(HAS_NON_INT_BITFIELDS)
+#define M unsigned
+#else
+#define M int
+#endif
+";
+    let tree = parse(&mut p, src);
+    let raw = collect_macro_variants(&tree, src.as_bytes());
+    let m = MacroVariants {
+        name: "M".into(),
+        variants: raw["M"]
+            .iter()
+            .map(|v| MacroVariant {
+                body: v.body.clone(),
+                params: v.params.clone(),
+                guards: v.guards.clone(),
+                site: MacroSite { file: None, line: v.def_line },
+            })
+            .collect(),
+    };
+    // Known config: nothing predefined; HAS_NON_INT_BITFIELDS is a knob we've
+    // seen #defined somewhere (universe), WIN32 is not.
+    let cfg = KnownConfig::new(
+        Default::default(),
+        ["HAS_NON_INT_BITFIELDS".to_string()].into_iter().collect(),
+    );
+    let ranked = m.ranked(&cfg);
+    // last one is the win32 variant, unreachable + labeled.
+    let (last, r) = ranked.last().unwrap();
+    assert_eq!(last.body, "short");
+    assert_eq!(last.guards, vec!["defined(WIN32)".to_string()]);
+    assert_eq!(r.label().as_deref(), Some("unreachable: WIN32 undefined"));
+    // the two HAS branches are UNKNOWN (kept, not guessed).
+    assert!(ranked[..2]
+        .iter()
+        .all(|(_, r)| matches!(r, Reachability::Unknown { .. })));
+    // join over the REAL pack predicate: short ∨ unsigned ∨ int → integer.
+    let pack = crate::query_extract::cpp_pack();
+    assert_eq!(
+        m.join_type(pack.annot_type),
+        Some(crate::file_analysis::InferredType::Numeric)
+    );
 }
 
 #[test]

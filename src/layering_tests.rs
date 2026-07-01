@@ -44,6 +44,8 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("reparse", Build),
         // C++ reparse seam (macro expansion before extraction spike)
         ("cpp_reparse", Build),
+        // config-variant macro model: guard trail + reachability + join
+        ("cpp_macro_model", Build),
         // zero-config toolchain probe: shell out to cc for stdlib
         // include roots + predefined macros + resource dir (spike)
         ("cpp_toolchain", Build),

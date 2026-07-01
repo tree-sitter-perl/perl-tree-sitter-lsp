@@ -39,6 +39,16 @@ pub struct Macro {
     /// `Some(params)` = function-like; `None` = object-like.
     pub params: Option<Vec<String>>,
     pub body: String,
+    /// Enclosing `#if`/`#ifdef`/`#else` conditions at the `#define`, OUTERMOST
+    /// first — the config guard trail (`docs`: `cpp_macro_model`). Empty =
+    /// unconditional. Rides the expansion-side rep so a config-variant macro
+    /// carries WHICH config each body belongs to. `#[serde(default)]` for cache
+    /// blobs written before guards existed.
+    #[serde(default)]
+    pub guards: Vec<String>,
+    /// 0-based line of the `#define` — the variant's def site.
+    #[serde(default)]
+    pub def_line: usize,
 }
 
 /// One source replacement: original `[start,end)` → `replacement`.
@@ -172,10 +182,15 @@ fn cached_query(slot: &'static OnceLock<Query>, lang: &tree_sitter::Language, sr
     slot.get_or_init(|| Query::new(lang, src).expect("cpp_reparse query"))
 }
 
-pub fn collect_macros(tree: &Tree, src: &[u8]) -> BTreeMap<String, Macro> {
+/// Walk `collect_macros`' query, calling `emit(name, Macro)` per `#define`
+/// (object- and function-like). The Macro carries its config guard trail —
+/// the enclosing `#if`/`#ifdef`/`#else` conditions — captured from the CST
+/// ancestors of the def. Both the dedup'd table (expansion side) and the
+/// variant-preserving collection route through here so the guard trail is
+/// captured once.
+fn walk_macro_defs(tree: &Tree, src: &[u8], mut emit: impl FnMut(String, Macro)) {
     let query = cached_query(&MACRO_DEF_Q, &tree.language(), MACRO_DEF_QUERY);
     let names: Vec<&str> = query.capture_names().to_vec();
-    let mut out = BTreeMap::new();
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(query, tree.root_node(), src);
     while let Some(m) = it.next() {
@@ -184,12 +199,20 @@ pub fn collect_macros(tree: &Tree, src: &[u8]) -> BTreeMap<String, Macro> {
         let mut fname = None;
         let mut fparams: Option<Vec<String>> = None;
         let mut fbody = None;
+        // Any name capture pins the def site (its parent is the preproc_def).
+        let mut name_node: Option<tree_sitter::Node> = None;
         for c in m.captures {
             let txt = c.node.utf8_text(src).unwrap_or("");
             match names[c.index as usize] {
-                "oname" => oname = Some(txt.to_string()),
+                "oname" => {
+                    oname = Some(txt.to_string());
+                    name_node = Some(c.node);
+                }
                 "obody" => obody = Some(clean_body(txt)),
-                "fname" => fname = Some(txt.to_string()),
+                "fname" => {
+                    fname = Some(txt.to_string());
+                    name_node = Some(c.node);
+                }
                 "fparams" => {
                     fparams = Some(
                         txt.trim_start_matches('(')
@@ -204,14 +227,107 @@ pub fn collect_macros(tree: &Tree, src: &[u8]) -> BTreeMap<String, Macro> {
                 _ => {}
             }
         }
+        let guards = name_node.map(|n| guard_trail(n, src)).unwrap_or_default();
+        let def_line = name_node.map(|n| n.start_position().row).unwrap_or(0);
         if let (Some(n), Some(b)) = (oname, obody) {
-            out.insert(n, Macro { params: None, body: b });
+            emit(n, Macro { params: None, body: b, guards: guards.clone(), def_line });
         }
         if let (Some(n), Some(p), Some(b)) = (fname, fparams, fbody) {
-            out.insert(n, Macro { params: Some(p), body: b });
+            emit(n, Macro { params: Some(p), body: b, guards, def_line });
         }
     }
+}
+
+pub fn collect_macros(tree: &Tree, src: &[u8]) -> BTreeMap<String, Macro> {
+    let mut out = BTreeMap::new();
+    walk_macro_defs(tree, src, |n, m| {
+        out.insert(n, m);
+    });
     out
+}
+
+/// The COMPLETE variant set per macro name — every `#define`, not the
+/// collection-order winner `collect_macros` keeps. This is the config-variant
+/// model input: a macro `#define`d three times under three different `#if`s
+/// yields three variants, each with its guard trail + def site.
+pub fn collect_macro_variants(
+    tree: &Tree,
+    src: &[u8],
+) -> BTreeMap<String, Vec<Macro>> {
+    let mut out: BTreeMap<String, Vec<Macro>> = BTreeMap::new();
+    walk_macro_defs(tree, src, |n, m| {
+        out.entry(n).or_default().push(m);
+    });
+    out
+}
+
+/// The config guard trail for a `#define` at `node` (a name identifier inside
+/// the preproc_def): the enclosing `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`
+/// conditions, OUTERMOST first. An else/elif branch negates the condition it
+/// falls under; chained elifs accumulate the negations of preceding arms
+/// because each `#elif`/`#else` is the `alternative` child of the arm before
+/// it, and ascending through an `alternative` edge negates that arm's own
+/// condition.
+fn guard_trail(node: tree_sitter::Node, src: &[u8]) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    let mut prev = node;
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        let is_alt = p
+            .child_by_field_name("alternative")
+            .map(|a| a.id())
+            == Some(prev.id());
+        match p.kind() {
+            "preproc_if" | "preproc_elif" => {
+                let cond = p
+                    .child_by_field_name("condition")
+                    .and_then(|c| c.utf8_text(src).ok())
+                    .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_else(|| "1".to_string());
+                terms.push(if is_alt { negate(&cond) } else { cond });
+            }
+            "preproc_ifdef" => {
+                // Node kind is shared by #ifdef and #ifndef; the leading
+                // directive text disambiguates.
+                let name = p
+                    .child_by_field_name("name")
+                    .and_then(|c| c.utf8_text(src).ok())
+                    .unwrap_or("")
+                    .to_string();
+                let ndef = src
+                    .get(p.start_byte()..)
+                    .and_then(|s| std::str::from_utf8(s).ok())
+                    .map(|s| s.trim_start().starts_with("#ifndef"))
+                    .unwrap_or(false);
+                let base = if ndef {
+                    format!("!defined({name})")
+                } else {
+                    format!("defined({name})")
+                };
+                terms.push(if is_alt { negate(&base) } else { base });
+            }
+            // #else contributes no condition of its own — the negation of the
+            // arm it belongs to is applied when we ascend into the parent
+            // conditional and see this else as its `alternative` child.
+            _ => {}
+        }
+        prev = p;
+        cur = p.parent();
+    }
+    terms.reverse();
+    terms
+}
+
+fn negate(cond: &str) -> String {
+    if let Some(inner) = cond.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
+        inner.to_string()
+    } else if cond.starts_with("defined(") {
+        format!("!{cond}")
+    } else if cond.starts_with("!defined(") {
+        cond.trim_start_matches('!').to_string()
+    } else {
+        format!("!({cond})")
+    }
 }
 
 /// Largest a macro body may grow to during pre-expansion — a backstop
@@ -471,7 +587,7 @@ fn include_set_hash(src: &str) -> u64 {
 
 /// Bump when the persisted macro-table format or the gather's semantics
 /// change in a way that invalidates on-disk blobs.
-const MACRO_CACHE_VERSION: i64 = 1;
+const MACRO_CACHE_VERSION: i64 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedMacros {
