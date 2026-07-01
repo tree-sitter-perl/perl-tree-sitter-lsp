@@ -10,3 +10,7 @@ gold-corpus/local/
 gold-corpus/.carton/
 gold-corpus/local
 *.vsix
+
+# local scratch (scanner experiments — not part of the repo)
+/sner.pl
+/sner.scm
