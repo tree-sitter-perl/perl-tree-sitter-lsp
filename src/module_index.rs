@@ -34,6 +34,17 @@ pub use crate::file_analysis::{CachedModule, SubInfo};
 
 type InferredTypeOwned = crate::file_analysis::InferredType;
 
+/// Does this cached module declare a `Class`/type named `name`? The cache
+/// slot's rank (Class beats Sub/value) is derived from the occupant rather
+/// than stored alongside it, so the deterministic-winner tie-break in
+/// `register_symbols` can compare ranks order-independently.
+fn module_defines_class(m: &CachedModule, name: &str) -> bool {
+    m.analysis
+        .symbols
+        .iter()
+        .any(|s| matches!(s.kind, SymKind::Class) && s.name == name)
+}
+
 // ---- Internal sync primitives (pub(crate) for resolver thread) ----
 
 /// Thread-safe queue: Mutex<Vec> + Condvar.
@@ -763,15 +774,39 @@ impl ModuleIndex {
             // name. C reuses names freely — a `#define OP(x)` macro in one
             // header (a Sub) vs the `OP` typedef in another (a Class). Member
             // completion + ancestor resolution key on the TYPE, so a Class
-            // OVERWRITES; a Sub/value only FILLS an empty slot. Race-free
-            // under the parallel index: the Class insert always wins, the
-            // or_insert never clobbers a Class already present.
-            if matches!(sym.kind, SymKind::Class) {
-                self.cache.insert(sym.name.clone(), Some(cached.clone()));
-            } else {
-                self.cache
-                    .entry(sym.name.clone())
-                    .or_insert_with(|| Some(cached.clone()));
+            // beats a Sub/value.
+            //
+            // When two WORKSPACE files define the SAME name at the SAME rank
+            // (two files each declaring `class Box` — common with test
+            // fixtures / vendored copies), the winner MUST NOT depend on the
+            // parallel registration order, or `get_cached(name)` flips
+            // per-process (the Rayon index registers in nondeterministic
+            // order). Break the tie by the smallest canonical path — a
+            // stable, order-independent choice.
+            let incoming_is_class = matches!(sym.kind, SymKind::Class);
+            use dashmap::mapref::entry::Entry;
+            match self.cache.entry(sym.name.clone()) {
+                Entry::Vacant(v) => {
+                    v.insert(Some(cached.clone()));
+                }
+                Entry::Occupied(mut o) => {
+                    let replace = match o.get() {
+                        None => true,
+                        Some(existing) => {
+                            let existing_is_class =
+                                module_defines_class(existing, &sym.name);
+                            match (incoming_is_class, existing_is_class) {
+                                (true, false) => true,  // Class beats Sub/value
+                                (false, true) => false, // Sub/value never beats a Class
+                                // Same rank: deterministic by path.
+                                _ => cached.path < existing.path,
+                            }
+                        }
+                    };
+                    if replace {
+                        o.insert(Some(cached.clone()));
+                    }
+                }
             }
         }
     }

@@ -1698,7 +1698,16 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // (`unsigned short` — has a space) is `ClassName(text)` so hover shows the
     // raw spelling. Struct/union/enum tag typedefs (`typedef struct op OP`)
     // don't reach here — the skeleton's @parent edge already aliases them.
-    for (mid, alias) in &alias_name_by_match {
+    // Emit in match-id (≈ source) order: two `#define`s / typedefs of the
+    // SAME alias name (a config-variant type macro like `PERL_BITFIELD16`,
+    // guarded `#ifdef … #else …`) land competing `TypeName(alias)` witnesses,
+    // and the reducer is latest-wins — a HashMap-iteration emission order
+    // makes the winner flip per process (Rust's randomized hasher). Sorted
+    // emission fixes the winner to the last-defined variant, deterministically.
+    let mut alias_mids: Vec<&usize> = alias_name_by_match.keys().collect();
+    alias_mids.sort_unstable();
+    for mid in alias_mids {
+        let alias = &alias_name_by_match[mid];
         let Some(underlying) = alias_of_by_match.get(mid) else { continue };
         out.witnesses.push(crate::witnesses::Witness {
             attachment: crate::witnesses::WitnessAttachment::TypeName(alias.clone()),
@@ -1713,7 +1722,13 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // (defined cross-file in another header via a config-guarded `#define`)
     // chases through to its integer leaf. Gated on a TYPE-shaped body so the
     // sea of value macros (`#define MAX 100`) mints nothing.
-    for (mid, alias) in &macro_alias_name_by_match {
+    // Same deterministic-emission rule as the typedef loop above (the
+    // `PERL_BITFIELD16` config-variant JOIN lives here): sorted by match id so
+    // the latest-wins reducer's winner is order-independent.
+    let mut macro_mids: Vec<&usize> = macro_alias_name_by_match.keys().collect();
+    macro_mids.sort_unstable();
+    for mid in macro_mids {
+        let alias = &macro_alias_name_by_match[mid];
         let Some(underlying) = macro_alias_of_by_match.get(mid) else { continue };
         let underlying = underlying.trim();
         if !looks_like_type_spelling(underlying) {
@@ -1728,7 +1743,13 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     }
 
     // ---- join flow captures into Variable witnesses ----
-    for (mid, (name, scope, at)) in &flow_targets {
+    // Match-id order (deterministic) — two captures targeting the same
+    // `Variable{name, scope}` slot would otherwise land witnesses in
+    // HashMap-iteration order, flipping the latest-wins winner per process.
+    let mut flow_mids: Vec<&usize> = flow_targets.keys().collect();
+    flow_mids.sort_unstable();
+    for mid in flow_mids {
+        let (name, scope, at) = &flow_targets[mid];
         let var = crate::witnesses::WitnessAttachment::Variable {
             name: name.clone(),
             scope: *scope,
