@@ -18,6 +18,42 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist-macro-refs",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macro_refs.h",
+      "line": 0,
+      "col": 8,
+      "expect": {
+        "all": [
+          "\"file\":\"macro_refs.h\",\"line\":\"2\"",
+          "\"file\":\"macro_refs.h\",\"line\":\"3\""
+        ],
+        "none": []
+      },
+      "status": "xfail"
+    },
+    {
+      "id": "cpp-hitlist-struct-refs",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "struct_refs.cpp",
+      "line": 0,
+      "col": 7,
+      "expect": {
+        "all": [
+          "\"file\":\"struct_refs.cpp\",\"line\":\"2\"",
+          "\"file\":\"struct_refs.cpp\",\"line\":\"3\""
+        ],
+        "none": []
+      },
+      "status": "xfail"
     }
   ]
 }

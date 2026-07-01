@@ -32,6 +32,14 @@
       "file": "attr_macro.cpp", "line": 9, "col": 21,
       "expect": { "all": ["Widget", "*class*"], "none": ["*exported*", "*deprecated*"] },
       "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist-macro-field-type",
+      "difficulty": "hard", "semantic_area": "cpp-hitlist",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "macro_field_type.cpp", "line": 2, "col": 18,
+      "expect": { "all": ["unsigned short"], "none": [] },
+      "status": "xfail"
     }
   ]
 }

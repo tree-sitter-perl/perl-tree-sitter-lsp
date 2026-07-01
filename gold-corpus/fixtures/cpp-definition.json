@@ -12,6 +12,18 @@
       "col": 12,
       "expect": { "all": ["sample.cpp:13:5"], "none": [] },
       "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist-include-nav",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "inc_nav.cpp",
+      "line": 0,
+      "col": 10,
+      "expect": { "all": ["incdep.h"], "none": [] },
+      "status": "xfail"
     }
   ]
 }
