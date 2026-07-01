@@ -126,6 +126,11 @@ pub struct PackDriver {
     /// original source → every `#define` as a `MacroDef` (guard trail, def
     /// span, delegation callee). `None` for packs without a preprocessor.
     collect_macro_defs: Option<fn(&mut tree_sitter::Parser, &str) -> Vec<crate::file_analysis::MacroDef>>,
+    /// Member-block macros as roles (C preprocessor only): classify a macro
+    /// pasted standalone into a struct/class body, BLANK the use (so the base
+    /// parses clean), and mint the synthetic base + parent edges. `None` for
+    /// packs without a preprocessor.
+    member_blocks: Option<fn(&mut tree_sitter::Parser, &str) -> crate::cpp_reparse::MemberBlockPlan>,
 }
 
 #[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
@@ -155,9 +160,19 @@ impl LanguageDriver for PackDriver {
             }
             _ => std::sync::Arc::new(crate::cpp_reparse::PreExpandedExternal::empty()),
         };
+        // Member-block macros as roles: BLANK the standalone-in-struct-body uses
+        // so `struct op { BASEOP };` parses clean, and mint the synthetic base +
+        // parent edges (injected below, into the extracted skeleton). The blank
+        // is length-preserving, so the transform + remap stay in original
+        // coordinates; the ORIGINAL source keeps the token (goto-def-on-`BASEOP`
+        // untouched). `docs/adr/macro-handling.md`.
+        let plan = self
+            .member_blocks
+            .map(|f| crate::timings::phase("cpp.member_blocks", || f(&mut parser, source)));
+        let parse_input: &str = plan.as_ref().map(|p| p.blanked_source.as_str()).unwrap_or(source);
         let (src, map, recovered) = match self.transform {
-            Some(t) => crate::timings::phase("cpp.transform", || t(&mut parser, source, &external)),
-            None => (source.to_string(), crate::cpp_reparse::SpliceMap::default(), Vec::new()),
+            Some(t) => crate::timings::phase("cpp.transform", || t(&mut parser, parse_input, &external)),
+            None => (parse_input.to_string(), crate::cpp_reparse::SpliceMap::default(), Vec::new()),
         };
         let Some(tree) = parser.parse(&src, None) else { return FileAnalysis::new(Default::default()) };
         match crate::query_extract::extract(&tree, src.as_bytes(), &(self.pack)()) {
@@ -171,6 +186,14 @@ impl LanguageDriver for PackDriver {
                 // gitignored generated header (`config.h`'s `U16TYPE`), but the
                 // gather reached it — so carry the alias here.
                 emit_external_type_aliases(&mut skel.witnesses, &external, (self.pack)().annot_type);
+                // Member-block roles: inject the synthetic bases + parent edges
+                // (original coords) into the skeleton, so the ONE ancestor walk
+                // resolves `o->op_type` / hover / the references splat. Must run
+                // AFTER remap (the injected spans are already original) and BEFORE
+                // `into_file_analysis` (it builds indices over everything).
+                if let Some(plan) = &plan {
+                    inject_member_blocks(&mut skel, plan, (self.pack)().annot_type);
+                }
                 let mut fa = skel.into_file_analysis();
                 apply_attribute_macros(&mut fa, &recovered);
                 // Macro identity lane: collect every `#define` off the ORIGINAL
@@ -213,6 +236,7 @@ fn cpp_driver() -> PackDriver {
         transform: Some(crate::cpp_reparse::preprocess_validated_with),
         gather_macros: Some(crate::cpp_reparse::included_macros_pre_expanded),
         collect_macro_defs: Some(crate::cpp_reparse::collect_macro_defs),
+        member_blocks: Some(crate::cpp_reparse::plan_member_blocks),
     }
 }
 
@@ -231,6 +255,7 @@ fn python_driver() -> PackDriver {
         transform: None,
         gather_macros: None,
         collect_macro_defs: None,
+        member_blocks: None,
     }
 }
 
@@ -249,6 +274,7 @@ fn r_driver() -> PackDriver {
         transform: None,
         gather_macros: None,
         collect_macro_defs: None,
+        member_blocks: None,
     }
 }
 
@@ -268,6 +294,7 @@ fn cmake_driver() -> PackDriver {
         transform: None,
         gather_macros: None,
         collect_macro_defs: None,
+        member_blocks: None,
     }
 }
 
@@ -293,6 +320,89 @@ fn apply_attribute_macros(fa: &mut FileAnalysis, recovered: &[(String, String)])
                 && !sym.attributes.contains(signal)
             {
                 sym.attributes.push(signal.clone());
+            }
+        }
+    }
+}
+
+/// Inject the member-block synthetic bases + parent edges into the extracted
+/// skeleton (`docs/adr/macro-handling.md`, "Member-block macros = roles"). The
+/// macro's own `#define` symbol is reclassified Variable → Class (the navigable
+/// base), members are minted under it (package = the macro), and each member
+/// re-sources the SAME `TypeName` edge the expanded field would have. The
+/// existing ancestor walk (`resolve_method_in_ancestors` / `parents_of`) then
+/// delivers `o->op_type` resolution / hover / the references splat — no parallel
+/// field resolution. Spans are already in ORIGINAL coordinates.
+#[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
+fn inject_member_blocks(
+    skel: &mut crate::query_extract::SkeletonAnalysis,
+    plan: &crate::cpp_reparse::MemberBlockPlan,
+    annot_type: fn(&str) -> Option<crate::file_analysis::InferredType>,
+) {
+    use crate::file_analysis::{InferredType, Scope, ScopeId, ScopeKind};
+    use crate::query_extract::SkelSymbol;
+    use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+
+    if plan.is_empty() {
+        return;
+    }
+    // `struct op → BASEOP`, one edge per pasting struct — the copypasta IS
+    // inheritance. `into_file_analysis` folds these into `package_parents`.
+    for (child, parent) in &plan.edges {
+        skel.parents.push((child.clone(), parent.clone()));
+    }
+    for base in &plan.bases {
+        // The macro's object-like `#define` symbol becomes the navigable base
+        // Class (members nest under it; goto-def on the token still routes
+        // through the macro identity lane). Both `#define` sites of a config-
+        // variant macro reclassify; `into_file_analysis` dedups them by name.
+        for s in &mut skel.symbols {
+            if s.kind == "var" && s.name == base.macro_name && s.package.is_none() {
+                s.kind = "class".to_string();
+            }
+        }
+        // One scope over the `#define` body, so `scope_at(member_point)` finds
+        // it and the member's `Variable{name, scope}` type witness resolves.
+        let scope_id = ScopeId(skel.scopes.len() as u32);
+        skel.scopes.push(Scope {
+            id: scope_id,
+            parent: None,
+            kind: ScopeKind::Class { name: base.macro_name.clone() },
+            span: base.body_scope_span,
+            package: Some(base.macro_name.clone()),
+        });
+        skel.scope_count = skel.scopes.len();
+        for m in &base.members {
+            skel.symbols.push(SkelSymbol {
+                kind: "var".to_string(), // a data member (Variable), package-tagged
+                name: m.name.clone(),
+                start: m.name_span.start,
+                end: m.name_span.end,
+                name_start: m.name_span.start,
+                name_end: m.name_span.end,
+                package: Some(base.macro_name.clone()),
+                scope_depth: 1,
+                scope: scope_id,
+                return_type: None,
+                deref_stack: Vec::new(),
+            });
+            // The role member emits the SAME `TypeName` edge the expanded field
+            // did — the emission site moved, the edge is canonical (slice 2's
+            // hover leaf + the type chase resolve `op_type` → `unsigned short`).
+            let payload = match annot_type(&m.type_text) {
+                Some(InferredType::ClassName(cn)) => {
+                    Some(WitnessPayload::Edge(WitnessAttachment::TypeName(cn)))
+                }
+                Some(t) => Some(WitnessPayload::InferredType(t)),
+                None => None,
+            };
+            if let Some(payload) = payload {
+                skel.witnesses.push(Witness {
+                    attachment: WitnessAttachment::Variable { name: m.name.clone(), scope: scope_id },
+                    source: WitnessSource::Builder("member-block".into()),
+                    payload,
+                    span: m.name_span,
+                });
             }
         }
     }

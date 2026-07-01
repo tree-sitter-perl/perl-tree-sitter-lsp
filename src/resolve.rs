@@ -972,7 +972,14 @@ fn symbol_defines_target(sym: &crate::file_analysis::Symbol, target: &TargetRef)
                 .iter()
                 .any(|c| Some(c.as_str()) == sym.package.as_deref())
                 || sym.package.as_deref() == Some(class.as_str());
-            matches!(sym.kind, SymKind::Sub | SymKind::Method) && on_chain
+            // A data member (cpp `o->field`) mints the same MethodCall ref as a
+            // method, so its `Variable`/`Field` decl is the target's declaration
+            // too. `on_chain` (package ∈ family) already excludes package-less
+            // locals — a plain Perl `my $x` never matches a Method target.
+            matches!(
+                sym.kind,
+                SymKind::Sub | SymKind::Method | SymKind::Variable | SymKind::Field
+            ) && on_chain
         }
         TargetKind::Package => matches!(
             sym.kind,

@@ -1394,13 +1394,50 @@ pub fn pack_hover_markdown(
     language: &str,
     module_index: Option<&dyn crate::file_analysis::CrossFileLookup>,
 ) -> Option<String> {
-    // Cursor on a def, or on a call/ref naming a LOCAL def.
-    let local = analysis.symbol_at(point).or_else(|| {
-        let r = analysis.ref_at(point)?;
-        let name = r.unqualified_target_name();
-        analysis.symbols.iter().find(|s| s.name == name)
-    });
-    if let Some(sym) = local {
+    // Cursor directly on a symbol DECL (its own type point + scope).
+    if let Some(sym) = analysis.symbol_at(point) {
+        return Some(render_symbol_hover(
+            sym, source, &sym.span.start, language, analysis, point, module_index,
+        ));
+    }
+    let r = analysis.ref_at(point)?;
+    // Member access (`obj->field` / `obj->method()`): resolve the EXACT member
+    // via the invocant class + ancestor walk — the SAME resolution goto-def
+    // uses — BEFORE the by-name shortcut below, so a same-file field def (or a
+    // same-named symbol on another class) can't hijack it with the wrong scope.
+    // A data field shows `field: type` (member_hover, keyed on the field's own
+    // scope); a method shows its signature.
+    if matches!(r.kind, RefKind::MethodCall { .. }) {
+        if let Some(midx) = module_index {
+            if let Some(cn) = analysis.method_call_invocant_class(r, Some(midx)) {
+                let field = r.unqualified_target_name();
+                if let Some(crate::file_analysis::MethodResolution::Local { sym_id, .. }) =
+                    analysis.resolve_method_in_ancestors(&cn, field, Some(midx))
+                {
+                    let sym = analysis.symbol(sym_id);
+                    if matches!(sym.kind, FaSymKind::Method | FaSymKind::Sub) {
+                        return Some(render_symbol_hover(
+                            sym, source, &sym.span.start, language, analysis, sym.span.start, Some(midx),
+                        ));
+                    }
+                }
+                // The member's declared type may be a config-variant macro whose
+                // flow type is the join abstraction (`Numeric`); display the
+                // concrete leaf from the config-active variant's alias chain.
+                if let Some(leaf) = analysis
+                    .member_type_spelling(&cn, field, Some(midx))
+                    .and_then(|sp| config_variant_leaf_display(analysis, &sp, midx))
+                {
+                    return Some(format!("```{}\n{}: {}\n```\n\n*field*", language, field, leaf));
+                }
+                if let Some(h) = analysis.member_hover(&cn, field, Some(midx)) {
+                    return Some(format!("```{}\n{}\n```\n\n*field*", language, h));
+                }
+            }
+        }
+    }
+    // A call/ref naming a LOCAL def (function call, non-member).
+    if let Some(sym) = analysis.symbols.iter().find(|s| s.name == r.unqualified_target_name()) {
         return Some(render_symbol_hover(
             sym, source, &sym.span.start, language, analysis, point, module_index,
         ));
@@ -1408,24 +1445,6 @@ pub fn pack_hover_markdown(
     // Cross-file: a call whose target isn't local — look the function up in
     // the cross-file index and render its signature from the defining file.
     let midx = module_index?;
-    let r = analysis.ref_at(point)?;
-    // Member access (`obj->field`): the MethodCall ref resolves its invocant
-    // class, then the field's `name: type` — the same ref goto-def lands on.
-    if matches!(r.kind, RefKind::MethodCall { .. }) {
-        let cn = analysis.method_call_invocant_class(r, Some(midx))?;
-        let field = r.unqualified_target_name();
-        // The member's declared type may be a config-variant macro whose flow
-        // type is the join abstraction (`Numeric`). Display the concrete leaf
-        // recovered from the config-active variant's alias chain instead.
-        if let Some(leaf) = analysis
-            .member_type_spelling(&cn, field, Some(midx))
-            .and_then(|sp| config_variant_leaf_display(analysis, &sp, midx))
-        {
-            return Some(format!("```{}\n{}: {}\n```\n\n*field*", language, field, leaf));
-        }
-        let h = analysis.member_hover(&cn, field, Some(midx))?;
-        return Some(format!("```{}\n{}\n```\n\n*field*", language, h));
-    }
     if !matches!(r.kind, RefKind::FunctionCall { .. }) {
         return None;
     }

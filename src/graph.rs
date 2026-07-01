@@ -146,6 +146,16 @@ impl<'a> GraphView<'a> {
                     }
                 }
                 EdgeKind::InheritsInv => {
+                    // Local children: a class in THIS file naming `class` as a
+                    // parent (same-file hierarchies — many structs pasting one
+                    // member-block role macro, a single-file Perl `@ISA` chain).
+                    // Symmetric with `parents_of` (local ∪ cross-file); the walk's
+                    // seen-set dedups against the cross-file index below.
+                    for (child, parents) in &self.fa.package_parents {
+                        if parents.iter().any(|p| p == class) {
+                            out.push(Node::Class(child.clone()));
+                        }
+                    }
                     if let Some(idx) = self.idx {
                         for (pkg, _module) in idx.direct_children_of(class) {
                             out.push(Node::Class(pkg));

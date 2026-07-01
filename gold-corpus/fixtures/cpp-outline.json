@@ -44,6 +44,26 @@
         ]
       },
       "status": "xfail"
+    },
+    {
+      "id": "cpp-member-block-base-and-members-outline",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "member_block.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Class\",\"line\":\"2\",\"name\":\"BASEOP\"",
+          "\"kind\":\"Class\",\"line\":\"3\",\"name\":\"REFCNT\"",
+          "\"name\":\"op_type\",\"package\":\"BASEOP\"",
+          "\"name\":\"op_refcnt\",\"package\":\"REFCNT\""
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

@@ -161,10 +161,18 @@ one pattern: **global set + reachability scope.**
   2. **provenance-leaf hover display** — **LANDED** (a6d8223). op_type hovers
      the concrete leaf; typing stays the abstraction.
   3. **member-block macros = roles** (the field-splat / copypasta-as-
-     inheritance) — classify member-block macros by struct-body usage, **blank**
-     the use (introduces the blank mode), mint the visible synthetic base +
-     parent edges, members from the config-active variant. Fixes `BASEOP`
-     field refs-splat / hover / goto-def. Independent, high user-pain value.
+     inheritance) — **LANDED**. `cpp_reparse::plan_member_blocks` classifies a
+     field-block macro by struct-body usage (body-parseability is the
+     discriminator, per-candidate parse-damage gate confirms), **blanks** the
+     use (length-preserving; introduces the blank mode; the original keeps the
+     token, so goto-def-on-`BASEOP` is untouched), and mints one synthetic base
+     Class per macro with members from the config-active variant.
+     `language_driver::inject_member_blocks` reclassifies the macro symbol →
+     Class, adds the members (re-sourcing the same `TypeName` edge) + the
+     `struct → BASEOP` parent edges; the existing ancestor walk
+     (`resolve_method_in_ancestors` / `parents_of` / `GraphView::InheritsInv`,
+     now including same-file children) delivers member resolution, hover, and
+     the references splat. Fixes `BASEOP` field refs-splat / hover / goto-def.
   4. **resolution visibility = include-closure scope** — the lie above; reuses
      slice 1's reachability machinery. Correctness for vendored/monorepo name
      collisions. Independent of the expansion policy.
