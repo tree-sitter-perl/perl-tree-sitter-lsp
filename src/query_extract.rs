@@ -1057,6 +1057,12 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // underlying type text), joined per match → `TypeName` alias witnesses.
     let mut alias_name_by_match: HashMap<usize, String> = HashMap::new();
     let mut alias_of_by_match: HashMap<usize, String> = HashMap::new();
+    // Object-like `#define X body` alias halves — kept SEPARATE from the
+    // typedef alias so the emission can gate on a type-shaped body (a
+    // macro-heavy header has thousands of value macros we must NOT mint
+    // TypeName witnesses for).
+    let mut macro_alias_name_by_match: HashMap<usize, String> = HashMap::new();
+    let mut macro_alias_of_by_match: HashMap<usize, String> = HashMap::new();
     for e in &events {
         if e.cap == "type.annot" {
             annot_by_match.insert(e.match_id, e.text.clone());
@@ -1066,6 +1072,12 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         }
         if e.cap == "alias.of" {
             alias_of_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "macro.alias.name" {
+            macro_alias_name_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "macro.alias.of" {
+            macro_alias_of_by_match.insert(e.match_id, e.text.clone());
         }
     }
     let mut annot_text_by_var: HashMap<(String, crate::file_analysis::ScopeId), String> =
@@ -1688,20 +1700,29 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // don't reach here — the skeleton's @parent edge already aliases them.
     for (mid, alias) in &alias_name_by_match {
         let Some(underlying) = alias_of_by_match.get(mid) else { continue };
-        let underlying = underlying.trim();
-        let payload = match (pack.annot_type)(underlying) {
-            Some(InferredType::ClassName(cn)) => crate::witnesses::WitnessPayload::Edge(
-                crate::witnesses::WitnessAttachment::TypeName(cn),
-            ),
-            Some(t) => crate::witnesses::WitnessPayload::InferredType(t),
-            None => crate::witnesses::WitnessPayload::InferredType(InferredType::ClassName(
-                underlying.to_string(),
-            )),
-        };
         out.witnesses.push(crate::witnesses::Witness {
             attachment: crate::witnesses::WitnessAttachment::TypeName(alias.clone()),
             source: crate::witnesses::WitnessSource::Builder("skeleton-typedef".into()),
-            payload,
+            payload: type_alias_payload(underlying.trim(), pack.annot_type),
+            span: Span { start: Point { row: 0, column: 0 }, end: Point { row: 0, column: 0 } },
+        });
+    }
+
+    // ---- object-like `#define X body` type aliases → TypeName witnesses ----
+    // Same alias graph as a typedef, so a field/var typed `PERL_BITFIELD16`
+    // (defined cross-file in another header via a config-guarded `#define`)
+    // chases through to its integer leaf. Gated on a TYPE-shaped body so the
+    // sea of value macros (`#define MAX 100`) mints nothing.
+    for (mid, alias) in &macro_alias_name_by_match {
+        let Some(underlying) = macro_alias_of_by_match.get(mid) else { continue };
+        let underlying = underlying.trim();
+        if !looks_like_type_spelling(underlying) {
+            continue;
+        }
+        out.witnesses.push(crate::witnesses::Witness {
+            attachment: crate::witnesses::WitnessAttachment::TypeName(alias.clone()),
+            source: crate::witnesses::WitnessSource::Builder("skeleton-macro-alias".into()),
+            payload: type_alias_payload(underlying, pack.annot_type),
             span: Span { start: Point { row: 0, column: 0 }, end: Point { row: 0, column: 0 } },
         });
     }
@@ -1812,6 +1833,41 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         }
     }
     Ok(out)
+}
+
+/// The `TypeName(alias) → …` payload for an underlying type spelling, resolving
+/// it through the pack's `annot_type`: a class-shaped leaf edges into the alias
+/// graph (`Edge(TypeName(cn))`), a primitive is a terminal `InferredType`, an
+/// unrecognized spelling (`unsigned short` — has a space) is `ClassName(text)`
+/// so hover shows it verbatim. Shared by typedef, file-local `#define`, and
+/// gathered-external `#define` alias emission.
+pub(crate) fn type_alias_payload(
+    underlying: &str,
+    annot_type: fn(&str) -> Option<InferredType>,
+) -> crate::witnesses::WitnessPayload {
+    use crate::witnesses::{WitnessAttachment, WitnessPayload};
+    match annot_type(underlying) {
+        Some(InferredType::ClassName(cn)) => WitnessPayload::Edge(WitnessAttachment::TypeName(cn)),
+        Some(t) => WitnessPayload::InferredType(t),
+        None => WitnessPayload::InferredType(InferredType::ClassName(underlying.to_string())),
+    }
+}
+
+/// Is `body` a bare TYPE spelling (a macro that aliases a type), rather than a
+/// value/expression? Accepts identifier/keyword words possibly `::`-qualified
+/// and space-separated (`U16`, `unsigned short`, `std::string`, `struct op`);
+/// rejects numeric literals (`100`), operators, and punctuation (`1 << 3`,
+/// `(x)`, `&y`). Cheap first-token gate: a type spelling never starts with a
+/// digit or a symbol, and contains only word/`:`/space bytes.
+pub(crate) fn looks_like_type_spelling(body: &str) -> bool {
+    let b = body.trim();
+    if b.is_empty() {
+        return false;
+    }
+    if !b.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
+        return false;
+    }
+    b.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == ' ')
 }
 
 fn byte_range_of(events: &[Event], match_id: usize, cap: &str) -> Option<(usize, usize)> {

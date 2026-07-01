@@ -783,6 +783,19 @@ impl PreExpandedExternal {
             &self.full
         }
     }
+
+    /// Object-like gathered macros as `(name, body)` — the raw (un-pre-expanded)
+    /// bodies, so a `#define X Y` stays an alias EDGE (`X → TypeName(Y)`) the
+    /// bag chases, rather than a flattened leaf. The type-alias emission uses
+    /// this to carry an include-closure's type macros (`U16TYPE` from a
+    /// gitignored generated `config.h`) into every consuming file's bag, where
+    /// the cross-file `TypeName` chase can never index the header directly.
+    pub fn object_like_macros(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.raw
+            .iter()
+            .filter(|(_, m)| m.params.is_none())
+            .map(|(k, m)| (k.as_str(), m.body.as_str()))
+    }
 }
 
 /// Every identifier token appearing in any macro body — the reference

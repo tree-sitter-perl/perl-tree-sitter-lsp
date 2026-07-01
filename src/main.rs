@@ -147,7 +147,7 @@ async fn main() {
             return;
         }
         Some("--parse") if args.len() >= 3 => {
-            cli_parse(&args[2]);
+            cli_parse(&args[2], args.get(3).map(|s| s.as_str()));
             return;
         }
         Some("--languages") => {
@@ -413,8 +413,9 @@ fn print_usage() {
     eprintln!("  perl-lsp --clear-cache [<root>]                        Wipe the module cache for");
     eprintln!("                                                         <root>, or every project if");
     eprintln!("                                                         <root> is omitted");
-    eprintln!("  perl-lsp --parse <file|-->                             Print tree-sitter parse tree");
-    eprintln!("                                                         (`-` reads from stdin)");
+    eprintln!("  perl-lsp --parse <file|--> [<lang>]                    Print tree-sitter parse tree");
+    eprintln!("                                                         (`-` reads from stdin; <lang>");
+    eprintln!("                                                         picks a grammar by id, e.g. cpp)");
     eprintln!();
     eprintln!("MULTI-LANGUAGE (pack drivers, opt-in at build time):");
     eprintln!("  perl-lsp --languages                                   Languages this build serves");
@@ -1860,7 +1861,7 @@ fn cli_clear_cache(root: Option<&str>) {
 /// `<file>` may be `-` to read from stdin. Mirrors `tree-sitter parse`
 /// output shape — `(node_kind [row, col] - [row, col]` per line,
 /// 2-space indent per depth, field names prefixed (`field: kind`).
-fn cli_parse(path: &str) {
+fn cli_parse(path: &str, lang: Option<&str>) {
     use std::io::Read;
     let source = if path == "-" {
         let mut s = String::new();
@@ -1878,10 +1879,24 @@ fn cli_parse(path: &str) {
             }
         }
     };
-    // Route to the file's grammar by extension (cpp/python/r/cmake), so
+    // Route to a grammar: an explicit `lang` id (stdin can't route by
+    // extension) wins, else the file's extension (cpp/python/r/cmake), so
     // --parse shows the SAME tree the pack extractor sees. Perl + stdin +
-    // unknown extensions keep the Perl grammar.
-    let mut parser = if path != "-" {
+    // unknown extensions/ids keep the Perl grammar.
+    let mut parser = if let Some(id) = lang {
+        let reg = crate::language_driver::LanguageRegistry::with_enabled();
+        match reg.for_id(id) {
+            Some(d) => d.make_parser(),
+            None => {
+                eprintln!(
+                    "unknown language `{}`; served: {}",
+                    id,
+                    reg.languages().join(", ")
+                );
+                std::process::exit(1);
+            }
+        }
+    } else if path != "-" {
         let reg = crate::language_driver::LanguageRegistry::with_enabled();
         reg.for_path(std::path::Path::new(path))
             .filter(|d| d.id() != "perl")

@@ -22,6 +22,13 @@
 ; function-like (`#define MIN(a,b) ...`) → a callable (Sub).
 (preproc_def name: (identifier) @def.var.name) @def.var
 (preproc_function_def name: (identifier) @def.sub.name) @def.sub
+; An object-like macro whose body is a bare type spelling is a TYPE ALIAS the
+; same as a `typedef` — `#define PERL_BITFIELD16 U16` / `#define BITF16 unsigned`.
+; The alias graph resolves it (incl. cross-file, since the #define is a
+; file-scope symbol): a field typed `PERL_BITFIELD16` in another header chases
+; through to `unsigned short`. Non-type bodies (`#define MAX 100`) are gated out
+; at emission by `annot_type`.
+(preproc_def name: (identifier) @macro.alias.name value: (preproc_arg) @macro.alias.of)
 
 ; ---- namespaces: a Package SYMBOL (so its members nest under it in the
 ; outline) + a sticky context + a real scope for its body ----

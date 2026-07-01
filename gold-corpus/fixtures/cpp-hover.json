@@ -40,6 +40,30 @@
       "file": "macro_field_type.cpp", "line": 2, "col": 18,
       "expect": { "all": ["unsigned short"], "none": [] },
       "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist-bitfield-typedef-field-type",
+      "difficulty": "hard", "semantic_area": "cpp-hitlist",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "bitfield_field.cpp", "line": 1, "col": 16,
+      "expect": { "all": ["op_type", "unsigned short"], "none": [] },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist-config-variant-macro-field-type",
+      "difficulty": "hard", "semantic_area": "cpp-hitlist",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "cfgvar_macro_field.cpp", "line": 7, "col": 28,
+      "expect": { "all": ["op_type", "unsigned short"], "none": ["PERL_BITFIELD16"] },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist-crossfile-macro-member-field-type",
+      "difficulty": "hard", "semantic_area": "cpp-hitlist",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture/opmacro",
+      "file": "op.c", "line": 1, "col": 36,
+      "expect": { "all": ["op_type", "unsigned short"], "none": ["PERL_BITFIELD16", "U16TYPE"] },
+      "status": "gold"
     }
   ]
 }

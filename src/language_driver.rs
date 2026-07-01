@@ -161,6 +161,12 @@ impl LanguageDriver for PackDriver {
                 // remap extracted spans from transformed → original coords
                 // (no-op for identity / pass-through languages).
                 remap_spans(&mut skel, &src, source, &map);
+                // Type-alias `#define`s gathered from the include closure ride
+                // into this file's bag as `TypeName` witnesses (span-less, so
+                // post-remap is fine): the cross-file chase can't index a
+                // gitignored generated header (`config.h`'s `U16TYPE`), but the
+                // gather reached it — so carry the alias here.
+                emit_external_type_aliases(&mut skel.witnesses, &external, (self.pack)().annot_type);
                 let mut fa = skel.into_file_analysis();
                 apply_attribute_macros(&mut fa, &recovered);
                 fa
@@ -279,6 +285,36 @@ fn apply_attribute_macros(fa: &mut FileAnalysis, recovered: &[(String, String)])
     }
 }
 
+/// Emit `TypeName(name) → …` witnesses for the type-alias `#define`s gathered
+/// from a file's include closure. The cross-file `TypeName` chase resolves an
+/// alias by `get_cached(name)` → the header defining it; that fails when the
+/// header is gitignored (perl5's generated `config.h`, where `U16TYPE unsigned
+/// short` lives), so the alias never resolves past that hop. The gather already
+/// followed the `#include` and has the body, so carry it into THIS file's bag —
+/// the hop then resolves locally. Gated on a type-shaped body so the sea of
+/// value macros mints nothing. Non-cpp packs gather nothing (empty iterator).
+#[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
+fn emit_external_type_aliases(
+    witnesses: &mut Vec<crate::witnesses::Witness>,
+    external: &crate::cpp_reparse::PreExpandedExternal,
+    annot_type: fn(&str) -> Option<crate::file_analysis::InferredType>,
+) {
+    use crate::file_analysis::Span;
+    use tree_sitter::Point;
+    for (name, body) in external.object_like_macros() {
+        let body = body.trim();
+        if !crate::query_extract::looks_like_type_spelling(body) {
+            continue;
+        }
+        witnesses.push(crate::witnesses::Witness {
+            attachment: crate::witnesses::WitnessAttachment::TypeName(name.to_string()),
+            source: crate::witnesses::WitnessSource::Builder("external-macro-alias".into()),
+            payload: crate::query_extract::type_alias_payload(body, annot_type),
+            span: Span { start: Point { row: 0, column: 0 }, end: Point { row: 0, column: 0 } },
+        });
+    }
+}
+
 /// Remap extracted skeleton spans from transformed coords back to
 /// original source coords via the anchor map. A no-op for an identity
 /// map (clean/pass-through files round-trip byte→point→byte unchanged),
@@ -321,6 +357,45 @@ fn remap_spans(
     for sc in &mut skel.scopes {
         sc.span.start = r(sc.span.start);
         sc.span.end = r(sc.span.end);
+    }
+    // Witness spans (the type tier). A length-changing splice (`PBF op_type` →
+    // `unsigned op_type`) shifts every span AFTER it, so a declared-type
+    // witness left in transformed coords lands past the original query point
+    // and the temporal fold drops it. Remap the witness `.span`, any span-
+    // bearing attachment (`Expr`/`BranchArm`), and the same shapes reached
+    // through a payload edge target — so `expr_type_at_span` and the temporal
+    // ordering all speak original coordinates, like refs.
+    use crate::witnesses::{WitnessAttachment, WitnessPayload};
+    let rspan = |sp: crate::file_analysis::Span| -> crate::file_analysis::Span {
+        let (start, end) = remap_span(sp.start, sp.end);
+        crate::file_analysis::Span { start, end }
+    };
+    let remap_att = |a: &mut WitnessAttachment| match a {
+        WitnessAttachment::Expr(sp) | WitnessAttachment::BranchArm(sp) => *sp = rspan(*sp),
+        _ => {}
+    };
+    for w in &mut skel.witnesses {
+        remap_att(&mut w.attachment);
+        match &mut w.payload {
+            WitnessPayload::Edge(t)
+            | WitnessPayload::CallReturn { target: t, .. }
+            | WitnessPayload::QualifiedCallReturn { method_lookup: t, .. }
+            | WitnessPayload::Projected { base: t, .. } => remap_att(t),
+            _ => {}
+        }
+        w.span = rspan(w.span);
+    }
+    // Value-flow edges (the provenance tier above the bag) + label/goto refs +
+    // moved-from sites all carry transformed spans too.
+    for fe in &mut skel.flow_edges {
+        fe.target_at = r(fe.target_at);
+        fe.source = rspan(fe.source);
+    }
+    for (_, _, span) in &mut skel.label_refs {
+        *span = rspan(*span);
+    }
+    for (_, span, _) in &mut skel.moved_from {
+        *span = rspan(*span);
     }
 }
 
