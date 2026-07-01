@@ -181,6 +181,16 @@ async fn main() {
     let (service, socket) = LspService::new(Backend::new);
 
     Server::new(stdin, stdout, socket).serve(service).await;
+
+    // `serve()` returns when the client's stdin/socket reaches EOF — the CLEAN
+    // `shutdown`+`exit` path AND the UNCLEAN path (editor crash / kill with no
+    // `exit` notification) both land here. Exit explicitly rather than letting
+    // `main` return into the tokio-runtime drop: background `spawn_blocking`
+    // work (workspace indexing does `rt.block_on(client.send_request(..))`,
+    // which parks forever once the client is gone) can otherwise keep the
+    // runtime — and the process — alive, orphaning a 40-thread server to init.
+    // An LSP server has nothing to flush after the connection closes.
+    std::process::exit(0);
 }
 
 /// A blocking-thread bridge for stdio, replacing `tokio::io::stdin/stdout`.
