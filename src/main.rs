@@ -26,6 +26,7 @@ mod language_driver;
 mod cpp_templates;
 mod cpp_template_join;
 mod cpp_reparse;
+mod cpp_toolchain;
 mod cursor_sentinel;
 mod query_extract;
 mod reparse;
