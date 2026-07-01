@@ -24,14 +24,29 @@
   name: (_) @def.method.name) @def.method
 
 ; ---- variable declarations (single and paren-list forms) ----
-; FINDING: the `variable:`/`variables:` fields the CST prints (and
-; child_by_field_name reads) match ZERO in the query engine — a
-; grammar/field-table mismatch invisible until measured. The
-; field-less structural form below is the workaround; a .scm pack
-; accumulates exactly the same grammar traps cst.rs encodes, with
-; far worse debuggability (silent non-match vs a failing unit test).
+; `(_ (varname))` is a generic var-node discriminator: any sigil kind
+; (scalar/array/hash) that carries a varname, matched whether it sits
+; under the single `variable:` field or the paren-list `variables:`
+; field — so one field-less pattern covers both forms. We capture the
+; WHOLE sigiled node, NOT the inner varname, because the builder anchors
+; a variable's selection on the sigil; the whole-node capture aligns
+; column-for-column (descending to (varname) shifts one column right and,
+; measured, craters def parity).
+;
+; The earlier finding here claimed the `variable:`/`variables:` fields
+; "match ZERO in the query engine" and cast this field-less form as a
+; workaround. That was a long-standing mis-measurement, NOT a grammar
+; regression: the sibling for_statement `variable:` (below) matches fine
+; and nobody cross-checked the two. Measured — see the unit test
+; `field_queryability_must_be_probed_per_node`: the single `variable:`
+; field IS queryable (resolves to the var node); only the paren-list
+; `variables:` field is quirky, resolving to the anonymous `(` token (the
+; same field-table trap as `right:` on assignment_expression), so
+; `variables: (scalar)` matches nothing while `variables: _` binds the
+; paren. Neither field is needed here — the field-less discriminator is
+; the simplest form that stays correct across both spellings.
 (variable_declaration
-  [(scalar) (array) (hash)] @def.var.name) @def.var
+  (_ (varname)) @def.var.name) @def.var
 
 ; ---- scopes ----
 (block) @scope

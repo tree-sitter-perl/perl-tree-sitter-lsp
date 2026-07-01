@@ -116,13 +116,14 @@ fn query_skeleton_differential_report() {
             for sym in fa.symbols.iter().filter(|s| s.kind == *bkind) {
                 t.builder += 1;
                 let pos = (sym.selection_span.start.row, sym.selection_span.start.column);
-                // builder anchors variable selection on the varname
-                // (post-sigil); the skeleton captures the whole sigiled
-                // node — accept either anchor.
-                let hit = skel_kinds.iter().any(|sk| {
-                    skel_defs.contains(&(sk.to_string(), pos.0, pos.1))
-                        || (pos.1 > 0 && skel_defs.contains(&(sk.to_string(), pos.0, pos.1 - 1)))
-                });
+                // Exact column: the builder anchors a variable's
+                // selection on the sigil, and the skeleton captures the
+                // whole sigiled node — both start at the sigil, so no
+                // anchor fudge is needed (an earlier `col - 1` tolerance
+                // papered over a mis-stated anchor; see skeleton.scm).
+                let hit = skel_kinds
+                    .iter()
+                    .any(|sk| skel_defs.contains(&(sk.to_string(), pos.0, pos.1)));
                 if hit {
                     t.matched += 1;
                 } else {
@@ -237,20 +238,24 @@ fn query_skeleton_differential_report() {
 }
 #[test]
 fn field_queryability_must_be_probed_per_node() {
-    // THE trap this spike found: `variable:`/`variables:` fields the
-    // CST prints (and child_by_field_name serves) match ZERO in the
-    // query engine on variable_declaration — while `variable:` on
-    // for_statement matches fine. Field queryability is per-node and
-    // only observable by measuring; a .scm pack fails SILENTLY here.
+    // The corrected story behind skeleton.scm's variable-def patterns.
+    // The earlier finding claimed the `variable:`/`variables:` fields on
+    // variable_declaration both "match ZERO in the query engine"; that
+    // was a long-standing mis-measurement (the sibling for_statement
+    // `variable:` matches fine — nobody cross-checked). The real,
+    // narrower shape, proved here with numbers:
+    //   - single `variable:` resolves to the (scalar)/(array)/(hash)
+    //     node and IS queryable;
+    //   - paren-list `variables:` resolves in the query engine to the
+    //     anonymous `(` token (same field-table trap as `right:` on
+    //     assignment_expression), so a NAMED-node matcher under it finds
+    //     nothing — but `variables: _` binds the paren and the inner
+    //     vars are reachable as siblings.
     use tree_sitter::{Query, QueryCursor, StreamingIterator};
-    let src = "my ($a, $b) = @_;\n";
+    let src = "my $x = 1;\nmy ($a, $b) = @_;\n";
     let mut parser = crate::builder::create_parser();
     let tree = parser.parse(src, None).unwrap();
-    for pat in [
-        "(variable_declaration variables: (scalar) @v)",
-        "(variable_declaration variables: [(scalar) (array) (hash)] @v)",
-        "(variable_declaration (scalar) @v)",
-    ] {
+    let count = |pat: &str| -> usize {
         let q = Query::new(&tree.language(), pat).unwrap();
         let mut c = QueryCursor::new();
         let mut ms = c.matches(&q, tree.root_node(), src.as_bytes());
@@ -258,13 +263,24 @@ fn field_queryability_must_be_probed_per_node() {
         while let Some(m) = ms.next() {
             n += m.captures.len();
         }
-        println!("PAT {pat} -> {n} captures");
-        if pat.contains("variables:") {
-            assert_eq!(n, 0, "if this now matches, the grammar fixed its field tables — simplify skeleton.scm");
-        } else if !pat.contains("variables:") && !pat.contains("[") {
-            assert_eq!(n, 2);
-        }
-    }
+        n
+    };
+    // single field: queryable, resolves to the named var node.
+    assert_eq!(count("(variable_declaration variable: (scalar (varname) @v))"), 1);
+    // paren-list field: a named-node matcher under it finds nothing,
+    // because the field resolves to the anonymous `(` token...
+    assert_eq!(count("(variable_declaration variables: (scalar) @v)"), 0);
+    assert_eq!(count("(variable_declaration variables: (_) @v)"), 0);
+    // ...which `variables: _` (wildcard, matches anon nodes too) binds:
+    // exactly one paren per paren-list declaration.
+    assert_eq!(count("(variable_declaration variables: _ @v)"), 1);
+    // Both fields CAN be reached if wanted (single directly, paren-list
+    // via the paren-anchored sibling) — but skeleton.scm needs neither:
+    // the field-less discriminator `(_ (varname))` covers both spellings
+    // in one pattern (the single form here, plus the two paren-list vars).
+    assert_eq!(count("(variable_declaration variable: (_ (varname) @v))"), 1);
+    assert_eq!(count("(variable_declaration variables: _ (_ (varname) @v))"), 2);
+    assert_eq!(count("(variable_declaration (_ (varname) @v))"), 3);
 }
 
 // ---- spike 2: the witness bag fed from captures alone ----
