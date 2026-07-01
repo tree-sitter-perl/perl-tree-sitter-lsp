@@ -155,7 +155,12 @@ async fn main() {
             return;
         }
         Some("--lang-analyze") if args.len() >= 3 => {
-            cli_lang_analyze(&args[2]);
+            // Multiple files analyze in ONE process, sharing the process-global
+            // header/macro caches — so a second C++ file's gather reuses the
+            // first's parsed headers (op.c → sv.c is near-free).
+            for f in &args[2..] {
+                cli_lang_analyze(f);
+            }
             return;
         }
         _ => {}
@@ -319,6 +324,17 @@ fn cli_lang_analyze(file: &str) {
         eprintln!("cannot read {file}");
         std::process::exit(1);
     };
+    // Persist the transitive macro table across invocations — keyed on the
+    // file's directory (the CLI has no workspace root). Without this the LSP-only
+    // `set_macro_persist_dir` never fires here, so every `--lang-analyze` run
+    // re-gathered the whole #include closure cold (op.c: ~1.5s). The on-disk tier
+    // now makes a second run warm.
+    if let Some(dir) = path.parent() {
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        crate::cpp_reparse::set_macro_persist_dir(
+            crate::module_cache::cache_dir_for_workspace(Some(&key.to_string_lossy())),
+        );
+    }
     // `PERL_LSP_BENCH_ITERS=N` re-analyzes N times in-process — the 2nd+ runs
     // are WARM (macro tables cached), which is where the per-analyze macro-
     // expansion cost shows. Combine with `PERL_LSP_PHASE_TIMING=1` for the
@@ -392,7 +408,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("MULTI-LANGUAGE (pack drivers, opt-in at build time):");
     eprintln!("  perl-lsp --languages                                   Languages this build serves");
-    eprintln!("  perl-lsp --lang-analyze <file>                         Analyze a file via its driver");
+    eprintln!("  perl-lsp --lang-analyze <file>...                      Analyze file(s) via their driver (shared caches)");
     eprintln!("                                                         (route by extension; dump outline)");
     eprintln!("    Build a cpp-lsp:  cargo build --features cpp   (or --features all-langs)");
     eprintln!();
