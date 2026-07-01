@@ -423,12 +423,16 @@ pub struct LangPack {
     /// (name, ordered args); this predicate classifies.
     pub cmd_effects: fn(cmd: &str) -> Vec<CmdEffect>,
     /// Guard narrowing: given the guard token (`@narrow.guard` — a
-    /// function/operator like `isinstance`, `ref`) and the type token
-    /// (`@narrow.type`), the refined type that holds inside the guarded
-    /// block, or `None` if this guard doesn't narrow. The pack owns
+    /// function/operator like `isinstance`, `has_value`; `None` for the
+    /// token-less `if (opt)` truthiness form) and the type text, the
+    /// refined type that holds inside the guarded block, or `None` if this
+    /// guard doesn't narrow. The type text is the `@narrow.type` capture
+    /// when the guard names one (`dynamic_cast<Derived*>`), else the
+    /// subject's DECLARED type (the optional-engagement form reads
+    /// `std::optional<T>` off the declaration and peels `T`). The pack owns
     /// "which guard means which refinement" (rule #10); core just scopes
     /// the witness to the block.
-    pub narrow_guard: fn(guard: &str, type_text: &str) -> Option<InferredType>,
+    pub narrow_guard: fn(guard: Option<&str>, type_text: &str) -> Option<InferredType>,
     /// Completion trigger characters for the LSP
     /// `completionProvider.triggerCharacters` slot — the client auto-fires
     /// completion (and reports the char in `CompletionContext`) when one is
@@ -574,7 +578,7 @@ pub fn python_pack() -> LangPack {
         import_call: |_, _| None,
         cmd_effects: |_| vec![],
         // `isinstance(x, Foo)` narrows x to Foo inside the guard.
-        narrow_guard: |guard, ty| (guard == "isinstance").then(|| InferredType::ClassName(ty.to_string())),
+        narrow_guard: |guard, ty| (guard == Some("isinstance")).then(|| InferredType::ClassName(ty.to_string())),
         trigger_chars: &["."],
         receiver_names: &["self", "cls"],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -726,12 +730,20 @@ pub fn cpp_pack() -> LangPack {
         shape_ctor: |_| false,
         import_call: |_, _| None,
         cmd_effects: |_| vec![],
-        // `if (dynamic_cast<Derived*>(b))` proves `b` is a `Derived` inside —
-        // the cpp analog of python `isinstance`. The pointer-ness is dropped for
-        // navigation (like declared pointer locals), so the refinement is the
-        // pointee class.
+        // Two narrowings, both keyed on what the value IS, not a name allowlist:
+        //   `if (dynamic_cast<Derived*>(b))` — b is a Derived inside (ty is the
+        //     template arg; pointer-ness dropped for navigation, like locals).
+        //   `if (opt)` / `if (opt.has_value())` — an engaged std::optional<T>
+        //     holds a T inside (ty is opt's DECLARED type; peel the inner T).
+        //     The bare form carries no guard token; `.has_value()` gates the
+        //     method so `opt.value_or(x)` (not an engagement test) won't narrow.
         narrow_guard: |guard, ty| {
-            (guard == "dynamic_cast").then(|| InferredType::ClassName(ty.to_string()))
+            let class = match guard {
+                Some("dynamic_cast") => ty.to_string(),
+                None | Some("has_value") => optional_inner(ty)?,
+                _ => return None,
+            };
+            Some(InferredType::ClassName(class))
         },
         trigger_chars: &[".", ">", ":"],
         receiver_names: &["this"],
@@ -763,6 +775,24 @@ pub fn cpp_pack() -> LangPack {
         skip_kinds: &["string_literal", "char_literal", "raw_string_literal", "comment"],
         call_kinds: &["call_expression"],
     }
+}
+
+/// Peel `T` out of a `std::optional<T>` declared-type text, unqualified
+/// (matching how `annot_type` keys classes by their last `::` segment). `None`
+/// when the text isn't an optional — the type-side gate that keeps the
+/// token-less `if (opt)` narrowing from firing on non-optional subjects.
+fn optional_inner(ty: &str) -> Option<String> {
+    let inner = ty
+        .trim()
+        .strip_prefix("std::optional<")
+        .or_else(|| ty.trim().strip_prefix("optional<"))?
+        .strip_suffix('>')?
+        .trim();
+    let leaf = inner.rsplit("::").next().unwrap_or(inner).trim();
+    (!leaf.is_empty()
+        && !leaf.contains(' ')
+        && leaf.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_'))
+    .then(|| leaf.to_string())
 }
 
 /// `expr.lit.<t>` suffix → type. ENGINE-side vocabulary, not per-pack:
@@ -961,6 +991,26 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             rettype_by_match.insert(e.match_id, e.text.clone());
         }
     }
+    // var name → its declared-type text, joined per declaration match. Feeds the
+    // token-less optional-engagement narrowing (`if (opt)`): the guard names no
+    // type, so the refinement reads the subject's declared `std::optional<T>`.
+    let mut annot_text_by_var: HashMap<String, String> = HashMap::new();
+    {
+        let mut annot_by_match: HashMap<usize, &str> = HashMap::new();
+        for e in &events {
+            if e.cap == "type.annot" {
+                annot_by_match.insert(e.match_id, e.text.as_str());
+            }
+        }
+        for e in &events {
+            if e.cap == "flow.target" {
+                if let Some(annot) = annot_by_match.get(&e.match_id) {
+                    annot_text_by_var
+                        .insert((pack.shape_name)("ref.var", &e.text), annot.to_string());
+                }
+            }
+        }
+    }
 
     // ---- the state machine: scope stack + sticky contexts ----
     let mut out = SkeletonAnalysis::default();
@@ -1078,18 +1128,24 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 // refined type holds within `id` (and is invisible
                 // outside it). annot_type maps primitive guards; anything
                 // else is a class refinement.
-                if let (Some(var), Some(ty), Some(guard)) = (
-                    narrow_var.get(&e.match_id),
-                    narrow_type.get(&e.match_id),
-                    narrow_guard.get(&e.match_id),
-                ) {
-                    if let Some(refined) = (pack.narrow_guard)(guard, ty) {
+                if let Some(var) = narrow_var.get(&e.match_id) {
+                    let subject = (pack.shape_name)("ref.var", var);
+                    // Type text: the guard's own `@narrow.type` when it names one
+                    // (`dynamic_cast<Derived*>`), else the subject's declared type
+                    // (the optional-engagement form peels `T` from it). The guard
+                    // token is absent for the bare `if (opt)` truthiness form.
+                    let ty = narrow_type
+                        .get(&e.match_id)
+                        .cloned()
+                        .or_else(|| annot_text_by_var.get(&subject).cloned());
+                    let guard = narrow_guard.get(&e.match_id).map(String::as_str);
+                    if let Some(refined) = ty.and_then(|t| (pack.narrow_guard)(guard, &t)) {
                         // Defer: the region cutoff (first rebind edge) needs the
                         // FlowEdges, minted after this loop. Carry the FULL
                         // guarded-block region [start, end]; the post-pass
                         // truncates it at the earliest rebind.
                         pending_narrow.push((
-                            (pack.shape_name)("ref.var", var),
+                            subject,
                             refined,
                             Span { start: e.start, end: e.end },
                             id,
@@ -1559,8 +1615,8 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // cutoff the Perl narrowing uses (`earliest_rebind_in`). Deferred to here so
     // the edges exist. The witness gets a REAL region span [start, cutoff], so
     // point-containment ends the narrowing at the rebind — the soundness Perl
-    // got from its cutoff, now generic. (cpp's `narrow_guard` is stubbed, so
-    // this fires for python today; any LangPack that narrows gets it free.)
+    // got from its cutoff, now generic. Every LangPack that narrows (python
+    // isinstance, cpp dynamic_cast + optional engagement) gets it free.
     for (name, refined, region, scope) in pending_narrow {
         let end = crate::file_analysis::earliest_rebind_in(&out.flow_edges, &name, region)
             .unwrap_or(region.end);

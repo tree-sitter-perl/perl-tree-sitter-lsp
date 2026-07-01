@@ -1266,6 +1266,91 @@ void f(Base* b) {
 }
 
 #[test]
+fn cpp_optional_engaged_guard_narrows_to_inner_type() {
+    // Guard-testing a `std::optional<Widget>` as engaged proves it holds a
+    // Widget inside the block, so `opt->` / `*opt` resolve on Widget there.
+    // Two engagement shapes — bare truthiness `if (opt)` and `if
+    // (opt.has_value())` — both peel T off the DECLARED optional type; the
+    // refinement is gone after the block and dies at a reassignment (the same
+    // edge-driven cutoff as dynamic_cast / isinstance).
+    let src = "\
+void f(std::optional<Widget> a, std::optional<Widget> b) {
+    if (a) {
+        a->run();
+        a = other();
+        a->run();
+    }
+    a->run();
+    if (b.has_value()) {
+        b->go();
+    }
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    use crate::file_analysis::InferredType;
+    let widget = || Some(InferredType::ClassName("Widget".into()));
+    // bare `if (a)`: a narrows to Widget inside (row 2)…
+    assert_eq!(
+        fa.inferred_type_via_bag("a", tree_sitter::Point { row: 2, column: 8 }),
+        widget(),
+        "bare `if (a)` narrows the engaged optional to its inner Widget",
+    );
+    // …but the reassignment inside the block ends it (row 4, post-rebind)…
+    assert_ne!(
+        fa.inferred_type_via_bag("a", tree_sitter::Point { row: 4, column: 8 }),
+        widget(),
+        "reassignment rebinds a → narrowing truncated by the cutoff",
+    );
+    // …and it does not leak past the block (row 6).
+    assert_ne!(
+        fa.inferred_type_via_bag("a", tree_sitter::Point { row: 6, column: 4 }),
+        widget(),
+        "narrowing scoped to the guard block — gone after",
+    );
+    // `if (b.has_value())`: same narrowing via the method-form guard (row 8).
+    assert_eq!(
+        fa.inferred_type_via_bag("b", tree_sitter::Point { row: 8, column: 8 }),
+        widget(),
+        "`has_value()` narrows the engaged optional to its inner Widget",
+    );
+}
+
+#[test]
+fn cpp_optional_guard_does_not_narrow_non_optional_subject() {
+    // The narrowing keys on the subject BEING a std::optional (rule #10, on the
+    // type not a name): a bare `if (p)` over a non-optional pointer must not
+    // invent an inner type, and `opt.value_or(x)` (not an engagement test) must
+    // not narrow even though opt IS optional.
+    let src = "\
+void f(Widget* p, std::optional<Widget> opt) {
+    if (p) {
+        p->run();
+    }
+    if (opt.value_or(0)) {
+        opt->run();
+    }
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    use crate::file_analysis::InferredType;
+    // `p` stays its declared pointee type (Widget) — NOT re-narrowed to some
+    // peeled inner — but critically the bare-if didn't fabricate a bogus type.
+    // The load-bearing assertion: opt is not narrowed by a non-engagement call.
+    assert_ne!(
+        fa.inferred_type_via_bag("opt", tree_sitter::Point { row: 5, column: 8 }),
+        Some(InferredType::ClassName("Widget".into())),
+        "value_or() is not an engagement guard → opt not narrowed to inner",
+    );
+    // sanity: `p` is a pointer local, so it types as its pointee Widget from the
+    // declaration (unchanged by the bare-if), proving the guard added nothing.
+    assert_eq!(
+        fa.inferred_type_via_bag("p", tree_sitter::Point { row: 2, column: 8 }),
+        Some(InferredType::ClassName("Widget".into())),
+        "non-optional pointer keeps its declared pointee type; bare-if is a no-op",
+    );
+}
+
+#[test]
 fn cpp_pointer_declared_vars_get_their_pointee_type() {
     // `T* p;` and the dynamic_cast condition-form both type the var to
     // the pointee class (pointer-ness dropped for navigation).
